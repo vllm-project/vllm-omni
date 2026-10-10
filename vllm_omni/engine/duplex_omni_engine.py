@@ -72,6 +72,13 @@ class DuplexOmniEngine(AsyncOmniEngine):
             )
         if not plugin_path:
             raise ValueError(f"{self.model!r} is not a duplex model: the pipeline declares no duplex_plugin")
+        transitions = getattr(pipeline_config, "stage_transitions", None)
+        if transitions is not None:
+            from vllm_omni.config.stage_routing import StageRouting
+
+            route = StageRouting.from_transitions(len(pipeline_config.stages), transitions)
+            if route.stage_order != tuple(range(len(pipeline_config.stages))):
+                raise ValueError("Non-sequential stage transitions require a route-aware duplex plugin contract")
         deploy_config = self.deploy_config
         if deploy_config is None:
             raise ValueError("DuplexOmniEngine requires a deploy config with session_mode: duplex (none resolved)")

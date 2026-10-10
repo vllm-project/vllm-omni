@@ -19,6 +19,7 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
@@ -455,11 +456,18 @@ class OmniBase(PDDisaggregationMixin):
             # is still in self.request_states) is corrected after the pop.
             self._publish_request_gauges(len(self.request_states))
 
+    def _configured_stage_routing(self) -> StageRouting:
+        pipeline = self.engine.pipeline_config
+        return StageRouting.from_transitions(
+            len(self._stage_meta_list), pipeline.stage_transitions if pipeline is not None else None
+        )
+
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
             output_modalities,
             self.output_modalities,
             self._stage_meta_list,
+            stage_order=self._configured_stage_routing().stage_order,
         )
 
     def _compute_final_output_stage_ids(self, output_modalities: list[str] | None) -> list[int]:
@@ -469,8 +477,9 @@ class OmniBase(PDDisaggregationMixin):
             requested_modalities = self.output_modalities
         return [
             sid
-            for sid, stage in enumerate(self._stage_meta_list)
-            if getattr(stage, "final_output", False) and stage.final_output_type in requested_modalities
+            for sid in self._configured_stage_routing().stage_order
+            if self._stage_meta_list[sid].final_output
+            and self._stage_meta_list[sid].final_output_type in requested_modalities
         ]
 
     def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:

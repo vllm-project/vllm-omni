@@ -99,9 +99,9 @@ class OmniChunkRecvHandle:
     """Minimal identifier carried from scheduler to runner for input-receive
     registration.
 
-    The runner's ``register_chunk_recv`` only consumes ``request_id`` and
-    ``external_req_id`` from each pending request, so we ship just those
-    two fields instead of the full Request object.  Concrete typing
+    The runner's ``register_chunk_recv`` consumes the request identifiers and
+    the bound producer endpoint, so we ship those fields instead of the full
+    Request object. Concrete typing
     keeps msgspec serialization deterministic across IPC (default,
     PD-disagg, multi-node executor variants) and avoids the
     ``list[Any]`` fallback path.

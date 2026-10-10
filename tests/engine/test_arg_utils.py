@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from transformers import PretrainedConfig, Qwen3Config, Qwen3OmniMoeConfig
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
@@ -34,6 +34,19 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def local_default_model(tmp_path_factory, monkeypatch):
+    """Exercise real config conversion without downloading the default model."""
+    from vllm.engine.arg_utils import get_model_path
+
+    model_path = tmp_path_factory.mktemp("default-model-config")
+    Qwen3Config(architectures=["Qwen3ForCausalLM"]).save_pretrained(model_path)
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.get_model_path",
+        lambda model, revision: str(model_path) if model == EngineArgs.model else get_model_path(model, revision),
+    )
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
@@ -87,6 +100,15 @@ def test_default_stage_id_is_concrete_int():
 
     cfg = engine_args.create_model_config()
     assert cfg.stage_id == 0
+
+
+@pytest.mark.parametrize(("stage_id", "source", "target"), [(2, 0, 1), (1, 2, None)])
+def test_projected_connector_endpoints_reach_worker_model_config(stage_id, source, target):
+    spec = {"name": "SharedMemoryConnector", "extra": {}, "from_stage": source, "to_stage": target}
+    config = OmniEngineArgs(stage_id=stage_id, stage_connector_spec=spec).create_model_config()
+    assert config.stage_connector_config["from_stage"] == source
+    assert config.stage_connector_config["to_stage"] == target
+    assert spec["extra"] == {}
 
 
 def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
@@ -186,6 +208,7 @@ def test_full_payload_capability_validates_platform_selected_worker(monkeypatch)
 
 def test_multimodal_kwarg_overrides(monkeypatch):
     """Ensure that overrides in the multimodal config are preserved."""
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, revision: model)
     sig = inspect.signature(OmniEngineArgs)
     default_mm_cache = sig.parameters["mm_processor_cache_gb"].default
     override_val = default_mm_cache + 1
@@ -326,6 +349,7 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
 
 def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
     """A successful remote tokenizer download must not enter the error path."""
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, revision: model)
     tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
     tokenizer_dir.mkdir()
     baseline_config = Mock()
@@ -463,6 +487,7 @@ def test_patch_valid_hf_config_without_model_type_preserves_keys(tmp_path):
 
 def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
     """Remote resolution failures must stay on vLLM's normal error path."""
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, revision: model)
     loader_error = OSError("remote config resolution failed")
     parent_inputs = {}
 

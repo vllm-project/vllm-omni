@@ -21,6 +21,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -85,6 +86,36 @@ async def test_engine_dead_broadcasts_fatal_to_rpc_waiters(monkeypatch: pytest.M
     assert "stage engine died" in fatal.error
 
 
+@pytest.mark.asyncio
+async def test_shutdown_cancels_membership_watcher_and_closes_stages(mocker) -> None:
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    membership = mocker.Mock()
+    membership.start.return_value = watcher
+    membership.drain_tasks = mocker.AsyncMock()
+    requests: asyncio.Queue = asyncio.Queue()
+    requests.put_nowait(ShutdownRequestMessage())
+    orchestrator = Orchestrator(
+        request_async_queue=requests,
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+        membership_controller=membership,
+    )
+    close_stages = mocker.spy(orchestrator, "_shutdown_stages")
+    # run() owns its loop's tasks; keep the guard on this same task.
+    task = asyncio.current_task()
+    assert task is not None
+    guard = asyncio.get_running_loop().call_later(2, task.cancel)
+    try:
+        await orchestrator.run()
+    finally:
+        guard.cancel()
+    assert watcher.cancelled()
+    membership.drain_tasks.assert_awaited_once()
+    membership.shutdown.assert_called_once()
+    close_stages.assert_called_once()
+
+
 @dataclass
 class OrchestratorFixture:
     orchestrator: Orchestrator
@@ -132,10 +163,14 @@ class FakeStageClient:
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
-        self._engine_core_outputs = queue.Queue()
-        self._diffusion_outputs = queue.Queue()
+        self.sample_rate: int | None = None
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
+        self._diffusion_outputs: queue.Queue[Any] = queue.Queue()
 
     # Orchestrator-facing interface.
+    async def call_utility_async(self, method, request_ids):
+        assert method == "omni_release_request_resources"
+
     async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
 
@@ -228,7 +263,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 
 
 class FakeOutputProcessor:
-    def __init__(self, *, request_outputs: list[object] | None = None) -> None:
+    def __init__(self, *, request_outputs: list[Any] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
@@ -359,7 +394,7 @@ def _build_stage_pools(
     stage_clients: list[list[FakeStageClient]],
     *,
     output_processors: list[FakeOutputProcessor] | None = None,
-    stage_vllm_configs: list[object] | None = None,
+    stage_vllm_configs: list[Any] | None = None,
 ) -> list[StagePool]:
     """Build StagePool list from per-stage replica lists.
 
@@ -389,13 +424,14 @@ def _build_stage_pools(
 
 
 def _build_harness(
-    stage_clients: list[object],
+    stage_clients: list[Any],
     *,
-    output_processors: list[object] | None = None,
+    output_processors: list[Any] | None = None,
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    stage_transitions: tuple[tuple[int, int], ...] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -430,6 +466,7 @@ def _build_harness(
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,
+                stage_transitions=stage_transitions,
                 log_stats=log_stats,
             )
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
@@ -1054,6 +1091,103 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("release_fails", [False, True])
+async def test_abort_ack_waits_for_resource_release_and_failed_cleanup_can_retry(
+    orchestrator_factory, monkeypatch, release_fails
+):
+    fixture = orchestrator_factory([FakeStageClient(final_output=True)])
+    obj = fixture.orchestrator
+    entered = threading.Event()
+    released = threading.Event()
+    calls = []
+
+    async def release(ids):
+        calls.append(ids)
+        entered.set()
+        while not released.is_set():
+            await asyncio.sleep(0.001)
+        if release_fails and len(calls) == 1:
+            raise TimeoutError("READ ownership remains active")
+
+    monkeypatch.setattr(obj.stage_pools[0], "release_request_resources", release)
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="owned",
+            prompt=FakePromptRequest(request_id="owned", prompt_token_ids=[1], resumable=False),
+            original_prompt={"prompt": "ownership"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(obj.stage_pools[0].clients[0].add_request_calls) == 1)
+        fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=["owned"], rpc_id="first"))
+        await _wait_for(entered.is_set)
+        assert fixture.queues[2].sync_q.empty()
+        assert obj.request_states["owned"].closing
+        released.set()
+        result = await _get_rpc_message(fixture)
+        assert result.success is (not release_fails)
+        if release_fails:
+            assert "READ ownership" in result.error
+            assert obj.request_states["owned"].closing
+            fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=["owned"], rpc_id="retry"))
+            result = await _get_rpc_message(fixture)
+            assert result.rpc_id == "retry" and result.success
+            assert calls == [["owned"], ["owned"]]
+        assert "owned" not in obj.request_states
+    finally:
+        released.set()
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_trigger", ["completion", "uncorrelated_abort"])
+async def test_automatic_release_failure_is_request_scoped_and_does_not_publish_success(
+    orchestrator_factory, monkeypatch, cleanup_trigger
+):
+    stage = FakeStageClient(final_output=True)
+    fixture = orchestrator_factory(
+        [stage],
+        output_processors=[FakeOutputProcessor(request_outputs=[_build_request_output("owned")])],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(async_chunk=True))],
+    )
+    obj = fixture.orchestrator
+    original = stage.call_utility_async
+
+    async def fail_release(method, ids):
+        raise TimeoutError("READ ownership remains active")
+
+    monkeypatch.setattr(stage, "call_utility_async", fail_release)
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="owned",
+            prompt=FakePromptRequest(request_id="owned", prompt_token_ids=[1], resumable=False),
+            original_prompt={"prompt": "ownership"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage.add_request_calls) == 1)
+        if cleanup_trigger == "completion":
+            stage.push_engine_core_outputs(_engine_core_outputs("owned", 1.0))
+        else:
+            fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=["owned"]))
+        await _wait_for(lambda: not fixture.output_sync_q.empty())
+        error = fixture.output_sync_q.get_nowait()
+        assert isinstance(error, ErrorMessage)
+        assert error.request_id == "owned" and not error.fatal
+        assert fixture.queues[1].sync_q.empty()
+        assert obj.request_states["owned"].closing
+        assert fixture.thread.is_alive()
+        monkeypatch.setattr(stage, "call_utility_async", original)
+        fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=["owned"], rpc_id="retry"))
+        result = await _get_rpc_message(fixture)
+        assert result.success and "owned" not in obj.request_states
+    finally:
+        await _shutdown_orchestrator(fixture)
+
+
+@pytest.mark.asyncio
 async def test_abort_marks_only_last_final_stage_output_finished() -> None:
     """A request with two final AR stages must keep earlier abort outputs unfinished."""
     stages = [
@@ -1394,6 +1528,7 @@ async def test_handle_streaming_update_unknown_request_is_dropped() -> None:
     orchestrator.async_chunk = False
     orchestrator.request_states = {}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     add_request_calls: list[str] = []
 
     async def record_add_request(msg) -> None:
@@ -1476,6 +1611,7 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
 def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [mocker.Mock()]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.stage_pools[0].get_bound_client.return_value = None
     req_state = SimpleNamespace(native_kv_transfer_id="xfer-req")
     output = SimpleNamespace(kv_transfer_params={"num_transfer_tokens": 4})
@@ -1540,6 +1676,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
         )
     }
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
 
     await orchestrator._handle_streaming_update(
         StageSubmissionMessage(
@@ -1584,6 +1721,7 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-stream": req_state}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -1769,8 +1907,8 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
 @pytest.mark.asyncio
 async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator_factory) -> None:
     """CFG companions should be routed to the same stage-0 replica as their parent."""
-    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=True)
     default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
     stage_pools = _build_stage_pools(
         [[stage0_r0, stage0_r1]],
@@ -1985,6 +2123,7 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     second = _Pool(fail_once=True)
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [first, second]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
 
     with pytest.raises(RuntimeError, match="stage abort failed"):
         await orchestrator._abort_request_ids(["req-a"])
@@ -2014,6 +2153,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
         stage_pools=[],
     )
     orchestrator.stage_pools = pools
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
     mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
     cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)

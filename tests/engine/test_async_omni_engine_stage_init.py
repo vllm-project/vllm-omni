@@ -17,7 +17,8 @@ from omegaconf import OmegaConf
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from tests.helpers.mock import patch_hf_snapshot_download
-from vllm_omni.config.omni_config import OmniStageRuntimeConfig
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig, OmniStageRuntimeConfig
+from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -313,11 +314,19 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
         client_mod.__dict__.update(saved)
 
 
-def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(monkeypatch):
+@pytest.mark.parametrize("transitions", [None, ((0, 2),)])
+def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(monkeypatch, transitions):
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.stage_configs = [types.SimpleNamespace()]
+    engine.pipeline_config = PipelineConfig(
+        model_type="test",
+        stages=tuple(StagePipelineConfig(stage_id=sid, model_stage="test", final_output=sid == 2) for sid in range(3)),
+        stage_transitions=transitions,
+    )
+    engine.stage_configs = [
+        BaseVllmOmniStageConfig(stage_pipeline_config=stage) for stage in engine.pipeline_config.stages
+    ]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
@@ -348,12 +357,14 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     assert captured["stage_init_timeout"] == 7
     assert captured["log_stats"] is True
     assert captured["client_config"] is engine._client_config
+    assert captured["stage_transitions"] == transitions
 
 
 def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):
     import vllm_omni.engine.omni_engine_base as engine_mod
 
     engine = object.__new__(AsyncOmniEngine)
+    engine.pipeline_config = None
     engine.stage_configs = [types.SimpleNamespace()]
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"

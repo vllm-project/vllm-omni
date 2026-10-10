@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -23,6 +24,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine.errors import ResourceReleaseError
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
@@ -60,6 +62,10 @@ class StageUnavailableError(RuntimeError):
     ``EngineDeadError`` handlers (teardown-on-dead, poll-path eviction) are
     not silently enrolled.
     """
+
+
+class RequestClosedError(RuntimeError):
+    """The request entered cleanup before stage admission completed."""
 
 
 @dataclass
@@ -100,7 +106,7 @@ class StagePool:
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
     # A replica that dies mid-release never answers; without a bound its background release never finishes.
-    RELEASE_RPC_TIMEOUT_S: float = 5.0
+    RELEASE_RPC_TIMEOUT_S: float = 15.0
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
     _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
@@ -138,8 +144,12 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
-        self._has_chunk_transfer_adapter = bool(
-            getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
+        model_config = getattr(stage_vllm_config, "model_config", None)
+        self._has_transfer_resources = bool(
+            getattr(model_config, "async_chunk", False)
+            or uses_native_mrv2_data_plane(
+                model_config, use_v2_model_runner=getattr(model_config, "use_v2_model_runner", False)
+            )
         )
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
@@ -321,6 +331,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        request_state: OrchestratorRequestState | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -329,10 +340,16 @@ class StagePool:
         ``request_id`` return the same replica. Bounded wait up to
         ``DISPATCH_WAIT_TIMEOUT_S`` when no UP replica is currently usable.
 
-        In non-distributed (legacy) mode: delegates to
-        :meth:`select_replica_id`.
+        With a request state, cleanup stops selection and a lost binding fails
+        the request: receivers may already hold that replica's sender address.
+        Without one, retain the legacy re-selection behavior.
         """
+        if request_state is not None and request_state.closing:
+            raise RequestClosedError(request_id)
         if self._hub is None or self._lb is None:
+            bound = self.get_bound_replica_id(request_id)
+            if request_state is not None and bound is not None and not self.is_replica_available(bound):
+                raise StageUnavailableError(f"stage {self.stage_id} bound replica {bound} is unavailable")
             return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
         # 1. Sticky: previously bound and still serviceable?
@@ -341,6 +358,8 @@ class StagePool:
             replica_id = self._serviceable_replica_id_for_addr(bound_addr)
             if replica_id is not None:
                 return replica_id
+            if request_state is not None:
+                raise StageUnavailableError(f"stage {self.stage_id} bound replica is no longer serviceable")
             # Bound replica is gone or DOWN — fall through to re-select.
             self._affinity.pop(request_id, None)
 
@@ -357,6 +376,8 @@ class StagePool:
         task = task or Task(request_id=request_id)
         deadline = _time.monotonic() + self.DISPATCH_WAIT_TIMEOUT_S
         while True:
+            if request_state is not None and request_state.closing:
+                raise RequestClosedError(request_id)
             candidates = self._collect_serviceable_replicas()
             if candidates:
                 # LB chose an index *into our candidates list*.
@@ -835,7 +856,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -1011,17 +1032,19 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
-            replica_id = await self._pick_or_select(
+            replica_id = await self.pick(
                 request_id,
                 affinity_request_id=affinity_request_id,
+                request_state=req_state,
             )
-            client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            diffusion_client = self._diffusion_client(replica_id)
+            await diffusion_client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
-        replica_id = await self._pick_or_select(
+        replica_id = await self.pick(
             request_id,
             affinity_request_id=affinity_request_id,
+            request_state=req_state,
         )
         client = self.clients[replica_id]
         if client is None:
@@ -1070,9 +1093,7 @@ class StagePool:
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+        replica_id = await self.pick(request_id, request_state=req_state)
 
         client = self.clients[replica_id]
         if client is None:
@@ -1117,11 +1138,11 @@ class StagePool:
         self,
         request_id: str,
         interaction: OmniInteractionPrompt,
+        *,
+        request_state: OrchestratorRequestState | None = None,
     ) -> int:
         """Submit a midway interaction to an active diffusion (typically video generation) request."""
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+        replica_id = await self.pick(request_id, request_state=request_state)
 
         client = self._diffusion_client(replica_id)
         result = await client.submit_interaction_async(request_id, interaction)
@@ -1130,17 +1151,6 @@ class StagePool:
             reason = result.get("reason") or "Unknown interaction RPC error"
             raise ValueError(str(reason))
         return replica_id
-
-    async def _pick_or_select(
-        self,
-        request_id: str,
-        *,
-        affinity_request_id: str | None = None,
-    ) -> int:
-        """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
-        if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
-        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
     # ---- Stage-local polling ----
 
@@ -1317,20 +1327,23 @@ class StagePool:
         bindings as part of the same teardown, so a binding lookup here would
         race it. The engine-core handler is idempotent for unknown ids.
         """
-        if not request_ids or not self._has_chunk_transfer_adapter:
+        if not request_ids or not self._has_transfer_resources:
             return
         ids = list(request_ids)
 
         async def release(replica_id: int, call: Any) -> None:
             try:
+                if call is None:
+                    raise RuntimeError("Replica does not support resource-release RPC")
                 await asyncio.wait_for(call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S)
             except Exception as e:
-                logger.warning(
-                    "[StagePool-%s] release_request_resources on replica %s failed: %r", self.stage_id, replica_id, e
-                )
+                raise ResourceReleaseError(f"Stage {self.stage_id} replica {replica_id} resource release failed") from e
 
         calls = [(i, getattr(self.clients[i], "call_utility_async", None)) for i in self.live_replica_ids()]
-        await asyncio.gather(*(release(i, call) for i, call in calls if call is not None))
+        results = await asyncio.gather(*(release(i, call) for i, call in calls), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def collective_rpc(
         self,

@@ -8,7 +8,8 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from concurrent.futures import Future
+from typing import Any, cast
 
 import torch
 from vllm.v1.metrics.stats import PrefillStats
@@ -20,7 +21,12 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
 from ..factory import OmniConnectorFactory
-from ..utils.config import ConnectorSpec, stage_receives_chunks
+from ..utils.config import (
+    REQUEST_RESOURCE_RELEASE_TIMEOUT_S,
+    ConnectorSpec,
+    get_stage_connector_peer,
+    stage_receives_chunks,
+)
 from ..utils.initialization import resolve_connector_spec
 from ..utils.kv_utils import get_local_tp_rank, get_omni_replica_id
 from ..utils.logging import get_connector_logger
@@ -137,6 +143,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     work and return immediately.
     """
 
+    # Backends expose transport-specific capabilities in addition to the
+    # shared connector interface; this subclass always creates one.
+    connector: Any
+
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         # The base constructor starts the save thread, so sender-generation
@@ -195,17 +205,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
-        # Save-thread only: running count of segments reclaimed after finish.
-        self._reclaimed_shm_total = 0
+        # Save-thread only: running count of payloads reclaimed after finish.
+        self._reclaimed_payload_total = 0
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -410,6 +420,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 because ``finish_requests`` skips requests that already report
                 ``is_finished()``. See ``_finish_parked_streaming_session``.
         """
+        request = cast(Request, request)
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -498,7 +509,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def _poll_single_request(self, entry: _LoadEntry):
         request = entry.request
         stage_id = self.connector.stage_id
-        target_stage_id = stage_id - 1
+        target_stage_id = get_stage_connector_peer(self.config, stage_id, "from_stage")
+        if target_stage_id is None:
+            return True
         req_id = request.request_id
         with self._receiver_state_lock:
             if self._registered_load_entries.get(req_id) is not entry:
@@ -692,8 +705,21 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for chunk_id in range(num_puts):
                 self.connector.cleanup(f"{key_prefix}_{chunk_id}")
             return
-        if "release_shm" in task:
-            self._release_shm_prefix(task["release_shm"])
+        if "release_prefix" in task:
+            completion = task["release_completion"]
+            try:
+                self._release_connector_prefix(task["release_prefix"])
+                wait = getattr(self.connector, "wait_for_cleanup", None)
+                if callable(wait):
+                    wait(
+                        task["release_prefix"],
+                        receive_prefix=task["receive_prefix"],
+                        deadline=task["release_deadline"],
+                    )
+            except Exception as error:
+                completion.set_exception(error)
+            else:
+                completion.set_result(None)
             return
         request = task["request"]
         external_req_id = request.external_req_id
@@ -774,12 +800,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = unflatten_payload(dict(raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
         stage_id = self.connector.stage_id
-        next_stage_id = stage_id + 1
+        next_stage_id = get_stage_connector_peer(self.config, stage_id, "to_stage")
+        if next_stage_id is None:
+            return
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
@@ -1050,8 +1078,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
-    def release_shm_resources(self, request_id: str) -> None:
-        """Queue reclaim of inter-stage segments this request left unconsumed.
+    def release_request_resources(self, request_id: str, *, deadline: float | None = None) -> Future[None]:
+        """Finish queued publications and apply the backend's request cleanup.
 
         Safe only once every stage has finished with the request: the producer
         keeps writing until its own request ends, and a consumer that stopped
@@ -1060,30 +1088,45 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         orchestrator -- the only party that knows all stages are done -- drives
         this (see ``Orchestrator._cleanup_request_ids``).
 
-        Like abort cleanup, the unlink runs on the save thread, so the
-        scheduler never performs SHM I/O.
+        Cleanup runs behind puts on the save thread, so the scheduler never
+        performs connector I/O. Legacy backends without prefix cleanup retain
+        their existing resource lifecycle; their completion confirms the local
+        publication fence, not physical reclamation by the backend.
         """
-        if not isinstance(self.connector, SharedMemoryConnector):
-            return
         external_req_id = self.request_ids_mapping.get(request_id, request_id)
-        self._pending_save_reqs.append({"release_shm": f"{external_req_id}_{self.connector.stage_id}_"})
+        from_stage = get_stage_connector_peer(self.config, self.connector.stage_id, "from_stage")
+        completion: Future[None] = Future()
+        self._pending_save_reqs.append(
+            {
+                "release_prefix": f"{external_req_id}_{self.connector.stage_id}_",
+                "receive_prefix": f"{external_req_id}_{from_stage}_" if from_stage is not None else None,
+                "release_completion": completion,
+                "release_deadline": deadline
+                if deadline is not None
+                else time.monotonic() + REQUEST_RESOURCE_RELEASE_TIMEOUT_S,
+            }
+        )
         with self._save_cond:
             self._save_cond.notify()
+        return completion
 
-    def _release_shm_prefix(self, key_prefix: str) -> None:
-        reclaimed = self.connector.cleanup_prefix(key_prefix)
+    def _release_connector_prefix(self, key_prefix: str) -> None:
+        cleanup = getattr(self.connector, "cleanup_prefix", None)
+        if not callable(cleanup):
+            return
+        reclaimed = cleanup(key_prefix)
         if not reclaimed:
             return
         # Non-zero means a consumer stopped before draining the producer.
         # Common on audio requests, so warn only when the running total
         # crosses another _RECLAIM_WARN_INTERVAL boundary.
-        prev = self._reclaimed_shm_total
-        self._reclaimed_shm_total = prev + reclaimed
-        if prev // _RECLAIM_WARN_INTERVAL != self._reclaimed_shm_total // _RECLAIM_WARN_INTERVAL:
+        prev = self._reclaimed_payload_total
+        self._reclaimed_payload_total = prev + reclaimed
+        if prev // _RECLAIM_WARN_INTERVAL != self._reclaimed_payload_total // _RECLAIM_WARN_INTERVAL:
             logger.warning(
-                "Reclaimed %d unconsumed inter-stage segments so far; "
+                "Reclaimed %d unconsumed inter-stage payloads so far; "
                 "a downstream stage finished before draining its producer",
-                self._reclaimed_shm_total,
+                self._reclaimed_payload_total,
             )
 
     def cleanup(
@@ -1627,7 +1670,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
-            request_ids = requests.keys()
+            request_ids = cast(dict[str, Request], requests).keys()
 
         connector_owned_ids = {
             request.request_id

@@ -20,6 +20,7 @@ import janus
 from vllm.logger import init_logger
 
 from vllm_omni.config.omni_config import BaseVllmOmniStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -170,12 +171,18 @@ class StageRuntime:
         *,
         stage_init_timeout: int,
         async_chunk: bool,
+        stage_transitions: tuple[tuple[int, int], ...] | None = None,
         tokenizer: str | None = None,
         parallel_stage_init: bool = False,
         log_stats: bool = False,
         client_config: OmniClientConfig | None = None,
     ) -> None:
         self._stage_configs = stage_configs
+        self._stage_routing = (
+            StageRouting.from_transitions(len(stage_configs), stage_transitions)
+            if stage_transitions is not None
+            else None
+        )
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
@@ -767,6 +774,7 @@ class StageRuntime:
                 omni_transfer_config=omni_transfer_config,
                 stage_id=stage_id,
                 async_chunk=self._async_chunk,
+                stage_routing=self._stage_routing,
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]
@@ -1366,6 +1374,7 @@ class DistStageRuntime(StageRuntime):
         omni_lb_policy: str = "random",
         request_queue: janus.Queue[EngineQueueMessage] | None = None,
         parallel_stage_init: bool = False,
+        stage_transitions: tuple[tuple[int, int], ...] | None = None,
     ) -> None:
         super().__init__(
             stage_configs=stage_configs,
@@ -1373,6 +1382,7 @@ class DistStageRuntime(StageRuntime):
             config_path=config_path,
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
+            stage_transitions=stage_transitions,
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
@@ -1691,6 +1701,7 @@ def create_stage_runtime(
     single_stage_mode: bool,
     stage_init_timeout: int,
     async_chunk: bool,
+    stage_transitions: tuple[tuple[int, int], ...] | None = None,
     tokenizer: str | None = None,
     parallel_stage_init: bool = False,
     # Distributed-only params:
@@ -1714,6 +1725,7 @@ def create_stage_runtime(
             config_path=config_path,
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
+            stage_transitions=stage_transitions,
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
@@ -1731,6 +1743,7 @@ def create_stage_runtime(
         config_path=config_path,
         stage_init_timeout=stage_init_timeout,
         async_chunk=async_chunk,
+        stage_transitions=stage_transitions,
         tokenizer=tokenizer,
         parallel_stage_init=parallel_stage_init,
         log_stats=log_stats,

@@ -20,6 +20,7 @@ from vllm_omni.config.omni_config import (
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
 from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_runtime import StageEngineLaunch
 from vllm_omni.entrypoints.cli.serve import (
@@ -327,8 +328,9 @@ def test_serve_validate_rejects_sleep_mode_with_multiple_api_servers(mocker: Moc
 
 @pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize("downstream_async_chunk", [False, True])
+@pytest.mark.parametrize("transitions", [None, ((0, 2),)])
 def test_build_multi_api_stage_runtime_matches_current_constructor(
-    mocker: MockerFixture, typed: bool, downstream_async_chunk: bool
+    mocker: MockerFixture, typed: bool, downstream_async_chunk: bool, transitions: tuple[tuple[int, int], ...] | None
 ) -> None:
     from vllm_omni.entrypoints.cli import serve as serve_module
 
@@ -342,14 +344,14 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
         ),
         frozenset({"model"}),
     )
+    num_stages = 3 if transitions is not None else 2
+    pipeline_stages = tuple(
+        StagePipelineConfig(stage_id=i, model_stage="ar", final_output=i == num_stages - 1) for i in range(num_stages)
+    )
     if typed:
         from vllm_omni.config.omni_config import VllmOmniARStageConfig
-        from vllm_omni.config.stage_config import StagePipelineConfig
 
-        stages = [
-            VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=i, model_stage="ar"))
-            for i in range(2)
-        ]
+        stages = [VllmOmniARStageConfig(stage_pipeline_config=stage) for stage in pipeline_stages]
         stages[1].connector_config.async_chunk = downstream_async_chunk
     else:
         stages = [
@@ -359,7 +361,7 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
                     async_chunk=bool(i and downstream_async_chunk), enable_sleep_mode=False
                 ),
             )
-            for i in range(2)
+            for i in range(num_stages)
         ]
     mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
     mocker.patch(
@@ -369,7 +371,11 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
     mocker.patch("vllm_omni.entrypoints.utils.parse_stage_overrides", return_value={})
     mocker.patch(
         "vllm_omni.config.resolver.resolve_omni_config",
-        return_value=OmniConfigResolution(config_path="dummy-config", stage_configs=tuple(stages)),
+        return_value=OmniConfigResolution(
+            config_path="dummy-config",
+            stage_configs=tuple(stages),
+            pipeline_config=PipelineConfig(model_type="test", stages=pipeline_stages, stage_transitions=transitions),
+        ),
     )
 
     runtime = serve_module._build_multi_api_stage_runtime(args, 2)
@@ -377,6 +383,9 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
     assert runtime._client_count == 1
     assert runtime._client_index == 0
     assert runtime._async_chunk is downstream_async_chunk
+    assert (runtime._stage_routing.stage_order if runtime._stage_routing is not None else None) == (
+        (0, 2) if transitions is not None else None
+    )
 
 
 @pytest.mark.parametrize("typed", [False, True])
@@ -852,7 +861,10 @@ def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
     )
 
 
-def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: MockerFixture) -> None:
+@pytest.mark.parametrize("transitions", [None, ((0, 2),)])
+def test_run_headless_llm_registers_with_auto_assigned_replica_id(
+    mocker: MockerFixture, transitions: tuple[tuple[int, int], ...] | None
+) -> None:
     """LLM headless: each loop iteration registers with auto-assigned
     replica_id (master picks a free slot) and spawns one
     ``StageEngineCoreProcManager`` per local replica."""
@@ -871,7 +883,15 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
 
     mocker.patch(
         "vllm_omni.config.resolver.resolve_omni_config",
-        return_value=_resolved(stage_cfg),
+        return_value=OmniConfigResolution(
+            config_path="/fake/stages.yaml",
+            stage_configs=(stage_cfg, _make_stage_cfg(1, "llm"), _make_stage_cfg(2, "llm")),
+            pipeline_config=PipelineConfig(
+                model_type="test",
+                stages=tuple(StagePipelineConfig(stage_id=i, model_stage="ar", final_output=i == 2) for i in range(3)),
+                stage_transitions=transitions,
+            ),
+        ),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -919,6 +939,10 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     assert kwargs["replica_id"] is None
     assert "socket_ownership" not in kwargs
     assert mock_connector_spec.call_args.kwargs["async_chunk"] is True
+    stage_routing = mock_connector_spec.call_args.kwargs["stage_routing"]
+    assert (stage_routing.stage_order if stage_routing is not None else None) == (
+        (0, 2) if transitions is not None else None
+    )
 
     assert mock_manager_cls.call_count == 1
     mgr_kwargs = mock_manager_cls.call_args.kwargs

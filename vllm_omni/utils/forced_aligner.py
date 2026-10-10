@@ -101,6 +101,7 @@ def inject_forced_aligner_stage(
         StageExecutionType,
         StagePipelineConfig,
     )
+    from vllm_omni.config.stage_routing import StageRouting
     from vllm_omni.model_executor.stage_input_processors.forced_aligner import (
         POOLING_OUTPUT_DECODER_PATH,
         TIMESTAMPS_MODALITY,
@@ -115,13 +116,17 @@ def inject_forced_aligner_stage(
 
     _FA = "vllm_omni.model_executor.stage_input_processors.forced_aligner"
     new_id = len(pipeline.stages)
+    source_id = StageRouting.from_transitions(new_id, pipeline.stage_transitions).stage_order[-1]
+    transitions = pipeline.stage_transitions
+    if transitions is not None:
+        transitions += ((source_id, new_id),)
     aligner_ps = StagePipelineConfig(
         stage_id=new_id,
         model_stage="forced_aligner",
         # Pooling stage = LLM_AR stage run with runner="pooling" (vLLM derives
         # is_pooling_model from runner_type).
         execution_type=StageExecutionType.LLM_AR,
-        input_sources=(new_id - 1,),
+        input_sources=(source_id,),
         final_output=True,
         final_output_type=TIMESTAMPS_MODALITY,
         owns_tokenizer=True,
@@ -129,7 +134,7 @@ def inject_forced_aligner_stage(
         model_arch=fa.architecture,
         custom_process_input_func=f"{_FA}.code2wav2aligner",
     )
-    extended = replace(pipeline, stages=pipeline.stages + (aligner_ps,))
+    extended = replace(pipeline, stages=pipeline.stages + (aligner_ps,), stage_transitions=transitions)
 
     engine_extras: dict[str, Any] = {
         "model": fa.model,

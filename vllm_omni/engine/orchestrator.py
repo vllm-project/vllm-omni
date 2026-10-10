@@ -34,13 +34,14 @@ from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS, FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
-from vllm_omni.engine.errors import NativeKVHandoffError
+from vllm_omni.engine.errors import NativeKVHandoffError, ResourceReleaseError
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -60,7 +61,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import RequestClosedError, StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -239,7 +240,6 @@ class OrchestratorRequestState:
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
     final_output_stage_ids: set[int] = field(default_factory=set)
-    finished_final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
     pending_final_output: OutputMessage | None = None
 
@@ -270,6 +270,22 @@ class OrchestratorRequestState:
     upstream_first_audio: bool = False
     pending_upstream_first_audio: tuple[int, OmniEngineCoreOutput] | None = None
     pending_first_audio_outputs: list[tuple[int, int, Any]] = field(default_factory=list)
+    # One cleanup operation owns the request until abort and binding release
+    # finish. Retain state for partial abort outputs, but forbid new admission.
+    cleanup_future: asyncio.Future[list[OutputMessage]] | None = field(default=None, repr=False)
+
+    @property
+    def closing(self) -> bool:
+        return self.cleanup_future is not None
+
+    @property
+    def final_outputs_finished(self) -> bool:
+        selected = self.final_output_stage_ids or {self.final_stage_id}
+        return selected <= self.finished_stage_ids
+
+    @property
+    def submitted_stages_finished(self) -> bool:
+        return self.stage_submit_ts.keys() <= self.finished_stage_ids
 
 
 @dataclass
@@ -336,7 +352,6 @@ class OrchestratorBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
-    _transfer_release_tasks: set[asyncio.Task] = set()
 
     def __init__(
         self,
@@ -346,6 +361,7 @@ class OrchestratorBase:
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
+        stage_transitions: tuple[tuple[int, int], ...] | None = None,
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
@@ -363,6 +379,7 @@ class OrchestratorBase:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        self._stage_routing = StageRouting.from_transitions(self.num_stages, stage_transitions)
         self.log_stats = log_stats
         self._prom_metrics = prom_metrics
         self._stage_replica_waiting: dict[tuple[int, int], int] = {}
@@ -385,7 +402,6 @@ class OrchestratorBase:
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
         # Strong refs for in-flight releases; the loop only weak-refs tasks, so dropping these risks mid-flight GC.
-        self._transfer_release_tasks: set[asyncio.Task] = set()
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -489,7 +505,7 @@ class OrchestratorBase:
         if self._membership is not None:
 
             async def cleanup_member_requests(ids: list[str]) -> None:
-                await self._cleanup_request_ids(ids, abort=True)
+                await self._cleanup_request_ids(ids, abort=True, release_owners=True)
 
             self._membership.install_unregister_handlers(
                 output_queue=self.output_async_queue,
@@ -505,7 +521,11 @@ class OrchestratorBase:
             tasks.append(membership_watcher)
 
         try:
-            await asyncio.gather(*tasks)
+            # These loops live until shutdown or failure. Once one exits,
+            # cancel the others in finally, including the membership watcher.
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
         except asyncio.CancelledError:
             raise
         except EngineDeadError as e:
@@ -664,7 +684,10 @@ class OrchestratorBase:
             error = str(exc)
             logger.exception("[Orchestrator] Abort failed for request(s) %s", request_ids)
             if msg.rpc_id is None:
-                raise
+                if isinstance(exc, ResourceReleaseError):
+                    await self._report_release_failure(list(request_ids), exc)
+                else:
+                    raise
         if msg.rpc_id is not None:
             # Always emit a result when rpc_id is set so CorrelatedRpcClient
             # waiters are unblocked even on failure.
@@ -728,35 +751,26 @@ class OrchestratorBase:
             output_msg.finished = index == last_index_by_req[output_msg.request_id]
         return abort_outputs
 
-    def _release_stage_transfer_resources(self, request_ids: list[str]) -> None:
-        """Drop each stage's inter-stage transfer resources for finished requests.
+    async def _release_stage_transfer_resources(self, request_ids: list[str]) -> None:
+        """Finish each stage's transfer lifecycle for terminated requests.
 
         This is the only point that knows every stage is done with the request,
         so it is the only safe place to reclaim segments a consumer never
-        drained. Scheduled rather than awaited: reclaim is best-effort and must
-        not add RPC latency to request teardown.
+        drained. Every live replica completes its local publication fence and
+        applicable backend cleanup. SHM/NIXL additionally confirm ownership
+        drain; legacy backends retain their existing resource contract. A
+        failed operation leaves the request closed for retry.
         """
         if not request_ids:
             return
 
-        async def _run() -> None:
-            results = await asyncio.gather(
-                *(pool.release_request_resources(request_ids) for pool in self.stage_pools),
-                return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning("[Orchestrator] release transfer resources failed: %s", result)
-
-        try:
-            task = asyncio.get_running_loop().create_task(_run())
-            self._transfer_release_tasks.add(task)
-            task.add_done_callback(self._transfer_release_tasks.discard)
-        except RuntimeError:
-            logger.warning(
-                "[Orchestrator] no running event loop; skipped reclaim of transfer resources for %s",
-                request_ids,
-            )
+        results = await asyncio.gather(
+            *(pool.release_request_resources(request_ids) for pool in self.stage_pools),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -964,9 +978,14 @@ class OrchestratorBase:
                 # Only the dedicated first-frame channel is intercepted.
                 if (
                     req_state is None
+                    or req_state.closing
                     or req_state.upstream_first_audio
                     or req_state.pending_upstream_first_audio is not None
-                    or (stage_id if final_output else stage_id + 1) > req_state.final_stage_id
+                    or (
+                        stage_id not in self._request_stage_path(req_state)
+                        if final_output
+                        else self._next_request_stage(stage_id, req_state) is None
+                    )
                 ):
                     continue
                 audio = mm.get("model_outputs")
@@ -978,6 +997,7 @@ class OrchestratorBase:
                 continue
             if (
                 req_state is not None
+                and not req_state.closing
                 and final_output
                 and not req_state.upstream_first_audio
                 and (requires_first or req_state.pending_first_audio_outputs)
@@ -1000,10 +1020,16 @@ class OrchestratorBase:
         from vllm_omni.engine import OmniEngineCoreOutputs
 
         pending = req_state.pending_upstream_first_audio
-        if pending is None or self.request_states.get(req_state.request_id) is not req_state:
+        if pending is None or req_state.closing or self.request_states.get(req_state.request_id) is not req_state:
             return
         source_stage, first_output = pending
-        codec_stage = source_stage if self.stage_pools[source_stage].final_output else source_stage + 1
+        codec_stage = (
+            source_stage
+            if self.stage_pools[source_stage].final_output
+            else self._next_request_stage(source_stage, req_state)
+        )
+        if codec_stage is None:
+            return
         pool = self.stage_pools[codec_stage]
         replica_id = pool.get_bound_replica_id(req_state.request_id)
         if replica_id is None or req_state.request_id not in pool.output_processor.request_states:
@@ -1022,11 +1048,11 @@ class OrchestratorBase:
             logger.exception("First-audio output processing failed for %s", req_state.request_id)
             await self._handle_stage_error(codec_stage, first_output, error=str(error))
             return
-        if self.request_states.get(req_state.request_id) is not req_state:
+        if req_state.closing or self.request_states.get(req_state.request_id) is not req_state:
             return
         ready, req_state.pending_first_audio_outputs = req_state.pending_first_audio_outputs, []
         for pending_stage, pending_replica, output in ready:
-            if self.request_states.get(req_state.request_id) is not req_state:
+            if req_state.closing or self.request_states.get(req_state.request_id) is not req_state:
                 break
             terminal: set[str] = set()
             processed = await self._process_llm_stage_outputs(
@@ -1416,7 +1442,7 @@ class OrchestratorBase:
             )
         )
         await self._cleanup_request_ids(
-            [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
+            [parent_id],
             abort=True,
             release_owners=True,
         )
@@ -1472,9 +1498,9 @@ class OrchestratorBase:
         stage_has_live = bool(pool.live_replica_ids())
         failed_ids: list[str] = []
         for req_id, req_state in list(self.request_states.items()):
-            if stage_id not in req_state.stage_submit_ts:
-                continue
             bound = pool.get_bound_replica_id(req_id)
+            if stage_id not in req_state.stage_submit_ts and bound is None:
+                continue
             if bound == replica_id or not stage_has_live:
                 await self.output_async_queue.put(
                     ErrorMessage(
@@ -1492,7 +1518,7 @@ class OrchestratorBase:
         # distributed-membership eviction path.
         for req_id in failed_ids:
             await self._cleanup_request_ids(
-                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                [req_id],
                 abort=True,
                 # A session-owned request has an owner that outlives the stage
                 # request: without this the runner and its admission slot
@@ -1526,7 +1552,7 @@ class OrchestratorBase:
             )
         )
         await self._cleanup_request_ids(
-            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            [req_id],
             abort=True,
             release_owners=True,
         )
@@ -1557,7 +1583,7 @@ class OrchestratorBase:
             )
         )
         await self._cleanup_request_ids(
-            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            [req_id],
             abort=True,
             release_owners=release_owners,
         )
@@ -1596,6 +1622,8 @@ class OrchestratorBase:
         try:
             await dispatch()
             return True
+        except RequestClosedError:
+            return False
         except NativeKVHandoffError as e:
             await self._fail_request_client_error(
                 req_id,
@@ -1676,26 +1704,27 @@ class OrchestratorBase:
         cannot outlive its requests.
 
         ``release_owners`` asks the subclass to also release any session that
-        owns these requests (error paths pass True); the base ignores it.
+        owns these requests (error paths pass True). It also marks automatic
+        error cleanup, whose release failure must remain request-scoped.
 
         Returns:
             Final-stage AR abort ``OutputMessage`` list when ``abort=True``;
             otherwise an empty list.
         """
-        del release_owners
         if not request_ids:
             return []
 
-        cleanup_ids = list(dict.fromkeys(request_ids))
-        batch = set(cleanup_ids)
+        candidates = list(dict.fromkeys(request_ids))
+        batch = set(candidates)
         orphaned_parents: dict[str, str] = {}
-        for rid in cleanup_ids:
+        for rid in candidates:
             pid = self._cfg_tracker.get_parent_id(rid)
             if pid is not None and pid not in batch and not self._cfg_tracker.is_companion_done(rid):
                 orphaned_parents.setdefault(pid, rid)
+        errors: list[ErrorMessage] = []
         for pid, cid in orphaned_parents.items():
             deferred = self._cfg_tracker.pop_pending_parent(pid)
-            await self.output_async_queue.put(
+            errors.append(
                 ErrorMessage(
                     request_id=pid,
                     stage_id=deferred["stage_id"] if deferred is not None else None,
@@ -1703,25 +1732,107 @@ class OrchestratorBase:
                 )
             )
             batch.add(pid)
-            cleanup_ids.append(pid)
-        for rid in list(cleanup_ids):
-            for cid in self._cfg_tracker.cleanup_parent(rid):
+            candidates.append(pid)
+        for rid in list(candidates):
+            for cid in self._cfg_tracker.get_companion_request_ids(rid).values():
                 if cid not in batch:
                     batch.add(cid)
-                    cleanup_ids.append(cid)
+                    candidates.append(cid)
+
+        # Expand CFG ownership before selecting cleanup owners so a parent's
+        # cleanup joins a companion's running operation rather than replacing it.
+        cleanup_ids: list[str] = []
+        pending: dict[asyncio.Future[list[OutputMessage]], list[str]] = {}
+        for request_id in candidates:
+            state = self.request_states.get(request_id)
+            future = state.cleanup_future if state is not None else None
+            if future is not None and (not future.done() or future.exception() is None):
+                pending.setdefault(future, []).append(request_id)
+            else:
+                cleanup_ids.append(request_id)
+
+        # A parent must stay closed until its already-closing companions have
+        # released their resources. Unrelated joined requests retain their own
+        # outcome, so their failure cannot prevent this batch's cleanup.
+        dependencies = tuple(
+            future
+            for future, joined_ids in pending.items()
+            if any(self._cfg_tracker.get_parent_id(rid) in cleanup_ids for rid in joined_ids)
+            or any(self._cfg_tracker.get_parent_id(rid) in joined_ids for rid in cleanup_ids)
+        )
+        for future in dependencies:
+            pending.pop(future)
+
         abort_outputs: list[OutputMessage] = []
-        if abort:
-            abort_outputs = await self._abort_request_ids(cleanup_ids)
-        self._release_request_bindings(cleanup_ids)
-        self._release_stage_transfer_resources(cleanup_ids)
-        for request_id in cleanup_ids:
+        if cleanup_ids:
+            future = asyncio.get_running_loop().create_future()
+            for request_id in cleanup_ids:
+                state = self.request_states.get(request_id)
+                if state is not None:
+                    state.cleanup_future = future
+            try:
+                for error in errors:
+                    await self.output_async_queue.put(error)
+                abort_outputs = await self._finish_request_cleanup(cleanup_ids, abort=abort, dependencies=dependencies)
+            except BaseException as exc:
+                future.set_exception(exc)
+                # The owner raises directly; joining callers receive the same
+                # failure, without an unobserved-Future warning if none join.
+                future.exception()
+                if isinstance(exc, ResourceReleaseError) and (not abort or release_owners):
+                    await self._report_release_failure(cleanup_ids, exc)
+                else:
+                    raise
+            else:
+                future.set_result(abort_outputs)
+
+        for future, joined_ids in pending.items():
+            # Cancelling a duplicate abort waiter must not cancel the owner.
+            try:
+                abort_outputs.extend(await asyncio.shield(future))
+            except ResourceReleaseError as error:
+                if abort and not release_owners:
+                    raise
+                await self._report_release_failure(joined_ids, error)
+        return abort_outputs if abort else []
+
+    async def _report_release_failure(self, request_ids: list[str], error: ResourceReleaseError) -> None:
+        for request_id in request_ids:
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    error=str(error),
+                    fatal=False,
+                    request_id=request_id,
+                    status_code=HTTPStatus.BAD_GATEWAY.value,
+                    error_type=type(error).__name__,
+                )
+            )
+
+    async def _finish_request_cleanup(
+        self,
+        request_ids: list[str],
+        *,
+        abort: bool,
+        dependencies: tuple[asyncio.Future[list[OutputMessage]], ...] = (),
+    ) -> list[OutputMessage]:
+        """Finish the claimed cleanup while request state remains available."""
+        abort_outputs = await self._abort_request_ids(request_ids) if abort else []
+        await self._release_stage_transfer_resources(request_ids)
+        results = await asyncio.gather(*(asyncio.shield(future) for future in dependencies), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            abort_outputs.extend(result)
+        self._release_request_bindings(request_ids)
+        for request_id in request_ids:
+            self._cfg_tracker.cleanup_parent(request_id)
             self._pd_kv_params.pop(request_id, None)
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
-                cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", set()))
-            if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
-                self._running_counter.decrement()
-                req_state.running_counter_registered = False
+                cleanup_request_artifact_dirs(req_state.request_artifact_dirs)
+                if req_state.running_counter_registered and self._running_counter is not None:
+                    self._running_counter.decrement()
+                    req_state.running_counter_registered = False
         return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
@@ -1748,10 +1859,6 @@ class OrchestratorBase:
             return False
 
         req_state.finished_stage_ids.add(stage_id)
-        final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-        if stage_id not in final_output_stage_ids:
-            return True
-        req_state.finished_final_output_stage_ids.add(stage_id)
         return True
 
     async def _report_duplex_session_request_error(
@@ -1807,23 +1914,19 @@ class OrchestratorBase:
         pool = self.stage_pools[stage_id]
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
-            if req_state is None or req_state.session_owned:
+            if req_state is None or req_state.closing or req_state.session_owned:
                 continue
             pending = req_state.pending_final_output
             if pending is not None:
-                if set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
-                    req_state.pending_final_output = None
-                    await self.output_async_queue.put(pending)
-                    await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+                if self._request_completion_ready(req_state):
+                    await self._publish_final_output(req_state, pending)
                 # A real terminal output is pending; do not replace it with
                 # the swallowed-output fallback before upstream completion.
                 continue
-            if not pool.final_output:
+            if not pool.final_output or stage_id != req_state.final_stage_id:
                 continue
-            final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
+            if stage_id not in req_state.finished_stage_ids:
                 continue
-
             final_output_type = getattr(pool.stage_client, "final_output_type", None)
             logger.info(
                 "[Orchestrator] req=%s stage-%s raw terminal produced no processed terminal; returning empty %s output",
@@ -1836,18 +1939,32 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=pool._infer_audio_sample_rate(),
             )
-            await self.output_async_queue.put(
-                OutputMessage(
-                    request_id=request_id,
-                    stage_id=stage_id,
-                    replica_id=replica_id,
-                    engine_outputs=terminal_output,
-                    metrics=None,
-                    finished=True,
-                    stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
-                )
+            message = OutputMessage(
+                request_id=request_id,
+                stage_id=stage_id,
+                replica_id=replica_id,
+                engine_outputs=terminal_output,
+                metrics=None,
+                finished=True,
+                stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
             )
-            await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+            if self._request_completion_ready(req_state):
+                await self._publish_final_output(req_state, message)
+            else:
+                req_state.pending_final_output = message
+
+    async def _publish_final_output(self, req_state: OrchestratorRequestState, message: OutputMessage) -> None:
+        """Publish success after the request's transfer lifecycle finishes."""
+        request_id = req_state.request_id
+        await self._cleanup_request_ids([request_id])
+        if request_id not in self.request_states:
+            req_state.pending_final_output = None
+            await self.output_async_queue.put(message)
+
+    def _request_completion_ready(self, req_state: OrchestratorRequestState) -> bool:
+        return req_state.final_outputs_finished and (
+            not self.async_chunk or req_state.streaming.enabled or req_state.submitted_stages_finished
+        )
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""
@@ -1881,6 +1998,8 @@ class OrchestratorBase:
         stage_metrics: Any,
     ) -> None:
         """Route a processed output: send to frontend and/or forward."""
+        if req_state.closing:
+            return
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
@@ -1898,9 +2017,7 @@ class OrchestratorBase:
 
         request_finished = False
         if finished and self.stage_pools[stage_id].final_output and not segment_finished:
-            req_state.finished_final_output_stage_ids.add(stage_id)
-            final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-            request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
+            request_finished = stage_id == req_state.final_stage_id
         if req_state.session_owned:
             # Session-owned outputs are delivered through the session interceptor.
             pass
@@ -1914,12 +2031,7 @@ class OrchestratorBase:
                 finished=request_finished,
                 stage_submit_ts=submit_ts,
             )
-            if (
-                request_finished
-                and self.async_chunk
-                and not req_state.streaming.enabled
-                and not set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids)
-            ):
+            if request_finished:
                 # Direct chunk delivery can finish the decoder before the
                 # upstream engine's terminal output/metrics reaches this loop.
                 # Keep request state until those messages are routed, otherwise
@@ -1948,12 +2060,13 @@ class OrchestratorBase:
         if await self._intercept_stage_output(stage_id, replica_id, output, req_state, stage_metrics, submit_ts):
             return
 
+        next_stage_id = self._next_request_stage(stage_id, req_state)
         if (
             (finished or segment_finished)
-            and stage_id < req_state.final_stage_id
+            and next_stage_id is not None
             and not req_state.skip_legacy_stage_forward
-            and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
-            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+            and (not self.async_chunk or not self._stage_receives_async_chunks(next_stage_id))
+            and (next_stage_id not in req_state.stage_submit_ts or req_state.streaming.enabled)
         ):
             if (
                 finished
@@ -1997,16 +2110,14 @@ class OrchestratorBase:
                     )
 
         pending = req_state.pending_final_output
-        if pending is not None and set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
-            req_state.pending_final_output = None
-            await self.output_async_queue.put(pending)
-            request_finished = True
+        if pending is not None and not req_state.closing and self._request_completion_ready(req_state):
+            await self._publish_final_output(req_state, pending)
 
-        if request_finished and not req_state.session_owned:
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+    def _request_stage_path(self, req_state: OrchestratorRequestState) -> tuple[int, ...]:
+        return self._stage_routing.path_to(req_state.final_stage_id)
 
-    def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
-        return (stage_id + 1) in req_state.stage_submit_ts
+    def _next_request_stage(self, stage_id: int, req_state: OrchestratorRequestState) -> int | None:
+        return self._stage_routing.next_stage(stage_id, req_state.final_stage_id)
 
     def _stage_receives_async_chunks(self, stage_id: int) -> bool:
         """Whether a stage's connector supplies its runtime inputs."""
@@ -2148,11 +2259,12 @@ class OrchestratorBase:
             return
 
         parent_state = self.request_states.get(parent_id)
-        if parent_state is None:
+        if parent_state is None or parent_state.closing:
             return
 
         stage_id = deferred["stage_id"]
-        if (stage_id + 1) in parent_state.stage_submit_ts:
+        next_stage_id = self._next_request_stage(stage_id, parent_state)
+        if next_stage_id is None or next_stage_id in parent_state.stage_submit_ts:
             return
 
         await self._forward_to_next_stage(
@@ -2178,7 +2290,7 @@ class OrchestratorBase:
 
             req_id = raw_output.request_id
             req_state = self.request_states.get(req_id)
-            if req_state is None:
+            if req_state is None or req_state.closing:
                 continue
             if self._cfg_tracker.is_companion(req_id):
                 # kv_ready only says the companion's KV hit the connector; its
@@ -2188,9 +2300,8 @@ class OrchestratorBase:
                 # Done-marking now happens solely on the processed-output path
                 # in _route_output, after set_companion_output.
                 continue
-            if stage_id >= req_state.final_stage_id:
-                continue
-            if (stage_id + 1) in req_state.stage_submit_ts:
+            next_stage_id = self._next_request_stage(stage_id, req_state)
+            if next_stage_id is None or next_stage_id in req_state.stage_submit_ts:
                 continue
 
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
@@ -2290,18 +2401,24 @@ class OrchestratorBase:
         is_final_update: bool = False,
     ) -> None:
         """Forward output to the next stage; a dead stage fails only this request."""
+        if req_state.closing:
+            return
+        next_stage_id = self._next_request_stage(src_stage_id, req_state)
+        if next_stage_id is None:
+            return
         await self._dispatch_or_fail_request(
             lambda: self._forward_to_next_stage_unguarded(
                 req_id,
                 src_stage_id,
                 output,
                 req_state,
+                next_stage_id=next_stage_id,
                 src_replica_id=src_replica_id,
                 is_streaming_session=is_streaming_session,
                 is_final_update=is_final_update,
             ),
             req_id=req_id,
-            stage_id=src_stage_id + 1,
+            stage_id=next_stage_id,
             operation="inter-stage forward",
         )
 
@@ -2312,23 +2429,23 @@ class OrchestratorBase:
         output: Any,
         req_state: OrchestratorRequestState,
         *,
+        next_stage_id: int,
         src_replica_id: int | None = None,
         is_streaming_session: bool = False,
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
-        next_logical = src_stage_id + 1
-        next_pool = self.stage_pools[next_logical]
+        next_pool = self.stage_pools[next_stage_id]
         if not next_pool.live_replica_ids():
             # The downstream stage lost all of its replicas before this in-flight
             # request could be forwarded.
-            await self._fail_request_dead_stage(req_id, next_logical)
+            await self._fail_request_dead_stage(req_id, next_stage_id)
             return
         next_client = next_pool.stage_client
-        params = req_state.sampling_params_list[next_logical]
+        params = req_state.sampling_params_list[next_stage_id]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
-        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+        already_submitted = next_stage_id in req_state.stage_submit_ts
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
 
@@ -2371,7 +2488,7 @@ class OrchestratorBase:
                     )
                 )
                 await self._cleanup_request_ids(
-                    [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    [req_id],
                     abort=True,
                 )
                 return
@@ -2401,59 +2518,36 @@ class OrchestratorBase:
                     req_id,
                     _dt_ar2d,
                     src_stage_id,
-                    next_logical,
+                    next_stage_id,
                 )
-                if diffusion_prompt is None:
+                if diffusion_prompt is None or (isinstance(diffusion_prompt, list) and not diffusion_prompt):
                     error_output = OmniRequestOutput.from_error(
                         req_id,
-                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
+                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_stage_id}",
                     )
                     logger.warning(
                         "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
                         "routing terminal error output",
                         req_id,
                         src_stage_id,
-                        next_logical,
+                        next_stage_id,
                     )
                     await self.output_async_queue.put(
                         OutputMessage(
                             request_id=req_id,
-                            stage_id=next_logical,
+                            stage_id=next_stage_id,
                             engine_outputs=error_output,
                             metrics=None,
                             finished=True,
                         )
                     )
                     await self._cleanup_request_ids(
-                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                        [req_id],
+                        abort=True,
+                        release_owners=True,
                     )
                     return
                 if isinstance(diffusion_prompt, list):
-                    if not diffusion_prompt:
-                        error_output = OmniRequestOutput.from_error(
-                            req_id,
-                            f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
-                        )
-                        logger.warning(
-                            "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
-                            "routing terminal error output",
-                            req_id,
-                            src_stage_id,
-                            next_logical,
-                        )
-                        await self.output_async_queue.put(
-                            OutputMessage(
-                                request_id=req_id,
-                                stage_id=next_logical,
-                                engine_outputs=error_output,
-                                metrics=None,
-                                finished=True,
-                            )
-                        )
-                        await self._cleanup_request_ids(
-                            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                        )
-                        return
                     if len(diffusion_prompt) == 1:
                         diffusion_prompt = diffusion_prompt[0]
             else:
@@ -2475,18 +2569,20 @@ class OrchestratorBase:
                     submit_kwargs=submit_kwargs,
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
+            if req_state.closing:
+                return
             self._on_stage_submitted(
-                next_logical,
+                next_stage_id,
                 req_id,
                 replica_id,
                 req_state,
             )
-            req_state.stage_submit_ts[next_logical] = _time.time()
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
             self._emit_tx_edge(
                 from_stage=src_stage_id,
                 from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
+                to_stage=next_stage_id,
                 to_pool=next_pool,
                 request_id=req_id,
                 tx_ms=_tx_ms,
@@ -2494,7 +2590,7 @@ class OrchestratorBase:
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
-        if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
+        if self._pd_pair is not None and (src_stage_id, next_stage_id) == self._pd_pair:
             params = self._build_pd_decode_params(req_id, params)
 
             # Use the original user prompt for the decode stage (not processed embeddings)
@@ -2528,19 +2624,21 @@ class OrchestratorBase:
                     replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
                     replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                if req_state.closing:
+                    return
                 self._on_stage_submitted(
-                    next_logical,
+                    next_stage_id,
                     req_id,
                     replica_id,
                     req_state,
                 )
 
-            req_state.stage_submit_ts[next_logical] = _time.time()
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
             self._emit_tx_edge(
                 from_stage=src_stage_id,
                 from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
+                to_stage=next_stage_id,
                 to_pool=next_pool,
                 request_id=req_id,
                 tx_ms=_tx_ms,
@@ -2571,7 +2669,7 @@ class OrchestratorBase:
         except OmniClientError as exc:
             await self._fail_request_client_error(
                 req_id,
-                next_logical,
+                next_stage_id,
                 str(exc),
                 status_code=exc.status_code,
                 error_type=exc.error_type,
@@ -2582,9 +2680,9 @@ class OrchestratorBase:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
                 req_id,
-                next_logical,
+                next_stage_id,
             )
-            if not await self._handle_forward_failure(req_id, next_logical, req_state, exc):
+            if not await self._handle_forward_failure(req_id, next_stage_id, req_state, exc):
                 raise
             return
         finally:
@@ -2596,7 +2694,7 @@ class OrchestratorBase:
                     "[Orchestrator] req=%s stage-%s produced no inputs for stage-%s; waiting for more outputs",
                     req_id,
                     src_stage_id,
-                    next_logical,
+                    next_stage_id,
                 )
                 return
 
@@ -2608,14 +2706,13 @@ class OrchestratorBase:
                 final_output_type=final_output_type,
                 audio_sample_rate=final_pool._infer_audio_sample_rate(),
             )
-            submit_ts = _time.time()
-            req_state.stage_submit_ts[final_stage_id] = submit_ts
+            submit_ts = req_state.stage_submit_ts.get(final_stage_id)
             logger.info(
                 "[Orchestrator] req=%s stage-%s produced no terminal inputs for stage-%s; "
                 "returning empty %s output from final stage-%s",
                 req_id,
                 src_stage_id,
-                next_logical,
+                next_stage_id,
                 final_output_type or "text",
                 final_stage_id,
             )
@@ -2623,14 +2720,16 @@ class OrchestratorBase:
                 OutputMessage(
                     request_id=req_id,
                     stage_id=final_stage_id,
-                    replica_id=0,
+                    replica_id=final_pool.get_bound_replica_id(req_id),
                     engine_outputs=terminal_output,
                     metrics=None,
                     finished=True,
                     stage_submit_ts=submit_ts,
                 )
             )
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            # Later chunk receivers may already be prewarmed. Empty bridge
+            # input means they will never receive a payload or terminal marker.
+            await self._cleanup_request_ids([req_id], abort=True, release_owners=True)
             return
 
         # Build and submit requests for each input
@@ -2641,7 +2740,7 @@ class OrchestratorBase:
             mm_features = req_state.mm_features if model_stage == "thinker" else None
             request = self._build_next_stage_request(
                 req_id,
-                next_logical,
+                next_stage_id,
                 next_input,
                 params=params,
                 mm_features=mm_features,
@@ -2653,19 +2752,21 @@ class OrchestratorBase:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
                 replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+            if req_state.closing:
+                return
             self._on_stage_submitted(
-                next_logical,
+                next_stage_id,
                 req_id,
                 replica_id,
                 req_state,
             )
 
-        req_state.stage_submit_ts[next_logical] = _time.time()
+        req_state.stage_submit_ts[next_stage_id] = _time.time()
         _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
         self._emit_tx_edge(
             from_stage=src_stage_id,
             from_replica=src_replica_id if src_replica_id is not None else 0,
-            to_stage=next_logical,
+            to_stage=next_stage_id,
             to_pool=next_pool,
             request_id=req_id,
             tx_ms=_tx_ms,
@@ -2690,7 +2791,10 @@ class OrchestratorBase:
         caller still holding ``req_state`` stops instead of recording state on
         an object the cleanup already popped from ``request_states``.
         """
-        if req_state.final_stage_id <= 0:
+        stage_path = self._request_stage_path(req_state)
+        if req_state.closing or self.request_states.get(request_id) is not req_state:
+            return False
+        if len(stage_path) <= 1:
             return True
 
         prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
@@ -2722,9 +2826,23 @@ class OrchestratorBase:
             )
             return False
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
+        for source_stage_id, next_stage_id in zip(stage_path, stage_path[1:]):
+            if req_state.closing or self.request_states.get(request_id) is not req_state:
+                return False
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            # Reserve bridge-fed senders without submitting a placeholder.
+            # Their downstream receiver must use the same replica as the later
+            # real submission, including when the default replica is unavailable.
+            if not await self._dispatch_or_fail_request(
+                lambda: next_pool.pick(request_id, request_state=req_state),
+                req_id=request_id,
+                stage_id=next_stage_id,
+                operation="async-chunk replica selection",
+            ):
+                return False
+            if req_state.closing or self.request_states.get(request_id) is not req_state:
+                return False
             if not self._stage_receives_async_chunks(next_stage_id):
                 # Outgoing-only stages receive their first real input from the
                 # orchestrator. Pre-submitting a placeholder lets it race and
@@ -2737,7 +2855,7 @@ class OrchestratorBase:
             if next_pool.stage_type == "diffusion":
                 submit_kwargs = self._diffusion_submit_kwargs(
                     request_id,
-                    next_stage_id - 1,
+                    source_stage_id,
                     next_pool.stage_client,
                     req_state,
                 )
@@ -2804,7 +2922,7 @@ class OrchestratorBase:
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
                 )
-                request.payload_sender_info = self._build_payload_sender_info(next_stage_id - 1, request_id=request_id)
+                request.payload_sender_info = self._build_payload_sender_info(source_stage_id, request_id=request_id)
                 request.external_req_id = request.request_id
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(
@@ -2820,7 +2938,7 @@ class OrchestratorBase:
 
             # Attribute the failure to the stage that failed, not stage 0; the
             # request is already cleaned up, so stop prewarming.
-            if not submitted:
+            if not submitted or req_state.closing or self.request_states.get(request_id) is not req_state:
                 return False
 
             # The guard swallows submit_initial's return value; the pool binding
@@ -2835,16 +2953,15 @@ class OrchestratorBase:
 
             if req_state.pending_upstream_first_audio is not None or req_state.upstream_first_audio:
                 await self._flush_upstream_first_audio(req_state)
-                if self.request_states.get(request_id) is not req_state:
+                if req_state.closing or self.request_states.get(request_id) is not req_state:
                     return False
 
-            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
-            # replica is stage 0's bound replica (single-replica thinker in
-            # all current configs); fall back to 0 if unknown.
+            # Attribute prewarming to the actual route edge and bound source
+            # replica; fall back to replica 0 when no source binding exists.
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
+            src_replica = self.stage_pools[source_stage_id].get_bound_replica_id(request_id)
             self._emit_tx_edge(
-                from_stage=next_stage_id - 1,
+                from_stage=source_stage_id,
                 from_replica=src_replica if src_replica is not None else 0,
                 to_stage=next_stage_id,
                 to_pool=next_pool,
@@ -2860,12 +2977,13 @@ class OrchestratorBase:
         prompt: Any,
     ) -> None:
         source_stage_id = 0
-        if source_stage_id + 1 > req_state.final_stage_id:
+        next_stage_id = self._next_request_stage(source_stage_id, req_state)
+        if next_stage_id is None:
             return
         config = getattr(self.stage_pools[source_stage_id].stage_vllm_config, "kv_transfer_config", None)
         if getattr(config, "kv_role", None) != "kv_producer":
             return
-        if self.stage_pools[source_stage_id + 1].stage_type != "diffusion":
+        if self.stage_pools[next_stage_id].stage_type != "diffusion":
             return
 
         from vllm_omni.diffusion.diffusion_kv.kv_connector import build_source_kv_transfer_params, mint_transfer_id
@@ -2929,7 +3047,7 @@ class OrchestratorBase:
 
             sender_pool = self.stage_pools[sender_stage_id]
             sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
-            if sender_stage is None:
+            if request_id is None:
                 sender_stage = sender_pool.stage_client
             get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
             if not callable(get_sender_info):
@@ -2957,7 +3075,7 @@ class OrchestratorBase:
             return None
         sender_pool = self.stage_pools[sender_stage_id]
         sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
-        if sender_stage is None:
+        if request_id is None:
             sender_stage = sender_pool.stage_client
         get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
         if not callable(get_sender_info):
@@ -2998,7 +3116,7 @@ class Orchestrator(OrchestratorBase):
 
     def _native_mrv2_receiver_stage(self, final_stage_id: int) -> int | None:
         """First downstream stage up to ``final_stage_id`` that receives on MRv2's native data plane."""
-        for stage_id in range(1, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+        for stage_id in self._stage_routing.path_to(final_stage_id)[1:]:
             vllm_config = getattr(self.stage_pools[stage_id], "stage_vllm_config", None)
             model_config = getattr(vllm_config, "model_config", None)
             if uses_native_mrv2_data_plane(
@@ -3015,10 +3133,40 @@ class Orchestrator(OrchestratorBase):
         prompt = msg.prompt
         original_prompt = msg.original_prompt
         sampling_params_list = msg.sampling_params_list
-        if not sampling_params_list:
-            raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg.final_stage_id
-        final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
+        output_stage_ids = msg.final_output_stage_ids or [final_stage_id]
+        if request_id in self.request_states:
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=request_id,
+                    stage_id=stage_id,
+                    error="Request ID is already in use; wait for completion or abort acknowledgement before reuse",
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            )
+            return
+        try:
+            stage_path = self._stage_routing.path_to(final_stage_id)
+            if any(type(sid) is not int for sid in output_stage_ids):
+                raise ValueError("Requested output stage IDs must be integers")
+            final_output_stage_ids = set(output_stage_ids)
+            if not final_output_stage_ids.issubset(stage_path):
+                raise ValueError("Requested output stages must belong to the request's configured route")
+            if final_stage_id not in final_output_stage_ids:
+                raise ValueError("The final stage must be a requested output stage")
+            # A distributed pool can temporarily be empty. Its registered
+            # pipeline metadata was checked by the frontend; do not turn
+            # replica unavailability into a false output-contract error.
+            if any(
+                self.stage_pools[sid].stage_client is not None and not self.stage_pools[sid].final_output
+                for sid in final_output_stage_ids
+            ):
+                raise ValueError("Requested output stages must declare final_output=True")
+            if len(sampling_params_list) <= max(stage_path):
+                raise ValueError("Missing sampling params for a stage in the configured route")
+        except ValueError as exc:
+            await self._fail_request_client_error(request_id, stage_id, str(exc))
+            return
 
         if not self.stage_pools[stage_id].live_replica_ids():
             # Stage 0 lost all replicas between the HTTP-layer errored check and
@@ -3087,7 +3235,7 @@ class Orchestrator(OrchestratorBase):
         ):
             return
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and req_state.final_stage_id != 0:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state, attach_prewarm_payload=True)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
@@ -3097,7 +3245,7 @@ class Orchestrator(OrchestratorBase):
         request = msg.prompt
         final_stage_id = msg.final_stage_id
         req_state = self.request_states.get(request_id)
-        if req_state is None:
+        if req_state is None or req_state.closing:
             # Streaming updates always follow the first-chunk add_request
             # through the same ordered submission queue, so an unknown id
             # here can only mean the request already finished or was
@@ -3108,6 +3256,19 @@ class Orchestrator(OrchestratorBase):
                 "[Orchestrator] streaming_update for unknown req=%s; dropping (request finished or aborted)",
                 request_id,
             )
+            return
+
+        try:
+            if type(final_stage_id) is not int or final_stage_id != req_state.final_stage_id:
+                raise ValueError("The final stage cannot change during a streaming request")
+            if msg.final_output_stage_ids and any(type(sid) is not int for sid in msg.final_output_stage_ids):
+                raise ValueError("Requested output stage IDs must be integers")
+            if msg.final_output_stage_ids and set(msg.final_output_stage_ids) != req_state.final_output_stage_ids:
+                raise ValueError("Output stages cannot change during a streaming request")
+            if msg.sampling_params_list and len(msg.sampling_params_list) <= max(self._request_stage_path(req_state)):
+                raise ValueError("Missing sampling params for a stage in the configured route")
+        except ValueError as exc:
+            await self._fail_request_client_error(request_id, stage_id, str(exc))
             return
 
         if msg.sampling_params_list:
@@ -3128,7 +3289,7 @@ class Orchestrator(OrchestratorBase):
         ):
             return
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and req_state.final_stage_id != 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
@@ -3140,7 +3301,7 @@ class Orchestrator(OrchestratorBase):
         sampling_params_list = msg.sampling_params_list
 
         parent_state = self.request_states.get(parent_id)
-        if parent_state is None:
+        if parent_state is None or parent_state.closing:
             logger.info(
                 "[Orchestrator] Dropping CFG companion %s (role=%s): parent %s is no longer active",
                 companion_id,
@@ -3192,7 +3353,7 @@ class Orchestrator(OrchestratorBase):
         request_id = msg.request_id
         event_id = msg.interaction.get("event_id")
         req_state = self.request_states.get(request_id)
-        if req_state is None:
+        if req_state is None or req_state.closing:
             logger.info("[Orchestrator] Dropping interaction for inactive req %s", request_id)
             await self.output_async_queue.put(
                 ErrorMessage(
@@ -3206,7 +3367,7 @@ class Orchestrator(OrchestratorBase):
             return
 
         try:
-            await self.stage_pools[stage_id].submit_interaction(request_id, msg.interaction)
+            await self.stage_pools[stage_id].submit_interaction(request_id, msg.interaction, request_state=req_state)
         except Exception as exc:
             logger.info(
                 "[Orchestrator] Failed interaction for req %s: %s",

@@ -208,7 +208,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if runner is not None:
             runner.on_stage_failure(next_stage_id, exc, request_id=req_id)
         await self._cleanup_request_ids(
-            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            [req_id],
             abort=True,
             release_owners=close_session,
         )

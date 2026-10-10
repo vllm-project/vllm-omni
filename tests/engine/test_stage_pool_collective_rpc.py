@@ -192,6 +192,25 @@ def test_release_request_resources_skips_without_async_chunk():
 
 
 @pytest.mark.cpu
+def test_release_request_resources_includes_native_full_payload():
+    async def run() -> None:
+        call = AsyncMock()
+        pool = StagePool(
+            0,
+            [SimpleNamespace(call_utility_async=call)],  # type: ignore[list-item]
+            stage_vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    async_chunk=False, use_v2_model_runner=True, supports_native_mrv2_data_plane=True
+                )
+            ),
+        )
+        await pool.release_request_resources(["req-1"])
+        call.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_release_request_resources_times_out_hung_replica_without_blocking_others(monkeypatch):
     async def run() -> None:
         async def hang(*_args):
@@ -210,7 +229,9 @@ def test_release_request_resources_times_out_hung_replica_without_blocking_other
         live.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
         assert not release.done()
 
-        await asyncio.wait_for(release, timeout=1.0)
+        with pytest.raises(RuntimeError, match="replica 0 resource release failed") as error:
+            await asyncio.wait_for(release, timeout=1.0)
+        assert isinstance(error.value.__cause__, TimeoutError)
 
     asyncio.run(run())
 

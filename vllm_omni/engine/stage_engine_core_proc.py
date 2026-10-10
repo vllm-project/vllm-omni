@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import time
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -33,6 +34,8 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
+from vllm_omni.distributed.omni_connectors.utils.config import REQUEST_RESOURCE_RELEASE_TIMEOUT_S
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import (
@@ -138,14 +141,20 @@ class StageEngineCoreProc(EngineCoreProc):
         Invoked over the UTILITY channel by the orchestrator once every stage
         has finished with the request. Idempotent and safe for unknown ids.
         """
+        model_config = self.vllm_config.model_config
+        if uses_native_mrv2_data_plane(
+            model_config, use_v2_model_runner=getattr(model_config, "use_v2_model_runner", False)
+        ):
+            self.model_executor.collective_rpc("omni_release_request_resources", args=(request_ids,))
+            return
         adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
         if adapter is None:
             return
-        for request_id in request_ids or ():
-            try:
-                adapter.release_shm_resources(request_id)
-            except Exception as e:
-                logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
+        deadline = time.monotonic() + REQUEST_RESOURCE_RELEASE_TIMEOUT_S
+        completions = [adapter.release_request_resources(request_id, deadline=deadline) for request_id in request_ids]
+        for completion in completions:
+            if completion is not None:
+                completion.result(timeout=max(0, deadline - time.monotonic()))
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
