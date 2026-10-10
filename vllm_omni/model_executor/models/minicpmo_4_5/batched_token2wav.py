@@ -316,6 +316,7 @@ class BatchedToken2Wav(nn.Module):
         connector_config: Mapping[str, int] | None = None,
         hift_graph_config: Mapping[str, Any] | None = None,
         cfm_graph_config: Mapping[str, Any] | None = None,
+        chunk_encoder_graph_config: Mapping[str, Any] | None = None,
         bfloat16_attention_cache: bool = False,
         setup_cache_size: int = 1,
         cfm_tf32: bool = False,
@@ -335,6 +336,27 @@ class BatchedToken2Wav(nn.Module):
         self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        encoder_cfg = dict(chunk_encoder_graph_config or {})
+        connector = connector_config or {}
+        left_context = int(connector.get("codec_left_context_frames", 0) or 0)
+        chunk_frames = int(connector.get("codec_chunk_frames", 25) or 25)
+        initial_frames = int(connector.get("initial_codec_chunk_frames", 0) or 0)
+        token_widths = {left_context + chunk_frames}
+        if initial_frames:
+            token_widths.add(left_context + initial_frames)
+        self._chunk_encoder_token_widths = tuple(sorted(width for width in token_widths if width > 0))
+        self._chunk_encoder_graph = (
+            FlowEncoderGraphs(
+                functools.partial(self._encode_chunk_eager, last_chunk=False),
+                chunk_forward=self._encode_chunk_eager,
+                rows=encoder_cfg.get("rows", [1]),
+                max_graphs=int(encoder_cfg.get("max_graphs", 8)),
+                capture_after=int(encoder_cfg.get("capture_after", 2)),
+                eager_min_batch=int(encoder_cfg.get("eager_min_batch", 8)),
+            )
+            if encoder_cfg.get("enabled", False)
+            else None
+        )
         enable_cached_istft = getattr(self.hift, "enable_cached_istft", None)
         if callable(enable_cached_istft):
             enable_cached_istft()
@@ -649,8 +671,37 @@ class BatchedToken2Wav(nn.Module):
         last_chunk: bool,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        precaptured_checked: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self._ensure_relpos_pe(tokens, att_cache)
+        if not self.flow.training and not torch.is_grad_enabled():
+            precaptured = None if precaptured_checked else getattr(self, "_encoder_graphs", None)
+            if precaptured is not None and not last_chunk and cnn_cache is not None and att_cache is not None:
+                outputs = precaptured.run(tokens, cnn_cache.split(1, dim=0), att_cache.split(1, dim=1))
+                if outputs is not None:
+                    # These caches outlive the next replay of the shared arena.
+                    return tuple(value.clone() for value in outputs)
+            dynamic = getattr(self, "_chunk_encoder_graph", None)
+            if dynamic is not None:
+                return dynamic(
+                    tokens,
+                    last_chunk=last_chunk,
+                    cnn_cache=cnn_cache,
+                    att_cache=att_cache,
+                    position_tables=self._encoder_position_tables(),
+                    shared_checked=precaptured_checked or precaptured is dynamic,
+                )
+        return self._encode_chunk_eager(tokens, last_chunk=last_chunk, cnn_cache=cnn_cache, att_cache=att_cache)
+
+    def _encoder_position_tables(self) -> tuple[torch.Tensor, ...]:
+        # Only dynamic replay needs this signature. Precaptured hits skip it.
+        modules = getattr(self, "_encoder_position_modules", None)
+        if modules is None:
+            modules = tuple(module for module in self.flow.encoder.modules() if hasattr(module, "pe"))
+            self._encoder_position_modules = modules
+        return tuple(module.pe for module in modules if isinstance(module.pe, torch.Tensor))
+
+    def _encode_chunk_eager(self, tokens, *, last_chunk, cnn_cache, att_cache):
         embedded = self.flow.input_embedding(tokens)
         hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
             xs=embedded,
@@ -691,15 +742,17 @@ class BatchedToken2Wav(nn.Module):
         ]
         # Default width: the steady duplex chunk, the left context plus one unit of new frames.
         unit = int(connector.get("initial_codec_chunk_frames", 0) or 0) or int(connector.get("codec_chunk_frames", 25))
-        graphs = FlowEncoderGraphs(
-            # With no ``extend_pe`` (checked above) this runs exactly the eager continuation's ops.
-            functools.partial(self._encode_chunk, last_chunk=False),
-            rows=config.get("rows") or [1],
-            token_widths=config.get("token_widths") or [int(connector.get("codec_left_context_frames", 3)) + unit],
-            lookahead=lookahead,
-            upsample=self._upsample_stride(),
-            held_tensors=lambda: tuple(module.pos_enc.pe for module in tables),
+        graphs = self._chunk_encoder_graph or FlowEncoderGraphs(
+            functools.partial(self._encode_chunk_eager, last_chunk=False),
+            chunk_forward=self._encode_chunk_eager,
         )
+        graphs.rows = tuple(sorted(set(config.get("rows") or [1])))
+        graphs.token_widths = tuple(
+            sorted(set(config.get("token_widths") or [int(connector.get("codec_left_context_frames", 3)) + unit]))
+        )
+        graphs.lookahead = lookahead
+        graphs.upsample = self._upsample_stride()
+        graphs._held_tensors = lambda: tuple(module.pos_enc.pe for module in tables)
         logger.info(
             "Flow encoder CUDA Graph enabled for continuation chunks (rows %s, tokens %s)",
             list(graphs.rows),
@@ -711,13 +764,13 @@ class BatchedToken2Wav(nn.Module):
         self, tokens: torch.Tensor, states: list[BatchedToken2WavState], copy: bool = False
     ) -> tuple[torch.Tensor, ...] | None:
         """A continuation chunk's encoder outputs from its graph: views rewritten by the next replay, or copies."""
-        if self._encoder_graphs is None:
+        if self._encoder_graphs is None or self.flow.training or torch.is_grad_enabled():
             return None
         flows = [state.flow_cache for state in states]
         outputs = self._encoder_graphs.run(
             tokens, [flow["conformer_cnn_cache"] for flow in flows], [flow["conformer_att_cache"] for flow in flows]
         )
-        return tuple(value.clone() for value in outputs) if outputs and copy else outputs
+        return tuple(value.clone() for value in outputs) if outputs is not None and copy else outputs
 
     @torch.inference_mode()
     def precapture_flow_encoder(self, features: PromptFeatures) -> int:
@@ -739,6 +792,7 @@ class BatchedToken2Wav(nn.Module):
                 hidden_dim=int(self.flow.encoder_proj.out_features),
                 dtype=att.dtype,
                 device=att.device,
+                cnn_dtype=cnn.dtype,
             )
         torch.accelerator.synchronize(att.device)
         logger.info(
@@ -748,6 +802,69 @@ class BatchedToken2Wav(nn.Module):
             graphs.storage_bytes() / 2**20,
             _format_memory_delta(memory_before, _memory_snapshot(att.device)),
         )
+        if captured:
+            graphs.capture_on_request = False
+        return captured
+
+    @torch.inference_mode()
+    def precapture_chunk_encoder(self, features: PromptFeatures) -> int:
+        """Precapture continuation graphs into the shared FlowEncoderGraphs arena.
+
+        Keep the legacy configuration entry point. NPU uses the same owner's
+        exact-shape admission path; CUDA requests only replay startup shapes.
+        """
+        graph = self._chunk_encoder_graph
+        if graph is None or not self._flow_on_cuda() or torch.version.hip is not None or not graph.max_graphs:
+            return 0
+        if graph.graphs:
+            graph.capture_on_request = False
+            return 0
+        if graph.exact_graphs:
+            return 0
+        lookahead = self._pre_lookahead_len()
+        if lookahead is None:
+            return 0
+        widths = tuple(width for width in self._chunk_encoder_token_widths if width > lookahead)
+        if not widths:
+            return 0
+        if not graph.rows:
+            return 0
+        graph.token_widths = widths
+        graph.lookahead = lookahead
+        graph.upsample = self._upsample_stride()
+        graph._held_tensors = self._encoder_position_tables
+        (state,) = self.setup_batch(features, 1)
+        cnn = state.flow_cache["conformer_cnn_cache"]
+        att = state.flow_cache["conformer_att_cache"]
+        keys = graph.keys_for(
+            start=int(att.shape[3]), prompt_len=int(features.mels.shape[1]), suffix=_CACHE_TRIM_SUFFIX
+        )
+        # Prefer steady-state lengths for every width before transient lengths.
+        keys = sorted(keys, key=lambda key: (-key[2], key[1]))[: graph.max_graphs]
+        probe = torch.zeros((1, max(widths)), dtype=torch.long, device=att.device)
+        probe_att = torch.zeros(
+            (*att.shape[:3], max(key[2] for key in keys), att.shape[4]), dtype=att.dtype, device=att.device
+        )
+        self._ensure_relpos_pe(probe, probe_att)
+        with self._autocast(att.device):
+            captured = graph.capture(
+                keys,
+                cnn_shape=tuple(cnn.shape[1:]),
+                att_layout=(int(att.shape[0]), int(att.shape[2]), int(att.shape[4])),
+                hidden_dim=int(self.flow.encoder_proj.out_features),
+                dtype=att.dtype,
+                device=att.device,
+                cnn_dtype=cnn.dtype,
+            )
+        if captured:
+            graph.capture_on_request = False
+            self._encoder_graphs = graph
+            logger.info(
+                "Flow encoder graphs frozen after precapture (%d shared-arena graphs, rows %s, buffers %.1f MiB)",
+                captured,
+                list(graph.rows),
+                graph.storage_bytes() / 2**20,
+            )
         return captured
 
     @staticmethod
@@ -1505,6 +1622,7 @@ class BatchedToken2Wav(nn.Module):
                 channels=int(features.mels.shape[2]),
                 spk_dim=int(self.flow.spk_embed_affine_layer.out_features),
                 keep=(prompt_len, _CACHE_TRIM_SUFFIX),
+                tail_frames=(self._pre_lookahead_len() or 0) * int(getattr(self.flow, "token_mel_ratio", 2)),
             )
 
     def _create_initial_states(
@@ -1556,6 +1674,18 @@ class BatchedToken2Wav(nn.Module):
             for row in split
         ]
 
+    def _setup_cache_key(self, features: PromptFeatures) -> tuple[tuple[str, str], int]:
+        bucket_frames = (
+            self._cfm_graph_bucket_frames
+            if self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled
+            else 0
+        )
+        return (features.cache_key, bucket_frames)
+
+    def has_cached_setup(self, features: PromptFeatures) -> bool:
+        """Whether :meth:`setup_batch` would hit its cache now; read-only."""
+        return self._setup_cache_key(features) in self._setup_cache
+
     def setup_batch(self, features: PromptFeatures, batch_size: int) -> list[BatchedToken2WavState]:
         """Initial states for ``batch_size`` requests sharing one prompt.
 
@@ -1568,14 +1698,9 @@ class BatchedToken2Wav(nn.Module):
         per batch size recomputed identical rows and cached one ~0.3 GiB
         estimator cache copy per request.
         """
-        bucket_frames = (
-            self._cfm_graph_bucket_frames
-            if self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled
-            else 0
-        )
         # Capture the policy before setup: graph capture may disable the wrapper
         # after padding has already been chosen for these initial states.
-        cache_key = (features.cache_key, bucket_frames)
+        cache_key = self._setup_cache_key(features)
         state = self._setup_cache.get(cache_key)
         if state is not None:
             self._setup_cache.move_to_end(cache_key)
@@ -1687,21 +1812,23 @@ class BatchedToken2Wav(nn.Module):
         # Whole-Euler reads and writes each request's estimator cache directly,
         # so the batch never holds a stacked copy of it.
         per_request_att = self._whole_euler_active()
-        # A captured encoder graph stacks the conformer caches into its own inputs.
-        graphed = None if last_chunk or flush_encoder else self._graph_encode(tokens, states)
-        flow_cache = self._stack_flow_cache(
-            states, include_estimator_att=not per_request_att, include_conformer=graphed is None
-        )
         prompt_len = int(features.mels.shape[1])
         att_keep = (prompt_len, _CACHE_TRIM_SUFFIX)
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):
+            # Replay must use the same autocast context as startup capture.
+            # A captured encoder graph stacks the conformer caches into its own inputs.
+            graphed = None if last_chunk or flush_encoder else self._graph_encode(tokens, states)
+            flow_cache = self._stack_flow_cache(
+                states, include_estimator_att=not per_request_att, include_conformer=graphed is None
+            )
             # A graph's shared results are read below and copied per row by _split_flow_cache.
             hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
                 tokens,
                 last_chunk=last_chunk or flush_encoder,
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
+                precaptured_checked=True,
             )
             projected_speakers = self._project_speakers(speakers)
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
@@ -1841,16 +1968,19 @@ class BatchedToken2Wav(nn.Module):
         for (*_, last_chunk), rows in encoder_groups.items():
             group_states = [states[row] for row in rows]
             group_tokens = torch.stack([tokens[row] for row in rows], dim=0)
-            # With several groups the next replay rewrites the shared graph results, so they are copied.
-            graphed = None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
-            # The encoder reads only the conformer caches.
-            group_cache = {} if graphed else self._stack_flow_cache(group_states, include_estimator_att=False)
             with self._autocast(group_tokens.device):
+                # With several groups the next replay rewrites the shared graph results, so they are copied.
+                graphed = (
+                    None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
+                )
+                # The encoder reads only the conformer caches.
+                group_cache = {} if graphed else self._stack_flow_cache(group_states, include_estimator_att=False)
                 hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
                     group_tokens,
                     last_chunk=last_chunk,
                     cnn_cache=group_cache["conformer_cnn_cache"],
                     att_cache=group_cache["conformer_att_cache"],
+                    precaptured_checked=True,
                 )
             for group_row, row in enumerate(rows):
                 hidden_rows[row] = hidden[group_row : group_row + 1]

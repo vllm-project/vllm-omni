@@ -92,6 +92,33 @@ def _extract_prompt_reference_audio(
     return _extract_first_audio_ref({"audio": serving_reference_audio})
 
 
+# The prewarm payload rides inline in the placeholder request; a longer
+# reference is left to the chunk-0 path alone.
+_CODE2WAV_PREWARM_MAX_REF_SECONDS = 60
+
+
+def code2wav_prewarm_payload(prompt: Any) -> dict[str, Any] | None:
+    """Return the reference Code2Wav can prepare before its first chunk.
+
+    Uses the same extractor as ``llm2tts``, so the waveform and sample rate
+    match the reference chunk 0 later carries and hit the same
+    content-addressed caches. Returns ``None`` when there is nothing to send.
+    """
+    try:
+        reference_audio = _extract_prompt_reference_audio(prompt)
+        if reference_audio is None:
+            return None
+        waveform, sample_rate = reference_audio
+        if sample_rate <= 0 or waveform.numel() == 0:
+            return None
+        if waveform.numel() > _CODE2WAV_PREWARM_MAX_REF_SECONDS * sample_rate:
+            return None
+        return {"ref_audio": waveform.contiguous(), "ref_audio_sr": int(sample_rate)}
+    except Exception:
+        logger.debug("MiniCPM-o 4.5 Code2Wav prewarm payload skipped", exc_info=True)
+        return None
+
+
 def _extract_native_runtime_ref_audio(data_plane_metadata):
     if not isinstance(data_plane_metadata, dict):
         return None
@@ -207,9 +234,12 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
         if valid is None:
             valid = pooling_output.get("meta.codec_frame_valid")
         if isinstance(valid, torch.Tensor) and isinstance(audio, torch.Tensor):
-            # Model Runner V2 emits one id per token row plus its validity
-            # (decode rows of live requests); keep only the codec frames.
+            # Device codec outputs carry a validity mask; prefill rows can
+            # carry empty audio and masks. reshape(0, -1) is ambiguous even
+            # for a correctly empty codec delta.
             rows = valid.detach().to(device="cpu").reshape(-1).bool()
+            if rows.numel() == 0 and audio.numel() == 0:
+                return []
             audio = audio.detach().to(device="cpu").reshape(rows.numel(), -1)[rows]
         return _codec_scalars(audio)
     if isinstance(pooling_output, Sequence) and not isinstance(

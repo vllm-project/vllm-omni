@@ -87,6 +87,9 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             model_arch="MiniCPMO45Code2Wav",
             supports_native_mrv2_data_plane=True,
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
+            # Sends the reference audio with the async-chunk placeholder so
+            # Code2Wav can prepare it while it waits for chunk 0.
+            async_chunk_prewarm_payload_func=f"{_PROC}.code2wav_prewarm_payload",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
         ),

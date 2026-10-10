@@ -557,4 +557,4 @@ steps:
       - python tools/nightly/generate_nightly_perf_html.py
       - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
