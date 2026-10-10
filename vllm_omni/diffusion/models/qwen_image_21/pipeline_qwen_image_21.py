@@ -189,6 +189,14 @@ def get_qwen_image_21_pre_process_func(
         request.allow_mixed_step_phases = False
         if request.sampling_params.true_cfg_scale is None:
             request.sampling_params.true_cfg_scale = 1.0
+        # Request-level sigmas may arrive via whitelisted extra-body params,
+        # which the serving layer stores in ``extra_args`` rather than the
+        # typed field (same convention as LTX2). Hoist them so the pipeline
+        # sees the explicit override before the preset grid is injected.
+        if request.sampling_params.sigmas is None:
+            extra_sigmas = (request.sampling_params.extra_args or {}).get("sigmas")
+            if extra_sigmas is not None:
+                request.sampling_params.sigmas = [float(s) for s in extra_sigmas]
         # Inject the model-level sampling grid as request sigmas so the
         # step scheduler and cache refresh resolve the total step count from
         # len(sigmas). prepare_timesteps applies the same grid as a fallback
