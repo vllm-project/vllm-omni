@@ -22,10 +22,10 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.sampler import Sampler
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
-from .sampling import create_h3_sample_solver
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
 )
@@ -366,8 +366,8 @@ def minimax_h3_denoise_loop(
     if audio_edit is not None:
         audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
-    video_solver = create_h3_sample_solver(sampler, sigmas_video)
-    audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
+    video_solver = Sampler(sampler, sigmas_video)
+    audio_solver = Sampler(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
         check_request_cancellation()

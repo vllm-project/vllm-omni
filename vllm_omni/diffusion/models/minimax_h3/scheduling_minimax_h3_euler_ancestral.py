@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import math
 from typing import Any
 
 import torch
+
+from vllm_omni.diffusion.sampler import EulerSampler
+
+minimax_h3_euler_eta0_step = EulerSampler.step_denoised
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -67,39 +72,6 @@ def minimax_h3_rf_v_to_x0(
     x0 = xt + sigma_t * v
     _require_finite_tensor(x0, "x0")
     return x0
-
-
-def minimax_h3_euler_eta0_step(
-    state: torch.Tensor,
-    denoised: torch.Tensor,
-    *,
-    sigma_curr: float,
-    sigma_next: float,
-) -> torch.Tensor:
-    if state.shape != denoised.shape:
-        raise ValueError(f"state and denoised shapes must match, got {state.shape} vs {denoised.shape}")
-    if not torch.is_floating_point(state):
-        raise ValueError("state must be a floating point tensor")
-    if not torch.is_floating_point(denoised):
-        raise ValueError("denoised must be a floating point tensor")
-    _require_finite_tensor(state, "state")
-    _require_finite_tensor(denoised, "denoised")
-    sigma_curr = _validate_sigma(sigma_curr, "sigma_curr")
-    sigma_next = _validate_sigma(sigma_next, "sigma_next")
-    if sigma_curr == 0.0:
-        if sigma_next != 0.0:
-            raise ValueError("sigma_next must be 0 when sigma_curr is 0")
-        return state
-    compute_dtype = torch.float32
-    if state.dtype not in (torch.float16, torch.bfloat16):
-        compute_dtype = state.dtype
-    sigma_curr_t = state.new_tensor(sigma_curr, dtype=compute_dtype)
-    sigma_next_t = state.new_tensor(sigma_next, dtype=compute_dtype)
-    sigma_ratio = sigma_next_t / sigma_curr_t
-    out = sigma_ratio * state.to(dtype=compute_dtype) + (1.0 - sigma_ratio) * denoised.to(dtype=compute_dtype)
-    out = out.to(dtype=state.dtype)
-    _require_finite_tensor(out, "euler_eta0_step output")
-    return out
 
 
 class MiniMaxH3EulerAncestralEta0SchedulerAdapter:

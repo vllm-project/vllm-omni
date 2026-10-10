@@ -64,6 +64,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
+from vllm_omni.diffusion.sampler import Sampler, resolve_sampler_name
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -157,7 +158,6 @@ from .packed_tokens import (
     minimax_h3_unpatchify_video_tokens,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
-from .sampling import create_h3_sample_solver, normalize_h3_sampler
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
 )
@@ -1820,7 +1820,7 @@ class MiniMaxH3Pipeline(
         one: the rows start from those latents re-noised to the schedule
         position ``refine`` selects, and the returned schedules begin there.
         """
-        sampler = normalize_h3_sampler(sampler)
+        sampler = resolve_sampler_name(sampler)
         if sampler != "euler" and base_schedule is not None:
             raise ValueError(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
@@ -2904,7 +2904,7 @@ class MiniMaxH3Pipeline(
 
         self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
-        sampler = normalize_h3_sampler(extra.get("sampler"))
+        sampler = resolve_sampler_name(extra.get("sampler"))
         if sampler != "euler" and base_schedule is not None:
             raise ValueError(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
@@ -3246,8 +3246,8 @@ class MiniMaxH3Pipeline(
                 _STEP_AUDIO_ROWS: audio_rows,
                 _STEP_COND_ANCHOR: cond_anchor,
                 _STEP_AUDIO_ANCHOR: audio_anchor,
-                _STEP_VIDEO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_video),
-                _STEP_AUDIO_SOLVER: create_h3_sample_solver(inputs.get("sampler", "euler"), sigmas_audio),
+                _STEP_VIDEO_SOLVER: Sampler(inputs.get("sampler", "euler"), sigmas_video),
+                _STEP_AUDIO_SOLVER: Sampler(inputs.get("sampler", "euler"), sigmas_audio),
                 _STEP_SIGMAS_VIDEO: sigmas_video,
                 _STEP_SIGMAS_AUDIO: sigmas_audio,
                 _STEP_VIDEO_EDIT: inputs.get("video_edit"),
