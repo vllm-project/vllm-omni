@@ -762,6 +762,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         self._register_load_state_dict_pre_hook(self._load_hook, with_module=True)
 
+        self._cached_attn_bias: torch.Tensor | None = None
+
     @staticmethod
     def _load_hook(module, state_dict, prefix, *_):
         mappings = {
@@ -835,6 +837,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         key: torch.Tensor,
         value: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
@@ -894,39 +897,44 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             )
         else:
             k, v, pos_k = self._complete_kv(k, v, execution_context)
-            pos_k = pos_k[:, None]
 
-            if self.causal:
-                # Reuse cached arange(T) — keyed by (device, T) so that changing
-                # T never frees a previous allocation (CUDA graph safety: a
-                # captured graph bakes in the pointer, so storage must live as
-                # long as the module and all captured graphs).
-                cache_key = (q.device, T)
-                if cache_key not in self._arange_t_cache:
-                    self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
-                pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
-                delta = pos_q - pos_k
-                # Build mask directly in the convention needed by the active path.
-                # SDPA / streaming_attention use True=attend; npu_fusion_attention
-                # uses True=masked.  On NPU we construct the inverted mask directly
-                # (avoids a ~attn_bias allocation + kernel per layer per step).
-                is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
-                streaming_attention = getattr(self, "_streaming_attention", None)
-                use_npu_path = is_npu and streaming_attention is None
-                if use_npu_path:
-                    # NPU convention: True = masked (inverted)
-                    attn_bias = (pos_k < 0) | (delta < 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias | (delta >= self.context)
-                    attn_bias = attn_bias[:, None]
+            if attn_bias is None:
+                pos_k = pos_k[:, None]
+                if self.causal:
+                    # Reuse cached arange(T) — keyed by (device, T) so that changing
+                    # T never frees a previous allocation (CUDA graph safety: a
+                    # captured graph bakes in the pointer, so storage must live as
+                    # long as the module and all captured graphs).
+                    cache_key = (q.device, T)
+                    if cache_key not in self._arange_t_cache:
+                        self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
+                    pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
+                    delta = pos_q - pos_k
+                    # Build mask directly in the convention needed by the active path.
+                    # SDPA / streaming_attention use True=attend; npu_fusion_attention
+                    # uses True=masked.  On NPU we construct the inverted mask directly
+                    # (avoids a ~attn_bias allocation + kernel per layer per step).
+                    is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = is_npu and streaming_attention is None
+                    if use_npu_path:
+                        # NPU convention: True = masked (inverted)
+                        attn_bias = (pos_k < 0) | (delta < 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias | (delta >= self.context)
+                        attn_bias = attn_bias[:, None]
+                    else:
+                        # SDPA / streaming_attention convention: True = attend
+                        attn_bias = (pos_k >= 0) & (delta >= 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias & (delta < self.context)
+                        attn_bias = attn_bias[:, None]
                 else:
-                    # SDPA / streaming_attention convention: True = attend
-                    attn_bias = (pos_k >= 0) & (delta >= 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias & (delta < self.context)
-                    attn_bias = attn_bias[:, None]
+                    attn_bias = None
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = False
+                self._cached_attn_bias = attn_bias
             else:
-                attn_bias = None
                 streaming_attention = getattr(self, "_streaming_attention", None)
                 use_npu_path = False
 
@@ -1099,24 +1107,30 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
+        if isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_2.scale)
         return x_orig.to(update.dtype) + self.layer_scale_2(update)
 
     def _sa_block(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         x_orig = x
         x = self.norm1(x)
-        update = self.self_attn(x, x, x, execution_context=execution_context)
+        update = self.self_attn(x, x, x, execution_context=execution_context, attn_bias=attn_bias)
+        if isinstance(self.layer_scale_1, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_1.scale)
         return x_orig.to(update.dtype) + self.layer_scale_1(update)
 
     def forward(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
-        x = self._sa_block(x, execution_context)
+        x = self._sa_block(x, execution_context, attn_bias)
         x = self._ff_block(x, execution_context)
         state = self._streaming_state
         if state is not None and execution_context is None:
@@ -1190,6 +1204,8 @@ class MossAudioTokenizerTransformer(StreamingModule):
                 )
             )
 
+        self._share_attn_bias: bool = True
+
     def _init_streaming_state(self, batch_size: int) -> TransformerState:
         device = next(self.parameters()).device
         return TransformerState(
@@ -1219,8 +1235,19 @@ class MossAudioTokenizerTransformer(StreamingModule):
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
-        for layer in self.layers:
-            x = layer(x, *args, **kwargs)
+        shared_attn_bias: torch.Tensor | None = None
+        try:
+            for i, layer in enumerate(self.layers):
+                if self._share_attn_bias and i == 0:
+                    x = layer(x, *args, attn_bias=None, **kwargs)
+                    shared_attn_bias = layer.self_attn._cached_attn_bias
+                elif self._share_attn_bias:
+                    x = layer(x, *args, attn_bias=shared_attn_bias, **kwargs)
+                else:
+                    x = layer(x, *args, attn_bias=None, **kwargs)
+        finally:
+            for layer in self.layers:
+                layer.self_attn._cached_attn_bias = None
 
         if state is not None:
             assert isinstance(state, TransformerState)
