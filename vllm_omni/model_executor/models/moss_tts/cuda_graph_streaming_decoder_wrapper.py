@@ -81,31 +81,15 @@ class CUDAGraphStreamingDecoderWrapper:
         frame_sizes: list[int],
         num_quantizers: int,
         vllm_config: VllmConfig,
-        scratch_base: int | None = None,
-        private_pool: bool = False,
-        compiled_decode: nn.Module | None = None,
     ) -> None:
         self.codec = codec
         self.state_capacity = int(state_capacity)
-        # Graph padding rows use scratch slots [scratch_base, scratch_base+B).
-        # A wrapper replaying concurrently with another needs its own scratch
-        # range and graph memory pool.
-        self.scratch_base = self.state_capacity if scratch_base is None else int(scratch_base)
-        self._private_pool = bool(private_pool)
-        # Graphs bake in the cuBLAS workspace of the stream they were captured
-        # on, and torch.cuda.graph shares one default capture stream. Split-K
-        # GEMMs synchronize through that workspace, so two graphs replaying
-        # concurrently from one capture stream can spin on each other forever.
-        self._capture_stream: torch.cuda.Stream | None = None
         self.batch_sizes = sorted({int(size) for size in batch_sizes if 0 < int(size) <= state_capacity})
         self.frame_sizes = sorted({int(size) for size in frame_sizes if int(size) > 0})
         self.num_quantizers = int(num_quantizers)
         self.graphs: dict[tuple[int, int], _CapturedStreamingDecodeGraph] = {}
         self._pool = None
         self._warmed_up = False
-        if compiled_decode is not None:
-            self._compiled_decode: nn.Module | None = compiled_decode
-            return
         # vLLM owns Inductor compilation; this wrapper remains the sole owner
         # of CUDA Graph capture/replay because it understands persistent codec
         # state slots. Disable vLLM's CUDA Graph layer to avoid nested graphs.
@@ -114,7 +98,7 @@ class CUDAGraphStreamingDecoderWrapper:
         compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compile_config.compilation_config.static_forward_context = {}
         with set_current_vllm_config(compile_config):
-            self._compiled_decode = _MossStreamingDecodeCompileAdapter(
+            self._compiled_decode: nn.Module | None = _MossStreamingDecodeCompileAdapter(
                 codec,
                 vllm_config=compile_config,
             )
@@ -191,7 +175,7 @@ class CUDAGraphStreamingDecoderWrapper:
                     frame_size,
                     exc_info=True,
                 )
-                scratch_slots = self.scratch_base + torch.arange(
+                scratch_slots = self.state_capacity + torch.arange(
                     batch_size,
                     dtype=torch.long,
                     device=device,
@@ -222,13 +206,10 @@ class CUDAGraphStreamingDecoderWrapper:
             device=device,
         )
         lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
-        scratch_slots = self.scratch_base + torch.arange(batch_size, dtype=torch.long, device=device)
+        scratch_slots = self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=device)
         valid_rows = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        if self._private_pool and self._capture_stream is None:
-            self._capture_stream = torch.cuda.Stream(device=device)
-        # Warm up on the capture stream so its workspace exists before capture.
-        stream = self._capture_stream or torch.cuda.Stream()
+        stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(3):
@@ -238,11 +219,9 @@ class CUDAGraphStreamingDecoderWrapper:
         self.codec.reset_decoder_state_slots(scratch_slots)
 
         if self._pool is None:
-            self._pool = (
-                torch.cuda.graph_pool_handle() if self._private_pool else current_platform.get_global_graph_pool()
-            )
+            self._pool = current_platform.get_global_graph_pool()
         graph = CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool, stream=self._capture_stream, capture_error_mode="thread_local"):
+        with torch.cuda.graph(graph, pool=self._pool, capture_error_mode="thread_local"):
             audio, audio_lengths = decode(codes, lengths, scratch_slots, valid_rows)
 
         self.graphs[(batch_size, frame_size)] = _CapturedStreamingDecodeGraph(
@@ -293,7 +272,7 @@ class CUDAGraphStreamingDecoderWrapper:
         entry.static_lengths.zero_()
         entry.static_lengths[:actual_batch_size].fill_(int(frame_size))
         entry.static_state_slot_ids.copy_(
-            self.scratch_base + torch.arange(batch_size, dtype=torch.long, device=entry.static_state_slot_ids.device)
+            self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=entry.static_state_slot_ids.device)
         )
         entry.static_state_slot_ids[:actual_batch_size].copy_(state_slot_ids, non_blocking=True)
         entry.static_valid_rows.zero_()

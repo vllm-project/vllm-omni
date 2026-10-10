@@ -574,6 +574,7 @@ class StageMetadata:
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    async_chunk_prewarm_payload_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -659,6 +660,12 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    async_chunk_prewarm_payload_func: Callable | None = None
+    _acp_path = _get_attr_or_item(stage_config, "async_chunk_prewarm_payload_func")
+    if _acp_path:
+        _mod, _fn = _acp_path.rsplit(".", 1)
+        async_chunk_prewarm_payload_func = getattr(importlib.import_module(_mod), _fn)
+
     model_stage = engine_args.get("model_stage")
 
     if stage_type == "diffusion":
@@ -698,6 +705,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         runtime_cfg=runtime_cfg,
         prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
+        async_chunk_prewarm_payload_func=async_chunk_prewarm_payload_func,
     )
 
 
@@ -761,6 +769,7 @@ def extract_stage_metadata_from_omni_stage_config(
         runtime_cfg=stage_config.runtime_config,
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
+        async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
     )
 
 

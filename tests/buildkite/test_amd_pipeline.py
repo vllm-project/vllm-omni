@@ -13,6 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
+AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
 CUDA_MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
@@ -22,6 +23,14 @@ DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
 AR_PAGED_ATTENTION_MARKERS = "core_model and rocm and MI325 and cards_1"
 JOY_GPU_LABEL = "Diffusion · JoyImage GPU Inference Test"
 JOY_GPU_PATH = "tests/diffusion/models/joy_image/test_joy_image_gpu.py"
+MODEL_EXECUTOR_CPU_MARKERS = "core_model and cpu and not omni"
+PERSONAPLEX_TEMPORAL_LABEL = "Simple · PersonaPlex Temporal Streaming Test"
+PERSONAPLEX_TEMPORAL_PATH = "tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py"
+PERSONAPLEX_TEMPORAL_STRESS_NODES = [
+    f"{PERSONAPLEX_TEMPORAL_PATH}::test_temporal_streaming_step_matches_legacy_end_to_end",
+    f"{PERSONAPLEX_TEMPORAL_PATH}::test_mimi_streaming_step_matches_legacy_end_to_end",
+]
+PERSONAPLEX_TEMPORAL_ARTIFACTS = "artifacts/personaplex-temporal-streaming/**/*"
 DIFFUSION_CPU_MARKERS = (
     "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 )
@@ -59,6 +68,44 @@ def _walk_steps(steps: list[dict]):
     for step in steps:
         yield step
         yield from _walk_steps(step.get("steps", []))
+
+
+def _find_steps_selecting_path(pipeline_path: Path, test_path: str) -> list[dict]:
+    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    matches = []
+
+    def walk(steps: list[dict]) -> None:
+        for step in steps:
+            if any(
+                arg == test_path or arg.startswith(f"{test_path}::")
+                for command in step.get("commands", [])
+                for arg in split(command)
+            ):
+                matches.append(step)
+            walk(step.get("steps", []))
+
+    walk(pipeline.get("steps", []))
+    return matches
+
+
+def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> dict:
+    matches = []
+    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+
+    def walk(steps: list[dict]) -> None:
+        for step in steps:
+            commands = step.get("commands", [])
+            if any(
+                split(command)[:3] == ["pytest", "-sv", "tests/model_executor"]
+                and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in split(command)
+                for command in commands
+            ):
+                matches.append(step)
+            walk(step.get("steps", []))
+
+    walk(pipeline.get("steps", []))
+    assert len(matches) == 1, f"expected one model executor CPU shard step in {pipeline_path}"
+    return matches[0]
 
 
 def _find_diffusion_cpu_shard_step(pipeline_path: Path) -> dict:
@@ -151,10 +198,93 @@ def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() 
 
 @pytest.mark.parametrize(
     "pipeline_path",
+    [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE],
+    ids=["ready", "merge"],
+)
+def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress(
+    pipeline_path: Path,
+) -> None:
+    step = _find_model_executor_cpu_shard_step(pipeline_path)
+    pytest_command = next(command for command in step["commands"] if "tests/model_executor" in command)
+    argv = split(pytest_command)
+
+    assert step["parallelism"] == 3
+    assert argv[:3] == ["pytest", "-sv", "tests/model_executor"]
+    assert argv[argv.index("-m") + 1] == MODEL_EXECUTOR_CPU_MARKERS
+    assert all(not arg.startswith("--ignore") for arg in argv)
+    assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
+        PERSONAPLEX_TEMPORAL_STRESS_NODES
+    )
+    assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in argv
+    assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in argv
+    assert "-k" not in argv
+
+
+def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None:
+    steps = _find_steps_selecting_path(
+        AMD_NIGHTLY_PIPELINE,
+        PERSONAPLEX_TEMPORAL_PATH,
+    )
+    assert len(steps) == 1
+    step = steps[0]
+
+    assert step["label"] == PERSONAPLEX_TEMPORAL_LABEL
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 120
+    assert step["artifact_paths"] == [PERSONAPLEX_TEMPORAL_ARTIFACTS]
+    assert "depends_on" not in step
+    assert "retry" not in step
+
+    commands = step["commands"]
+    all_commands = "\n".join(commands)
+    pytest_commands = [command for command in commands if "pytest" in split(command)]
+    collect_commands = [command for command in pytest_commands if "--collect-only" in split(command)]
+    run_commands = [command for command in pytest_commands if "--collect-only" not in split(command)]
+    assert len(collect_commands) == 1
+    assert len(run_commands) == 1
+
+    collect_argv = split(collect_commands[0])
+    assert collect_argv[:3] == [
+        "pytest",
+        "--collect-only",
+        "-q",
+    ]
+    assert collect_argv[3:5] == PERSONAPLEX_TEMPORAL_STRESS_NODES
+    assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/collection.txt" in collect_commands[0]
+
+    run_argv = split(run_commands[0])
+    assert run_argv[:5] == [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=2m",
+        "110m",
+        "pytest",
+    ]
+    assert run_argv[5:8] == [
+        "-s",
+        "-v",
+        "-ra",
+    ]
+    assert run_argv[8:10] == PERSONAPLEX_TEMPORAL_STRESS_NODES
+    assert "--durations=50" in run_argv
+    assert "--junitxml=$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.xml" in run_argv
+    assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.log" in run_commands[0]
+    assert "-n" not in run_argv
+    assert "-k" not in run_argv
+    assert all(not arg.startswith("--ignore") for arg in run_argv)
+    assert "|| true" not in all_commands
+    assert "VLLM_CI_ALLOW_NO_TESTS" not in all_commands
+    assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest-summary.txt" in all_commands
+
+
+@pytest.mark.parametrize(
+    "pipeline_path",
     [CUDA_READY_PIPELINE, CUDA_MERGE_PIPELINE],
     ids=["ready", "merge"],
 )
-def test_cuda_pr_gates_retain_full_omni_processor_coverage(pipeline_path: Path) -> None:
+def test_cuda_pr_gates_retain_full_model_executor_coverage(pipeline_path: Path) -> None:
     step = _find_step("Simple · Model Executor Test", pipeline_path)
     assert "source_file_dependencies" not in step
 
@@ -165,6 +295,12 @@ def test_cuda_pr_gates_retain_full_omni_processor_coverage(pipeline_path: Path) 
     assert "tests/model_executor" in argv
     assert marker_expression == "core_model and cpu"
     assert "not omni" not in marker_expression
+    assert all(not arg.startswith("--ignore") for arg in argv)
+    assert all(not arg.startswith("--deselect") for arg in argv)
+
+    test_source = Path(PERSONAPLEX_TEMPORAL_PATH).read_text(encoding="utf-8")
+    assert "pytestmark = [pytest.mark.core_model, pytest.mark.cpu]" in test_source
+    assert "@pytest.mark.slow" not in test_source
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
@@ -374,3 +510,16 @@ def test_amd_template_preserves_step_retry_policy() -> None:
     # policy when the source suite is rendered into the uploaded pipeline.
     assert template.count("{% if step.retry %}") == 2
     assert template.count("{% for retry_rule in step.retry.automatic %}") == 2
+
+
+def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
+    runner = AMD_RUNNER.read_text(encoding="utf-8")
+    template = AMD_TEMPLATE.read_text(encoding="utf-8")
+
+    assert "set -euo pipefail" in runner
+    assert "if /bin/bash -o pipefail -c" in runner
+    assert 'exit "${test_status}"' in runner
+    assert 'exit "${exit_code}"' in runner
+    assert 'VLLM_CI_ALLOW_NO_TESTS:-0}" == "1"' in runner
+    assert template.count('{% if step.grade and step.grade == "Blocking" %}') == 2
+    assert template.count("soft_fail: true") == 2

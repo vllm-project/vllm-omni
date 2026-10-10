@@ -176,7 +176,7 @@ steps:
         commands:
           - |
             timeout 20m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m 'core_model' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_2
 

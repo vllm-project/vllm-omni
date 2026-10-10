@@ -52,6 +52,25 @@ x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/deploy/minicpmo_4_5.yaml
   - vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja
 
+# Shared serving/runtime changes must exercise MiniCPM's basic functional
+# jobs. Keep these separate from model dependencies so they do not also select
+# every MiniCPM performance, accuracy, and documentation job.
+x-minicpmo-4-5-functional-runtime: &minicpmo_4_5_functional_runtime
+  - vllm_omni/config/
+  - vllm_omni/core/
+  - vllm_omni/engine/
+  - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/entrypoints/async_omni_base.py
+  - vllm_omni/entrypoints/openai/
+  - vllm_omni/inputs/
+  - vllm_omni/outputs/
+  - vllm_omni/data_entry_keys.py
+  - vllm_omni/distributed/omni_connectors/
+  - vllm_omni/worker/
+  - vllm_omni/worker_v2/
+  - vllm_omni/platforms/npu/worker/
+  - vllm_omni/model_executor/models/common/
+
 x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
   - vllm_omni/engine/duplex/
@@ -221,6 +240,7 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_omni.py
     - tests/e2e/online_serving/test_qwen3_omni_expansion.py
     - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+    - tests/e2e/online_serving/test_qwen3_omni_thinking.py
 
   omni_qwen3_omni_accuracy:
     - *qwen3_omni
@@ -252,6 +272,7 @@ source_file_dependencies:
 
   omni_minicpmo_4_5_function:
     - *minicpmo_4_5
+    - *minicpmo_4_5_functional_runtime
     - tests/e2e/offline_inference/test_minicpmo_4_5.py
     - tests/e2e/online_serving/test_minicpmo_4_5.py
     - tests/e2e/online_serving/test_minicpmo_4_5_expansion.py
