@@ -1172,6 +1172,19 @@ def test_api_topology_resolved_from_launch(requested, config, expected):
     assert api_server._resolve_api_server_count(Namespace(api_server_count=requested), config) == expected
 
 
+@pytest.mark.parametrize("current,expected", [(16, 4), (2, 2)])
+def test_api_server_torch_threads_are_capped(current, expected):
+    import torch
+
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(current)
+        api_server._limit_api_server_torch_threads()
+        assert torch.get_num_threads() == expected
+    finally:
+        torch.set_num_threads(previous)
+
+
 @pytest.mark.parametrize("requested,config", [(2, None), (2, {}), (2, {"client_count": 1}), (2, {"client_count": "2"})])
 def test_api_topology_rejects_inconsistent_launch(requested, config):
     with pytest.raises(ValueError):

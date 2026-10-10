@@ -185,7 +185,8 @@ def test_release_request_resources_skips_without_async_chunk():
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=False)),
         )
 
-        await pool.release_request_resources(["req-1"])
+        pool.schedule_release_request_resources(["req-1"])
+        await asyncio.sleep(0.01)
         call.assert_not_awaited()
 
     asyncio.run(run())
@@ -205,12 +206,13 @@ def test_release_request_resources_times_out_hung_replica_without_blocking_other
         )
         monkeypatch.setattr(pool, "RELEASE_RPC_TIMEOUT_S", 0.2)
 
-        release = asyncio.create_task(pool.release_request_resources(["req-1"]))
+        pool.schedule_release_request_resources(["req-1"])
         await asyncio.sleep(0.05)
         live.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
-        assert not release.done()
+        assert 0 in pool._release_flushers
 
-        await asyncio.wait_for(release, timeout=1.0)
+        await asyncio.wait_for(pool._release_flushers[0], timeout=1.0)
+        assert not pool._release_flushers
 
     asyncio.run(run())
 

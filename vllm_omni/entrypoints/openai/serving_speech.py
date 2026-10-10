@@ -30,6 +30,7 @@ from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -420,6 +421,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         allowed_local_media_path: str = "",
         allowed_media_domains: list[str] | None = None,
         speech_cache_config: SpeechCacheConfig | None = None,
+        request_logger: RequestLogger | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -427,6 +429,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         engine client that pure diffusion engines don't provide.
         """
         instance = cls.__new__(cls)
+        instance.request_logger = request_logger
         instance.speech_cache_config = speech_cache_config or SpeechCacheConfig()
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
@@ -1565,6 +1568,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             resolved.append((wav_list, sr))
         return resolved
 
+    def _log_request(self, msg: str, *args: object) -> None:
+        """Per-request success logging: INFO with --enable-log-requests, DEBUG otherwise.
+
+        Every speech request logged twice at INFO, which formats and flushes
+        on the API server's event loop under load.
+        """
+        if getattr(self, "request_logger", None):
+            logger.info(msg, *args)
+        else:
+            logger.debug(msg, *args)
+
     def _observe_speech_audio_ttfp(
         self,
         *,
@@ -1859,14 +1873,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             if first_audio_chunk_s is not None:
                 first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
-                logger.info(
+                self._log_request(
                     "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
                     request_id,
                     total_ms,
                     first_chunk_ms,
                 )
             else:
-                logger.info(
+                self._log_request(
                     "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
                     request_id,
                     total_ms,
@@ -2120,7 +2134,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 model_type = tts_params.get("task_type", ["unknown"])[0]
             else:
                 model_type = "generic"
-        logger.info("TTS speech request %s: model=%s", request_id, model_type)
+        self._log_request("TTS speech request %s: model=%s", request_id, model_type)
         _rl = getattr(self, "request_logger", None)
         if _rl:
             base_len = len(f"TTS speech request {request_id}: text=")
@@ -2503,7 +2517,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.instructions:
                 prompt["instruct"] = request.instructions
 
-            logger.info(
+            self._log_request(
                 "Diffusion TTS speech request %s: voice_clone=%s",
                 request_id,
                 "ref_audio" in prompt,
@@ -2806,7 +2820,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request_arrival_ts=request_arrival_ts,
                 )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
-            logger.info(
+            self._log_request(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
                 request_id,
                 total_ms,

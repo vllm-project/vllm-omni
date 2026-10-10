@@ -22,7 +22,7 @@ from vllm_omni.distributed.omni_coordinator import (
 )
 from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.distributed.omni_coordinator.omni_coord_client_for_hub import OmniCoordClientForHub
-from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage
+from vllm_omni.engine.messages import ErrorMessage, OutputQueueWriter
 from vllm_omni.engine.stage_pool import StagePool
 
 logger = init_logger(__name__)
@@ -58,7 +58,7 @@ class MembershipController:
         self._observed_up_attached_addrs: set[tuple[int, str]] = set()
         self._shutdown_event = asyncio.Event()
         self._watcher_task: asyncio.Task[None] | None = None
-        self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
+        self._output_queue: OutputQueueWriter | None = None
         self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
         self._replica_removed_callback: Callable[[int, int], None] | None = None
 
@@ -110,7 +110,7 @@ class MembershipController:
         self,
         stage_id: int,
         input_addr: str,
-        output_queue: asyncio.Queue[EngineQueueMessage] | None = None,
+        output_queue: OutputQueueWriter | None = None,
         cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None,
     ) -> None:
         """Handle an unregister_remote_replica message."""
@@ -286,7 +286,7 @@ class MembershipController:
     def install_unregister_handlers(
         self,
         *,
-        output_queue: asyncio.Queue[EngineQueueMessage],
+        output_queue: OutputQueueWriter,
         cleanup_callback: Callable[[list[str]], Awaitable[None]],
         replica_removed_callback: Callable[[int, int], None] | None = None,
     ) -> None:

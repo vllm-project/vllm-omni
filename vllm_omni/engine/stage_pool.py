@@ -141,6 +141,10 @@ class StagePool:
         self._has_chunk_transfer_adapter = bool(
             getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
         )
+        # Per-replica release batching: ids waiting for the replica's next RPC
+        # and the task sending them (also the strong reference keeping it alive).
+        self._pending_releases: dict[int, dict[str, None]] = {}
+        self._release_flushers: dict[int, asyncio.Task[None]] = {}
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
@@ -1310,27 +1314,64 @@ class StagePool:
 
         return abort_outputs
 
-    async def release_request_resources(self, request_ids: list[str]) -> None:
-        """Ask every live replica to drop transfer resources for *request_ids*.
+    def schedule_release_request_resources(self, request_ids: list[str]) -> None:
+        """Queue a best-effort release of *request_ids* on every live replica.
 
         Broadcast rather than binding-routed: the orchestrator releases route
         bindings as part of the same teardown, so a binding lookup here would
         race it. The engine-core handler is idempotent for unknown ids.
+
+        Each replica batches independently: ids of requests that finish while
+        its release RPC is in flight go out together in its next RPC, and a
+        hung replica delays only its own batches (bounded by
+        ``RELEASE_RPC_TIMEOUT_S`` per RPC).
         """
         if not request_ids or not self._has_chunk_transfer_adapter:
             return
-        ids = list(request_ids)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "[StagePool-%s] no running event loop; skipped reclaim of transfer resources for %s",
+                self.stage_id,
+                request_ids,
+            )
+            return
+        for replica_id in self.live_replica_ids():
+            pending = self._pending_releases.setdefault(replica_id, {})
+            pending.update(dict.fromkeys(request_ids))
+            if replica_id not in self._release_flushers:
+                self._release_flushers[replica_id] = loop.create_task(self._flush_replica_releases(replica_id))
 
-        async def release(replica_id: int, call: Any) -> None:
-            try:
-                await asyncio.wait_for(call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S)
-            except Exception as e:
-                logger.warning(
-                    "[StagePool-%s] release_request_resources on replica %s failed: %r", self.stage_id, replica_id, e
-                )
-
-        calls = [(i, getattr(self.clients[i], "call_utility_async", None)) for i in self.live_replica_ids()]
-        await asyncio.gather(*(release(i, call) for i, call in calls if call is not None))
+    async def _flush_replica_releases(self, replica_id: int) -> None:
+        pending = self._pending_releases[replica_id]
+        try:
+            while pending:
+                # Let completions handled in this loop pass join the batch.
+                await asyncio.sleep(0)
+                ids = list(pending)
+                pending.clear()
+                # Resolve the client per RPC: the replica may have been removed or replaced.
+                client = self.clients[replica_id] if replica_id < len(self.clients) else None
+                call = getattr(client, "call_utility_async", None)
+                if call is None:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[StagePool-%s] release_request_resources on replica %s failed: %r",
+                        self.stage_id,
+                        replica_id,
+                        e,
+                    )
+        finally:
+            # No await from here on, so a concurrent schedule cannot slip in
+            # between: the next one starts a fresh batch and sender.
+            del self._pending_releases[replica_id]
+            del self._release_flushers[replica_id]
 
     async def collective_rpc(
         self,

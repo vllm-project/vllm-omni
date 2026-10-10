@@ -165,8 +165,13 @@ class FakeAsyncOmniEngine:
         except queue.Empty:
             return None
 
-    async def try_get_output_async(self) -> Any | None:
-        return self.try_get_output()
+    async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+        msgs: list[Any] = []
+        while len(msgs) < max_messages and (msg := self.try_get_output()) is not None:
+            msgs.append(msg)
+        if not msgs:
+            await asyncio.sleep(0.001)
+        return msgs
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         return self.stage_metadata[stage_id]

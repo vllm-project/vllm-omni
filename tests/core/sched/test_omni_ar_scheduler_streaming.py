@@ -37,6 +37,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
+    sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode),
     )
@@ -151,6 +152,7 @@ def _run_resumable_segment_stop(
     inter_stage_output=None,
 ):
     sched = MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -306,6 +308,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise(
     session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
     sched = mocker.MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -399,6 +402,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     num_output_placeholders = session.num_output_placeholders
 
     sched = MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -475,6 +479,7 @@ def test_legacy_stale_async_marker_bypasses_real_placeholder_accounting() -> Non
     request.num_stale_output_tokens = 0
 
     sched = OmniARAsyncScheduler.__new__(OmniARAsyncScheduler)
+    sched._hold_payloadless_outputs = False
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None

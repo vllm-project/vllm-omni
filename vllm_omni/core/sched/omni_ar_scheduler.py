@@ -47,6 +47,19 @@ def _should_emit_engine_output(
     )
 
 
+def _holds_payloadless_outputs(model_config: object) -> bool:
+    """Whether a final audio stage may fold token-only steps into its next output.
+
+    Such a stage streams audio through ``multimodal_output``; its codec tokens
+    are not client-visible. Steps that sampled a token but produced no audio
+    then only cost serialization, IPC and per-output API work.
+    """
+    # OmniModelConfig fields; a plain vLLM ModelConfig has neither.
+    return bool(getattr(model_config, "final_output", False)) and (
+        getattr(model_config, "engine_output_type", None) == "audio"
+    )
+
+
 class SampledLogprobContractError(RuntimeError):
     """The model runner returned unusable sampled-token logprobs."""
 
@@ -160,6 +173,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
+        # External finishes release Request before their terminal output is assembled.
+        self._held_token_ids: dict[str, list[int]] = {}
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -789,6 +805,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or kv_transfer_params
                 or stopped
             )
+            if (
+                has_stage_output
+                and not stopped
+                and not mm_output
+                and pooler_output is None
+                and prefill_stats is None
+                and new_logprobs is None
+                and prompt_logprobs_tensors is None
+                and prompt_token_id_logprobs is None
+                and kv_transfer_params is None
+                and self._hold_payloadless_outputs
+                and request.sampling_params is not None
+                and not request.sampling_params.detokenize
+            ):
+                # Token-only step of a final audio stage: the client sees
+                # nothing new, so carry the tokens on the next emitted output
+                # instead of sending one output per decode step.
+                self._held_token_ids.setdefault(req_id, []).extend(new_token_ids)
+                has_stage_output = False
             if has_stage_output and _should_emit_engine_output(
                 self.vllm_config.model_config,
                 stopped=stopped,
@@ -887,6 +922,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             engine_core_outputs,
             synthesize_abort_outputs=True,
         )
+
+        # Include external errors, control messages and synthetic aborts in the
+        # same flush, after every output path has finished assembling its batch.
+        if self._hold_payloadless_outputs:
+            for client_output in engine_core_outputs.values():
+                for output in client_output.outputs:
+                    held = self._held_token_ids.pop(output.request_id, None)
+                    if held:
+                        output.new_token_ids = held + output.new_token_ids
 
         self._attach_scheduler_stats(
             engine_core_outputs,

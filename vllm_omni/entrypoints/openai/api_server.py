@@ -25,6 +25,7 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import torch
 import uvloop
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -316,6 +317,19 @@ def run_omni_api_server_worker_proc(
     )
 
 
+def _limit_api_server_torch_threads() -> None:
+    """Cap the API server's intra-op Torch pool at four threads.
+
+    The API process runs small host-side tensor ops per output (audio chunk
+    concatenation, copies) whose parallel regions leave the OpenMP workers
+    spinning; with the default one-thread-per-CPU pool that pinned 7-8 cores per
+    API server and starved co-located stage processes. A few threads keep media
+    preprocessing (image and video resize/normalize) close to full speed. A
+    lower thread count already in effect (e.g. from OMP_NUM_THREADS) is kept.
+    """
+    torch.set_num_threads(min(4, torch.get_num_threads()))
+
+
 async def omni_run_server_worker(
     listen_address: str,
     sock: socket.socket,
@@ -324,6 +338,7 @@ async def omni_run_server_worker(
     **uvicorn_kwargs: object,
 ) -> None:
     """Run a single API server worker."""
+    _limit_api_server_torch_threads()
     api_server_count = _resolve_api_server_count(args, client_config)
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
@@ -918,6 +933,7 @@ async def omni_init_app_state(
             speech_cache_config=speech_cache_config,
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
             allowed_media_domains=getattr(args, "allowed_media_domains", None),
+            request_logger=request_logger,
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None

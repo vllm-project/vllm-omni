@@ -1104,6 +1104,12 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
     )
     assert captured_launch_env == ["enabled" if stage_id == 0 else None for stage_id in stage_ids]
     assert os.environ.get("VLLM_OMNI_TEST_STAGE_RUNTIME_ENV") is None
+    # Pre-spawned replicas are answered in launch order, after every earlier
+    # replica is ready, so each may wait for all of their initializations.
+    expected_handshake_timeout = runtime._stage_init_timeout * len(stage_ids) if client_count > 1 else None
+    assert [kwargs["handshake_timeout_s"] for kwargs in captured_launch_kwargs] == [expected_handshake_timeout] * len(
+        stage_ids
+    )
 
 
 @pytest.mark.parametrize("client_count", [1, 2])

@@ -12,11 +12,13 @@ final-output drain, and flag parsing.
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import janus
 import pytest
 
+from vllm_omni.engine.async_engine_utils import OutputQueueSink
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ShutdownRequestMessage
 from vllm_omni.engine.orchestrator import (
@@ -198,66 +200,115 @@ async def test_reader_reconcile_picks_up_swapped_client(orchestrator_factory) ->
 
 
 # ---------------------------------------------------------------------------
-# Blocking final-output drain (AsyncOmniEngine.get_output_blocking_async)
+# Final-output delivery (OutputQueueSink -> AsyncOmniEngine.get_outputs_async)
 # ---------------------------------------------------------------------------
 
 
 def _drain_engine(alive: bool = True) -> AsyncOmniEngine:
     engine = object.__new__(AsyncOmniEngine)
     engine.output_queue = janus.Queue()
+    engine._output_sink = OutputQueueSink(engine.output_queue.sync_q)
     engine.orchestrator_thread = SimpleNamespace(is_alive=lambda: alive)
     return engine
 
 
-def _drain_cleanup(engine: AsyncOmniEngine) -> None:
-    if engine._output_drain_executor is not None:
-        engine._output_drain_executor.shutdown(wait=False)
-        engine._output_drain_executor = None
-    engine.output_queue.close()
-
-
 @pytest.mark.asyncio
-async def test_blocking_drain_returns_queued_message() -> None:
+async def test_output_drain_caps_the_batch() -> None:
     engine = _drain_engine()
     try:
-        engine.output_queue.sync_q.put_nowait("msg-1")
-        assert await engine.get_output_blocking_async(timeout=1.0) == "msg-1"
+        for i in range(5):
+            engine._output_sink.put_nowait(i)
+        assert await engine.get_outputs_async(timeout=1.0, max_messages=3) == [0, 1, 2]
+        assert await engine.get_outputs_async(timeout=1.0, max_messages=3) == [3, 4]
     finally:
-        _drain_cleanup(engine)
+        engine.output_queue.close()
 
 
 @pytest.mark.asyncio
-async def test_blocking_drain_wakes_on_late_message() -> None:
-    """A message put after the wait starts wakes the drain, no polling."""
+async def test_output_drain_wakes_on_put_from_another_thread() -> None:
+    """The orchestrator thread's put wakes the waiting serving loop, no polling."""
     engine = _drain_engine()
     try:
-
-        async def _delayed_put() -> None:
-            await asyncio.sleep(0.05)
-            engine.output_queue.sync_q.put_nowait("late-msg")
-
-        put_task = asyncio.create_task(_delayed_put())
-        msg = await engine.get_output_blocking_async(timeout=5.0)
-        await put_task
-        assert msg == "late-msg"
+        timer = threading.Timer(0.05, engine._output_sink.put_nowait, args=("late-msg",))
+        timer.start()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        msgs = await engine.get_outputs_async(timeout=5.0)
+        timer.join()
+        assert msgs == ["late-msg"]
+        assert loop.time() - started < 1.0
     finally:
-        _drain_cleanup(engine)
+        engine.output_queue.close()
 
 
 @pytest.mark.asyncio
-async def test_blocking_drain_timeout_returns_none_when_alive() -> None:
+async def test_output_drain_coalesces_wakeups_while_busy(monkeypatch) -> None:
+    """Puts made after a wakeup is scheduled schedule no further loop callbacks."""
+    engine = _drain_engine()
+    sink = engine._output_sink
+    loop = asyncio.get_running_loop()
+    try:
+        assert await engine.get_outputs_async(timeout=0.01) == []  # armed, nothing queued
+        calls = []
+        original = loop.call_soon_threadsafe
+
+        def counting_call_soon_threadsafe(*args, **kwargs):
+            calls.append(args)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", counting_call_soon_threadsafe)
+        for i in range(10):
+            sink.put_nowait(i)
+        assert len(calls) == 1
+        assert await engine.get_outputs_async(timeout=1.0) == list(range(10))
+    finally:
+        engine.output_queue.close()
+
+
+@pytest.mark.asyncio
+async def test_output_drain_keeps_messages_put_after_a_timeout() -> None:
     engine = _drain_engine(alive=True)
     try:
-        assert await engine.get_output_blocking_async(timeout=0.05) is None
+        assert await engine.get_outputs_async(timeout=0.02) == []
+        engine._output_sink.put_nowait("after-timeout")
+        assert await engine.get_outputs_async(timeout=1.0) == ["after-timeout"]
     finally:
-        _drain_cleanup(engine)
+        engine.output_queue.close()
 
 
 @pytest.mark.asyncio
-async def test_blocking_drain_raises_when_orchestrator_dead() -> None:
+async def test_output_drain_cancel_leaves_queued_messages() -> None:
+    engine = _drain_engine(alive=True)
+    try:
+        reader = asyncio.ensure_future(engine.get_outputs_async(timeout=5.0))
+        await asyncio.sleep(0.02)
+        reader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+        engine._output_sink.put_nowait("kept")
+        assert await engine.get_outputs_async(timeout=1.0) == ["kept"]
+    finally:
+        engine.output_queue.close()
+
+
+@pytest.mark.asyncio
+async def test_output_drain_delivers_unannounced_message_before_dead_check() -> None:
+    """A message queued without a wakeup is returned at timeout, not lost to the dead check."""
+    engine = _drain_engine(alive=False)
+    try:
+        reader = asyncio.ensure_future(engine.get_outputs_async(timeout=0.1))
+        await asyncio.sleep(0.02)  # reader is now waiting for a wakeup
+        engine.output_queue.sync_q.put_nowait("fatal-error")  # bypasses the sink
+        assert await reader == ["fatal-error"]
+    finally:
+        engine.output_queue.close()
+
+
+@pytest.mark.asyncio
+async def test_output_drain_raises_when_orchestrator_dead() -> None:
     engine = _drain_engine(alive=False)
     try:
         with pytest.raises(RuntimeError, match="Orchestrator died"):
-            await engine.get_output_blocking_async(timeout=0.05)
+            await engine.get_outputs_async(timeout=0.05)
     finally:
-        _drain_cleanup(engine)
+        engine.output_queue.close()

@@ -52,6 +52,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     InteractionMessage,
     OutputMessage,
+    OutputQueueWriter,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
     StageMetricsMessage,
@@ -90,6 +91,11 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 # How often the event-driven loop reconciles its reader-task set against
 # `available_replica_ids()` (elastic membership, replica eviction) while idle.
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
+
+# Prompt fields an async-chunk prewarm placeholder replaces or serializes itself.
+_PREWARM_UNCOPIED_PROMPT_KEYS = frozenset(
+    ("prompt_token_ids", "multi_modal_data", "mm_processor_kwargs", "additional_information")
+)
 
 
 def _event_driven_orch_enabled(*, default: bool = False) -> bool:
@@ -336,12 +342,11 @@ class OrchestratorBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
-    _transfer_release_tasks: set[asyncio.Task] = set()
 
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        output_async_queue: OutputQueueWriter,
         rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
         stage_pools: list[StagePool],
         *,
@@ -384,8 +389,6 @@ class OrchestratorBase:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        # Strong refs for in-flight releases; the loop only weak-refs tasks, so dropping these risks mid-flight GC.
-        self._transfer_release_tasks: set[asyncio.Task] = set()
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -733,30 +736,15 @@ class OrchestratorBase:
 
         This is the only point that knows every stage is done with the request,
         so it is the only safe place to reclaim segments a consumer never
-        drained. Scheduled rather than awaited: reclaim is best-effort and must
-        not add RPC latency to request teardown.
+        drained. Queued rather than awaited: reclaim is best-effort and must
+        not add RPC latency to request teardown. Each stage pool batches the
+        release per replica, so a burst of completions costs a few RPCs and a
+        hung replica delays only its own batches.
         """
         if not request_ids:
             return
-
-        async def _run() -> None:
-            results = await asyncio.gather(
-                *(pool.release_request_resources(request_ids) for pool in self.stage_pools),
-                return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning("[Orchestrator] release transfer resources failed: %s", result)
-
-        try:
-            task = asyncio.get_running_loop().create_task(_run())
-            self._transfer_release_tasks.add(task)
-            task.add_done_callback(self._transfer_release_tasks.discard)
-        except RuntimeError:
-            logger.warning(
-                "[Orchestrator] no running event loop; skipped reclaim of transfer resources for %s",
-                request_ids,
-            )
+        for pool in self.stage_pools:
+            pool.schedule_release_request_resources(request_ids)
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -2777,7 +2765,21 @@ class OrchestratorBase:
                 if isinstance(original_prompt, dict):
                     from vllm_omni.engine.request_snapshot import copy_request_snapshot
 
-                    base_input = copy_request_snapshot(original_prompt)
+                    # The placeholder replaces the prompt and multimodal fields,
+                    # so they are not copied (multimodal inputs can be megabytes).
+                    # additional_information is serialized below, which copies
+                    # tensor bytes; its containers are copied, its tensors shared.
+                    memo: dict[int, Any] = {}
+                    base_input = copy_request_snapshot(
+                        {k: v for k, v in original_prompt.items() if k not in _PREWARM_UNCOPIED_PROMPT_KEYS},
+                        memo,
+                    )
+                    if "additional_information" in original_prompt:
+                        base_input["additional_information"] = copy_request_snapshot(
+                            original_prompt["additional_information"],
+                            memo,
+                            shared_types=(torch.Tensor,),
+                        )
                 else:
                     base_input = {}
 

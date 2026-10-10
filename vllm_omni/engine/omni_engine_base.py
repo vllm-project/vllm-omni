@@ -40,6 +40,7 @@ from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
     SHUTDOWN_JOIN_TIMEOUT_S,
+    OutputQueueSink,
     enqueue_orchestrator_shutdown,
     is_abort_transport_shutdown,
     is_janus_sync_queue_shutdown,
@@ -74,6 +75,8 @@ logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+# Output messages one serving-loop wakeup takes before yielding the event loop.
+_OUTPUT_DRAIN_MAX_BATCH = 256
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
 
 
@@ -124,8 +127,7 @@ class OmniEngineBase:
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
-    # Lazily created by get_output_blocking_async().
-    _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
+    _output_sink: OutputQueueSink | None = None
 
     def __init__(
         self,
@@ -302,6 +304,7 @@ class OmniEngineBase:
         # it (the orchestrator loop), so cross-thread use stays correct.
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        self._output_sink = OutputQueueSink(self.output_queue.sync_q)
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
@@ -450,7 +453,7 @@ class OmniEngineBase:
 
             orchestrator = self._create_orchestrator(
                 request_async_queue=self.request_queue.async_q,
-                output_async_queue=self.output_queue.async_q,
+                output_async_queue=self._output_sink,
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
                 async_chunk=self.async_chunk,
@@ -479,8 +482,8 @@ class OmniEngineBase:
             error_text = str(e) or "Orchestrator thread crashed"
             try:
                 error_msg = ErrorMessage(error=error_text, fatal=True)
-                if self.output_queue is not None:
-                    self.output_queue.sync_q.put_nowait(error_msg)
+                if self._output_sink is not None:
+                    self._output_sink.put_nowait(error_msg)
                 if self.rpc_output_queue is not None:
                     self.rpc_output_queue.sync_q.put_nowait(error_msg)
             except Exception:
@@ -955,50 +958,37 @@ class OmniEngineBase:
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
-    async def try_get_output_async(self) -> EngineQueueMessage | None:
-        """Async read from the Orchestrator output queue."""
-        try:
-            return self.output_queue.sync_q.get_nowait()
-        except queue.Empty:
-            if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-            return None
+    async def get_outputs_async(
+        self,
+        timeout: float = 1.0,
+        max_messages: int = _OUTPUT_DRAIN_MAX_BATCH,
+    ) -> list[EngineQueueMessage]:
+        """Wait for Orchestrator output on the serving event loop.
 
-    async def get_output_blocking_async(self, timeout: float = 1.0) -> EngineQueueMessage | None:
-        """Blocking-wait read from the Orchestrator output queue.
-
-        Waits up to ``timeout`` seconds in a dedicated drain thread for the
-        next message (condition-variable wakeup instead of a poll cadence);
-        returns ``None`` on timeout so the caller keeps its liveness check,
-        mirroring ``try_get_output_async``'s contract. Used by the serving
-        final-output drain when ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` is on.
+        Returns the messages queued so far (up to ``max_messages``), waiting
+        for the orchestrator's next put when none are queued. Returns an empty
+        list after ``timeout`` with the orchestrator alive, so the caller keeps
+        its liveness check.
         """
-        executor = self._output_drain_executor
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="omni-output-drain",
-            )
-            self._output_drain_executor = executor
-
-        sync_q = self.output_queue.sync_q
-
-        def _drain_get() -> EngineQueueMessage | None:
-            # Exceptions are swallowed to a None sentinel: the queue may be
-            # closed mid-shutdown, and an exception left on an executor future
-            # after task cancellation would warn as never-retrieved.
-            try:
-                return sync_q.get(timeout=timeout)
-            except queue.Empty:
-                return None
-            except Exception:
-                return None
-
-        loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(executor, _drain_get)
-        if msg is None and not self.is_alive():
-            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-        return msg
+        sink = self._output_sink
+        assert sink is not None
+        msgs = sink.drain(max_messages)
+        if msgs:
+            return msgs
+        ready = sink.arm_wakeup()
+        msgs = sink.drain(max_messages)
+        if msgs:
+            return msgs
+        try:
+            await asyncio.wait_for(ready.wait(), timeout)
+        except asyncio.TimeoutError:
+            # A put that skipped the wakeup (e.g. an error written while the
+            # orchestrator thread died) is still delivered before giving up.
+            msgs = sink.drain(max_messages)
+            if not msgs and not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.") from None
+            return msgs
+        return sink.drain(max_messages)
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""
@@ -1190,12 +1180,6 @@ class OmniEngineBase:
                     q.close()
             except Exception:
                 pass
-
-        if self._output_drain_executor is not None:
-            # Any in-flight blocking get bails out within its ≤1 s timeout
-            # (or immediately via the queue close above), so don't wait.
-            self._output_drain_executor.shutdown(wait=False)
-            self._output_drain_executor = None
 
         if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:
