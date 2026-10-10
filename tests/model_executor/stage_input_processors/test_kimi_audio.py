@@ -9,6 +9,7 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.kimi_audio.audio_processing import prepare_kimi_audio_inputs
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioPromptBuilder, KimiAudioSpecialTokens
 from vllm_omni.model_executor.stage_input_processors.kimi_audio import (
@@ -42,12 +43,15 @@ def prompt_builder():
     )
 
 
-@pytest.fixture
-def audio_request(prompt_builder):
+# None covers the default serving path, where admission draws the seed.
+@pytest.fixture(params=[42, None])
+def audio_request(request, prompt_builder):
     prompt = prepare_kimi_audio_inputs(
         [{"role": "user", "message_type": "text", "content": "Hi"}], prompt_builder, output_type="both"
     )
-    params = SamplingParams(include_stop_str_in_output=True, stop_token_ids=[prompt_builder.tokens.msg_end], seed=42)
+    params = SamplingParams(
+        include_stop_str_in_output=True, stop_token_ids=[prompt_builder.tokens.msg_end], seed=request.param
+    )
     return prepare_kimi_audio_request(prompt, [params]), params
 
 
@@ -60,9 +64,11 @@ def test_complete_audio_transfer_removes_controls_and_offset(prompt_builder, aud
         outputs=[SimpleNamespace(finish_reason="stop", multimodal_output={"codes": {"audio": torch.tensor(tokens)}})],
     )
     converted = kimi_audio_to_decoder([source], prompt)[0]
+    audio_seed = prompt["additional_information"]["meta"]["audio_seed"]
+    assert isinstance(audio_seed, int) and params.seed in (None, audio_seed)
     assert converted["prompt_token_ids"] == (codes or [0])
     assert converted["model_intermediate_buffer"]["codes"]["audio"] == codes
-    assert converted["model_intermediate_buffer"]["meta"] == {"finished": True, "audio_seed": params.seed}
+    assert converted["model_intermediate_buffer"]["meta"] == {"finished": True, "audio_seed": audio_seed}
 
 
 @pytest.mark.parametrize("code_count", [30, 35, 60])
@@ -76,6 +82,7 @@ def test_stream_transfer_emits_each_code_once_and_flushes_final_chunk(prompt_bui
     request = SimpleNamespace(
         request_id="internal-request",
         external_req_id="request",
+        additional_information=serialize_additional_information(prompt["additional_information"]),
         model_intermediate_buffer=prompt["model_intermediate_buffer"],
         sampling_params=params,
         is_finished=lambda: False,
@@ -99,5 +106,6 @@ def test_stream_transfer_emits_each_code_once_and_flushes_final_chunk(prompt_bui
     chunks.append(final)
     assert torch.cat([chunk.codes.audio for chunk in chunks]).flatten().tolist() == list(range(code_count))
     assert [chunk.meta.chunk_seq for chunk in chunks] == list(range(len(chunks)))
-    assert all(chunk.meta.audio_seed == params.seed for chunk in chunks)
+    audio_seed = prompt["additional_information"]["meta"]["audio_seed"]
+    assert all(chunk.meta.audio_seed == audio_seed for chunk in chunks)
     assert transfer.code_prompt_token_ids[request.external_req_id] == []

@@ -12,6 +12,7 @@ import msgspec
 import torch
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioPreparedInput, KimiAudioSpecialTokens
 from vllm_omni.model_executor.models.kimi_audio.sampling import KimiAudioSamplingParams
@@ -196,9 +197,13 @@ def kimi_audio_to_decoder_async_chunk(
             prepared = KimiAudioPreparedInput.from_wire(request.model_intermediate_buffer["kimi_audio_input"])
             if prepared.output_type != "both":
                 raise ValueError("Kimi-Audio audio streaming requires output_type='both'")
+            # Use the seed resolved at admission, as the complete handoff does;
+            # sampling_params.seed stays None when the caller omitted it.
+            info = deserialize_additional_information(getattr(request, "additional_information", None))
             state["kimi_audio"] = {
                 "offset": prepared.audio_token_offset,
                 "vocab_size": prepared.audio_vocab_size,
+                "audio_seed": info["meta"]["audio_seed"],
                 "chunk_seq": 0,
             }
         state = state["kimi_audio"]
@@ -236,7 +241,7 @@ def kimi_audio_to_decoder_async_chunk(
             finished=torch.tensor(finished, dtype=torch.bool),
             stream_finished=torch.tensor(finished, dtype=torch.bool),
             chunk_seq=state["chunk_seq"],
-            audio_seed=request.sampling_params.seed,
+            audio_seed=state["audio_seed"],
         ),
     )
     state["chunk_seq"] += 1
