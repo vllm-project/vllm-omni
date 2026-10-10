@@ -41,6 +41,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_data_plane_request_info,
     duplex_same_turn_request_ids,
     duplex_session_id_from_request_id,
+    duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
@@ -715,6 +716,20 @@ class ModelChannel:
         session.release_resources_for_request_ids(release_ids)
         await self._ctx.stage_port.cleanup(release_ids)
 
+    def _terminal_listen_turn_id(
+        self,
+        model_result: dict[str, object],
+        *,
+        model_turn_id: int | None,
+        data_plane_request_id: object,
+    ) -> int | None:
+        """Resolve the turn ended by an auto-response terminal listen, or None."""
+        if not self._out.auto_responds() or model_result.get("end_of_turn") is not True:
+            return None
+        if model_turn_id is not None:
+            return model_turn_id
+        return duplex_turn_id_from_request_id(data_plane_request_id if isinstance(data_plane_request_id, str) else None)
+
     async def _on_model_listen(
         self,
         model_result: dict[str, object],
@@ -723,11 +738,9 @@ class ModelChannel:
         data_plane_request_id: object,
         expected_epoch: int | None,
     ) -> tuple[str | None, bool]:
-        """The model chose to keep listening rather than speak.
+        """Continue a non-terminal listen or finish the listening response.
 
-        Either it continues the current response with another unit, or the
-        response ends here: an auto-response session that has continuations
-        left schedules one, and anything else closes the turn out.
+        Auto-response terminal listens complete the model turn before abort.
         """
         session = self._ctx.session
         model_state = self._ctx.model_state
@@ -778,17 +791,27 @@ class ModelChannel:
         }
         if response_id is not None:
             payload["response_id"] = response_id
+        ended_turn_id = self._terminal_listen_turn_id(
+            model_result, model_turn_id=model_turn_id, data_plane_request_id=data_plane_request_id
+        )
         self._attach_runtime_metadata(payload, model_result)
         self._out.emit(payload)
         if self._ctx.run.closing:
             return close_reason, emitted_response
+        if ended_turn_id is not None:
+            # Complete the silent turn before abort so the next append uses a new turn.
+            model_state.clear_continuation()
+            session.complete_model_turn(ended_turn_id)
+            bound_turn_id = session.active_response_turn_id
+            if response_id is None and bound_turn_id is not None and bound_turn_id <= ended_turn_id:
+                session.bind_response_turn(None)
         if model_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
             # stage_port.abort_requests expects a list of ids; a bare str is
             # iterated as characters and never matches the prewarmed binding.
             await self._abort_request([data_plane_request_id], notify=False)
             if self._ctx.run.closing:
                 return close_reason, emitted_response
-        if response_id is not None:
+        if response_id is not None and session.active_response_id == response_id:
             if not auto_response and self.response_continuations_remaining(response_id):
                 self._ctx.services.spawn(
                     self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
@@ -800,7 +823,7 @@ class ModelChannel:
                 return close_reason, emitted_response
             if auto_response:
                 model_state.clear_continuation()
-                if not auto_continuations_remaining:
+                if ended_turn_id is None and not auto_continuations_remaining:
                     completed_turn_id = model_turn_id
                     if completed_turn_id is None:
                         completed_turn_id = session.active_response_turn_id
@@ -878,6 +901,13 @@ class ModelChannel:
             self._attach_runtime_metadata(payload, model_result)
             self._out.emit(payload)
             return close_reason, emitted_response
+        if is_listen is True and not draining:
+            ended_turn_id = self._terminal_listen_turn_id(
+                model_result, model_turn_id=model_turn_id, data_plane_request_id=data_plane_request_id
+            )
+            if ended_turn_id is not None and ended_turn_id < session.turn_id:
+                # Drop completed-turn listens before committing model context.
+                return close_reason, emitted_response
         context_text = model_result.get("model_context_text")
         if isinstance(context_text, str) and isinstance(data_plane_request_id, str):
             self._ctx.plugin.commit_model_context(
