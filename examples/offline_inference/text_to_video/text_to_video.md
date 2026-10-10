@@ -284,7 +284,7 @@ the shared [`image_to_video.py`](../image_to_video/README.md) example with
 - `--extra-body`: JSON object of model-specific generation knobs, filtered against the model's declared `extra_body_params` and merged into sampling `extra_args` (see the Helios and Cosmos3 examples above and [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)).
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
-- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism/cfg_parallel.md).
 - `--tensor-parallel-size`: tensor parallel size (effective for models that support TP, e.g. LTX2).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.

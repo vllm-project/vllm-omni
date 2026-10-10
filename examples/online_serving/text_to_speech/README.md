@@ -563,7 +563,7 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 
 - Server uses `use_zero_spk_emb=True` and the cookbook decode defaults (`max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`). For other caption fields (`语速`, `基频`, `IP`, BGM, etc.) or overriding decode args, use the offline example where `additional_information` is set explicitly.
 - This is the online counterpart of [`examples/offline_inference/text_to_speech/ming_flash_omni_tts/`](../../offline_inference/text_to_speech/ming_flash_omni_tts/).
-- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../../ming_flash_omni/).
+- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../ming_flash_omni/).
 
 ---
 
