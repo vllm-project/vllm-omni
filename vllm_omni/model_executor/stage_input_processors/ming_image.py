@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import _ensure_list
 
 _IMAGE_PATCH_TOKEN_ID = 157157
@@ -84,7 +85,7 @@ def thinker2image(
     if isinstance(prompt, dict):
         negative_prompt = prompt.get("negative_prompt", negative_prompt)
     if isinstance(negative_prompt, str) and negative_prompt.strip():
-        raise ValueError("Ming-Image uses zero negative conditioning and does not accept negative_prompt.")
+        raise OmniClientError("Ming-Image uses zero negative conditioning and does not accept negative_prompt.")
 
     query_hidden, direct_hidden = _extract_conditions(source_outputs[0])
     extra: dict[str, Any] = {
@@ -102,7 +103,7 @@ def thinker2image(
 
     num_layers = int(extra_args.get("num_layers", 1))
     if num_layers < 1:
-        raise ValueError("num_layers must be at least 1.")
+        raise OmniClientError("num_layers must be at least 1.")
     extra["num_layers"] = num_layers
     return [{"prompt": "", "extra": extra}]
 

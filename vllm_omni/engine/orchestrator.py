@@ -1583,7 +1583,10 @@ class OrchestratorBase:
         StageUnavailableError (no live replica / evicted slot) or
         EngineDeadError (replica died mid-submit before the poll loop evicted
         it). Both mean "this request cannot be placed", not "the server is
-        broken": fail the request and keep serving (#4285). An OverflowError
+        broken": fail the request and keep serving (#4285). An OmniClientError
+        raised while building or submitting the request (e.g. by an inter-stage
+        bridge rejecting a user-supplied field) is failed as that client error
+        with its own status code. An OverflowError
         from encoding an out-of-range request value is likewise failed as a
         client error (400) rather than killing the loop. Other unrelated errors
         propagate. Returns False when the request was failed.
@@ -1637,6 +1640,29 @@ class OrchestratorBase:
             await self._fail_request_dead_stage(req_id, stage_id)
             if dead_replica is not None and dead_replica in pool.live_replica_ids():
                 await self._handle_dead_replica(stage_id, dead_replica, e)
+            return False
+        except OmniClientError as e:
+            # A dispatch (including an inter-stage bridge such as a
+            # ``custom_process_input_func``) rejected this request's input: a
+            # documented 4xx client error. Fail just this request, as the LLM
+            # ``process_engine_inputs`` path already does, instead of letting it
+            # escape the orchestration loop and take down every request.
+            logger.warning(
+                "[Orchestrator] %s dispatch for req=%s rejected by stage-%s: %s",
+                operation,
+                req_id,
+                stage_id,
+                e,
+            )
+            req_state = self.request_states.get(req_id)
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                str(e),
+                status_code=e.status_code,
+                error_type=e.error_type,
+                release_owners=bool(getattr(req_state, "session_owned", False)),
+            )
             return False
         except OverflowError as e:
             # Catch overflow errors in the request payload to ensure that msgpack
