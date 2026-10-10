@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
@@ -22,6 +23,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -51,6 +53,24 @@ def build_parallel_attention_strategy(
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
     ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
+    if (
+        getattr(cfg, "model_class_name", None) == "QwenImage21Pipeline"
+        and getattr(cfg, "enforce_eager", False)
+        and getattr(cfg, "dtype", None) == torch.bfloat16
+        and str(torch.__version__).startswith("2.13.")
+        and ulysses_degree > 1
+        and ring_degree == 1
+        and allgather_degree == 1
+        and getattr(p, "ulysses_mode", "strict") == "strict"
+        and (getattr(cfg, "extras", None) or {}).get("qwen21_auto_symmem_ulysses", True)
+        and current_omni_platform.is_cuda()
+        and current_omni_platform.is_available()
+    ):
+        capability = current_omni_platform.get_device_capability()
+        if capability is not None and capability.major >= 10 and "B300" in current_omni_platform.get_device_name():
+            # Byte-preserving NVLink exchange avoids the repeated permutation
+            # and NCCL launch overhead of the stock Q/K/V/O path.
+            ulysses_a2a_permute = True
 
     sp_configured = ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1
     if not sp_configured:

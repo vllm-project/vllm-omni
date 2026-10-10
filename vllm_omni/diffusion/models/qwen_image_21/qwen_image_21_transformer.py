@@ -34,6 +34,9 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.pointwise import eligible as pointwise_eligible
+from vllm_omni.diffusion.models.qwen_image_21.pointwise import residual, rotary, silu_mul
+from vllm_omni.diffusion.models.qwen_image_21.qk_norm import qk_rotary
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
@@ -88,6 +91,9 @@ def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torc
     Same contract as the reference `apply_rotary_emb_qwen(..., use_real=False)`:
     `x` is [B, S, H, D], `freqs` is the complex frequency tensor [S, D // 2].
     """
+    fused = rotary(x, freqs)
+    if fused is not None:
+        return fused
     paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
 
@@ -287,10 +293,11 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out",
         )
-        self.activation_fn = nn.SiLU()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.out(self.activation_fn(self.gate_layer(hidden_states)) * self.proj(hidden_states))
+    def forward(self, hidden_states: torch.Tensor, *, _pointwise_validated: bool = False) -> torch.Tensor:
+        return self.out(
+            silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states), _validated=_pointwise_validated)
+        )
 
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
@@ -529,11 +536,16 @@ class QwenImage21Attention(nn.Module):
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
 
-        query = self.norm_q(query).to(value.dtype)
-        key = self.norm_k(key).to(value.dtype)
-
-        query = self._apply_rotary_emb(query, freqs)
-        key = self._apply_rotary_emb(key, freqs)
+        fused_qk = None
+        if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
+            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+        if fused_qk is not None:
+            query, key = fused_qk
+        else:
+            query = self.norm_q(query).to(value.dtype)
+            key = self.norm_k(key).to(value.dtype)
+            query = self._apply_rotary_emb(query, freqs)
+            key = self._apply_rotary_emb(key, freqs)
 
         cached_key = cached_value = None
         if kv_cache is not None:
@@ -662,10 +674,16 @@ class QwenImage21TransformerBlock(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        _pointwise_validated: bool = False,
     ) -> torch.Tensor:
-        mod1, mod2 = modulation.chunk(2, dim=-1)
-
-        img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+        if prepared_modulation is None:
+            mod1, mod2 = modulation.chunk(2, dim=-1)
+            img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+            img_gate1 = img_gate1.tanh()
+        else:
+            scale1, img_gate1, scale2, img_gate2 = prepared_modulation
+            img_modulated = self.img_norm1(hidden_states) * scale1
         attn_output = self.attn(
             img_modulated,
             freqs,
@@ -676,10 +694,19 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        hidden_states = hidden_states + img_gate1.tanh() * attn_output
+        hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
 
-        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
-        hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
+        if prepared_modulation is None:
+            img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
+            img_gate2 = img_gate2.tanh()
+        else:
+            img_modulated2 = self.img_norm2(hidden_states) * scale2
+        mlp_output = (
+            self.img_mlp(img_modulated2, _pointwise_validated=True)
+            if _pointwise_validated
+            else self.img_mlp(img_modulated2)
+        )
+        hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -721,8 +748,15 @@ class QwenImage21SequencePrepare(nn.Module):
             target image (sharded under SP via `_sp_plan`). In decode mode the prefix parts are empty.
         """
         batch_size = hidden_states.shape[0]
-        image_pad_mask = self.expand_image_pad_mask(img_mask[0])
-        rotary_emb = self.pos_embed(img_shapes, image_pad_mask, device=hidden_states.device)
+        geometry = getattr(self, "_request_geometry", None)
+        if geometry is not None and "image_pad_mask" in geometry:
+            image_pad_mask = geometry["image_pad_mask"]
+            rotary_emb = geometry["rotary_emb"]
+        else:
+            image_pad_mask = self.expand_image_pad_mask(img_mask[0])
+            rotary_emb = self.pos_embed(img_shapes, image_pad_mask, device=hidden_states.device)
+            if geometry is not None:
+                geometry.update(image_pad_mask=image_pad_mask, rotary_emb=rotary_emb)
 
         target_tokens = math.prod(img_shapes[-1])
         prefix_len = image_pad_mask.shape[0] - target_tokens
@@ -839,6 +873,11 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.causal_block = causal_block
         self.quant_config = _enable_pattern_ignored_layers(quant_config)
         quant_config = self.quant_config
+        self._pointwise_contract_allowed = (
+            quant_config is None
+            and getattr(od_config, "lora_config", None) is None
+            and resolve_offload_strategy(od_config) == OffloadStrategy.NONE
+        )
 
         # Storage dtype for the cross-step prefix KV cache, from the supplementary
         # model-specific config entry `extras["prefix_kv_cache_dtype"]` (None = bf16/fp32
@@ -1104,6 +1143,31 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         else:
             txt_hidden_states = self.txt_in(encoder_hidden_states)
 
+        geometry = None
+        if (
+            kv_cache is not None
+            and batch_size == 1
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            signature = (
+                tuple(tuple(shape) for shape in layout),
+                cache_branch,
+                None if img_mask.is_inference() else img_mask._version,
+                None
+                if encoder_hidden_states_mask is None or encoder_hidden_states_mask.is_inference()
+                else encoder_hidden_states_mask._version,
+            )
+            previous = getattr(self, "_request_geometry_owner", None)
+            if (
+                previous is None
+                or previous[0] is not kv_cache
+                or previous[1] is not img_mask
+                or previous[2] != signature
+            ):
+                previous = self._request_geometry_owner = (kv_cache, img_mask, signature, {})
+            geometry = previous[3]
+        self.sequence_prepare._request_geometry = geometry
         prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
             hidden_states, txt_hidden_states, layout, img_mask, is_decode
         )
@@ -1126,8 +1190,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prefix_len = prefix_hidden_states.shape[1]
         sp_prefix_len = prefix_len if sp_active and not is_decode else 0
 
-        image_pad_mask = self.sequence_prepare.expand_image_pad_mask(img_mask[0])
-        _, target_token_mask = self.build_token_metadata(image_pad_mask, layout)
+        image_pad_mask = (
+            geometry["image_pad_mask"]
+            if geometry is not None
+            else self.sequence_prepare.expand_image_pad_mask(img_mask[0])
+        )
+        if geometry is not None and "token_metadata" in geometry:
+            image_ids, target_token_mask = geometry["token_metadata"]
+        else:
+            image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, layout)
+            if geometry is not None:
+                geometry["token_metadata"] = (image_ids, target_token_mask)
 
         timestep = timestep.to(hidden_states.dtype)
         if self.causal_condition:
@@ -1155,7 +1228,15 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # line up, in order, with the non-image positions of the vision-language sequence — the two are interleaved,
         # so the mask cannot be sliced off as a prefix.
         joint_key_valid = None
-        if encoder_hidden_states_mask is not None:
+        cached_key_valid = (
+            geometry is not None
+            and geometry.get("key_valid_mask_source") is encoder_hidden_states_mask
+            and "key_valid" in geometry
+            and geometry.get("sp_padding") == sp_padding
+        )
+        if cached_key_valid:
+            joint_key_valid = geometry["key_valid"]
+        elif encoder_hidden_states_mask is not None:
             joint_key_valid = torch.ones(
                 batch_size, image_pad_mask.shape[0], dtype=torch.bool, device=hidden_states.device
             )
@@ -1163,18 +1244,28 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
             joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[:, vlm_text_positions]
 
-        image_ids, _ = self.build_token_metadata(image_pad_mask, layout)
         full_seq_len = image_pad_mask.shape[0]
         padded_seq_len = full_seq_len + sp_padding
-        if sp_padding and joint_key_valid is None:
+        if not cached_key_valid and sp_padding and joint_key_valid is None:
             joint_key_valid = torch.ones(batch_size, full_seq_len, dtype=torch.bool, device=hidden_states.device)
-        if sp_padding:
+        if not cached_key_valid and sp_padding:
             joint_key_valid = F.pad(joint_key_valid, (0, sp_padding), value=False)
 
-        has_padding = joint_key_valid is not None and not bool(joint_key_valid.all())
+        has_padding = (
+            geometry["has_padding"]
+            if cached_key_valid
+            else joint_key_valid is not None and not bool(joint_key_valid.all())
+        )
         if not has_padding:
             # Match Diffusers and use the same mask-free dispatch in eager and graph decode.
             joint_key_valid = None
+        if geometry is not None and not cached_key_valid:
+            geometry.update(
+                key_valid=joint_key_valid,
+                key_valid_mask_source=encoder_hidden_states_mask,
+                has_padding=has_padding,
+                sp_padding=sp_padding,
+            )
         attn_metadata: AttentionMetadata | None = None
         cache_write_len: int | None = None
         if is_decode:
@@ -1197,6 +1288,30 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
 
+        prepared_modulation = None
+        pointwise_validated = False
+        if (
+            joint_hidden_states.device.type == "cuda"
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and self._decode_graph_manager is None
+        ):
+            # The model shares one modulation across all blocks. Materialize
+            # its token selection/scale/tanh once per step, using the same ops.
+            scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
+            prepared_modulation = (
+                1 + _select_modulation_rows(scale1, local_mask),
+                _select_modulation_rows(gate1, local_mask).tanh(),
+                1 + _select_modulation_rows(scale2, local_mask),
+                _select_modulation_rows(gate2, local_mask).tanh(),
+            )
+            if getattr(self, "_pointwise_contract_allowed", False):
+                # Native unquantized linear/norm operations preserve dtype,
+                # device and dense row layout. Validate the shared gates once
+                # per step, instead of repeating it at every pointwise call.
+                pointwise_validated = pointwise_eligible(
+                    joint_hidden_states, prepared_modulation[1], prepared_modulation[3]
+                )
         for index_block, block in enumerate(self.transformer_blocks):
             block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
             joint_hidden_states = block(
@@ -1210,6 +1325,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
+                prepared_modulation=prepared_modulation,
+                _pointwise_validated=pointwise_validated,
             )
 
         if (
@@ -1276,6 +1393,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         """Drop captured decode graphs and their static buffers (e.g. sleep mode)."""
         if self._decode_graph_manager is not None:
             self._decode_graph_manager.clear()
+        self._request_geometry_owner = None
+        self.sequence_prepare._request_geometry = None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

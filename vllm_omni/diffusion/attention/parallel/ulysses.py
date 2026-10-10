@@ -543,11 +543,15 @@ class UlyssesParallelAttention:
                 ulysses_world_size,
             ):
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+                from vllm_omni.diffusion.distributed.qkv_a2a import eligible, qkv_fwd_batched
 
                 group_name = self._ulysses_pg.group_name
-                query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
-                key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
-                value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                if eligible(query, key, value, ulysses_world_size):
+                    query, key, value = qkv_fwd_batched(query, key, value, group_name, ulysses_world_size)
+                else:
+                    query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
+                    key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
+                    value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
             else:

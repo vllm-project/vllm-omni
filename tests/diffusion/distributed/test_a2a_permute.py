@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(torch.utils.cpp_extension, "CUDA_HOME", None)
     cu13_include = tmp_path / "nvidia" / "cu13" / "include"
     nccl_include = tmp_path / "nvidia" / "nccl" / "include"
     nccl_lib = tmp_path / "nvidia" / "nccl" / "lib" / "libnccl.so.2"
@@ -39,6 +40,29 @@ def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatc
 
     assert set(load_kwargs["extra_include_paths"]) == {str(cu13_include), str(nccl_include)}
     assert load_kwargs["extra_ldflags"] == [str(nccl_lib)]
+
+
+def test_full_toolkit_excludes_conflicting_wheel_runtime_headers(tmp_path, monkeypatch) -> None:
+    toolkit = tmp_path / "cuda"
+    (toolkit / "include").mkdir(parents=True)
+    (toolkit / "include" / "cusparse.h").touch()
+    runtime = tmp_path / "nvidia" / "cu13" / "include"
+    runtime.mkdir(parents=True)
+    (runtime / "cuda_runtime_api.h").touch()
+    nccl = tmp_path / "nvidia" / "nccl"
+    (nccl / "include").mkdir(parents=True)
+    (nccl / "include" / "nccl.h").touch()
+    (nccl / "lib").mkdir()
+    (nccl / "lib" / "libnccl.so.2").touch()
+    kwargs = {}
+    monkeypatch.setattr(torch.utils.cpp_extension, "CUDA_HOME", str(toolkit))
+    monkeypatch.setattr(torch.utils.cpp_extension, "load", lambda **values: kwargs.update(values))
+    monkeypatch.setattr(a2a_permute.sysconfig, "get_paths", lambda: {"purelib": str(tmp_path)})
+    monkeypatch.setattr(a2a_permute.symm_mem, "set_backend", lambda value: None)
+    monkeypatch.setattr(a2a_permute, "_BUILT", False)
+    a2a_permute.ensure_a2a_permute_available()
+    assert str(runtime) not in kwargs["extra_include_paths"]
+    assert str(nccl / "include") in kwargs["extra_include_paths"]
 
 
 @dataclass

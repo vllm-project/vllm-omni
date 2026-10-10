@@ -229,6 +229,14 @@ class QwenImage21RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
+        if x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            # This VAE uses the same F.normalize + rounded scale/gamma/bias
+            # contract as Wan. Reuse its exact reduction and fused epilogue.
+            from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath.forwards import rms_norm_fastpath
+
+            output = rms_norm_fastpath(self, x)
+            if output is not None:
+                return output
         needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
             t in str(x.dtype) for t in ("float4_", "float8_")
         )

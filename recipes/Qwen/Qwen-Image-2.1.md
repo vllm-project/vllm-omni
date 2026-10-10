@@ -80,6 +80,92 @@ curl http://localhost:8091/v1/images/generations \
   }'
 ```
 
+### Four-GPU BF16 eager inference on Blackwell
+
+For latency-sensitive Turbo text-to-image requests, use TP1/Ulysses4 with
+the native eight-step schedule, CFG1 and a single untiled VAE:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen-Image-2.1-Turbo \
+  --omni --enforce-eager --dtype bfloat16 --num-gpus 4 \
+  --tensor-parallel-size 1 --usp 4 --ring 1 --cfg-parallel-size 1 \
+  --vae-patch-parallel-size 1 --max-num-seqs 1 \
+  --diffusion-attention-backend FLASH_ATTN --port 8098
+```
+
+The eager CUDA/BF16 path fuses pointwise operations while preserving BF16
+intermediate rounding. The head128 Q/K RMSNorm/RoPE kernel additionally
+requires PyTorch 2.13; unsupported configurations use the original norm
+arithmetic. Qwen's VAE reuses the existing Wan normalization fast path.
+Native unquantized blocks without LoRA or offload validate pointwise tensor
+contracts once per step. Compilation and other configurations retain the
+guarded paths.
+
+On B300 with PyTorch 2.13, strict Ulysses with Ring1/AllGather1 automatically
+selects symmetric-memory exchange. Equal, eligible BF16 Q/K/V tensors share one
+exchange; other layouts retain the separate exchanges. The automatic
+selection can be disabled with `extras.qwen21_auto_symmem_ulysses: false`
+in a diffusion stage configuration. Explicit `ulysses_a2a_permute` selection
+keeps its existing meaning.
+
+Pure text-to-image inference also caches exact text conditioning, bounded
+by 16 entries and 16 MiB. Image-conditioned requests, batched prompts,
+training/gradients, LoRA and CPU offload bypass and invalidate this cache.
+Geometry reuse lasts only for one request's KV-cache lifetime. Generated
+images and sampled latents are never cached by these optimizations.
+
+The original-source B300 campaign measured synchronous HTTP image E2E:
+POST through complete PNG/base64 JSON download, with decoding/file writes
+outside the timer. It used 1280x704 native RGBA output, concurrency1, six
+full-step warmups per server, and three repeated prompts with new seeds.
+Preparation, model loading and profiler diagnostics were excluded.
+
+| Median of five alternating AB/BA trial means | Latency |
+| --- | --- |
+| Original main `f69b1f2b19cece03f6736c7da093ea25de0e24fd` | 384.16 ms |
+| Frozen RSI candidate `330d411d2dd567bc061cb3124f4e39d195a4be45` | 266.60 ms |
+| Reduction against the fresh original-source baseline | 30.60% |
+
+Hardware: four B300 SXM6 AC GPUs, 275040 MiB per GPU, NV18, NUMA0.
+Software: PyTorch2.13.0+cu130, vLLM0.31.0, diffusers0.40.0,
+transformers5.14.1, FA4 and driver610.43.02. Baseline trial means ranged
+377.64-399.76 ms; candidate means ranged261.82-294.65 ms. All40 measured
+and first-request images, plus four held-out images, had identical decoded
+RGB/alpha pixels (SSIM1, PSNR infinity).
+
+These numbers describe the frozen RSI source pair and warmed repeated-prompt
+workload. They are not a new benchmark of the rebased PR against its newer
+main base, a cold-prompt speedup, or a statistical-significance/tail-latency
+claim. The original source remains the denominator throughout the campaign.
+
+The [source-pinned campaign driver](https://github.com/david6666666/OmniRSI/blob/c1bcf5d7eeae2fda816e3fdb71cb1d1f1d6b50f3/examples/qwen21_turbo_b300.py)
+records the server argv, full request protocol, source/dependency identities,
+preparation and warmup times, individual timings, and generated PNG files.
+Run it with the prepared inference environment and pinned model snapshot:
+
+```bash
+git clone https://github.com/david6666666/OmniRSI.git /tmp/qwen21-rsi-repro
+git -C /tmp/qwen21-rsi-repro checkout c1bcf5d7eeae2fda816e3fdb71cb1d1f1d6b50f3
+# Set these to the checkout, local model snapshot and local cache directory.
+export QWEN21_SOURCE="$PWD"
+export QWEN21_SNAPSHOT="$HF_HOME/hub/models--Qwen--Qwen-Image-2.1-Turbo/snapshots/d65dbc9a7e8f6b5479e33dee6030eaab2a906509"
+export QWEN21_CACHE=/tmp/qwen21-rsi-cache
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 \
+  python /tmp/qwen21-rsi-repro/examples/qwen21_turbo_b300.py \
+  --source-repo "$QWEN21_SOURCE" --model-path "$QWEN21_SNAPSHOT" \
+  --cache-root "$QWEN21_CACHE" --tp 1 --ulysses 4 --repetitions 3 \
+  --output /tmp/qwen21-rsi-result/result.json
+```
+
+Reserve idle GPUs before running; the driver rejects occupied devices.
+Use a new output directory for every run. For a new A/B claim, freeze both
+source trees, keep the same devices and runtime, and alternate five server
+runs per side with `--repetitions 1`. Profile separately with
+`--diagnostic --profile-steps 2`; diagnostic timings are not E2E benchmarks.
+See the [complete RSI report](https://github.com/david6666666/OmniRSI/blob/c1bcf5d7eeae2fda816e3fdb71cb1d1f1d6b50f3/docs/qwen21-turbo-b300-phase2-results.md)
+for every accepted/rejected round, the preserved failed cohort, and the
+accuracy protocol.
+
 ## Offline Inference
 
 ### Text-to-image

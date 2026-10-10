@@ -61,13 +61,21 @@ def _ensure_built() -> None:
     with _BUILD_LOCK:
         if _BUILT:
             return
-        from torch.utils.cpp_extension import load
+        from torch.utils.cpp_extension import CUDA_HOME, load
 
         here = os.path.dirname(__file__)
         src = os.path.join(here, "csrc", "a2a_permute.cu")
         site_packages = sysconfig.get_paths()["purelib"]
         nvidia_root = os.path.join(site_packages, "nvidia")
         include_paths = glob.glob(os.path.join(nvidia_root, "*", "include"))
+        toolkit_include = os.path.join(CUDA_HOME, "include") if CUDA_HOME else None
+        if toolkit_include and os.path.isfile(os.path.join(toolkit_include, "cusparse.h")):
+            # cpp_extension adds the toolkit as a system include. A wheel's
+            # core CUDA headers would otherwise precede it and may have a
+            # different minor version than nvcc/CCCL.
+            include_paths = [
+                path for path in include_paths if not os.path.isfile(os.path.join(path, "cuda_runtime_api.h"))
+            ]
         nccl_libs = glob.glob(os.path.join(nvidia_root, "nccl", "lib", "libnccl.so*"))
         if not nccl_libs:
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
