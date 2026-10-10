@@ -1136,3 +1136,90 @@ def test_is_sleeping_for_given_stages():
         assert not await omni.is_sleeping(stage_ids=[0])
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_pause_abort_cancels_pending_submits():
+    """pause_generation(mode="abort") cancels generate() submits stuck on a
+    full request queue, so their admission slots release (#8678)."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = set()
+
+        stuck = asyncio.create_task(asyncio.Event().wait())
+        omni._pending_submits.add(stuck)
+
+        await omni.pause_generation(mode="abort", clear_cache=False)
+
+        with pytest.raises(asyncio.CancelledError):
+            await stuck
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_releases_pending_submit_admission():
+    """sleep() must not wait forever behind a submit suspended on a full
+    queue: the abort-mode cancel releases the slot and sleep proceeds."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = set()
+        omni._admitting = 1
+
+        async def suspended_submit() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(suspended_submit())
+
+        async def release_on_cancel() -> None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                await omni._release_generate_admission()
+                raise
+
+        waiter = asyncio.create_task(release_on_cancel())
+        omni._pending_submits.add(task)
+
+        await asyncio.wait_for(omni.sleep(level=1, mode="abort"), timeout=2)
+        assert omni._admitting == 0
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_add_request_async_suspends_on_full_queue_without_wedging(mocker):
+    """A full request queue suspends the submit coroutine (cancellable), not
+    the event loop thread (#8678)."""
+
+    import janus
+
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    async def run() -> None:
+        engine = object.__new__(AsyncOmniEngine)
+        engine.request_queue = janus.Queue(maxsize=1)
+        engine.request_queue.sync_q.put_nowait(object())
+        engine.prompt_expand_func = None
+        mocker.patch.object(
+            engine,
+            "_build_add_request_message",
+            return_value=SimpleNamespace(request_artifact_dirs=None, original_prompt=None),
+        )
+
+        submit = asyncio.create_task(engine.add_request_async(request_id="req-1", prompt={"prompt": "hi"}))
+        # If this loop turn runs at all, the event loop is not wedged.
+        await asyncio.sleep(0.05)
+        assert not submit.done()
+
+        submit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        # A cancelled put enqueues nothing.
+        assert engine.request_queue.sync_q.qsize() == 1
+
+    asyncio.run(run())
