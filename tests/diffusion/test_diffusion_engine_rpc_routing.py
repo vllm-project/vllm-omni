@@ -228,6 +228,90 @@ async def _consume_final_output(generator):
     return final_output
 
 
+@pytest.mark.asyncio
+async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_cleans_up():
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched import StepScheduler
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    scheduler = StepScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+    engine = _make_engine_with_loop(asyncio.get_running_loop(), scheduler=scheduler, start_loop=False)
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    engine.od_config.streaming_output = True
+    engine.od_config.max_num_seqs = 1
+    engine._streaming_playback = {}
+    calls = []
+
+    def execute(output):
+        request_id = output.scheduled_request_ids[0]
+        calls.append(request_id)
+        chunk = calls.count(request_id)
+        return RunnerOutput(
+            request_id=request_id,
+            step_index=chunk,
+            finished=chunk == 3,
+            result=DiffusionOutput(chunk_index=chunk - 1, finished=chunk == 3),
+            streaming_media_duration=1.0,
+        )
+
+    engine.execute_fn = execute
+    engine._loop_started = True
+    engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
+    engine.worker_thread.start()
+    try:
+        request = OmniDiffusionRequest(
+            request_id="paced",
+            prompt="video",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=3, streaming_buffer_seconds=0.75),
+        )
+        engine.add_request(request)
+        queue = engine._out_streams["paced"]
+        first = await asyncio.wait_for(queue.get(), 2)
+        assert first.chunk_index == 0
+        # A control round-trip must finish even though generation is blocked.
+        await asyncio.wait_for(engine.async_collective_rpc("ping"), 1)
+        assert calls == ["paced"]
+        await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.1))
+        await asyncio.sleep(0.02)
+        assert calls == ["paced"]
+        await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.3))
+        second = await asyncio.wait_for(queue.get(), 2)
+        assert second.chunk_index == 1
+        assert calls == ["paced", "paced"]
+        assert engine._playback_blocked()
+        # Delayed/reordered progress cannot move the playhead backwards.
+        await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.2))
+        assert engine._streaming_playback["paced"].played_seconds == 0.3
+        engine.abort("paced")
+        terminal = await asyncio.wait_for(queue.get(), 2)
+        assert terminal.aborted
+        assert not engine._streaming_playback
+        assert calls == ["paced", "paced"]
+        # An aborted session must not leave the next request paused.
+        engine.add_request(
+            OmniDiffusionRequest(
+                request_id="next",
+                prompt="video",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=3),
+            )
+        )
+        next_queue = engine._out_streams["next"]
+        for _ in range(3):
+            last = await asyncio.wait_for(next_queue.get(), 2)
+        assert last.finished
+        assert calls.count("next") == 3
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.parametrize("position", [True, -1, float("nan"), float("inf"), "1"])
+def test_playback_feedback_rejects_invalid_positions(position):
+    engine = _make_engine_with_loop(None, start_loop=False)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        engine.collective_rpc("update_streaming_playback", args=("missing", position))
+
+
 # ─────────────────────── single-thread invariant ───────────────────────────
 
 

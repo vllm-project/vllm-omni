@@ -104,6 +104,91 @@ def _build_test_app(
     return app, handler, engine_client
 
 
+def test_playback_feedback_reaches_engine_and_releases_next_chunk(mocker: MockerFixture):
+    feedback = asyncio.Event()
+    observed = []
+
+    async def generate(*args, **kwargs):
+        observed.append(kwargs["sampling_params_list"][0].streaming_buffer_seconds)
+        yield OmniRequestOutput.from_diffusion(
+            request_id="video",
+            images=[_fake_video_frames(2)],
+            final_output_type="image",
+            finished=False,
+        )
+        await feedback.wait()
+        yield OmniRequestOutput.from_diffusion(
+            request_id="video",
+            images=[_fake_video_frames(2)],
+            final_output_type="image",
+            finished=True,
+        )
+
+    app, _handler, engine = _build_test_app(
+        mocker=mocker,
+        streaming_chunks=[(b"first", False), (b"last", True)],
+        mock_generate=generate,
+    )
+
+    # Exercise the real stage-parameter propagation instead of this helper's
+    # canned default sampling params.
+    from vllm_omni.entrypoints.openai.stage_params import build_stage_sampling_params_list
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
+        side_effect=build_stage_sampling_params_list,
+    )
+
+    async def update(request_id, position):
+        assert position == 0.25
+        feedback.set()
+
+    engine.update_streaming_playback = mocker.AsyncMock(side_effect=update)
+    with TestClient(app) as client, client.websocket_connect("/v1/realtime/video") as ws:
+        ws.send_json({"type": "session.start", "prompt": "video", "streaming_buffer_seconds": 0.75})
+        start = ws.receive_json()
+        assert start["type"] == "video.start"
+        assert _receive_video_chunk(ws)[1] == b"first"
+        ws.send_json({"type": "session.playback", "position_seconds": -1})
+        assert ws.receive_json()["type"] == "error"
+        engine.update_streaming_playback.assert_not_called()
+        ws.send_json({"type": "session.playback", "position_seconds": 0.25})
+        assert _receive_video_chunk(ws)[1] == b"last"
+        assert ws.receive_json()["type"] == "session.done"
+    assert observed == [0.75]
+    engine.update_streaming_playback.assert_awaited_once_with(start["request_id"], 0.25)
+
+
+def test_disconnect_aborts_while_generation_waits_for_playback(mocker: MockerFixture):
+    aborted = asyncio.Event()
+
+    async def generate(*args, **kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id="video",
+            images=[_fake_video_frames(2)],
+            final_output_type="image",
+            finished=False,
+        )
+        await aborted.wait()
+
+    app, _handler, engine = _build_test_app(
+        mocker=mocker,
+        streaming_chunks=[(b"first", False)],
+        mock_generate=generate,
+    )
+
+    async def abort(request_id):
+        aborted.set()
+
+    engine.abort = mocker.AsyncMock(side_effect=abort)
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime/video") as ws:
+            ws.send_json({"type": "session.start", "prompt": "video", "streaming_buffer_seconds": 0.75})
+            assert ws.receive_json()["type"] == "video.start"
+            assert _receive_video_chunk(ws)[1] == b"first"
+    engine.abort.assert_awaited()
+
+
 class TestStreamingVideoOutputWebSocket:
     """WebSocket protocol tests for streaming generated video output."""
 
@@ -358,7 +443,7 @@ class TestStreamingVideoOutputWebSocket:
                 assert err["type"] == "error"
                 assert error_message in err["message"]
 
-        engine_client.abort.assert_not_called()
+        engine_client.abort.assert_awaited_once()
 
 
 class _MockVideoOutputWebSocket:

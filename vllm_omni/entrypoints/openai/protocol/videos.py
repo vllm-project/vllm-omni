@@ -160,6 +160,14 @@ class VideoGenerationRequest(BaseModel):
         description="Frames per second for output video",
     )
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
+    streaming_buffer_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        le=10,
+        strict=True,
+        allow_inf_nan=False,
+        description="Realtime playback feedback window; requires session.playback updates. May overshoot by one chunk.",
+    )
     aspect_ratio: str | None = Field(
         default=None,
         description=(
