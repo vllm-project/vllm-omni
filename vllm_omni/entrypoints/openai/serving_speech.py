@@ -6,7 +6,6 @@ import base64
 import hashlib
 import io
 import json
-import math
 import os
 import re
 import struct
@@ -1132,7 +1131,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not all(isinstance(x, (int, float)) for x in embedding):
             raise ValueError("'speaker_embedding' must contain only numeric values")
 
-        if not all(math.isfinite(x) for x in embedding):
+        # Check the float32 tensor that gets stored, not the parsed numbers: 1e39 is a
+        # finite float that becomes Inf in float32, and an integer too large for a float
+        # raises OverflowError, which the route would report as a 500.
+        try:
+            tensor = torch.tensor([float(x) for x in embedding], dtype=torch.float32)
+        except OverflowError:
+            tensor = None
+        if tensor is None or not bool(torch.isfinite(tensor).all()):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
 
         emb_dim = len(embedding)
@@ -1150,7 +1156,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sanitized_consent = _sanitize_filename(consent)
             timestamp = self._next_upload_timestamp()
 
-            tensor = torch.tensor(embedding, dtype=torch.float32)
             filename = f"{sanitized_name}_{sanitized_consent}_{timestamp}.safetensors"
             file_path = self.uploaded_speakers_dir / filename
             if not _validate_path_within_directory(file_path, self.uploaded_speakers_dir):
