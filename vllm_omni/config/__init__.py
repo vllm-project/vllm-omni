@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Configuration module for vLLM-Omni.
 """
@@ -10,6 +13,7 @@ from vllm_omni.config.omni_config import (
     OmniStageConnectorConfig,
     OmniStageDiffusionParallelConfig,
     OmniStageLoadConfig,
+    OmniStageLoRAConfig,
     OmniStageModelConfig,
     OmniStageParallelConfig,
     OmniStageRuntimeConfig,
@@ -69,6 +73,7 @@ __all__ = [
     "OmniStageConnectorConfig",
     "OmniStageDiffusionParallelConfig",
     "OmniStageLoadConfig",
+    "OmniStageLoRAConfig",
     "OmniStageModelConfig",
     "VllmOmniOrchestratorConfig",
     "OmniStageParallelConfig",

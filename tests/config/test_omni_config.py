@@ -20,6 +20,7 @@ from transformers import Qwen3OmniMoeConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import LoadConfig as VllmLoadConfig
+from vllm.config import LoRAConfig as VllmLoRAConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
@@ -33,6 +34,7 @@ from vllm_omni.config.omni_config import (
     OmniStageConnectorConfig,
     OmniStageDiffusionParallelConfig,
     OmniStageLoadConfig,
+    OmniStageLoRAConfig,
     OmniStageModelConfig,
     OmniStageParallelConfig,
     OmniStageRuntimeConfig,
@@ -355,20 +357,20 @@ def test_diffusion_cli_parallel_overrides_beat_nested_deploy_parallel_config():
 @pytest.mark.parametrize(
     "cli_overrides",
     [
-        {"enable_lora": True},
-        {"stage_0_enable_lora": True},
+        {"cpu_offload_gb": 4},
+        {"stage_0_cpu_offload_gb": 4},
     ],
     ids=["global", "stage-scoped"],
 )
 def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_overrides):
-    with pytest.raises(ValueError, match=r"no structured config owner: enable_lora"):
+    with pytest.raises(ValueError, match=r"no structured config owner: cpu_offload_gb"):
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
 
 
 @pytest.mark.parametrize(
     ("engine_extras", "unowned_field"),
     [
-        ({"enable_lora": True}, "enable_lora"),
+        ({"cpu_offload_gb": 4}, "cpu_offload_gb"),
         ({"parallel_config": {"cfg_parallel_size": 2}}, "parallel_config.cfg_parallel_size"),
     ],
     ids=["top-level", "nested-parallel-config"],
@@ -417,6 +419,139 @@ def test_model_cli_fields_reach_typed_engine_args(monkeypatch):
     engine_args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model="test-model")
 
     assert {field: engine_args.get(field) for field in _MODEL_CLI_FLAGS} == _MODEL_CLI_FLAGS
+
+
+_LORA_ENGINE_ARGS = {"enable_lora": True, "max_lora_rank": 64, "max_loras": 2, "lora_target_modules": ["o_proj"]}
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_tts", "bagel"])
+@pytest.mark.parametrize("source", ["stage-cli", "deploy-engine-extras", "deploy-yaml"])
+def test_stage_scoped_llm_lora_fields_build_typed_lora_config(model_type, source, tmp_path: Path):
+    pipeline = _resolve_pipeline_or_skip(model_type)
+    if source == "stage-cli":
+        config = VllmOmniConfig.from_pipeline_config(
+            pipeline, cli_overrides={f"stage_0_{name}": value for name, value in _LORA_ENGINE_ARGS.items()}
+        )
+    elif source == "deploy-engine-extras":
+        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras=dict(_LORA_ENGINE_ARGS))])
+        config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    else:
+        deploy_path = tmp_path / f"{model_type}_lora.yaml"
+        deploy_path.write_text(
+            f"""\
+pipeline: {model_type}
+stages:
+  - stage_id: 0
+    enable_lora: true
+    max_lora_rank: 64
+    max_loras: 2
+    lora_target_modules: [o_proj]
+"""
+        )
+        assert load_deploy_config(deploy_path).stages[0].engine_extras["enable_lora"] is True
+        config = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=str(deploy_path))
+
+    lora_config = config.stage_by_id(0).lora_config
+    assert isinstance(lora_config, OmniStageLoRAConfig)
+    assert lora_config.max_lora_rank == 64
+    assert lora_config.max_loras == 2
+    assert lora_config.target_modules == ["o_proj"]
+    assert lora_config._omni_explicit_fields == {"max_lora_rank", "max_loras", "target_modules"}
+    # vLLM resolves max_cpu_loras from max_loras in the engine process.
+    assert lora_config.max_cpu_loras is None
+    assert all(stage.lora_config is None for stage in config.stage_configs if stage.stage_id != 0)
+    if model_type == "bagel":
+        assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 1
+
+
+def test_global_llm_lora_fields_apply_to_single_stage_pipeline():
+    pipeline = PipelineConfig(
+        model_type="single_stage",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="stage", final_output=True),),
+    )
+
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        cli_overrides={"enable_lora": True, "max_lora_rank": 64, "max_loras": 2, "max_cpu_loras": 4},
+    )
+
+    lora_config = config.stage_by_id(0).lora_config
+    assert isinstance(lora_config, OmniStageLoRAConfig)
+    assert (lora_config.max_lora_rank, lora_config.max_loras, lora_config.max_cpu_loras) == (64, 2, 4)
+    assert lora_config._omni_explicit_fields == {"max_lora_rank", "max_loras", "max_cpu_loras"}
+
+
+@pytest.mark.parametrize(
+    ("model_type", "cli_overrides"),
+    [
+        ("qwen3_tts", {"enable_lora": True}),
+        ("qwen3_tts", {"max_lora_rank": 64}),
+        ("qwen3_tts", {"max_cpu_loras": 4}),
+        ("bagel", {"enable_lora": True}),
+        ("bagel", {"max_lora_rank": 64}),
+    ],
+)
+def test_global_llm_lora_fields_rejected_on_multi_stage_pipelines(model_type, cli_overrides):
+    with pytest.raises(ValueError, match=r"set vLLM LoRA argument\(s\).*--stage-overrides"):
+        _from_pipeline_key(model_type, cli_overrides=cli_overrides)
+
+
+def test_global_max_cpu_loras_keeps_diffusion_meaning_on_mixed_pipeline():
+    config = _from_pipeline_key("bagel", cli_overrides={"max_cpu_loras": 4})
+    assert config.stage_by_id(0).lora_config is None
+    assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 4
+
+    # The AR stage sizes its vLLM LoRA cache only from stage-scoped keys.
+    config = _from_pipeline_key(
+        "bagel", cli_overrides={"max_cpu_loras": 1, "stage_0_enable_lora": True, "stage_0_max_loras": 2}
+    )
+    assert config.stage_by_id(0).lora_config.max_cpu_loras is None
+    assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 1
+
+    config = _from_pipeline_key(
+        "bagel", cli_overrides={"max_cpu_loras": 1, "stage_0_enable_lora": True, "stage_0_max_cpu_loras": 4}
+    )
+    assert config.stage_by_id(0).lora_config.max_cpu_loras == 4
+    assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 1
+
+    config = _from_pipeline_key("bagel", cli_overrides={"stage_1_max_cpu_loras": 5})
+    assert config.stage_by_id(0).lora_config is None
+    assert config.stage_by_id(1).diffusion_config.max_cpu_loras == 5
+
+
+def test_llm_lora_options_without_enable_lora_are_ignored():
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+
+    for cli_overrides in ({"stage_0_max_lora_rank": 64}, {"stage_0_enable_lora": False, "stage_0_max_lora_rank": 64}):
+        config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides=cli_overrides)
+        assert config.stage_by_id(0).lora_config is None
+
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras=dict(_LORA_ENGINE_ARGS))])
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline, user_deploy_config=deploy, cli_overrides={"stage_0_enable_lora": False}
+    )
+    assert config.stage_by_id(0).lora_config is None
+
+
+def test_vllm_lora_fields_rejected_on_diffusion_stage():
+    with pytest.raises(ValueError, match="enable_lora"):
+        _from_pipeline_key("bagel", cli_overrides={"stage_1_enable_lora": True})
+
+
+def test_omni_stage_lora_config_validates_without_resolving_deferred_fields(monkeypatch):
+    with pytest.raises(ValueError):
+        OmniStageLoRAConfig(max_lora_rank=48)
+    with pytest.raises(ValueError, match="must be >= max_loras"):
+        OmniStageLoRAConfig(max_loras=4, max_cpu_loras=2)
+    assert OmniStageLoRAConfig(max_cpu_loras=0).max_cpu_loras == 0
+
+    lora_config = OmniStageLoRAConfig()
+    assert lora_config.max_cpu_loras is None
+    assert lora_config._omni_explicit_fields == frozenset()
+
+    # Platform and env checks belong to the engine process.
+    monkeypatch.setenv("VLLM_LORA_ENABLE_DUAL_STREAM", "1")
+    assert OmniStageLoRAConfig(fully_sharded_loras=True).fully_sharded_loras is True
 
 
 @pytest.mark.parametrize("stage_id", [0, 2], ids=["ar", "generation"])
@@ -548,8 +683,8 @@ def test_from_pipeline_config_keeps_global_kv_cache_dtype_outside_diffusion_stag
 def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are_merged():
     assert omni_config_module._stage_cli_overrides(
         0,
-        {"enable_lora": True},
-    ) == {"enable_lora": True}
+        {"cpu_offload_gb": 4},
+    ) == {"cpu_offload_gb": 4}
 
 
 @pytest.mark.parametrize(
@@ -715,6 +850,7 @@ def test_public_config_exports_use_stage_specific_sub_config_names():
         "OmniStageConnectorConfig",
         "OmniStageDiffusionParallelConfig",
         "OmniStageLoadConfig",
+        "OmniStageLoRAConfig",
         "OmniStageModelConfig",
         "VllmOmniOrchestratorConfig",
         "OmniStageParallelConfig",
@@ -964,6 +1100,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "connector_config",
         "runtime_config",
         "parallel_config",
+        "lora_config",
         "compilation_config",
         "profiler_config",
         "quantization_config",
@@ -1114,6 +1251,8 @@ def test_sub_config_fields_match_structured_scopes():
         "output_connectors",
         "input_connectors",
     }
+    assert issubclass(OmniStageLoRAConfig, VllmLoRAConfig)
+    assert {f.name for f in fields(OmniStageLoRAConfig)} == {f.name for f in fields(VllmLoRAConfig)}
     vllm_parallel_fields = {f.name for f in fields(VllmParallelConfig)}
     assert issubclass(OmniStageParallelConfig, VllmParallelConfig)
     assert {f.name for f in fields(OmniStageParallelConfig)} == vllm_parallel_fields
@@ -1157,6 +1296,7 @@ def test_inherited_sub_configs_initialize_transport_safe_derived_fields():
         OmniStageLoadConfig,
         OmniStageCacheConfig,
         OmniStageSchedulerConfig,
+        OmniStageLoRAConfig,
         OmniStageParallelConfig,
         OmniStageDiffusionParallelConfig,
     ],
@@ -1174,6 +1314,7 @@ def test_inherited_sub_configs_are_keyword_only(config_cls):
         OmniStageLoadConfig,
         OmniStageCacheConfig,
         OmniStageSchedulerConfig,
+        OmniStageLoRAConfig,
         OmniStageParallelConfig,
         OmniStageDiffusionParallelConfig,
     ],

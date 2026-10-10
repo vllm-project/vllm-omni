@@ -47,10 +47,12 @@ schema source for AR and generation stages:
 - `OmniStageCacheConfig` inherits `vllm.config.CacheConfig`.
 - `OmniStageSchedulerConfig` inherits `vllm.config.SchedulerConfig`.
 - `OmniStageParallelConfig` inherits `vllm.config.ParallelConfig`.
+- `OmniStageLoRAConfig` inherits `vllm.config.LoRAConfig`; like
+  `VllmConfig.lora_config`, a stage carries it only when `enable_lora` is set.
 
-This inheritance preserves the existing load, cache, scheduler, and parallel
-concern boundaries while reducing duplicate downstream declarations. It does
-not, by itself, make every inherited field an effective vLLM-Omni runtime
+This inheritance preserves the existing load, cache, scheduler, parallel, and
+LoRA concern boundaries while reducing duplicate downstream declarations. It
+does not, by itself, make every inherited field an effective vLLM-Omni runtime
 option. Construction and runtime consumption are separate surfaces:
 
 | Surface | Current behavior |
@@ -61,19 +63,21 @@ option. Construction and runtime consumption are separate surfaces:
 | Terminal materialization | The engine-owning process constructs the final upstream `VllmConfig` and performs model-, platform-, rank-, port-, and backend-dependent initialization. |
 
 The generated projection maps include known upstream naming differences such
-as `cache_dtype` to `kv_cache_dtype`, `policy` to `scheduling_policy`, and
-`data_parallel_master_ip` to `data_parallel_address`. A field added to both an
-upstream concern config and `EngineArgs` therefore enters the AR/generation
-projection without requiring a second downstream allowlist. Explicit inherited
-fields that have no projection raise an error rather than being silently
-dropped.
+as `cache_dtype` to `kv_cache_dtype`, `policy` to `scheduling_policy`,
+`data_parallel_master_ip` to `data_parallel_address`, and `target_modules` to
+`lora_target_modules`. A field added to both an upstream concern config and
+`EngineArgs` therefore enters the AR/generation projection without requiring a
+second downstream allowlist. Explicit inherited fields that have no projection
+raise an error rather than being silently dropped.
 
 Ownership exclusions remain deliberate. Stage topology owns `scheduler_cls`,
 cache owns `disable_hybrid_kv_cache_manager`, and Omni runtime owns
 `distributed_executor_backend` and `worker_cls`; vLLM's private API-process
-fields are terminal internals. These exclusions prevent one input from being
-constructed or projected through two config concerns. Effective-engine-argument
-tests cover both the dynamic mapping and this exclusion boundary.
+fields are terminal internals. vLLM LoRA inputs are owned only by AR and
+generation stages, while diffusion stages keep their own LoRA fields on
+`diffusion_config`. These exclusions prevent one input from being constructed
+or projected through two config concerns. Effective-engine-argument tests cover
+both the dynamic mapping and this exclusion boundary.
 
 `CompilationConfig` and `ProfilerConfig` are direct structured-stage fields:
 `stage.compilation_config` and `stage.profiler_config`. They accept mapping/YAML

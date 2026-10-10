@@ -325,6 +325,35 @@ From highest to lowest:
 4. Overlay YAML (via `base_config:`) on top of the base YAML
 5. Parser defaults
 
+### vLLM LoRA on LLM stages
+
+AR and generation stage entries accept vLLM's LoRA engine options, such as
+`enable_lora`, `max_lora_rank`, `max_loras`, `max_cpu_loras`,
+`lora_target_modules`, and `fully_sharded_loras`. As in vLLM, the other options
+take effect only on a stage that also sets `enable_lora: true`.
+
+```yaml
+stages:
+  - stage_id: 0
+    enable_lora: true
+    max_lora_rank: 64
+```
+
+The equivalent CLI and Python forms are
+`--stage-overrides '{"0": {"enable_lora": true, "max_lora_rank": 64}}'` and
+`Omni(model, stage_overrides={"0": {"enable_lora": True, "max_lora_rank": 64}})`.
+
+- Top-level `--enable-lora` (or `enable_lora=True`) works only on single-stage
+  pipelines. Multi-stage pipelines reject global vLLM LoRA options and must use
+  stage-scoped keys, including in the stage-based / `--headless` CLI, where each
+  process resolves the whole pipeline.
+- `AsyncOmni.generate(..., lora_request=...)` applies the adapter on stage 0.
+- Diffusion stages reject `enable_lora` and configure LoRA through `lora_path`,
+  `lora_scale`, and `lora_backend` instead; see [Diffusion LoRA](../user_guide/diffusion/lora.md).
+- `max_cpu_loras` sizes the CPU LoRA cache of whichever stage type receives it.
+  A global value on a pipeline with a diffusion stage sizes only the diffusion
+  cache; set an LLM stage's value with a stage-scoped key.
+
 ### Worked override example
 
 Starting from the bundled `vllm_omni/deploy/qwen3_omni_moe.yaml`:
