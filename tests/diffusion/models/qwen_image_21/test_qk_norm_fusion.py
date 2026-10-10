@@ -18,6 +18,10 @@ def test_cpu_declines_fused_reduction():
 
 @pytest.mark.gpu
 @pytest.mark.cuda
+@pytest.mark.skipif(
+    torch.version.hip is not None or not str(torch.__version__).startswith("2.13."),
+    reason="The exact ATen reduction fast path requires CUDA PyTorch 2.13",
+)
 @pytest.mark.parametrize("sequence", [880, 911, 913, 914])
 @torch.no_grad()
 def test_strided_qkv_matches_original_rms_and_complex_rope(sequence):
