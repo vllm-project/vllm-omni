@@ -159,11 +159,11 @@ def test_bagel_step_preprocessor_buckets_effective_img2img_sizes(tmp_path):
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
             request_id=request_id,
         )
-        for request_id, size in (("a", (800, 400)), ("b", (1024, 512)))
+        for request_id, size in (("a", (800, 600)), ("b", (1024, 512)))
     ]
     first, second = (pre_process(request) for request in requests)
 
-    assert (first.sampling_params.height, first.sampling_params.width) == (400, 800)
+    assert (first.sampling_params.height, first.sampling_params.width) == (608, 800)
     assert (second.sampling_params.height, second.sampling_params.width) == (512, 1024)
 
     scheduler = StepScheduler()
@@ -203,7 +203,7 @@ def test_bagel_pre_process_aligns_source_derived_canvas_for_size_auto(tmp_path):
 
     pre_process(request)
 
-    assert (request.sampling_params.height, request.sampling_params.width) == (704, 496)
+    assert (request.sampling_params.height, request.sampling_params.width) == (720, 512)
     assert not _bagel_canvas_requested(request.sampling_params)
 
 
@@ -213,7 +213,7 @@ def test_bagel_pre_process_derives_canvas_when_caller_asked_for_none(tmp_path):
 
     pre_process(request)
 
-    assert (request.sampling_params.height, request.sampling_params.width) == (400, 800)
+    assert (request.sampling_params.height, request.sampling_params.width) == (512, 1024)
     assert (request.sampling_params.height_not_provided, request.sampling_params.width_not_provided) == (True, True)
     assert not _bagel_canvas_requested(request.sampling_params)
 
