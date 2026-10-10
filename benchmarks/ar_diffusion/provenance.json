@@ -1,0 +1,33 @@
+{
+  "source": "Physis-AI/WaveServe-dev PR #12",
+  "source_commit": "47f6f173cad4a5eb67fe70d73408c5b81a1aa914",
+  "source_url": "https://github.com/Physis-AI/WaveServe-dev/tree/47f6f173cad4a5eb67fe70d73408c5b81a1aa914/benchmark/legacy_tick",
+  "retained_source_files": [
+    {
+      "file": "horizontal_kv_ipc.py",
+      "sha256": "6a61d71f2af4a79f6e010e23fb5b175a14eea4be593e1e47005709087c772ab4",
+      "retained": "IPC handshake, ready/release tickets and exporter/importer lifetime fences"
+    },
+    {
+      "file": "horizontal_kv_round.py",
+      "sha256": "0e64c628b1dec162b678f1261622530f39f865078e80dedbb15485eed8f4e5df",
+      "retained": "Deterministic overlapped producer-tick NCCL rounds and allocator stream fences"
+    },
+    {
+      "file": "kv_ipc.py",
+      "sha256": "b4eaf52a1cc949690a26bffc79f441216bc6f1f1468c3e73ff643d1f4abd92f5",
+      "retained": "CUDA driver copy, stream flag and gather helpers"
+    }
+  ],
+  "adaptations": [
+    "Consolidate only the exercised hybrid path into hybrid_transport.py; remove generic managers and alternative policies",
+    "Layer-major native attention pools; CUDA Python 13 IPC handle compatibility",
+    "Derive per-block reads and recipients directly from native ChunkPlan; no second scheduling implementation",
+    "Allocate only the selected variant KV pool, dropping the unused native pool from hybrid runs"
+  ],
+  "submitted_files": {
+    "block_plan.py": "5bbb611461967f3ef090cb0b0e18998ff215630c93b7d7b9adc70975f57b41ca",
+    "hybrid_transport.py": "25513eb228b9f6913163fe5a93bb2933fe3b3b816142389caa7392362e9e41fa",
+    "hybrid_kv.py": "ac6cab51e929786ff2168042888573298b74bca71af498b1fcb296ea879bda56"
+  }
+}
