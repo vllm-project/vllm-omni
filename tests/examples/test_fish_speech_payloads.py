@@ -50,3 +50,19 @@ def test_payload_store_is_safe_for_concurrent_store_and_consume():
     assert sorted(item["input"] for item in results if item is not None) == sorted(str(i) for i in range(64))
     assert store.consume("") is None
     assert store.consume(None) is None
+
+
+def test_payload_store_interleaves_consumers_at_capacity():
+    store = _payload_store_class()(ttl=60, cap=8)
+    consumed = []
+
+    def store_and_consume(index):
+        request_id = store.store({"input": str(index)})
+        value = store.consume(request_id)
+        if value is not None:
+            consumed.append(value["input"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(store_and_consume, range(64)))
+
+    assert sorted(consumed) == sorted(str(i) for i in range(64))

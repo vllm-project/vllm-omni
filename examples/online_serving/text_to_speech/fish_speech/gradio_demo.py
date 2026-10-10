@@ -509,8 +509,8 @@ class PayloadStore:
     def store(self, payload: dict) -> str:
         if not isinstance(payload, dict):
             raise TypeError("payload must be an object")
-        now = time.monotonic()
         with self._lock:
+            now = time.monotonic()
             self._cleanup_locked(now)
             while len(self._items) >= self.cap:
                 oldest = min(self._items, key=lambda key: self._items[key][0])
@@ -522,8 +522,8 @@ class PayloadStore:
     def consume(self, req_id: str) -> dict | None:
         if not isinstance(req_id, str) or not req_id:
             return None
-        now = time.monotonic()
         with self._lock:
+            now = time.monotonic()
             pending = self._items.pop(req_id, None)
             if pending is None or pending[0] <= now:
                 return None
