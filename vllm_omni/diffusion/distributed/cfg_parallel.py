@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -88,6 +90,48 @@ class CFGParallelMixin(metaclass=ABCMeta):
         and set self.scheduler to a composite scheduler that handles tuples.
     """
 
+    @property
+    def current_step_index(self) -> int | None:
+        return getattr(self, "_current_step_index", None)
+
+    @property
+    def current_sigma(self) -> float | torch.Tensor | None:
+        return getattr(self, "_current_sigma", None)
+
+    @contextmanager
+    def _cache_step_metadata(self, step_index: int, num_timesteps: int) -> Iterator[None]:
+        """Expose the scheduler's actual sigma while cache hooks run."""
+        if not callable(getattr(self, "_cache_context_factory", None)):
+            yield
+            return
+
+        self._current_step_index: int | None = step_index
+        self._num_timesteps = num_timesteps
+        try:
+            # Before the first scheduler step, begin_index includes any
+            # img2img strength offset. Later steps use the scheduler's cursor.
+            scheduler = getattr(self, "scheduler", None)
+            sigma_index = getattr(scheduler, "step_index", None)
+            if sigma_index is None:
+                sigma_index = (getattr(scheduler, "begin_index", None) or 0) + step_index
+            sigmas = getattr(scheduler, "sigmas", None)
+            self._current_sigma = sigmas[sigma_index] if sigmas is not None else None
+            yield
+        finally:
+            self._current_step_index = None
+            self._current_sigma = None
+
+    def _predict_noise_with_cache_context(self, context_name: str, model_kwargs: dict[str, Any] | None):
+        # Only require kwargs for the branch executed on this rank.
+        assert model_kwargs is not None
+        context_factory = getattr(self, "_cache_context_factory", None)
+        # Cosmos3 owns explicitly named contexts in its predict_noise override,
+        # including transfer branches beyond ordinary cond/uncond CFG.
+        if not callable(context_factory) or "_cache_context" in model_kwargs:
+            return self.predict_noise(**model_kwargs)
+        with context_factory(context_name):
+            return self.predict_noise(**model_kwargs)
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -130,10 +174,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 # Each rank computes one branch
                 if cfg_rank == 0:
                     logger.debug("CFG Parallel: Rank 0 computing positive branch")
-                    local_pred = _wrap(self.predict_noise(**positive_kwargs))
+                    local_pred = _wrap(self._predict_noise_with_cache_context("cond", positive_kwargs))
                 else:
                     logger.debug("CFG Parallel: Rank %d computing negative branch", cfg_rank)
-                    local_pred = _wrap(self.predict_noise(**negative_kwargs))
+                    local_pred = _wrap(self._predict_noise_with_cache_context("uncond", negative_kwargs))
 
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
@@ -153,8 +197,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
             else:
                 # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
-                negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
+                positive_noise_pred = _wrap(self._predict_noise_with_cache_context("cond", positive_kwargs))
+                negative_noise_pred = _wrap(self._predict_noise_with_cache_context("uncond", negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -169,7 +213,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**positive_kwargs)
+            pred = self._predict_noise_with_cache_context("cond", positive_kwargs)
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
