@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 import websockets
 import yaml
+from websockets.exceptions import ConnectionClosed
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
 from tests.helpers.mark import hardware_test
@@ -474,6 +475,36 @@ def _assert_realtime_accuracy(
     )
 
 
+async def _conformance_recv_until(ws, predicate, collected=None, *, timeout_s=120):
+    events = collected if collected is not None else []
+
+    async def _loop():
+        while not predicate(events):
+            raw = await ws.recv()
+            if isinstance(raw, bytes):
+                continue
+            event = json.loads(raw)
+            events.append(event)
+            if event.get("type") == "error":
+                err = event.get("error", event)
+                if err.get("type") == "server_error":
+                    raise AssertionError(f"Server error: {event}")
+
+    await asyncio.wait_for(_loop(), timeout=timeout_s)
+    return events
+
+
+def _conformance_events_of_type(events, t):
+    return [e for e in events if e.get("type") == t]
+
+
+async def _conformance_open_session(host, port, model):
+    ws = await websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024)
+    await ws.send(json.dumps({"type": "session.update", "session": {"type": "realtime", "model": model}}))
+    events = await _conformance_recv_until(ws, lambda evts: any(e["type"] == "session.updated" for e in evts))
+    return ws, events
+
+
 class TestQwen3OmniRealtimeWebSocket:
     @pytest.fixture(scope="class")
     def omni_server(self, request, run_level):
@@ -661,6 +692,91 @@ class TestQwen3OmniRealtimeWebSocket:
 
         _assert_realtime_smoke(result)
         _assert_realtime_accuracy(result)
+
+    # -- Protocol conformance --------------------------------------------- #
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_session_lifecycle_events(self, omni_server) -> None:
+        """session.created must precede session.updated; both appear exactly once."""
+
+        async def _run():
+            ws, events = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                created = _conformance_events_of_type(events, "session.created")
+                updated = _conformance_events_of_type(events, "session.updated")
+                assert len(created) == 1
+                assert len(updated) == 1
+                ci = next(i for i, e in enumerate(events) if e["type"] == "session.created")
+                ui = next(i for i, e in enumerate(events) if e["type"] == "session.updated")
+                assert ci < ui, "session.created must precede session.updated"
+                assert "id" in created[0].get("session", {})
+
+        asyncio.run(_run())
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_empty_commit_returns_error(self, omni_server) -> None:
+        """Committing an empty audio buffer must return an error event."""
+
+        async def _run():
+            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                events = await _conformance_recv_until(
+                    ws, lambda evts: any(e["type"] == "error" for e in evts), timeout_s=30
+                )
+                errors = _conformance_events_of_type(events, "error")
+                assert errors
+                assert "empty" in json.dumps(errors[0]).lower()
+
+        asyncio.run(_run())
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_graceful_session_close(self, omni_server) -> None:
+        """session.close must cleanly end the session."""
+
+        async def _run():
+            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            await ws.send(json.dumps({"type": "session.close"}))
+            events: list[dict] = []
+            try:
+                await _conformance_recv_until(
+                    ws, lambda evts: any(e["type"] == "session.closed" for e in evts), timeout_s=15
+                )
+            except (ConnectionClosed, TimeoutError):
+                pass
+            else:
+                assert len(_conformance_events_of_type(events, "session.closed")) == 1
+            ws2, events2 = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws2:
+                assert _conformance_events_of_type(events2, "session.created")
+
+        asyncio.run(_run())
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_abnormal_disconnect_no_leak(self, omni_server) -> None:
+        """An abrupt disconnect must not prevent opening a new session."""
+
+        async def _run():
+            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            await ws.close()
+            await asyncio.sleep(2)
+            ws2, events2 = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws2:
+                assert len(_conformance_events_of_type(events2, "session.created")) == 1
+
+        asyncio.run(_run())
 
 
 # These regressions use the engine-owned Qwen duplex plugin. The older class
