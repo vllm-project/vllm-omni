@@ -39,8 +39,7 @@ Install the optional CUDA 13 extra:
 pip install 'vllm-omni[fa4]'
 ```
 
-Version `4.0.0b18` is required; earlier beta wheels had known JIT failures on
-Blackwell. On Blackwell, `FLASH_ATTN` is FA4 only: Hopper-only FA2/FA3
+The extra pins `4.0.0b33`. On Blackwell, `FLASH_ATTN` is FA4 only: Hopper-only FA2/FA3
 wheels are not used, even if they import. If FA4 is missing, explicit
 `FLASH_ATTN` is rejected and automatic selection continues to other
 Blackwell backends.

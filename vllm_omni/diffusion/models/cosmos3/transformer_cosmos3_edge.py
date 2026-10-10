@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 Edge transformer variant with a Nemotron dense UND backbone."""
 
 from __future__ import annotations
@@ -150,6 +150,8 @@ class Cosmos3EdgeCausalAttention(nn.Module):
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=True,
+            role="cosmos3.und",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
             skip_sequence_parallel=True,
