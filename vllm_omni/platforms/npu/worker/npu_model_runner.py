@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import inspect
 from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
@@ -24,6 +25,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
+from vllm_omni.platforms.npu.native_rejection_sampler import restore_native_rejection_sampler
 from vllm_omni.platforms.npu.worker.aux_output import NPUAuxOutputMixin
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -41,8 +43,15 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
         self, kv_cache_config, kv_cache_allocation_context: AbstractContextManager | None = None
     ) -> None:
         """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
+        # vllm-ascend's override only grew the ``kv_cache_allocation_context``
+        # parameter on the 0.30 line; probe the signature so one omni build
+        # drives both the 0.29 and the 0.30 vllm-ascend.
+        params = inspect.signature(NPUModelRunner.initialize_kv_cache).parameters
+        accepts_ctx = "kv_cache_allocation_context" in params
         NPUModelRunner.initialize_kv_cache(
-            self, kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context
+            self,
+            kv_cache_config,
+            **({"kv_cache_allocation_context": kv_cache_allocation_context} if accepts_ctx else {}),
         )
         self._init_omni_aux_output(kv_cache_config)
         if getattr(self, "_omni_prefix_cache_cfg", None) is None:
@@ -76,6 +85,13 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
 
             apply_model_patches(self.model_config)
         NPUModelRunner.load_model(self, *args, **kwargs)
+        # Before the first request verifies a draft: on 910_93 the patched
+        # Triton rejection kernels fault their warmup (skipped) and would be
+        # JIT-compiled mid-request otherwise, stalling every stage. See
+        # native_rejection_sampler for the chain. The runner's own config is
+        # passed because vLLM's set_current_vllm_config context only wraps
+        # its own load_model call, which has already returned here.
+        restore_native_rejection_sampler(self.vllm_config)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
@@ -479,6 +495,71 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
             **model_kwargs_extra,
         }
         run_model = partial(self.model, **model_inputs)
+
+        # K-step (Talker multi-frame decode). A decode step that schedules K
+        # positions per request belongs to ``talker_multiframe``: it replays a
+        # captured decode graph once per frame and samples one codec frame per
+        # replay. The one-query path writes each frame's embedding straight into
+        # the buffer the graph reads; the wide path refreshes the per-frame
+        # inputs instead. Everything else (prefill, a mixed step, another stage)
+        # falls through to the ordinary single-forward path below.
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.applies(self.model, model_kwargs_extra)
+        if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):
+            # Falling through here would sample one frame from the last row of
+            # each span and report one stop row for a step that needs one per
+            # position: wrong codec tokens and wrong scheduler accounting, both
+            # silently. The preceding gate log says which check refused.
+            raise RuntimeError(
+                "MiniCPM-o scheduled a multi-token decode step that the multi-frame "
+                "loop declined; see the preceding '[minicpmo] multi-frame Talker "
+                "decode not engaged' line"
+            )
+        if frames > 1:
+            spans = [(int(start), int(end)) for start, end in model_kwargs_extra["request_token_spans"]]
+            narrow = talker_multiframe.begin_narrow_step(
+                runner=self,
+                forward_context=forward_context,
+                frames=frames,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                spans=spans,
+            )
+            graph_tokens = len(spans) if narrow is not None else num_tokens_padded
+            try:
+                model_output = talker_multiframe.run(
+                    model=self.model,
+                    run_model=run_model,
+                    after_forward=lambda: self._update_full_graph_params_if_needed(forward_context, graph_tokens),
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    frames=frames,
+                    model_kwargs=model_kwargs,
+                    model_kwargs_extra=model_kwargs_extra,
+                    narrow=narrow,
+                )
+            finally:
+                talker_multiframe.end_narrow_step(forward_context, narrow)
+            # The vocab gate the multi-frame path needs, applied here because
+            # this is the wrapper the K-step runs through. The Talker's
+            # vLLM-level head is the two-wide continue/stop row, but input_batch
+            # reports vocab_size=0, and the rejection sampler's parse_output
+            # then masks every accepted token as out-of-vocab: the request comes
+            # back with nothing, the scheduler never rolls back the K tokens it
+            # advanced, and the next steps schedule a negative count -- the
+            # engine hangs right after the first 'engaged' step. Single-frame
+            # steps never took the branch that reads vocab_size; only the K-step
+            # does. The gate takes only "not None" from this argument: the width
+            # it writes is the two-wide stop row, never the width of whatever
+            # tensor it is handed.
+            stop_rows = getattr(self.model, "batch_stop_logits", None)
+            talker_multiframe.ensure_stop_token_vocab(
+                self,
+                stop_rows if stop_rows is not None else model_output.text_hidden_states,
+            )
+            self._omni_last_model_output = model_output
+            return model_output
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait.

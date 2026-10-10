@@ -370,6 +370,9 @@ def tts2code2wav_async_chunk(
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    # One window size for every payload. A separate smaller first window
+    # (initial_codec_chunk_frames) used to shorten the first payload, but with
+    # the steady window itself at 25 frames it only added a seam.
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:

@@ -454,6 +454,10 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
     expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    if deploy_name == "minicpmo_4_5":
+        # Single-card deploy: batch sizes round up to a capture bucket so the
+        # 32-entry pool covers the shape space.
+        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected
@@ -967,6 +971,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "compilation_config",
         "profiler_config",
         "quantization_config",
+        # Stage-level speculative_config is passed straight through to the
+        # engine: the Talker K-step block is read by the engine, not unpacked
+        # structurally like the other stage configs.
+        "speculative_config",
     }
     assert "diffusion_config" not in public_fields
     assert {f.name for f in fields(VllmOmniDiffusionStageConfig)} == public_fields | {"diffusion_config"}

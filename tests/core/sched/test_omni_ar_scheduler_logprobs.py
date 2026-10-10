@@ -131,7 +131,12 @@ class _RequestQueue(list):
 
 def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     """Build a minimal stub for OmniARScheduler.update_from_output()."""
+    # update_from_output gates its K-step empty-row rollback on
+    # _talker_kstep_armed (omni_ar_scheduler.py); the stub models an
+    # un-armed scheduler so the rollback branch stays out of these
+    # generic logprob-behavior tests.
     scheduler = SimpleNamespace(
+        _talker_kstep_armed=lambda: False,
         perf_metrics=None,
         connector=None,
         aux_output_connector=None,

@@ -38,6 +38,7 @@ from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -1423,13 +1424,58 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
-                if getattr(self.model, "requires_request_sample_eligibility", False):
+                if requires_request_sample_eligibility(self.model):
                     model_kwargs_extra["request_sample_eligible"] = [
                         bool(
                             (req := self.requests.get(req_id)) is not None
                             and int(req.num_computed_tokens) + int(nstp[req_index]) >= int(req.num_tokens)
                         )
                         for req_index, req_id in enumerate(self.input_batch.req_ids)
+                    ]
+                    # Effective per-request sampling params (stage defaults
+                    # merged with request overrides) for in-model sampling
+                    # paths, so the K-step codec sampler keeps the
+                    # single-frame configuration contract. Same order as
+                    # request_sample_eligible / request_token_spans.
+                    model_kwargs_extra["request_sampling_params"] = [
+                        req.sampling_params if (req := self.requests.get(req_id)) is not None else None
+                        for req_id in self.input_batch.req_ids
+                    ]
+                    # Remaining request output budget per request, so the
+                    # in-model K-step codec loop stops emitting frames where the
+                    # engine stops accepting tokens: the scheduler truncates the
+                    # sampled ids at the request limit, but the connector still
+                    # concatenates every emitted codec frame (PR #7929 review).
+                    # Both of the engine's length stops are folded in
+                    # (v1/core/sched/utils.py:111-117): the request's
+                    # max_tokens - num_output_tokens, and the context's
+                    # max_model_len - num_tokens. None means the request carries
+                    # no max_tokens, which leaves the stage-resolved codec budget
+                    # in charge. Same order as request_sampling_params.
+                    context_budget = [
+                        (
+                            self.max_model_len - int(req.num_tokens)
+                            if (req := self.requests.get(req_id)) is not None
+                            else None
+                        )
+                        for req_id in self.input_batch.req_ids
+                    ]
+                    model_kwargs_extra["request_max_tokens_remaining"] = [
+                        (
+                            max(
+                                min(
+                                    int(req.sampling_params.max_tokens) - len(req.output_token_ids),
+                                    context_budget[index],
+                                ),
+                                0,
+                            )
+                            if (req := self.requests.get(req_id)) is not None
+                            and req.sampling_params is not None
+                            and req.sampling_params.max_tokens is not None
+                            and context_budget[index] is not None
+                            else None
+                        )
+                        for index, req_id in enumerate(self.input_batch.req_ids)
                     ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request

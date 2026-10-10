@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Mapping
@@ -47,6 +48,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
@@ -114,7 +116,17 @@ class ExecuteModelState(NamedTuple):
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
 
+    # vllm-ascend's ascend-graph wrapper reads this flag from the runner, but
+    # the vllm-ascend build this image ships never sets it -- the static-shape
+    # capture path would raise AttributeError without a default here.
+    enable_hamming_sparse: bool = False
+
     def __init__(self, *args, **kwargs):
+        from vllm_omni.platforms.npu.attention import static_shape_decode
+
+        # Before parent init: vLLM's selector uses current_platform
+        # (vllm-ascend), not NPUOmniPlatform.get_attn_backend_cls.
+        static_shape_decode.install_into_ascend_backend()
         super().__init__(*args, **kwargs)
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
@@ -136,6 +148,189 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
 
+    @contextlib.contextmanager
+    def _narrow_decode_query_len(self):
+        """One query row per decode graph, for the duration of the block.
+
+        Multi-frame replay reads one row of its graph, and a K-query replay costs
+        ~0.6 ms more than a one-query one. Without the multi-frame loop engaged
+        (``narrow_replay_enabled`` false) this is a no-op, so the wide capture
+        path stays exactly as before."""
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        saved = int(getattr(self, "uniform_decode_query_len", 1) or 1)
+        if saved <= 1 or not talker_multiframe.narrow_replay_enabled(self):
+            yield
+            return
+        logger.info("[minicpmo] the Talker's decode graphs are one query row wide, not %d", saved)
+        dispatcher = getattr(self, "cudagraph_dispatcher", None)
+        dispatcher_saved = getattr(dispatcher, "uniform_decode_query_len", None)
+        self.uniform_decode_query_len = 1
+        if dispatcher_saved is not None:
+            dispatcher.uniform_decode_query_len = 1
+        try:
+            yield
+        finally:
+            self.uniform_decode_query_len = saved
+            if dispatcher_saved is not None:
+                dispatcher.uniform_decode_query_len = dispatcher_saved
+
+    def _check_and_update_cudagraph_mode(self, *args, **kwargs):
+        """Register the dispatcher's decode keys one query row wide, not K."""
+        with self._narrow_decode_query_len():
+            return super()._check_and_update_cudagraph_mode(*args, **kwargs)
+
+    def _capture_cudagraphs(self, *args, **kwargs):
+        """Capture static-shape decode graphs per KV capacity bucket.
+
+        Each bucket needs its own pass: the default path leaves the capacity unset
+        and would file the graphs under a key decode never looks up. Signature is
+        fully forwarded ("*args/**kwargs") because the upstream parent takes an
+        extra ``profiler`` argument that this override must not swallow."""
+        from vllm.config import CUDAGraphMode
+
+        from vllm_omni.platforms.npu.attention import static_shape_decode
+
+        runtime_mode = kwargs.get("cudagraph_runtime_mode")
+        if runtime_mode is None and len(args) >= 2:
+            runtime_mode = args[1]
+        buckets: tuple[int, ...] = ()
+        if runtime_mode == CUDAGraphMode.FULL:
+            buckets = static_shape_decode.buckets_for(
+                static_shape_decode.capacity_for(
+                    self.vllm_config.model_config.max_model_len,
+                    self.vllm_config.cache_config.block_size,
+                ),
+                self.vllm_config.cache_config.block_size,
+            )
+        if not buckets:
+            return super()._capture_cudagraphs(*args, **kwargs)
+        with self._narrow_decode_query_len():
+            for capacity in sorted(buckets, reverse=True):
+                logger.info("[minicpmo] capturing static-shape decode graphs at kv_capacity=%d", capacity)
+                with static_shape_decode.capturing_bucket(capacity):
+                    super()._capture_cudagraphs(*args, **kwargs)
+
+    def propose_draft_token_ids(self, valid_sampled_token_ids, *args, **kwargs):
+        """Carry the Talker's frame count to the scheduler, not a prediction.
+
+        Stage 1 declares a speculative_config so that vLLM knows the request
+        advances by K tokens per step -- that is what grows the block table and
+        reserves the KV slots `talker_multiframe` writes into. The drafter
+        itself has nothing to say: the Talker's vLLM-level vocabulary is
+        `continue` and `stop`, the frames are generated sequentially inside one
+        `execute_model`, and the model's own stop row is what ends the request.
+        So the draft is `continue` repeated, and the rejection sampler accepts
+        it exactly up to the frame the codec sequence ended on.
+
+        The frame count comes from `drafts_this_step`, which reads the runner's
+        own `num_spec_tokens` -- the value vLLM derives from the deploy
+        config's speculative_config. Reading it off the model instead would
+        depend on wrappers we do not control.
+
+        NOTE: the NPU draft call site passes ``sampled_token_ids`` first
+        (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
+        GPU signature has ``scheduler_output`` first instead.
+        """
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.drafts_this_step(self)
+        if frames > 1:
+            # How many draft positions each request actually ran with in this
+            # step -- the scheduler's own account, and the only reliable way to
+            # tell a truncated K-frame row apart from an ordinary one-token
+            # result (prefill, or a step the loop intentionally sat out). The
+            # vllm-ascend call site passes (sampling_metadata, scheduler_output,
+            # spec_decode_metadata, ...) positionally after the sampled ids.
+            scheduler_output = next((a for a in args if hasattr(a, "scheduled_spec_decode_tokens")), None)
+            scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+            req_ids = list(getattr(self.input_batch, "req_ids", []) or [])
+            scheduled_draft_counts = [len(scheduled.get(req_id, ())) for req_id in req_ids[: self.input_batch.num_reqs]]
+            # Fold a short row only on a request that has already run the
+            # multi-frame loop, tracked per-request in `_kstep_drafted_reqs`.
+            # A cold-start row -- length 1, the request never multi-frame --
+            # must draft or the K-step deadlocks on "no drafts emitted"; a
+            # short row on a *live* multi-frame request is a codec stop fired
+            # mid-span and must fold, or the step that re-drafts it walks the
+            # dead speaker through frames that no longer belong to its audio.
+            # One batch can mix both kinds of row, which is why the flag is
+            # per-request history and not a batch-level toggle: a batch flag
+            # either deadlocks the cold start or re-drafts a live short row
+            # the step after a fold (observed 09-30: spans 4,5,5,5,6 refused
+            # as non-uniform right after a fold cleared the flag).
+            drafted_reqs = getattr(self, "_kstep_drafted_reqs", None)
+            if drafted_reqs is None:
+                drafted_reqs = self._kstep_drafted_reqs = set()
+            # A finished request leaves req_ids; drop it here. Without this a
+            # stop-truncated step would leave its request in the set forever,
+            # but re-drafting is deferred only while live short rows remain,
+            # so the non-uniform raise stays unreachable.
+            drafted_reqs.intersection_update(req_ids)
+            rows = valid_sampled_token_ids if isinstance(valid_sampled_token_ids, list) else []
+            has_live_short_row = any(
+                count > 0
+                and isinstance(row, list)
+                and len(row) < frames
+                and req_id in drafted_reqs
+                for count, row, req_id in zip(scheduled_draft_counts, rows, req_ids)
+            )
+            if not isinstance(valid_sampled_token_ids, list):
+                # The padded-drafter branch passes the verify output tensor;
+                # `constant_drafts` can only read list rows, so if we ever
+                # get here the K-step silently degrades to single frames
+                # every step. Name the branch so the first scene is the last.
+                logger.error(
+                    "[kstep] propose received %s (expected list); "
+                    "constant_drafts will emit no drafts this step "
+                    "(use_ngram_gpu=%s, padded_drafter_disabled=%s)",
+                    type(valid_sampled_token_ids).__name__,
+                    self.speculative_config.use_ngram_gpu()
+                    if self.speculative_config is not None
+                    else None,
+                    self.speculative_config.disable_padded_drafter_batch
+                    if self.speculative_config is not None
+                    else None,
+                )
+            drafts = talker_multiframe.constant_drafts(
+                valid_sampled_token_ids,
+                frames,
+                self.input_batch.num_reqs,
+                scheduled_draft_counts,
+                fold_short_rows=has_live_short_row,
+            )
+            if any(drafts):
+                # This batch just booked a multi-frame step: every request in
+                # it has now run multi-frame, so a later short row on any of
+                # them must fold until it drains (see the note above).
+                drafted_reqs.update(req_ids)
+            if not any(drafts):
+                # Dump the rows as they were seen. An all-empty batch here is
+                # the stall signature: name WHICH request and what shape the
+                # step returned instead of leaving one log line to reason from.
+                # Type-safe throughout: the padded-drafter branch passes a
+                # tensor, and `tensor or []` raises the ambiguous-truth error.
+                if isinstance(valid_sampled_token_ids, list):
+                    rows = valid_sampled_token_ids
+                    _desc = (
+                        f"rows={len(rows)}"
+                        f" types={[type(r).__name__ for r in rows[:8]]}"
+                        f" lens={[len(r) for r in rows[:8] if isinstance(r, list)]}"
+                        f" scheduled={scheduled_draft_counts[:8]}"
+                        f" head={repr(rows)[:400]}"
+                    )
+                else:
+                    seen = valid_sampled_token_ids
+                    shape = tuple(seen.shape) if hasattr(seen, "shape") else "?"
+                    _desc = f"rows=<{type(seen).__name__} shape={shape}>"
+                logger.error(
+                    "[kstep] no drafts emitted: frames=%s num_reqs=%s %s",
+                    frames,
+                    self.input_batch.num_reqs,
+                    _desc,
+                )
+            return drafts
+        return super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
@@ -156,6 +351,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     #  -------------------------------------- Omni-new -------------------------------------------------
     def capture_model(self) -> int:
+        # num_spec_tokens comes from the deploy config's speculative_config,
+        # which vLLM applies when the runner is built.
         npugraph_memory_bytes = super().capture_model()
         self._capture_talker_mtp_graphs()
         return npugraph_memory_bytes
@@ -910,6 +1107,26 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self.input_batch.sampling_metadata.logitsprocs,
                 logits.shape[-1],
             )
+            # K-step only, and both halves matter: the model class has to
+            # implement the multi-frame path (``supports_multi_frame_decode``)
+            # *and* this deployment has to arm it -- stage 1's speculative_config
+            # is what sets ``num_spec_tokens``. With the loop off, vLLM's
+            # min_tokens layer behaves as it does on any other stage and must
+            # keep working, so it is only cleared when both hold.
+            #
+            # Why clear it at all: this layer censors the stop token itself, and
+            # its release condition is a spec-decoding bookkeeping counter we do
+            # not control -- a request whose count never advances can never
+            # stop. The model already masks the codec EOS by its own frame count
+            # (talker_codec_sample), so the vLLM-level layer is redundant here.
+            if supports_multi_frame_decode(self.model) and int(
+                getattr(self, "num_spec_tokens", 0) or 0
+            ) > 0:
+                from vllm_omni.platforms.npu.worker import talker_multiframe
+
+                talker_multiframe.neutralize_kstep_min_tokens(
+                    self.input_batch.sampling_metadata.logitsprocs
+                )
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -976,6 +1193,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
