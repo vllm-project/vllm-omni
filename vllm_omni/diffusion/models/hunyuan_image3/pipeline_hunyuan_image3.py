@@ -30,6 +30,7 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.utils import retrieve_timesteps
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -54,7 +55,6 @@ from .hunyuan_image3_transformer import (
     UNetUp,
     build_batch_2d_rope,
     real_batched_index_select,
-    retrieve_timesteps,
 )
 from .request_layout import HunyuanPreparedLayout
 
