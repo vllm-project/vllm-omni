@@ -75,7 +75,7 @@ def _init_single_rank_tp_env():
     os.environ.setdefault("MASTER_PORT", "29501")
 
     if not torch.distributed.is_initialized():
-        init_distributed_environment(world_size=1, rank=0, local_rank=0)
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
 
     if not model_parallel_is_initialized():
         initialize_model_parallel(

@@ -143,7 +143,7 @@ def _worker(
     device = torch.device(f"{current_omni_platform.device_type}:{rank}")
     current_omni_platform.set_device(device)
     _set_dist_env(rank, world_size, port)
-    init_distributed_environment(world_size=world_size, rank=rank)
+    init_distributed_environment(world_size=world_size, rank=rank, distributed_init_method="env://")
     initialize_model_parallel(
         data_parallel_size=1,
         cfg_parallel_size=1,

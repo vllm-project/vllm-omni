@@ -116,7 +116,9 @@ def init_distributed() -> tuple[int, int]:
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    init_distributed_environment(world_size=world_size, rank=rank, local_rank=local_rank)
+    init_distributed_environment(
+        world_size=world_size, rank=rank, local_rank=local_rank, distributed_init_method="env://"
+    )
     initialize_model_parallel(sequence_parallel_size=world_size, ulysses_degree=world_size)
     return rank, world_size
 

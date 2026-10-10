@@ -251,9 +251,9 @@ class DiffusionWorker:
         rank: int,
         od_config: OmniDiffusionConfig,
         skip_load_model: bool = False,
-        distributed_init_method: str | None = None,
+        *,
+        distributed_init_method: str,
     ):
-        self.distributed_init_method = distributed_init_method
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
@@ -271,7 +271,7 @@ class DiffusionWorker:
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self._shutdown_complete = False
         self.stage_id = getattr(od_config, "stage_id", 0)
-        self.init_device()
+        self.init_device(distributed_init_method=distributed_init_method)
         try:
             # Create model runner — one decision chain, in precedence order:
             #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -317,15 +317,14 @@ class DiffusionWorker:
             raise
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
-    def init_device(self) -> None:
+    def init_device(self, *, distributed_init_method: str) -> None:
         """Initialize the device and distributed environment."""
         world_size = self.od_config.num_gpus
         rank = self.rank
 
-        # Set environment variables for local distributed initialization.
-        if self.distributed_init_method is None:
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        # Set environment variables for distributed initialization.
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -360,7 +359,7 @@ class DiffusionWorker:
             init_distributed_environment(
                 world_size=world_size,
                 rank=rank,
-                distributed_init_method=self.distributed_init_method or "env://",
+                distributed_init_method=distributed_init_method,
                 local_rank=self.local_rank,
             )
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
@@ -1155,6 +1154,8 @@ class WorkerProc:
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        *,
+        distributed_init_method: str,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
@@ -1179,7 +1180,13 @@ class WorkerProc:
         assert od_config.master_port is not None
 
         # Create worker using WorkerWrapperBase for extension support
-        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
+        self.worker = self._create_worker(
+            gpu_id,
+            od_config,
+            worker_extension_cls,
+            custom_pipeline_args,
+            distributed_init_method=distributed_init_method,
+        )
         self._running = True
 
         self._async_output_queue: queue.Queue | None = None
@@ -1210,6 +1217,8 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         worker_extension_cls: str | None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        *,
+        distributed_init_method: str,
     ) -> "WorkerWrapperBase":
         """Create a worker instance. Override in subclasses for different worker types."""
         worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
@@ -1220,6 +1229,7 @@ class WorkerProc:
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
             base_worker_class=base_worker_class,
+            distributed_init_method=distributed_init_method,
         )
         return wrapper
 
@@ -1616,6 +1626,8 @@ class WorkerProc:
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        *,
+        distributed_init_method: str,
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
@@ -1649,6 +1661,7 @@ class WorkerProc:
                 wake_event=wake_event,
                 worker_extension_cls=worker_extension_cls,
                 custom_pipeline_args=custom_pipeline_args,
+                distributed_init_method=distributed_init_method,
             )
             logger.info(f"Worker {rank}: Scheduler loop started.")
             pipe_writer.send(
@@ -1691,7 +1704,8 @@ class WorkerWrapperBase:
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
         rank: int | None = None,
-        distributed_init_method: str | None = None,
+        *,
+        distributed_init_method: str,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
@@ -1704,8 +1718,7 @@ class WorkerWrapperBase:
                 A ``pipeline_class`` entry triggers custom pipeline initialization.
             rank: Global distributed rank. Defaults to ``gpu_id`` for local
                 multiprocessing.
-            distributed_init_method: Explicit rendezvous URL, or None for the
-                local launcher's environment-based rendezvous.
+            distributed_init_method: Rendezvous URL for the worker process group.
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
@@ -1720,15 +1733,13 @@ class WorkerWrapperBase:
         # Create the actual worker instance. Only dynamic custom pipelines skip
         # initial loading; native pipelines may also use custom_pipeline_args
         # for model-specific component paths.
-        worker_init_kwargs: dict[str, Any] = {
-            "local_rank": gpu_id,
-            "rank": gpu_id if rank is None else rank,
-            "od_config": od_config,
-            "skip_load_model": self.uses_custom_pipeline,
-        }
-        if distributed_init_method is not None:
-            worker_init_kwargs["distributed_init_method"] = distributed_init_method
-        worker = worker_class(**worker_init_kwargs)
+        worker = worker_class(
+            local_rank=gpu_id,
+            rank=gpu_id if rank is None else rank,
+            od_config=od_config,
+            skip_load_model=self.uses_custom_pipeline,
+            distributed_init_method=distributed_init_method,
+        )
         try:
             # Re-initialize pipeline with custom pipeline if provided.
             if self.uses_custom_pipeline:

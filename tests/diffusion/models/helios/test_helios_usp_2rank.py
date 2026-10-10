@@ -134,7 +134,7 @@ def helios_forward_on_model(
             "MASTER_PORT": "12361",
         }
     )
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
 
     parallel_config = DiffusionParallelConfig(
         pipeline_parallel_size=1,

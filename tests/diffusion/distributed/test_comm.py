@@ -60,7 +60,7 @@ def _init_worker(
     if device_kind == "cpu":
         configure_cpu_collective_worker()
     backend = "gloo" if device_kind == "cpu" else None
-    init_distributed_environment(backend=backend)
+    init_distributed_environment(backend=backend, distributed_init_method="env://")
 
 
 def _close_tolerance(dtype: torch.dtype) -> tuple[float, float]:

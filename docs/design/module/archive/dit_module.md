@@ -316,7 +316,7 @@ class DiffusionWorker:
         self.vllm_config = _create_diffusion_worker_vllm_config(
             self.device, self.od_config
         )
-        init_distributed_environment(world_size, rank)
+        init_distributed_environment(world_size, rank, distributed_init_method="env://")
         parallel_config = self.od_config.parallel_config
         initialize_model_parallel(
             data_parallel_size=parallel_config.data_parallel_size,

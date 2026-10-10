@@ -1204,7 +1204,7 @@ def ulysses_attention_on_test_model(
         }
     )
     # Initialize distributed environment
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
 
     # Set up OmniDiffusionConfig with parallel config
     parallel_config = DiffusionParallelConfig(

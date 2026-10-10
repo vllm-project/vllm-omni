@@ -70,6 +70,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             worker_extension_cls=self.od_config.worker_extension_cls,
             custom_pipeline_args=getattr(self.od_config, "custom_pipeline_args", None),
             base_worker_class=resolve_obj_by_qualname(worker_cls_path),
+            distributed_init_method="env://",
         )
         logger.info("Diffusion worker initialized in-process (uniproc executor)")
 
