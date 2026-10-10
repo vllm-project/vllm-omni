@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -316,6 +317,7 @@ class QwenImage21Pipeline(
 
         The runner looks this up on the pipeline, not on the transformer.
         """
+        self._prompt_embedding_cache = OrderedDict()
         transformer = getattr(self, "transformer", None)
         release = getattr(transformer, "release_captured_graphs", None)
         if callable(release):
@@ -729,13 +731,52 @@ class QwenImage21Pipeline(
                 number of images that should be generated per prompt
         """
         prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        prompt_embeds, prompt_embeds_mask, image_pad_mask = self._get_qwen_prompt_embeds(
-            prompt,
-            images_per_prompt,
-            max_sequence_length=max_sequence_length,
-            prompt_name=prompt_name,
+        cacheable = (
+            len(prompt) == 1
+            and isinstance(prompt[0], str)
+            and not (images_per_prompt is not None and any(images_per_prompt))
+            and not torch.is_grad_enabled()
+            and not self.text_encoder.training
+            and not getattr(self.od_config, "lora_config", None)
+            and not getattr(self.od_config, "enable_cpu_offload", False)
         )
+        cache = getattr(self, "_prompt_embedding_cache", None)
+        if cache is None or not cacheable:
+            cache = self._prompt_embedding_cache = OrderedDict()
+        key = (
+            (
+                tuple(prompt),
+                max_sequence_length,
+                prompt_name,
+                id(self.text_encoder),
+                id(self.processor),
+                self.text_encoder.dtype,
+                str(self.device),
+                self.prompt_template_t2i,
+                self._drop_idx,
+            )
+            if cacheable
+            else None
+        )
+        encoded = cache.get(key) if cacheable else None
+        if encoded is None:
+            encoded = self._get_qwen_prompt_embeds(
+                prompt,
+                images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name=prompt_name,
+            )
+            size = sum(t.numel() * t.element_size() for t in encoded)
+            if cacheable and size <= 16 * 1024 * 1024:
+                cache[key] = encoded
+                while (
+                    len(cache) > 16
+                    or sum(t.numel() * t.element_size() for entry in cache.values() for t in entry) > 16 * 1024 * 1024
+                ):
+                    cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = encoded
 
         # Request-major expansion (A,A,B,B). ``repeat`` on the 2D masks would
         # prepend a dimension and reshape to A,B,A,B — wrong pairing with embeds.
