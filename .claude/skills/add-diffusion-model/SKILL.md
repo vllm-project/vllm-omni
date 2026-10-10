@@ -1,6 +1,6 @@
 ---
 name: add-diffusion-model
-description: Add a new diffusion model (text-to-image, text-to-video, image-to-video, text-to-audio, image editing) to vLLM-Omni, including native non-Diffusers ports, reference-parity validation, Cache-DiT, offload, and parallelism support (TP, SP/USP, CFG-Parallel, HSDP). Use when integrating or reviewing a new diffusion model, porting a Diffusers pipeline or custom model repository, creating a DiT adapter, reusing shared examples, or qualifying multi-GPU and memory optimizations.
+description: Add a new diffusion model (text-to-image, text-to-video, image-to-video, text-to-audio, image editing) to vLLM-Omni, including native non-Diffusers ports, reference-parity validation, Cache-DiT, offload, and parallelism support (TP, SP/USP, CFG-Parallel, HSDP). Use when integrating or reviewing a new diffusion model, porting a Diffusers pipeline or custom model repository, creating a DiT adapter, reusing shared examples, or qualifying multi-GPU and memory optimizations. Also covers how a new model inherits platform optimizations (attention backend selection, response encoding, regional torch.compile, fused Q/K norm+RoPE, CFG/USP frameworks, request batching, component quantization router) instead of reimplementing them.
 ---
 
 # Adding a Diffusion Model to vLLM-Omni
@@ -8,6 +8,8 @@ description: Add a new diffusion model (text-to-image, text-to-video, image-to-v
 ## Overview
 
 This skill guides you through adding a new diffusion model to vLLM-Omni. The model may come from HuggingFace Diffusers (structured pipeline) or from a private/custom repo. The workflow differs significantly depending on the source.
+
+Most performance work is **inherited, not reimplemented**: flags, shared ops, and three small interfaces give a new model the platform's attention backends, response encoding, regional torch.compile, CFG/USP frameworks, request batching, and quantization router. See [references/platform-optimization-inheritance.md](references/platform-optimization-inheritance.md) for what is automatic, what needs a small contract, and what stays model-owned (worked example: Boogu-Image, an image-generation DiT).
 
 ## Prerequisites
 
@@ -326,6 +328,8 @@ cannot represent the protocol, and document that gap in the PR.
 
 **Validation**: No errors, output is meaningful, quality matches reference implementation.
 
+While validating first serve, also check the zero-code free wins — one alternative attention backend, per-request response format (image-specific), and regional torch.compile via `_repeated_blocks` — see [references/platform-optimization-inheritance.md](references/platform-optimization-inheritance.md).
+
 See [references/troubleshooting.md](references/troubleshooting.md) for common errors.
 
 ### Step 6: Add Example Scripts
@@ -400,6 +404,8 @@ all-warmup smoke proves integration, not acceleration.
 ### Step 10: Add Parallelism Support
 
 After the model works on a single GPU, add multi-GPU parallelism. Add each type incrementally, testing after each addition.
+
+Most of these are small contracts driven by the platform frameworks (`CFGParallelMixin`, `_sp_plan`, HSDP shard conditions) rather than per-model reimplementations — see [references/platform-optimization-inheritance.md](references/platform-optimization-inheritance.md) for what each interface owes the framework and the recommended sequencing.
 
 See [references/parallelism-patterns.md](references/parallelism-patterns.md) for detailed code patterns and API reference.
 
@@ -490,6 +496,8 @@ whether prompt encoding and VAE/audio decoding are included. For multi-device
 layouts, plot user latency against throughput per device and keep different
 denoising-step counts on separate Pareto frontiers.
 
+Any performance claim from profiling follows the perf evidence contract (one comparison column per claim at equal workload, A/B on the same head, named SHAs, quality gate) — see the evidence section of [references/platform-optimization-inheritance.md](references/platform-optimization-inheritance.md) and the review-pr skill's [perf-verification check](../review-pr/references/checks/perf-verification.md).
+
 ---
 
 ## Pre-commit conventions
@@ -527,6 +535,7 @@ shellcheck). In particular:
 - [Transformer Adaptation](references/transformer-adaptation.md) — porting transformers from diffusers
 - [Custom Model Patterns](references/custom-model-patterns.md) — patterns for non-diffusers models
 - [Native Model Integration Checklist](references/native-model-integration-checklist.md) — ownership boundaries, phase gates, qualification matrix, and review evidence
+- [Platform Optimization Inheritance](references/platform-optimization-inheritance.md) — what a new model inherits for free (flags, shared ops), the three small interfaces (CFG, SP, request batching), model-owned work, and the perf evidence contract; worked example Boogu-Image
 - [Parallelism Patterns](references/parallelism-patterns.md) — TP, SP/USP, CFG parallel, HSDP implementation details
 - [Cache-DiT Patterns](references/cache-dit-patterns.md) — cache-dit acceleration for standard and custom architectures
 - [Troubleshooting](references/troubleshooting.md) — common errors and fixes
