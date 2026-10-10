@@ -956,3 +956,31 @@ def test_packed_rope_table_env_override(monkeypatch):
     monkeypatch.delenv(env)
     assert len(_with_packed_rope_table(long)) == 3
     assert _with_packed_rope_table(short) is short
+
+
+@pytest.mark.parametrize(
+    ("module_name", "shards"),
+    [
+        (
+            "double_stream_layers.0.img_instruct_attn.instruct_to_qkv",
+            ["instruct_to_q", "instruct_to_k", "instruct_to_v"],
+        ),
+        ("double_stream_layers.0.img_instruct_attn.img_to_qkv", ["img_to_q", "img_to_k", "img_to_v"]),
+        ("single_stream_layers.0.attn.to_qkv", ["to_q", "to_k", "to_v"]),
+        ("single_stream_layers.0.feed_forward.gate_up_proj", ["linear_1", "linear_3"]),
+    ],
+)
+def test_transformer_packed_mapping_routes_unfused_quantization_policy(recording_quant_config, module_name, shards):
+    from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+    from vllm.model_executor.model_loader.utils import configure_quant_config
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import BooguImageTransformer2DModel
+
+    configure_quant_config(recording_quant_config, BooguImageTransformer2DModel)
+    mapping = recording_quant_config.packed_modules_mapping
+    parent = module_name.rsplit(".", 1)[0]
+    ignored = [f"{parent}.{shard}" for shard in shards]
+    assert is_layer_skipped(module_name, ignored, mapping)
+    assert not is_layer_skipped(module_name, [], mapping)
+    with pytest.raises(ValueError, match="some but not all shards"):
+        is_layer_skipped(module_name, ignored[:1], mapping)

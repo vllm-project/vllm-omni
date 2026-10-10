@@ -80,6 +80,7 @@ def mock_dependencies(mocker, monkeypatch):
         lambda *a, **k: mock_vae,
     )
 
+    mock_configure_quant_config = mocker.patch(f"{_MODULE}.configure_quant_config")
     mock_transformer_cls = mocker.MagicMock(name="transformer_cls")
     mock_transformer_instance = mocker.MagicMock(name="transformer")
     mock_transformer_cls.return_value = mock_transformer_instance
@@ -99,6 +100,7 @@ def mock_dependencies(mocker, monkeypatch):
         "processor": mock_processor,
         "vae": mock_vae,
         "scheduler": mock_scheduler,
+        "configure_quant_config": mock_configure_quant_config,
         "transformer_cls": mock_transformer_cls,
         "transformer": mock_transformer_instance,
     }
@@ -1763,3 +1765,40 @@ def test_turbo_dmd_ti2i_keeps_reference_latents_and_uses_zero_conditioning_sigma
     assert all(ref is not None for ref in pipeline.transformer.refs)
     assert pipeline.scheduler.set_calls == 0
     assert pipeline.scheduler.step_calls == 0
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_constructor_configures_transformer_component_before_construction(mock_dependencies, mocker, quantized):
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    quant_config = mocker.MagicMock(spec_set=QuantizationConfig) if quantized else None
+    resolve = mocker.patch(
+        f"{_MODULE}.resolve_component_quant_config",
+        side_effect=lambda config, component: quant_config if component == "transformer" else None,
+    )
+    configure = mock_dependencies["configure_quant_config"]
+    constructor = mock_dependencies["transformer_cls"]
+    events = mocker.MagicMock()
+    events.attach_mock(configure, "configure")
+    events.attach_mock(constructor, "construct")
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+    )
+
+    BooguImagePipeline(od_config=od_config)
+
+    resolve.assert_any_call(od_config.quantization_config, "transformer")
+    resolve.assert_any_call(od_config.quantization_config, "mllm")
+    if quantized:
+        assert events.mock_calls[:2] == [
+            mocker.call.configure(quant_config, constructor),
+            mocker.call.construct(od_config=od_config, quant_config=quant_config, prefix="transformer"),
+        ]
+    else:
+        configure.assert_not_called()
+    constructor.assert_called_once_with(od_config=od_config, quant_config=quant_config, prefix="transformer")
