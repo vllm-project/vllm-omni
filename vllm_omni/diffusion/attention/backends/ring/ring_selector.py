@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
@@ -20,6 +20,7 @@ from .ring_kernels import (
     flash_attn_forward_aiter,
     flashinfer_attn_forward,
     pytorch_attn_forward,
+    vllm_flash_attn_forward,
 )
 
 if HAS_SAGE_ATTENTION:
@@ -34,6 +35,7 @@ class AttnType(Enum):
     FA = "fa"
     FA3 = "fa3"
     FA4 = "fa4"
+    VLLM_FA = "vllm_fa"
     FLASHINFER = "flashinfer"
     TORCH = "torch"
     SAGE_AUTO = "sage_auto"
@@ -81,6 +83,9 @@ def select_flash_attn_impl(
 
     elif impl_type == AttnType.FA4:
         return flash_attn4_func_forward
+
+    elif impl_type == AttnType.VLLM_FA:
+        return vllm_flash_attn_forward
 
     elif impl_type == AttnType.FLASHINFER:
         return flashinfer_attn_forward
