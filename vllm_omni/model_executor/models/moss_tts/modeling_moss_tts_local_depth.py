@@ -80,7 +80,17 @@ class _MossTTSLocalAttention(nn.Module):
         if max_seq_len <= 0:
             return
         cache = self._rope_cos_cache
-        if cache.numel() > 0 and cache.device == device and cache.dtype == dtype and int(cache.shape[1]) >= max_seq_len:
+        # ``torch.device("npu") == torch.device("npu", index=0)`` is False on
+        # Ascend (unlike CUDA), so a naive equality check would miss the cache
+        # and rebuild the arange/einsum/cos/sin tables on every depth step.
+        cache_device_ok = (
+            cache.numel() > 0
+            and cache.device.type == device.type
+            and (device.index is None or cache.device.index == device.index)
+            and cache.dtype == dtype
+            and int(cache.shape[1]) >= max_seq_len
+        )
+        if cache_device_ok:
             return
 
         position_ids = torch.arange(max_seq_len, device=device, dtype=torch.float32)
