@@ -12,8 +12,10 @@ just a different n_vq/codec and output sample rate (48 kHz vs 24 kHz).
 from __future__ import annotations
 
 import gc
-import os
-import urllib.request
+import math
+import struct
+import wave
+from pathlib import Path
 
 import pytest
 import torch
@@ -25,7 +27,7 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
-DEPLOY_CONFIG = get_deploy_config_path("moss_tts_local.yaml")
+DEPLOY_CONFIG = get_deploy_config_path("ci/moss_tts_local.yaml")
 _OMNI_RUNNER_PARAM = (
     MODEL,
     DEPLOY_CONFIG,
@@ -40,7 +42,8 @@ pytestmark = [
 ]
 
 SAMPLE_RATE = 48000
-REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/reference_zh_1.wav"
+_REF_SAMPLE_RATE = 48000
+_REF_DURATION_S = 2.0
 
 _DEFAULT_SAMPLING = SamplingParams(
     temperature=1.7,
@@ -52,28 +55,49 @@ _DEFAULT_SAMPLING = SamplingParams(
 )
 
 
+def _write_synthetic_reference_wav(path: Path) -> None:
+    """Write a deterministic voice-like reference clip (stdlib only).
+
+    The clip is a decaying harmonic stack (220/440/660/880 Hz) with a slow
+    amplitude envelope, 48 kHz mono 16-bit PCM. CI is network-restricted, so
+    the reference is synthesized locally instead of fetched from GitHub.
+    """
+    n_samples = int(_REF_SAMPLE_RATE * _REF_DURATION_S)
+    frames = bytearray()
+    partials = (
+        (220.0, 0.6, 0.0),
+        (440.0, 0.3, 0.0),
+        (660.0, 0.15, 0.0),
+        (880.0, 0.08, 0.5),
+    )
+    for i in range(n_samples):
+        t = i / _REF_SAMPLE_RATE
+        envelope = math.exp(-3.0 * t / _REF_DURATION_S) * (
+            0.5 + 0.5 * math.sin(2.0 * math.pi * 3.5 * t)
+        )
+        sample = sum(amp * math.sin(2.0 * math.pi * freq * t + phase) for freq, amp, phase in partials)
+        sample = max(-1.0, min(1.0, sample * envelope))
+        frames.extend(struct.pack("<h", int(sample * 32767)))
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(_REF_SAMPLE_RATE)
+        f.writeframes(bytes(frames))
+
+
 @pytest.fixture(scope="session")
 def ref_audio_path(tmp_path_factory) -> str:
-    target = tmp_path_factory.mktemp("moss_tts_local_ref") / "zh_1.wav"
-    try:
-        with urllib.request.urlopen(REF_AUDIO_URL, timeout=30) as resp:
-            target.write_bytes(resp.read())
-    except Exception as exc:  # noqa: BLE001
-        msg = f"Cannot fetch reference clip {REF_AUDIO_URL}: {exc}"
-        if os.environ.get("MOSS_TTS_SKIP_ON_NET_FAIL"):
-            pytest.skip(msg)
-        pytest.fail(msg)
-    if not target.exists() or target.stat().st_size == 0:
-        pytest.fail(f"Reference clip empty after download: {target}")
+    target = tmp_path_factory.mktemp("moss_tts_local_ref") / "zh_reference.wav"
+    _write_synthetic_reference_wav(target)
     return str(target)
 
 
-def _build_request(text: str, ref_audio_path: str) -> dict:
+def _build_request(text: str, ref_audio_path: str, language: str = "English") -> dict:
     processor = AutoProcessor.from_pretrained(MODEL, trust_remote_code=True)
     message = processor.build_user_message(
         text=text,
         reference=[ref_audio_path],
-        language="English",
+        language=language,
     )
     unified = processor(conversations=[[message]], mode="generation")["input_ids"][0]
     del processor
@@ -130,7 +154,7 @@ def test_moss_tts_v15_local_voice_clone(omni_runner: OmniRunner, ref_audio_path)
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"})
 def test_moss_tts_v15_local_voice_clone_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Chinese text produces non-empty 48 kHz audio."""
-    req = _build_request("你好，这是本地延迟模型的语音克隆测试。", ref_audio_path)
+    req = _build_request("你好，这是本地延迟模型的语音克隆测试。", ref_audio_path, language="Chinese")
     audio, sr = _collect_audio(omni_runner, req)
 
     assert sr == SAMPLE_RATE
