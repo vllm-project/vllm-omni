@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.utils import denormalize_latents, normalize_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -505,17 +506,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             image_latents = torch.cat(image_latents, dim=0)
         else:
             image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        image_latents = (image_latents - latents_mean) / latents_std
+        image_latents = normalize_latents(image_latents, self.vae.config)
 
         return image_latents
 
@@ -841,15 +832,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         else:
             latents = self._unpack_latents(latents, height, width, layers, self.vae_scale_factor)
             latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
+            latents = denormalize_latents(latents, self.vae.config)
 
             b, c, f, h, w = latents.shape
 

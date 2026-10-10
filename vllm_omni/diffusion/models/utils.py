@@ -242,6 +242,36 @@ def create_transformers_model_with_vllm_linears(
     return model
 
 
+def vae_latent_mean_std(
+    vae_config,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    ndim: int = 5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-channel latents_mean and latents_std tensors from a VAE config.
+
+    Returns broadcastable tensors of shape ``(1, C, 1, …)`` with *ndim*
+    dimensions, already on *device* and cast to *dtype*.
+    """
+    shape = (1, -1) + (1,) * (ndim - 2)
+    mean = torch.tensor(vae_config.latents_mean, device=device, dtype=dtype).view(shape)
+    std = torch.tensor(vae_config.latents_std, device=device, dtype=dtype).view(shape)
+    return mean, std
+
+
+def normalize_latents(latents: torch.Tensor, vae_config, *, ndim: int = 5) -> torch.Tensor:
+    """Normalize raw VAE latents: ``(latents - mean) / std``."""
+    mean, std = vae_latent_mean_std(vae_config, device=latents.device, dtype=latents.dtype, ndim=ndim)
+    return (latents - mean) / std
+
+
+def denormalize_latents(latents: torch.Tensor, vae_config, *, ndim: int = 5) -> torch.Tensor:
+    """Denormalize latents back to raw VAE space: ``latents * std + mean``."""
+    mean, std = vae_latent_mean_std(vae_config, device=latents.device, dtype=latents.dtype, ndim=ndim)
+    return latents * std + mean
+
+
 def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:

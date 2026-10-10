@@ -33,6 +33,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.utils import denormalize_latents, normalize_latents
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_preencode_batch_frames,
     resolve_wan_preencode_mp4,
@@ -716,36 +717,14 @@ class Wan22S2VPipeline(
     # ------------------------------------------------------------------
 
     def _normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Apply (latent - mean) * (1/std) normalization.
-
-        The original Wan2_1_VAE does this internally, but diffusers'
-        AutoencoderKLWan stores the values in config without applying them.
-        """
         if not hasattr(self.vae, "config") or not hasattr(self.vae.config, "latents_mean"):
             return latents
-        mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        inv_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        return (latents - mean) * inv_std
+        return normalize_latents(latents, self.vae.config)
 
     def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Reverse normalization before VAE decode: latent / (1/std) + mean."""
         if not hasattr(self.vae, "config") or not hasattr(self.vae.config, "latents_mean"):
             return latents
-        mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        inv_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        return latents / inv_std + mean
+        return denormalize_latents(latents, self.vae.config)
 
     # ------------------------------------------------------------------
     # Encoding helpers

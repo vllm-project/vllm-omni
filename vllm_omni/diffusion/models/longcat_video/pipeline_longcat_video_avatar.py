@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer i
     create_full_precision_avatar_dit,
     create_quantized_avatar_dit,
 )
+from vllm_omni.diffusion.models.utils import denormalize_latents, normalize_latents
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -793,18 +794,10 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
             current_omni_platform.empty_cache()
 
     def normalize_latents(self, latents):
-        latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1)
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return (latents - latents_mean) * latents_std
+        return normalize_latents(latents, self.vae.config)
 
     def denormalize_latents(self, latents):
-        latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1)
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return latents / latents_std + latents_mean
+        return denormalize_latents(latents, self.vae.config)
 
     def prepare_latents(
         self,

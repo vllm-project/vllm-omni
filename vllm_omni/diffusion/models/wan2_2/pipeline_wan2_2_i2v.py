@@ -30,7 +30,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
-from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.models.utils import _load_json, denormalize_latents, normalize_latents
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
     resolve_wan_preencode_batch_frames,
@@ -740,15 +740,7 @@ class Wan22I2VPipeline(
             output = latents
         else:
             latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
+            latents = denormalize_latents(latents, self.vae.config)
             if preencode_mp4:
                 output = decode_to_mp4(
                     self.vae,
@@ -946,15 +938,7 @@ class Wan22I2VPipeline(
         latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
 
         # Normalize latents
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latent_condition.device, latent_condition.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latent_condition.device, latent_condition.dtype
-        )
-        latent_condition = (latent_condition - latents_mean) * latents_std
+        latent_condition = normalize_latents(latent_condition, self.vae.config)
         latent_condition = latent_condition.to(dtype)
 
         if self.expand_timesteps:

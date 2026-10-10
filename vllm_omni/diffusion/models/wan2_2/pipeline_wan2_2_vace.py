@@ -25,6 +25,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.utils import denormalize_latents, vae_latent_mean_std
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
@@ -415,12 +416,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         """
         vae_dtype = self.vae.dtype
 
-        latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=torch.float32).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std, device=device, dtype=torch.float32).view(
-            1, self.vae.config.z_dim, 1, 1, 1
-        )
+        latents_mean, latents_std = vae_latent_mean_std(self.vae.config, device=device, dtype=torch.float32)
 
         # Binarize mask
         mask = torch.where(mask > 0.5, 1.0, 0.0).to(dtype=vae_dtype)
@@ -434,8 +430,8 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             inactive_latent = retrieve_latents(self.vae.encode(inactive), generator, sample_mode="argmax")
             reactive_latent = retrieve_latents(self.vae.encode(reactive), generator, sample_mode="argmax")
 
-        inactive_latent = ((inactive_latent.float() - latents_mean) * latents_std).to(vae_dtype)
-        reactive_latent = ((reactive_latent.float() - latents_mean) * latents_std).to(vae_dtype)
+        inactive_latent = ((inactive_latent.float() - latents_mean) / latents_std).to(vae_dtype)
+        reactive_latent = ((reactive_latent.float() - latents_mean) / latents_std).to(vae_dtype)
 
         # Concatenate inactive + reactive along channels -> [B, 2*z_dim, T, H, W]
         latents = torch.cat([inactive_latent, reactive_latent], dim=1)
@@ -448,7 +444,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                 ref_image = ref_image[None, :, None, :, :]  # [1, C, 1, H, W]
                 with torch.no_grad():
                     ref_latent = retrieve_latents(self.vae.encode(ref_image), generator, sample_mode="argmax")
-                ref_latent = ((ref_latent.float() - latents_mean) * latents_std).to(vae_dtype)
+                ref_latent = ((ref_latent.float() - latents_mean) / latents_std).to(vae_dtype)
                 ref_latent = ref_latent.squeeze(0)  # [z_dim, 1, H, W]
                 # Double channels with zeros (inactive=ref, reactive=zeros)
                 ref_latent = torch.cat([ref_latent, torch.zeros_like(ref_latent)], dim=0)
@@ -742,15 +738,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             output = latents
         else:
             latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
+            latents = denormalize_latents(latents, self.vae.config)
             output = self.vae.decode(latents, return_dict=False)[0]
 
         return split_diffusion_output_by_request(

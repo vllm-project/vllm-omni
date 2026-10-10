@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.utils import denormalize_latents
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -907,15 +908,7 @@ class QwenImagePipeline(
 
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents = latents / latents_std + latents_mean
+        latents = denormalize_latents(latents, self.vae.config)
         image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
         return DiffusionOutput(
             output=image,
