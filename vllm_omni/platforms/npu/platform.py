@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
 
@@ -97,6 +98,30 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # after loading. Enable internal format so the NZ storage layout
         # is preserved for fused NPU kernels.
         torch.npu.config.allow_internal_format = True
+
+    @classmethod
+    def init_ar_worker_runtime(
+        cls,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().init_ar_worker_runtime(vllm_config, device)
+
+        # Register the MOSS-TTS local depth whole-loop NPUGraph adapter here,
+        # not in __init__: the patch imports MossTTSLocalDepthTransformer,
+        # which pulls in vllm_omni.platforms while NPUOmniPlatform.__init__ is
+        # still running. It cannot hang off set_device either -- the only
+        # in-tree set_device callers are the diffusion worker and the
+        # diffusion parallel state, while MOSS stage 0 runs on NPUARWorker
+        # whose init_device inherits vllm-ascend's _init_device. This AR
+        # startup hook runs after device setup and before model loading, so
+        # the patched setup_compile / generate_frame are in place before any
+        # depth transformer instance calls them.
+        from vllm_omni.platforms.npu.models.moss_tts_local_depth import (
+            apply_moss_tts_local_depth_patch,
+        )
+
+        apply_moss_tts_local_depth_patch()
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
