@@ -145,7 +145,7 @@ class RealtimeEnvelope:
         )
 
     def note_session_payload(self, session_payload: Mapping[str, object]) -> None:
-        """Track wire defaults declared by a session object (open or session.update)."""
+        """Track wire defaults declared by an *accepted* session object (open or session.updated)."""
         self.defaults = self.defaults.with_session_payload(session_payload)
 
     # ---- commands ----
@@ -154,12 +154,20 @@ class RealtimeEnvelope:
         return payload.get("type") in ENVELOPE_EVENT_TYPES
 
     def translate(self, payload: Mapping[str, object]) -> DuplexCommand:
-        """Wire event -> command (raises :class:`DuplexCommandError`)."""
-        if payload.get("type") == "session.update":
-            session = payload.get("session")
-            if isinstance(session, dict):
-                self.note_session_payload(session)
+        """Wire event -> command (raises :class:`DuplexCommandError`).
+
+        Mid-session ``session.update`` must not mutate ``defaults`` here: the
+        engine may reject the update (``ErrorEvent``) after translate returns.
+        A following append waits until that update is accepted or rejected.
+        Defaults are applied from the accepted ``session.updated`` once it is
+        enqueued, including while the pump is still sending an earlier event
+        (:meth:`apply_accepted_session`).
+        """
         return translate_realtime_command(payload, defaults=self.defaults)
+
+    def apply_accepted_session(self, session_payload: Mapping[str, object]) -> None:
+        """Apply wire defaults from a successful ``session.updated`` (or open)."""
+        self.note_session_payload(session_payload)
 
     # ---- outbound helpers ----
 

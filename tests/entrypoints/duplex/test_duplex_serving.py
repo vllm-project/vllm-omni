@@ -19,7 +19,14 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated
+from vllm_omni.engine.duplex.events import (
+    AudioDelta,
+    DuplexEvent,
+    ErrorEvent,
+    SessionClosed,
+    SessionCreated,
+    SessionUpdated,
+)
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
@@ -105,6 +112,18 @@ class FakeHandle:
 
     def output_guard(self, event: DuplexEvent):
         return self._outbox.guard(event)
+
+    def queued_events(self) -> tuple[DuplexEvent, ...]:
+        return self._outbox.queued_events()
+
+    def observation_seq(self) -> int:
+        return self._outbox.observation_seq()
+
+    def observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        return self._outbox.observations_after(seq)
+
+    async def wait_for_observation(self, seen: int) -> bool:
+        return await self._outbox.wait_for_observation(seen)
 
     async def submit(self, command: commands.DuplexCommand) -> None:
         if self.closed:
@@ -683,6 +702,136 @@ def test_realtime_envelope_first_message_classification() -> None:
     autostarted = envelope.first_message({"type": "input_audio_buffer.commit"})
     assert autostarted.kind == "open" and autostarted.session_payload == {"model": "m"}
     assert autostarted.pending_command_payload == {"type": "input_audio_buffer.commit"}
+
+
+def test_session_update_does_not_mutate_defaults_until_accepted() -> None:
+    """#7636 Issue 10: rejected session.update must not change append decode defaults."""
+    envelope = RealtimeEnvelope.from_query_params({"model": "m"})
+    assert envelope.defaults.input_audio_format == "pcm16"
+
+    envelope.translate(
+        {
+            "type": "session.update",
+            "session": {"model": "another-model", "input_audio_format": "pcm_f32le"},
+        }
+    )
+    # Engine would reject the model change; wire defaults stay pcm16 until session.updated.
+    assert envelope.defaults.input_audio_format == "pcm16"
+
+    envelope.apply_accepted_session({"input_audio_format": "pcm_f32le"})
+    assert envelope.defaults.input_audio_format == "pcm_f32le"
+
+
+def _append(audio: bytes) -> dict[str, object]:
+    return {"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")}
+
+
+def _decoded_audio_nbytes(command: commands.DuplexCommand) -> int:
+    audio = command.audio
+    if isinstance(audio, str):
+        return len(base64.b64decode(audio))
+    return len(audio)
+
+
+@pytest.mark.asyncio
+async def test_queued_session_updated_applies_before_next_append_while_send_is_delayed() -> None:
+    """#7996 review: a blocked outbound send must not leave the next append on the old format.
+
+    The engine has already queued ``session.updated``. The pump is still
+    delivering an earlier event, so it has not applied the new defaults yet.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    release = asyncio.Event()
+    sending = asyncio.Event()
+    original_send = ws.send_json
+
+    async def blocked_send(payload: dict[str, Any]) -> None:
+        sending.set()
+        await release.wait()
+        await original_send(payload)
+
+    ws.send_json = blocked_send  # type: ignore[method-assign]
+    try:
+        handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+        await asyncio.wait_for(sending.wait(), timeout=2.0)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        assert "session.updated" not in ws.types()
+        ws.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
+        # The queued session.updated is applied before this translate, so the
+        # 8 float32 bytes are kept instead of being read as pcm16.
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        release.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_append_waits_for_engine_session_update_before_translate() -> None:
+    """A pipelined append waits until the engine accepts or rejects the update.
+
+    ``submit`` only enqueues. Until ``session.updated`` or the matching error
+    is enqueued, 8 bytes must not already have been decoded as pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        rejected_update = _session_update(input_audio_format="pcm_f32le")
+        rejected_update["event_id"] = "upd-reject"
+        ws.feed(rejected_update)
+        ws.feed(_append(b"\x00" * 8))
+        await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(ErrorEvent(code="model_update_unsupported", message="rejected", related_event_id="upd-reject"))
+        rejected = await _next_append(handle)
+        # pcm16 turns 8 bytes into 4 int16 samples, then 16 bytes of float32.
+        assert _decoded_audio_nbytes(rejected) == 16
+
+        accepted_update = _session_update(input_audio_format="pcm_f32le")
+        accepted_update["event_id"] = "upd-ok"
+        ws.feed(accepted_update)
+        ws.feed(_append(b"\x00" * 8))
+        await _next_command(handle, commands.UpdateSession, after=1)
+        await asyncio.sleep(0.05)
+        assert len([command for command in handle.commands if isinstance(command, commands.AppendAudio)]) == 1
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        accepted = await _next_append(handle, after=1)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+async def _next_command(handle: FakeHandle, command_type: type, *, after: int = 0) -> commands.DuplexCommand:
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while asyncio.get_running_loop().time() < deadline:
+        matched = [command for command in handle.commands if isinstance(command, command_type)]
+        if len(matched) > after:
+            return matched[after]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {command_type.__name__}; commands={handle.commands!r}")
+
+
+async def _next_append(handle: FakeHandle, *, after: int = 0) -> commands.AppendAudio:
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while asyncio.get_running_loop().time() < deadline:
+        appends = [command for command in handle.commands if isinstance(command, commands.AppendAudio)]
+        if len(appends) > after:
+            return appends[after]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for append; commands={handle.commands!r}")
 
 
 def test_parse_resume_request_requires_the_three_fields_only() -> None:

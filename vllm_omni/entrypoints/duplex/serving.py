@@ -27,14 +27,16 @@ from functools import partial
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError
+from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError, UpdateSession
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
+    ErrorEvent,
     SessionClosed,
     SessionCreated,
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    SessionUpdated,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, ResumeRequest, parse_resume_request
@@ -54,7 +56,6 @@ from vllm_omni.entrypoints.duplex.websocket import (
     receive_text_with_timeout,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
-from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
 logger = init_logger(__name__)
 
@@ -92,6 +93,34 @@ class _ResumeCredentials:
     resume_token: str
 
 
+@dataclass(frozen=True)
+class _PendingSessionUpdate:
+    """A ``session.update`` submitted to the engine and not yet accepted or rejected."""
+
+    event_id: str | None
+    #: ``observation_seq`` sampled before ``submit``, so the outcome is visible.
+    after_seq: int
+
+
+def _error_answers_session_update(event: ErrorEvent, event_id: str | None) -> bool:
+    related = event.related_event_id
+    if event_id:
+        return related == event_id
+    return related is None
+
+
+def _session_update_outcome(
+    events: tuple[DuplexEvent, ...], event_id: str | None
+) -> SessionUpdated | ErrorEvent | None:
+    """First acceptance, or the error that answers this update. Other errors are skipped."""
+    for event in events:
+        if isinstance(event, SessionUpdated):
+            return event
+        if isinstance(event, ErrorEvent) and _error_answers_session_update(event, event_id):
+            return event
+    return None
+
+
 class OmniDuplexSessionHandler:
     """WebSocket transport for engine-resident duplex sessions."""
 
@@ -111,11 +140,17 @@ class OmniDuplexSessionHandler:
             replay_max_bytes_per_session=runtime_config.resume_replay_max_bytes_per_session,
         )
         self._resync_required_sessions: set[str] = set()
-        #: Wire defaults (input/output audio format and rate) per session. They
-        #: are negotiated on the session but live on the per-connection
-        #: envelope, so a reconnect has to be handed them back.
-        self._input_defaults: dict[str, RealtimeInputDefaults] = {}
+        #: Live connection envelopes keyed by session id. ``session.updated``
+        #: arrives on the session-scoped pump; the envelope that must apply the
+        #: new wire defaults lives on the read loop, so the pump looks it up here.
+        #: Defaults stay on that envelope. A reconnect copies them off the
+        #: previous entry before replacing it. The pump drops the entry when
+        #: the session ends.
+        self._live_envelopes: dict[str, RealtimeEnvelope] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
+        #: One submitted ``session.update`` whose ``session.updated`` or rejection
+        #: is not yet visible. The next format-dependent append waits on it.
+        self._pending_session_updates: dict[str, _PendingSessionUpdate] = {}
 
     # ------------------------------------------------------------------ #
     # Entry point                                                         #
@@ -151,7 +186,6 @@ class OmniDuplexSessionHandler:
                     return
             if pending_command is not None:
                 await self._submit_wire_event(attachment, envelope, pending_command, send_json)
-            self._input_defaults[attachment.handle.session_id] = envelope.defaults
             await self._read_loop(websocket, envelope, attachment, send_json)
             await self._drain_terminal_pump(attachment)
         except WebSocketDisconnect:
@@ -225,6 +259,9 @@ class OmniDuplexSessionHandler:
                 attachment_generation=created.attachment_generation,
                 resume_token=created.resume_token.plaintext,
             )
+        # Bind before the pump starts so a session.updated emitted during open
+        # applies onto this connection's envelope.
+        self._live_envelopes[handle.session_id] = envelope
         self._start_pump(handle, credentials)
         return attachment
 
@@ -357,11 +394,13 @@ class OmniDuplexSessionHandler:
             return None
         # A reconnect brings a fresh envelope carrying pcm16/16 kHz wire
         # defaults. The negotiated input format is a wire default, not part of
-        # the public session object, so it has to be carried over explicitly:
-        # otherwise the first append that omits format/rate is decoded as pcm16.
-        remembered = self._input_defaults.get(session_id)
-        if remembered is not None:
-            envelope.defaults = remembered
+        # the public session object, so copy it from the envelope this session
+        # is still holding before replacing the map entry. Otherwise the first
+        # append that omits format/rate is decoded as pcm16.
+        previous = self._live_envelopes.get(session_id)
+        if previous is not None:
+            envelope.defaults = previous.defaults
+        self._live_envelopes[session_id] = envelope
         self._start_pump(handle, None)
         return _Attachment(handle=handle, generation=resumed.attachment_generation)
 
@@ -479,6 +518,11 @@ class OmniDuplexSessionHandler:
                         attachment_generation=credentials.attachment_generation,
                         resume_token=credentials.resume_token,
                     )
+                if isinstance(event, SessionUpdated):
+                    # Queued updates are also applied before the next translate.
+                    # This path still covers a client that waits for the event
+                    # itself and sends nothing in between.
+                    self._apply_accepted_session_defaults(session_id, event.session)
                 await self._send_event(session_id, event, handle=handle)
                 if isinstance(event, SessionClosed):
                     close_reason = event.reason or event.type
@@ -490,7 +534,8 @@ class OmniDuplexSessionHandler:
         finally:
             self._pumps.pop(session_id, None)
             self._resync_required_sessions.discard(session_id)
-            self._input_defaults.pop(session_id, None)
+            self._live_envelopes.pop(session_id, None)
+            self._pending_session_updates.pop(session_id, None)
             attachment = None
             with suppress(Exception):
                 attachment = await self._attachment_registry.close(session_id)
@@ -692,15 +737,63 @@ class OmniDuplexSessionHandler:
         payload: dict[str, object],
         send_json: SendJson,
     ) -> None:
+        # An append that omits its format has to see the outcome of a
+        # session.update already submitted on this connection. Acceptance may
+        # still be inside the engine, so it is not enough that a
+        # session.updated is sitting in the outbox. A later update waits too,
+        # so only one update is in flight.
+        if payload.get("type") in {"input_audio_buffer.append", "session.update"}:
+            await self._wait_for_pending_session_update(attachment.handle)
+            if attachment.handle.closed:
+                return
+        # An accepted session.update is already on the outbox once the engine
+        # emits it. Apply that before translate so the next append does not
+        # keep the previous format while the pump is still sending an earlier
+        # event. A rejected update never queues session.updated.
+        self._apply_queued_session_updates(attachment.handle)
         try:
             command = envelope.translate(payload)
         except DuplexCommandError as exc:
             await send_json(envelope.command_error_payload(exc))
             return
-        # ``translate`` folds a session.update's audio settings into the
-        # envelope; remember them so a later reconnect starts where this left off.
-        self._input_defaults[attachment.handle.session_id] = envelope.defaults
         await self._submit_command(attachment, envelope, command, send_json)
+
+    async def _wait_for_pending_session_update(self, handle: DuplexSessionHandle) -> None:
+        """Block until the in-flight ``session.update`` is accepted or rejected.
+
+        The outcome is the ``session.updated`` or matching ``error`` the engine
+        enqueued. This does not wait for the pump to send that event.
+        """
+        session_id = handle.session_id
+        while True:
+            pending = self._pending_session_updates.get(session_id)
+            if pending is None or handle.closed:
+                return
+            seen = handle.observation_seq()
+            outcome = _session_update_outcome(handle.observations_after(pending.after_seq), pending.event_id)
+            if isinstance(outcome, SessionUpdated):
+                self._apply_accepted_session_defaults(session_id, outcome.session)
+                self._pending_session_updates.pop(session_id, None)
+                return
+            if isinstance(outcome, ErrorEvent):
+                self._pending_session_updates.pop(session_id, None)
+                return
+            if not await handle.wait_for_observation(seen):
+                self._pending_session_updates.pop(session_id, None)
+                return
+
+    def _apply_queued_session_updates(self, handle: DuplexSessionHandle) -> None:
+        """Apply ``session.updated`` events the pump has not dequeued yet."""
+        for event in handle.queued_events():
+            if isinstance(event, SessionUpdated):
+                self._apply_accepted_session_defaults(handle.session_id, event.session)
+
+    def _apply_accepted_session_defaults(self, session_id: str, session_payload: Mapping[str, object]) -> None:
+        """Apply wire defaults only after the engine accepted a session.update."""
+        envelope = self._live_envelopes.get(session_id)
+        if envelope is None:
+            return
+        envelope.apply_accepted_session(session_payload)
 
     async def _submit_command(
         self,
@@ -709,10 +802,17 @@ class OmniDuplexSessionHandler:
         command: DuplexCommand,
         send_json: SendJson,
     ) -> None:
+        after_seq = attachment.handle.observation_seq() if isinstance(command, UpdateSession) else None
         try:
             await attachment.handle.submit(command)
         except DuplexSessionError as exc:
             await send_json(envelope.error_payload(exc.code, str(exc), event_id=command.event_id))
+            return
+        if after_seq is not None:
+            self._pending_session_updates[attachment.handle.session_id] = _PendingSessionUpdate(
+                event_id=command.event_id,
+                after_seq=after_seq,
+            )
 
     # ------------------------------------------------------------------ #
     # Disconnect                                                          #
