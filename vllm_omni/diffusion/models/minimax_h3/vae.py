@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_compile import install_compiled_rope_output_guard
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -358,6 +359,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
         decoder = getattr(self.remote.model, "decoder", None)
         if decoder is not None:
+            install_compiled_rope_output_guard(decoder)
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
