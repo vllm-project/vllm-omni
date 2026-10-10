@@ -657,12 +657,12 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
         ("1", "duplex"),
         ("true", "duplex"),
         ("on", "duplex"),
-        ("0", "legacy"),
-        ("false", "legacy"),
+        ("0", "turn_based"),
+        ("false", "turn_based"),
     ],
 )
 async def test_realtime_route_defaults_to_configured_duplex_handler(
-    monkeypatch, duplex_query: str | None, expected_handler: str
+    duplex_query: str | None, expected_handler: str
 ) -> None:
     calls: list[str] = []
 
@@ -670,15 +670,16 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_realtime_session(self, _websocket) -> None:
             calls.append("duplex")
 
-    async def _dispatch_turn_based(_websocket) -> None:
-        calls.append("legacy")
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
 
-    monkeypatch.setattr(api_server, "dispatch_realtime_websocket", _dispatch_turn_based)
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
                 openai_serving_duplex=_DuplexHandler(),
+                openai_realtime_handler=_TurnBasedHandler(),
             )
         ),
         query_params=query_params,

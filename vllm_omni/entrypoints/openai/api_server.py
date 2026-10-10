@@ -95,7 +95,10 @@ from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
-from vllm_omni.entrypoints.duplex.openai import dispatch_realtime_websocket
+from vllm_omni.entrypoints.duplex.openai import (
+    OpenAIRealtimeHandler,
+    _reject_unavailable_realtime_websocket,
+)
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import (
     DUPLEX_WARMUP_CLIENT_WAIT_S,
@@ -857,6 +860,7 @@ async def omni_init_app_state(
         request_logger = None
 
     base_model_paths = [BaseModelPath(name=name, model_path=args.model) for name in served_model_names]
+    state.openai_realtime_handler = OpenAIRealtimeHandler.from_engine_client(engine_client)
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.args = args
@@ -1795,7 +1799,12 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    await dispatch_realtime_websocket(websocket)
+    realtime_handler = getattr(websocket.app.state, "openai_realtime_handler", None)
+    if realtime_handler is None:
+        await _reject_unavailable_realtime_websocket(websocket)
+        return
+
+    await realtime_handler.handle_websocket(websocket)
 
 
 async def _wait_for_duplex_warmup(websocket: WebSocket) -> None:
