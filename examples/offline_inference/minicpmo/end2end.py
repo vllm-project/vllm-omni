@@ -295,17 +295,35 @@ def main(args):
         detokenize=True,
         repetition_penalty=1.1,
     )
-    # Stage 1 (talker + Token2Wav): max_tokens=1 satisfies the scheduler;
-    # waveform is produced in-process by Token2Wav.
+    # Stage 1 (Talker): emits the codec stream consumed by Code2Wav. Mirrors
+    # stage 1 of the MiniCPM-o 4.5 deploy configs. ``max_tokens=1`` was only
+    # correct while Token2Wav still ran in-process; after the Talker/Code2Wav
+    # split it stops the stream after a single chunk (~0.16 s of audio).
     talker_sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
         top_k=-1,
-        max_tokens=1,
+        min_tokens=50,
+        max_tokens=2048,
+        stop_token_ids=[1],
         seed=SEED,
         detokenize=False,
     )
-    sampling_params_list = [thinker_sampling_params, talker_sampling_params][: omni.num_stages]
+    # Stage 2 (Code2Wav): codec chunks -> 24 kHz waveform. Mirrors stage 2 of
+    # the deploy configs. Without it ``num_stages == 3`` and ``generate()``
+    # rejects the two-element list.
+    code2wav_sampling_params = SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        max_tokens=65536,
+        detokenize=True,
+    )
+    sampling_params_list = [
+        thinker_sampling_params,
+        talker_sampling_params,
+        code2wav_sampling_params,
+    ][: omni.num_stages]
 
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]
