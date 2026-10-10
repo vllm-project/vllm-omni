@@ -265,11 +265,20 @@ def drive(url, args, n, conc, label, results, lock, idx, chunk_frames):
                 if i >= n:
                     return
                 text = texts[i % len(texts)]
+                voice = i % len(args.ref_audio)
                 try:
                     r = one_request(
-                        c, url, args.model, text, args.ref_audio, args.ref_text, chunk_frames, seed=args.seed
+                        c,
+                        url,
+                        args.model,
+                        text,
+                        args.ref_audio[voice],
+                        args.ref_text[voice],
+                        chunk_frames,
+                        seed=args.seed,
                     )
                     r["text"] = text
+                    r["voice"] = voice
                     with lock:
                         results.append(r)
                 except Exception as e:
@@ -344,14 +353,15 @@ def run_combo(args, conc: int, chunk_frames: int, out: Path) -> dict:
         problems = []
         for r in ok:
             problems += check_correctness(r, args.min_audio_s)
-        # With a fixed seed, same-text requests must produce byte-identical PCM (per text group)
+        # With a fixed seed, same-(text, voice) requests must produce byte-identical PCM
         if args.seed is not None:
-            by_text: dict[str, bytes] = {}
+            by_text: dict[tuple, bytes] = {}
             for r in ok:
                 t = r.get("text")
-                ref = by_text.get(t)
+                key = (t, r.get("voice"))
+                ref = by_text.get(key)
                 if ref is None:
-                    by_text[t] = r.get("audio_bytes")
+                    by_text[key] = r.get("audio_bytes")
                 elif r.get("audio_bytes") != ref:
                     problems.append(f"byte-identity violation for text {t!r}: seeded requests produced different PCM")
         n_ok = len(ok)
@@ -421,8 +431,14 @@ def parse_args() -> argparse.Namespace:
         "them so a single server launch covers all utterance lengths; results "
         "are bucketed per text.",
     )
-    p.add_argument("--ref-audio", default=DEFAULT_REF_AUDIO)
-    p.add_argument("--ref-text", default=DEFAULT_REF_TEXT)
+    p.add_argument(
+        "--ref-audio",
+        nargs="+",
+        default=[DEFAULT_REF_AUDIO],
+        help="One or more reference voices. With several, requests cycle through "
+        "them (request i uses voice i %% N), so concurrent requests carry different voices.",
+    )
+    p.add_argument("--ref-text", nargs="+", default=[DEFAULT_REF_TEXT], help="One transcript per --ref-audio.")
     p.add_argument("--concurrency", type=int, nargs="+", default=[1, 8])
     p.add_argument(
         "--step-size",
@@ -462,7 +478,10 @@ def parse_args() -> argparse.Namespace:
         "equivalent (any non-int) to disable -- there is no unset sentinel here "
         "by design, since the default sweep is meant to be exactly reproducible.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if len(args.ref_audio) != len(args.ref_text):
+        p.error("--ref-audio and --ref-text must have the same number of values")
+    return args
 
 
 def main() -> None:
