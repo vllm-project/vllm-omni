@@ -44,21 +44,30 @@ import torch.nn.functional as F
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import _rms_norm_f32
 
 
-def _apply_rope(q: torch.Tensor, k: torch.Tensor, offset: torch.Tensor, max_period: float = 10_000.0):
-    """Interleaved RoPE at absolute ``offset``, fp32 rotation (moshi ``apply_rope``)."""
-    B, H, T, D = q.shape
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
-    ts = ts.view(-1, 1, T, 1)
+def _rope_tables(offset: torch.Tensor, seq_len: int, head_dim: int, max_period: float = 10_000.0):
+    """Per-row RoPE ``cos``/``sin`` tables for positions ``offset + [0, seq_len)``.
 
+    ``offset`` is the per-row ``[B]`` absolute position. The tables depend only
+    on ``(offset, seq_len, head_dim)``, so a streaming stack builds them once per
+    ``step()`` and hands the same pair to every layer. Returns ``(rotr, roti)``,
+    each ``[B, 1, seq_len, head_dim // 2]`` fp32.
+    """
+    D = head_dim
+    ds = torch.arange(D // 2, device=offset.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    ts = offset.float().view(-1, 1) + torch.arange(seq_len, device=offset.device, dtype=torch.float32)
+    ts = ts.view(-1, 1, seq_len, 1)
+    return torch.cos(freqs * ts), torch.sin(freqs * ts)
+
+
+def _apply_rope(q: torch.Tensor, k: torch.Tensor, rotr: torch.Tensor, roti: torch.Tensor):
+    """Interleaved RoPE with precomputed ``_rope_tables``, fp32 rotation (moshi ``apply_rope``)."""
+    D = q.shape[-1]
     dims = q.shape[:-1]
     q = q.view(*dims, D // 2, 2)
     k = k.view(*dims, D // 2, 2)
     qr, qi = q[..., 0].float(), q[..., 1].float()
     kr, ki = k[..., 0].float(), k[..., 1].float()
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
     qor = qr * rotr - qi * roti
     qoi = qr * roti + qi * rotr
     kor = kr * rotr - ki * roti
@@ -67,6 +76,36 @@ def _apply_rope(q: torch.Tensor, k: torch.Tensor, offset: torch.Tensor, max_peri
     qo = torch.stack([qor.to(dtype), qoi.to(dtype)], dim=-1)
     ko = torch.stack([kor.to(dtype), koi.to(dtype)], dim=-1)
     return qo.view(*dims, D), ko.view(*dims, D)
+
+
+def _ringkv_positions(offset: torch.Tensor, seq_len: int, capacity: int, active: torch.Tensor):
+    """Ring write indexes and pre-mask absolute positions for one ``complete()``.
+
+    ``offset`` is the per-row ``[B]`` end offset *before* this write; inactive
+    rows do not advance. Every ``_RingKV`` of a stack ticks in lockstep with the
+    stack's ``_offset``, so a stack builds these once per ``step()`` and shares
+    them across layers. Returns ``indexes [B, seq_len]`` and ``positions [B, capacity]``
+    (``-1`` for never-written cells). The per-row ``start_offset`` mask is NOT
+    applied here: it is per-ring elastic-recycle state and stays in ``complete()``.
+    """
+    indexes = (
+        torch.arange(seq_len, device=offset.device, dtype=offset.dtype).view(1, -1) + offset.view(-1, 1)
+    ) % capacity
+    end_offset = (offset + seq_len * active.to(offset.dtype)).view(-1, 1)
+    idx = torch.arange(capacity, device=offset.device, dtype=torch.long)
+    invalid = idx.view(1, -1) >= end_offset
+    end_index = end_offset % capacity
+    delta = idx.view(1, -1) - end_index
+    # `delta <= 0` (not `< 0`) is moshi's exact convention (transformer.py
+    # RingKVCache.complete). It labels the just-past-newest slot as the future
+    # write position, so once the ring has wrapped the single oldest in-window
+    # cell is excluded and the effective window is capacity-1. This is inherited
+    # verbatim from the reference and only shows after the window fills (Helium
+    # ~3000 frames / 240 s); it costs one frame out of thousands. Do NOT change
+    # this to `< 0`: it would diverge from moshi and break greedy bit-parity.
+    positions = torch.where(delta <= 0, end_offset + delta, end_offset + delta - capacity)
+    positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+    return indexes, positions
 
 
 class _RingKV:
@@ -101,12 +140,23 @@ class _RingKV:
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1
 
-    def complete(self, k: torch.Tensor, v: torch.Tensor, active: torch.Tensor):
+    def complete(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        active: torch.Tensor,
+        indexes: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ):
+        """Write ``k``/``v`` and return ``(keys, values, positions [B, capacity])``.
+
+        ``indexes``/``positions`` are this write's ``_ringkv_positions`` tables;
+        streaming stacks pass the copy they hoisted once per ``step()``. When
+        omitted (standalone use) they are built from this ring's ``end_offset``.
+        """
         B, H, T, D = k.shape
-        indexes = (
-            torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype).view(1, -1)
-            + self.end_offset.view(-1, 1)
-        ) % self.capacity
+        if indexes is None or positions is None:
+            indexes, positions = _ringkv_positions(self.end_offset, T, self.capacity, active)
         idx4 = indexes.view(B, 1, T, 1).expand(-1, H, -1, D)
         # Keep inactive rows completely inert. Once the ring is full, the
         # physical future-write slot is also addressable by the position mask;
@@ -121,20 +171,6 @@ class _RingKV:
         self.cache[1].scatter_(2, idx4, v)
         self.end_offset.add_(T * active.to(self.end_offset.dtype))
 
-        idx = torch.arange(self.capacity, device=self.end_offset.device, dtype=torch.long)
-        end_offset = self.end_offset.view(-1, 1)
-        invalid = idx.view(1, -1) >= end_offset
-        end_index = end_offset % self.capacity
-        delta = idx.view(1, -1) - end_index
-        # `delta <= 0` (not `< 0`) is moshi's exact convention (transformer.py
-        # RingKVCache.complete). It labels the just-past-newest slot as the future
-        # write position, so once the ring has wrapped the single oldest in-window
-        # cell is excluded and the effective window is capacity-1. This is inherited
-        # verbatim from the reference and only shows after the window fills (Helium
-        # ~3000 frames / 240 s); it costs one frame out of thousands. Do NOT change
-        # this to `< 0`: it would diverge from moshi and break greedy bit-parity.
-        positions = torch.where(delta <= 0, end_offset + delta, end_offset + delta - self.capacity)
-        positions = torch.where(invalid, torch.full_like(positions, -1), positions)
         below = positions < self.start_offset.view(-1, 1)  # [B, capacity]
         positions = torch.where(below, torch.full_like(positions, -1), positions)
         return self.cache[0], self.cache[1], positions
@@ -168,6 +204,8 @@ class _TemporalLayer(nn.Module):
         offset: torch.Tensor,
         context: int,
         active: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor],
+        ring: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         B, T, _ = x.shape
         h = _rms_norm_f32(x, self.norm1_alpha, 1e-8)
@@ -176,9 +214,9 @@ class _TemporalLayer(nn.Module):
         # downstream kernels see identical strides (bit-level replay agreement).
         qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = _apply_rope(q, k, offset)
+        q, k = _apply_rope(q, k, *rope)
 
-        keys, values, pos_k = kv.complete(k, v, active)
+        keys, values, pos_k = kv.complete(k, v, active, *ring)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])  # [B, 1, cap]
         pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
@@ -260,8 +298,12 @@ class PersonaPlexTemporalStreaming(nn.Module):
         assert self._kv is not None, "call streaming_init first"
         active = _normalize_temporal_active(active, self._offset)
         x = frame_embedding
+        T = x.shape[1]
+        # Offset-pure tables, identical for every layer: build once per step.
+        rope = _rope_tables(self._offset, T, self.layers[0].head_dim, self.max_period)
+        ring = _ringkv_positions(self._offset, T, self.context, active)
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context, active)
+            x = layer(x, kv, self._offset, self.context, active, rope, ring)
         self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
         out = _rms_norm_f32(x, self.out_norm_alpha, 1e-8)
         text_logits = F.linear(out, self.text_linear)

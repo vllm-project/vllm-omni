@@ -207,9 +207,12 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
         if valid is None:
             valid = pooling_output.get("meta.codec_frame_valid")
         if isinstance(valid, torch.Tensor) and isinstance(audio, torch.Tensor):
-            # Model Runner V2 emits one id per token row plus its validity
-            # (decode rows of live requests); keep only the codec frames.
+            # Device codec outputs carry a validity mask; prefill rows can
+            # carry empty audio and masks. reshape(0, -1) is ambiguous even
+            # for a correctly empty codec delta.
             rows = valid.detach().to(device="cpu").reshape(-1).bool()
+            if rows.numel() == 0 and audio.numel() == 0:
+                return []
             audio = audio.detach().to(device="cpu").reshape(rows.numel(), -1)[rows]
         return _codec_scalars(audio)
     if isinstance(pooling_output, Sequence) and not isinstance(

@@ -6,25 +6,29 @@
 
 The sink and context-parallel math is adapted from SandAI's Apache-2.0
 MAGI-2 preview implementation.  This version uses vLLM's bundled
-FlashAttention extension and vLLM-Omni's existing Ulysses process group; the
-PyTorch path is an exact, portable oracle for small tests.
+FlashAttention extension on CUDA, standalone FlashAttention-3 on MUSA, and
+vLLM-Omni's existing Ulysses process group; the chunked PyTorch path is the
+portable reference and the MUSA fallback.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from functools import cache
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.utils.fa import (
+    flash_attn_3_varlen,
+    flash_attn_3_varlen_unsupported,
     resolve_vllm_flash_attn_version,
     vllm_flash_attn_varlen_with_lse,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .parallel import (
     Magi2ParallelGroup,
@@ -33,7 +37,12 @@ from .parallel import (
     scatter_seqlen_gather_heads,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
+
+# MATE's Mubin kernel, which runs when no native sinks are passed, truncates the BF16
+# softmax probabilities. Packed batches whose longest query sequence is shorter than
+# this use the exact Torch reference; MAGI-2 production sequences are far longer.
+_MUSA_FA3_MIN_TOKENS = 32
 
 
 @cache
@@ -151,9 +160,17 @@ def torch_varlen_attention_with_sink(
     cu_seqlens_k: torch.Tensor,
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
+    query_chunk_size: int = 512,
 ) -> torch.Tensor:
-    """Reference packed attention, including GQA and sink logits."""
+    """Reference packed attention, including GQA and sink logits.
 
+    During inference, score/probability tensors have at most query_chunk_size
+    rows instead of the full query length. Each chunk still attends to all
+    keys; K/V storage and any tensors retained for autograd are not bounded.
+    """
+
+    if type(query_chunk_size) is not int or query_chunk_size <= 0:
+        raise ValueError("query_chunk_size must be a positive integer")
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("packed attention expects q/k/v shaped [tokens,heads,dim]")
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
@@ -166,15 +183,20 @@ def torch_varlen_attention_with_sink(
         q_part = q[q_start:q_end].float()
         k_part = _repeat_kv_heads(k[k_start:k_end], q.shape[1]).float()
         v_part = _repeat_kv_heads(v[k_start:k_end], q.shape[1]).float()
-        scores = torch.einsum("qhd,khd->hqk", q_part, k_part) * scale
-        if softcap > 0:
-            scores = softcap * torch.tanh(scores / softcap)
-        if sink is not None and sink.numel() > 0:
-            sink_scores = sink.float().transpose(0, 1).unsqueeze(1).expand(-1, q_part.shape[0], -1)
-            probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)[..., : k_part.shape[0]]
-        else:
-            probabilities = torch.softmax(scores, dim=-1)
-        output[q_start:q_end] = torch.einsum("hqk,khd->qhd", probabilities, v_part).to(output.dtype)
+        # Retain the empty calculation too, including its autograd dependencies.
+        for offset in range(0, max(1, q_part.shape[0]), query_chunk_size):
+            q_chunk = q_part[offset : offset + query_chunk_size]
+            scores = torch.einsum("qhd,khd->hqk", q_chunk, k_part) * scale
+            if softcap > 0:
+                scores = softcap * torch.tanh(scores / softcap)
+            if sink is not None and sink.numel() > 0:
+                sink_scores = sink.float().transpose(0, 1).unsqueeze(1).expand(-1, q_chunk.shape[0], -1)
+                probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)[..., : k_part.shape[0]]
+            else:
+                probabilities = torch.softmax(scores, dim=-1)
+            output[q_start + offset : q_start + offset + q_chunk.shape[0]] = torch.einsum(
+                "hqk,khd->qhd", probabilities, v_part
+            ).to(output.dtype)
     return output
 
 
@@ -189,10 +211,10 @@ def packed_attention_with_sink(
 ) -> torch.Tensor:
     """Run packed attention on one rank after Ulysses head exchange."""
 
-    cu_q, cu_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
-    cu_q = cu_q.to(device=q.device, dtype=torch.int32).contiguous()
-    cu_k = cu_k.to(device=q.device, dtype=torch.int32).contiguous()
-    if q.is_cuda:
+    bounds_q, bounds_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
+    cu_q = bounds_q.to(device=q.device, dtype=torch.int32).contiguous()
+    cu_k = bounds_k.to(device=q.device, dtype=torch.int32).contiguous()
+    if q.is_cuda and current_omni_platform.is_cuda():
         out, lse = vllm_flash_attn_varlen_with_lse(
             q,
             k,
@@ -206,12 +228,42 @@ def packed_attention_with_sink(
             fa_version=_resolve_flash_attn_version(),
         )
         return correct_out_lse_with_sink(out, lse, sink)[0]
+    if (
+        current_omni_platform.is_musa()
+        and q.device.type == current_omni_platform.device_type
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.shape[0] > 0
+        and k.shape[0] > 0
+        and max_q >= _MUSA_FA3_MIN_TOKENS
+    ):
+        unsupported = flash_attn_3_varlen_unsupported(softcap > 0, True)
+        if unsupported is None:
+            out, lse = flash_attn_3_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                softmax_scale=q.shape[-1] ** -0.5,
+                softcap=softcap,
+                return_softmax_lse=True,
+            )
+            # Correct the learned sinks in FP32; FA3 itself runs in the activation dtype.
+            if sink is not None:
+                out = out.float()
+            return correct_out_lse_with_sink(out, lse, sink)[0].to(q.dtype)
+        logger.warning_once(
+            "MAGI-2 FlashAttention-3 is unavailable on MUSA; using Torch reference attention: %s", unsupported
+        )
+    # The reference reads the sequence bounds on the host; device copies would sync per sequence.
     return torch_varlen_attention_with_sink(
         q,
         k,
         v,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
+        cu_seqlens_q=bounds_q.cpu(),
+        cu_seqlens_k=bounds_k.cpu(),
         softcap=softcap,
         sink=sink,
     )

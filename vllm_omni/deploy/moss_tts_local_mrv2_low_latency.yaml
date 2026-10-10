@@ -4,11 +4,11 @@
 # throughput-first serving.
 #
 # Optional launch-level settings (see the full command in recipes/OpenMOSS/MOSS-TTS.md):
-#   - CUDA MPS for the GPU (stage 0 below lowers its own MPS client priority);
+#   - CUDA MPS for the GPU;
 #   - VLLM_OMNI_EVENT_DRIVEN_ORCH=1;
 #   - --api-server-count 4 with VLLM_WORKER_MULTIPROC_METHOD=spawn and
 #     VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR=/dev/shm/<dir> so frontends share reference codes;
-#   - VLLM_OMNI_CONNECTOR_RECV_POLL_MS=1 so Stage 1 picks up first chunks sooner.
+#   - VLLM_OMNI_CONNECTOR_RECV_POLL_MS=1 to reduce inter-stage polling latency.
 base_config: moss_tts_local_mrv2.yaml
 
 connectors:
@@ -16,16 +16,6 @@ connectors:
     extra:
       generation_min_batch_size: 32
       generation_max_wait_ms: 12
-      # Stage 1 decodes each first chunk from its receive thread on a small
-      # dedicated graph set and emits it directly, so first chunks no longer
-      # wait for the engine loop or a regular codec step.
-      codec_first_chunk_fast_path: 1
-      # Regular codec replays wait for an in-flight first-chunk decode.
-      codec_first_chunk_gate: 1
-      # Short regular codec steps bound contention with first-chunk decodes.
-      generation_max_regular_batch: 16
-      # Optional ramp. Both the first-chunk graph and regular graphs follow it.
-      # codec_chunk_ramp: [1, 4, 15]
 
 platforms:
   cuda:
@@ -38,17 +28,12 @@ platforms:
           mrv2_gpu_slot_state: true
           mrv2_batch_prefill: true
           mrv2_direct_tokens: true
-          # Sample each frame right after the forward that produced it.
-          mrv2_eager_mtp: true
         compilation_config:
           mode: 3
           cudagraph_mode: FULL
           max_cudagraph_capture_size: 2048
           cudagraph_num_of_warmups: 1
         kv_cache_memory_bytes: 34359738368  # 32 GiB
-        env:
-          # Under MPS, let codec kernels schedule ahead of the talker's.
-          CUDA_MPS_CLIENT_PRIORITY: "1"
       - stage_id: 1
         max_num_seqs: 128
         # Keep synchronous scheduling; benchmark async scheduling separately.
