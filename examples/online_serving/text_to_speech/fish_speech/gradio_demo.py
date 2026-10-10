@@ -20,12 +20,16 @@ Usage:
 """
 
 import argparse
+import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
 import secrets
+import threading
 import time
+from contextlib import asynccontextmanager
 
 try:
     import gradio as gr
@@ -140,25 +144,38 @@ def _build_player_js(sample_rate: int) -> str:
     <script>
     const SR = {sample_rate};
     const WC = {json.dumps(WORKLET_JS)};
-    let ctx = null, node = null, abort = null, gen = false, generation = 0, st = {{}};
+    let ctx = null, node = null, initPromise = null, abort = null, gen = false, generation = 0, st = {{}};
 
-    async function init() {{
-        if (ctx) return;
-        ctx = new AudioContext({{ sampleRate: SR }});
-        const b = new Blob([WC], {{ type: 'application/javascript' }});
-        const u = URL.createObjectURL(b);
-        await ctx.audioWorklet.addModule(u);
-        URL.revokeObjectURL(u);
-        node = new AudioWorkletNode(ctx, 'tts-playback-processor');
-        node.connect(ctx.destination);
-        node.port.onmessage = (e) => {{
-            if (e.data.type === 'started' && e.data.token === generation && gen) setStatus('Playing...', '#64dd17');
-            else if (e.data.type === 'ended' && e.data.token === generation && !gen) {{
-                setStatus('Done', '#64dd17'); showStats(true);
-                const btn = document.getElementById('tts-stop-btn');
-                if (btn) btn.style.display = 'none';
+    function init() {{
+        if (initPromise) return initPromise;
+        initPromise = (async () => {{
+            ctx = new AudioContext({{ sampleRate: SR }});
+            const b = new Blob([WC], {{ type: 'application/javascript' }});
+            const u = URL.createObjectURL(b);
+            try {{
+                await ctx.audioWorklet.addModule(u);
+            }} finally {{
+                URL.revokeObjectURL(u);
             }}
-        }};
+            node = new AudioWorkletNode(ctx, 'tts-playback-processor');
+            node.connect(ctx.destination);
+            node.port.onmessage = (e) => {{
+                if (e.data.type === 'started' && e.data.token === generation && gen) setStatus('Playing...', '#64dd17');
+                else if (e.data.type === 'ended' && e.data.token === generation && !gen) {{
+                    setStatus('Done', '#64dd17'); showStats(true);
+                    const btn = document.getElementById('tts-stop-btn');
+                    if (btn) btn.style.display = 'none';
+                }}
+            }};
+        }})().catch(async (e) => {{
+            if (node) node.disconnect();
+            if (ctx) await ctx.close().catch(() => {{}});
+            ctx = null;
+            node = null;
+            initPromise = null;
+            throw e;
+        }});
+        return initPromise;
     }}
 
     function setStatus(text, color) {{
@@ -467,41 +484,90 @@ def generate_speech(api_base: str, text: str, ref_audio, ref_audio_url, ref_text
         raise gr.Error(f"Failed to decode audio: {e}")
 
 
+class PayloadStore:
+    """Thread-safe, single-consumer store for payloads handed to the browser."""
+
+    def __init__(self, ttl: float = 300.0, cap: int = 128):
+        self.ttl = ttl
+        self.cap = cap
+        self._items: dict[str, tuple[float, dict]] = {}
+        self._lock = threading.Lock()
+
+    def _cleanup_locked(self, now: float) -> None:
+        for key, (expires, _) in list(self._items.items()):
+            if expires <= now:
+                self._items.pop(key, None)
+
+    def cleanup(self) -> None:
+        with self._lock:
+            self._cleanup_locked(time.monotonic())
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def store(self, payload: dict) -> str:
+        if not isinstance(payload, dict):
+            raise TypeError("payload must be an object")
+        now = time.monotonic()
+        with self._lock:
+            self._cleanup_locked(now)
+            while len(self._items) >= self.cap:
+                oldest = min(self._items, key=lambda key: self._items[key][0])
+                self._items.pop(oldest, None)
+            req_id = secrets.token_urlsafe(32)
+            self._items[req_id] = (now + self.ttl, payload)
+            return req_id
+
+    def consume(self, req_id: str) -> dict | None:
+        if not isinstance(req_id, str) or not req_id:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            pending = self._items.pop(req_id, None)
+            if pending is None or pending[0] <= now:
+                return None
+            return pending[1]
+
+
 def create_app(api_base: str):
     """Create the FastAPI app with a streaming proxy + Gradio UI."""
-    fastapi_app = FastAPI()
+    payload_store = PayloadStore()
 
-    # Server-side payload store: streaming payloads (esp. base64 ref_audio) are
-    # too large to route through the Gradio textbox -> JS -> fetch pipeline, so
-    # we build them in Python, stash them here, and hand the browser only a
-    # short request id to fetch by.
-    _pending_payloads: dict[str, tuple[float, dict]] = {}
-    payload_ttl = 300.0
-    payload_cap = 128
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        cleanup_task = asyncio.create_task(_cleanup_payloads())
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cleanup_task
+            payload_store.clear()
 
-    def store_payload(payload: dict) -> str:
-        now = time.monotonic()
-        for key, (expires, _) in list(_pending_payloads.items()):
-            if expires <= now:
-                _pending_payloads.pop(key, None)
-        while len(_pending_payloads) >= payload_cap:
-            oldest = min(_pending_payloads, key=lambda key: _pending_payloads[key][0])
-            _pending_payloads.pop(oldest, None)
-        req_id = secrets.token_urlsafe(32)
-        _pending_payloads[req_id] = (now + payload_ttl, payload)
-        return req_id
+    async def _cleanup_payloads() -> None:
+        while True:
+            await asyncio.sleep(min(payload_store.ttl, 1.0))
+            payload_store.cleanup()
+
+    fastapi_app = FastAPI(lifespan=lifespan)
+    fastapi_app.state.payload_store = payload_store
 
     # ── Streaming proxy (same-origin, no CORS issues) ────────────
     @fastapi_app.post("/proxy/v1/audio/speech")
     async def proxy_speech(request: Request):
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return Response(content="Request body must be a JSON object", status_code=400)
+        if not isinstance(body, dict):
+            return Response(content="Request body must be a JSON object", status_code=400)
         req_id = body.get("_req_id")
-        if not req_id:
-            return Response(content="Missing request id", status_code=400)
-        pending = _pending_payloads.pop(req_id, None)
-        if pending is None or pending[0] <= time.monotonic():
+        if not isinstance(req_id, str) or not req_id:
+            return Response(content="Request id must be a non-empty string", status_code=400)
+        body = payload_store.consume(req_id)
+        if body is None:
             return Response(content="Unknown or expired request id", status_code=404)
-        body = pending[1]
         body.pop("_nonce", None)
         try:
             client = httpx.AsyncClient(timeout=300)
@@ -545,7 +611,7 @@ def create_app(api_base: str):
         # fetch().body.getReader(), inflating time-to-first-playback.
         return StreamingResponse(relay(), media_type="audio/pcm")
 
-    # ── Gradio UI ────────────────────────────────────────────────
+    # ── Gradio UI ─────────────────────────────────────────────────
     with gr.Blocks(title="Fish Speech S2 Pro Demo") as demo:
         gr.Markdown("# Fish Speech S2 Pro - Text to Speech")
         gr.Markdown(f"**Server:** `{api_base}` | **Model:** fishaudio/s2-pro | **Output:** 44.1kHz")
@@ -647,7 +713,7 @@ def create_app(api_base: str):
             if stream_enabled:
                 text, ref_a, ref_url, ref_t, _fmt = args
                 payload = build_payload(text, ref_a, ref_url, ref_t, "pcm", stream=True)
-                req_id = store_payload(payload)
+                req_id = payload_store.store(payload)
                 browser_payload = {"_req_id": req_id}
                 return json.dumps(browser_payload), gr.update()
             # Non-streaming path: return the full clip via gr.Audio.
