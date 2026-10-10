@@ -519,10 +519,12 @@ class OmniServeCommand(CLISubcommand):
             "--omni-lb-policy",
             type=str,
             default="random",
-            choices=["random", "round-robin", "least-queue-length"],
+            choices=["random", "round-robin", "least-queue-length", "cost-aware"],
             help=(
                 "Per-stage load-balancing policy used by the head's StagePool to "
-                "route requests across UP replicas. Only consulted on the head runtime."
+                "route requests across UP replicas. 'cost-aware' estimates diffusion "
+                "work from request geometry, frames, steps, and output count. Only "
+                "consulted on the head runtime."
             ),
         )
         omni_config_group.add_argument(
@@ -1189,6 +1191,7 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
         async_chunk=async_chunk,
         tokenizer=getattr(args, "tokenizer", None),
         log_stats=not bool(getattr(args, "disable_log_stats", False)),
+        omni_lb_policy=str(getattr(args, "omni_lb_policy", "random")),
     )
 
 
