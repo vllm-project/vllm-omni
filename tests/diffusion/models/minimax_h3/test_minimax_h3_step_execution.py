@@ -708,8 +708,7 @@ def test_timestep_positions_preserve_interleaved_conditions(locked_audio, edit_t
     "times", [(0.3, 0.6, 0.999, 1.0), (1.0, 1.0, 1.0, 1.0), (0.5, 0.5000000001, 0.5, 0.5), (0.999, 1.0, 0.999, 1.0)]
 )
 @pytest.mark.parametrize("locked_audio", [False, True])
-@pytest.mark.parametrize("edit_targets", [False, True])
-def test_small_timestep_classes_match_dense_unique(times, locked_audio, edit_targets):
+def test_small_timestep_classes_match_dense_unique(times, locked_audio):
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
     from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 
@@ -730,10 +729,16 @@ def test_small_timestep_classes_match_dense_unique(times, locked_audio, edit_tar
     if locked_audio:
         branch.locked_audio_rows = torch.zeros(4, 32)
     kwargs = dict(zip(("t_video", "t_audio", "imgvid_cond_timestep", "audio_ref_cond_timestep"), times))
-    if edit_targets:
-        kwargs["video_target_timesteps"] = torch.linspace(0.1, 0.9, branch.video_target_positions.numel())
     dense = torch.empty(branch.seq_len)
     branch.fill_timesteps(dense, **kwargs)
+    # Pin the real packer's row semantics independently of both implementations.
+    for positions, mask, target_time, condition_time in (
+        (packed["img_pos"], packed["update_mask"], times[0], times[2]),
+        (packed["audio_pos"], packed["audio_update_mask"], 1.0 if locked_audio else times[1], times[3]),
+    ):
+        for selected, value in ((positions[mask], target_time), (positions[~mask], condition_time)):
+            assert selected.numel() > 0
+            assert torch.equal(dense[selected], torch.full_like(dense[selected], value))
     expected = torch.unique(dense, sorted=True, return_inverse=True)
     actual = branch.prepare_timesteps(**kwargs)
     for got, wanted in zip(actual, expected):

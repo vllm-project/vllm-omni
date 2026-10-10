@@ -87,6 +87,10 @@ def main() -> None:
                 current_omni_platform.synchronize()
                 times.append((time.perf_counter() - start) * 1000 / 8)
             records.append({"arm": arm, "times_ms": times, "median_ms": statistics.median(times)})
+        summary = {}
+        for arm in methods:
+            samples = [sample for record in records if record["arm"] == arm for sample in record["times_ms"]]
+            summary[arm] = {"sample_count": len(samples), "median_ms": statistics.median(samples)}
         # Tracing is outside the formal timing interval.
         counts = {}
         for arm, fn in methods.items():
@@ -94,11 +98,11 @@ def main() -> None:
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
             ) as prof:
                 fn(branches[arm], **kwargs)
-                current_omni_platform.synchronize()
+            current_omni_platform.synchronize()
             counts[arm] = [
                 {"key": e.key, "count": e.count}
                 for e in prof.key_averages()
-                if "nonzero" in e.key or "Synchronize" in e.key
+                if e.key == "aten::nonzero" or "Synchronize" in e.key
             ]
         report["cases"].append(
             {
@@ -106,11 +110,12 @@ def main() -> None:
                 "latent_t": latent_t,
                 "exact": True,
                 "records": records,
+                "summary": summary,
                 "profile_counts": counts,
             }
         )
         Path(a.output).write_text(json.dumps(report, indent=2))
-        print(branch.seq_len, [(r["arm"], r["median_ms"]) for r in records], counts, flush=True)
+        print(branch.seq_len, summary, counts, flush=True)
 
 
 if __name__ == "__main__":
