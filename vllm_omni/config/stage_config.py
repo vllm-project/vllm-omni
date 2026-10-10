@@ -602,6 +602,8 @@ class DeployConfig:
 
     # Async chunk's default depends on whether or not the pipeline supports it.
     async_chunk: bool | None = None
+    enable_tail_aware_scheduling: bool | None = None
+    tail_aware_scheduling_config: dict[str, Any] | None = None
     session_mode: str = "turn"
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
@@ -868,6 +870,8 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "speech_cache": SpeechCacheConfig(**speech_cache),
         "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk"),
+        "enable_tail_aware_scheduling": raw_dict.get("enable_tail_aware_scheduling"),
+        "tail_aware_scheduling_config": raw_dict.get("tail_aware_scheduling_config"),
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
