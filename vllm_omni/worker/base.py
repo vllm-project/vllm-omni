@@ -117,12 +117,15 @@ class OmniGPUWorkerBase(GPUWorker):
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. profiled_usage = weights + peak_activation + non_torch_increase
-               (measured by ``memory_profiling`` around ``profile_run()``;
-               ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time)
+            2. non_kv_cache_memory = total_consumed + transient_peak_headroom
+               (measured by upstream ``memory_profiling`` around
+               ``profile_run()``). ``total_consumed`` is the free-memory delta
+               since instance creation, so persistent allocations that predate
+               the profile window, such as runner buffers, are covered.
 
-            3. available_kv_cache = requested_memory - profiled_usage
+            3. available_kv_cache = requested_memory - non_kv_cache_memory
+               (CUDA-graph memory is profiled after this window and reserved
+               separately; see the graph-reserve change)
 
         Note:
             Process-scoped NVML estimation was removed in favour of the
@@ -146,18 +149,26 @@ class OmniGPUWorkerBase(GPUWorker):
             self.model_runner.profile_run()
 
         self.non_torch_memory = profile_result.non_torch_increase
-        self.peak_activation_memory = profile_result.torch_peak_increase
+        # Align with upstream GPUWorker.determine_available_memory field
+        # semantics: transient peak headroom (torch peak minus torch allocations
+        # after the profile), not the profiling-window peak delta. The inherited
+        # warm-up recommendation in GPUWorker.compile_or_warm_up_model() reads
+        # this value, so it must mean what upstream assigned it. (Upstream adds
+        # the applied CUDA-graph estimate to this value as well; that term
+        # arrives with the graph-reserve change.) Set before total_consumed, as
+        # the comment below requires both to be populated.
+        self.peak_activation_memory = profile_result.transient_peak_headroom
         # Upstream 58b2012aa2 added `total_consumed` to the profiling result
         # and reads it in GPUWorker.compile_or_warm_up_model() (when
         # kv_cache_memory_bytes is None and peak_activation_memory is set, both
         # true here). Mirror upstream so the omni override keeps it populated.
         self.total_consumed = profile_result.total_consumed
 
-        profiled_usage = (
-            int(self.model_runner.model_memory_usage)
-            + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
-        )
+        # Size the budget from upstream's authoritative aggregate instead of
+        # reconstructing the legacy weights + peak + non-torch sum, which
+        # dropped allocations made before the profiling window (e.g. runner
+        # buffers). `non_kv_cache_memory` covers them via the free-memory delta.
+        profiled_usage = profile_result.non_kv_cache_memory
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(
             "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
