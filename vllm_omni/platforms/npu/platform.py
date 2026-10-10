@@ -118,6 +118,18 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         adapt_patch()
         init_ascend_config(vllm_config)
 
+        # Register Ascend MoE LoRA wrappers (F2). The diffusion bridge selects
+        # AscendFusedMoEWithLoRA directly by import in
+        # ``_select_moe_lora_wrapper_cls`` (F1), so this registration is not
+        # strictly required for the diffusion path; it keeps the global
+        # ``_all_lora_classes`` consistent with upstream NPUWorker behavior so
+        # any code path that falls back to vLLM's ``from_layer`` also picks the
+        # Ascend MoE wrapper.
+        # See RFC: Diffusion MoE LoRA Bridge — HunyuanImage3 Baseline (F2).
+        from vllm_ascend.lora.utils import refresh_all_lora_classes
+
+        refresh_all_lora_classes()
+
     @classmethod
     def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
         """Use the block geometry required by Ascend's native paged kernel."""
