@@ -8,11 +8,10 @@ import pytest
 from vllm_omni.diffusion.cache.teacache.coefficient_estimator import (
     _MODEL_ADAPTERS,
     DataCollectionHook,
-    SD3Adapter,
     ZImageAdapter,
 )
 from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS, TeaCacheConfig
-from vllm_omni.diffusion.cache.teacache.extractors import extract_sd3_context, extract_zimage_context
+from vllm_omni.diffusion.cache.teacache.extractors import extract_zimage_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -45,9 +44,17 @@ def test_data_collection_hook_resolves_extractor_at_init():
         DataCollectionHook("NotARegisteredTransformer")
 
 
-def test_sd3_estimator_adapter_registered():
-    assert _MODEL_ADAPTERS["SD3"] is SD3Adapter
-    assert SD3Adapter.model_class_name == "StableDiffusion3Pipeline"
-    assert SD3Adapter.uses_tf_config is True
-    assert DataCollectionHook("SD3Transformer2DModel").extractor_fn is extract_sd3_context
+def test_sd3_has_calibrated_defaults():
+    """SD3.5 ships its own polynomial and a lower threshold than the global 0.2."""
+    sd3 = _MODEL_COEFFICIENTS["SD3Transformer2DModel"]
+    # Pin the calibrated fit so a recalibration has to update this test deliberately.
+    assert sd3 == pytest.approx([-2.57416593e03, 7.58966325e02, -4.54911308e01, 3.30785652e00, -2.18653269e-03])
 
+    config = TeaCacheConfig(transformer_type="SD3Transformer2DModel")
+    assert config.coefficients == sd3
+    # At the global default the image content changes on this model.
+    assert config.rel_l1_thresh == 0.1
+
+    # An explicit threshold still wins over the model default.
+    explicit = TeaCacheConfig(transformer_type="SD3Transformer2DModel", rel_l1_thresh=0.2)
+    assert explicit.rel_l1_thresh == 0.2
