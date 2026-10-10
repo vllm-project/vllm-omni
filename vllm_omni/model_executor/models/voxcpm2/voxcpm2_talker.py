@@ -55,6 +55,59 @@ logger = init_logger(__name__)
 
 _ENABLE_NVTX_PROFILE = False
 
+
+def _install_dtype_aware_encode(tts: nn.Module, vae_dtype: torch.dtype) -> None:
+    """Wrap ``audio_vae.encode`` so every caller is dtype-safe under a bf16 VAE.
+
+    Inputs are cast to ``vae_dtype`` (prevents fp32/bf16 mismatch errors on
+    Ascend NPU for callers like ``_encode_raw_audio`` and the native
+    ``_encode_wav`` / ``build_prompt_cache``). The result is cast back to
+    float32 to preserve the historical contract of the cached prompt
+    features: ``_build_prefill_inputs`` concatenates them with fp32 zero
+    padding (voice-clone / continuation / ICL prefill). ``torch.cat`` would
+    silently type-promote a bf16 feature to float32 on torch 2.x, so without
+    this cast the cache would drift to bf16-precision values with no error
+    signal; the explicit float32 restore keeps the pre-PR cache precision.
+    """
+    original_encode = tts.audio_vae.encode
+
+    def _dtype_aware_encode(audio_data, sample_rate, *args, **kwargs):
+        audio_data = audio_data.to(dtype=vae_dtype)
+        result = original_encode(audio_data, sample_rate, *args, **kwargs)
+        return result.float()
+
+    tts.audio_vae.encode = _dtype_aware_encode
+
+
+def _remove_weight_norm_from_module(module: nn.Module) -> None:
+    """Recursively remove weight_norm from all submodules.
+
+    This materializes the final weight (weight_g * weight_v / ||weight_v||)
+    so it is computed once at load time instead of on every forward pass,
+    avoiding fp32 upcast from the norm computation.
+    """
+    removed = 0
+    for m in module.modules():
+        if hasattr(m, "weight_g") and hasattr(m, "weight_v"):
+            try:
+                nn.utils.remove_weight_norm(m)
+                removed += 1
+            except (ValueError, RuntimeError) as exc:
+                # A failed materialization must not be silently skipped: the
+                # module would keep the per-forward norm path (the aten::to
+                # upcast this PR removes), and WeightNorm.remove can leave a
+                # module half-broken (weight deleted, hook still attached).
+                # Fail loudly at load time with the offending module named.
+                logger.error(
+                    "weight_norm removal failed for %s in audio_vae: %s",
+                    type(m).__name__,
+                    exc,
+                )
+                raise
+    if removed:
+        logger.info("Removed weight_norm from %d modules in audio_vae", removed)
+
+
 # Lower bound for the _active_states leak-warn threshold.  The effective
 # threshold is max(_ACTIVE_STATE_LEAK_WARN_MIN, 4 * max_batch_size) so small
 # deployments still get a usable floor instead of a tiny noisy one.
@@ -239,7 +292,8 @@ def _encode_raw_audio(
         audio = torch.nn.functional.pad(audio, pad)
 
     vae_device = next(tts.audio_vae.parameters()).device
-    feat = tts.audio_vae.encode(audio.to(vae_device), encode_sr).cpu()
+    vae_dtype = next(tts.audio_vae.parameters()).dtype
+    feat = tts.audio_vae.encode(audio.to(device=vae_device, dtype=vae_dtype), encode_sr).cpu()
     return feat.view(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
 
 
@@ -908,7 +962,19 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         VoxCPM = import_voxcpm2_core()
         native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
         self._tts: nn.Module = native.tts_model.to(self._device)
+
+        # Remove weight_norm from audio_vae: materialize final weights so
+        # forward passes avoid recomputing norm (which forces fp32 aten::to).
+        _remove_weight_norm_from_module(self._tts.audio_vae)
+        self._tts.audio_vae.to(dtype=torch.bfloat16)
+
         self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
+        self._vae_dtype = next(self._tts.audio_vae.parameters()).dtype
+
+        # Wrap audio_vae.encode so all callers (_encode_raw_audio, native
+        # _encode_wav / build_prompt_cache) are dtype-safe under the bf16
+        # cast; see _install_dtype_aware_encode for the fp32 output contract.
+        _install_dtype_aware_encode(self._tts, self._vae_dtype)
         self._patch_size = self._tts.patch_size
         self._feat_dim = self._tts.feat_dim
         self._sample_rate = getattr(self.config, "sample_rate", 48000)
@@ -1582,6 +1648,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if feat.device.type != omni_platform.current_omni_platform.device_type:
             return self.tts.audio_vae.decode(feat)
 
+        feat = feat.to(dtype=self._vae_dtype)
         sr_cond = self._get_vae_decode_sr_cond(feat.device)
         if not self._enable_vae_cuda_graph:
             return self.tts.audio_vae.decode(feat, sr_cond=sr_cond)
@@ -2859,7 +2926,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.last_audio_patch_gpu = None
 
         # patch shape: (patch_size, feat_dim) or (1, patch_size, feat_dim)
-        new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
+        new_latent = patch.reshape(-1, self._feat_dim).to(self._vae_dtype)
         vae_decode_every = getattr(self, "_vae_decode_every", 1)
         if vae_decode_every > 1:
             is_stopping = self._should_stop_from_cached_logits(state)
@@ -2971,7 +3038,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 continue
             state.last_audio_patch_gpu = None
 
-            new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
+            new_latent = patch.reshape(-1, self._feat_dim).to(self._vae_dtype)
             if vae_decode_every > 1:
                 is_stopping = self._should_stop_from_cached_logits(state)
                 state.pending_vae_latents_gpu.append(new_latent.detach())
@@ -3089,7 +3156,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     ):
                         sizes = [int(chunk.numel()) for chunk in chunks]
                         merged = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
-                        merged_cpu = merged.detach().cpu().contiguous()
+                        merged_cpu = merged.detach().cpu().float().contiguous()
                         mm["model_outputs"] = list(merged_cpu.split(sizes))
                     else:
                         mm["model_outputs"] = chunks
