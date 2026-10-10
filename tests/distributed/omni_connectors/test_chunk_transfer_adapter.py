@@ -192,6 +192,9 @@ class DummyWaitingQueue(list):
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
     request = Mock(
+        _all_token_ids=[],
+        _output_token_ids=[],
+        output_token_count=0,
         client_index=0,
         request_id=req_id,
         external_req_id=external_req_id or req_id,
@@ -199,6 +202,7 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         prompt_token_ids=[],
         num_prompt_tokens=0,
         num_computed_tokens=0,
+        num_in_flight_tokens=0,
         num_output_placeholders=0,
         prefill_stats=None,
         additional_information=None,

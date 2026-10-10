@@ -1,0 +1,57 @@
+# Single-H200 full-duplex MRv2 profile. All three stages use V2 and retain
+# the shared chunk adapter for resumable sessions. Sampling and session
+# capacities inherit from the native H200 profile.
+base_config: minicpmo_4_5_duplex_h200.yaml
+
+model_runner: v2
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      hift_graph_capture_batch_sizes: [1, 2, 4, 8, 16]
+      # Keep graph shapes across requests and reference-prompt variants.
+      cfm_max_graphs: 128
+      cfm_graph_offset_bucket_frames: 100
+      cfm_capture_warmup_iterations: 1
+      # The inherited fused body and slot pool require FP32 attention cache.
+      code2wav_bfloat16_attention_cache: false
+      cfm_drop_upstream_att_buffer: true
+      cfm_encoder_graph_rows: 16
+      # Cover exact onset/tail shapes at readiness, without padding audio.
+      hift_graph_first_chunk_frames: [1, 32]
+      hift_graph_continuation_frames: [1, 32]
+      hift_graph_exact_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+      # Later windows retain the inherited 25-frame size.
+      initial_codec_chunk_frames: 10
+      cfm_graph_capture_frames: [50, 100]
+
+stages:
+  - stage_id: 0
+    # Fit sixteen 8k-token BF16 KV windows plus append headroom.
+    kv_cache_memory_bytes: 25769803776  # 24 GiB
+    async_chunk: false
+    async_scheduling: true
+    compilation_config:
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
+  - stage_id: 1
+    # Publish codec output without an asynchronous lookahead step.
+    async_scheduling: false
+    compilation_config:
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
+  - stage_id: 2
+    async_scheduling: false
+    env:
+      VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS: "1"
+      VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS_SLACK_S: "0.5"
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

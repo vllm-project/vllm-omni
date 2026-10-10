@@ -2000,7 +2000,7 @@ def _build_model_config(
     kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
-        topology.supports_native_mrv2_data_plane,
+        topology.supports_native_mrv2_data_plane and deploy.session_mode == "turn",
     )
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))

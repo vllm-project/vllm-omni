@@ -339,8 +339,20 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             return False
         return super()._handle_stopped_request(request)
 
-    def _requeue_completed_native_chunks(self) -> None:
-        """Return completed native generation chunks to the admission queue.
+    def _uses_chunkwise_generation(self) -> bool:
+        """Separate runner slot ownership from the choice of transport.
+
+        MRv2 releases generation slots after each chunk. Duplex receivers
+        keep the shared adapter's prompt/segment/cancel lifecycle, but need
+        the same scheduling and in-flight fences as native turn receivers.
+        """
+        return bool(
+            (getattr(self, "_native_data_plane", False) or getattr(self, "use_v2_model_runner", False))
+            and self._async_chunk_transport_enabled()
+        )
+
+    def _requeue_completed_generation_chunks(self) -> None:
+        """Return completed generation chunks to the admission queue.
 
         A generation batch slot belongs to one chunk, not the entire stream.
         Keep requests with outstanding output in ``running`` so their state
@@ -350,11 +362,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         Stateful codecs retain lifetime admission until their decoder state is
         released, even when no chunk is currently executing.
         """
-        if (
-            not getattr(self, "_native_data_plane", False)
-            or not self._async_chunk_transport_enabled()
-            or self._retains_state_across_chunks
-        ):
+        if not self._uses_chunkwise_generation() or self._retains_state_across_chunks:
             return
         in_flight: list[Request] = []
         for request in self.running:
@@ -397,7 +405,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         skipped_kv_holding_requests = create_request_queue(self.policy)
         req_index = 0
         self._drop_aborted_queued_requests()
-        self._requeue_completed_native_chunks()
+        self._requeue_completed_generation_chunks()
         self._process_pending_omni_inputs(model_mode="generation")
         if getattr(self, "_generation_defer_batch", False):
             token_budget = 0
@@ -407,7 +415,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
         async_chunk_transport = self._async_chunk_transport_enabled()
-        native_chunks = bool(getattr(self, "_native_data_plane", False) and async_chunk_transport)
+        chunkwise = self._uses_chunkwise_generation()
         # Parking releases an execution slot, but stateful codecs retain their
         # request-owned state until completion or abort, in either runner.
         reserved_running_slots = (
@@ -423,7 +431,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         first_chunk_express = getattr(self, "_first_chunk_express", False)
         express = (
             first_chunk_express
-            and native_chunks
+            and chunkwise
             and not self._last_step_express
             and any(
                 r.request_id not in self._chunk_started
@@ -451,7 +459,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 req_index += 1
                 continue
 
-            if native_chunks and request.num_in_flight_tokens > 0:
+            if chunkwise and request.num_in_flight_tokens > 0:
                 # Overlap different streams, never two stateful chunks from
                 # the same stream. Readiness remains pending for the next step.
                 req_index += 1
@@ -511,7 +519,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             and len(num_scheduled_tokens) < execution_batch_size
             and (
                 len(num_scheduled_tokens)
-                if native_chunks and not self._retains_state_across_chunks
+                if chunkwise and not self._retains_state_across_chunks
                 else len(self.running) + reserved_running_slots
             )
             < self.max_num_active_reqs
@@ -527,7 +535,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.deferred_waiting.add(request)
                 skipped_requests.add_request(request)
                 continue
-            if native_chunks and request.num_in_flight_tokens > 0:
+            if chunkwise and request.num_in_flight_tokens > 0:
                 # A restored waiting entry can still own an outstanding batch.
                 # Do not let it block other ready streams or execute it twice.
                 request_queue.pop_request()
@@ -560,7 +568,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Allocate all input tokens for the request in one shot
             # (allocate 1 placeholder if zero)
             required_tokens = max(len(request.prompt_token_ids), 1)
-            if native_chunks:
+            if chunkwise:
                 required_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
                 if required_tokens <= 0:
                     if (
@@ -708,7 +716,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _continuations_have_slack(self) -> bool:
         """Whether every started stream with a chunk ready to decode can wait one express step."""
         now = time.monotonic()
-        for request in (*self.running, *self.waiting):
+        for request in (*self.running, *self.kv_holding_waiting, *self.waiting):
             if request.request_id not in self._chunk_started or request.num_in_flight_tokens > 0:
                 continue
             if len(request.prompt_token_ids) <= request.num_computed_tokens:
@@ -962,6 +970,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished
+                if is_segment_finished and self._first_chunk_express:
+                    # A resumable stream can emit several turns under one
+                    # request id. Old playback credit must not prioritize a
+                    # successor's first packet or delay its continuations.
+                    self._chunk_started.discard(req_id)
+                    self._stream_audio.pop(req_id, None)
                 if finished and self._native_data_plane:
                     self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
@@ -1023,6 +1037,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished
+            if is_segment_finished:
+                # A control-only terminal has no model output to take the
+                # normal stop path above. Rearm its receiver and retire the
+                # same playback state before another turn uses this id.
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
+                if self._first_chunk_express:
+                    self._chunk_started.discard(request.request_id)
+                    self._stream_audio.pop(request.request_id, None)
             kv_transfer_params = None
             ec_transfer_params = None
             if finished:

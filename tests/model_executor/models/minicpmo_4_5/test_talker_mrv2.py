@@ -49,6 +49,8 @@ def _batch(rows: list[dict], *, pad_to: int | None = None):
         input_ids=torch.tensor(ids + [0] * (padded - num_tokens), dtype=torch.int32),
         logits_indices=torch.tensor(starts[1:] - 1),
         seq_lens=torch.tensor(seq_lens + [0] * 2, dtype=torch.int32),
+        query_start_loc_np=starts,
+        num_scheduled_tokens=np.diff(starts),
     ), padded
 
 

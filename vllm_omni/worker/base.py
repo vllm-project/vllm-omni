@@ -13,7 +13,6 @@ from contextlib import AbstractContextManager, nullcontext
 import torch
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
-from vllm.v1.worker.gpu_worker import CompilationTimes
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 from vllm_omni.diffusion.data import (
@@ -46,10 +45,12 @@ class OmniGPUWorkerBase(GPUWorker):
         if callable(capture):
             capture()
 
-    def compile_or_warm_up_model(self) -> CompilationTimes:
-        result = super().compile_or_warm_up_model()
+    def _maybe_activate_jit_monitor(self) -> None:
+        # vLLM calls this after transformer warmup, before freezing the heap.
+        # Auxiliary kernels are still startup work: prime them before the
+        # monitor can report (or reject) compilation during inference.
         self._capture_auxiliary_graphs()
-        return result
+        super()._maybe_activate_jit_monitor()
 
     def load_model(self, *args, **kwargs):
         with self._maybe_get_memory_pool_context("weights"):

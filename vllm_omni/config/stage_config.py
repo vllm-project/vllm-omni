@@ -252,6 +252,9 @@ class StagePipelineConfig:
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
+    # Resumable sessions use the shared chunk adapter until native transport
+    # implements prompt replacement and segment-terminal delivery.
+    supports_mrv2_duplex: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
@@ -1008,13 +1011,14 @@ def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | 
 
 
 def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
-    """Reject session modes a downstream MRv2 native-data-plane stage lacks.
+    """Validate MRv2 session support before selecting its transport.
 
-    Streaming-session prompt replacement exists only in the V1 chunk adapter,
-    so a stage that receives from an upstream stage on MRv2 supports
-    turn-based sessions only.
+    Duplex-capable stages use the shared chunk adapter for resumable prompt
+    replacement. Native MRv2 transport currently supports turn sessions.
     """
     if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
+        return
+    if deploy.session_mode == "duplex" and ps.supports_mrv2_duplex:
         return
     if deploy.session_mode != "turn":
         raise ValueError(
@@ -1115,7 +1119,9 @@ def _build_engine_args(
     stage_runner = resolve_stage_model_runner(deploy, ds)
     validate_native_mrv2_session(deploy, ps, stage_runner)
     engine_args["use_v2_model_runner"] = stage_runner == "v2"
-    engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
+    engine_args["supports_native_mrv2_data_plane"] = bool(
+        ps.supports_native_mrv2_data_plane and deploy.session_mode == "turn"
+    )
     if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "

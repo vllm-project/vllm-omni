@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.messages import (
@@ -82,6 +82,14 @@ class DuplexOmniEngine(AsyncOmniEngine):
             )
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
+
+    def _set_pipeline_runtime_config(self, pipeline_config: PipelineConfig | None, config_path: str | None) -> None:
+        super()._set_pipeline_runtime_config(pipeline_config, config_path)
+        # Session audio crosses the orchestrator on every unit (Thinker ->
+        # Talker handoff, Code2Wav -> client), and each crossing of the 1 ms
+        # poll loop waits up to a full poll round. Wake on stage outputs
+        # instead; VLLM_OMNI_EVENT_DRIVEN_ORCH=0 still selects the poll loop.
+        self._event_driven_orch_default = True
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:

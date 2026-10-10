@@ -18,6 +18,7 @@ from vllm.v1.utils import ConstantList
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.base import OmniConnectorBase
 from ..connectors.shm_connector import SharedMemoryConnector
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
@@ -137,6 +138,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     work and return immediately.
     """
 
+    connector: OmniConnectorBase
+
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         # The base constructor starts the save thread, so sender-generation
@@ -195,7 +198,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
         # Save-thread only: running count of segments reclaimed after finish.
@@ -203,9 +206,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
-        self.requests_with_ready_chunks = set()
+        self.requests_with_ready_chunks: set[str] = set()
         self.replaced_streaming_prompt_ids: set[str] = set()
-        self.requests_origin_status = {}
+        self.requests_origin_status: dict[str, RequestStatus] = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
         # running_queue inside restore_queues(). Avoids calling
@@ -287,6 +290,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
         request.num_prompt_tokens = len(request.prompt_token_ids)
+        # Generation chunks replace the prompt rather than append AR tokens.
+        # Keep Request's ConstantList views and MRv2's prefill_token_ids on
+        # the same current chunk, including replacements of the prewarm stub.
+        request._all_token_ids[:] = request.prompt_token_ids
+        request._output_token_ids.clear()
+        request.output_token_count = 0
         if getattr(request, "prefill_stats", None) is None:
             request.prefill_stats = PrefillStats()
 
@@ -410,6 +419,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 because ``finish_requests`` skips requests that already report
                 ``is_finished()``. See ``_finish_parked_streaming_session``.
         """
+        assert request is not None
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
@@ -774,7 +784,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         sender_token: _SenderGeneration | None = None,
     ):
         raw_mm = task["multimodal_output"]
-        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
+        multimodal_output = unflatten_payload(dict(raw_mm)) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
@@ -1071,6 +1081,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._save_cond.notify()
 
     def _release_shm_prefix(self, key_prefix: str) -> None:
+        assert isinstance(self.connector, SharedMemoryConnector)
         reclaimed = self.connector.cleanup_prefix(key_prefix)
         if not reclaimed:
             return
@@ -1360,7 +1371,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._active_streams[request_id] = request
         return True
 
-    def collect_timed_out_request_ids(self, timeout_s: float) -> set[str]:
+    def collect_timed_out_request_ids(self, timeout_s: float, session_request_ids: set[str] | None = None) -> set[str]:
         """Return IDs whose chunk wait has exceeded *timeout_s*.
 
         The async-chunk path had no deadline of any kind: a request parks in
@@ -1385,6 +1396,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if timeout_s <= 0 or not self._waiting_since:
             return set()
         now = time.monotonic()
+        # Healthy duplex sessions can listen or wait between turns without
+        # emitting codec chunks. Their session owns the idle deadline. Keep a
+        # fresh connector deadline for a subsequent non-resumable final update.
+        if session_request_ids:
+            for req_id in self._waiting_since.keys() & session_request_ids:
+                self._waiting_since[req_id] = now
         timed_out_ids = {req_id for req_id, started in self._waiting_since.items() if now - started > timeout_s}
         for req_id in timed_out_ids:
             self._waiting_since.pop(req_id, None)
@@ -1430,6 +1447,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         queue_snapshot = list(queue)
         for request in queue_snapshot:
+            if self.model_mode == "generation" and getattr(request, "num_in_flight_tokens", 0) > 0:
+                continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
                     # Requests that have loaded chunk from last round
@@ -1567,6 +1586,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     ) -> None:
         queue_snapshot = list(queue)
         for request in queue_snapshot:
+            if self.model_mode == "generation" and getattr(request, "num_in_flight_tokens", 0) > 0:
+                # Do not let the receive thread replace a generation chunk's
+                # prompt or terminal metadata before its output is retired.
+                # The next scheduler cycle will register its successor.
+                continue
             if not self._ensure_active_stream(request):
                 if target_status == RequestStatus.WAITING:
                     # A non-active placeholder must not remain visible to the
@@ -1627,6 +1651,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         elif request_ids is not None:
             request_ids = set(request_ids)
         else:
+            assert requests is not None
             request_ids = requests.keys()
 
         connector_owned_ids = {

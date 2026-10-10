@@ -708,7 +708,7 @@ async def test_playback_ack_for_an_unknown_response_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
+async def test_barge_in_closes_the_model_turn_and_drops_its_late_output() -> None:
     h = await open_harness()
     try:
         await h.run(append_audio())
@@ -716,10 +716,13 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
 
         events = await h.run(commands.BargeIn())
-        assert h.session.epoch == 1
+        # The running request keeps the conversation; only the turn ends.
+        assert h.session.epoch == 0
+        assert h.session.turn_id == 1
         assert h.session.active_response_id is None
-        assert h.port.aborts == [[request_id]]
-        assert h.port.cleanups == [([request_id], True)]
+        assert h.session.active_request_id == request_id
+        assert h.port.aborts == []
+        assert h.port.cleanups == []
         done = find(events, "response.done")
         assert done.status == "cancelled"
         assert types(events)[: types(events).index("response.done")] == [
@@ -730,9 +733,27 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
             "conversation.item.done",
         ]
 
-        late = tts_output(request_id, samples=48000, text="hello", epoch=0)
-        assert h.deliver(late, epoch=0) is True  # consumed, never forwarded
+        late = tts_output(request_id, samples=48000, text="hello", turn_id=0)
+        assert h.deliver(late) is True  # consumed, never forwarded
         assert await h.settle() == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancel_replaces_the_request_while_older_tts_drains() -> None:
+    """A draining turn has its own request, so cancel falls back to a new epoch."""
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
+        h.session.bind_draining_request("duplex-drain-tts", "resp-old")
+
+        events = await h.run(commands.CancelResponse())
+        assert find(events, "response.done").status == "cancelled"
+        assert h.session.epoch == 1
+        assert h.port.aborts == [[request_id, "duplex-drain-tts"]]
     finally:
         await close_harness(h)
 
@@ -838,22 +859,44 @@ async def test_cancel_response_without_active_response_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_response_aborts_the_stage_request_and_reports_playback() -> None:
+async def test_cancel_response_closes_the_model_turn_and_keeps_its_request() -> None:
+    """response.cancel ends the response inside the running Stage-0 request.
+
+    Replacing the request would drop the KV that holds the conversation; the
+    session instead moves past the cancelled turn, and the next append closes
+    that turn in the model.
+    """
     h = await open_harness()
     try:
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
         await h.run(commands.AckPlayback(played_ms=400, response_id=h.session.active_response_id))
+        turn_id = h.session.active_response_turn_id
 
         events = await h.run(commands.CancelResponse())
         done = find(events, "response.done")
         assert done.status == "cancelled"
         assert done.response["status_details"]["reason"] == "client_cancelled"
-        assert h.port.aborts == [[request_id]]
-        assert h.session.epoch == 1
+        assert h.port.aborts == []
+        assert h.port.cleanups == []
+        assert h.session.epoch == 0
+        assert h.session.turn_id == turn_id + 1
+        assert h.session.active_request_id == request_id
         # Only the played prefix of the cancelled answer is kept in history.
         assert h.session.history == ({"role": "assistant", "content": "he"},)
+
+        # Output the cancelled turn still had in flight is stale.
+        h.deliver(tts_output(request_id, samples=48000, text="hello world", turn_id=turn_id))
+        assert await h.settle() == []
+
+        # The next append resumes the same request and closes the turn, once.
+        await h.run(append_audio())
+        await h.run(append_audio())
+        closing, after = h.port.submissions[-2:]
+        assert closing.context.request_id == after.context.request_id == request_id
+        assert closing.prompt["model_intermediate_buffer"]["duplex"]["payload"]["close_turn"] is True
+        assert "close_turn" not in after.prompt["model_intermediate_buffer"]["duplex"]["payload"]
     finally:
         await close_harness(h)
 
@@ -1558,7 +1601,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
         await orchestrator.session_manager.shutdown()
 
 
-def _response_request_metrics_of(event: object) -> dict[str, object]:
+def _response_request_metrics_of(event: DuplexEvent) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")

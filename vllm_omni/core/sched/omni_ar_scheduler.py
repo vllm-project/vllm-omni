@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -28,8 +29,10 @@ from vllm_omni.core.sched.utils import (
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.worker_v2.decode_burst import decode_burst_steps
 
 logger = init_logger(__name__)
+_UNSET_HOOK = object()
 
 
 def _should_emit_engine_output(
@@ -99,6 +102,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """
 
     max_num_active_reqs: int
+    num_lookahead_tokens: int
 
     def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
         model_config = self.vllm_config.model_config
@@ -119,6 +123,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # A decode burst (worker_v2.decode_burst) writes the KV of up to
+        # ``steps - 1`` tokens past the scheduled one: reserve those slots.
+        self._decode_burst_steps = decode_burst_steps(self.vllm_config)
+        self.num_lookahead_tokens = max(self.num_lookahead_tokens, self._decode_burst_steps - 1)
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -304,6 +312,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
+    def _take_held_running_requests(self) -> list[Request]:
+        """Remove running requests the stage processor asked to skip this step.
+
+        The processor exposes ``scheduling_hold_request_ids(now)``; a held
+        request keeps its KV and slot and is re-appended after scheduling.
+        """
+        hook = getattr(self, "_scheduling_hold_hook", _UNSET_HOOK)
+        if hook is _UNSET_HOOK:
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            path = getattr(model_config, "custom_process_next_stage_input_func", None)
+            hook = None
+            if path:
+                module_path = path.rsplit(".", 1)[0]
+                try:
+                    hook = getattr(importlib.import_module(module_path), "scheduling_hold_request_ids", None)
+                except ImportError:
+                    hook = None
+            self._scheduling_hold_hook = hook
+        if not callable(hook) or not getattr(self, "running", None):
+            return []
+        held_ids = hook(time.monotonic())
+        # Only yield the device when the held request is the stage's sole
+        # running work; with other rows decoding, skipping it only reshapes
+        # the batch and does not free the GPU for the downstream stage.
+        if not held_ids or len(self.running) != 1:
+            return []
+        held = [request for request in self.running if request.request_id in held_ids]
+        if held:
+            self.running = [request for request in self.running if request.request_id not in held_ids]
+        return held
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -389,11 +428,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.waiting = create_request_queue(self.policy)
             self.kv_holding_waiting = create_request_queue(self.policy)
 
+        held_running = self._take_held_running_requests()
         original_max_num_active_reqs = self.max_num_active_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
         )
+        # Held requests retain their model-runner slots. Removing them from
+        # ``running`` must not let waiting requests consume those slots.
+        reserved_running_slots += len(held_running)
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
@@ -406,6 +449,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
+            if held_running:
+                self.running.extend(held_running)
 
         self._postprocess_omni_schedule_output(
             scheduler_output,
@@ -607,6 +652,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+            elif (
+                len(generated_token_ids) > num_tokens_scheduled == 1
+                and getattr(self, "_decode_burst_steps", 1) > 1
+                and not output_is_stale
+            ):
+                # A decode burst computed the KV of every sampled token but
+                # the last, like the scheduled step computed its input's.
+                request.num_computed_tokens += len(generated_token_ids) - 1
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:

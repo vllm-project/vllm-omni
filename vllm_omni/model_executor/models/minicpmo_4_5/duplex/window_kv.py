@@ -64,8 +64,7 @@ positive block size. The conversion below reads that size back off the spec the
 parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
-Nothing here has been executed: it needs an engine, a checkpoint and a GPU. The
-arithmetic it delegates to is CPU-covered by
+The arithmetic it delegates to is CPU-covered by
 ``tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py``, which
 also checks the RoPE identity behind :func:`rotate_cached_keys` numerically.
 
@@ -451,7 +450,7 @@ def rotate_keys(keys: torch.Tensor, delta: int, inv_freq: torch.Tensor) -> torch
 def rotate_cached_keys(
     k_pool: torch.Tensor,
     *,
-    block_ids: list[int],
+    block_ids: list[int] | torch.Tensor,
     positions: torch.Tensor,
     plan: PositionReanchor,
     inv_freq: torch.Tensor,
@@ -828,13 +827,22 @@ class MiniCPMO45DuplexWorkerHelper:
         req_id: str,
         req_idx: int,
         group_idx: int = 0,
-    ) -> list[int]:
+    ) -> list[int] | torch.Tensor:
         """Resolve the flat block ID table for a specific KV cache group of a request.
 
         In production, req_state.block_ids is a tuple of lists, one per KV cache group.
         This helper unpacks the appropriate group to ensure compute_slot_mapping receives
         a flat 1D list of integer block IDs.
         """
+        if hasattr(runner, "req_states"):
+            blocks = runner.block_tables
+            group = group_idx if group_idx < len(blocks.block_tables) else 0
+            slot = runner.req_states.req_id_to_index[req_id]
+            count = int(blocks.num_blocks.np[group, slot])
+            # MRv2 applies staged writes before this hook. Its table has no
+            # persistent CPU mirror; rotate from the device row on the same
+            # stream, without a device-to-host copy for every cache layer.
+            return blocks.block_tables[group].gpu[slot, :count]
         req_state = getattr(runner, "requests", {}).get(req_id) if hasattr(runner, "requests") else None
         if req_state is not None and getattr(req_state, "block_ids", None):
             raw_blocks = req_state.block_ids
@@ -859,16 +867,26 @@ class MiniCPMO45DuplexWorkerHelper:
     @classmethod
     def maybe_apply_reanchor(cls, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
-        if not hasattr(runner, "input_batch") or runner.input_batch is None:
-            return
-        num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
-        req_ids = runner.input_batch.req_ids[:num_reqs]
+        mrv2 = hasattr(runner, "req_states")
+        if mrv2:
+            # Staged block-table writes are already applied. Reuse the same
+            # rotation below with V2's live request slots and device KV rows.
+            req_ids = list(scheduler_output.num_scheduled_tokens)
+        else:
+            if not hasattr(runner, "input_batch") or runner.input_batch is None:
+                return
+            num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
+            req_ids = runner.input_batch.req_ids[:num_reqs]
         applied_reanchors = getattr(runner, "_applied_stage0_reanchor_ids", None)
         if applied_reanchors is None:
             applied_reanchors = runner._applied_stage0_reanchor_ids = set()
 
         for req_idx, req_id in enumerate(req_ids):
-            info = runner.model_intermediate_buffer.get(req_id)
+            if mrv2:
+                req_idx = runner.req_states.req_id_to_index[req_id]
+                info = runner.model_state.intermediate_buffer.buffers[req_idx]
+            else:
+                info = runner.model_intermediate_buffer.get(req_id)
             if not isinstance(info, dict):
                 continue
             duplex = info.get("duplex")
@@ -909,7 +927,12 @@ class MiniCPMO45DuplexWorkerHelper:
             old_computed = int(
                 reanchor.get(
                     "old_computed_tokens",
-                    int(runner.input_batch.num_computed_tokens_cpu[req_idx]) + plan.delta,
+                    int(
+                        runner.req_states.num_computed_tokens_np[req_idx]
+                        if mrv2
+                        else runner.input_batch.num_computed_tokens_cpu[req_idx]
+                    )
+                    + plan.delta,
                 )
             )
 

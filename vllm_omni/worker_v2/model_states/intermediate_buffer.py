@@ -138,6 +138,12 @@ class OmniIntermediateBuffer:
             else:
                 dest[key] = value.detach().cpu().contiguous()
         elif isinstance(value, list):
+            # Token history can contain thousands of Python ints. Validate the
+            # complete list before copying it in C, avoiding per-token Tensor
+            # type checks. Mixed lists retain the Tensor ownership path.
+            if type(value) is list and all(type(item) is int for item in value):
+                dest[key] = value.copy()
+                return
             dest[key] = [
                 (
                     item.detach().clone()

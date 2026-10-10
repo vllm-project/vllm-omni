@@ -2,7 +2,8 @@
 # Thinker (stage 0), Talker (stage 1) and Code2Wav (stage 2) run on MRv2.
 # The Thinker uses native multimodal encoding and tensor-only FULL graphs;
 # downstream stages use the native data plane. These stages support
-# turn-based sessions only (duplex needs the V1 chunk adapter).
+# turn-based transport only. The separate duplex MRv2 profile uses the shared
+# chunk adapter for resumable session updates.
 #
 # On MRv2 the Talker keeps its sampled codec id, 16-frame penalty history and
 # EOS state on the device (no per-step D2H wait), and Code2Wav schedules

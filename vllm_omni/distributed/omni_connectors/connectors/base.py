@@ -16,6 +16,8 @@ class OmniConnectorBase(ABC):
     # without going through OmniSerializer.  Connectors that copy raw
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
+    # Chunk adapters use the resolved connector stage for routing.
+    stage_id: int
 
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:

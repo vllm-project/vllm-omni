@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -12,6 +13,7 @@ from vllm.inputs import TextPrompt
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine.duplex.intermediate import (
     build_duplex_intermediate_buffer,
+    pack_tts_hidden,
     set_ref_audio,
     set_tts_handoff,
 )
@@ -21,12 +23,17 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.reference_audio import (
+    decode_reference_audio,
+    encode_reference_audio,
+)
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
+_UNSET = object()
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -134,6 +141,46 @@ def _extract_native_runtime_ref_audio(data_plane_metadata):
     return torch.as_tensor(waveform, dtype=torch.float32).reshape(-1).cpu(), int(sample_rate)
 
 
+def _native_runtime_ref_audio_payload(data_plane_metadata, streaming_context, *, request_id: str):
+    """Cache one immutable reference snapshot in the owning streaming context.
+
+    The signature includes the actual reference/configuration and request,
+    session and epoch boundaries. Turn changes can reuse a fixed reference;
+    replacement, interruption and context reuse cannot select stale PCM.
+    No cache lives beyond the streaming context's existing cleanup lifetime.
+    """
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    cache_key = "minicpmo45_reference_audio"
+    metadata = data_plane_metadata if isinstance(data_plane_metadata, dict) else {}
+    runtime_config = metadata.get("runtime_config")
+    config = runtime_config if isinstance(runtime_config, dict) else {}
+    signature = (
+        request_id,
+        metadata.get("session_id"),
+        metadata.get("epoch"),
+        config.get("ref_audio_data"),
+        config.get("ref_audio_format"),
+        config.get("ref_audio_sample_rate_hz"),
+        config.get("ref_audio_path"),
+        config.get("tts_ref_audio_path"),
+    )
+    cached = bridge_states.get(cache_key) if isinstance(bridge_states, dict) else None
+    if isinstance(cached, dict) and cached.get("signature") == signature:
+        # Copy the tiny envelope: callers cannot modify a later condition's
+        # cached metadata, while immutable PCM bytes remain shared.
+        return dict(cached["payload"]), cached["sample_rate"]
+    reference = _extract_native_runtime_ref_audio(data_plane_metadata)
+    if reference is None:
+        if isinstance(bridge_states, dict):
+            bridge_states.pop(cache_key, None)
+        return None
+    waveform, sample_rate = reference
+    payload = encode_reference_audio(waveform)
+    if isinstance(bridge_states, dict):
+        bridge_states[cache_key] = {"signature": signature, "payload": payload, "sample_rate": sample_rate}
+    return dict(payload), sample_rate
+
+
 def _coerce_token_id_list(value):
     if value is None:
         return None
@@ -154,16 +201,14 @@ def _coerce_token_id_list(value):
     return out
 
 
-def _to_transport_list(value):
-    if hasattr(value, "detach"):
-        value = value.detach().cpu()
-    if isinstance(value, torch.Tensor):
-        return value.tolist()
-    return value
-
-
 def _coerce_int(value):
-    if hasattr(value, "detach"):
+    if isinstance(value, torch.Tensor):
+        # The first element, read once (the per-step metadata is 0-d).
+        numel = value.numel()
+        if numel == 0:
+            return None
+        value = (value if numel == 1 else value.detach().reshape(-1)[0]).item()
+    elif hasattr(value, "detach"):
         flat = value.detach().cpu().reshape(-1)
         if flat.numel() == 0:
             return None
@@ -188,6 +233,20 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
             f"codec_left_context_frames={left_context_frames}"
         )
     return chunk_frames, left_context_frames
+
+
+def _initial_codec_chunk_frames(transfer_manager: Any, chunk_frames: int) -> int:
+    """Frames that release a response's first codec window.
+
+    Read from ``initial_codec_chunk_frames``; 0 keeps ``chunk_frames``.
+    """
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    initial = int((config if isinstance(config, dict) else {}).get("initial_codec_chunk_frames", 0) or 0)
+    if initial < 0:
+        raise ValueError(f"Invalid MiniCPM-o codec chunk config: initial_codec_chunk_frames={initial}")
+    return min(initial, chunk_frames) if initial else chunk_frames
 
 
 def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
@@ -240,7 +299,12 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
             rows = valid.detach().to(device="cpu").reshape(-1).bool()
             if rows.numel() == 0 and audio.numel() == 0:
                 return []
-            audio = audio.detach().to(device="cpu").reshape(rows.numel(), -1)[rows]
+            audio = audio.detach().to(device="cpu").reshape(rows.numel(), -1)
+            if rows.numel() == 1:
+                # A decode step's single row is kept or dropped whole.
+                audio = audio if bool(rows.item()) else audio[:0]
+            else:
+                audio = audio[rows]
         return _codec_scalars(audio)
     if isinstance(pooling_output, Sequence) and not isinstance(
         pooling_output,
@@ -272,6 +336,26 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
 def _is_aborted(request: Any) -> bool:
     status_name = getattr(getattr(request, "status", None), "name", "")
     return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
+
+
+# Talker requests that just released a response's first codec window, mapped
+# to a monotonic deadline. Code2Wav decodes that window on the same GPU; until
+# the deadline the Talker scheduler leaves those rows out (see
+# ``scheduling_hold_request_ids``) so the opening CFM solve is not time-sliced
+# against more codec steps. Written by the output path, read by the scheduler
+# of the same EngineCore process.
+_FIRST_WINDOW_YIELD_UNTIL: dict[str, float] = {}
+# Shared by the Talker and its scheduler when this processor runs on MRv2.
+MRV2_DECODE_BURST_STEPS = 4
+_FIRST_WINDOW_YIELD_S = 0.025
+
+
+def scheduling_hold_request_ids(now: float) -> set[str]:
+    """Internal request ids the Talker scheduler should not schedule at ``now``."""
+    expired = [request_id for request_id, until in _FIRST_WINDOW_YIELD_UNTIL.items() if until <= now]
+    for request_id in expired:
+        del _FIRST_WINDOW_YIELD_UNTIL[request_id]
+    return set(_FIRST_WINDOW_YIELD_UNTIL)
 
 
 def tts2code2wav_async_chunk(
@@ -357,28 +441,54 @@ def tts2code2wav_async_chunk(
     delta = _extract_codec_delta(multimodal_output, request_id)
     pending.extend(delta)
     pending_text_utf8 = state.setdefault("pending_text_utf8", [])
-    current_text_utf8 = (
-        segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
-        if isinstance(segment_text_utf8, torch.Tensor)
-        else []
-    )
-    if native_duplex and current_text_utf8 and not state.get("segment_text_recorded", False):
-        # Talker repeats the unit text on every codec step. Queue it once for
-        # the first Code2Wav payload that can carry audio for this unit.
-        pending_text_utf8.extend(current_text_utf8)
-        state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    # A response's first window may be shorter (``initial_codec_chunk_frames``)
+    # to start playback sooner; later windows keep ``chunk_frames``. Native
+    # duplex streams span turns, so the first window is tracked per turn.
+    response_key = duplex_turn_key if native_duplex else None
+    if state.get("response_key", _UNSET) != response_key:
+        if native_duplex and state.get("response_key", _UNSET) is not _UNSET:
+            # A turn's terminal flush drops this state, so a previous key here
+            # means that turn closed without one (a cancelled response). Start
+            # the new turn's Code2Wav stream afresh, as after a terminal flush:
+            # its unflushed frames and vocoder context are not this turn's.
+            del pending[: len(pending) - len(delta)]
+            state["codec_end"] = 0
+            state["left_context"] = []
+            pending_text_utf8.clear()
+            state["segment_text_recorded"] = False
+            record["cache_epoch"] = int(record["cache_epoch"]) + 1
+            record["chunk_seq"] = 0
+        state["response_key"] = response_key
+        state["response_frames"] = 0
+    if native_duplex and isinstance(segment_text_utf8, torch.Tensor) and not state.get("segment_text_recorded", False):
+        # Talker repeats the unit text on every codec step. Queue it once for
+        # the first Code2Wav payload that can carry audio for this unit; the
+        # repeats are not decoded.
+        current_text_utf8 = segment_text_utf8.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
+        if current_text_utf8:
+            pending_text_utf8.extend(current_text_utf8)
+            state["segment_text_recorded"] = True
+    release_frames = (
+        _initial_codec_chunk_frames(transfer_manager, chunk_frames)
+        if int(state.get("response_frames", 0)) == 0
+        else chunk_frames
+    )
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    if not flush_pending and len(pending) < release_frames:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else release_frames)
+    if new_token_count and not flush_pending and int(state.get("response_frames", 0)) == 0:
+        if native_duplex and getattr(getattr(transfer_manager, "config", None), "use_v2_model_runner", False):
+            _FIRST_WINDOW_YIELD_UNTIL[internal_id] = time.monotonic() + _FIRST_WINDOW_YIELD_S
+    state["response_frames"] = int(state.get("response_frames", 0)) + new_token_count
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -426,7 +536,7 @@ def tts2code2wav_async_chunk(
         raw_ref_audio_sr = meta_info.get("ref_audio_sr")
         ref_audio_sr = _coerce_int(raw_ref_audio_sr)
         if raw_ref_audio is not None:
-            ref_audio = torch.as_tensor(raw_ref_audio, dtype=torch.float32).reshape(-1).cpu()
+            ref_audio = decode_reference_audio(raw_ref_audio).reshape(-1).cpu()
     finished_tensor = torch.tensor(last_chunk, dtype=torch.bool)
     payload = OmniPayloadStruct(
         codes=CodesStruct(
@@ -487,7 +597,7 @@ def tts2code2wav_full_payload(
     return OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(output_codes, dtype=torch.long),
-            ref=torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1) if ref_audio is not None else None,
+            ref=decode_reference_audio(ref_audio).reshape(-1) if ref_audio is not None else None,
         ),
         meta=_MiniCPMO45MetaStruct(
             request_id=request_id,
@@ -1069,14 +1179,19 @@ def llm2tts(
             if native_segment_end:
                 meta["segment_end"] = True
         ref_audio = reference_audio_by_request_id.get(llm_output.request_id)
-        if ref_audio is None:
-            ref_audio = _extract_native_runtime_ref_audio(
-                model_intermediate_buffer.get("duplex"),
-            )
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
-            set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+            set_ref_audio(model_intermediate_buffer, encode_reference_audio(ref_waveform), ref_sr)
+        else:
+            ref_payload = _native_runtime_ref_audio_payload(
+                model_intermediate_buffer.get("duplex"),
+                _streaming_context,
+                request_id=str(llm_output.request_id),
+            )
+            if ref_payload is not None:
+                payload, ref_sr = ref_payload
+                set_ref_audio(model_intermediate_buffer, payload, ref_sr)
+        handoff_hidden = pack_tts_hidden(tts_hidden_slice) if tts_hidden_slice is not None else None
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
@@ -1090,8 +1205,9 @@ def llm2tts(
         condition_sequence_state = None
         condition_sequence_value = None
         if handoff_ids is not None and handoff_hidden is not None:
+            assert tts_hidden_slice is not None
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
-            condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
+            condition_length = max(len(handoff_ids), int(tts_hidden_slice.shape[0])) + condition_suffix_length
             # Dummy ids only reserve scheduler slots; prefill overwrites the
             # embeddings. Talker.sample() blanks the whole prompt out of the
             # repetition penalty, so codec id 0 is not taxed from step one.

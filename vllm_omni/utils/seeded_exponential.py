@@ -88,6 +88,20 @@ def fill_exponential_rows(out: torch.Tensor, generators: list, rows: list[int] |
 
     numel = int(out.shape[-1]) if rows is not None else int(out.numel()) // len(generators)
     device = out.device
+    seeds, offsets, threads = claim_exponential_draws(generators, numel, device)
+    table = [seeds, offsets] if rows is None else [seeds, offsets, list(rows)]
+    state = torch.tensor(table, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
+    launch_exponential_rows(out, state[0], state[1], numel, threads, state[2] if rows is not None else None)
+    return out
+
+
+def claim_exponential_draws(generators: list, numel: int, device: torch.device) -> tuple[list[int], list[int], int]:
+    """Advance each generator exactly as one ``exponential_`` of ``numel`` would.
+
+    Returns the signed Philox seeds, the pre-draw offsets and the grid thread
+    count that ``launch_exponential_rows`` needs to reproduce those draws.
+    ``None`` generators claim from the default CUDA generator in order.
+    """
     threads, increment = torch_exponential_policy(numel, device)
     default = None
     seeds, offsets = [], []
@@ -101,20 +115,33 @@ def fill_exponential_rows(out: torch.Tensor, generators: list, rows: list[int] |
         seed = generator.initial_seed()
         seeds.append(seed - (1 << 64) if seed >= 1 << 63 else seed)
         offsets.append(offset)
-    table = [seeds, offsets] if rows is None else [seeds, offsets, list(rows)]
-    state = torch.tensor(table, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
+    return seeds, offsets, threads
+
+
+def launch_exponential_rows(
+    out: torch.Tensor,
+    seeds: torch.Tensor,
+    offsets: torch.Tensor,
+    numel: int,
+    threads: int,
+    rows: torch.Tensor | None = None,
+) -> None:
+    """Fill rows of ``out`` from device-resident (seed, offset) pairs.
+
+    Reads Philox state from device memory only, so a CUDA graph can capture
+    the launch and replay it with new per-step seeds/offsets.
+    """
     block = 1024
-    _generator_exponential_kernel[(len(generators), triton.cdiv(numel, block))](
+    _generator_exponential_kernel[(int(seeds.shape[0]), triton.cdiv(numel, block))](
         out,
-        state[2] if rows is not None else state[0],
-        state[0],
-        state[1],
+        rows if rows is not None else seeds,
+        seeds,
+        offsets,
         numel,
         threads,
         HAS_ROWS=rows is not None,
         BLOCK=block,
     )
-    return out
 
 
 def batched_seeded_exponential_supported(q: torch.Tensor, generators: dict) -> bool:

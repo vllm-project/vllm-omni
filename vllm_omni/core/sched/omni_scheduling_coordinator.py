@@ -234,6 +234,7 @@ class OmniSchedulingCoordinator:
     def collect_timed_out_request_ids(
         self,
         timeout_s: float,
+        session_request_ids: set[str] | None = None,
     ) -> set[str]:
         """Return IDs of requests that have been waiting longer than *timeout_s*.
 
@@ -253,6 +254,12 @@ class OmniSchedulingCoordinator:
         now = time.monotonic()
         timed_out_ids: set[str] = set()
         for req_id, start_time in self._waiting_since.items():
+            if session_request_ids and req_id in session_request_ids:
+                # Session idle/close owns resumable duplex waits. Restart the
+                # connector deadline here so a later final (non-resumable)
+                # update gets a full deadline for its terminal payload.
+                self._waiting_since[req_id] = now
+                continue
             if now - start_time > timeout_s:
                 timed_out_ids.add(req_id)
         if not timed_out_ids:

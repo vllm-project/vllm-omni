@@ -1346,6 +1346,9 @@ class DuplexSessionRunner:
         )
         if event_type == "response.cancel":
             session.release_input_bytes(model_state.clear_committed_audio())
+        if self._cancel_response_in_model_stream(reason=cancel_reason):
+            self.tasks.active_response_task = None
+            return
         had_stream = self.run.stream_request_id is not None
         cancelled = await self._cancel_active_response(self.tasks.active_response_task, reason=cancel_reason)
         had_stream = self.model.cancel_data_plane_stream() or had_stream
@@ -1428,6 +1431,61 @@ class DuplexSessionRunner:
         if not await self.model.signal_cancel_fence(cancelled_fence):
             return
         self.tasks.active_response_task = None
+
+    def _cancel_response_in_model_stream(self, *, reason: str) -> bool:
+        """Cancel the active response but keep the model's request and context.
+
+        Replacing the request (``_cancel_active_response``) drops the KV that
+        holds the whole conversation. When the response is a turn of a running
+        model stream and the plugin can close that turn at the next append,
+        the response instead ends like a turn the server bound closes: the
+        session moves past its turn id, so the turn's in-flight output is
+        stale, and the stage request keeps its context.
+        """
+        session = self.session
+        request_id = session.active_request_id
+        response_id = session.active_response_id
+        turn_id = session.active_response_turn_id
+        active_task = self.tasks.active_response_task
+        if (
+            request_id is None
+            or response_id is None
+            or turn_id is None
+            or self.run.stream_request_id != request_id
+            or session.draining_request_ids()
+            or (active_task is not None and not active_task.done())
+            or not self.plugin.close_model_turn(self.model_state)
+        ):
+            return False
+        epoch = session.epoch
+        committed_ms = session.playback.committed_ms
+        old_playback = session.playback.as_dict()
+        self.model_state.clear_continuation()
+        committed_message = session.end_response(
+            commit_text=self.model.should_commit_response_to_history(session, response_id),
+            playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
+            preserve_request=True,
+        )
+        item_id = f"item_{response_id}"
+        if committed_message is not None:
+            session.register_history_item(item_id, committed_message)
+        elif committed_ms > 0 and not session.playback_ack_is_too_late(response_id, item_id):
+            session.truncate_history_item(item_id, audio_end_ms=committed_ms)
+        session.complete_model_turn(turn_id)
+        session.clear_playback_cursor()
+        self.emit(
+            {
+                "type": "audio.cancelled",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "reason": reason,
+                "cancelled_epoch": epoch,
+                "epoch": epoch,
+                "committed_ms": committed_ms,
+                "playback": old_playback,
+            }
+        )
+        return True
 
     async def _cancel_active_response(
         self,

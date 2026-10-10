@@ -12,7 +12,7 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import cached_property
 from types import SimpleNamespace
@@ -29,18 +29,27 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
+from vllm.triton_utils import tl, tldevice, triton
+from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.states import RequestState
 
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.output_snapshot import RequestOutputSnapshot
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
-from vllm_omni.worker_v2.omni_sampler import OmniSampler
+from vllm_omni.utils.mm_outputs import partition_flat_payload
+from vllm_omni.worker_v2.decode_burst import BurstOutputBatch, decode_burst_steps
+from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput, StandardSample
 
 logger = init_logger(__name__)
 
@@ -66,6 +75,8 @@ _DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
 #: its text is spoken, while a genuine end of text shows up as an EOS anywhere
 #: else in the window.
 _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
+#: Per-request native duplex output metadata, constant for one condition.
+_DUPLEX_OUTPUT_META_KEYS = ("native_duplex", "duplex_epoch", "duplex_turn_id", "llm_output_text_utf8", "turn_end")
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
@@ -163,6 +174,67 @@ def _apply_batched_repetition_penalty(
     return penalized
 
 
+@triton.jit
+def _codec_window_penalty_kernel(
+    logits,
+    logits_row_stride: tl.constexpr,
+    logits_col_stride: tl.constexpr,
+    slots,
+    token_ids,
+    token_row_stride: tl.constexpr,
+    token_col_stride: tl.constexpr,
+    total_len,
+    prompt_len,
+    penalties,
+    prefix_history,
+    prefix_row_stride: tl.constexpr,
+    prefix_col_stride: tl.constexpr,
+    vocab_size: tl.constexpr,
+    window_size: tl.constexpr,
+    has_prefix: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(slots + row)
+    penalty = tl.load(penalties + slot)
+    if penalty == 1.0:
+        return
+    end = tl.load(total_len + slot)
+    prompt = tl.load(prompt_len + slot)
+    offsets = tl.arange(0, triton.next_power_of_2(window_size))
+    positions = end - window_size + offsets
+    valid = (offsets < window_size) & (positions >= tl.maximum(end - window_size, prompt))
+    history = tl.load(
+        token_ids + slot * token_row_stride + positions * token_col_stride,
+        mask=valid,
+        other=-1,
+    )
+    if has_prefix:
+        relative = positions - prompt
+        seed_valid = (offsets < window_size) & (relative < 0) & (relative >= -window_size)
+        seeds = tl.load(
+            prefix_history + slot * prefix_row_stride + (relative + window_size) * prefix_col_stride,
+            mask=seed_valid,
+            other=-1,
+        )
+        seed_valid &= seeds >= 0
+        history = tl.where(seed_valid, seeds, history)
+        valid |= seed_valid
+    tokens = tl.program_id(1) * block_size + tl.arange(0, block_size)
+    frequencies = tl.sum(((history[:, None] == tokens[None, :]) & valid[:, None]).to(tl.int32), axis=0)
+    values = tl.load(
+        logits + row * logits_row_stride + tokens * logits_col_stride,
+        mask=tokens < vocab_size,
+        other=0,
+    )
+    dtype = values.dtype
+    # Match the existing helper's casts before pow and before multiplication.
+    alpha = tldevice.pow(penalty.to(dtype).to(tl.float32), frequencies.to(tl.float32)).to(dtype).to(tl.float32)
+    values = values.to(tl.float32)
+    output = tl.where(values < 0, values * alpha, tldevice.div_rn(values, alpha))
+    tl.store(logits + row * logits_row_stride + tokens * logits_col_stride, output, mask=tokens < vocab_size)
+
+
 def _apply_codec_window_penalty_gpu(
     logits: torch.Tensor,
     slots: torch.Tensor,
@@ -172,19 +244,41 @@ def _apply_codec_window_penalty_gpu(
     penalty: torch.Tensor,
     *,
     window_size: int,
+    prefix_history: torch.Tensor | None = None,
 ) -> None:
     """In place: ``_apply_batched_repetition_penalty`` on the runner's device token history.
 
     Model Runner V2 keeps every request's sampled ids (``all_token_ids``) and
     lengths on the device, so the 16-frame window is gathered there instead of
-    being rebuilt on the host each step. Row ``r`` is scored over its last
+    being rebuilt on the host each step. CUDA fuses the window gather, counts
+    and scaling, avoiding a full-row history copy and temporary vocabulary
+    tensors. Other devices retain the Torch path. Row ``r`` is scored over its last
     ``window_size`` output ids, ``[max(total_len - window, prompt_len),
     total_len)``: the codes sampled so far, exactly the history the V1 path
-    builds in ``make_omni_output``. Same arithmetic as the V1 helper, so the
-    penalized logits are identical.
+    builds in ``make_omni_output``. It uses the V1 helper's frequency-based
+    arithmetic; fused float32 pow can differ by a few rounding bits.
     """
     num_rows, vocab_size = logits.shape
     if num_rows == 0:
+        return
+    if logits.is_cuda and current_omni_platform.is_cuda():
+        prefix = all_token_ids if prefix_history is None else prefix_history
+        _codec_window_penalty_kernel[(num_rows, triton.cdiv(vocab_size, 256))](
+            logits,
+            *logits.stride(),
+            slots,
+            all_token_ids,
+            *all_token_ids.stride(),
+            total_len,
+            prompt_len,
+            penalty,
+            prefix,
+            *prefix.stride(),
+            vocab_size,
+            window_size,
+            prefix_history is not None,
+            256,
+        )
         return
     slots = slots.long()
     end = total_len.index_select(0, slots).long()
@@ -194,6 +288,13 @@ def _apply_codec_window_penalty_gpu(
     valid = positions >= start.unsqueeze(1)
     rows = all_token_ids.index_select(0, slots)
     history = rows.gather(1, positions.clamp_min(0)).long()
+    if prefix_history is not None:
+        relative = positions - prompt_len.index_select(0, slots).long().unsqueeze(1)
+        seed_positions = (relative + window_size).clamp(0, window_size - 1)
+        seeds = prefix_history.index_select(0, slots).gather(1, seed_positions)
+        seed_valid = (relative < 0) & (relative >= -window_size) & (seeds >= 0)
+        history = torch.where(seed_valid, seeds, history)
+        valid = valid | seed_valid
     # Invalid positions count into a spare column that is dropped below.
     history = torch.where(valid & (history >= 0) & (history < vocab_size), history, vocab_size)
     frequencies = torch.zeros((num_rows, vocab_size + 1), dtype=torch.long, device=logits.device)
@@ -203,6 +304,125 @@ def _apply_codec_window_penalty_gpu(
         frequencies[:, :vocab_size].to(dtype=logits.dtype),
     )
     logits.copy_(torch.where(logits < 0, logits * alpha, logits / alpha))
+
+
+_DECODE_OUTPUT_BLOCK = 128
+
+
+# One compiled variant: no pointer-alignment or row-count specializations
+# that could trigger a JIT compile on a live step after the startup warmup.
+@triton.jit(
+    do_not_specialize=[
+        "token_ids",
+        "slot_ids",
+        "seq_lens",
+        "prompt_len",
+        "empty_speech",
+        "controls",
+        "codes_out",
+        "frame_valid_out",
+        "forced_out",
+        "mask_out",
+        "num_reqs",
+        "num_tokens",
+    ]
+)
+def _mrv2_decode_output_kernel(
+    token_ids,
+    slot_ids,
+    seq_lens,
+    prompt_len,
+    empty_speech,
+    controls,
+    codes_out,
+    frame_valid_out,
+    forced_out,
+    mask_out,
+    num_reqs,
+    num_tokens,
+    eos_id: tl.constexpr,
+    context_limit: tl.constexpr,
+    max_new_minus_one: tl.constexpr,
+    frames_per_chunk: tl.constexpr,
+    mask_steps: tl.constexpr,
+    native: tl.constexpr,
+    block: tl.constexpr,
+):
+    """``make_omni_output_mrv2``'s decode-only device math in one launch.
+
+    Row ``r < num_reqs`` is request ``r``'s single token (``token r``). Every
+    value is an exact integer/boolean expression of the eager Torch path.
+    """
+    rows = tl.program_id(0) * block + tl.arange(0, block)
+    token_mask = rows < num_tokens
+    req_mask = rows < num_reqs
+    token = tl.load(token_ids + rows, mask=token_mask, other=0).to(tl.int64)
+    tl.store(codes_out + rows, token, mask=token_mask)
+    slot = tl.load(slot_ids + rows, mask=req_mask, other=0).to(tl.int64)
+    prompt = tl.load(prompt_len + slot, mask=req_mask, other=0).to(tl.int64)
+    step = tl.load(seq_lens + rows, mask=req_mask, other=0).to(tl.int64) - prompt
+    empty = tl.load(empty_speech + slot, mask=req_mask, other=0) != 0
+    decode = step > 0
+    ended = (decode & (token == eos_id)) | empty
+    valid = decode & (~ended)
+    limit = tl.minimum(tl.maximum(context_limit - prompt, 0), max_new_minus_one)
+    if native:
+        control_limit = tl.load(controls + slot * 3, mask=req_mask, other=-1)
+        min_steps = tl.load(controls + slot * 3 + 1, mask=req_mask, other=-1)
+        turn_end_drain = tl.load(controls + slot * 3 + 2, mask=req_mask, other=-1)
+        limit = tl.where(control_limit >= 0, control_limit, limit)
+        # ``step >= frames_per_chunk > 0``: C and Python remainders agree.
+        boundary = (step >= frames_per_chunk) & ((step % frames_per_chunk) < mask_steps)
+        mask_eos = (step < min_steps) | ((turn_end_drain == 1) & boundary)
+    forced = ended | (step >= limit)
+    tl.store(frame_valid_out + rows, valid & req_mask, mask=token_mask)
+    tl.store(forced_out + rows, forced, mask=req_mask)
+    if native:
+        tl.store(mask_out + rows, mask_eos & (~forced), mask=req_mask)
+
+
+def _mrv2_decode_output_gpu(
+    token_ids: torch.Tensor,
+    slot_ids: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prompt_len: torch.Tensor,
+    empty_speech: torch.Tensor,
+    controls: torch.Tensor | None,
+    *,
+    num_reqs: int,
+    eos_id: int,
+    context_limit: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """(codes [T, 1] int64, frame_valid [T], forced_eos [R], mask_eos [R] | None)."""
+    num_tokens = int(token_ids.shape[0])
+    device = token_ids.device
+    codes = torch.empty((num_tokens, 1), dtype=torch.long, device=device)
+    frame_valid = torch.empty(num_tokens, dtype=torch.bool, device=device)
+    forced = torch.empty(num_reqs, dtype=torch.bool, device=device)
+    native = controls is not None
+    mask = torch.empty(num_reqs, dtype=torch.bool, device=device) if native else None
+    _mrv2_decode_output_kernel[(triton.cdiv(max(num_tokens, 1), _DECODE_OUTPUT_BLOCK),)](
+        token_ids,
+        slot_ids,
+        seq_lens,
+        prompt_len,
+        empty_speech,
+        controls if native else slot_ids,
+        codes,
+        frame_valid,
+        forced,
+        mask if native else forced,
+        num_reqs,
+        num_tokens,
+        eos_id=int(eos_id),
+        context_limit=int(context_limit),
+        max_new_minus_one=_OFFLINE_CODEC_MAX_NEW_TOKENS - 1,
+        frames_per_chunk=_DUPLEX_CODEC_FRAMES_PER_CHUNK,
+        mask_steps=_DUPLEX_TURN_END_BOUNDARY_MASK_STEPS,
+        native=native,
+        block=_DECODE_OUTPUT_BLOCK,
+    )
+    return codes, frame_valid, forced, mask
 
 
 class _CodecWindowPenaltiesState(LogitsProcessor):
@@ -218,7 +438,7 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
     state's slot of that pipeline.
     """
 
-    def __init__(self, base: Any, *, window_size: int) -> None:
+    def __init__(self, base: PenaltiesState, *, window_size: int) -> None:
         from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 
         self.base = base
@@ -230,12 +450,16 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
         self.repetition_penalty.copy_to_uva()
         self.use_window = np.zeros(max_num_reqs, dtype=bool)
         self.use_penalty = np.zeros(max_num_reqs, dtype=bool)
+        self.prefix_history = torch.full(
+            (max_num_reqs, self.window_size), -1, dtype=torch.long, device=self.req_states.device
+        )
 
     @property
     def output_bin_counts(self) -> torch.Tensor:
         return self.base.output_bin_counts
 
-    def add_request(self, req_idx: int, sampling_params: Any) -> bool:
+    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
+        self.prefix_history[req_idx].fill_(-1)
         repetition = float(getattr(sampling_params, "repetition_penalty", 1.0))
         self.repetition_penalty.np[req_idx] = repetition
         self.use_window[req_idx] = repetition != 1.0
@@ -264,21 +488,95 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
                 self.req_states.prompt_len.gpu,
                 self.repetition_penalty.gpu,
                 window_size=self.window_size,
+                prefix_history=self.prefix_history,
             )
         return self.base.apply(logits, ctx)
+
+
+def _mrv2_duplex_output_partition(
+    outputs: dict[str, Any],
+    output_meta: dict[str, list[torch.Tensor]],
+    entries: Sequence[tuple[Any, ...]],
+    token_axis_sizes: set[int],
+) -> dict[str, Any] | RequestOutputSnapshot:
+    """Per-request payloads for one native duplex Talker step, built directly.
+
+    ``outputs`` is the host copy of ``make_omni_output_mrv2``'s payload, whose
+    ``meta.finished`` is one ``[num_reqs]`` tensor; ``output_meta`` holds the
+    step's per-request metadata tensors. The result equals what
+    ``OmniARModelRunner._build_async_chunk_outputs_from_mm`` builds from the
+    per-request list layout: token-axis views for codes and validity, owned
+    clones of every per-request scalar/text tensor, and client entries that
+    share the inter-stage tensors. Any other layout gets the list layout back
+    and keeps the runner's generic partition.
+    """
+    num_rows = len(entries)
+    codes = outputs.get("codes")
+    meta = outputs.get("meta")
+    finished = meta.get("finished") if isinstance(meta, dict) else outputs.get("meta.finished")
+    audio = codes.get("audio") if isinstance(codes, dict) else None
+    valid = meta.get("codec_frame_valid") if isinstance(meta, dict) else None
+    if (
+        isinstance(codes, dict)
+        and isinstance(meta, dict)
+        and list(outputs) == ["codes", "meta"]
+        and list(codes) == ["audio"]
+        and list(meta) == ["codec_frame_valid", "finished"]
+        and isinstance(audio, torch.Tensor)
+        and isinstance(valid, torch.Tensor)
+        and isinstance(finished, torch.Tensor)
+        and audio.dim() > 0
+        and audio.shape[0] in token_axis_sizes
+        and valid.dim() > 0
+        and valid.shape[0] in token_axis_sizes
+        and tuple(finished.shape) == (num_rows,)
+        and all(len(column) == num_rows for column in output_meta.values())
+    ):
+        keys = ["codes.audio", "meta.codec_frame_valid", "meta.finished"]
+        keys += [f"meta.{key}" for key in _DUPLEX_OUTPUT_META_KEYS]
+        inter_template, client_template = partition_flat_payload(dict.fromkeys(keys))
+        inter_keys, client_keys = list(inter_template), list(client_template)
+        finished_rows = finished.unbind()
+        columns = [output_meta[key] for key in _DUPLEX_OUTPUT_META_KEYS]
+        inter_stage: list[dict[str, Any] | None] = []
+        client: list[dict[str, Any] | None] = []
+        for i, entry in enumerate(entries):
+            start, end = entry[0], entry[0] + entry[1]
+            values = [audio[start:end].contiguous(), valid[start:end].contiguous(), finished_rows[i].clone()]
+            values += [column[i].clone() for column in columns]
+            flat = dict(zip(keys, values))
+            inter_stage.append({key: flat[key] for key in inter_keys} or None)
+            client.append({key: flat[key] for key in client_keys} or None)
+        return RequestOutputSnapshot(inter_stage=inter_stage, client=client)
+    # Generic layout: per-request lists, as the runner's partition expects.
+    if isinstance(meta, dict):
+        if isinstance(finished, torch.Tensor):
+            meta["finished"] = list(finished.unbind())
+        for key in _DUPLEX_OUTPUT_META_KEYS:
+            meta[key] = list(output_meta[key])
+    else:
+        if isinstance(finished, torch.Tensor):
+            outputs["meta.finished"] = list(finished.unbind())
+        for key in _DUPLEX_OUTPUT_META_KEYS:
+            outputs[f"meta.{key}"] = list(output_meta[key])
+    return outputs
 
 
 def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> Any:
     """Wrap the runner's MRv2 sampler with codec penalties and EOS control.
 
-    The upstream sampler already applies ``min_tokens`` (codec EOS is a stage
-    stop token), temperature, top-k/top-p and seeded sampling on the device.
+    The upstream sampler applies ``min_tokens`` (codec EOS is a stage stop
+    token), temperature and top-k/top-p on the device. Seeded native duplex
+    rows retain V1's request-local draw to preserve codec onset behavior.
     The Talker adds its 16-frame codec penalty and overrides rows the model
     terminates (``_mrv2_forced_eos``) with codec EOS after sampling, exactly
     where V1's ``_force_eos_on_sampled_ids`` does.
     """
 
     stock = sampler.penalties_state
+    if isinstance(stock, _CodecWindowPenaltiesState):
+        # A second install would nest the window state and score it twice.
+        raise RuntimeError("MiniCPM-o Talker: MRv2 sampler already carries the codec window penalty")
     processors = sampler.logits_processors
     slot = next((i for i, processor in enumerate(processors) if processor is stock), None)
     if slot is None:
@@ -295,6 +593,12 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
         "MiniCPM-o Talker: MRv2 sampler with device-side %d-frame codec penalty and EOS control",
         _CODEC_PENALTY_WINDOW,
     )
+    talker._mrv2_penalties = sampler.penalties_state
+    if current_omni_platform.is_cuda() and sampler.req_states.device.type == "cuda":
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import MiniCPMO45SeededCodecSampler
+
+        sampler = MiniCPMO45SeededCodecSampler(sampler, talker)
+        talker._mrv2_seeded_codec_sampler = sampler
     return MiniCPMO45TalkerSampler(sampler, talker)
 
 
@@ -307,11 +611,97 @@ class MiniCPMO45TalkerSampler(OmniSampler):
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
+        masked = getattr(self.talker, "_mrv2_mask_eos", None)
+        if forced is not None and masked is not None and masked.shape[0] == logits.shape[0]:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2 import SeededCodecDecodeGraphs
+
+            graphs = getattr(getattr(self.talker, "_mrv2_seeded_codec_sampler", None), "decode_graphs", None)
+            if isinstance(graphs, SeededCodecDecodeGraphs):
+                # Same kernels (mask, sampling, forced EOS) replayed as one graph.
+                output = graphs.try_sample(logits, input_batch, masked, forced)
+                if output is not None:
+                    return output
+            logits[:, int(self.talker._codec_eos_id)].masked_fill_(masked, float("-inf"))
         output = self.base_sampler(logits, input_batch)
         if forced is not None:
             sampled = output.sampled_token_ids
             sampled.masked_fill_(forced.view(-1, *([1] * (sampled.ndim - 1))), int(self.talker._codec_eos_id))
         return output
+
+    def sample_step(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        req_states: RequestState,
+        grammar_output: GrammarOutput | None,
+        standard_sample: StandardSample,
+    ) -> OmniSamplingOutput:
+        result = super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
+        infos = getattr(self.talker, "_mrv2_output_infos", ())
+        if any(info.get("native_duplex") is True for info in infos):
+            # Code2Wav consumes codec ids and control metadata only.
+            result.include_hidden_states = False
+            result.finalize_multimodal = self.talker.mrv2_codec_history_finalizer(input_batch, infos)
+        return result
+
+
+class _TalkerDecodeBurst:
+    """``DecodeBurst`` over native duplex codec rows (see worker_v2.decode_burst).
+
+    A row continues until it draws codec EOS, sampled or forced; the
+    scheduler stops it at that token. Every further step of the burst still
+    draws for it, so each request's generator resumes after its last kept
+    draw once the host knows how many were kept.
+    """
+
+    def __init__(
+        self,
+        talker: "MiniCPMO45OmniTTSForConditionalGeneration",
+        steps: int,
+        generators: list[torch.Generator | None],
+    ) -> None:
+        self.talker = talker
+        self.steps = steps
+        self._generators = generators
+        # Per step: each row's generator offset after that step's draw.
+        self._offsets: list[list[int]] = []
+
+    def continues(self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
+        return sampled_token_ids[:, 0] != int(self.talker._codec_eos_id)
+
+    def record_step(self) -> None:
+        self._offsets.append([0 if generator is None else generator.get_offset() for generator in self._generators])
+
+    def merge_outputs(self, outputs: list[dict[str, Any]], live: list[torch.Tensor]) -> dict[str, Any]:
+        """``make_omni_output_mrv2`` payloads, each request's steps contiguous.
+
+        Steps after a row ended forward its EOS id, which is never a valid
+        frame; ``finished`` is the row's value at its last kept step.
+        """
+        num_reqs = int(live[0].shape[0])
+        codes = torch.stack([output["codes"]["audio"][:num_reqs, 0] for output in outputs], dim=1)
+        valid = torch.stack(
+            [output["meta"]["codec_frame_valid"][:num_reqs] & keep for output, keep in zip(outputs, live)], dim=1
+        )
+        finished = outputs[0]["meta"]["finished"]
+        for output, keep in zip(outputs[1:], live[1:]):
+            finished = torch.where(keep, output["meta"]["finished"], finished)
+        return {
+            "codes": {"audio": codes.reshape(-1, 1)},
+            "meta": {"codec_frame_valid": valid.reshape(-1), "finished": finished},
+        }
+
+    def finalizer(
+        self, batch: BurstOutputBatch
+    ) -> Callable[[dict[str, Any], list[int]], dict[str, Any] | RequestOutputSnapshot]:
+        return self.talker._codec_history_finalizer(
+            batch, self.talker._mrv2_output_infos, self.talker._mrv2_last_output_meta
+        )
+
+    def finish(self, num_sampled_np: np.ndarray, copy_event: torch.cuda.Event) -> None:
+        self.talker._mrv2_seeded_codec_sampler.defer_rng_rewind(
+            self._generators, self._offsets, num_sampled_np, copy_event
+        )
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -382,6 +772,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Rows the sampler must force to codec EOS, computed with this step's output.
         self._mrv2_forced_eos: torch.Tensor | None = None
         self._mrv2_decode_rows_logged = False
+        # This step's per-request duplex metadata, handed from
+        # make_omni_output_mrv2 to the codec history finalizer.
+        self._mrv2_output_meta: tuple[list[dict[str, Any]], dict[str, list[torch.Tensor]]] | None = None
+        # The metadata the latest finalizer consumed; a decode burst's merged
+        # output reuses it (it is constant across the burst's steps).
+        self._mrv2_last_output_meta: tuple[list[dict[str, Any]], dict[str, list[torch.Tensor]]] | None = None
+        # The model-owned codec limit also sizes scheduler KV lookahead.
+        self._mrv2_decode_burst_steps = decode_burst_steps(vllm_config)
+
+    #: Model Runner V2 output leaves are allocated by every
+    #: ``make_omni_output_mrv2`` call (codes via a dtype-converting copy,
+    #: validity and forced EOS from this step's device ops) and nothing writes
+    #: them afterwards, so the runner copies them to the host without a
+    #: snapshot. Per-request duplex metadata stays out of the device payload;
+    #: the codec history finalizer attaches it on the host.
+    mm_outputs_fresh_per_step = True
 
     def _init_native_talker(self, prefix: str) -> None:
         if self._tts_config is None:
@@ -420,10 +826,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         self.make_empty_intermediate_tensors = self.tts_model.make_empty_intermediate_tensors
 
+    def _text_embedding_row(self, token_id: int) -> torch.Tensor:
+        """``emb_text`` of one constant id as a weight-row view: no index upload or gather."""
+        weight = self.emb_text.weight
+        token_id = int(token_id)
+        if not 0 <= token_id < weight.shape[0]:
+            return self.emb_text(index_to_device([token_id], weight.device))
+        return weight[token_id : token_id + 1]
+
     def _boundary_embeddings(self) -> torch.Tensor:
         """Embed the ``<text_eos><audio_bos>`` tail every condition ends with."""
-        ids = index_to_device([self._text_eos_id, self._tts_bos_id], self.emb_text.weight.device)
-        return self.emb_text(ids)
+        return torch.cat([self._text_embedding_row(self._text_eos_id), self._text_embedding_row(self._tts_bos_id)])
 
     def _build_condition_embeddings(
         self,
@@ -453,7 +866,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         hidden_embeds = self.projector_semantic(hidden)
         if self._normalize:
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
-        audio_bos = self.emb_text(index_to_device([self._tts_bos_id], device))
+        audio_bos = self._text_embedding_row(self._tts_bos_id)
         condition = text_embeds + hidden_embeds
         if native_duplex:
             # Match MiniCPMTTS.generate_chunk's streaming condition.
@@ -599,16 +1012,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build request-local prefill/decode embeddings for the vLLM runner."""
         del input_embeds
+        # A FULL CUDA graph replay never calls forward(), so release finished
+        # requests here too; this runs on every step before the graph.
+        if getattr(self, "_deferred_cleanup_ids", None):
+            self._flush_deferred_cleanup()
         span_len = int(input_ids.shape[0])
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
         state = info_dict.get("audio_state")
         first_call = not isinstance(state, dict)
-        request_id = str(info_dict.get("request_id", "0"))
+        # V1 preprocess uses request_id; MRv2's slot buffer uses req_id.
+        # Streaming conditions and codec history belong to that request,
+        # including when other sessions prefill in the same batch.
+        request_id = str(info_dict.get("request_id") or info_dict.get("req_id", "0"))
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
-            # Cross-process stage transport serializes CPU tensors as lists.
-            # Normalize both local tensor handoffs and transported payloads
+            # get_tts_handoff unpacks the bridge's float32 bytes; legacy
+            # callers may still hand over nested lists. Normalize both
             # before validating/building the Talker condition.
             if isinstance(token_ids, (list, tuple)):
                 token_ids = torch.as_tensor(token_ids, dtype=torch.long)
@@ -859,12 +1279,51 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         req_infos: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
         """Decode rows are ``emb_code`` of their input id, already in ``input_embeds``."""
+        if getattr(self, "_deferred_cleanup_ids", None):
+            self._flush_deferred_cleanup()
         num_rows = len(req_infos)
         empty = input_embeds.new_empty((num_rows, 0))
         return input_ids, input_embeds, empty, empty, [{} for _ in range(num_rows)]
 
     def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
         return _install_mrv2_talker_sampler(sampler, self), None
+
+    def capture_auxiliary_graphs(self) -> None:
+        """Warm the CUDA seeded sampler before the worker reports readiness."""
+        self._warmup_mrv2_decode_output()
+        sampler = getattr(self, "_mrv2_seeded_codec_sampler", None)
+        if sampler is not None:
+            sampler.warmup()
+
+    @torch.inference_mode()
+    def _warmup_mrv2_decode_output(self) -> None:
+        """Compile the fused decode-output kernel (both layouts) on disposable inputs."""
+        empty_speech = getattr(self, "_mrv2_empty_speech", None)
+        tts_config = getattr(self, "_tts_config", None)
+        if (
+            empty_speech is None
+            or tts_config is None
+            or empty_speech.device.type != "cuda"
+            or not current_omni_platform.is_cuda()
+        ):
+            return
+        device = empty_speech.device
+        slots = empty_speech.shape[0]
+        ids = torch.zeros(1, dtype=torch.int32, device=device)
+        lengths = torch.zeros(slots, dtype=torch.int32, device=device)
+        controls = torch.full((slots, 3), -1, dtype=torch.long, device=device)
+        for native_controls in (None, controls):
+            _mrv2_decode_output_gpu(
+                ids,
+                ids,
+                ids,
+                lengths,
+                torch.zeros_like(empty_speech),
+                native_controls,
+                num_reqs=1,
+                eos_id=int(self._codec_eos_id),
+                context_limit=int(tts_config.max_position_embeddings) - 1,
+            )
 
     def make_omni_output_mrv2(
         self,
@@ -892,53 +1351,192 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             raise RuntimeError("MiniCPM-o Talker MRv2 output requires its MRv2 sampler (mrv2_custom_sampler)")
         num_reqs = int(input_batch.num_reqs)
         device = hidden.device
+        self._mrv2_output_infos = model_intermediate_buffer
+        native = any(info.get("native_duplex") is True for info in model_intermediate_buffer)
+        if native and getattr(self, "_mrv2_codec_controls", None) is None:
+            self._mrv2_codec_controls = torch.full((empty_speech.shape[0], 3), -1, dtype=torch.long, device=device)
+            self._mrv2_metadata_by_slot = {}
         if input_batch.has_prefill:
             # Prefill rows only: record whether the Thinker handed over an
             # empty condition (preprocess marks such a request finished).
             slots: list[int] = []
             flags: list[bool] = []
+            controls, histories = [], []
             for row in np.flatnonzero(input_batch.is_prefilling_np[:num_reqs]).tolist():
                 info = model_intermediate_buffer[row]
-                if info.get("native_duplex") is True:
-                    raise NotImplementedError("MiniCPM-o native duplex Talker requires model_runner: v1")
                 state = info.get("audio_state")
                 flags.append(bool(state.get("finished")) if isinstance(state, dict) else False)
                 slots.append(int(input_batch.idx_mapping_np[row]))
+                if native:
+                    if info.get("native_duplex") is True:
+                        controls.append([state["max_tokens"] - 1, state["min_tokens"], int(state["turn_end_drain"])])
+                        history = list(state.get("recent_codes", ()))[-_CODEC_PENALTY_WINDOW:]
+                        histories.append([-1] * (_CODEC_PENALTY_WINDOW - len(history)) + history)
+                    else:
+                        controls.append([-1, -1, -1])
+                        histories.append([-1] * _CODEC_PENALTY_WINDOW)
+                    self._mrv2_metadata_by_slot[slots[-1]] = self._duplex_output_metadata([info])
             if slots:
+                slot_tensor = index_to_device(slots, device)
                 empty_speech.index_copy_(
                     0,
-                    index_to_device(slots, device),
+                    slot_tensor,
                     index_to_device(flags, device, dtype=torch.bool),
                 )
+                if native:
+                    self._mrv2_codec_controls.index_copy_(
+                        0, slot_tensor, to_device_nonblocking(torch.tensor(controls, dtype=torch.long), device)
+                    )
+                    self._mrv2_penalties.prefix_history.index_copy_(
+                        0, slot_tensor, to_device_nonblocking(torch.tensor(histories, dtype=torch.long), device)
+                    )
         num_tokens = int(hidden.shape[0])
         token_ids = input_batch.input_ids[:num_tokens]
-        last_rows = input_batch.logits_indices[:num_reqs].long()
-        slot_ids = input_batch.idx_mapping[:num_reqs].long()
-        prompt_len = req_states.prompt_len.gpu.index_select(0, slot_ids).long()
+        # index_select takes the runner's int32 indices directly, and the step
+        # arithmetic stays exact in int32: no per-step widening copies.
+        slot_ids = input_batch.idx_mapping[:num_reqs]
+        one_token_rows = int(input_batch.query_start_loc_np[num_reqs]) == num_reqs
+        if (
+            one_token_rows
+            and not input_batch.has_prefill
+            and num_reqs > 0
+            and device.type == "cuda"
+            and current_omni_platform.is_cuda()
+        ):
+            # Steady decode: the ~25 elementwise launches below in one kernel.
+            codes, frame_valid, forced, mask = _mrv2_decode_output_gpu(
+                token_ids,
+                slot_ids,
+                input_batch.seq_lens[:num_reqs],
+                req_states.prompt_len.gpu,
+                empty_speech,
+                self._mrv2_codec_controls if native else None,
+                num_reqs=num_reqs,
+                eos_id=int(self._codec_eos_id),
+                context_limit=int(self._tts_config.max_position_embeddings) - 1,
+            )
+            self._mrv2_mask_eos = mask
+            self._mrv2_forced_eos = forced
+            return self._mrv2_omni_output(
+                hidden, codes, frame_valid, forced, native, input_batch, model_intermediate_buffer
+            )
+        prompt_len = req_states.prompt_len.gpu.index_select(0, slot_ids)
         # Codes emitted before this step's input (V1's ``state["step"]``).
-        step = input_batch.seq_lens[:num_reqs].long() - prompt_len
-        last_ids = token_ids.index_select(0, last_rows)
+        step = input_batch.seq_lens[:num_reqs] - prompt_len
+        # Every row schedules one token (plain decode): row i's last token is
+        # token i, so its logits index needs no gather.
+        if one_token_rows:
+            last_rows = None
+            last_ids = token_ids[:num_reqs]
+        else:
+            last_rows = input_batch.logits_indices[:num_reqs].long()
+            last_ids = token_ids.index_select(0, last_rows)
         empty = empty_speech.index_select(0, slot_ids)
         decode = step > 0
         eos_input = decode & (last_ids == int(self._codec_eos_id))
-        valid = decode & ~eos_input & ~empty
+        ended = eos_input | empty
+        valid = decode & ~ended
         # MiniCPMTTS.generate's max_new_token, clamped to the Talker context
         # (see ``preprocess``); the sample after the last allowed code is EOS.
-        remaining = int(self._tts_config.max_position_embeddings) - prompt_len
-        limit = torch.clamp(remaining, min=1, max=_OFFLINE_CODEC_MAX_NEW_TOKENS) - 1
-        self._mrv2_forced_eos = empty | eos_input | (step >= limit)
-        frame_valid = torch.zeros(num_tokens, dtype=torch.bool, device=device)
-        frame_valid.index_copy_(0, last_rows, valid)
+        # clamp(context - prompt, 1, max) - 1 == clamp(context - 1 - prompt, 0, max - 1).
+        limit = torch.clamp(
+            (int(self._tts_config.max_position_embeddings) - 1) - prompt_len,
+            min=0,
+            max=_OFFLINE_CODEC_MAX_NEW_TOKENS - 1,
+        )
+        self._mrv2_mask_eos = None
+        if native:
+            controls = self._mrv2_codec_controls.index_select(0, slot_ids)
+            limit = torch.where(controls[:, 0] >= 0, controls[:, 0], limit)
+            boundary = (step >= _DUPLEX_CODEC_FRAMES_PER_CHUNK) & (
+                step.remainder(_DUPLEX_CODEC_FRAMES_PER_CHUNK) < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
+            )
+            self._mrv2_mask_eos = (step < controls[:, 1]) | ((controls[:, 2] == 1) & boundary)
+        self._mrv2_forced_eos = ended | (step >= limit)
+        if native:
+            self._mrv2_mask_eos &= ~self._mrv2_forced_eos
+        if one_token_rows and num_tokens == num_reqs:
+            # ``valid`` is this step's own tensor and is never written again.
+            frame_valid = valid
+        else:
+            frame_valid = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+            if last_rows is None:
+                frame_valid[:num_reqs].copy_(valid)
+            else:
+                frame_valid.index_copy_(0, last_rows, valid)
+        # copy=True: the payload never aliases the runner's input buffer.
+        codes = token_ids.to(dtype=torch.long, copy=True).reshape(num_tokens, 1)
+        return self._mrv2_omni_output(
+            hidden, codes, frame_valid, self._mrv2_forced_eos, native, input_batch, model_intermediate_buffer
+        )
+
+    def _mrv2_omni_output(
+        self,
+        hidden: torch.Tensor,
+        codes: torch.Tensor,
+        frame_valid: torch.Tensor,
+        forced: torch.Tensor,
+        native: bool,
+        input_batch: Any,
+        model_intermediate_buffer: list[dict[str, Any]],
+    ) -> OmniOutput:
         if not self._mrv2_decode_rows_logged and not input_batch.has_prefill:
             self._mrv2_decode_rows_logged = True
             logger.info("MiniCPM-o Talker: MRv2 device-side codec output active (no host read of sampled ids)")
+        meta = {"codec_frame_valid": frame_valid}
+        self._mrv2_output_meta = None
+        if native:
+            # One device tensor (one D2H copy); the finalizer restores the
+            # per-request rows on the host. The per-slot metadata never
+            # enters the device payload: capture this step's tensors here.
+            meta["finished"] = forced
+            slot_meta = [self._mrv2_metadata_by_slot[int(slot)] for slot in input_batch.idx_mapping_np]
+            self._mrv2_output_meta = (
+                model_intermediate_buffer,
+                {key: [entry[key][0] for entry in slot_meta] for key in _DUPLEX_OUTPUT_META_KEYS},
+            )
         return OmniOutput(
             text_hidden_states=hidden,
-            multimodal_outputs={
-                "codes": {"audio": token_ids.to(dtype=torch.long).reshape(num_tokens, 1)},
-                "meta": {"codec_frame_valid": frame_valid},
-            },
+            multimodal_outputs={"codes": {"audio": codes}, "meta": meta},
         )
+
+    def mrv2_decode_burst(self, input_batch: InputBatch, req_states: RequestState) -> "_TalkerDecodeBurst | None":
+        """Plan a decode burst (worker_v2.decode_burst) for an all-native-duplex decode batch.
+
+        Called after the scheduled step sampled. The burst ends at the first
+        step whose draw is a forced codec EOS for every row (the chunk
+        ceiling) and stays within the request slots the scheduler reserved.
+        """
+        steps = self._mrv2_decode_burst_steps
+        sampler = getattr(self, "_mrv2_seeded_codec_sampler", None)
+        infos = getattr(self, "_mrv2_output_infos", ())
+        num_reqs = int(input_batch.num_reqs)
+        if (
+            steps <= 1
+            or sampler is None
+            or sampler._rewind_async_lookahead
+            or len(infos) != num_reqs
+            or not all(info.get("native_duplex") is True for info in infos)
+        ):
+            return None
+        num_computed = input_batch.num_computed_tokens_np[:num_reqs]
+        # This step forwards the request's ``step``-th codec frame (the
+        # device's ``seq_len - prompt_len``); the draw at
+        # ``step == max_tokens - 1`` is the chunk's forced codec EOS.
+        frame = num_computed + 1 - req_states.prompt_len.np[input_batch.idx_mapping_np[:num_reqs]]
+        remaining = 0
+        for row, info in enumerate(infos):
+            state = self._request_audio_states.get(str(info.get("request_id") or info["req_id"]))
+            if not isinstance(state, dict) or state.get("finished") or not isinstance(state.get("max_tokens"), int):
+                return None
+            remaining = max(remaining, int(state["max_tokens"]) - int(frame[row]))
+        # Lookahead slots end at max_model_len.
+        room = int(self.vllm_config.model_config.max_model_len) - int(num_computed.max())
+        steps = min(steps, remaining, room)
+        if steps <= 1:
+            return None
+        generators = [sampler._generators.get(request_id) for request_id in input_batch.req_ids[:num_reqs]]
+        return _TalkerDecodeBurst(self, steps, generators)
 
     def take_mrv2_forced_eos(self, input_batch: Any, req_states: Any, num_rows: int) -> torch.Tensor | None:
         """This step's forced-EOS rows, once; ``None`` outside a model step (warmup)."""
@@ -946,6 +1544,152 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if forced is None or int(forced.shape[0]) != int(num_rows):
             return None
         return forced
+
+    def mrv2_codec_history_finalizer(
+        self, input_batch: InputBatch, infos: list[dict[str, Any]]
+    ) -> Callable[[dict[str, Any], list[int]], dict[str, Any] | RequestOutputSnapshot]:
+        """Update cross-condition history from the runner's existing CPU copy.
+
+        GPU penalties/EOS do not read this history in decode. Capture state
+        identities so delayed output cannot update a new condition or session.
+
+        For native duplex steps it also restores the per-request output
+        metadata ``make_omni_output_mrv2`` kept off the device payload, and
+        returns the request partition the runner would otherwise build
+        recursively (same keys, tensors and ownership).
+        """
+        stashed = getattr(self, "_mrv2_output_meta", None)
+        self._mrv2_output_meta = None
+        self._mrv2_last_output_meta = stashed
+        return self._codec_history_finalizer(input_batch, infos, stashed)
+
+    def _codec_history_finalizer(
+        self,
+        input_batch: InputBatch | BurstOutputBatch,
+        infos: list[dict[str, Any]],
+        stashed: tuple[list[dict[str, Any]], dict[str, list[torch.Tensor]]] | None,
+    ) -> Callable[[dict[str, Any], list[int]], dict[str, Any] | RequestOutputSnapshot]:
+        sampler = getattr(self, "_mrv2_seeded_codec_sampler", None)
+        track_rng = sampler is not None and sampler._rewind_async_lookahead
+        num_rows = len(infos)
+        starts = np.asarray(input_batch.query_start_loc_np[:num_rows]).tolist()
+        counts = np.asarray(input_batch.num_scheduled_tokens[:num_rows]).tolist()
+        audio_states = self._request_audio_states
+        entries = []
+        for i, info in enumerate(infos):
+            request_id = str(info.get("request_id") or info["req_id"])
+            entries.append(
+                (
+                    starts[i],
+                    counts[i],
+                    request_id,
+                    # Intermediate-buffer updates merge dict fields into a new
+                    # container. Capture the model-owned state, whose identity
+                    # fences delayed output against a successor condition.
+                    audio_states.get(request_id),
+                    bool(input_batch.is_prefilling_np[i]) if track_rng else False,
+                    sampler.codec_rng_checkpoint(request_id) if track_rng else None,
+                )
+            )
+        if stashed is not None and stashed[0] is not infos:
+            # make_omni_output_mrv2 and this finalizer must describe one step;
+            # without its metadata the payload cannot be routed per request.
+            raise RuntimeError("MiniCPM-o Talker MRv2 output metadata belongs to a different batch")
+        output_meta = stashed[1] if stashed is not None else None
+        token_axis_sizes: set[int] = set()
+        if output_meta is not None and num_rows == int(input_batch.num_reqs):
+            # The token-axis sizes OmniAsyncOutput slices request payloads by.
+            query_start_loc = input_batch.query_start_loc_np
+            if query_start_loc.shape[0] > num_rows:
+                total_tokens = int(query_start_loc[num_rows])
+            else:
+                total_tokens = int(np.asarray(input_batch.num_scheduled_tokens[:num_rows], dtype=np.int64).sum())
+            token_axis_sizes = {total_tokens, int(getattr(input_batch, "num_tokens_after_padding", total_tokens))}
+        eos_id = int(self._codec_eos_id)
+
+        def finalize(outputs: dict[str, Any], num_sampled: list[int]) -> dict[str, Any] | RequestOutputSnapshot:
+            payload = flatten_payload(outputs)
+            audio, valid = payload.get("codes.audio"), payload.get("meta.codec_frame_valid")
+            if not isinstance(audio, torch.Tensor) or not isinstance(valid, torch.Tensor):
+                raise RuntimeError("MRv2 Talker output lost its codec rows or validity")
+            # One codec id per token row: read all rows once, not per request.
+            per_token = (
+                audio.dim() > 0 and audio.numel() == audio.shape[0] == valid.numel() and valid.dtype == torch.bool
+            )
+            audio_ids: list[int] | None = None
+            valid_rows: list[bool] = []
+            for i, (start, count, request_id, state, prefill, checkpoint) in enumerate(entries):
+                if not num_sampled[i] or not isinstance(state, dict):
+                    continue
+                if self._request_audio_states.get(request_id) is not state:
+                    continue
+                if per_token:
+                    if audio_ids is None:
+                        audio_ids = audio.reshape(-1).tolist()
+                        valid_rows = valid.reshape(-1).tolist()
+                    row_ids = audio_ids[start : start + count]
+                    if checkpoint is not None and (prefill or eos_id not in row_ids):
+                        sampler.commit_codec_rng(request_id, checkpoint)
+                    codes = [code for code, keep in zip(row_ids, valid_rows[start : start + count]) if keep]
+                else:
+                    row_audio = audio[start : start + count].reshape(-1)
+                    if checkpoint is not None and (prefill or eos_id not in row_audio.tolist()):
+                        sampler.commit_codec_rng(request_id, checkpoint)
+                    codes = row_audio[valid[start : start + count].reshape(-1)].tolist()
+                if codes:
+                    state["recent_codes"] = (list(state.get("recent_codes", ())) + codes)[-_CODEC_PENALTY_WINDOW:]
+            if output_meta is None:
+                return outputs
+            return _mrv2_duplex_output_partition(outputs, output_meta, entries, token_axis_sizes)
+
+        return finalize
+
+    @staticmethod
+    def _duplex_output_metadata(infos: list[dict[str, Any]]) -> dict[str, list[torch.Tensor]]:
+        result = {key: [] for key in _DUPLEX_OUTPUT_META_KEYS}
+        for info in infos:
+            info = info if isinstance(info, dict) else {}
+            native = info.get("native_duplex") is True
+            duplex_info = info.get("duplex")
+            if not isinstance(duplex_info, dict):
+                duplex_info = {}
+            epoch = duplex_info.get("epoch", -1)
+            turn_id = duplex_info.get("turn_id", -1)
+            if native and not all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
+            ):
+                raise RuntimeError(
+                    "MiniCPM-o native duplex Talker requires non-negative integer "
+                    f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
+                )
+            meta_info = info.get("meta")
+            if not isinstance(meta_info, dict):
+                meta_info = {}
+            segment_text = meta_info.get("native_duplex_segment_text", "") if native else ""
+            if not isinstance(segment_text, str):
+                segment_text = ""
+            turn_eos_id = meta_info.get("turn_eos_token_id")
+            ids_info = info.get("ids")
+            tts_ids = ids_info.get("tts") if native and isinstance(ids_info, dict) else None
+            if isinstance(tts_ids, torch.Tensor):
+                contains_turn_eos = isinstance(turn_eos_id, int) and bool(
+                    torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
+                )
+            elif isinstance(tts_ids, (list, tuple)):
+                contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+            else:
+                contains_turn_eos = False
+            result["native_duplex"].append(torch.tensor(native, dtype=torch.bool))
+            result["duplex_epoch"].append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
+            result["duplex_turn_id"].append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+            result["llm_output_text_utf8"].append(
+                torch.tensor(
+                    list(segment_text.encode("utf-8")),
+                    dtype=torch.uint8,
+                )
+            )
+            result["turn_end"].append(torch.tensor(native and contains_turn_eos, dtype=torch.bool))
+        return result
 
     def make_omni_output(
         self,
@@ -961,11 +1705,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             raise RuntimeError("MiniCPM-o continuous Talker requires one request_token_span per request")
         emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
 
-        native_duplex_flags: list[torch.Tensor] = []
-        duplex_epochs: list[torch.Tensor] = []
-        duplex_turn_ids: list[torch.Tensor] = []
-        segment_texts_utf8: list[torch.Tensor] = []
-        turn_end_flags: list[torch.Tensor] = []
         empty_delta = torch.empty((0, 1), dtype=torch.long, device="cpu")
         codec_deltas = [empty_delta for _ in infos]
         terminal_flags = [torch.tensor(False, dtype=torch.bool) for _ in infos]
@@ -979,49 +1718,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         gpu_groups = []
         frame_valid = [torch.empty(0, dtype=torch.bool, device="cpu") for _ in infos]
         for index, info in enumerate(infos):
-            info_dict = info if isinstance(info, dict) else {}
-            native_duplex = info_dict.get("native_duplex") is True
-            if emit_duplex_metadata:
-                duplex_info = info_dict.get("duplex")
-                if not isinstance(duplex_info, dict):
-                    duplex_info = {}
-                epoch = duplex_info.get("epoch", -1)
-                turn_id = duplex_info.get("turn_id", -1)
-                if native_duplex and not all(
-                    isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
-                ):
-                    raise RuntimeError(
-                        "MiniCPM-o native duplex Talker requires non-negative integer "
-                        f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
-                    )
-                meta_info = info_dict.get("meta")
-                if not isinstance(meta_info, dict):
-                    meta_info = {}
-                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
-                if not isinstance(segment_text, str):
-                    segment_text = ""
-                turn_eos_id = meta_info.get("turn_eos_token_id")
-                ids_info = info_dict.get("ids")
-                tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
-                if isinstance(tts_ids, torch.Tensor):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
-                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
-                    )
-                elif isinstance(tts_ids, (list, tuple)):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
-                else:
-                    contains_turn_eos = False
-                native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
-                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
-                segment_texts_utf8.append(
-                    torch.tensor(
-                        list(segment_text.encode("utf-8")),
-                        dtype=torch.uint8,
-                    )
-                )
-                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
-
             if not isinstance(info, dict):
                 continue
             request_id = str(info.get("request_id", index))
@@ -1155,15 +1851,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if gpu_rows:
             meta_outputs["codec_frame_valid"] = frame_valid
         if emit_duplex_metadata:
-            meta_outputs.update(
-                {
-                    "native_duplex": native_duplex_flags,
-                    "duplex_epoch": duplex_epochs,
-                    "duplex_turn_id": duplex_turn_ids,
-                    "llm_output_text_utf8": segment_texts_utf8,
-                    "turn_end": turn_end_flags,
-                }
-            )
+            meta_outputs.update(self._duplex_output_metadata(infos))
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
@@ -1176,6 +1864,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
 
     def _flush_deferred_cleanup(self) -> None:
+        seeded_sampler = getattr(self, "_mrv2_seeded_codec_sampler", None)
+        if seeded_sampler is not None:
+            seeded_sampler.on_requests_finished(self._deferred_cleanup_ids)
         request_audio_states = getattr(self, "_request_audio_states", {})
         request_condition_states = getattr(self, "_request_condition_states", {})
         decode_codec_ids = getattr(self, "_decode_codec_ids", {})

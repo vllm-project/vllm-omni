@@ -15,9 +15,26 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.outputs.output_modality import (
+    TensorAccumulationStrategy,
+    register_key_accumulation_strategy,
+    register_row_ledger_keys,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
+
+# The Thinker publishes the duplex prompt as a whole snapshot once per append.
+# A resumable session's request state is never reset, so the default
+# CONCAT_DIM0 would join every snapshot of the session (llm2tts only reads the
+# snapshot's length-relative tail and last token).
+register_key_accumulation_strategy("duplex_prompt_token_ids", TensorAccumulationStrategy.REPLACE)
+# Stage 0 appends one hidden row per forwarded token, tagged by the row
+# ledger (``latent_input_ids`` / ``latent_positions``). A resumable session
+# keeps growing these rows; consolidate them in amortized O(new rows) per
+# step instead of re-concatenating the whole session (llm2tts receives the
+# same values: it matches the current unit by the ledger).
+register_row_ledger_keys("latent_input_ids", ("hidden", "latent", "latent_positions"))
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(
@@ -48,6 +65,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             engine_output_type="latent",
             supports_native_mrv2_data_plane=True,
+            supports_mrv2_duplex=True,
             sampling_constraints={
                 "detokenize": True,
                 # The llm2tts bridge discards this boundary and every row
@@ -66,9 +84,8 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.llm2tts",
             custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
-            # Takes effect only when the deploy selects model_runner v2 for
-            # this stage (turn sessions only; duplex stays on V1).
             supports_native_mrv2_data_plane=True,
+            supports_mrv2_duplex=True,
             sampling_constraints={
                 "detokenize": False,
                 # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.
@@ -86,6 +103,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="MiniCPMO45Code2Wav",
             supports_native_mrv2_data_plane=True,
+            supports_mrv2_duplex=True,
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
             # Sends the reference audio with the async-chunk placeholder so
             # Code2Wav can prepare it while it waits for chunk 0.

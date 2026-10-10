@@ -189,6 +189,8 @@ class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._validate_parallel_support()
+        # The scheduled step's inputs a decode burst replays (see decode_burst).
+        self._decode_burst_context: tuple[SchedulerOutput, Any] | None = None
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
             if uses_native_mrv2_data_plane(
@@ -509,6 +511,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.update_requests(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self.block_tables.apply_staged_writes()
+            reanchor = getattr(self.model, "apply_duplex_kv_reanchor", None)
+            if callable(reanchor):
+                reanchor(self, scheduler_output=scheduler_output)
             if self.aux_output_connector is not None:
                 self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -550,6 +555,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._merge_ec_connector_no_forward(scheduler_output, empty_output)
             )
 
+        self._decode_burst_context = None if dummy_run else (scheduler_output, batch_desc)
         if not dummy_run:
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
