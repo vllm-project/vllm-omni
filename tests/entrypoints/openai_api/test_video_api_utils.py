@@ -169,13 +169,14 @@ async def test_decode_input_reference_preserves_image_pixel_limit_error(monkeypa
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
-    def _fake_mux_video_audio_bytes(frames, audio, fps, audio_sample_rate, video_codec_options=None):
+    def _fake_mux_video_audio_bytes(frames, audio, fps, audio_sample_rate, video_codec=None, video_codec_options=None):
         mux_calls.append(
             {
                 "frames": frames,
                 "audio": audio,
                 "fps": fps,
                 "audio_sample_rate": audio_sample_rate,
+                "video_codec": video_codec,
                 "video_codec_options": video_codec_options,
             }
         )
@@ -202,6 +203,7 @@ def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
     assert mux_calls[0]["frames"].dtype == np.uint8
     assert mux_calls[0]["fps"] == 8.0
     assert mux_calls[0]["audio"] is None
+    assert mux_calls[0]["video_codec"] == "h264"
 
 
 def test_float_frames_are_converted_without_stacking_full_video(monkeypatch):
@@ -1093,3 +1095,45 @@ def test_frame_interpolator_uses_platform_device_when_tensor_is_cpu(monkeypatch)
     assert chosen_devices == [torch.device("cuda")]
     assert multiplier == 2
     assert output_video.shape == (1, 3, 3, 32, 32)
+
+
+class TestResolveVideoEncodingRequest:
+    """The request's encoder choice, resolved from ``extra_params``.
+
+    This helper was factored out of two identical inline copies; the pre-refactor
+    code stringified an explicit ``None`` into the codec name ``"None"``. That was a
+    bug rather than behaviour, so ``None`` is treated as absent and pins h264 here.
+    """
+
+    DEFAULTS = {"preset": "ultrafast", "threads": "0"}
+
+    @pytest.mark.parametrize("extra_params", [None, "not-a-dict", 17, [], {}])
+    def test_missing_or_non_dict_params_yield_the_h264_defaults(self, extra_params: Any) -> None:
+        assert video_api_utils.resolve_video_encoding_request(extra_params) == ("h264", self.DEFAULTS)
+
+    def test_an_explicit_none_codec_is_absent_not_the_name_none(self) -> None:
+        codec, options = video_api_utils.resolve_video_encoding_request({"video_codec": None})
+        assert codec == "h264"
+        assert codec != "None"
+        assert options == self.DEFAULTS
+
+    def test_a_named_codec_keeps_the_default_options(self) -> None:
+        assert video_api_utils.resolve_video_encoding_request({"video_codec": "h264_nvenc"}) == (
+            "h264_nvenc",
+            self.DEFAULTS,
+        )
+
+    def test_codec_and_options_are_both_taken_from_the_request(self) -> None:
+        assert video_api_utils.resolve_video_encoding_request(
+            {"video_codec": "av1_nvenc", "video_codec_options": {"preset": "p1", "cq": "30"}}
+        ) == ("av1_nvenc", {"preset": "p1", "cq": "30"})
+
+    def test_options_alone_keep_the_default_codec(self) -> None:
+        assert video_api_utils.resolve_video_encoding_request({"video_codec_options": {"tune": "ll"}}) == (
+            "h264",
+            {"tune": "ll"},
+        )
+
+    def test_an_empty_options_dict_is_honoured(self) -> None:
+        # An explicit empty mapping means "no options", not "use the defaults".
+        assert video_api_utils.resolve_video_encoding_request({"video_codec_options": {}}) == ("h264", {})

@@ -102,6 +102,10 @@ def parse_turbo_filename(name: str) -> TurboSpec | None:
 
 _LORA_A_SUFFIX = ".lora_A.default.weight"
 _LORA_B_SUFFIX = ".lora_B.default.weight"
+# Native diffusers PEFT adapters (e.g. the PDMD students) omit the ``.default.`` adapter name that
+# LightX2V/ComfyUI exports carry, and keep a leading ``transformer.`` component prefix.
+_LORA_A_SUFFIXES = (".lora_A.default.weight", ".lora_A.weight")
+_LORA_B_SUFFIXES = (".lora_B.default.weight", ".lora_B.weight")
 _TURBO_TARGETS = frozenset({"to_q", "to_k", "to_v", "out_proj", "fc1", "fc2"})
 _TURBO_RAW_TARGET_SUFFIXES = (
     "attn.to_q",
@@ -171,17 +175,22 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
     pairs: dict[str, set[str]] = {}
     raw_targets: set[str] = set()
     for name in checkpoint.keys():
-        if name.endswith(_LORA_A_SUFFIX):
-            raw_target = name[: -len(_LORA_A_SUFFIX)]
+        # Normalise both published spellings to the LightX2V layout the rest of this function and
+        # the vLLM mapper expect: drop a component prefix, accept with or without ``.default.``.
+        key = name[len("transformer.") :] if name.startswith("transformer.") else name
+        suffix_a = next((s for s in _LORA_A_SUFFIXES if key.endswith(s)), None)
+        suffix_b = next((s for s in _LORA_B_SUFFIXES if key.endswith(s)), None)
+        if suffix_a is not None:
+            raw_target = key[: -len(suffix_a)]
             side = "a"
-        elif name.endswith(_LORA_B_SUFFIX):
-            raw_target = name[: -len(_LORA_B_SUFFIX)]
+        elif suffix_b is not None:
+            raw_target = key[: -len(suffix_b)]
             side = "b"
         else:
             raise ValueError(f"Unconsumed MiniMax-H3 Turbo tensor: {name!r}")
         raw_targets.add(raw_target)
 
-        mapped_name = _TURBO_WEIGHTS_MAPPER.apply_list([name])[0]
+        mapped_name = _TURBO_WEIGHTS_MAPPER.apply_list([key])[0]
         mapped_target = mapped_name.rsplit(".lora_", 1)[0]
         if mapped_target.rsplit(".", 1)[-1] not in _TURBO_TARGETS:
             raise ValueError(f"Unsupported MiniMax-H3 Turbo target: {raw_target!r}")
@@ -203,10 +212,10 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
                 f"MiniMax-H3 Turbo tensor has invalid global shape: {name}={tuple(tensor.shape)}, "
                 f"expected={expected_shape}"
             )
-        if side == "b" and ".ff.net.0.proj." in name:
+        if side == "b" and ".ff.net.0.proj." in key:
             value, gate = tensor.chunk(2, dim=0)
             tensor = torch.cat((gate, value), dim=0).contiguous()
-        tensors[name] = tensor
+        tensors[key] = tensor
 
     incomplete = sorted(target for target, sides in pairs.items() if sides != {"a", "b"})
     if incomplete:
@@ -264,7 +273,9 @@ def load_minimax_h3_turbo_lora(
             raise ValueError(
                 f"{lora_file.name} declares key_format={declared_format!r}, expected 'minimax-h3-diffusers'"
             )
-        raw_alpha = metadata.get("alpha")
+        # ``alpha`` is the LightX2V/ComfyUI metadata key; native diffusers PEFT adapters (e.g. the
+        # PDMD students) publish ``lora_alpha`` instead. Both mean the same thing: scale = alpha/rank.
+        raw_alpha = metadata.get("alpha") or metadata.get("lora_alpha")
         if raw_alpha is None:
             logger.warning(
                 "MiniMax-H3 Turbo artifact %s declares no alpha; using the LightX2V reference "

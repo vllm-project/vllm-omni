@@ -69,10 +69,20 @@ def _ensure_built() -> None:
         nvidia_root = os.path.join(site_packages, "nvidia")
         include_paths = glob.glob(os.path.join(nvidia_root, "*", "include"))
         nccl_libs = glob.glob(os.path.join(nvidia_root, "nccl", "lib", "libnccl.so*"))
+        # The runtime ships its own NCCL instead of the PyPI nvidia-nccl-cu13:
+        # a bundled libnccl.so plus the nccl_device headers.
+        # Without this fallback the build aborts with "could not locate nvidia-nccl libnccl.so",
+        # which kills the whole lane at model init.
+        if not nccl_libs or not any(os.path.isfile(os.path.join(path, "nccl.h")) for path in include_paths):
+            for root in sorted(
+                glob.glob(os.path.join(site_packages, "*nccl*")) + glob.glob(os.path.join(site_packages, "nvidia", "*"))
+            ):
+                include_paths += glob.glob(os.path.join(root, "include"))
+                nccl_libs += glob.glob(os.path.join(root, "lib", "libnccl.so*"))
         if not nccl_libs:
-            raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
+            raise RuntimeError("a2a_permute: could not locate libnccl.so (checked the usual site-packages locations)")
         if not any(os.path.isfile(os.path.join(path, "nccl.h")) for path in include_paths):
-            raise RuntimeError("a2a_permute: could not locate nvidia-nccl nccl.h")
+            raise RuntimeError("a2a_permute: could not locate nccl.h")
         load(
             name="vllm_omni_a2a_permute",
             sources=[src],
@@ -97,6 +107,58 @@ def ensure_a2a_permute_available() -> None:
 
 def _required_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
     return math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+
+
+_SYMM_NAMES: dict[str, str] = {}
+
+
+def _symm_group_name(group_name: str) -> str:
+    """Return the name symmetric memory should use for this process group.
+
+    Use the process group's OWN name. An earlier revision renamed it ("a2a_symm_36") and
+    registered that with c10d, on the theory that the host-communicator registry is keyed by
+    registered name. The renaming is itself what breaks
+    it -- rendezvous(t, pg) and rendezvous(t, pg.group_name) both succeed, while the alias
+    fails with "NCCL host communicator for group a2a_symm_... not found".
+    """
+    cached = _SYMM_NAMES.get(group_name)
+    if cached is not None:
+        return cached
+    name = group_name
+    try:
+        symm_mem.enable_symm_mem_for_group(name)
+        logger.info(
+            "[a2a_permute] symm-mem group %r enabled=%s",
+            name,
+            symm_mem.is_symm_mem_enabled_for_group(name),
+        )
+    except Exception as exc:
+        logger.warning("[a2a_permute] enable_symm_mem_for_group(%r) failed: %s: %s", name, type(exc).__name__, exc)
+    _SYMM_NAMES[group_name] = name
+    return name
+
+
+_COMM_PTRS: dict[tuple[str, str], int] = {}
+
+
+def _comm_ptr_for(group_name: str, device: torch.device) -> int:
+    """Host ncclComm_t for this group/device as an int, for the CUDA op.
+
+    The op cannot consult NCCLDevCommManager (see the comment in csrc/a2a_permute.cu), so
+    the pointer is read from the process group's NCCL backend and handed down.
+    """
+    key = (str(device), str(group_name))
+    cached = _COMM_PTRS.get(key)
+    if cached:
+        return cached
+    pg = _resolve_process_group(group_name)
+    backend = pg._get_backend(torch.device(device))
+    ptr = int(backend._comm_ptr())
+    if ptr == 0:
+        raise RuntimeError(f"a2a_permute: no host NCCL comm for group {group_name!r} on {device}")
+    _COMM_PTRS[key] = ptr
+    logger.info("[a2a_permute] group %r host comm ptr=%d on %s", group_name, ptr, device)
+    return ptr
 
 
 def _get_symm_buffer(
@@ -125,6 +187,9 @@ def _get_symm_buffer(
                     "warm up the maximum request shape before capture"
                 )
             if workspace is None:
+                # Registered name (not the numeric pg id) -- see _symm_group_name.
+                symm_name = _symm_group_name(group_name)
+                pg = _resolve_process_group(symm_name)
                 # NCCL symmetric-memory rendezvous requires the communicator to
                 # exist before the first allocation.
                 pg = _resolve_process_group(group_name)
@@ -134,7 +199,7 @@ def _get_symm_buffer(
             # an earlier kernel is still consuming it.
             torch.accelerator.synchronize(device)
             allocation = symm_mem.empty(required_bytes, dtype=torch.uint8, device=device)
-            handle = symm_mem.rendezvous(allocation, group_name)
+            handle = symm_mem.rendezvous(allocation, symm_name)
             workspace = _SymmWorkspace(
                 allocation=allocation,
                 handle=handle,
@@ -176,7 +241,9 @@ def ulysses_qkv_fwd(x: torch.Tensor, group_name: str, world_size: int) -> torch.
     # the copy engine instead of materializing the view with TensorIterator.
     torch.ops.a2ap.copy_rows(x.view(rows, p, lc), symm_in)
     out = torch.empty(p, rows, lc, device=x.device, dtype=x.dtype)
-    torch.ops.a2ap.all_to_all_permute(symm_in, out, 1, 0, group_name)
+    torch.ops.a2ap.all_to_all_permute(
+        symm_in, out, 1, 0, _symm_group_name(group_name), _comm_ptr_for(group_name, x.device)
+    )
     # (p, rows, lc) -> (B, S_global, H_local, D), sequence ordered rank-major
     return out.reshape(p, B, s_local, Hl, D).permute(1, 0, 2, 3, 4).reshape(B, p * s_local, Hl, D).contiguous()
 
@@ -204,7 +271,9 @@ def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Te
     # (B, p*S_local, Hl, D) -> (p, B*S_local, cols): block r = sequence shard destined to rank r
     symm_in.copy_(y.reshape(B, p, s_local, Hl, D).permute(1, 0, 2, 3, 4).reshape(p, rows, cols))
     out = torch.empty(rows, p, cols, device=y.device, dtype=y.dtype)
-    torch.ops.a2ap.all_to_all_permute(symm_in, out, 0, 1, group_name)
+    torch.ops.a2ap.all_to_all_permute(
+        symm_in, out, 0, 1, _symm_group_name(group_name), _comm_ptr_for(group_name, y.device)
+    )
     # (rows, p, cols) -> (B, S_local, H, D), heads ordered rank-major
     return out.reshape(B, s_local, p, Hl, D).reshape(B, s_local, H, D).contiguous()
 

@@ -8,7 +8,9 @@ and route bodies that have not yet moved to endpoint-owned modules."""
 import asyncio
 import copy
 import dataclasses
+import inspect as _h3_inspect
 import json
+import logging as _h3_logging
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
@@ -18,6 +20,7 @@ import random
 import signal
 import socket
 import time
+import time as _h3_time
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -3092,3 +3095,73 @@ if __name__ == "__main__":
     if args.model_tag is not None:
         args.model = args.model_tag
     asyncio.run(omni_run_server(args))
+
+
+# --- h3 sleep/wake routes (added 2026-10-04, v2 fixed await) -----------------------------------
+# Park an idle lane in host RAM and wake it in seconds instead of relaunching it (~4 min).
+# Worker pair: vllm_omni/diffusion/worker/diffusion_worker.py:811 sleep(level=1), :870 wake_up(tags).
+# Trigger chain: AsyncOmni.collective_rpc (async, entrypoints/async_omni.py:528) ->
+# engine.collective_rpc_async -> executor collective_rpc -> worker.execute_method -> sleep/wake_up.
+# Requires the server started with --enable-sleep-mode.
+
+
+async def _h3_engine_client(request: Request):
+    eng = getattr(request.app.state, "engine_client", None)
+    if eng is None:
+        raise HTTPException(status_code=503, detail="engine client not ready")
+    return eng
+
+
+async def _h3_rpc(eng, method: str, args: tuple):
+    """Invoke `method` on the workers, awaiting whatever shape the client hands back.
+
+    v1 called an async method without awaiting it and returned the coroutine, so sleep silently
+    never happened -- the lesson is to never trust a return value you have not awaited.
+    """
+    for target in (eng, getattr(eng, "engine_client", None), getattr(eng, "engine", None)):
+        if target is None:
+            continue
+        fn = getattr(target, "collective_rpc_async", None) or getattr(target, "collective_rpc", None)
+        if fn is None:
+            continue
+        for call in (lambda: fn(method, args=args), lambda: fn(method=method, args=args)):
+            try:
+                res = call()
+            except TypeError:
+                continue
+            if _h3_inspect.isawaitable(res):
+                res = await res
+            return res
+    raise HTTPException(status_code=501, detail="engine client exposes no collective_rpc")
+
+
+@router.post("/h3/sleep")
+async def h3_sleep(request: Request, level: int = 1):
+    """Offload the lane's weights to host RAM (level 1) so the VRAM can be reused."""
+    eng = await _h3_engine_client(request)
+    t0 = _h3_time.monotonic()
+    try:
+        res = await _h3_rpc(eng, "sleep", (level,))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"sleep failed: {exc!r}") from exc
+    dt = _h3_time.monotonic() - t0
+    _h3_logging.getLogger("vllm_omni.sleep").info("h3/sleep level=%s took %.2fs result=%s", level, dt, res)
+    return {"ok": True, "level": level, "seconds": round(dt, 2), "result": str(res)[:1200]}
+
+
+@router.post("/h3/wake")
+async def h3_wake(request: Request):
+    """Restore the lane from host RAM."""
+    eng = await _h3_engine_client(request)
+    t0 = _h3_time.monotonic()
+    try:
+        res = await _h3_rpc(eng, "wake_up", (None,))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"wake failed: {exc!r}") from exc
+    dt = _h3_time.monotonic() - t0
+    _h3_logging.getLogger("vllm_omni.sleep").info("h3/wake took %.2fs result=%s", dt, res)
+    return {"ok": True, "seconds": round(dt, 2), "result": str(res)[:1200]}

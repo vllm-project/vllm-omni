@@ -23,7 +23,6 @@ from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
@@ -31,7 +30,7 @@ from vllm_omni.diffusion.cache.cachedit import (
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
@@ -179,6 +178,85 @@ if TYPE_CHECKING:
     from vllm.lora.peft_helper import PEFTHelper
 
     from vllm_omni.lora.request import LoRARequest
+
+
+def _h3_step_profiler_factory():
+    """Env-gated per-step torch profiler.
+
+    H3_STEP_PROFILE=1 profiles one denoise step and logs CUDA-time attribution;
+    H3_STEP_PROFILE_STEP selects the step (default 1, avoiding first-call warmup).
+    """
+    if os.environ.get("H3_STEP_PROFILE", "").lower() not in ("1", "true", "yes"):
+        return None
+    target = int(os.environ.get("H3_STEP_PROFILE_STEP", "1"))
+
+    @contextmanager
+    def _prof(step: int):
+        if step != target:
+            yield
+            return
+        _stack = os.environ.get("H3_STEP_PROFILE_STACK", "0") == "1"
+        _shapes = os.environ.get("H3_STEP_PROFILE_SHAPES", "0") == "1"
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_modules=True,
+            with_stack=_stack,
+            record_shapes=_shapes,
+        ) as prof:
+            yield
+        if os.environ.get("H3_STEP_PROFILE_TRACE"):
+            logger.info(
+                "H3_STEP_PROFILE step=%d stack=%s shapes=%s (table skipped: trace export)",
+                step,
+                _stack,
+                _shapes,
+            )
+        else:
+            logger.info(
+                "H3_STEP_PROFILE step=%d stack=%s shapes=%s\n%s",
+                step,
+                _stack,
+                _shapes,
+                prof.key_averages().table(sort_by="cuda_time_total", row_limit=200 if _stack or _shapes else 30),
+            )
+        _trace = os.environ.get("H3_STEP_PROFILE_TRACE")
+        if _trace:
+            try:
+                _path = _trace.replace("%d", str(os.getpid())) if "%d" in _trace else f"{_trace}.{os.getpid()}"
+                _dir = os.path.dirname(_path)
+                if _dir:
+                    os.makedirs(_dir, exist_ok=True)
+                prof.export_chrome_trace(_path)
+                logger.info("H3_STEP_PROFILE trace -> %s", _path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("H3_STEP_PROFILE trace export failed: %s", exc)
+        # with_modules=True in the profile above is what answers
+        # "which module owns this kernel" -- key_averages() then carries nn.Module entries, at a
+        # tiny fraction of with_stack=True's cost (that one unwound Python stacks per op).
+
+    return _prof
+
+
+# Log-only per-stage timing. The denoise loop is already visible in
+# tqdm, but the non-denoise part of a request (text/vision encode, VAE decode, mp4 mux) was one
+# opaque 4.5 s block. H3_STAGE_TIMING=1 wraps the pipeline's stage methods so each reports itself.
+def _h3_stage_timed(fn):
+    import functools
+    import time
+
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            logger.info("H3_STAGE %s %.3fs", fn.__name__, time.perf_counter() - t0)
+
+    return _wrapper
+
 
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -997,6 +1075,7 @@ class MiniMaxH3Pipeline(
             od_config,
             quant_config=transformer_quant_config,
             diffusers_weights=modular,
+            partition=self.partition,
         )
         if self._fasth3_checkpoint is not None:
             self.transformer.enable_vsa_gates(sparsity=self._fasth3_checkpoint.vsa_sparsity)
@@ -1008,6 +1087,7 @@ class MiniMaxH3Pipeline(
                 od_config,
                 quant_config=transformer_quant_config,
                 diffusers_weights=modular,
+                partition="ref2va",
             )
 
         self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
@@ -1084,11 +1164,11 @@ class MiniMaxH3Pipeline(
             self.text_encoder = MiniMaxH3Qwen3VLEncoder(
                 os.path.join(model_path, "text_encoder"),
                 device=self.device,
-                load_model=rank < text_encoder_tp_size,
+                load_model=(self.text_encoder_group.world_size > 1 or rank == 0),
                 encoder_group=self.text_encoder_group,
                 quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
             )
-            if rank < text_encoder_tp_size:
+            if self.text_encoder_group.world_size > 1 or rank == 0:
                 self.weights_sources.append(
                     DiffusersPipelineLoader.ComponentSource(
                         model_or_path=str(model_path),
@@ -1400,11 +1480,44 @@ class MiniMaxH3Pipeline(
         """
         if text_encoder_tp_size == 1:
             return _SingleRankEncoderGroup(rank=self._dit_rank)
-        ranks = list(range(text_encoder_tp_size))
-        return init_world_group(
-            ranks=ranks,
-            local_rank=envs.LOCAL_RANK,
-            backend=current_omni_platform.dist_backend,
+        # Sharded encoder: return the TP group that the diffusion parallel state
+        # already created for this rank's SP slice.  It is a full GroupCoordinator
+        # (all_reduce/all_gather/broadcast, device_group, ranks, world_size), and
+        # every member of the group holds its own encoder shard, so the caller
+        # loads on all members (see the load_model/source gates below).
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        if group.world_size == text_encoder_tp_size:
+            return group
+        # With tensor_parallel_size == 1 the TP group is a single
+        # rank, so asking for a wider encoder silently collapsed to one rank and put the whole
+        # 63 GB Qwen3-VL encoder on rank 0 -- that is the TP1 x USP4 OOM. The encoder shards
+        # over the first ``text_encoder_tp_size`` DiT ranks (see DiffusionParallelConfig), and
+        # the diffusion world group is exactly that set. It has to be the *diffusion*
+        # coordinator: its collectives run on ``device_group`` directly, whereas vLLM's world
+        # group has no device communicator in these workers and raises
+        # "No device communicator found" at the first encoder all_reduce.
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sp_group,
+        )
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_world_group as get_dit_world_group,
+        )
+
+        world = get_dit_world_group()
+        if world.world_size == text_encoder_tp_size:
+            return world
+        try:
+            sp = get_sp_group()
+        except Exception:
+            sp = None
+        if sp is not None and sp.world_size == text_encoder_tp_size:
+            return sp
+        raise ValueError(
+            f"cannot shard the text encoder {text_encoder_tp_size}-way: the DiT TP group has "
+            f"{group.world_size} rank(s), the DiT world group {world.world_size}, and the "
+            f"sequence-parallel group {getattr(sp, 'world_size', None)}"
         )
 
     def _encoder_group_broadcast_tensor(
@@ -2137,6 +2250,7 @@ class MiniMaxH3Pipeline(
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     sampler=inputs["sampler"],
+                    step_profiler=_h3_step_profiler_factory(),
                     model=transformer,
                     positive=branch,
                     initial_video_rows=inputs["video_rows"],
@@ -3511,3 +3625,26 @@ __all__ = [
     "MiniMaxH3Pipeline",
     "get_minimax_h3_post_process_func",
 ]
+
+
+if os.environ.get("H3_STAGE_TIMING", "").lower() in ("1", "true", "yes"):
+    for _stage_name in ("prepare_encode", "encode_prompt", "denoise_step", "decode", "decode_to_mp4", "post_decode"):
+        _stage_fn = getattr(MiniMaxH3Pipeline, _stage_name, None)
+        if callable(_stage_fn):
+            setattr(MiniMaxH3Pipeline, _stage_name, _h3_stage_timed(_stage_fn))
+    # The worker's decode path does not route through MiniMaxH3Pipeline.decode on every shape, so
+    # time the VAEs themselves: video VAE, audio VAE, and the mp4 mux are the whole non-denoise
+    # budget once the encoder is measured separately.
+    try:
+        from vllm_omni.diffusion.models.minimax_h3.vae import (
+            MiniMaxH3AudioVAE,
+            MiniMaxH3VideoVAE,
+        )
+
+        for _cls in (MiniMaxH3VideoVAE, MiniMaxH3AudioVAE):
+            for _m in ("decode_latent", "encode_video", "encode_image", "encode_waveform"):
+                _fn = getattr(_cls, _m, None)
+                if callable(_fn):
+                    setattr(_cls, _m, _h3_stage_timed(_fn))
+    except Exception as _exc:  # never let instrumentation break a serve
+        logger.warning("H3_STAGE_TIMING: VAE timing not installed: %s", _exc)

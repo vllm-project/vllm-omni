@@ -364,6 +364,15 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             )
         install_temporal_stream_patches(self.remote.model)
         self.model = self.remote.model
+        # sm12x fast path ported from SGLang (unfused w2 bias); inert unless the H3_VAE_SM120
+        # control file selects a mode. The installer reports what it applied, so a silent no-op
+        # cannot hide behind a logging level.
+        try:
+            from .vae_sm120 import install_vae_sm120_fixes
+
+            install_vae_sm120_fixes(self, device=device)
+        except Exception as _h3vae_exc:  # optional path: never fail model load
+            logger.warning("h3_vae_sm120 not installed: %s", _h3vae_exc)
         self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None

@@ -40,6 +40,8 @@ def build_parallel_attention_strategy(
     if not is_forward_context_available():
         return NoParallelAttention()
     cfg = get_forward_context().omni_diffusion_config
+    if cfg is None:
+        return NoParallelAttention()
     p = cfg.parallel_config
 
     ulysses_degree = getattr(p, "ulysses_degree", 1)

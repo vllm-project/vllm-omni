@@ -35,6 +35,19 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_block_sparse_attn_bshd"):
         k = key.transpose(1, 2).contiguous()
         v = value.transpose(1, 2).contiguous()
 
+        # b12x block-list provider (SM120/SM121). Opt-in so the FastVideo provider stays
+        # the default and the two can be A/B'd on the same request.
+        if os.environ.get("VLLM_OMNI_BLOCK_SPARSE_B12X", "0") == "1":
+            from vllm_omni.diffusion.attention.ops.b12x_block_sparse import (
+                b12x_block_sparse_attn_bshd,
+            )
+
+            return (
+                b12x_block_sparse_attn_bshd(q, k, v, block_map, variable_block_sizes, logical_blocks)
+                .transpose(1, 2)
+                .contiguous()
+            )
+
         # Prefer the explicitly selected native provider when it supports
         # these tensors; retain the existing Triton provider otherwise.
         if os.environ.get("FASTVIDEO_VSA_SM100A", "0") == "1":

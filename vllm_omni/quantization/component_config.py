@@ -6,10 +6,33 @@ Routes get_quant_method() to different configs based on longest-prefix match:
     {"transformer": fp8_config, "vae": None}
     "transformer.blocks.0.attn.to_q" -> fp8_config
     "vae.encoder.conv_in"            -> None
+
+A key may also be a shell-style pattern, which expresses precision per layer role
+rather than per component::
+
+    {"transformer": mxfp8_config,
+     "transformer.*.mlp": nvfp4_config,     # every MLP in the stack
+     "transformer.*.attn": mxfp8_config,
+     "refiner": None}
+
+A pattern is matched against the layer prefix and each of its dotted ancestors
+(``transformer.blocks.0.mlp.fc1`` is tried as itself, then ``...mlp``, then
+``...blocks.0``, and so on), so ``transformer.*.mlp`` covers every layer under an
+MLP. Patterns are checked before plain prefixes because a pattern refines a
+component: if any pattern matches, the deepest matching pattern wins (patterns are one
+set, so a plain key never out-ranks a matching role pattern — otherwise a broad
+``transformer`` key, which covers every path below it, would make per-role keys
+unreachable); plain prefixes are consulted only when no pattern matches, longest first.
+
+``*`` follows fnmatch and therefore spans ``.``: ``*.mlp`` matches the ancestor
+``transformer.blocks.0.mlp``, and ``transformer.*`` matches every path below
+``transformer``. Write the trailing segment you mean (``*.mlp``, ``*.attn``) rather
+than relying on ``*`` stopping at a dot.
 """
 
 from __future__ import annotations
 
+import fnmatch
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -102,19 +125,54 @@ class ComponentQuantizationConfig(QuantizationConfig):
         super().__init__()
         self._components = component_configs
         self._default = default_config
-        self._sorted_prefixes = sorted(self._components.keys(), key=len, reverse=True)
+        # A key with a wildcard is a layer-role pattern and refines a plain component
+        # prefix, so patterns are consulted first. Longest pattern wins so a narrower
+        # role beats a broader one, and the order is deterministic for equal lengths.
+        self._patterns = {k: v for k, v in component_configs.items() if any(c in k for c in "*?[")}
+        self._sorted_patterns = sorted(self._patterns.keys(), key=len, reverse=True)
+        self._sorted_prefixes = sorted((k for k in self._components if k not in self._patterns), key=len, reverse=True)
+
+    def matches(self, prefix: str) -> bool:
+        """Whether *prefix* is explicitly covered by a key (not by the default).
+
+        Lets a caller distinguish "this layer role was named in the config" from
+        "this layer merely fell through to the default", which matters when the
+        default must not silently override a model's own default arm.
+        """
+        return self._match(prefix) is not None
+
+    def _match(self, prefix: str) -> tuple[str, QuantizationConfig | None] | None:
+        """Return the (key, config) that explicitly covers *prefix*, else None."""
+        # Deepest ancestor first (segs[0] is the prefix itself), then longest pattern.
+        ancestors = [".".join(prefix.split(".")[:i]) for i in range(len(prefix.split(".")), 0, -1)]
+        best: tuple[tuple[int, int], str, QuantizationConfig | None] | None = None
+        for depth, ancestor in enumerate(ancestors):
+            for pattern in self._sorted_patterns:
+                if fnmatch.fnmatchcase(ancestor, pattern):
+                    key = (len(ancestors) - depth, len(pattern))
+                    if best is None or key > best[0]:
+                        best = (key, pattern, self._patterns[pattern])
+            if best is not None and best[0][0] == len(ancestors) - depth:
+                break  # no shallower ancestor can beat a deeper match
+        if best is not None:
+            return (best[1], best[2])
+        for comp_prefix in self._sorted_prefixes:
+            if prefix.startswith(comp_prefix):
+                return (comp_prefix, self._components[comp_prefix])
+        return None
 
     def resolve(self, prefix: str) -> QuantizationConfig | None:
-        """Find the config for a given layer prefix (longest-prefix match).
+        """Find the config for a given layer prefix.
+
+        Layer-role patterns are tried first (longest pattern wins), then plain
+        component prefixes (longest prefix wins), then the default.
 
         Note: vLLM may remap quantization prefixes vs model definition
         prefixes (e.g. via WeightsMapper). If prefixes don't match after
         remapping, layers may fall through to the default config.
         """
-        for comp_prefix in self._sorted_prefixes:
-            if prefix.startswith(comp_prefix):
-                return self._components[comp_prefix]
-        return self._default
+        matched = self._match(prefix)
+        return matched[1] if matched is not None else self._default
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         """Apply a weight mapper to every routed quantization config."""

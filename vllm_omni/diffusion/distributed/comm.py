@@ -1,7 +1,9 @@
 # Copyright (c) Microsoft Corporation and Jiarui Fang
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # DeepSpeed Team & Jiarui Fang
 #  from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/comm/all_to_all.py
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -10,7 +12,53 @@ from torch import Tensor
 
 from vllm_omni.platforms import current_omni_platform
 
-__all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "RingComm"]
+__all__ = [
+    "all_to_all_4D",
+    "all_to_all_5D",
+    "SeqAllToAll4D",
+    "SeqAllToAll5D",
+    "RingComm",
+    "register_seq_all_to_all_backend",
+]
+
+
+# This module ships only the stock torch.distributed exchange. A model that needs a
+# different transport registers one here from its own package during setup, so the
+# generic distributed layer never imports a model.
+_SeqAllToAllExchange = Callable[[Tensor, "dist.ProcessGroup"], Tensor]
+_SeqAllToAll4DFused = Callable[[Tensor, "dist.ProcessGroup", int, bool], "Tensor | None"]
+
+_seq_all_to_all_exchange: Any = None
+_seq_all_to_all_4d_fused: Any = None
+
+
+def register_seq_all_to_all_backend(
+    exchange: _SeqAllToAllExchange | None = None,
+    fused_4d: _SeqAllToAll4DFused | None = None,
+) -> None:
+    """Install a model-provided all-to-all transport; ``None`` restores the stock path.
+
+    Args:
+        exchange: ``fn(input_t, group) -> Tensor`` replaces the equal-split
+            ``dist.all_to_all_single`` used by :func:`all_to_all_4D` and
+            :func:`all_to_all_5D`. It must return the shape and dtype it was given.
+        fused_4d: ``fn(input, group, seq_world_size, use_sync) -> Tensor | None`` may
+            handle a whole ``all_to_all_4D(scatter_idx=2, gather_idx=1)`` call,
+            including its layout transforms. Returning ``None`` falls through to the
+            implementation below.
+    """
+    global _seq_all_to_all_exchange, _seq_all_to_all_4d_fused
+    _seq_all_to_all_exchange = exchange
+    _seq_all_to_all_4d_fused = fused_4d
+
+
+def _exchange(input_t: Tensor, group, seq_world_size: int) -> Tensor:
+    """The one exchange a registered backend replaces; stock ``all_to_all_single`` otherwise."""
+    if _seq_all_to_all_exchange is not None:
+        return _seq_all_to_all_exchange(input_t, group)
+    out = torch.empty_like(input_t)
+    dist.all_to_all_single(out, input_t, group=group)
+    return out
 
 
 def all_to_all_4D(
@@ -39,6 +87,13 @@ def all_to_all_4D(
         seqlen = shard_seqlen * seq_world_size
         shard_hc = hc // seq_world_size
 
+        # A registered backend may handle this whole directional exchange, including the
+        # layout transforms below (that is what makes a fused wire possible). None -> stock.
+        if _seq_all_to_all_4d_fused is not None:
+            _fused = _seq_all_to_all_4d_fused(input, group, seq_world_size, use_sync)
+            if _fused is not None:
+                return _fused
+
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen/P, hc, hs) -reshape-> (bs, seq_len/P, P, hc/P, hs) -transpose(0,2)-> (P, seq_len/P, bs, hc/P, hs)
         input_t = input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs).transpose(0, 2).contiguous()
@@ -48,7 +103,7 @@ def all_to_all_4D(
         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
 
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            output = _exchange(input_t, group, seq_world_size)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -83,7 +138,7 @@ def all_to_all_4D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            output = _exchange(input_t, group, seq_world_size)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -155,7 +210,7 @@ def all_to_all_5D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, seq_len/P, 3, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, 3, bs, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            output = _exchange(input_t, group, seq_world_size)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -190,7 +245,7 @@ def all_to_all_5D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            output = _exchange(input_t, group, seq_world_size)
             if use_sync:
                 current_omni_platform.synchronize()
         else:

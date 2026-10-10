@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from collections.abc import Callable
@@ -55,6 +55,7 @@ if current_omni_platform.is_xpu():
 else:
     try:
         from sageattention import sageattn as _sageattn
+        from sageattention import sageattn_varlen
 
         sageattn = _sageattn
     except ImportError:
@@ -63,6 +64,7 @@ else:
             " by pip install git+https://github.com/thu-ml/SageAttention.git"
         )
         sageattn = None
+        sageattn_varlen = None
 
 if not hasattr(torch.ops.vllm_omni, "sage_attention"):
 
@@ -119,6 +121,13 @@ class SageAttentionBackend(AttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
+
+    @classmethod
+    def supports_packed_mask_free(cls) -> bool:
+        # forward_cuda dispatches sageattn_varlen
+        # over the caller's packed cu_seqlens, so a packed sequence with padding
+        # does not need a boolean attn_mask (the mask is what SAGE cannot take).
+        return True
 
     @staticmethod
     def get_name() -> str:
@@ -254,6 +263,38 @@ class SageAttentionImpl(AttentionImpl):
         _validate_sage_metadata(attn_metadata)
         if self.dropout != 0.0:
             raise ValueError(f"SAGE_ATTN: does not support dropout (dropout_p={self.dropout}).")
+        packed = getattr(attn_metadata, "packed_padding", None) if attn_metadata is not None else None
+        if packed is not None:
+            if sageattn_varlen is None:
+                raise ImportError(
+                    "SAGE_ATTN requires sageattention. Install with: "
+                    "pip install git+https://github.com/thu-ml/SageAttention.git"
+                )
+            # The packed buffer carries uninitialised padding beyond q_length
+            # (the cuDNN path slices K/V itself; flash only reads the declared
+            # ranges). Sage's Triton kernel validates the whole tensor, so slice
+            # to the declared lengths, run, then scatter back into a zero-filled
+            # buffer of the original shape.
+            q3 = query.flatten(0, 1)
+            k3 = key.flatten(0, 1)
+            v3 = value.flatten(0, 1)
+            n = int(packed.q_length)
+            out = sageattn_varlen(
+                q3[:n],
+                k3[:n],
+                v3[:n],
+                packed.cu_seqlens_q,
+                packed.cu_seqlens_k,
+                n,
+                int(packed.kv_length),
+                is_causal=self.causal,
+                sm_scale=self.softmax_scale,
+            )
+            if out.shape[0] == q3.shape[0]:
+                return out.reshape_as(query)
+            full = q3.new_zeros((q3.shape[0],) + tuple(out.shape[1:]))
+            full[: out.shape[0]] = out
+            return full.reshape_as(query)
         if sageattn is None:
             raise ImportError(
                 "SAGE_ATTN requires sageattention. Install with: "

@@ -157,7 +157,8 @@ void all_to_all_permute(
     at::Tensor& out,
     int64_t scatter_dim,
     int64_t gather_dim,
-    std::string group_name) {
+    std::string group_name,
+    int64_t comm_ptr) {
   TORCH_CHECK(input.stride(-1) == 1, "a2a_permute: innermost dim must be contiguous");
   const bool col_scatter = (scatter_dim == 1 && gather_dim == 0);
   const bool row_scatter = (scatter_dim == 0 && gather_dim == 1);
@@ -173,9 +174,14 @@ void all_to_all_permute(
   auto stream = at::cuda::getCurrentCUDAStream();
   auto device = input.device();
 
-  auto& manager = NCCLDevCommManager::get(device);
-  ncclComm_t comm = manager.get_comm(group_name);
-  ncclDevComm devcomm = get_or_create_devcomm(comm, group_name);
+  // This extension must NOT read NCCLDevCommManager. Its get() is an inline header
+  // function, so this .so links its own copy of the function-local singleton and owns a
+  // separate manager instance from the one libtorch registers into -- probing it from here
+  // reports every key as missing even right after torch registers the comm. The caller
+  // therefore supplies the host comm: Python reads ProcessGroupNCCL._comm_ptr().
+  TORCH_CHECK(comm_ptr != 0, "a2a_permute: comm_ptr must be a non-zero host ncclComm_t");
+  ncclComm_t comm = reinterpret_cast<ncclComm_t>(static_cast<intptr_t>(comm_ptr));
+  ncclDevComm devcomm = get_or_create_devcomm(comm, std::to_string(comm_ptr));
 
   const int my_rank = nccl_hdl->get_rank();
   const int p = nccl_hdl->get_world_size();
@@ -260,7 +266,7 @@ void all_to_all_permute(
 
 TORCH_LIBRARY_FRAGMENT(a2ap, m) {
   m.def("copy_rows(Tensor input, Tensor(a!) out) -> ()");
-  m.def("all_to_all_permute(Tensor input, Tensor(a!) out, int scatter_dim, int gather_dim, str group_name) -> ()");
+  m.def("all_to_all_permute(Tensor input, Tensor(a!) out, int scatter_dim, int gather_dim, str group_name, int comm_ptr) -> ()");
 }
 TORCH_LIBRARY_IMPL(a2ap, CUDA, m) {
   m.impl("copy_rows", TORCH_FN(copy_rows));

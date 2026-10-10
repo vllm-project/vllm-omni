@@ -219,6 +219,15 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# MiniMax-H3 lane extensions, now under the MiniMax-H3 model package. The wire and quantisation
+# codecs pass Triton constexpr parameters in upper case (N803) and import kernel
+# symbols as constants (N814) so the Python mirrors the kernel source it launches;
+# renaming would obscure that correspondence. TID251 and the F-correctness rules
+# still apply to these files.
+"vllm_omni/diffusion/models/minimax_h3/a2a_wire.py" = ["N803", "N814"]
+"vllm_omni/diffusion/models/minimax_h3/a2a_qkv_batch.py" = ["N803", "N814"]
+"vllm_omni/diffusion/models/minimax_h3/ar_wire.py" = ["N803", "N814"]
+"vllm_omni/diffusion/models/minimax_h3/comm/*.py" = ["N803", "N814"]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
 # MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.

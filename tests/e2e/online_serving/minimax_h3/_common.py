@@ -211,6 +211,139 @@ def run_dlo_wave(
         return list(executor.map(request_fn, (client, client), (2101, 2102)))
 
 
+CONCURRENCY_SEED = 1000
+CONCURRENCY_CARDS = 4
+
+
+# The H3 releases are split into two partitions: Ref2VA serves only ``ref2va``,
+# FL2VA serves ``t2va`` and ``fl2va``. A partition is served through a thin wrapper
+# root that carries a classic model_index.json beside the partition directory, so
+# each one needs its own path rather than one shared model.
+PARTITION_MODEL_ENV = {
+    "ref2va": "VLLM_TEST_MINIMAX_H3_REF2VA_MODEL",
+    "fl2va": "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL",
+    "t2va": "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL",
+}
+# Which partition a task type is served by.
+PARTITION_FOR_TASK = {"ref2va": "ref2va", "fl2va": "fl2va", "t2va": "fl2va"}
+
+
+def partition_model(task: str) -> str:
+    """Resolve the model root that serves *task*.
+
+    ``VLLM_TEST_MINIMAX_H3_<PARTITION>_MODEL`` wins; otherwise fall back to the
+    generic ``VLLM_TEST_MINIMAX_H3_MODEL`` so a single-partition run still works.
+    """
+    partition = PARTITION_FOR_TASK[task]
+    return os.environ.get(PARTITION_MODEL_ENV[partition]) or MODEL
+
+
+def concurrency_request(task: str, seed: int, *, model: str) -> tuple[dict[str, str], Any]:
+    """Build one request for *task*: the form plus its multipart files.
+
+    ``ref2va`` takes reference images, ``fl2va`` takes keyframes as input
+    references, and ``t2va`` takes no media at all.
+
+    ``model`` must be the model the server was actually started with: the request
+    names it, and a mismatch is a 400 (``... but server is running ...``). Taking
+    it from the server rather than from the module default is what lets one test
+    file cover both partitions.
+    """
+    if task == "ref2va":
+        form, files = _h3_form("ref2va", seed), ref2va_files()
+    elif task == "fl2va":
+        form, files = _h3_form("fl2va", seed), keyframe_files()
+    elif task == "t2va":
+        form, files = _h3_form("t2va", seed), None
+    else:
+        raise ValueError(f"unknown MiniMax-H3 task type: {task!r}")
+    form["model"] = model
+    return form, files
+
+
+def concurrency_params(*, wire: str, qkv_batch: bool = False, task: str = "ref2va") -> OmniServerParams:
+    """Build the four-card TP2 x USP2 layout the serving sweep uses.
+
+    ``wire`` selects the all-to-all and all-reduce transport (``bf16`` is the
+    stock path, ``int8`` the quantised one); ``qkv_batch`` additionally enables
+    the fused QKV exchange. The quantised linears are on in both arms so the
+    comparison isolates the transport. ``task`` selects the served partition and
+    therefore the model root; ref2va/fl2va/t2va are all served by this test file.
+    """
+    env = {
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        # CUDA and nvidia-smi must agree on device indices. With the default
+        # FASTEST_FIRST order the caller's CUDA_VISIBLE_DEVICES selects different
+        # cards on a mixed host (two RTX 5090 + four RTX PRO 6000 here), which OOMs
+        # on a 32 GiB card instead of using the four 96 GiB ones.
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "VLLM_OMNI_DIT_MXFP8": "1",
+        "VLLM_OMNI_DIT_NVFP4": "0",
+        "H3_A2A_WIRE": wire,
+        "H3_AR_WIRE": wire,
+    }
+    if qkv_batch:
+        env["H3_A2A_QKV_BATCH"] = "1"
+    return OmniServerParams(
+        model=partition_model(task),
+        server_args=[
+            "--trust-remote-code",
+            "--task-type",
+            task,
+            "--num-gpus",
+            str(CONCURRENCY_CARDS),
+            "--tensor-parallel-size",
+            "2",
+            "--usp",
+            "2",
+            "--ring",
+            "1",
+            "--text-encoder-tp-size",
+            "2",
+            "--vae-patch-parallel-size",
+            "4",
+            "--vae-parallel-mode",
+            "tile",
+            "--vae-use-tiling",
+        ],
+        env_dict=env,
+        stage_init_timeout=1800,
+        init_timeout=1800,
+        # The transport modules log the mode they engaged; the test reads it back to
+        # prove the accelerated path ran instead of silently falling back.
+        log_capture=True,
+    )
+
+
+def concurrency_form(seed: int) -> dict[str, str]:
+    """Build one Ref2VA request for the concurrency sweep."""
+    return _h3_form("ref2va", seed)
+
+
+def concurrency_task(server: object) -> str:
+    """Return the task type a launched server was started with."""
+    args = list(getattr(server, "serve_args", []) or [])
+    assert "--task-type" in args, "the concurrency server must pin --task-type"
+    return args[args.index("--task-type") + 1]
+
+
+def ref2va_files() -> list[tuple[str, tuple[str, io.BytesIO, str]]]:
+    """Return a fresh multipart reference-image payload for one request."""
+    return [("input_references", ("reference.jpg", io.BytesIO(_REF2VA_IMAGE), "image/jpeg"))]
+
+
+def keyframe_files() -> list[tuple[str, tuple[str, io.BytesIO, str]]]:
+    """Return a fresh FL2VA keyframe payload for one request.
+
+    Keyframes are image conditions on ``input_references``, the same part name the
+    reference images use. (``_common.fl2va_files`` spells the part in the singular,
+    which the API does not treat as an image condition, so an FL2VA request built
+    with it is rejected for having no image to resolve its aspect ratio.) At most
+    the first and last frames are accepted, so this sends one.
+    """
+    return [("input_references", ("first_frame.jpg", io.BytesIO(_FL2VA_IMAGE), "image/jpeg"))]
+
+
 def dlo_params(task_type: str) -> OmniServerParams:
     return OmniServerParams(
         model=MODEL,
@@ -346,6 +479,8 @@ def fasth3_form(seed: int) -> dict[str, str]:
 
 
 __all__ = [
+    "CONCURRENCY_CARDS",
+    "CONCURRENCY_SEED",
     "FASTH3_LORA",
     "FASTH3_SUPPORTED",
     "FASTH3_DURATION",
@@ -354,11 +489,18 @@ __all__ = [
     "FPS",
     "MODEL",
     "assert_h3_video",
+    "concurrency_form",
+    "concurrency_params",
+    "concurrency_request",
+    "concurrency_task",
+    "partition_model",
     "dlo_params",
     "fasth3_form",
     "fasth3_params",
     "fl2va_files",
+    "keyframe_files",
     "post_sync",
+    "ref2va_files",
     "run_dlo_wave",
     "run_fl2va",
     "run_ref2va",

@@ -613,6 +613,25 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             return all(bool(item) for item in result)
         return bool(result)
 
+    async def get_prefill_fairness(self) -> dict[str, Any]:
+        """Decode/prefill fairness query from the LIL vLLM fork's engine interface.
+
+        Diffusion pipelines have no prefill/decode scheduler, so there is nothing to
+        report; an autoregressive stage delegates to its engine when it implements it.
+        """
+        if hasattr(self.engine, "get_prefill_fairness"):
+            return await self.engine.get_prefill_fairness()
+        return {"enabled": False, "reason": "no prefill/decode scheduler on this pipeline"}
+
+    async def set_prefill_fairness(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Fairness configuration setter required by the LIL fork's engine interface.
+
+        See get_prefill_fairness: diffusion-only pipelines accept and ignore this.
+        """
+        if hasattr(self.engine, "set_prefill_fairness"):
+            return await self.engine.set_prefill_fairness(config)
+        return {"enabled": False, "reason": "no prefill/decode scheduler on this pipeline"}
+
     async def abort(self, request_id: str | Iterable[str], *, timeout: float | None = None) -> None:
         """Abort request(s) via the Orchestrator."""
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -21,6 +23,25 @@ from vllm_omni.diffusion.forward_context import (
 )
 
 logger = init_logger(__name__)
+
+# A model may move the q/k/v triple in a single collective instead of one exchange per
+# tensor. It registers that here from its own package, so this generic parallel-attention
+# module never imports a model.
+_BatchedQKVExchange = Callable[[Any, list, int, int, bool], "list | None"]
+
+_batched_qkv_exchange: Any = None
+
+
+def register_batched_qkv_exchange(backend) -> None:
+    """Install a model-provided batched q/k/v exchange; ``None`` restores the stock path.
+
+    ``backend(group, tensors, scatter_idx, gather_idx, use_sync)`` returns the exchanged
+    tensors in the same order, or ``None`` to fall through to the per-tensor stock path
+    (which is how a runtime-disabled backend reports itself).
+    """
+    global _batched_qkv_exchange
+    _batched_qkv_exchange = backend
+
 
 # When advanced_uaa pads Q by the GQA ratio, MQA/very-uneven-GQA shapes can
 # inflate the query-head count substantially (worst case: MQA @ U=N pads Q from
@@ -535,17 +556,33 @@ class UlyssesParallelAttention:
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
             else:
-                query = SeqAllToAll4D.apply(
-                    self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
-                )
-                key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-                value = SeqAllToAll4D.apply(
-                    self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
-                )
-                if gate_compress is not None:
-                    gate_compress = SeqAllToAll4D.apply(
-                        self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
+                _batched_res = None
+                if _batched_qkv_exchange is not None:
+                    _batched_res = _batched_qkv_exchange(
+                        self._ulysses_pg,
+                        [query, key, value] + ([gate_compress] if gate_compress is not None else []),
+                        self._scatter_idx,
+                        self._gather_idx,
+                        self._use_sync,
                     )
+                if _batched_res is not None:
+                    query, key, value = _batched_res[0], _batched_res[1], _batched_res[2]
+                    if gate_compress is not None:
+                        gate_compress = _batched_res[3]
+                else:
+                    query = SeqAllToAll4D.apply(
+                        self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
+                    )
+                    key = SeqAllToAll4D.apply(
+                        self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync
+                    )
+                    value = SeqAllToAll4D.apply(
+                        self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
+                    )
+                    if gate_compress is not None:
+                        gate_compress = SeqAllToAll4D.apply(
+                            self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
+                        )
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0

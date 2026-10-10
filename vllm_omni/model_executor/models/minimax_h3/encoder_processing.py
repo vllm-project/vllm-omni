@@ -127,7 +127,7 @@ def _resolve_fl2va_keyframe_indices(extra: Mapping[str, Any], image_count: int) 
 def _validate_ref2va_reference_counts(image_count: int, video_count: int, audio_count: int) -> None:
     if min(image_count, video_count, audio_count) < 0:
         raise OmniClientError("MiniMax H3 reference counts must be non-negative")
-    if image_count + video_count == 0:
+    if image_count + video_count == 0 and not _refmod_paths_from_env():
         raise OmniClientError("ref2va requires at least one image or video reference")
     if image_count > 9:
         raise OmniClientError("ref2va accepts at most 9 image references")
@@ -508,7 +508,7 @@ def prepare_encoder_inputs(
             _validate_reference_image(image)
     elif task == "ref2va":
         _validate_ref2va_reference_counts(len(raw_images), len(videos), len(audio_values))
-        if not raw_images and not videos:
+        if not raw_images and not videos and not _refmod_paths_from_env():
             raise OmniClientError("ref2va requires an image or video condition")
     else:
         raise OmniClientError(f"unsupported MiniMax H3 task {task!r}")
@@ -739,6 +739,38 @@ def _image_from_tensor(value: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
+# Optional identity conditioning from pre-encoded latents.
+#
+# An identity adapter is a single pre-encoded latent of shape [1, C, T, H, W] in the H3 video-VAE
+# latent space. It is pooled for the DiT's reference-token path and does not decode to an image, so
+# it cannot be fed through the VAE; it is injected directly as reference rows instead.
+#
+# H3_REFMOD_PATHS is an os.pathsep-separated list of .safetensors files.
+# H3_REFMOD_NORMALIZE=1 applies (latent - mean) / std first, which is what the engine's own image
+# path does before patchifying. Unset by default.
+def _refmod_paths_from_env() -> list[str]:
+    raw = os.environ.get("H3_REFMOD_PATHS", "").strip()
+    return [item for item in raw.split(os.pathsep) if item] if raw else []
+
+
+def _load_refmod_rows(video_vae: Any, path: str) -> tuple[torch.Tensor, tuple[int, int, int]]:
+    from safetensors import safe_open
+
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import minimax_h3_patchify_video_latent
+
+    with safe_open(path, framework="pt") as handle:
+        latent = handle.get_tensor("latent").float()
+    if latent.ndim == 4:
+        latent = latent[None]
+    channels = int(video_vae.config_dict["latent_channels"])
+    if os.environ.get("H3_REFMOD_NORMALIZE", "0").lower() not in ("0", "", "false", "no"):
+        mean = torch.tensor(video_vae.config_dict["latents_mean"]).view(1, channels, 1, 1, 1)
+        std = torch.tensor(video_vae.config_dict["latents_std"]).view(1, channels, 1, 1, 1)
+        latent = (latent - mean) / std
+    rows = minimax_h3_patchify_video_latent(latent, patch_size=(1, 2, 2)).float()
+    return rows, (int(latent.shape[2]), int(latent.shape[3]), int(latent.shape[4]))
+
+
 def encode_media(
     media: MiniMaxH3EncoderMediaInput,
     *,
@@ -766,6 +798,9 @@ def encode_media(
     visual_rows: list[torch.Tensor] = []
     visual_shapes: list[tuple[int, int, int]] = []
     video_edit_clean_rows: torch.Tensor | None = None
+    # RefMod latent shapes are tracked separately so the existing strict
+    # zip(video_shapes, media.video_audios) below stays untouched.
+    refmod_shapes: list[tuple[int, int, int]] = []
     if media.images or media.videos or media.video_edit is not None:
         if video_vae is None:
             raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
@@ -824,6 +859,14 @@ def encode_media(
         if sum(reference_lengths[:embedded_audio_count]) > 600 or sum(reference_lengths[embedded_audio_count:]) > 600:
             raise ValueError("MiniMax H3 audio references must be at most 15 seconds in total")
 
+    for _refmod_path in _refmod_paths_from_env():
+        if video_vae is None:
+            raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
+        with component_scope(video_vae):
+            _rows, _shape = _load_refmod_rows(video_vae, _refmod_path)
+        visual_rows.append(_rows)
+        refmod_shapes.append(_shape)
+
     ref_blocks: list[dict[str, Any]] = []
     image_shapes = visual_shapes[: len(media.images)]
     video_shapes = visual_shapes[len(media.images) :]
@@ -847,6 +890,9 @@ def encode_media(
         }
         for length in reference_lengths[embedded_audio_count:]
     )
+    ref_blocks.extend(
+        {"kind": "video", "ref_audio_t": 0, "latent_t": t, "latent_h": h, "latent_w": w} for (t, h, w) in refmod_shapes
+    )
     video_edit_mask = None
     if video_edit_clean_rows is not None:
         if media.video_edit_mask is None:
@@ -863,6 +909,10 @@ def encode_media(
             device=audio_edit_clean_rows.device,
             dtype=torch.float32,
         ).contiguous()
+    # RefMod shapes must join visual_shapes (they validate and carry the rope
+    # grid); done here, after image/video slicing above, so those stay intact.
+    visual_shapes.extend(refmod_shapes)
+
     return MiniMaxH3EncoderMediaConditioning(
         task=media.task,
         height=media.height,
