@@ -618,6 +618,13 @@ def test_from_cli_args_applies_diffusion_parallel_knobs():
         engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
         assert getattr(engine_args, knob) == value, f"{knob} was dropped"
 
-        stage_cfg = StageConfigFactory.create_default_diffusion({knob: value})[0]
+        # Forward the preserved value rather than the table literal, so the
+        # second assertion fails if ``from_cli_args`` dropped the knob.
+        factory_kwargs = {knob: getattr(engine_args, knob)}
+        if knob == "use_hsdp":
+            # Standalone HSDP (all other parallelism at 1) cannot
+            # auto-calculate its shard size; pass one explicitly.
+            factory_kwargs["hsdp_shard_size"] = 2048
+        stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
         parallel_config = stage_cfg["engine_args"]["parallel_config"]
         assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"
