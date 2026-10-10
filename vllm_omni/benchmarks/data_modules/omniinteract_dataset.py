@@ -21,6 +21,8 @@ from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.transformers_utils.repo_utils import hf_fs
 
+from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_NONE
+
 OMNIINTERACT_SUBSETS = ("1q1a", "1q1a_math", "1qna")
 OMNIINTERACT_SCENARIO_TAGS = ("realtime", "proactive", "nested", "interrupted", "1qna")
 DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
@@ -54,10 +56,12 @@ class OmniInteractSessionOptions:
     output_root: Path
     timeout_s: float
     media_timeout_s: float
-    ref_audio: str
+    ref_audio: str | None
     require_response: bool = False
     max_video_duration_s: float = DEFAULT_MAX_VIDEO_DURATION_S
     evaluation: OmniInteractEvaluationOptions | None = None
+    turn_detection: str = TURN_DETECTION_NONE
+    instructions: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,7 +69,7 @@ class OmniInteractPreparedInput:
     duration_s: float
     pcm16: bytes = field(repr=False)
     video_frames: tuple[str | None, ...] = field(repr=False)
-    ref_audio_data_url: str = field(repr=False)
+    ref_audio_data_url: str | None = field(repr=False)
 
 
 @dataclass
@@ -563,9 +567,10 @@ def _case_from_video_list_row(row: dict[str, object], *, line_no: int) -> OmniIn
         )
     else:
         by_path = {case.video_path.resolve(): case for case in _mapping_cases(subset_root, subset)}
-        case = by_path.get(video_path)
-        if case is None:
+        mapped_case = by_path.get(video_path)
+        if mapped_case is None:
             raise ValueError(f"OmniInteract video_list line {line_no} is not in {subset} mapping: {video_path}")
+        case = mapped_case
 
     expected_name = str(row.get("output_name") or "")
     if expected_name and expected_name != official_output_name(case):

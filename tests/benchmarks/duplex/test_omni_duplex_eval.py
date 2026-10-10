@@ -249,6 +249,13 @@ def test_response_aliases_and_clock_guard():
         extract_timed_sentences([], clock="wall")
 
 
+def test_timed_sentences_keep_whitespace_only_deltas_between_tokens():
+    deltas = [" ", "There", " are", " exactly", " ", "1", "2", " dumplings", "."]
+    events = [{"type": "response.output_text.delta", "delta": delta, "_media_clock_ms": 1000} for delta in deltas]
+    timed = extract_timed_sentences(events)
+    assert [item.sentence for item in timed] == ["There are exactly 12 dumplings."]
+
+
 def test_protocol_windows_and_parsing():
     assert PROTOCOL_PIN == "ca3c122b4d4bf67afd6b18ea5e724b4561bdde48"
     assert temporal_window(4, 5, 10) == (2.0, 3.0)

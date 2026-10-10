@@ -235,6 +235,25 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
 
+  omni_qwen3_omni_duplex_perf:
+    - *qwen3_omni
+    - vllm_omni/deploy/qwen3_omni_duplex.yaml
+    - vllm_omni/engine/duplex/
+    - vllm_omni/engine/duplex_omni_engine.py
+    - vllm_omni/engine/duplex_orchestrator.py
+    - vllm_omni/entrypoints/duplex/
+    - vllm_omni/entrypoints/duplex_omni.py
+    - vllm_omni/entrypoints/openai/api_server.py
+    - vllm_omni/entrypoints/openai/duplex_capability.py
+    - vllm_omni/entrypoints/cli/benchmark/
+    - vllm_omni/experimental/fullduplex/
+    - vllm_omni/protocol/
+    - vllm_omni/clients/
+    - vllm_omni/benchmarks/
+    - tests/dfx/conftest.py
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json
+
   omni_qwen3_omni_reliability:
     - *qwen3_omni
     - tests/dfx/reliability/test_reliability_qwen3_omni.py

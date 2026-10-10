@@ -557,3 +557,30 @@ In VAD mode, click **Camera** to upload sampled frames with your spoken question
 see [camera setup and limits](../realtime_web/README.md#qwen-vad-camera-input).
 For explicit turns, use `--manual` with the shared UI as described in the
 [shared UI guide](../realtime_web/README.md#qwen3-explicit-turn-realtime).
+
+### Duplex benchmarks: OmniInteract and Omni-DuplexEval
+
+Both benchmarks replay recorded clips into one duplex session. Qwen answers
+committed turns, so run them with server VAD turn detection: the client never
+commits, and frames reach Qwen as `input_image` items (it refuses
+`video_frames` on audio appends). Qwen refuses a reference voice, so omit it.
+Serve `vllm_omni/deploy/qwen3_omni_duplex.yaml` (one session at a time) and
+keep client concurrency at 1.
+
+```bash
+vllm bench omni-duplex-eval --omni generate \
+    --url ws://127.0.0.1:8091/v1/realtime?duplex=1 \
+    --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --turn-detection server_vad \
+    --instructions "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences." \
+    --dataset Hothan/Omni-DuplexEval \
+    --response-root /data/omni-duplex-eval/qwen3-responses
+```
+
+Evaluate and summarize as in the
+[MiniCPM-o Omni-DuplexEval guide](../minicpmo/README.md#run-omni-duplexeval).
+For OmniInteract, see
+[turn-based duplex models](../../../docs/cli/bench/serve.md#turn-based-duplex-models-qwen3-omni).
+A turn-based model acknowledges proactive requests ("remind me when ...")
+immediately but does not speak again when the event happens, so proactive
+splits score low by construction.

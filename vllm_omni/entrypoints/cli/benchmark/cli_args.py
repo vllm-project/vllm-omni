@@ -52,6 +52,7 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         OMNIINTERACT_SCENARIO_TAGS,
         OMNIINTERACT_SUBSETS,
     )
+    from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
     group.add_argument(
@@ -102,7 +103,23 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Reject media longer than this safety limit before decoding.",
     )
     group.add_argument(
-        "--omniinteract-ref-audio", type=_existing_file, help="Reference WAV for native-duplex audio output."
+        "--omniinteract-ref-audio",
+        type=_existing_file,
+        help="Reference voice WAV for models that clone it (MiniCPM-o). Omit for models that refuse one (Qwen3-Omni).",
+    )
+    group.add_argument(
+        "--omniinteract-turn-detection",
+        choices=TURN_DETECTION_MODES,
+        default=TURN_DETECTION_NONE,
+        help=(
+            "'none' streams each clip and commits once, for model-native duplex models (MiniCPM-o). "
+            "'server_vad' lets the server cut the soundtrack into turns, for turn-based duplex models "
+            "(Qwen3-Omni); the client then never commits and waits for every turn to be answered."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-instructions",
+        help="Session system prompt. Omitted by default, which keeps each model's own duplex prompt.",
     )
     group.add_argument(
         "--omniinteract-require-response", action="store_true", help="Fail LISTEN-only functional E2E cases."
@@ -500,8 +517,6 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")
         if getattr(args, "endpoint", None) != "/v1/realtime":
             raise ValueError("OmniInteract requires --endpoint /v1/realtime")
-        if not getattr(args, "omniinteract_ref_audio", None):
-            raise ValueError("OmniInteract requires --omniinteract-ref-audio")
         if getattr(args, "omniinteract_evaluate", False) and not getattr(args, "omniinteract_judge_model", None):
             raise ValueError("OmniInteract evaluation requires --omniinteract-judge-model")
         if getattr(args, "omniinteract_video_list", None):

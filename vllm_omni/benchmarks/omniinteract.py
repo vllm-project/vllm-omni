@@ -19,8 +19,8 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin, urlsplit
@@ -33,6 +33,18 @@ from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractPreparedInput,
     case_manifest,
     sampled_case_row,
+)
+from vllm_omni.benchmarks.duplex_session_inputs import (
+    FRAME_TRANSPORT_IMAGE_ITEMS,
+    SERVER_VAD_TAIL_S,
+    TURN_DETECTION_MODES,
+    TURN_DETECTION_NONE,
+    TURN_DETECTION_SERVER_VAD,
+    ImageItemWindow,
+    select_frame_transport,
+    server_turns_pending,
+    session_turn_detection,
+    turn_activity_count,
 )
 
 # The duplex client library (vllm_omni.clients) is imported lazily inside the
@@ -73,6 +85,10 @@ class OmniInteractBenchmarkConfig:
     require_response: bool = False
     extra_headers: dict[str, str] | None = None
     extra_body: dict[str, object] | None = None
+    #: ``none`` streams the clip and commits once (model-native duplex);
+    #: ``server_vad`` lets the server cut the soundtrack into turns.
+    turn_detection: str = TURN_DETECTION_NONE
+    instructions: str | None = None
 
 
 @dataclass
@@ -220,6 +236,10 @@ class _Playback:
         self._total_samples: dict[str, int] = {}
         self._response_end_s: dict[str, float] = {}
         self._acked_ms: dict[str, int] = {}
+        #: Responses the server flushed with ``output_audio_buffer.cleared``
+        #: (barge-in), and those of them that lost audio the listener never heard.
+        self.cleared: set[str] = set()
+        self.truncated: set[str] = set()
 
     def _warn_once(self, warning: str) -> None:
         if warning not in self.warnings:
@@ -233,6 +253,10 @@ class _Playback:
             if event.get("type") == "response.done":
                 if response_id:
                     self.completed.add(response_id)
+                continue
+            if event.get("type") == "output_audio_buffer.cleared":
+                if response_id:
+                    self._clear(response_id, events.event_received_at_s[index])
                 continue
             if event.get("type") != "response.output_audio.delta":
                 continue
@@ -257,13 +281,42 @@ class _Playback:
                 raise ValueError("response audio is not valid base64") from exc
             if not raw or len(raw) % PCM16_BYTES_PER_SAMPLE:
                 raise ValueError("response audio is empty or not PCM16 aligned")
+            if response_id in self.cleared:
+                # Audio of a flushed response never reaches the speaker.
+                self.truncated.add(response_id)
+                continue
             start = max(events.event_received_at_s[index], self.end_s)
             samples = len(raw) // PCM16_BYTES_PER_SAMPLE
-            segment = _AudioSegment(index, response_id, start, start + samples / rate, raw)
+            segment = _AudioSegment(index, response_id, start, start + samples / OUTPUT_SAMPLE_RATE, raw)
             self.segments.append(segment)
             self.end_s = segment.end_s
             self._total_samples[response_id] = self._total_samples.get(response_id, 0) + samples
             self._response_end_s[response_id] = segment.end_s
+
+    def _clear(self, response_id: str, at_s: float) -> None:
+        """Drop a response's unplayed audio, as a live client flushes its speaker queue.
+
+        A barge-in model tells the client to stop playing with
+        ``output_audio_buffer.cleared``; audio queued behind ``at_s`` is never
+        heard, so it leaves the serialized playback clock.
+        """
+        self.cleared.add(response_id)
+        kept: list[_AudioSegment] = []
+        for segment in self.segments:
+            if segment.response_id != response_id or segment.end_s <= at_s:
+                kept.append(segment)
+                continue
+            self.truncated.add(response_id)
+            if segment.start_s < at_s:
+                samples = int((at_s - segment.start_s) * OUTPUT_SAMPLE_RATE)
+                kept.append(replace(segment, end_s=at_s, pcm16=segment.pcm16[: samples * PCM16_BYTES_PER_SAMPLE]))
+        self.segments = kept
+        if response_id in self._total_samples:
+            self._total_samples[response_id] = sum(
+                len(segment.pcm16) // PCM16_BYTES_PER_SAMPLE for segment in kept if segment.response_id == response_id
+            )
+            self._response_end_s[response_id] = min(self._response_end_s[response_id], at_s)
+        self.end_s = max([at_s, *(segment.end_s for segment in kept)])
 
     async def acknowledge(self, client: _RealtimeSession, now: float | None = None) -> None:
         """Ack playback progress incrementally along the serialized clock.
@@ -314,6 +367,8 @@ async def stream_inputs(
     pcm: bytes,
     frames: Sequence[str | None],
     playback: _Playback,
+    *,
+    image_items: ImageItemWindow | None = None,
 ) -> tuple[int, int, float, float]:
     bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     chunk_bytes = bytes_per_second * _INPUT_CHUNK_MS // 1000
@@ -337,9 +392,13 @@ async def stream_inputs(
             "duration_ms": (end - offset) * 1000 // bytes_per_second,
             "audio_end_ms": end_ms,
         }
-        if ready:
-            event["video_frames"] = ready
         lags.append(max(0.0, time.monotonic() - started_at - offset / bytes_per_second))
+        if ready and image_items is not None:
+            # The frame enters the image context before the audio it was
+            # captured with, as a camera would deliver it.
+            await image_items.push(ready)
+        elif ready:
+            event["video_frames"] = ready
         await client.send(event)
         await playback.acknowledge(client)
         await asyncio.sleep(max(0.0, started_at + end_ms / 1000 - time.monotonic()))
@@ -377,9 +436,12 @@ def response_ledger(
             raise ValueError(f"response.done without response.created for {response_id}")
         if response_id in done:
             raise ValueError(f"duplicate response.done for {response_id}")
-        response = event.get("response") if isinstance(event.get("response"), dict) else {}
-        details = event.get("status_details") if isinstance(event.get("status_details"), dict) else {}
-        nested = response.get("status_details") if isinstance(response.get("status_details"), dict) else {}
+        response_value = event.get("response")
+        response = response_value if isinstance(response_value, dict) else {}
+        details_value = event.get("status_details")
+        details = details_value if isinstance(details_value, dict) else {}
+        nested_value = response.get("status_details")
+        nested = nested_value if isinstance(nested_value, dict) else {}
         if "failed" in {event.get("status"), response.get("status"), details.get("type"), nested.get("type")}:
             raise ValueError(f"response.done reports failure for {response_id}")
         done.add(response_id)
@@ -415,8 +477,11 @@ def _has_post_commit_decision(
 
 # An ack computed just before a commit event was delivered can still lose the
 # race server-side; the response it acks was already superseded, so the
-# refusal is harmless — record it instead of failing the case.
-_TOLERATED_ERROR_CODES = frozenset({"playback_ack_too_late"})
+# refusal is harmless — record it instead of failing the case. A barge-in
+# model can also retire an interrupted or pruned response's history item before
+# the serialized playback clock reaches it (``playback_item_not_found``); the
+# ack only feeds server history, never the recorded output, so it is recorded too.
+_TOLERATED_ERROR_CODES = frozenset({"playback_ack_too_late", "playback_item_not_found"})
 
 # ``session.close`` carries no reason of its own, so the server stamps the
 # terminal event with the reason it inferred for it. Anything else on a
@@ -548,6 +613,40 @@ async def wait_for_session_completion(
     )
 
 
+async def wait_for_server_turns(
+    client: _RealtimeSession,
+    playback: _Playback,
+    *,
+    session_from: int,
+    timeout_s: float,
+    settle_s: float,
+) -> None:
+    """Wait until every server-detected turn has been answered.
+
+    With ``server_vad`` the client never commits, so there is no final commit
+    to anchor on. The session is complete once no speech or response is open
+    and no event has arrived for ``settle_s``, which also covers the short gap
+    between a VAD commit and its ``response.created``.
+    """
+    deadline = time.monotonic() + timeout_s
+    activity = turn_activity_count(client.events.events[session_from:])
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        client.raise_if_reader_stopped()
+        _raise_if_session_terminated(client.events, session_from, warnings=playback.warnings)
+        await playback.acknowledge(client)
+        current = turn_activity_count(client.events.events[session_from:])
+        if current != activity:
+            activity, stable_since = current, time.monotonic()
+        if (
+            not server_turns_pending(client.events.events[session_from:])
+            and time.monotonic() - stable_since >= settle_s
+        ):
+            return
+        await asyncio.sleep(0.05)
+    raise TimeoutError("Timed out waiting for server-detected turns to finish")
+
+
 def _output_dir(root: Path, case: OmniInteractCase) -> Path:
     relative = case.video_rel.replace("\\", "/")
     stem = Path(relative).with_suffix("").as_posix().replace("/", "__")
@@ -582,7 +681,10 @@ def _atomic_replace(path: Path, writer: Callable[[Path], None]) -> None:
 
 
 def _atomic_write_text(path: Path, value: str) -> None:
-    _atomic_replace(path, lambda temporary: temporary.write_text(value, encoding="utf-8"))
+    def write(temporary: Path) -> None:
+        temporary.write_text(value, encoding="utf-8")
+
+    _atomic_replace(path, write)
 
 
 def _atomic_write_json(path: Path, value: object) -> None:
@@ -726,13 +828,17 @@ def _collect_output(
         result.official_eval_ineligible_reasons.append("audio_clipped")
     if cancelled:
         result.official_eval_ineligible_reasons.append("cancelled_response")
+    if playback.truncated:
+        # The transcript still holds the whole response while the listener
+        # heard only its played prefix, like a cancelled response.
+        result.official_eval_ineligible_reasons.append("cleared_response")
     result.eligible_for_official_eval = not result.official_eval_ineligible_reasons
     audio_sizes = {segment.event_index: len(segment.pcm16) for segment in playback.segments}
     events = (
         [
             {
                 **{key: value for key, value in event.items() if key not in {"delta", "audio"}},
-                "audio_bytes": audio_sizes[index],
+                "audio_bytes": audio_sizes.get(index, 0),
             }
             if event.get("type") == "response.output_audio.delta"
             else dict(event)
@@ -864,19 +970,34 @@ class _RealtimeSession:
 
     _MAX_FRAME_BYTES = 64 * 1024 * 1024
 
-    def __init__(self, config: OmniInteractBenchmarkConfig, reference_audio: str) -> None:
+    def __init__(self, config: OmniInteractBenchmarkConfig, reference_audio: str | None) -> None:
         from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
 
-        self.session_config = SessionConfig(
-            ref_audio=reference_audio,
-            overlap_policy="listen_only",
-            playback_commit_policy="ack_only",
-            idle_timeout_s=float(config.timeout_s),
-            extra_body={
-                "force_listen_count": 0,
-                **(config.extra_body or {}),
-            },
-        )
+        turn_detection = session_turn_detection(config.turn_detection)
+        if turn_detection is None:
+            self.session_config = SessionConfig(
+                ref_audio=reference_audio,
+                instructions=config.instructions,
+                overlap_policy="listen_only",
+                playback_commit_policy="ack_only",
+                idle_timeout_s=float(config.timeout_s),
+                extra_body={
+                    "force_listen_count": 0,
+                    **(config.extra_body or {}),
+                },
+            )
+        else:
+            # Turn-based: the server VAD commits each utterance and creates the
+            # response, so the model-native auto_response stays off.
+            self.session_config = SessionConfig(
+                ref_audio=reference_audio,
+                instructions=config.instructions,
+                auto_response=False,
+                turn_detection=turn_detection,
+                playback_commit_policy="ack_only",
+                idle_timeout_s=float(config.timeout_s),
+                extra_body=dict(config.extra_body or {}),
+            )
         self.url = _websocket_url(config)
         headers = dict(config.extra_headers or {})
 
@@ -999,6 +1120,8 @@ def _wants_annotation_video_clock(client: _RealtimeSession) -> bool:
     required = caps.get("required_input_modalities") or ()
     if isinstance(required, str):
         required = (required,)
+    if not isinstance(required, Iterable):
+        return False
     try:
         video_required = "video" in {str(item) for item in required}
     except TypeError:
@@ -1020,8 +1143,8 @@ async def run_omniinteract_case(
     capture_artifacts: bool = True,
     prepared_input: OmniInteractPreparedInput | None = None,
 ) -> OmniInteractCaseResult:
-    if not config.ref_audio:
-        raise ValueError("ref_audio is required for MiniCPM-o native-duplex audio output")
+    if config.turn_detection not in TURN_DETECTION_MODES:
+        raise ValueError(f"turn_detection must be one of {TURN_DETECTION_MODES}")
     for name, value in (
         ("timeout_s", config.timeout_s),
         ("media_timeout_s", config.media_timeout_s),
@@ -1038,6 +1161,7 @@ async def run_omniinteract_case(
     )
     started_at = time.monotonic()
     try:
+        frames: Sequence[str | None]
         if prepared_input is None:
             from vllm_omni.clients.duplex import reference_audio_data_url
 
@@ -1056,9 +1180,19 @@ async def run_omniinteract_case(
             frames = prepared_input.video_frames
         if not any(frames):
             raise ValueError(f"No video frames were decoded from {case.video_path}")
+        server_turns = config.turn_detection == TURN_DETECTION_SERVER_VAD
         async with _RealtimeSession(config, reference_audio) as client:
             session_from = 0  # the collector holds only this session's events
-            pcm = _ensure_final_commit_tail(pcm, client.events.events)
+            if server_turns:
+                # No final commit: trailing silence lets the VAD close the last turn.
+                pcm += bytes(round(SERVER_VAD_TAIL_S * PCM16_SAMPLE_RATE) * PCM16_BYTES_PER_SAMPLE)
+            else:
+                pcm = _ensure_final_commit_tail(pcm, client.events.events)
+            image_items = (
+                ImageItemWindow(client.send, item_prefix="omniinteract_frame")
+                if select_frame_transport(_session_capabilities(client)) == FRAME_TRANSPORT_IMAGE_ITEMS
+                else None
+            )
             playback = _Playback()
             stream_start = time.monotonic()
             try:
@@ -1093,21 +1227,30 @@ async def run_omniinteract_case(
                         ANNOTATION_VIDEO_FPS,
                     )
                 else:
-                    stream = stream_inputs(client, pcm, frames, playback)
+                    stream = stream_inputs(client, pcm, frames, playback, image_items=image_items)
                 try:
                     chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(stream, timeout=upload_timeout_s)
                 except asyncio.TimeoutError as exc:
                     raise TimeoutError(f"Realtime upload timed out after {upload_timeout_s:g}s") from exc
-                commit_from = len(client.events.events)
-                await client.commit()
-                await wait_for_session_completion(
-                    client,
-                    playback,
-                    commit_from=commit_from,
-                    session_from=session_from,
-                    timeout_s=config.timeout_s,
-                    settle_s=_COMPLETION_SETTLE_S,
-                )
+                if server_turns:
+                    await wait_for_server_turns(
+                        client,
+                        playback,
+                        session_from=session_from,
+                        timeout_s=config.timeout_s,
+                        settle_s=_COMPLETION_SETTLE_S,
+                    )
+                else:
+                    commit_from = len(client.events.events)
+                    await client.commit()
+                    await wait_for_session_completion(
+                        client,
+                        playback,
+                        commit_from=commit_from,
+                        session_from=session_from,
+                        timeout_s=config.timeout_s,
+                        settle_s=_COMPLETION_SETTLE_S,
+                    )
                 await playback.acknowledge(client, playback.end_s)
                 _raise_if_session_terminated(client.events, session_from, warnings=playback.warnings)
                 close_from = len(client.events.events)

@@ -198,6 +198,9 @@ def test_response_metrics_include_engine_tpot_and_stream_window():
         "tpot_ms": {"count": 2, "mean": 15.0, "p50": 10.0, "p99": 20.0},
         "ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "rtf": {"count": 2, "mean": 2.0, "p50": 2.0, "p99": 2.0},
+        # Without server request metrics, TTFT already starts at response.created.
+        "client_ttft_ms": {"count": 2, "mean": 100.0, "p50": 100.0, "p99": 100.0},
+        "client_ttfp_ms": {"count": 2, "mean": 300.0, "p50": 200.0, "p99": 400.0},
         "stages": {
             "0": {
                 "ttft_ms": {"count": 2, "mean": 0.0, "p50": 0.0, "p99": 0.0},
@@ -604,7 +607,8 @@ def test_response_ledger_rejects_identity_errors(events, match: str):
 
 class _CompletionClient:
     def __init__(self, collector: EventCollector):
-        self.events, self.acks = collector, []
+        self.events = collector
+        self.acks: list[tuple[str, int]] = []
 
     def raise_if_reader_stopped(self) -> None:
         return None
@@ -700,19 +704,20 @@ async def test_acks_continue_after_committed_input():
     assert playback.completion_acked == {"r1"}
 
 
-def test_tolerated_playback_ack_rejection_is_a_warning_not_a_failure():
+@pytest.mark.parametrize("code", ["playback_ack_too_late", "playback_item_not_found"])
+def test_tolerated_playback_ack_rejection_is_a_warning_not_a_failure(code: str):
     collector = _collector(
         (
             {
                 "type": "error",
-                "error": {"type": "invalid_request_error", "code": "playback_ack_too_late"},
+                "error": {"type": "invalid_request_error", "code": code},
             },
             1.0,
         ),
     )
     warnings: list[str] = []
     oi._raise_if_session_terminated(collector, 0, warnings=warnings)
-    assert warnings == ["tolerated in-flight server rejection: playback_ack_too_late"]
+    assert warnings == [f"tolerated in-flight server rejection: {code}"]
 
     collector.add({"type": "error", "error": {"code": "bad_event", "message": "boom"}}, received_at_s=1.1)
     with pytest.raises(RuntimeError, match="bad_event"):
@@ -798,6 +803,65 @@ def test_ineligible_outputs_are_excluded_from_manifest(tmp_path: Path, audio_tim
             "subset": case.subset,
         }
     ]
+
+
+def test_cleared_response_leaves_the_playback_clock_and_the_manifest(tmp_path: Path):
+    # r1 queues 2 s of audio at t=10; the user barges in at t=10.5, so the
+    # server clears r1. A live client flushes its queue: r1 keeps 0.5 s, its
+    # later delta never plays, and r2 starts at once instead of after r1.
+    case = _case(tmp_path)
+    collector = _collector(
+        (_created("r1"), 9.9),
+        (_audio("r1", samples=24_000), 10.0),
+        (_audio("r1", samples=24_000), 10.01),
+        (_text("r1", "first"), 10.02),
+        ({"type": "output_audio_buffer.cleared", "response_id": "r1"}, 10.5),
+        (_audio("r1", samples=2400), 10.51),
+        (_done("r1"), 10.52),
+        (_created("r2"), 10.6),
+        (_audio("r2", samples=2400), 10.7),
+        (_text("r2", "second"), 10.71),
+        (_done("r2"), 10.72),
+    )
+    result = oi.OmniInteractCaseResult(case.subset, str(case.video_path), "")
+    playback = oi._Playback()
+    playback.ingest(collector)
+    assert playback.cleared == playback.truncated == {"r1"}
+    assert [(s.response_id, round(s.start_s, 3), round(s.end_s, 3)) for s in playback.segments] == [
+        ("r1", 10.0, 10.5),
+        ("r2", 10.7, 10.8),
+    ]
+    assert len(playback.segments[0].pcm16) == 12_000 * 2
+    context = oi._collect_output(
+        collector,
+        playback,
+        stream_start=0.0,
+        video_duration_s=11.0,
+        require_response=False,
+        retain_events=True,
+        result=result,
+    )
+    assert result.official_eval_ineligible_reasons == ["cleared_response"]
+    assert [chunk["timestamp"] for chunk in context.chunks] == [[10.0, 10.5], [10.7, 10.8]]
+    flushed = [event for event in context.events if event["type"] == "response.output_audio.delta"]
+    assert [event["audio_bytes"] for event in flushed] == [24_000, 0, 0, 4800]
+
+
+def test_clear_after_full_playback_keeps_the_case_eligible(tmp_path: Path):
+    case, collector, result = _successful_output(tmp_path)
+    collector.add({"type": "output_audio_buffer.cleared", "response_id": "r1"}, received_at_s=10.5)
+    context_playback = oi._Playback()
+    oi._collect_output(
+        collector,
+        context_playback,
+        stream_start=0.0,
+        video_duration_s=11.0,
+        require_response=False,
+        retain_events=False,
+        result=result,
+    )
+    assert context_playback.cleared == {"r1"} and not context_playback.truncated
+    assert result.eligible_for_official_eval
 
 
 def test_official_output_name_matches_minicpmo_batch_layout(tmp_path: Path):
@@ -934,7 +998,7 @@ async def test_public_runner_executes_one_prepared_session(tmp_path: Path, monke
         request_index=0,
         prepared_input=prepared,
     )
-    assert result.success and result.transcript == "answer" and result._artifact_context is not None
+    assert result.success and result.transcript == "answer" and result._artifact_context is not None, result.error
     assert not config.output_root.exists()
     assert "autostart=0" in _RealtimeClient.instances[-1].url
     session_config = _RealtimeClient.instances[-1].session_config
@@ -946,6 +1010,79 @@ async def test_public_runner_executes_one_prepared_session(tmp_path: Path, monke
     # moment its audio arrived, then the exact total once drained.
     assert acks[-1] == ("r1", 1)
     assert acks in ([("r1", 1)], [("r1", 0), ("r1", 1)])
+
+
+class _ServerVadClient(_RealtimeClient):
+    """A turn-based session: frames only as image items, the server VAD answers."""
+
+    async def __aenter__(self):
+        self.sent: list[dict[str, object]] = []
+        caps = {
+            "chunk_period_ms": 1000,
+            "required_input_modalities": ["audio"],
+            "optional_input_modalities": [],
+            "supports_image_input": True,
+        }
+        self.events.add({"type": "session.created", "session": {"capabilities": caps}})
+        return self
+
+    async def send(self, event: dict[str, object]) -> None:
+        self.sent.append(event)
+        if event["type"] != "input_audio_buffer.append" or any(
+            e["type"] == "response.created" for e in self.events.events
+        ):
+            return
+        now = time.monotonic()
+        for index, turn_event in enumerate(
+            (
+                {"type": "input_audio_buffer.speech_started"},
+                {"type": "input_audio_buffer.speech_stopped"},
+                {"type": "input_audio_buffer.committed"},
+                _created(),
+                _audio(samples=24),
+                _text(value="answer"),
+                _done(),
+            )
+        ):
+            self.events.add(turn_event, received_at_s=now + index * 0.001)
+
+    async def commit(self) -> None:
+        raise AssertionError("server_vad sessions must not send a client commit")
+
+
+@pytest.mark.asyncio
+async def test_server_vad_runner_sends_frames_as_image_items_and_never_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    case = _case(tmp_path)
+    config = oi.OmniInteractBenchmarkConfig(
+        model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        output_root=tmp_path / "out",
+        require_response=True,
+        turn_detection="server_vad",
+        instructions="Answer briefly.",
+    )
+    frame = base64.b64encode(b"jpeg").decode()
+    prepared = data.OmniInteractPreparedInput(1.0, b"\0\0" * 16_000, (frame,), None)
+    monkeypatch.setattr(oi, "_RealtimeSession", _ServerVadClient)
+    monkeypatch.setattr(oi, "_COMPLETION_SETTLE_S", 0.0)
+    monkeypatch.setattr(oi, "SERVER_VAD_TAIL_S", 0.2)
+    result = await oi.run_omniinteract_case(case, config, request_index=0, prepared_input=prepared)
+
+    assert result.success and result.transcript == "answer", result.error
+    client = _ServerVadClient.instances[-1]
+    session_config = client.session_config
+    assert session_config.turn_detection == {"type": "server_vad"}
+    assert session_config.instructions == "Answer briefly."
+    assert session_config.auto_response is False and session_config.overlap_policy is None
+    assert session_config.ref_audio is None and "force_listen_count" not in session_config.extra_body
+    appends = [event for event in client.sent if event["type"] == "input_audio_buffer.append"]
+    assert appends and not any("video_frames" in event for event in appends)
+    # The 1.0 s clip plus the 0.2 s VAD tail, in 200 ms chunks.
+    assert len(appends) == 6
+    images = [event for event in client.sent if event["type"] == "conversation.item.create"]
+    assert [event["item"]["content"][0]["image_url"] for event in images] == ["data:image/jpeg;base64," + frame]
+    assert result.input_video_frames == 1
 
 
 def test_standard_sample_loading_prepares_media_before_timing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1197,7 +1334,6 @@ def test_batch_artifact_failure_removes_partial_batch_files(tmp_path: Path, monk
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [
-        ("omniinteract_ref_audio", None, "ref-audio"),
         ("endpoint", "/v1/completions", "v1/realtime"),
         ("max_concurrency", 0, "positive"),
         ("skip_tokenizer_init", True, "skip-tokenizer-init"),
@@ -1215,6 +1351,28 @@ def test_cli_rejects_incompatible_omniinteract_options(field: str, value, match:
     setattr(args, field, value)
     with pytest.raises(ValueError, match=match):
         preprocess_serve_args(args)
+
+
+def test_cli_accepts_a_turn_based_session_without_reference_audio():
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--backend",
+            "openai-realtime-duplex",
+            "--endpoint",
+            "/v1/realtime",
+            "--dataset-name",
+            "omniinteract",
+            "--model",
+            "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "--omniinteract-turn-detection",
+            "server_vad",
+        ]
+    )
+    preprocess_serve_args(args)
+    assert args.omniinteract_turn_detection == "server_vad"
+    assert args.omniinteract_ref_audio is None
 
 
 def test_whole_benchmark_lock_serializes_a_shared_output_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

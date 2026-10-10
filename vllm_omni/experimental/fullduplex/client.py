@@ -11,7 +11,7 @@ import json
 import math
 import time
 import wave
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -620,11 +620,14 @@ class RealtimeDuplexClient:
         units: Any,
         *,
         realtime: bool = True,
+        frame_sink: Callable[[list[str]], Awaitable[object]] | None = None,
     ) -> int:
         """Stream PCM16 units, optionally attaching camera frames to each unit.
 
         A unit's frame slot takes a single JPEG/PNG (raw bytes or base64) or a
         sequence of them, which the Realtime wire caps at two per append.
+        ``frame_sink`` receives a unit's frames instead of the append, just
+        before it is sent, for sessions that take images as conversation items.
         Returns the number of appends that carried at least one frame.
         """
         audio_end_ms = 0
@@ -649,7 +652,10 @@ class RealtimeDuplexClient:
                 if item is not None
             ]
             if encoded_frames:
-                event["video_frames"] = encoded_frames
+                if frame_sink is not None:
+                    await frame_sink(encoded_frames)
+                else:
+                    event["video_frames"] = encoded_frames
                 frames_sent += 1
             await self.send(event)
             if realtime:

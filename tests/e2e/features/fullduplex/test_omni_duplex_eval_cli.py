@@ -203,6 +203,85 @@ async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path
     assert any(event["type"] == "playback.ack" for event in received)
 
 
+@pytest.mark.asyncio
+async def test_generate_server_vad_sends_image_items_and_waits_for_server_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import websockets
+
+    received = []
+    caps = {"required_input_modalities": ["audio"], "optional_input_modalities": [], "supports_image_input": True}
+
+    async def handler(websocket):
+        appends = 0
+        async for raw in websocket:
+            event = json.loads(raw)
+            received.append(event)
+            if event["type"] == "session.update":
+                await websocket.send(json.dumps({"type": "session.created", "session": {"capabilities": caps}}))
+            elif event["type"] == "input_audio_buffer.append":
+                appends += 1
+                if appends == 1:
+                    await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
+                elif appends == 2:
+                    for turn_event in (
+                        {"type": "input_audio_buffer.speech_stopped"},
+                        {"type": "response.created", "response": {"id": "r1"}},
+                        {"type": "response.output_text.delta", "response_id": "r1", "delta": "Now."},
+                        {
+                            "type": "response.output_audio.delta",
+                            "response_id": "r1",
+                            "delta": base64.b64encode(b"\0\0" * 240).decode(),
+                            "sample_rate_hz": 24_000,
+                        },
+                        {"type": "response.done", "response": {"id": "r1"}},
+                    ):
+                        await websocket.send(json.dumps(turn_event))
+            elif event["type"] == "session.close":
+                await websocket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\0\0" * 16_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
+    monkeypatch.setattr(runner, "SERVER_VAD_TAIL_S", 1.0)
+    monkeypatch.setattr(runner, "_SERVER_TURN_SETTLE_S", 0.0)
+    audio = tmp_path / "question.wav"
+    video = tmp_path / "video.mp4"
+    for path in (audio, video):
+        path.write_bytes(b"data")
+    sample = DuplexSample("sample", "RTD_counting", "rtd", "counting", video, audio)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path / "responses",
+            instructions=None,
+            turn_detection="server_vad",
+        )
+
+    session = next(event["session"] for event in received if event["type"] == "session.update")
+    assert session["turn_detection"] == {"type": "server_vad"}
+    assert session["extra_body"]["auto_response"] is False
+    assert "ref_audio" not in session and "instructions" not in session
+    assert not any(event["type"] == "input_audio_buffer.commit" for event in received)
+    appends = [event for event in received if event["type"] == "input_audio_buffer.append"]
+    assert len(appends) == 2 and not any("video_frames" in event for event in appends)
+    images = [event for event in received if event["type"] == "conversation.item.create"]
+    assert [event["item"]["content"][0]["image_url"] for event in images] == [
+        "data:image/jpeg;base64," + base64.b64encode(b"jpeg").decode()
+    ]
+    assert json.loads(result.output.read_text(encoding="utf-8")) == [{"sentence": "Now.", "start": 2.0, "end": 2.0}]
+    meta = json.loads(result.output.with_name("sample.meta.json").read_text(encoding="utf-8"))
+    assert meta["response_done"] is True and meta["drain_timeout"] is None
+    assert meta["turn_detection"] == "server_vad" and meta["frame_transport"] == "image_items"
+    assert meta["ref_audio_sha256"] is None
+
+
 def _pr_manifest(tmp_path: Path, sample_ids: tuple[str, ...]) -> Path:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
@@ -273,8 +352,10 @@ def _fake_generate(results: dict[str, GenerateSampleResult | None]):
         clock: str = "media",
         overwrite: bool = False,
         unit_ms: int = 1000,
+        instructions: str | None = None,
+        turn_detection: str = "none",
     ) -> GenerateSampleResult:
-        _ = (url, model, ref_audio, fps, mix, pace, clock, overwrite, unit_ms)
+        _ = (url, model, ref_audio, fps, mix, pace, clock, overwrite, unit_ms, instructions, turn_detection)
         result = results[sample.id]
         if result is None:
             return GenerateSampleResult(output=Path(output_root) / sample.split / f"{sample.id}.json")
