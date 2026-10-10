@@ -34,6 +34,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import per_request_initial_chunk_size_override
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -248,11 +249,11 @@ def talker2code2wav_async_chunk(
         return None
 
     return _flush_async_chunk(
-        transfer_manager, request_id, finished, _async_chunk_config(transfer_manager), emitted_frames
+        transfer_manager, request_id, finished, _async_chunk_config(transfer_manager, request), emitted_frames
     )
 
 
-def _async_chunk_config(transfer_manager: Any) -> tuple[int, int, int, int]:
+def _async_chunk_config(transfer_manager: Any, request: Any) -> tuple[int, int, int, int]:
     """Validated (chunk, left context, right holdback, initial chunk) frames."""
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
@@ -261,6 +262,7 @@ def _async_chunk_config(transfer_manager: Any) -> tuple[int, int, int, int]:
     left_context_size_config = int(cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES))
     right_holdback_size_config = int(cfg.get("codec_right_holdback_frames", _DEFAULT_CODEC_RIGHT_HOLDBACK_FRAMES))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
+    configured_initial_chunk_size, _ = per_request_initial_chunk_size_override(request, configured_initial_chunk_size)
 
     if (
         chunk_size <= 0
@@ -400,9 +402,9 @@ def talker2code2wav_async_chunk_batch(
     """One talker step of async-chunk payloads with one host conversion per row.
 
     Same accumulation and flush semantics as ``talker2code2wav_async_chunk``;
-    the chunk config is resolved once per step and each emitted ``[1, Q]``
-    CPU row is converted with a single ``tolist`` instead of several small
-    tensor operations per request.
+    each request's config is resolved independently so per-request initial
+    chunk overrides are honored. Each emitted ``[1, Q]`` CPU row is converted
+    with a single ``tolist`` instead of several small tensor operations.
     """
     if not (len(pooling_outputs) == len(requests) == len(is_finished)):
         raise ValueError("batch codec inputs must have identical lengths")
@@ -410,7 +412,6 @@ def talker2code2wav_async_chunk_batch(
     if emitted_frames is None:
         emitted_frames = {}
         transfer_manager.higgs_v3_emitted_frames = emitted_frames
-    config = None
     rows_by_request = transfer_manager.code_prompt_token_ids
     payloads: list[OmniPayloadStruct | None] = []
     for pooling_output, request, finished_flag in zip(pooling_outputs, requests, is_finished):
@@ -435,8 +436,7 @@ def talker2code2wav_async_chunk_batch(
         elif not finished:
             payloads.append(None)
             continue
-        if config is None:
-            config = _async_chunk_config(transfer_manager)
+        config = _async_chunk_config(transfer_manager, request)
         payloads.append(_flush_async_chunk(transfer_manager, request_id, finished, config, emitted_frames))
     return payloads
 
