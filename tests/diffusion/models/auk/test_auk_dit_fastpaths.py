@@ -10,6 +10,7 @@ under the per-step CUDA graph.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.auk import auk_transformer as T
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, build_time_grid
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
@@ -103,7 +104,7 @@ def _padded_inputs(device: str) -> dict[str, torch.Tensor]:
     return {name: value.to(device) for name, value in inputs.items()}
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])

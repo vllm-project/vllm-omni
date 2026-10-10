@@ -13,9 +13,10 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 def patch_cumem_allocator(mocker: MockerFixture):

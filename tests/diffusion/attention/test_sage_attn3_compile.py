@@ -6,9 +6,10 @@ import importlib.util
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "B200"}, num_cards=1)]
 
 requires_sage3_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available()

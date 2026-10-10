@@ -11,6 +11,7 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 from vllm_omni.worker_v2.model_states import init_omni_model_state
@@ -21,7 +22,12 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 pytestmark = pytest.mark.core_model
 
 
-@pytest.fixture(params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)])
+@pytest.fixture(
+    params=[
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ]
+)
 def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -212,7 +218,7 @@ def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch(state_cls):
     assert frame.call_args.kwargs["generator"] is None
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_slot_mtp_graph_padding_reorder_and_owned_output():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")

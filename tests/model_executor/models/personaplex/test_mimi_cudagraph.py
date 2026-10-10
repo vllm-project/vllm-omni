@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from vllm.platforms import current_platform
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import _MIMI_DECODE_BATCH_FRAMES
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     CODEBOOKS,
@@ -185,7 +186,7 @@ def _drive(codec: PersonaPlexMimiCodec, frames: int, recycle_at: int, device: to
     return torch.stack(codes_out), torch.stack(pcm_out), inactive_ok
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_graph_replay_is_bitwise_equal_to_eager_across_recycle() -> None:
     device = torch.device("cuda")
@@ -216,7 +217,7 @@ def test_graph_replay_is_bitwise_equal_to_eager_across_recycle() -> None:
     assert pointers == [tensor.data_ptr() for tensor in _state_tensors(codec)]
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("batch_size", [1, 3])
 def test_multi_frame_decode_graph_matches_eager_chunks(batch_size: int) -> None:
@@ -254,7 +255,7 @@ def test_multi_frame_decode_graph_matches_eager_chunks(batch_size: int) -> None:
         _assert_waveform_matches(actual[rows], expected[rows])
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_failed_capture_warns_with_the_error_and_stays_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.model_executor.models.personaplex import personaplex_mimi_cudagraph
@@ -296,7 +297,7 @@ def test_failed_capture_warns_with_the_error_and_stays_eager(monkeypatch: pytest
     _assert_waveform_matches(codec.decode_frame(expected_codes), expected_pcm)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_capture_does_not_hide_errors_that_are_not_cuda_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     codec = _random_codec(torch.device("cuda"), batch_size=2)
@@ -310,7 +311,7 @@ def test_capture_does_not_hide_errors_that_are_not_cuda_failures(monkeypatch: py
     assert codec._cuda_graphs == {}
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_graph_capture_leaves_a_fresh_stream_and_resize_drops_graphs() -> None:
     device = torch.device("cuda")

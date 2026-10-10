@@ -7,13 +7,14 @@ import pytest
 from PIL import Image
 from vllm import SamplingParams
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_cache_resets_invalidate_real_engine_and_allow_repeated_multimodal_inputs():
     deploy_config = modify_stage_config(

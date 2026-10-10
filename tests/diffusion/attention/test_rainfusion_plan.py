@@ -18,6 +18,7 @@ from unittest import mock
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends import rainfusion_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
@@ -28,7 +29,7 @@ from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.npu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 PREFIX_ROWS = 710  # 14 text rows + 696 audio rows
 ALIGNED_GRID = (62, 24, 40)  # 1280x768 -> 59520 video rows, 465 blocks

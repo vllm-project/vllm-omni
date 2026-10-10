@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 from tests.diffusion.offloader.helpers import patch_offload_runtime
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.offloader import layerwise_backend, sequential_backend
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
@@ -78,7 +79,12 @@ class _Pipeline(nn.Module):
         return self.resident(self.vae(self.transformer(self.text_encoder(self.image_encoder(x)))))
 
 
-@pytest.fixture(params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)])
+@pytest.fixture(
+    params=[
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ]
+)
 def execution_device(request, monkeypatch):
     if request.param == "cuda":
         if not torch.cuda.is_available():

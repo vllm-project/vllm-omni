@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
     MiniCPMO45OmniTTSForConditionalGeneration,
@@ -140,7 +141,7 @@ def test_sampler_adapter_keeps_upstream_counts_and_only_forces_codec_eos(mocker,
     talker.take_mrv2_forced_eos.assert_called_once_with(batch, base.req_states, 2)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
     """The real MRv2 sampler pipeline scores the V1 16-frame codec penalty.
 

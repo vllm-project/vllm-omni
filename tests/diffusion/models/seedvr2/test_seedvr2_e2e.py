@@ -18,7 +18,14 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.local_model, pytest.mark.cuda, pytest.mark.diffusion, pytest.mark.parallel]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [
+    pytest.mark.local_model,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+]
 MODEL_DIR_ENV = "VLLM_TEST_SEEDVR2_MODEL_DIR"
 # Two model windows with one four-frame seam, at the smallest legal frame size.
 LONG_FRAMES = 20
@@ -190,10 +197,10 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
 
         # Validation must happen before a job is admitted, through model-owned
         # extra_params on both the long route and the common video endpoint.
-        for invalid in ("{", "[]", '{"color_correction_method":"invalid"}'):
-            assert submit(extra_params=invalid).status_code == 400
+        for extra_params in ("{", "[]", '{"color_correction_method":"invalid"}'):
+            assert submit(extra_params=extra_params).status_code == 400
         with source.open("rb") as upload:
-            invalid = requests.post(
+            rejected = requests.post(
                 f"http://{server.host}:{server.port}/v1/videos/sync",
                 data={
                     "prompt": " ",
@@ -205,7 +212,7 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
                 files={"input_references": ("input.mp4", upload, "video/mp4")},
                 timeout=120,
             )
-        assert invalid.status_code == 400, invalid.text
+        assert rejected.status_code == 400, rejected.text
         accepted = submit(extra_params='{"color_correction_method":"wavelet"}')
         assert accepted.status_code == 202, accepted.text
         job_id = accepted.json()["id"]

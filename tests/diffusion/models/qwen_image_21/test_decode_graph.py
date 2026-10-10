@@ -6,6 +6,7 @@ import weakref
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.models.qwen_image_21 import decode_graph
 from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -163,8 +164,7 @@ def test_registration_preserves_request_cache_and_separates_layouts(graph_case):
     assert not torch.equal(entries[0].freqs, entries[1].freqs)
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("failure_phase", ["warmup", "capture"])
 def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, monkeypatch, failure_phase):
     manager, device, cleanup = graph_case
@@ -192,8 +192,7 @@ def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, mo
     assert bool((cache[0]["cond"]["key"] == 1).all())
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_replay_uses_active_request_and_layout(graph_case):
     manager, device, _ = graph_case
     first, second = make_cache(device, 1.0), make_cache(device, 5.0)
@@ -278,8 +277,7 @@ def test_all_valid_mask_shares_graph_entry_and_padding_falls_back(graph_case):
         assert entry.attn_metadata is None
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_batch_changes_and_padding_do_not_reuse_stale_prefix(graph_case):
     manager, device, _ = graph_case
     first = make_cache(device, 1.0)

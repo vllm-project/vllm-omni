@@ -106,7 +106,7 @@ repos:
       stages: [manual]
 
     - id: check-mark
-      name: Ensure test files have CI marks (no direct SKU)
+      name: Ensure test files have CI marks (no direct SKU or bare platform)
       entry: python tools/pre_commit/check_test_marks.py
       language: python
       types: [python]

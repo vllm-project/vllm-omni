@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.magi2.attention import torch_varlen_attention_with_sink
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -158,7 +159,7 @@ def test_empty_query_keeps_autograd_dependencies():
         torch.testing.assert_close(left, right, rtol=0, atol=0)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_musa_chunked_matches_unchunked(dtype):
     if not hasattr(torch, "musa") or not torch.musa.is_available():

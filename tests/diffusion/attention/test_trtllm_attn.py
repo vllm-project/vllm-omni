@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends import trtllm_attn as tg
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -16,7 +17,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionImpl
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "B200"}, num_cards=1)]
 
 
 def _has_trtllm_attn() -> bool:
