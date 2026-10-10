@@ -268,6 +268,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     hsdp_shard_size: int
     hsdp_replicate_size: int
     enable_expert_parallel: bool
+    expert_parallel_size: int
 
 
 class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
@@ -711,6 +712,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
+    expert_parallel_size: int | None = None
 
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank

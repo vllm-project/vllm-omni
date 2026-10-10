@@ -16,7 +16,7 @@ import diffusers
 import huggingface_hub
 import torch
 from PIL import Image
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -263,6 +263,8 @@ class DiffusionParallelConfig:
     """Number of tensor parallel groups."""
 
     enable_expert_parallel: bool = False
+    # Head-sharded models may partition each SP group into smaller EP groups.
+    expert_parallel_size: int | None = Field(default=None, gt=0, strict=True)
     """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
 
     sequence_parallel_size: int | None = None
@@ -349,6 +351,8 @@ class DiffusionParallelConfig:
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
+        if self.expert_parallel_size is not None and not self.enable_expert_parallel:
+            raise ValueError("expert_parallel_size requires enable_expert_parallel=True")
         assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
         assert self.data_parallel_size is None or self.data_parallel_size > 0, "Data parallel size must be > 0"
         assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
@@ -1154,6 +1158,13 @@ class OmniDiffusionConfig:
 
     # Supplementary model specific parameters
     extras: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def use_head_expert_parallel(self) -> bool:
+        return (
+            self.parallel_config.enable_expert_parallel
+            and get_diffusion_model_metadata(self.model_class_name).expert_parallel_style == "head"
+        )
 
     @property
     def is_moe(self) -> bool:

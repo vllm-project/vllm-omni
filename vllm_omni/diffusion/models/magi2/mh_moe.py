@@ -253,6 +253,10 @@ class Magi2MultiHeadMoE(nn.Module):
         self.ep_pad_heads = self.padded_num_heads - self.num_heads
         self.local_head_start = self.ep_group.rank * self.local_num_heads
         self.has_real_moe_heads = self.local_head_start < self.num_heads
+        # Tokens are exchanged over this group, which holds ``dispatch_replicas``
+        # consecutive runs of EP ranks that own the same head shards.
+        self.dispatch_group = self.ep_group
+        self.dispatch_replicas = 1
 
         self.gate = nn.Parameter(torch.empty(self.local_flatten_num_experts, self.d_head, dtype=torch.float32))
         self.W_gate = nn.Parameter(
@@ -319,6 +323,20 @@ class Magi2MultiHeadMoE(nn.Module):
             # prompt encoding, so this is the routine path, not an edge case.
             self.prepare_owned_layout()
         return applied
+
+    def set_dispatch_group(self, group: Magi2ParallelGroup) -> None:
+        """Exchange tokens over ``group`` instead of the EP group.
+
+        ``group`` must consist of consecutive runs of EP-sized rank blocks whose
+        ranks at this rank's position own the same head shard as this rank.
+        Each rank's tokens are then split between the owners in every run.
+        """
+
+        size = self.ep_group.world_size
+        if self.ep_group.replicated_sequence or group.world_size % size or group.rank % size != self.ep_group.rank:
+            raise ValueError("MoE dispatch group must be runs of EP ranks aligned with this rank's head shard")
+        self.dispatch_group = group
+        self.dispatch_replicas = group.world_size // size
 
     def _get_bf16_packed_w13(self) -> torch.Tensor:
         # When gate/up already live inside one packed bank, that bank *is* the
@@ -504,7 +522,7 @@ class Magi2MultiHeadMoE(nn.Module):
             )
         return torch_mh_moe_forward(x_heads, gather_ids, sorted_probs, offsets, self.W_gate, self.W_up, self.W_down)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sequence_split_sizes: list[int] | None = None) -> torch.Tensor:
         if self.ep_group.world_size > 1 and self.ep_group.replicated_sequence:
             # TP column-parallel ``split_linear`` already emits exactly this
             # rank's contiguous MoE-head slice.  Compute it once and leave it
@@ -521,16 +539,33 @@ class Magi2MultiHeadMoE(nn.Module):
         if self.ep_pad_heads:
             padding = x_heads.new_zeros((x_heads.shape[0], self.ep_pad_heads, self.d_head))
             x_heads = torch.cat((x_heads, padding), dim=1)
-        sequence_split_sizes: list[int] | None = None
+        dispatch_group = self.dispatch_group
+        if sequence_split_sizes is not None and (
+            len(sequence_split_sizes) != dispatch_group.world_size
+            or any(type(size) is not int or size < 0 for size in sequence_split_sizes)
+            or sequence_split_sizes[dispatch_group.rank] != x_heads.shape[0]
+        ):
+            raise ValueError("EP sequence split sizes do not describe the local tensor")
         if self.ep_group.world_size > 1:
-            local_size = torch.tensor([x_heads.shape[0]], dtype=torch.int64, device=x_heads.device)
-            gathered_sizes = [torch.empty_like(local_size) for _ in range(self.ep_group.world_size)]
-            torch.distributed.all_gather(gathered_sizes, local_size, group=self.ep_group.group)
-            sequence_split_sizes = [int(size.item()) for size in gathered_sizes]
-            x_heads = ep_dispatch(x_heads, self.ep_group, sequence_split_sizes)
+            if sequence_split_sizes is None:
+                local_size = torch.tensor([x_heads.shape[0]], dtype=torch.int64, device=x_heads.device)
+                gathered_sizes = [torch.empty_like(local_size) for _ in range(dispatch_group.world_size)]
+                torch.distributed.all_gather(gathered_sizes, local_size, group=dispatch_group.group)
+                sequence_split_sizes = [int(size.item()) for size in gathered_sizes]
+            replicas = self.dispatch_replicas
+            if replicas > 1:
+                size = self.ep_group.world_size
+                runs = [
+                    sequence_split_sizes[start : start + size] for start in range(0, len(sequence_split_sizes), size)
+                ]
+                if len({sum(run) for run in runs}) != 1:
+                    # Owners would batch other token counts than the exchange inside each run gives them.
+                    dispatch_group, replicas = self.ep_group, 1
+                    sequence_split_sizes = runs[self.dispatch_group.rank // size]
+            x_heads = ep_dispatch(x_heads, dispatch_group, sequence_split_sizes, replicas)
         output = self._local_forward(x_heads) if self.has_real_moe_heads else torch.zeros_like(x_heads)
         if self.ep_group.world_size > 1:
-            output = ep_undispatch(output, self.ep_group, sequence_split_sizes)
+            output = ep_undispatch(output, dispatch_group, sequence_split_sizes, replicas)
         if self.ep_pad_heads:
             output = output[:, : self.num_heads]
         return output.reshape(-1, self.num_heads * self.d_head)

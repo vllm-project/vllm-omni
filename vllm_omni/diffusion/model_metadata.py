@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ class DiffusionModelMetadata:
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
     supports_latent_mask_editing: bool = False
+    # Head-sharded MoE uses SP-local groups, not vLLM FusedMoE rank folding.
+    expert_parallel_style: Literal["vllm", "head"] = "vllm"
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -93,6 +96,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+        # MAGI-2 shards MoE experts along the head axis over the SP ranks rather
+        # than through vLLM's FusedMoE; the head style lets ``expert_parallel_size``
+        # differ from the sequence-parallel degree.
+        expert_parallel_style="head",
     ),
     # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
     # above (an MP4 with both tracks) — declared "video" for the same reason:

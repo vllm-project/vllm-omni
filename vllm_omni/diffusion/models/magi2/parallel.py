@@ -25,9 +25,20 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+
+from vllm_omni.diffusion.distributed.head_parallel import (
+    HeadParallelLayout,
+    replica_token_counts,
+    scatter_heads_gather_tokens,
+    scatter_tokens_gather_heads,
+)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 
 @dataclass(frozen=True)
@@ -72,17 +83,69 @@ def get_magi2_ulysses_group() -> Magi2ParallelGroup:
     )
 
 
+def get_magi2_expert_parallel_config() -> DiffusionParallelConfig | None:
+    """Return the parallel config when the model opted into head-EP, else ``None``.
+
+    ``use_head_expert_parallel`` is the metadata-driven opt-in that makes
+    ``expert_parallel_size`` settable independently of the SP degree, so it also
+    decides whether the MoE head axis follows the framework's EP group.
+    """
+
+    from vllm_omni.diffusion.forward_context import get_forward_context
+
+    try:
+        od_config = get_forward_context().omni_diffusion_config
+    except AssertionError:
+        return None
+    if od_config is not None and getattr(od_config, "use_head_expert_parallel", False):
+        return od_config.parallel_config
+    return None
+
+
+def _head_expert_parallel_group() -> Magi2ParallelGroup | None:
+    """Return the head-sharded expert group, or ``None`` when it is not active.
+
+    vLLM-Omni builds this group only when the model declares
+    ``expert_parallel_style="head"`` *and* expert parallelism is enabled. Its
+    degree comes from ``expert_parallel_size`` and may be smaller than the
+    sequence-parallel degree, in which case it is a subgroup of the SP ranks.
+    """
+
+    try:
+        from vllm.distributed import parallel_state as vllm_parallel_state
+    except ImportError:
+        return None
+    coordinator = getattr(vllm_parallel_state, "_EP", None)
+    if coordinator is None:
+        return None
+    # ``init_model_parallel_group`` returns a GroupCoordinator; the raw
+    # device_group is what the collectives below expect.
+    device_group = getattr(coordinator, "device_group", None)
+    if device_group is None:
+        return None
+    return Magi2ParallelGroup(
+        group=device_group,
+        world_size=dist.get_world_size(device_group),
+        rank=dist.get_rank(device_group),
+    )
+
+
 def get_magi2_ep_group() -> Magi2ParallelGroup:
     """Return the process group used for MAGI's MoE-head parallelism.
 
-    TP is the explicit MoE-head axis when it is larger than one.  Otherwise
-    the released SP-only layout overlaps head parallelism with Ulysses.  Both
-    groups are initialized and owned by vLLM-Omni; MAGI creates no ad-hoc
-    process groups.
+    Head-sharded expert parallelism wins when it is active, because it is the
+    only layout that lets the MoE degree differ from the sequence-parallel
+    degree. Otherwise TP is the explicit MoE-head axis when it is larger than
+    one, and failing that the released SP-only layout overlaps head parallelism
+    with Ulysses. All of these groups are initialized and owned by vLLM-Omni;
+    MAGI creates no ad-hoc process groups.
     """
 
     if not dist.is_available() or not dist.is_initialized():
         return Magi2ParallelGroup(None, 1, 0)
+    head_ep = _head_expert_parallel_group()
+    if head_ep is not None:
+        return head_ep
     try:
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -97,6 +160,69 @@ def get_magi2_ep_group() -> Magi2ParallelGroup:
         rank=coordinator.rank_in_group,
         replicated_sequence=True,
     )
+
+
+def validate_magi2_expert_parallel(parallel: DiffusionParallelConfig) -> None:
+    """Reject head-EP layouts the native transformer cannot execute.
+
+    The MoE head axis is the full ``hidden_size`` head count, and the EP-sharded
+    gate/up/down weights are sliced over that same axis.  Tensor parallelism
+    already column-shards the routed hidden state, so combining the two would
+    slice the head axis twice.
+    """
+
+    if parallel.enable_expert_parallel and parallel.tensor_parallel_size != 1:
+        raise ValueError("MAGI-2 head-EP currently requires tensor_parallel_size=1")
+
+
+def get_magi2_ep_split_indices(ep_group: Magi2ParallelGroup, sp_group: Magi2ParallelGroup) -> tuple[int, ...] | None:
+    """Map SP-local token counts into EP rank order without a collective.
+
+    Legacy TP replicates each SP token shard, so it does not use this mapping.
+    """
+    if ep_group.replicated_sequence:
+        return None
+
+    def members(group: Magi2ParallelGroup) -> list[int]:
+        if group.group is not None:
+            return dist.get_process_group_ranks(group.group)
+        if group.world_size != 1:
+            raise ValueError("A multi-rank MAGI-2 group requires a process group")
+        return [dist.get_rank() if dist.is_available() and dist.is_initialized() else 0]
+
+    ep_ranks, sp_ranks = members(ep_group), members(sp_group)
+    try:
+        return tuple(sp_ranks.index(rank) for rank in ep_ranks)
+    except ValueError as exc:
+        raise ValueError("MAGI-2 head-EP group must be contained in its SP group") from exc
+
+
+def get_magi2_ep_replicas(ep_group: Magi2ParallelGroup, sp_group: Magi2ParallelGroup) -> int:
+    """Count the head-EP groups that tile the SP group in rank order, else 1.
+
+    When the SP ranks split into consecutive head-EP groups of size ``E``, SP
+    rank ``s`` owns the same head shard as SP rank ``s % E`` of every other
+    group, so one head exchange over the SP group can send each owner part of
+    every rank's tokens.
+    """
+    if ep_group.replicated_sequence or ep_group.group is None or sp_group.group is None:
+        return 1
+    size = ep_group.world_size
+    if size <= 1 or sp_group.world_size <= size or sp_group.world_size % size:
+        return 1
+    from vllm_omni.diffusion.distributed.parallel_state import get_expert_parallel_group_ranks
+
+    try:
+        ep_group_ranks = get_expert_parallel_group_ranks()
+    except AssertionError:
+        return 1
+    sp_ranks = dist.get_process_group_ranks(sp_group.group)
+    runs = [list(sp_ranks[start : start + size]) for start in range(0, len(sp_ranks), size)]
+    if any(run not in ep_group_ranks for run in runs):
+        return 1
+    if list(dist.get_process_group_ranks(ep_group.group)) != runs[sp_group.rank // size]:
+        raise ValueError("MAGI-2 head-EP group does not match its run of SP ranks")
+    return len(runs)
 
 
 def get_magi2_tp_group() -> Magi2ParallelGroup:
@@ -291,50 +417,52 @@ def scatter_heads_gather_seqlen(
     return list(torch.split(output, local_head_counts, dim=1))
 
 
+def _ep_layout(sequence_split_sizes: list[int], rank: int, replicas: int) -> HeadParallelLayout:
+    token_counts = tuple(sequence_split_sizes)
+    if replicas == 1:
+        return HeadParallelLayout(token_counts, rank)
+    return HeadParallelLayout(token_counts, rank, replica_token_counts(token_counts, replicas))
+
+
 def ep_dispatch(
     tensor: torch.Tensor,
     group: Magi2ParallelGroup | None = None,
     sequence_split_sizes: list[int] | None = None,
+    replicas: int = 1,
 ) -> torch.Tensor:
-    """Dispatch ``[S,H,D]`` so each rank evaluates a contiguous head shard."""
+    """Dispatch ``[S,H,D]`` so each rank evaluates a contiguous head shard.
+
+    With ``replicas`` > 1, ``group`` is that many consecutive runs of head-EP
+    ranks, and every rank's tokens are split between the owners of each shard.
+    """
 
     group = group or get_magi2_ep_group()
     if group.world_size == 1:
         return tensor
-    if tensor.ndim != 3 or tensor.shape[1] % group.world_size:
+    if replicas < 1 or group.world_size % replicas:
+        raise ValueError(f"EP replicas {replicas} must divide the exchange group size {group.world_size}")
+    shards = group.world_size // replicas
+    if tensor.ndim != 3 or tensor.shape[1] % shards:
         raise ValueError(
-            f"MoE head count {tensor.shape[1] if tensor.ndim >= 2 else '?'} must divide by EP size {group.world_size}"
+            f"MoE head count {tensor.shape[1] if tensor.ndim >= 2 else '?'} must divide by EP size {shards}"
         )
-    sequence, heads, dim = tensor.shape
-    local_heads = heads // group.world_size
+    sequence = tensor.shape[0]
     if sequence_split_sizes is None:
         local_size = torch.tensor([sequence], dtype=torch.int64, device=tensor.device)
         gathered_sizes = [torch.empty_like(local_size) for _ in range(group.world_size)]
         dist.all_gather(gathered_sizes, local_size, group=group.group)
         sequence_split_sizes = [int(size.item()) for size in gathered_sizes]
-    if len(sequence_split_sizes) != group.world_size or sequence_split_sizes[group.rank] != sequence:
+    if len(sequence_split_sizes) != group.world_size:
         raise ValueError("EP sequence split sizes do not describe the local tensor")
-    send = tensor.contiguous().view(sequence, group.world_size, local_heads, dim).permute(1, 0, 2, 3).contiguous()
-    output = torch.empty(
-        (sum(sequence_split_sizes), local_heads, dim),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    row_width = local_heads * dim
-    dist.all_to_all_single(
-        output.view(-1),
-        send.view(-1),
-        output_split_sizes=[size * row_width for size in sequence_split_sizes],
-        input_split_sizes=[sequence * row_width] * group.world_size,
-        group=group.group,
-    )
-    return output
+    layout = _ep_layout(sequence_split_sizes, group.rank, replicas)
+    return scatter_heads_gather_tokens(tensor, group.group, layout)
 
 
 def ep_undispatch(
     tensor: torch.Tensor,
     group: Magi2ParallelGroup | None = None,
     sequence_split_sizes: list[int] | None = None,
+    replicas: int = 1,
 ) -> torch.Tensor:
     """Undo :func:`ep_dispatch` and restore the complete MoE head axis."""
 
@@ -344,28 +472,13 @@ def ep_undispatch(
     if tensor.ndim != 3:
         raise ValueError("EP-dispatched tensor must be [global_tokens,local_heads,dim]")
     if sequence_split_sizes is None:
-        if tensor.shape[0] % group.world_size:
-            raise ValueError("uneven EP sequence requires explicit split sizes")
+        if replicas != 1 or tensor.shape[0] % group.world_size:
+            raise ValueError("uneven or replicated EP sequence requires explicit split sizes")
         sequence_split_sizes = [tensor.shape[0] // group.world_size] * group.world_size
-    if len(sequence_split_sizes) != group.world_size or sum(sequence_split_sizes) != tensor.shape[0]:
+    if len(sequence_split_sizes) != group.world_size:
         raise ValueError("EP sequence split sizes do not partition the global tensor")
-    sequence = sequence_split_sizes[group.rank]
-    local_heads, dim = tensor.shape[1:]
-    send = tensor.contiguous()
-    output = torch.empty(
-        (group.world_size, sequence, local_heads, dim),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    row_width = local_heads * dim
-    dist.all_to_all_single(
-        output.view(-1),
-        send.view(-1),
-        output_split_sizes=[sequence * row_width] * group.world_size,
-        input_split_sizes=[size * row_width for size in sequence_split_sizes],
-        group=group.group,
-    )
-    return output.permute(1, 0, 2, 3).contiguous().view(sequence, group.world_size * local_heads, dim)
+    layout = _ep_layout(sequence_split_sizes, group.rank, replicas)
+    return scatter_tokens_gather_heads(tensor, group.group, layout)
 
 
 class Magi2SequenceDispatcher:
