@@ -199,24 +199,54 @@ def test_real_shape_matches_previous_arithmetic_bf16(seq):
     assert diff.mean().item() < 1e-3, diff.mean().item()
 
 
-def test_empty_text_stream_on_the_default_backend():
+def test_empty_text_stream_skipped_by_apply_refiners():
     """The recipe's text-to-image request with text_guidance_scale > 1 runs the
-    context refiner on a zero-token unconditional prompt. Before the guards this
-    raised ``RuntimeError: step must be nonzero`` from the FA varlen fallback and
-    left a sticky CUDA error from the fused RMSNorm kernel."""
+    context refiner on a zero-token unconditional prompt. A zero-length sequence
+    crashes the FA varlen fallback, so ``_apply_refiners`` must skip the refiner
+    and return the empty text unchanged."""
+    from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
+
     torch.manual_seed(0)
-    block = (
-        TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5, modulation=False)
+    model = (
+        Transformer2DModel(
+            patch_size=2,
+            in_channels=16,
+            hidden_size=192,
+            num_layers=1,
+            num_refiner_layers=1,
+            num_attention_heads=6,
+            num_kv_heads=2,
+            multiple_of=32,
+            ffn_dim_multiplier=1.0,
+            norm_eps=1e-5,
+            axes_dim_rope=(16, 8, 8),
+            axes_lens=(64, 64, 64),
+            text_feat_dim=64,
+        )
         .cuda()
         .to(torch.bfloat16)
         .eval()
     )
-    hidden = torch.randn(1, 0, DIM, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(1, 0, dtype=torch.bool, device="cuda")
-    angles = torch.rand(1, 0, block.head_dim, device="cuda")
+    text_hidden_states = torch.randn(1, 0, model.hidden_size, device="cuda", dtype=torch.bfloat16)
+    text_attention_mask = torch.ones(1, 0, dtype=torch.bool, device="cuda")
+    context_rotary_emb = (
+        torch.zeros(1, 0, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+        torch.zeros(1, 0, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+    )
+    img_tokens = torch.randn(1, 16, model.hidden_size, device="cuda", dtype=torch.bfloat16)
+    img_mask = torch.ones(1, 16, dtype=torch.bool, device="cuda")
+    noise_rotary_emb = (
+        torch.zeros(1, 16, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+        torch.zeros(1, 16, sum(model.config.axes_dim_rope), device="cuda", dtype=torch.bfloat16),
+    )
+    temb = torch.randn(1, min(model.hidden_size, 1024), device="cuda", dtype=torch.bfloat16)
+
     with torch.no_grad():
-        out = block(hidden, mask, (angles.cos().to(torch.bfloat16), angles.sin().to(torch.bfloat16)))
-    assert out.shape == (1, 0, DIM)
+        out_text, _ = model._apply_refiners(
+            text_hidden_states, text_attention_mask, context_rotary_emb, img_tokens, img_mask, noise_rotary_emb, temb
+        )
+    assert out_text.shape == (1, 0, model.hidden_size)
+    assert torch.equal(out_text, text_hidden_states)
     # A failed kernel launch is reported asynchronously; this device-to-host copy surfaces it.
     torch.randn(4, device="cuda").cpu()
 
