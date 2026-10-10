@@ -68,8 +68,33 @@ Print per-stage benchmark metrics for --omni serving when stage metrics are retu
 Specify to save benchmark results to a json file
 
 - `--save-detailed`
-"When saving the results, whether to include per request "
-        "information such as response, error, ttfs, tpots, etc."
+Include per-request information, such as responses, errors, and latency metrics, when saving results with `--save-result`.
+
+For `daily-omni`, `openai-chat-omni`, `/v1/videos`, and the image backends
+(`openai-image-edits-omni`, `/v1/images/generations`, `/v1/images/edits`), this
+also requests server-side stage snapshots by setting
+`extra_body.return_stage_metrics=true` unless explicitly overridden. This is
+not a local-JSON-only option: snapshots can increase response/SSE payload size
+and measurement overhead. Stage 0 timings can also supply token intervals
+when client-side intervals are unavailable. Keep the same options in
+performance comparisons. Image backends already request these metrics
+without `--save-detailed`; unsupported backends are unchanged.
+
+Benchmark results keep two distinct, request-aligned fields:
+
+- `request_stage_metrics`: the existing compact workload snapshots containing
+    token counts, finish reasons, and audio frames/duration when available.
+    This field does not depend on `--save-detailed`, omits per-token timing
+    arrays, uses `null` for missing snapshots, and is omitted when no compact
+    snapshots are available.
+- `stage_metrics`: full returned stage snapshots, including any per-token
+    timing arrays, only with `--save-detailed`. Missing snapshots use `{}`.
+    This field supplements rather than replaces `request_stage_metrics`.
+
+Both arrays follow the formal input request order, retain entries for failed
+requests, and exclude warmup requests. Saving snapshots does not create
+metrics that the server did not return. An explicit
+`extra_body.return_stage_metrics=false` is preserved.
 
 - `--result-dir`
  "Specify directory to save benchmark json results."

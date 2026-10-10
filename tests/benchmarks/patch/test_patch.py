@@ -120,6 +120,7 @@ class MockResponse:
 
     def __init__(self, status, chunks, delay_between_chunks=0):
         self.status = status
+        self.headers: dict[str, str] = {}
         self.reason = "OK" if status == 200 else "Error"
         self._chunks = chunks
         self._delay = delay_between_chunks
@@ -136,6 +137,111 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+def test_request_stage_metrics_preserve_request_alignment():
+    first = MixRequestFuncOutput(
+        stage_metrics={
+            "0": {
+                "stage_id": 0,
+                "stage_gen_time_ms": 12.5,
+            }
+        }
+    )
+    missing = MixRequestFuncOutput(stage_metrics=None)
+    multiple = MixRequestFuncOutput(
+        stage_metrics={
+            "0": {"stage_id": 0},
+            "1": {"stage_id": 1},
+        }
+    )
+
+    assert patch._request_stage_metrics([first, missing, multiple]) == [
+        {
+            "0": {
+                "stage_id": 0,
+                "stage_gen_time_ms": 12.5,
+            }
+        },
+        {},
+        {
+            "0": {"stage_id": 0},
+            "1": {"stage_id": 1},
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "daily-omni",
+        "openai-chat-omni",
+        "openai-image-edits-omni",
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/videos",
+    ],
+)
+def test_save_detailed_requests_stage_metrics(backend):
+    args = SimpleNamespace(
+        print_stage=False,
+        save_detailed=True,
+        backend=backend,
+        extra_body={},
+    )
+
+    assert patch.should_request_stage_metrics(args) is True
+
+
+def test_save_detailed_does_not_request_stage_metrics_for_unsupported_backend():
+    args = SimpleNamespace(
+        print_stage=False,
+        save_detailed=True,
+        backend="openai",
+        percentile_metrics=(),
+        extra_body={},
+    )
+
+    assert patch.should_request_stage_metrics(args) is False
+
+
+def test_save_detailed_preserves_explicit_stage_metrics_opt_out():
+    extra_body = {"return_stage_metrics": False, "temperature": 0.0}
+    args = SimpleNamespace(
+        print_stage=False,
+        save_detailed=True,
+        backend="openai-chat-omni",
+        extra_body=extra_body,
+    )
+
+    actual = patch.maybe_enable_stage_metrics(extra_body, enabled=patch.should_request_stage_metrics(args))
+
+    assert actual == {"return_stage_metrics": False, "temperature": 0.0}
+    assert actual is not extra_body
+    assert extra_body == {"return_stage_metrics": False, "temperature": 0.0}
+
+
+def test_detailed_stage_metrics_are_opt_in():
+    outputs = [
+        MixRequestFuncOutput(stage_metrics={"0": {"stage_id": 0}}),
+        MixRequestFuncOutput(stage_metrics=None),
+    ]
+
+    result: dict[str, object] = {}
+    patch.set_save_detailed(False)
+    patch._add_detailed_stage_metrics(result, outputs)
+    assert "stage_metrics" not in result
+
+    patch.set_save_detailed(True)
+    try:
+        patch._add_detailed_stage_metrics(result, outputs)
+    finally:
+        patch.set_save_detailed(False)
+
+    assert result["stage_metrics"] == [
+        {"0": {"stage_id": 0}},
+        {},
+    ]
 
 
 @pytest.mark.asyncio
@@ -2091,7 +2197,8 @@ def test_get_samples_forwards_upstream_multimodal_backends_kwarg(mocker: MockerF
 
 
 @pytest.mark.asyncio
-async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snapshots(monkeypatch):
+@pytest.mark.parametrize("save_detailed", [False, True])
+async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snapshots(monkeypatch, save_detailed):
     """Persist compact formal-request snapshots in input order, excluding warmups and retaining gaps."""
     second_finished = asyncio.Event()
     completion_order = []
@@ -2128,6 +2235,7 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
         )
 
     monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "test-stage-metrics", request_func)
+    monkeypatch.setattr(patch, "_SAVE_DETAILED", save_detailed)
     result = await patch.benchmark(
         task_type=patch.TaskType.GENERATION,
         endpoint_type="test-stage-metrics",
@@ -2158,6 +2266,13 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
     )
     assert completion_order.index(1) < completion_order.index(0)
     assert result["request_stage_metrics"] == expected
+    if save_detailed:
+        assert result["stage_metrics"] == snapshots
+        serialized = json.loads(json.dumps(result))
+        assert serialized["request_stage_metrics"] == expected
+        assert serialized["stage_metrics"] == snapshots
+    else:
+        assert "stage_metrics" not in result
 
 
 @pytest.mark.parametrize("snapshot", [None, {}, "not-a-dict"])
