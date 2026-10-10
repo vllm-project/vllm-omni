@@ -618,12 +618,11 @@ class DiffusionEngine:
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
-            if self._scheduling_paused:
-                # No wave runs while paused, so requests finished by an abort
-                # would otherwise wait for the resume to surface.
-                with self._cv:
-                    pending_finished = self.scheduler.pending_finished_request_ids()
-                self._emit_finished_outputs(pending_finished, None)
+            # Aborting the last request can leave no runnable wave, even when
+            # scheduling is not paused. Deliver its terminal output before idle.
+            with self._cv:
+                pending_finished = self.scheduler.pending_finished_request_ids()
+            self._emit_finished_outputs(pending_finished, None)
 
             with self._cv:
                 while (
@@ -1647,6 +1646,10 @@ class DiffusionEngine:
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        if getattr(self, "execution_mode", None) == DiffusionExecutionMode.STEP_BATCH and request_ids:
+            # Abort processing is serialized with execution. There may never be
+            # another scheduler wave to deliver finished_req_ids to the runner.
+            self.executor.collective_rpc("release_step_requests", args=(request_ids,))
         self._remove_diffusion_kv_requests(request_ids)
 
     def _finalize_finished_request(

@@ -748,6 +748,13 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def release_step_requests(self, request_ids: list[str]) -> None:
+        """Retire cancelled step state at the serialized worker-call boundary."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.release_step_requests(request_ids)
+        for request_id in request_ids:
+            self._step_lora_state.pop(request_id, None)
+
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
 
