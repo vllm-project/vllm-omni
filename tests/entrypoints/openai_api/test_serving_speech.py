@@ -455,6 +455,81 @@ class TestSpeechAPI:
             "X-VLLM-OMNI-INPUT-AUDIO-TOKENS": "4",
         }
 
+    @staticmethod
+    def _usage_tokenizer_server(trust_remote_code: bool, skip_tokenizer_init: bool = False) -> OmniOpenAIServingSpeech:
+        server = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+        server._tts_tokenizer = None
+        server.engine_client = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="org/no-hf-tokenizer",
+                trust_remote_code=trust_remote_code,
+                skip_tokenizer_init=skip_tokenizer_init,
+            )
+        )
+        return server
+
+    def test_usage_tokenizer_failure_is_not_retried_per_request(self, mocker: MockerFixture):
+        from_pretrained = mocker.patch(
+            "transformers.AutoTokenizer.from_pretrained", side_effect=ValueError("no tokenizer files")
+        )
+        server = self._usage_tokenizer_server(trust_remote_code=False)
+
+        counts = [server._count_usage_text_tokens("some lyrics") for _ in range(3)]
+
+        assert counts == [0, 0, 0]
+        assert from_pretrained.call_count == 1
+
+    @pytest.mark.parametrize("trust_remote_code", [False, True])
+    def test_usage_tokenizer_follows_server_trust_remote_code(self, mocker: MockerFixture, trust_remote_code: bool):
+        from_pretrained = mocker.patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=lambda text, padding=False: {"input_ids": text.split()},
+        )
+        server = self._usage_tokenizer_server(trust_remote_code=trust_remote_code)
+
+        assert server._count_usage_text_tokens("one two three") == 3
+        assert server._count_usage_text_tokens("four five") == 2
+        from_pretrained.assert_called_once_with("org/no-hf-tokenizer", trust_remote_code=trust_remote_code)
+
+    def test_usage_tokenizer_is_not_loaded_when_the_engine_skips_tokenizer_init(self, mocker: MockerFixture):
+        from_pretrained = mocker.patch("transformers.AutoTokenizer.from_pretrained")
+        server = self._usage_tokenizer_server(trust_remote_code=False, skip_tokenizer_init=True)
+
+        assert [server._count_usage_text_tokens("some lyrics") for _ in range(2)] == [0, 0]
+        from_pretrained.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("loads", "text_tokens"),
+        [pytest.param(True, "2", id="fallback-loads"), pytest.param(False, "0", id="fallback-fails")],
+    )
+    def test_usage_header_from_the_fallback_tokenizer(
+        self, test_app, client, mocker: MockerFixture, loads: bool, text_tokens: str
+    ):
+        """A model that never sets ``_tts_tokenizer`` gets its text count from the fallback, loaded once."""
+        if loads:
+            from_pretrained = mocker.patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=lambda text, padding=False: {"input_ids": text.split()},
+            )
+        else:
+            from_pretrained = mocker.patch(
+                "transformers.AutoTokenizer.from_pretrained", side_effect=ValueError("no tokenizer files")
+            )
+        speech_server = test_app.state.openai_serving_speech
+        speech_server._tts_tokenizer = None
+        model_config = speech_server.engine_client.model_config
+        model_config.model = "tts-model"
+        model_config.trust_remote_code = False
+        model_config.skip_tokenizer_init = False
+        payload = {"input": "Hello world", "model": "tts-model", "voice": "alloy", "response_format": "wav"}
+
+        for _ in range(2):
+            response = client.post("/v1/audio/speech", json=payload)
+            assert response.status_code == 200
+            assert response.headers["x-vllm-omni-input-text-tokens"] == text_tokens
+
+        from_pretrained.assert_called_once_with("tts-model", trust_remote_code=False)
+
     def test_create_speech_mp3_format(self, client):
         payload = {
             "input": "Hello world",
