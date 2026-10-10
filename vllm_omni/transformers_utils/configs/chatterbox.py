@@ -95,3 +95,28 @@ class ChatterboxConfig(PretrainedConfig):
             self.n_cfm_timesteps = 10
             self.t3_weights = "t3_cfg.safetensors"
             self.s3gen_weights = "s3gen.safetensors"
+
+    def update(self, config_dict: dict) -> None:
+        """Apply variant defaults before vLLM's post-construction field overrides."""
+        variant = config_dict.get("variant", self.variant)
+        if variant != self.variant:
+            defaults = ChatterboxConfig(variant)
+            for name in (
+                "vocab_size",
+                "speech_vocab_size",
+                "text_vocab_size",
+                "num_hidden_layers",
+                "max_position_embeddings",
+                "activation_function",
+                "cond_prompt_len",
+                "enc_cond_seconds",
+                "min_ref_seconds",
+                "loudness_target_lufs",
+                "n_silence_tokens",
+                "meanflow",
+                "n_cfm_timesteps",
+                "t3_weights",
+                "s3gen_weights",
+            ):
+                setattr(self, name, getattr(defaults, name))
+        super().update(config_dict)

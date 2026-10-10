@@ -46,3 +46,26 @@ def test_survives_a_config_json_round_trip_001() -> None:
     )
     assert (cfg.vocab_size, cfg.text_vocab_size) == (6563, 50276)
     assert cfg.architectures == ["ChatterboxForConditionalGeneration"]
+
+
+@pytest.mark.parametrize("variant", ["turbo", "original"])
+def test_post_construction_variant_override_matches_constructor(variant):
+    config = ChatterboxConfig("original" if variant == "turbo" else "turbo")
+    config.update({"variant": variant})
+    assert config.to_dict() == ChatterboxConfig(variant).to_dict()
+
+
+def test_variant_override_preserves_explicit_field_overrides():
+    config = ChatterboxConfig()
+    config.update({"variant": "original", "max_position_embeddings": 2048})
+    assert config.t3_weights == "t3_cfg.safetensors"
+    assert config.num_hidden_layers == 30
+    assert config.max_position_embeddings == 2048
+
+
+def test_invalid_variant_override_does_not_change_config():
+    config = ChatterboxConfig()
+    before = config.to_dict()
+    with pytest.raises(ValueError, match="variant"):
+        config.update({"variant": "multilingual"})
+    assert config.to_dict() == before
