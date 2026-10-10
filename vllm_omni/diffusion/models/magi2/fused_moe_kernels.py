@@ -264,15 +264,35 @@ def invoke_fused_moe_bf16(
     )
 
 
-def global_sort_routes(
+@triton.jit
+def _route_gather_kernel(
+    order_ptr,
+    probs_ptr,
+    gather_ids_ptr,
+    sorted_probs_ptr,
+    num_routes,
+    routes_per_head,
+    top_k,
+    block: tl.constexpr,
+):
+    """Materialize the CSR payload from a permutation without a token index buffer."""
+
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    mask = offsets < num_routes
+    source = tl.load(order_ptr + offsets, mask=mask, other=0)
+    # The pre-sort layout is [head, token, route], so the token id of a flat
+    # position is implied by the position itself.
+    tl.store(gather_ids_ptr + offsets, ((source % routes_per_head) // top_k).to(tl.int32), mask=mask)
+    tl.store(sorted_probs_ptr + offsets, tl.load(probs_ptr + source, mask=mask, other=0.0), mask=mask)
+
+
+def _reference_global_sort_routes(
     topk_probs: torch.Tensor,
     topk_indices: torch.Tensor,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert per-head routes into a stable flattened-expert CSR layout."""
+    """Unfused reference layout builder.  Kept as the oracle for the fast path."""
 
-    if topk_probs.shape != topk_indices.shape or topk_indices.ndim != 3:
-        raise ValueError("top-k probabilities and indices must have the same [H,S,K] shape")
     heads, sequence, top_k = topk_indices.shape
     device = topk_indices.device
     head_offset = torch.arange(heads, device=device).view(heads, 1, 1) * num_experts
@@ -285,6 +305,54 @@ def global_sort_routes(
     counts = torch.bincount(flattened_experts, minlength=heads * num_experts)
     offsets = torch.zeros(heads * num_experts + 1, device=device, dtype=torch.long)
     offsets[1:] = counts.cumsum(0)
+    return gather_ids, sorted_probs, offsets
+
+
+def global_sort_routes(
+    topk_probs: torch.Tensor,
+    topk_indices: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert per-head routes into a stable flattened-expert CSR layout.
+
+    Bit-identical to :func:`_reference_global_sort_routes`, but the flattened
+    expert keys are sorted in the narrowest integer type that holds them, the
+    token ids are derived from the permutation instead of being gathered from a
+    materialized index tensor, and the CSR offsets come from a binary search
+    over the sorted keys rather than from ``torch.bincount``, which synchronizes.
+    """
+
+    if topk_probs.shape != topk_indices.shape or topk_indices.ndim != 3:
+        raise ValueError("top-k probabilities and indices must have the same [H,S,K] shape")
+    heads, sequence, top_k = topk_indices.shape
+    device = topk_indices.device
+    flat_experts = heads * num_experts
+    if not topk_indices.is_cuda or sequence == 0:
+        return _reference_global_sort_routes(topk_probs, topk_indices, num_experts)
+
+    # int16 halves the radix-sort key traffic and is exact while the largest
+    # flattened expert id stays inside a signed 16-bit value.
+    key_dtype = torch.int16 if flat_experts <= torch.iinfo(torch.int16).max else torch.int32
+    head_offset = torch.arange(heads, device=device, dtype=key_dtype).view(heads, 1, 1) * num_experts
+    keys = (topk_indices.to(key_dtype) + head_offset).reshape(-1)
+    sorted_keys, order = torch.sort(keys, stable=True)
+
+    num_routes = order.numel()
+    gather_ids = torch.empty(num_routes, device=device, dtype=torch.int32)
+    sorted_probs = torch.empty(num_routes, device=device, dtype=torch.float32)
+    block = 1024
+    _route_gather_kernel[(triton.cdiv(num_routes, block),)](
+        order,
+        topk_probs.reshape(-1).contiguous(),
+        gather_ids,
+        sorted_probs,
+        num_routes,
+        sequence * top_k,
+        top_k,
+        block,
+    )
+    bounds = torch.arange(flat_experts + 1, device=device, dtype=key_dtype)
+    offsets = torch.searchsorted(sorted_keys, bounds)
     return gather_ids, sorted_probs, offsets
 
 
