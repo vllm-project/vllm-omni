@@ -151,6 +151,22 @@ class VoiceConditioning:
     prompt_feat: torch.Tensor
     embedding: torch.Tensor
 
+    @classmethod
+    def from_builtin(cls, model: str) -> "VoiceConditioning":
+        """Load the checkpoint's built-in voice without constructing encoders."""
+        model_dir = model
+        if not os.path.isdir(model):
+            model_dir = hf_api().snapshot_download(model, allow_patterns=["conds.pt"])
+        conditionals = torch.load(os.path.join(model_dir, "conds.pt"), map_location="cpu", weights_only=True)
+        t3, gen = conditionals["t3"], conditionals["gen"]
+        return cls(
+            cond_tokens=t3["cond_prompt_speech_tokens"],
+            speaker_emb=t3["speaker_emb"],
+            prompt_token=gen["prompt_token"],
+            prompt_feat=gen["prompt_feat"],
+            embedding=gen["embedding"],
+        )
+
     def additional_information(self, text_ids: list[int]) -> dict:
         """The request payload: stage 0's prompt and stage 1's reference.
 

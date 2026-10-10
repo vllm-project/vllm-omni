@@ -67,6 +67,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # Every dedicated TTS model-type must have an adapter so the orchestrator's
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
+    "chatterbox",
     "qwen3_tts",
     "voxcpm2",
     "voxtral_tts",
