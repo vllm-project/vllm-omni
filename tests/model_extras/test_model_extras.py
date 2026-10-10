@@ -19,7 +19,9 @@ from vllm_omni.model_extras import (
     get_extra_body_params,
     get_extra_output_params,
     get_output_tensor_range,
+    get_reference_image_resizer,
     get_x_to_text_model_family,
+    resize_reference_images,
     should_init_extra_args_for_non_diffusion_stages,
     should_preserve_reference_image_size,
 )
@@ -298,6 +300,106 @@ def test_minimax_h3_preserves_reference_image_size(model_class_name: str) -> Non
         model_class_name,
         model="MiniMaxAI/MiniMax-H3",
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_default_reference_image_resizer_resamples_to_requested_box() -> None:
+    image = Image.new("RGB", (48, 32))
+
+    resized = resize_reference_images(
+        "UnregisteredPipeline",
+        image,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert isinstance(resized, Image.Image)
+    assert resized.size == (96, 64)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_default_reference_image_resizer_preserves_list_shape() -> None:
+    images = [Image.new("RGB", (48, 32)), Image.new("RGB", (96, 64))]
+
+    resized = resize_reference_images(
+        "UnregisteredPipeline",
+        images,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert isinstance(resized, list)
+    assert [image.size for image in resized] == [(96, 64), (96, 64)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_reference_image_resizer_hook_owns_geometry() -> None:
+    # LingBot-Video declares the passthrough hook: its pipeline applies its own
+    # aspect-preserving resize + crop, so the shared layer must not pre-stretch.
+    image = Image.new("RGB", (48, 32))
+
+    resized = resize_reference_images(
+        "LingBotVideoPipeline",
+        image,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert resized is image
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_reference_image_resizer_is_resolved_once_not_per_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Resolving a bare model reference reads the checkpoint's metadata. A server
+    # preparing one reference image per request must not pay that on every
+    # request, so the policy is resolved once and the bound resizer reused.
+    lookups: list[tuple[str, str | None]] = []
+
+    def fake_resolve(model: str, revision: str | None = None) -> str:
+        lookups.append((model, revision))
+        return "UnregisteredPipeline"
+
+    monkeypatch.setattr("vllm_omni.diffusion.data.resolve_model_class_name", fake_resolve)
+    image = Image.new("RGB", (48, 32))
+
+    for _ in range(3):
+        resize_reference_images(None, image, width=96, height=64, model="org/model")
+    assert len(lookups) == 3
+
+    lookups.clear()
+    resizer = get_reference_image_resizer(None, model="org/model")
+    for _ in range(3):
+        assert resizer(image, width=96, height=64).size == (96, 64)
+    assert lookups == [("org/model", None)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_reference_image_resizer_honours_legacy_preserve_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Models still declaring only the boolean reference_image_size_resolver keep
+    # working: an opt-in resolver passes the raw image through.
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_components.preserves_reference_image_size",
+        lambda *, model, revision=None: True,
+    )
+    image = Image.new("RGB", (48, 32))
+
+    resized = resize_reference_images(
+        "LTX2Pipeline",
+        image,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert resized is image
 
 
 @pytest.mark.core_model
