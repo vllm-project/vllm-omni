@@ -23,8 +23,8 @@ class MoTRMSNorm(CustomOp):
     with ``self.weight`` – exactly like a vanilla RMSNorm.
 
     In *gen* mode, text tokens are normalised with ``self.weight`` and
-    gen tokens are normalised with ``self.gen_weight``, using a single
-    fused Triton kernel that avoids the gather / scatter overhead.
+    gen tokens are normalised with ``self.gen_weight``. CUDA uses a fused
+    Triton kernel; NPU uses the fused CANN RMSNorm operator for each subset.
     """
 
     def __init__(
@@ -86,7 +86,7 @@ class MoTRMSNorm(CustomOp):
         )
 
     # ------------------------------------------------------------------
-    # NPU fast-path (not implemented yet; reserved for future optimization)
+    # NPU fast-path (fused CANN RMSNorm operator)
     # ------------------------------------------------------------------
     def forward_npu(
         self,
@@ -94,7 +94,15 @@ class MoTRMSNorm(CustomOp):
         text_indices: torch.Tensor | None = None,
         vae_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.forward_native(x, text_indices, vae_indices)
+        if text_indices is None:
+            return self._rms_norm_npu(x, self.weight)
+
+        output = torch.empty_like(x)
+        if text_indices.numel() > 0:
+            output[text_indices] = self._rms_norm_npu(x[text_indices], self.weight)
+        if vae_indices.numel() > 0:
+            output[vae_indices] = self._rms_norm_npu(x[vae_indices], self.gen_weight)
+        return output
 
     # ------------------------------------------------------------------
     # Helpers
@@ -105,6 +113,16 @@ class MoTRMSNorm(CustomOp):
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         return (x * weight.float()).to(orig_dtype)
+
+    def _rms_norm_npu(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # Use the fused CANN operator to replace the native Pow/ReduceMean/rsqrt
+        # sequence. The NPU operator requires gamma to match the input dtype.
+        import torch_npu
+
+        if weight.dtype != x.dtype or weight.device != x.device:
+            weight = weight.to(device=x.device, dtype=x.dtype)
+        normalized, _ = torch_npu.npu_rms_norm(x, weight, epsilon=self.variance_epsilon)
+        return normalized
 
     def extra_repr(self) -> str:
         return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
