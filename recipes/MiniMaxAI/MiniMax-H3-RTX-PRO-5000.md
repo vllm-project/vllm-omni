@@ -1,11 +1,10 @@
 # MiniMax-H3 on RTX PRO 5000 Blackwell GPUs
 
 This recipe runs MiniMax-H3 in BF16 on 72 GiB RTX PRO 5000 Blackwell GPUs. It
-contains the two-GPU DLO configuration validated before SM120 exact VAE ops
-and the recommended resident configurations: TP1 x Ulysses2 with 20 resident
-layers on two GPUs, TP2 x
-Ulysses2 on four GPUs, and TP4 x Ulysses2 on eight GPUs. The four- and
-eight-GPU routes do not require offload.
+contains the two-GPU DLO configuration and the four- and eight-GPU resident
+configurations, all validated before SM120 exact VAE ops: TP1 x Ulysses2 with
+20 resident layers on two GPUs, TP2 x Ulysses2 on four GPUs, and TP4 x
+Ulysses2 on eight GPUs. The four- and eight-GPU routes do not require offload.
 
 ## Capacity requirements
 
@@ -79,9 +78,10 @@ vllm serve "${MODEL}" \
 
 ### Four GPUs
 
-The validated baseline uses TP2 x Ulysses2, text-encoder TP4, VAE patch
-parallelism 4, and explicit cuDNN BF16 attention. Selecting the backend
-explicitly keeps the recipe independent of platform-default backend changes.
+The baseline validated before SM120 exact VAE ops uses TP2 x Ulysses2,
+text-encoder TP4, VAE patch parallelism 4, and explicit cuDNN BF16 attention.
+Selecting the backend explicitly keeps the recipe independent of
+platform-default backend changes.
 
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
@@ -110,8 +110,9 @@ vllm serve "${MODEL}" \
 
 ### Eight GPUs
 
-The recommended eight-GPU route uses TP4 x Ulysses2, text-encoder TP8, VAE
-patch parallelism 8, and host-memory interleaving across both NUMA nodes.
+The eight-GPU route validated before SM120 exact VAE ops uses TP4 x
+Ulysses2, text-encoder TP8, VAE patch parallelism 8, and host-memory
+interleaving across both NUMA nodes.
 
 ```bash
 export MODEL_ROOT=/path/to/MiniMax-H3
