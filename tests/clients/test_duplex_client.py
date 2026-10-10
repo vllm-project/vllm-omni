@@ -1555,3 +1555,71 @@ def test_event_collector_response_text_joins_deltas_per_response():
     assert collector.response_text("r1") == "hello"
     assert collector.response_text("r2") == "other"
     assert collector.response_text("r3") == ""
+
+
+async def test_trace_captures_handshake_send_receive_and_replay_without_changing_delivery():
+    from vllm_omni.clients.duplex_trace import DuplexTrace
+
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    trace = DuplexTrace()
+    client, _ = make_client(sock, trace=trace)
+    async with client:
+        await client.send({"type": "input_audio_buffer.append", "audio": "SECRET"})
+        sock.feed({"type": "response.created", "response": {"id": "r1"}, "server_event_seq": 2})
+        done = {"type": "response.done", "response_id": "r1", "server_event_seq": 3}
+        sock.feed(done)
+        sock.feed(done)  # wire trace retains replay even though delivery deduplicates it
+        sock.feed(SESSION_CLOSED)
+        received = [event.type async for event in client.events()]
+    assert received.count("response.done") == 1
+    snapshot = trace.snapshot()
+    counts = snapshot["event_counts"]
+    assert counts["send:session.update"] == 1
+    assert counts["receive:session.created"] == 1
+    assert counts["send:input_audio_buffer.append"] == 1
+    assert counts["send:session.event_ack"] == 2
+    assert counts["receive:response.done"] == 2
+    assert counts["receive:session.closed"] == 1
+    assert "SECRET" not in json.dumps(snapshot)
+    assert "tok-1" not in json.dumps(snapshot)
+
+
+async def test_trace_captures_resume_handshake_and_pending_events_once():
+    from vllm_omni.clients.duplex_trace import DuplexTrace
+
+    first, second = FakeSocket(), FakeSocket()
+    first.feed(SESSION_CREATED)
+    second.feed({"type": "response.created", "response": {"id": "r1"}, "server_event_seq": 2})
+    second.feed({"type": "session.resumed", "session": {"id": SESSION_ID}})
+    second.feed(SESSION_CLOSED)
+    trace = DuplexTrace()
+    client, _ = make_client(first, second, trace=trace, reconnect=ReconnectPolicy(backoff_s=(0, 0)))
+    async with client:
+        first.feed(ConnectionError("dropped"))
+        received = [event.type async for event in client.events()]
+    assert "connection.resumed" in received
+    counts = trace.snapshot()["event_counts"]
+    assert counts["send:session.resume"] == 1
+    assert counts["receive:session.resumed"] == 1
+    assert counts["receive:response.created"] == 1
+    assert "receive:connection.resumed" not in counts  # synthetic, not a wire event
+    assert "tok-1" not in json.dumps(trace.snapshot())
+
+
+async def test_trace_does_not_report_failed_send_as_success():
+    from vllm_omni.clients.duplex import DuplexConnectionError
+    from vllm_omni.clients.duplex_trace import DuplexTrace
+
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    trace = DuplexTrace()
+    client, _ = make_client(sock, trace=trace)
+    async with client:
+        sock.closed = True
+        with pytest.raises(DuplexConnectionError):
+            await client.send({"type": "response.cancel"})
+        sock.feed(SESSION_CLOSED)
+        async for _ in client.events():
+            pass
+    assert "send:response.cancel" not in trace.snapshot()["event_counts"]
