@@ -131,6 +131,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
         submitted: asyncio.Future[None] | None = None,
+        entry_stage_id: int = 0,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -157,6 +158,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            entry_stage_id: Stage the request is submitted to; > 0 bypasses
+                stage 0 and leaves the prompt raw for that stage. Streaming
+                prompts always enter at stage 0.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -292,6 +296,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    entry_stage_id=entry_stage_id,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             submit_ts = time.time()

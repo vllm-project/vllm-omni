@@ -22,6 +22,7 @@ import janus
 import torch
 from vllm import envs as vllm_envs
 from vllm.logger import init_logger
+from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
@@ -68,6 +69,7 @@ from vllm_omni.engine.stage_runtime import (
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.preprocess import build_omni_renderer
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
@@ -290,6 +292,7 @@ class OmniEngineBase:
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
+        self._entry_stage_renderers: dict[int, BaseRenderer] = {}  # see get_stage_renderer
         self.prompt_transform_func: Any | None = None
         self.prompt_expand_func: Any | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
@@ -403,6 +406,10 @@ class OmniEngineBase:
             if self.stage_vllm_configs and self.stage_vllm_configs[0] is not None
             else None
         )
+        if self.stage_configs and getattr(self.stage_configs[0], "bypass_without_modalities", ()):
+            # Chat requests that bypass stage 0 are rendered for stage 1; the
+            # orchestrator runs their multimodal processing.
+            self._entry_stage_renderers[1] = build_omni_renderer(self.stage_vllm_configs[1])
         self.prompt_transform_func = (
             getattr(self.stage_clients[0], "prompt_transform_func", None) if self.stage_clients else None
         )
@@ -999,6 +1006,10 @@ class OmniEngineBase:
         if msg is None and not self.is_alive():
             raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
         return msg
+
+    def get_stage_renderer(self, stage_id: int) -> BaseRenderer:
+        """Return the renderer for chat requests that bypass stage 0 and enter at ``stage_id``."""
+        return self._entry_stage_renderers[stage_id]
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""

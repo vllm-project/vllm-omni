@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import janus
 import pytest
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -1105,6 +1106,39 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
         assert queues[1].sync_q.empty()
         assert state.request_id not in orchestrator.request_states
         assert all(pool.get_bound_replica_id(state.request_id) is None for pool in orchestrator.stage_pools)
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_input_rejected_by_next_stage_is_request_scoped() -> None:
+    """A forwarded prompt that fails the next stage's own validation (here more tokens
+    than it accepts) fails only that request instead of escaping the orchestrator loop."""
+
+    def process_inputs(**kwargs):
+        raise VLLMValidationError("The decoder prompt is longer than the maximum model length of 16384.")
+
+    stage1 = FakeStageClient(
+        final_output=True, next_inputs=[{"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}]
+    )
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient()], [stage1]]))
+    orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
+    state = OrchestratorRequestState(
+        request_id="too-long",
+        prompt={"prompt_token_ids": [1]},
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    orchestrator.request_states[state.request_id] = state
+    try:
+        await orchestrator._route_output(0, 0, _build_request_output(state.request_id), state, stage_metrics=None)
+
+        error = queues[1].sync_q.get_nowait()
+        assert isinstance(error, ErrorMessage)
+        assert (error.request_id, error.stage_id, error.status_code, error.fatal) == ("too-long", 1, 400, False)
+        assert stage1.add_request_calls == []
+        assert state.request_id not in orchestrator.request_states
     finally:
         for q in queues:
             q.close()

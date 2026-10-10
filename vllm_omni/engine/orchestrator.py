@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 import janus
 import torch
 from vllm.config import ModelConfig
+from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
@@ -39,6 +40,7 @@ from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, scope_stage_replica_mm_uuids
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
@@ -203,6 +205,8 @@ class OrchestratorRequestState:
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
+    # Stage the request was admitted to; > 0 when the stages before it are bypassed.
+    entry_stage_id: int = 0
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
@@ -2011,6 +2015,58 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
+    def _scope_stage_mm_cache_to_replica(self, req_id: str, stage_id: int, prompt: Any) -> Any:
+        """Bind the receiving replica before multimodal processing and return the prompt with
+        its cache keys scoped to it."""
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
+            return prompt
+        pool = self.stage_pools[stage_id]
+        if pool.live_num_replicas <= 1:
+            return prompt
+        replica_id = pool.preselect_replica_id(req_id)
+        if replica_id is None:
+            # No serviceable replica yet (distributed mode): unscoped keys could let the
+            # sender omit media for the replica that ends up receiving the request.
+            raise StageUnavailableError(f"stage {stage_id} has no serviceable replica to bind")
+        model_config = getattr(pool.stage_vllm_config, "model_config", None)
+        mm_config = getattr(model_config, "multimodal_config", None)
+        scoped = [
+            scope_stage_replica_mm_uuids(
+                item,
+                stage_id=stage_id,
+                replica_id=replica_id,
+                model_id=str(getattr(model_config, "model", "")),
+                mm_hasher_algorithm=getattr(mm_config, "mm_hasher_algorithm", None) or "blake3",
+            )
+            for item in prompts
+        ]
+        return scoped if isinstance(prompt, list) else scoped[0]
+
+    def _build_entry_stage_request(
+        self,
+        req_id: str,
+        stage_id: int,
+        prompt: Any,
+        req_state: OrchestratorRequestState,
+        lora_request: Any = None,
+    ) -> Any:
+        """Process a bypassing request's raw prompt with the input processor that also prepares the
+        prompts forwarded to this stage, so the stage keeps a single multimodal cache sender."""
+        prompt = self._scope_stage_mm_cache_to_replica(req_id, stage_id, prompt)
+        processor = self._get_stage_input_processor(stage_id)
+        request = processor.process_inputs(
+            request_id=req_id,
+            prompt=prompt,
+            params=req_state.sampling_params_list[stage_id],
+            supported_tasks=("generate",),
+            arrival_time=req_state.request_timestamp,
+            lora_request=lora_request,
+        )
+        request = self._upgrade_processed_stage_request(request, prompt)
+        request.external_req_id = req_id
+        return apply_omni_final_stage_metadata(request, req_state.final_stage_id)
+
     def _next_stage_input_is_tokens(self, next_input: Any) -> bool:
         return isinstance(next_input, dict) and "prompt_token_ids" in next_input
 
@@ -2039,6 +2095,7 @@ class OrchestratorBase:
             request.payload_sender_info = payload_sender_info
             return request
 
+        next_input = self._scope_stage_mm_cache_to_replica(req_id, next_stage_id, next_input)
         processor = self._get_stage_input_processor(next_stage_id)
         # A pooling stage is driven by PoolingParams; vLLM validates them against
         # the stage's supported tasks, so advertise the model's pooling tasks (or
@@ -2604,15 +2661,27 @@ class OrchestratorBase:
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             model_stage = getattr(getattr(next_pool.stage_vllm_config, "model_config", None), "model_stage", None)
             mm_features = req_state.mm_features if model_stage == "thinker" else None
-            request = self._build_next_stage_request(
-                req_id,
-                next_logical,
-                next_input,
-                params=params,
-                mm_features=mm_features,
-                resumable=next_stage_resumable,
-                payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
-            )
+            try:
+                request = self._build_next_stage_request(
+                    req_id,
+                    next_logical,
+                    next_input,
+                    params=params,
+                    mm_features=mm_features,
+                    resumable=next_stage_resumable,
+                    payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
+                )
+            except (ValueError, VLLMClientError) as exc:
+                # The forwarded input failed this stage's own validation (e.g. more
+                # visual tokens than it accepts), which stage 0 would have rejected
+                # at admission: fail only this request, as the bypass entry does.
+                logger.warning(
+                    "[Orchestrator] req=%s: stage-%s rejected the forwarded input: %s", req_id, next_logical, exc
+                )
+                await self._fail_request_client_error(
+                    req_id, next_logical, str(exc), release_owners=req_state.session_owned
+                )
+                return
 
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
@@ -2639,19 +2708,20 @@ class OrchestratorBase:
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
-        stage0_request: Any,
+        entry_request: Any,
         req_state: OrchestratorRequestState,
     ) -> bool:
-        """Pre-submit downstream stages for async-chunk mode.
+        """Pre-submit the stages after the request's entry stage for async-chunk mode.
 
         Returns False when the request was failed and cleaned up in here, so a
         caller still holding ``req_state`` stops instead of recording state on
         an object the cleanup already popped from ``request_states``.
         """
-        if req_state.final_stage_id <= 0:
+        entry_stage_id = req_state.entry_stage_id
+        if req_state.final_stage_id <= entry_stage_id:
             return True
 
-        prompt_token_ids = getattr(stage0_request, "prompt_token_ids", None)
+        prompt_token_ids = getattr(entry_request, "prompt_token_ids", None)
         if prompt_token_ids is None:
             # R1.3 of #4855. Skipping the prewarm leaves every downstream stage
             # unsubmitted, so the request produces no output and no error -- it
@@ -2667,20 +2737,20 @@ class OrchestratorBase:
             # either. This is the same shape `_handle_stage_error` uses for a
             # request-scoped client error.
             logger.error(
-                "[Orchestrator] req=%s: async_chunk prewarm needs stage0 prompt_token_ids "
+                "[Orchestrator] req=%s: async_chunk prewarm needs entry-stage prompt_token_ids "
                 "and none were provided; failing the request",
                 request_id,
             )
             await self._fail_request_client_error(
                 request_id,
-                0,
-                "async_chunk requires prompt_token_ids on the stage-0 request; "
+                entry_stage_id,
+                "async_chunk requires prompt_token_ids on the entry-stage request; "
                 "an embeds-only prompt cannot prewarm downstream stages",
                 release_owners=True,
             )
             return False
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
+        for next_stage_id in range(entry_stage_id + 1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
             if not self._stage_receives_async_chunks(next_stage_id):
@@ -2742,7 +2812,7 @@ class OrchestratorBase:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
-                downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
+                downstream_resumable = bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
@@ -2956,7 +3026,7 @@ class Orchestrator(OrchestratorBase):
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
-        stage_id = 0
+        stage_id = msg.entry_stage_id
         request_id = msg.request_id
         prompt = msg.prompt
         original_prompt = msg.original_prompt
@@ -2967,7 +3037,7 @@ class Orchestrator(OrchestratorBase):
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
         if not self.stage_pools[stage_id].live_replica_ids():
-            # Stage 0 lost all replicas between the HTTP-layer errored check and
+            # The entry stage lost all replicas between the HTTP-layer errored check and
             # dispatch. Runs before request state / running counter registration,
             # so the helper's cleanup is a no-op here.
             await self._fail_request_dead_stage(request_id, stage_id)
@@ -3004,6 +3074,7 @@ class Orchestrator(OrchestratorBase):
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            entry_stage_id=stage_id,
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
@@ -3013,13 +3084,29 @@ class Orchestrator(OrchestratorBase):
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
-        req_state.stage_submit_ts[stage_id] = _time.time()
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+        if stage_id != 0:
+            _t_preprocess = _time.perf_counter()
+            try:
+                prompt = self._build_entry_stage_request(
+                    request_id, stage_id, prompt, req_state, lora_request=msg.lora_request
+                )
+            except StageUnavailableError:
+                await self._fail_request_dead_stage(request_id, stage_id)
+                return
+            except Exception as exc:
+                # Rejected input (too long, invalid media, ...), which the stage-0
+                # path raises before admission: fail only this request.
+                logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
+                await self._fail_request_client_error(request_id, stage_id, str(exc))
+                return
+            req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
+        req_state.stage_submit_ts[stage_id] = _time.time()
         if not await self._dispatch_or_fail_request(
             lambda: self.stage_pools[stage_id].submit_initial(
                 request_id,
@@ -3033,12 +3120,11 @@ class Orchestrator(OrchestratorBase):
         ):
             return
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and final_stage_id > stage_id:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
-        stage_id = 0
         request_id = msg.request_id
         request = msg.prompt
         final_stage_id = msg.final_stage_id
@@ -3056,6 +3142,7 @@ class Orchestrator(OrchestratorBase):
             )
             return
 
+        stage_id = req_state.entry_stage_id
         if msg.sampling_params_list:
             req_state.sampling_params_list = msg.sampling_params_list
 
@@ -3074,7 +3161,7 @@ class Orchestrator(OrchestratorBase):
         ):
             return
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and final_stage_id > stage_id:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:

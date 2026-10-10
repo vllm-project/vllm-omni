@@ -28,6 +28,7 @@ def _make_serving_chat(output_modalities: list[str], stage_configs=None):
         output_modalities=output_modalities,
         errored=False,
         stage_configs=stage_configs or [],
+        resolve_entry_stage_id=lambda input_modalities: 0,
     )
     instance._diffusion_mode = False
     instance.models = MagicMock()

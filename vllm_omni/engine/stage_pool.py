@@ -1019,10 +1019,18 @@ class StagePool:
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
+        # A request bound before submit (preselected for multimodal cache scoping)
+        # must not move: its cache keys name that replica, which may be gone now.
+        preselected = self.get_bound_replica_id(request_id)
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
         )
+        if preselected is not None and replica_id != preselected:
+            self.release_binding(request_id)
+            raise StageUnavailableError(
+                f"stage {self.stage_id} replica {preselected} bound to {request_id} became unavailable before submit"
+            )
         client = self.clients[replica_id]
         if client is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")

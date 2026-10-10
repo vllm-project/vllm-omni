@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stateless request and shutdown helpers for :mod:`async_omni_engine`."""
 
 from __future__ import annotations
@@ -25,6 +28,78 @@ SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
 SHUTDOWN_JOIN_TIMEOUT_S = 30.0
 _WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
 _JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
+
+
+def _iter_multimodal_items(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def scope_stage_replica_mm_uuids(
+    prompt: Any,
+    *,
+    stage_id: int,
+    replica_id: int,
+    model_id: str,
+    mm_hasher_algorithm: str,
+) -> Any:
+    """Return ``prompt`` with its multimodal cache UUIDs scoped to one stage replica, as a
+    shallow copy (see ``AsyncOmniEngine._ensure_stage_replica_mm_uuids``)."""
+
+    if not isinstance(prompt, dict):
+        return prompt
+
+    mm_data = prompt.get("multi_modal_data")
+    if not isinstance(mm_data, dict) or not mm_data:
+        return prompt
+
+    from vllm.multimodal.hasher import MultiModalHasher
+
+    existing_uuids = prompt.get("multi_modal_uuids")
+    if not isinstance(existing_uuids, dict):
+        existing_uuids = {}
+
+    scoped_uuids: dict[str, list[str | None]] = dict(existing_uuids)
+    for modality, raw_items in mm_data.items():
+        items = _iter_multimodal_items(raw_items)
+        if not items:
+            continue
+
+        modality_existing = existing_uuids.get(modality)
+        if not isinstance(modality_existing, list):
+            modality_existing = [modality_existing] if modality_existing is not None else []
+
+        modality_uuids: list[str | None] = []
+        for idx, item in enumerate(items):
+            user_uuid = modality_existing[idx] if idx < len(modality_existing) else None
+            if user_uuid is not None:
+                base_uuid = str(user_uuid)
+            elif item is None:
+                base_uuid = None
+            else:
+                base_uuid = MultiModalHasher.hash_kwargs(
+                    mm_hasher_algorithm,
+                    model_id=model_id,
+                    **{modality: item},
+                )
+
+            if base_uuid is None:
+                modality_uuids.append(None)
+            else:
+                modality_uuids.append(f"stage{stage_id}:rep{replica_id}:{base_uuid}")
+
+        scoped_uuids[modality] = modality_uuids
+
+    if not scoped_uuids:
+        return prompt
+    scoped_prompt = dict(prompt)
+    scoped_prompt["multi_modal_uuids"] = scoped_uuids
+    return scoped_prompt
+
+
 _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"
 _RPC_RESULT_ROUTER_CLOSED_MESSAGES = {
     "RPC result router closed",
@@ -74,6 +149,9 @@ def upgrade_to_omni_request(
         raw_buffer = raw_prompt.get("model_intermediate_buffer")
         if isinstance(raw_info, dict):
             wire_payload = dict(raw_info)
+            # Deferred image/video stays on the original prompt for the orchestrator;
+            # keep it off the wire, where PIL images and video arrays cannot be serialized.
+            wire_payload.pop("deferred_multi_modal_data", None)
         if isinstance(raw_buffer, dict):
             model_intermediate_buffer = raw_buffer
         additional_information = serialize_additional_information(
