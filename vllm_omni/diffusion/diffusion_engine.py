@@ -11,10 +11,11 @@ import os
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from types import AsyncGeneratorType
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import PIL.Image
@@ -231,6 +232,38 @@ class _RpcTask:
 class DiffusionExecutionMode(str, Enum):
     REQUEST_BATCH = "request_batch"
     STEP_BATCH = "step_batch"
+
+
+class _ClosingOutputStream(AsyncGenerator[DiffusionOutput, None]):
+    """Close queue registration even if the underlying generator never starts."""
+
+    def __init__(self, stream: AsyncGenerator[DiffusionOutput, None], on_close: Callable[[], None]) -> None:
+        self._stream = stream
+        self._on_close: Callable[[], None] | None = on_close
+
+    def _release_if_closed(self) -> None:
+        # Distinguish a closed native generator from rejected concurrent use.
+        if cast(AsyncGeneratorType, self._stream).ag_frame is None and self._on_close is not None:
+            on_close, self._on_close = self._on_close, None
+            on_close()
+
+    async def asend(self, value: None) -> DiffusionOutput:
+        try:
+            return await self._stream.asend(value)
+        finally:
+            self._release_if_closed()
+
+    async def athrow(self, *args: Any) -> DiffusionOutput:
+        try:
+            return await self._stream.athrow(*args)
+        finally:
+            self._release_if_closed()
+
+    async def aclose(self) -> None:
+        try:
+            await self._stream.aclose()
+        finally:
+            self._release_if_closed()
 
 
 class DiffusionEngine:
@@ -1158,11 +1191,20 @@ class DiffusionEngine:
         request = self._prepare_request_for_admission(request)
         return self._add_prepared_request(request)
 
-    async def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+    def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+        """Bind a closable stream to the currently registered request queue."""
         with self._cv:
             queue = self._out_streams.get(request_id)
         if queue is None:
             raise RuntimeError(f"Request {request_id} not found in output queue.")
+        return _ClosingOutputStream(
+            self._iterate_output_stream(request_id, queue),
+            lambda: self._release_output_stream(request_id, queue),
+        )
+
+    async def _iterate_output_stream(
+        self, request_id: str, queue: asyncio.Queue[DiffusionOutput]
+    ) -> AsyncGenerator[DiffusionOutput, None]:
         try:
             while True:
                 output: DiffusionOutput = await queue.get()
@@ -1173,9 +1215,12 @@ class DiffusionEngine:
             logger.error(f"Wait for response failed: {e}")
             raise
         finally:
-            with self._cv:
-                if self._out_streams.get(request_id) is queue:
-                    self._out_streams.pop(request_id, None)
+            self._release_output_stream(request_id, queue)
+
+    def _release_output_stream(self, request_id: str, queue: asyncio.Queue[DiffusionOutput]) -> None:
+        with self._cv:
+            if self._out_streams.get(request_id) is queue:
+                self._out_streams.pop(request_id, None)
 
     def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
         request_id = self.add_request(request)
