@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
-Online serving tests for ``Qwen/Qwen-Image-Edit-2511`` (image-to-image via chat completions).
+Online serving tests for ``Qwen/Qwen-Image-Edit-2511`` (native generation and image editing).
 
+- ``test_text_to_image_without_reference``: native image generation with no reference image.
 - ``test_single_image_to_image_001``: one reference image, fixed 512×512.
 - ``test_multi_images_to_image_001``: two reference images, fixed 512×512.
 - ``test_different_sizes_001``: ``slow`` — mixed input resolutions; ``extra_body`` uses
@@ -50,6 +51,30 @@ def _get_diffusion_feature_cases(model: str = MODEL):
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(), indirect=True)
+def test_text_to_image_without_reference(omni_server: OmniServer, online_client: OnlineOmniClient):
+    """Native generation on the same edit checkpoint; a structural smoke, not a quality benchmark."""
+    # This existing client helper includes success, count, decode, and dimension assertions.
+    online_client.send_images_generations_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "prompt": "A friendly green turtle on a pale blue background, clean illustration.",
+                "negative_prompt": " ",
+                "n": 1,
+                "size": "512x512",
+                "response_format": "b64_json",
+                "num_inference_steps": 2,
+                "true_cfg_scale": 4.0,
+                "seed": 42,
+            },
+            "timeout": 300,
+        }
+    )
 
 
 @pytest.mark.slow

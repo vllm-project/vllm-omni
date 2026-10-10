@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import logging
@@ -99,10 +99,30 @@ def get_qwen_image_edit_plus_pre_process_func(
 
         # Handle single image or list of images
         if raw_image is None:
+            # Native text-to-image uses noise latents, not a synthetic input image.
+            default_width, default_height = calculate_dimensions(VAE_IMAGE_SIZE, 1.0)
+            height, width = normalize_min_aligned_size(
+                request.sampling_params.height or default_height,
+                request.sampling_params.width or default_width,
+                vae_scale_factor * 2,
+            )
+            prompt["additional_information"].update(
+                condition_images=None,
+                vae_images=None,
+                condition_image_sizes=[],
+                vae_image_sizes=[],
+                calculated_height=height,
+                calculated_width=width,
+            )
+            request.sampling_params.height = height
+            request.sampling_params.width = width
+            request.prompt = prompt
             return request
 
         if not isinstance(raw_image, list):
             raw_image = [raw_image]
+        if not raw_image:
+            raise ValueError("Input image list cannot be empty. Omit image for text-to-image generation.")
         if len(raw_image) > MAX_QWEN_IMAGE_EDIT_PLUS_INPUT_IMAGES:
             raise ValueError(
                 f"Received {len(raw_image)} input images. "
@@ -373,6 +393,15 @@ class QwenImageEditPlusPipeline(
 
         template = self.prompt_template_encode
         drop_idx = self.prompt_template_encode_start_idx
+        if image is None:
+            # Match QwenImagePipeline's text-only conditioning without changing
+            # the edit template shared by image-backed requests.
+            template = (
+                "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, "
+                "quantity, text, spatial relationships of the objects and background:<|im_end|>\n"
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+            )
+            drop_idx = 34
         txt = [template.format(base_img_prompt + e) for e in prompt]
         txt_tokens = self.tokenizer(
             txt,
@@ -401,21 +430,28 @@ class QwenImageEditPlusPipeline(
             error_context="after applying the Qwen prompt template",
         )
 
-        # Use processor to handle both text and image inputs
-        model_inputs = self.processor(
-            text=txt,
-            images=image,
-            padding=True,
-            return_tensors="pt",
-        ).to(self.device)
+        if image is None:
+            model_inputs = txt_tokens
+            outputs = self.text_encoder(
+                input_ids=model_inputs.input_ids,
+                attention_mask=model_inputs.attention_mask,
+                output_hidden_states=True,
+            )
+        else:
+            model_inputs = self.processor(
+                text=txt,
+                images=image,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
 
-        outputs = self.text_encoder(
-            input_ids=model_inputs.input_ids,
-            attention_mask=model_inputs.attention_mask,
-            pixel_values=model_inputs.pixel_values,
-            image_grid_thw=model_inputs.image_grid_thw,
-            output_hidden_states=True,
-        )
+            outputs = self.text_encoder(
+                input_ids=model_inputs.input_ids,
+                attention_mask=model_inputs.attention_mask,
+                pixel_values=model_inputs.pixel_values,
+                image_grid_thw=model_inputs.image_grid_thw,
+                output_hidden_states=True,
+            )
 
         hidden_states = outputs.hidden_states[-1]
         split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
@@ -467,6 +503,9 @@ class QwenImageEditPlusPipeline(
                 max_sequence_length=max_sequence_length,
                 prompt_name=prompt_name,
             )
+            if image is None:
+                prompt_embeds = prompt_embeds[:, :max_sequence_length]
+                prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
@@ -623,7 +662,7 @@ class QwenImageEditPlusPipeline(
         return self._interrupt
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        """Forward pass for image editing with support for multiple images."""
+        """Generate or edit images with optional multi-image conditioning."""
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         if len(req.prompts) > 1:
@@ -650,6 +689,13 @@ class QwenImageEditPlusPipeline(
         ):
             condition_images = additional_information.get("condition_images")
             vae_images = additional_information.get("vae_images")
+            raw_image = (first_prompt.get("multi_modal_data") or {}).get("image")
+            if (condition_images is None) != (vae_images is None) or (
+                condition_images is None and raw_image is not None
+            ):
+                raise RuntimeError(
+                    "Missing preprocess images that should have been created by the preprocess function."
+                )
             vae_image_sizes = additional_information.get("vae_image_sizes")
             calculated_height = additional_information.get("calculated_height")
             calculated_width = additional_information.get("calculated_width")
