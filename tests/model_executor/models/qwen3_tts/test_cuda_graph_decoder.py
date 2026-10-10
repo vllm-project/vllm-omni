@@ -44,6 +44,7 @@ except Exception:
         "cuda_graph_decoder_wrapper.py",
     )
     _spec = importlib.util.spec_from_file_location("cuda_graph_decoder_wrapper", os.path.abspath(_WRAPPER_PATH))
+    assert _spec is not None and _spec.loader is not None
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     CUDAGraphDecoderWrapper = _mod.CUDAGraphDecoderWrapper
@@ -156,12 +157,21 @@ def test_padded_batch_size_uses_larger_capture_bucket(decoder):
     codes = _random_codes(25, batch_size=3)
 
     with torch.no_grad():
-        eager_out = decoder(codes)
+        # Compare the same convolution shape as the captured bucket. Changing
+        # batch size can select a different backend algorithm and reduction
+        # order, even though each row is independent of the padded rows.
+        padded_codes = torch.zeros(4, NUM_QUANTIZERS, 25, dtype=codes.dtype, device=codes.device)
+        padded_codes[:3].copy_(codes)
+        eager_out = decoder(padded_codes)[:3]
+        unpadded_out = decoder(codes)
         graph_out = w.decode(codes)
 
     assert (4, 25) in w.graphs
     assert graph_out.shape == eager_out.shape
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+    # Padding independent batch rows preserves the unpadded result up to
+    # floating-point reduction order in the shape-dependent convolution.
+    torch.testing.assert_close(graph_out, unpadded_out, atol=1e-6, rtol=1e-5)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
