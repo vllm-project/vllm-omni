@@ -9,13 +9,14 @@ import sys
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.ltx2.ops import qk_rms_norm as qk_rms_norm_ops
 from vllm_omni.diffusion.models.ltx2.ops import residual_adaln as residual_adaln_ops
 from vllm_omni.diffusion.models.ltx2.ops import resolve_ltx2_vae_operators
 from vllm_omni.diffusion.models.ltx2.ops import swiglu as swiglu_ops
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 _DIM_SPLIT = (16, 24, 24)
 

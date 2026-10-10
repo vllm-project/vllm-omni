@@ -11,6 +11,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
@@ -146,7 +148,7 @@ def test_two_rank_conditioning_and_errors_gloo(tmp_path):
     _run_collectives(tmp_path, "gloo")
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
 @pytest.mark.parallel
 @pytest.mark.skipif(
     os.environ.get("VLLM_TEST_MINIMAX_H3_COLLECTIVES") != "1",

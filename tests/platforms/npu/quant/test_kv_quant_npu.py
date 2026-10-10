@@ -16,6 +16,8 @@ from types import ModuleType
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
@@ -69,7 +71,7 @@ def test_rotation_is_fixed_orthogonal_cached_and_preserves_rng():
 
 
 @npu_smoke
-@pytest.mark.npu
+@hardware_test(res={"npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize("layout", ["BSND", "BNSD"])
 @pytest.mark.parametrize("seq_len", [256, 75600])

@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def _projection_worker(rank, world_size, rendezvous, offload_weights, compiled):

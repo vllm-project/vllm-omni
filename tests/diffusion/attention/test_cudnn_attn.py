@@ -9,6 +9,7 @@ import torch
 from torch.nn.attention import SDPBackend
 
 import vllm_omni.diffusion.attention.backends.cudnn_attn as cudnn_backend
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionBackend, CuDNNAttentionImpl
 
@@ -213,8 +214,7 @@ def test_dense_mask_takes_precedence_over_spans(monkeypatch):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("batch_size", [1, 2])
 def test_cudnn_piecewise_matches_dense_on_device(batch_size):
     generator = torch.Generator(device="cuda").manual_seed(42)

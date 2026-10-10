@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
     MossAudioTokenizerMultiheadAttention,
     MossAudioTokenizerRotaryEmbedding,
@@ -14,7 +15,7 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
 )
 from vllm_omni.model_executor.models.moss_tts.slot_attention import slot_ring_attention, slot_ring_attention_rows
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.mark.parametrize(

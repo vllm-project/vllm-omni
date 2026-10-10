@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
 import numpy as np
 import pytest
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.local_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.parallel,
 ]

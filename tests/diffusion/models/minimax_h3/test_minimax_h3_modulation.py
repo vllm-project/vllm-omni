@@ -5,7 +5,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
     _iter_row_chunks,
@@ -152,7 +152,7 @@ def test_modulation_wrappers_match_reference_above_grid_limit(device):
         torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
@@ -192,7 +192,7 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
     assert torch.equal(modulated_out, expected)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("fused_gate", [False, True])

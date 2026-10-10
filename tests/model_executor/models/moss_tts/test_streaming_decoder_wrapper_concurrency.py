@@ -8,11 +8,12 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.cuda_graph_streaming_decoder_wrapper import (
     CUDAGraphStreamingDecoderWrapper,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 CAP, DIM = 8, 64
 

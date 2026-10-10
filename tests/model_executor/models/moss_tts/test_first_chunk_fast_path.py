@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_test
 from tests.model_executor.models.moss_tts.test_streaming_terminal_batch import session as cpu_session
 from vllm_omni.model_executor.models.moss_tts.first_chunk_fast_path import MossFirstChunkFastPath, _SlotHandoff
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
@@ -97,7 +98,7 @@ class _CallbackSink:
         return Delivery()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_emits_each_first_chunk_and_hands_slot_to_main_path(cuda):
     fast, session, wrapper = _fast(cuda)
     emitted = {}
@@ -136,7 +137,7 @@ def test_emits_each_first_chunk_and_hands_slot_to_main_path(cuda):
     assert wrapper.state[:2].tolist() == [1, 1]
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_order_after_blocks_until_decode_finishes(cuda):
     fast, _, wrapper = _fast(cuda)
     fast.bind(_CallbackSink(lambda *args: None))
@@ -157,7 +158,7 @@ def test_order_after_blocks_until_decode_finishes(cuda):
     fast.close()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_no_free_slot_leaves_chunk_to_main_path(cuda):
     fast, _, _ = _fast(cuda, capacity=0)
     fast.bind(_CallbackSink(lambda *args: None))
@@ -283,7 +284,7 @@ def test_oldest_acquire_reuses_least_recently_released_slot():
     assert s._free_stream_slots[-1] == a
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_failed_decode_reports_error_without_replaying_state(cuda):
     fast, _, wrapper = _fast(cuda)
 
@@ -300,7 +301,7 @@ def test_failed_decode_reports_error_without_replaying_state(cuda):
     fast.close()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_failed_output_handoff_retains_decoded_samples(cuda):
     fast, _, _ = _fast(cuda)
 
@@ -341,7 +342,7 @@ def test_gate_waits_only_for_enabled_inflight_decode(mocker, enabled, complete):
         stream.wait_event.assert_not_called()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_gate_hands_inflight_gpu_output_to_main_stream(cuda):
     fast, _, _ = _fast(cuda)
     side = torch.cuda.Stream()
@@ -469,7 +470,7 @@ def test_cancel_waits_for_first_chunk_admission_and_reclaims_slot(monkeypatch):
     _cancel_during_admission(fast, session, scheduler, sink)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_cancel_during_first_chunk_admission_orders_cuda_handoff_and_reuse(cuda):
     fast, session, _ = _fast(cuda, capacity=2)
     scheduler = SimpleNamespace(requests={"r": SimpleNamespace(client_index=3)})

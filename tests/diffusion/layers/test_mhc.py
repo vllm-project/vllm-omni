@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers import mhc
 from vllm_omni.diffusion.models.magi2 import layers as model_layers
 
@@ -158,7 +159,10 @@ def test_compile_keeps_native_graph():
     assert not any("triton" in x for x in targets)
 
 
-DEVICES = [pytest.param("cuda", marks=pytest.mark.cuda), pytest.param("musa", marks=pytest.mark.musa)]
+DEVICES = [
+    pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
+]
 
 
 def device(name):

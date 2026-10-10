@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
+from tests.helpers.mark import hardware_test
 from tests.model_executor.models.moss_tts.test_local_model_state import _batch, _state
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
@@ -23,7 +24,7 @@ from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 pytestmark = pytest.mark.core_model
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seed", [None, 17])
 @pytest.mark.parametrize("temperature", [0.0, 1.7])
 def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed, temperature):
@@ -64,7 +65,7 @@ def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed,
     torch.testing.assert_close(actual.sampled_token_ids, snapshot, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "constraint",
     [

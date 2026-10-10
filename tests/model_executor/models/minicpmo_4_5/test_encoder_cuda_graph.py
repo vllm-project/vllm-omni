@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cuda_graph import EncoderCudaGraph
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     SiglipVisionConfig,
@@ -35,7 +36,7 @@ def test_cpu_and_grad_paths_remain_eager():
     assert not graph._seen
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_replay_refreshes_inputs_preserves_outputs_and_bounds_shapes():
@@ -64,7 +65,7 @@ def test_replay_refreshes_inputs_preserves_outputs_and_bounds_shapes():
     assert len(graph._seen) <= 8
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_vision_graph_handles_changed_mask_and_retained_embeddings():
@@ -134,7 +135,7 @@ def _audio_model(device):
     return model.eval().to(device)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_audio_graph_refreshes_mask_and_matches_eager():
@@ -193,7 +194,7 @@ def test_fp16_audio_keeps_host_overflow_check_eager():
     assert model.get_audio_hidden_states(data)[0].shape == (10, 48)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_one_off_shapes_do_not_exhaust_capture_admission():
@@ -208,7 +209,7 @@ def test_one_off_shapes_do_not_exhaust_capture_admission():
     assert len(graph.graphs) == 1
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_managers_do_not_share_buffers_between_streams():
@@ -246,7 +247,7 @@ def test_invalid_admission_options(options):
         _make_graph(torch.sin, **options)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_configurable_admission_and_capacity_miss_accounting():
@@ -269,7 +270,7 @@ def test_configurable_admission_and_capacity_miss_accounting():
     assert stats["hit_rate"] == pytest.approx(2 / 9)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_memory_admission_defers_capture_but_preserves_existing_replay(monkeypatch):
@@ -290,7 +291,7 @@ def test_memory_admission_defers_capture_but_preserves_existing_replay(monkeypat
     assert graph.get_cumulative_stats()["graph_hits"] == 2
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_capture_failure_is_fatal_without_retry_or_eager_fallback(monkeypatch):
@@ -315,7 +316,7 @@ def test_capture_failure_is_fatal_without_retry_or_eager_fallback(monkeypatch):
     assert graph.get_cumulative_stats()["capture_failures"] == 1
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_zero_capacity_disables_capture():
@@ -328,7 +329,7 @@ def test_zero_capacity_disables_capture():
     assert graph.get_cumulative_stats()["capacity_misses"] == 3
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("share_pools", [False, True])
 @torch.inference_mode()
@@ -355,7 +356,7 @@ def test_pool_reuse_preserves_outputs_across_late_capture_and_arbitrary_replay(s
         torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_shared_pools_are_isolated_by_encoder_and_replay_stream():

@@ -8,13 +8,19 @@ import numpy as np
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.moss_tts.test_local_model_state import _admit, _batch, _state, _step
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 
 pytestmark = pytest.mark.core_model
 
 
-@pytest.fixture(params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)])
+@pytest.fixture(
+    params=[
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ]
+)
 def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")

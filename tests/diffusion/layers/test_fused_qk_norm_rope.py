@@ -6,7 +6,9 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 _HEAD_DIM = 128
 _ROTARY_DIM = 96
