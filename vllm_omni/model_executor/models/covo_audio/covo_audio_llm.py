@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 Tencent.
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -8,6 +12,14 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
+
+_MAX_AUDIO_TOKENS = 188
 
 
 class DownsampleLayer(nn.Module):
@@ -126,6 +138,80 @@ class CovoAudioLLMForConditionalGeneration(nn.Module, SupportsPP, SupportsMultiM
             else:
                 result.append(features[i])
         return result
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        return EncoderCudaGraphConfig(
+            modalities=["audio"],
+            buffer_keys=["audio_features"],
+            out_hidden_size=self.audio_adapter.downsample_layers[-1].linear2.out_features,
+        )
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
+        return _MAX_AUDIO_TOKENS, 2 * _MAX_AUDIO_TOKENS
+
+    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
+        audio_features = mm_kwargs["audio_features"]
+        return [
+            EncoderItemSpec(input_size=audio_features.shape[-1], output_tokens=_MAX_AUDIO_TOKENS)
+            for _ in range(audio_features.shape[0])
+        ]
+
+    def select_encoder_cudagraph_items(self, mm_kwargs: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+        return {key: value[indices] for key, value in mm_kwargs.items()}
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
+    ) -> EncoderCudaGraphCaptureInputs:
+        batch_size = min(token_budget // _MAX_AUDIO_TOKENS, max_batch_size)
+        if batch_size < 1:
+            raise ValueError("CoVo encoder CUDA graph budget must fit at least one audio item")
+        encoder_dtype = next(self.encoder.parameters()).dtype
+        return EncoderCudaGraphCaptureInputs(
+            {"audio_features": torch.zeros((batch_size, 128, 3000), device=device, dtype=encoder_dtype)}
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ) -> EncoderCudaGraphReplayBuffers:
+        audio_features = mm_kwargs["audio_features"]
+        return EncoderCudaGraphReplayBuffers({"audio_features": audio_features})
+
+    def encoder_cudagraph_forward(self, inputs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
+        feats = self.encoder(inputs["audio_features"]).last_hidden_state
+        return self.audio_adapter(feats)
+
+    def encoder_eager_forward(self, mm_kwargs: dict[str, Any], path: str = "default") -> torch.Tensor:
+        audio_features = mm_kwargs["audio_features"]
+        encoder_dtype = next(self.encoder.parameters()).dtype
+        return self.encoder_cudagraph_forward({"audio_features": audio_features.to(dtype=encoder_dtype)}, path)
+
+    def postprocess_encoder_output(
+        self,
+        outputs: dict[str, torch.Tensor],
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        assert batch_mm_kwargs is not None
+        audio_num_tokens = batch_mm_kwargs.get("audio_num_tokens")
+        features = outputs["default"]
+        for batch_idx, original_idx in enumerate(indices):
+            n = int(audio_num_tokens[batch_idx]) if audio_num_tokens is not None else _MAX_AUDIO_TOKENS
+            item = features[batch_idx, :n, :]
+            dest[original_idx] = item.clone() if clone else item
 
     def forward(
         self,

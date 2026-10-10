@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2026 Tencent.
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -13,7 +13,7 @@ from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.models import SupportsPP
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph, SupportsMultiModal
 from vllm.model_executor.models.utils import init_vllm_registered_model
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -188,6 +188,7 @@ class CovoAudioForConditionalGeneration(
     nn.Module,
     SupportsPP,
     SupportsMultiModal,
+    SupportsEncoderCudaGraph,
     CustomProcessMixin,
 ):
     requires_raw_input_tokens: bool = True
@@ -252,6 +253,65 @@ class CovoAudioForConditionalGeneration(
         if self.model_stage == "fused_thinker_talker":
             return self.fused_thinker_talker.embed_multimodal(**kwargs)
         return None
+
+    def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
+        return "audio"
+
+    def get_encoder_cudagraph_config(self):
+        return self.fused_thinker_talker.get_encoder_cudagraph_config()
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
+        return self.fused_thinker_talker.get_encoder_cudagraph_budget_range(vllm_config)
+
+    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]):
+        return self.fused_thinker_talker.get_encoder_cudagraph_item_specs(mm_kwargs)
+
+    def select_encoder_cudagraph_items(self, mm_kwargs: dict[str, Any], indices: list[int]):
+        return self.fused_thinker_talker.select_encoder_cudagraph_items(mm_kwargs, indices)
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
+    ):
+        return self.fused_thinker_talker.prepare_encoder_cudagraph_capture_inputs(
+            token_budget, max_batch_size, max_frames_per_batch, device, dtype, path, axis_keys
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ):
+        return self.fused_thinker_talker.prepare_encoder_cudagraph_replay_buffers(
+            mm_kwargs, max_batch_size, max_frames_per_batch, path
+        )
+
+    def encoder_cudagraph_forward(self, inputs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
+        return self.fused_thinker_talker.encoder_cudagraph_forward(inputs, path)
+
+    def encoder_eager_forward(self, mm_kwargs: dict[str, Any], path: str = "default") -> torch.Tensor:
+        return self.fused_thinker_talker.encoder_eager_forward(mm_kwargs, path)
+
+    def postprocess_encoder_output(
+        self,
+        outputs: dict[str, torch.Tensor],
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        self.fused_thinker_talker.postprocess_encoder_output(
+            outputs, indices, per_item_out_tokens, dest, clone, batch_mm_kwargs
+        )
 
     def embed_input_ids(
         self,
