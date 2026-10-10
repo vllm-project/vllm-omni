@@ -204,7 +204,6 @@ Turbo / Edit-Turbo online FP8:
 # Turbo
 vllm serve Boogu/Boogu-Image-0.1-Turbo \
   --omni \
-  --revision hotfix-20260625 \
   --model-class-name BooguImageTurboPipeline \
   --host 127.0.0.1 --port 8091 \
   --dtype bfloat16 --max-num-seqs 1 --enforce-eager \
