@@ -144,6 +144,39 @@ steps:
           - export VLLM_ROCM_USE_AITER=0
           - bash .buildkite/amd/scripts/run-omni-processor-test.sh
 
+  # AMD builds #13509 and #13511 measured the four long-running oracle cases
+  # at about 57-84 minutes total. Keep enough budget for the slower observation,
+  # collection, and artifact finalization while running the stress cases serially.
+  - group: ":performing_arts: PersonaPlex CPU Nightly"
+    steps:
+      - label: "Simple · PersonaPlex Temporal Streaming Test"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        artifact_paths:
+          - "artifacts/personaplex-temporal-streaming/**/*"
+        commands:
+          - export VLLM_ROCM_USE_AITER=0
+          - export PERSONAPLEX_TEMPORAL_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/personaplex-temporal-streaming"
+          - mkdir -p "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR"
+          - >-
+            pytest --collect-only -q
+            tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_temporal_streaming_step_matches_legacy_end_to_end
+            tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
+            2>&1 | tee "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/collection.txt"
+          - >-
+            timeout --signal=TERM --kill-after=2m 110m
+            pytest -s -v -ra
+            tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_temporal_streaming_step_matches_legacy_end_to_end
+            tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
+            --durations=50
+            --junitxml="$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 100 "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.log" >
+            "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest-summary.txt"
+
   - group: ":full_moon: LingBot-Video MI300 Nightly"
     steps:
       - label: "LingBot-Video Dense CFG-off Smoke"

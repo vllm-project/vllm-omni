@@ -163,7 +163,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 CUDA, with the original Local projection and sampler. When
 `nvidia-cuda-mps-control` is on `PATH`, it starts private full-quota MPS.
 GPUs with at least 140 GiB total memory use the C128 system profile with
-prefix caching, Triton backbone attention, bounded codec first-chunk decode,
+prefix caching, Triton backbone attention, Stage0 first-frame audio,
 native Torch sampler compilation and dense codec graph buckets through 128. Its Talker KV budget is 32 GiB; smaller GPUs or a failed memory
 query use C64 with utilization-based memory budgets. When the MPS executable
 is unavailable, the automatic default is C64 MRV2 without MPS. NPU, XPU,
@@ -181,15 +181,24 @@ remain confined to the throughput profile; they are not enabled in C64.
 
 The same `moss_tts_local_mrv2_optimized.yaml` system profile can be selected
 explicitly. It retains the original Local depth projection and sampling algorithm.
-The codec admits fast first chunks below 32 active streams; crowded streams use
-the regular decoder with a dispatch target of 16 and a maximum wait of 6 ms.
-This preserves the low-load first-audio path while coalescing high-load work.
+With CUDA MRV2 GPU slot state and asynchronous chunks, Stage0 prepares the first
+MTP frame immediately after prefill, decodes it locally and sends it directly.
+This requires a `UniProcExecutor` (or subclass) with TP=1 and PP=1. Other executors
+retain regular Stage1 delivery without loading the extra Stage0 decoder.
+Requests whose stop conditions or sampling constraints prevent safe early
+publication also retain regular delivery. Stage1 primes its streaming state
+with the same codes and sends subsequent audio without duplicating the first
+frame. Its regular dispatch target is 16 with a maximum wait of 6 ms.
 `local_compile_audio_sampler: true` in the Talker HF overrides compiles the native
 Torch sampler; explicit request generators use the original helper. Set the
 override to `false` in a deployment file to disable that compilation. The setting
 is specific to this C128 system profile.
 Both stages share one GPU, with a 32 GiB Talker KV budget; this profile requires H200-class memory and
 `nvidia-cuda-mps-control` on `PATH`.
+The Stage0 decoder adds approximately 2 GiB of parameter weights for this
+checkpoint, plus buffers and CUDA Graph memory, all included in model memory
+profiling. Its T=1 graph buckets follow the Talker's capture sizes up to the
+request capacity.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
@@ -377,14 +386,13 @@ CUDA_VISIBLE_DEVICES= PYTHONPATH=. python -m pytest -q \
 ### Low-latency and reference-encoding options
 
 `moss_tts_local_mrv2_low_latency.yaml` keeps both stage capacities at 128 and
-uses prefill 2048, GPU slot state, batch prefill, direct tokens and eager MTP.
-Its codec first-chunk fast path uses dedicated graphs and a stream handoff
-before the regular decoder reuses the request slot. A gate limits contention
-with regular codec work. Slot waits are bounded at 30 seconds. A failed or
-stalled decode raises an error rather than replaying a partially advanced
-slot; a failed output enqueue retains owned PCM for regular delivery.
-Closing the decoder rejects new jobs. Its regular-batch limit of 16 is internal dispatch
-policy; it does not change the client concurrency or stage capacities.
+uses prefill 2048, GPU slot state, batch prefill and direct tokens. It uses the
+same Stage0 first-frame path and executor requirements described above. Only
+the first MTP frame is prepared immediately after prefill; its codes and audio
+embedding are reused on the next decode step. Eager MTP for subsequent frames
+is not enabled by default. Stage1 uses its regular streaming decoder, with a
+dispatch target of 32 and a maximum wait of 12 ms; these coalescing settings do
+not limit client concurrency or the stage capacities.
 
 Reference encoding runs in the API layer, independently of MRV2. Enable
 reference graphs explicitly with `VLLM_OMNI_MOSS_REF_GRAPHS=1`; the default

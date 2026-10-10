@@ -1,18 +1,15 @@
 # CUDA system profile for MOSS-TTS-Local-Transformer-v1.5.
 # Selected automatically with at least 140 GiB GPU memory and MPS available.
 # Requires H200-class memory and nvidia-cuda-mps-control on PATH.
-# Adds prefix caching, Triton backbone attention and faster codec dispatch;
-# keeps the original Local depth projection and native Torch sampler.
-# The throughput baseline remains moss_tts_local_mrv2_high_concurrency.yaml.
+# Adds prefix caching, Triton backbone attention and Stage0 first-frame audio.
+# Extends the shared C128 profile with the system-level settings below.
 base_config: moss_tts_local_mrv2_high_concurrency.yaml
 model_runner: v1
+dtype: bfloat16
 
 connectors:
   shm:
     extra:
-      codec_first_chunk_fast_path: 1
-      # Keep the fast first chunk for low load; coalesce crowded streams.
-      codec_first_chunk_max_active_streams: 32
       generation_min_batch_size: 16
       generation_max_wait_ms: 6
 

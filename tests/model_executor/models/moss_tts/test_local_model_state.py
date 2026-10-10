@@ -65,7 +65,7 @@ def _state(cls, device):
     state.device, state.dtype = device, state.model.model.embed_tokens.weight.dtype
     state.has_preprocess = state.has_postprocess = state.have_multimodal_outputs = True
     state.scheduler_config = SimpleNamespace(max_num_seqs=5)
-    state.vllm_config = SimpleNamespace()
+    state.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096, logits_processors=None))
     state.intermediate_buffer = OmniIntermediateBuffer(5)
     state._static_inputs_embeds = torch.zeros(16, 4, device=device, dtype=state.dtype)
     state._mtp_input_ids = torch.zeros(5, device=device, dtype=torch.long)

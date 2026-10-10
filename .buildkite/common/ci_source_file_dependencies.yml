@@ -221,6 +221,7 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_omni.py
     - tests/e2e/online_serving/test_qwen3_omni_expansion.py
     - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+    - tests/e2e/online_serving/test_qwen3_omni_thinking.py
 
   omni_qwen3_omni_accuracy:
     - *qwen3_omni

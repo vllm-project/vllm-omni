@@ -18,7 +18,13 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/model_executor -m 'core_model and cpu and not omni' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        - >-
+          pytest -sv tests/model_executor
+          -m 'core_model and cpu and not omni'
+          --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_temporal_streaming_step_matches_legacy_end_to_end
+          --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
+          --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+          --shard-id=$$BUILDKITE_PARALLEL_JOB
 
     - label: "Simple · Omni Processor Snapshot Smoke"
       agent_pool: mi300_1
