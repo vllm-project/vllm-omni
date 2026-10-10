@@ -1763,3 +1763,58 @@ def test_turbo_dmd_ti2i_keeps_reference_latents_and_uses_zero_conditioning_sigma
     assert all(ref is not None for ref in pipeline.transformer.refs)
     assert pipeline.scheduler.set_calls == 0
     assert pipeline.scheduler.step_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("version", "pipeline_name", "should_bind"),
+    [
+        ("0.30.0", "BooguImagePipeline", False),
+        ("0.31.0", "BooguImagePipeline", True),
+        ("0.32.0", "BooguImagePipeline", True),
+        ("0.31.0", "BooguImageTurboPipeline", True),
+    ],
+)
+def test_constructor_binds_marlin_workspace_before_loading(
+    mock_dependencies, monkeypatch, mocker, version, should_bind, pipeline_name
+):
+    from vllm_omni.diffusion.models.boogu_image import marlin_workspace, pipeline_boogu_image
+
+    monkeypatch.setattr(pipeline_boogu_image.vllm, "__version__", version)
+    bind = mocker.patch.object(marlin_workspace, "bind_boogu_marlin_workspaces")
+    loader = mocker.patch(f"{_MODULE}.AutoWeightsLoader")
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config="fp8",
+    )
+
+    getattr(pipeline_boogu_image, pipeline_name)(od_config=od_config)
+
+    if should_bind:
+        bind.assert_called_once_with(mock_dependencies["mllm_builder"].return_value)
+    else:
+        bind.assert_not_called()
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize("serialized", [False, True], ids=["bf16", "serialized-fp8"])
+def test_constructor_hf_mllm_does_not_bind_marlin_workspace(mock_dependencies, monkeypatch, mocker, serialized):
+    from vllm_omni.diffusion.models.boogu_image import marlin_workspace, pipeline_boogu_image
+
+    monkeypatch.setattr(pipeline_boogu_image.vllm, "__version__", "0.31.0")
+    bind = mocker.patch.object(marlin_workspace, "bind_boogu_marlin_workspaces")
+    if serialized:
+        mock_dependencies["mllm_config_loader"].return_value = Qwen3VLConfig(
+            quantization_config={"quant_method": "fp8", "modules_to_not_convert": ["model.visual"]}
+        )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config="fp8" if serialized else None,
+    )
+
+    pipeline_boogu_image.BooguImagePipeline(od_config=od_config)
+
+    bind.assert_not_called()

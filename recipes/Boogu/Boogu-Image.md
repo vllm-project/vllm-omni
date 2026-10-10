@@ -198,6 +198,32 @@ vllm serve Boogu/Boogu-Image-0.1-Base \
 For image editing, replace `Base` with `Edit` and keep the corresponding
 quantization configuration.
 
+Turbo / Edit-Turbo online FP8:
+
+```bash
+# Turbo
+vllm serve Boogu/Boogu-Image-0.1-Turbo \
+  --omni \
+  --model-class-name BooguImageTurboPipeline \
+  --host 127.0.0.1 --port 8091 \
+  --dtype bfloat16 --max-num-seqs 1 --enforce-eager \
+  --diffusion-attention-backend TORCH_SDPA \
+  --quantization fp8
+
+# Edit-Turbo
+vllm serve Boogu/Boogu-Image-0.1-Edit-Turbo \
+  --omni \
+  --revision hotfix-1k-20260708 \
+  --model-class-name BooguImageTurboPipeline \
+  --host 127.0.0.1 --port 8091 \
+  --dtype bfloat16 --max-num-seqs 1 --enforce-eager \
+  --diffusion-attention-backend TORCH_SDPA \
+  --quantization fp8
+```
+
+Start one server at a time. For local checkpoints, use the local model
+directory and omit `--revision`.
+
 #### Notes
 
 - **Memory usage:**
@@ -226,6 +252,15 @@ quantization configuration.
 
     - **Conflict between the default kernels and Transformers versions:** The default Transformers version range (`>=5.10.1,<5.15`) conflicts with `kernels==0.16.1` when loading pre-quantized FP8 MLLM weights through Hugging Face `FP8Linear`. When using this loading path with `kernels==0.16.1`, please upgrade Transformers to `5.17.0`.
 
+    - **Online FP8 with vLLM 0.31 and later:** Check the selected MLLM kernel
+      on Ada (SM89) and Ampere (SM80 / SM86), where
+      online per-block FP8 can use Marlin. The shared Marlin workspace path can switch CUDA streams.
+      Boogu's UNI output handoff lacks the
+      corresponding cross-stream wait, which can corrupt generated images.
+      For selected `MarlinFP8ScaledMMLinearKernel` MLLM kernels, Boogu allocates
+      a per-layer workspace after weight loading and passes it explicitly,
+      avoiding the implicit stream switch.
+
 #### Verification
 
 The request format is shared by both FP8 paths. Set `<MODEL_ID>` to the model
@@ -233,6 +268,10 @@ ID passed to `vllm serve`. For example, use
 `Boogu/Boogu-Image-0.1-Base-fp8` for serialized TorchAO FP8 or
 `Boogu/Boogu-Image-0.1-Base` for native online FP8. For image editing, use the
 corresponding Edit model.
+
+For Turbo / Edit-Turbo, use the same requests with the corresponding model ID
+and set `num_inference_steps=4` and `guidance_scale=1.0`. Keep
+`guidance_scale_2=1.0` (the default).
 
 Base text-to-image:
 
@@ -286,6 +325,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
     "size": "1024x1024",
     "seed": 42
   }' | jq -r '.data[0].b64_json' | base64 -d > output-turbo.png
+```
 
 ### Notes
 

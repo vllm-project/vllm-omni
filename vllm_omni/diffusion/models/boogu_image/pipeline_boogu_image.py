@@ -29,9 +29,11 @@ from typing import ClassVar, cast
 import PIL.Image
 import torch
 import torch.nn.functional as F
+import vllm
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
+from packaging.version import Version
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModel, Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLModel, Qwen3VLProcessor
@@ -363,6 +365,11 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             prefix="mllm",
             skip_modules=("mllm.visual",),
         )
+
+        if Version(vllm.__version__) >= Version("0.31.0"):
+            from vllm_omni.diffusion.models.boogu_image.marlin_workspace import bind_boogu_marlin_workspaces
+
+            bind_boogu_marlin_workspaces(mllm)
 
         self.weights_sources.append(
             DiffusersPipelineLoader.ComponentSource(
