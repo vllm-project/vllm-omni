@@ -780,6 +780,11 @@ class OmniModelState(DefaultModelState):
                 continue
 
             info = {key: value for key, value in buf.items() if isinstance(key, str)}
+            # Match the V1 runner: the sampler's seed does not seed random
+            # draws performed inside model.forward (e.g. VoxCPM2 CFM noise).
+            sampling_params = info.get("sampling_params")
+            info["_omni_seed"] = getattr(sampling_params, "seed", None)
+            info["_omni_max_tokens"] = getattr(sampling_params, "max_tokens", None)
             prompt_len = None
             num_computed_tokens = None
             if req_states is not None:
@@ -1515,6 +1520,7 @@ class OmniModelState(DefaultModelState):
                 buffer_list = self.intermediate_buffer.gather(input_batch)
                 make_output_kwargs = {
                     "model_intermediate_buffer": buffer_list,
+                    "request_ids": list(input_batch.req_ids),
                     "request_token_spans": [
                         (
                             int(input_batch.query_start_loc_np[i]),

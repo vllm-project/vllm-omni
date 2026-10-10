@@ -103,6 +103,51 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
     np.testing.assert_array_equal(copied[0][1], [2, 0])
 
 
+@pytest.mark.parametrize("has_audio", [False, True])
+@pytest.mark.parametrize("include_hidden", [False, True])
+def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, has_audio, include_hidden) -> None:
+    from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2AudioOutput
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    audio = torch.arange(8, dtype=torch.float32)
+    input_batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 3, 4]),
+        num_scheduled_tokens=np.array([3, 1]),
+        num_reqs=2,
+        num_tokens_after_padding=4,
+    )
+    sampler_output = SamplerOutput(torch.tensor([[0], [1]]), None, None, torch.tensor([0, 1]), torch.tensor([0, 0]))
+    finalizer = MagicMock(side_effect=lambda output: output)
+
+    output = _async_output(
+        req_ids=["prefill", "decode"],
+        sampler_output=sampler_output,
+        num_sampled_tokens=torch.tensor([0, 1]),
+        text_hidden=torch.arange(8, dtype=torch.float32).reshape(4, 2) if include_hidden else None,
+        multimodal_outputs={"voxcpm2_audio_pending": True},
+        input_batch=input_batch,
+        streaming_audio=VoxCPM2AudioOutput(
+            wav=audio if has_audio else torch.empty(0),
+            valid_samples=torch.tensor([audio.numel()] if has_audio else [], dtype=torch.long),
+            sample_rate=torch.tensor(48000),
+            batch_rows=(1,) if has_audio else (),
+            num_reqs=2,
+        ),
+        finalize_output=finalizer,
+    ).get_output()
+
+    finalizer.assert_called_once_with(output)
+    assert output.sampled_token_ids == [[], [1]]
+    assert output.pooler_output is None
+    assert output.inter_stage_outputs is None
+    if has_audio:
+        assert output.multimodal_outputs[0] == {}
+        assert set(output.multimodal_outputs[1]) == {"model_outputs", "sr"}
+        torch.testing.assert_close(output.multimodal_outputs[1]["model_outputs"], audio)
+    else:
+        assert output.multimodal_outputs == [{}, {}]
+
+
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)

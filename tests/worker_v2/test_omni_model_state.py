@@ -103,6 +103,28 @@ def _seeded(seed):
     return SimpleNamespace(extra_args={"test_seed": seed}, seed=None)
 
 
+def test_preprocess_forwards_request_seed_to_model() -> None:
+    state = _make_state(has_preprocess=True)
+    state.intermediate_buffer.buffers[0] = {
+        "req_id": "seeded",
+        "sampling_params": SimpleNamespace(seed=42, max_tokens=128),
+    }
+    captured = []
+
+    def preprocess(input_ids, input_embeds, **info):
+        captured.append(info)
+        return input_ids, input_embeds, {}
+
+    state.model.preprocess = preprocess
+    state.run_preprocess(
+        _DummyInputBatch([0], num_computed_tokens_cpu=[0]),
+        {"input_ids": torch.tensor([1]), "inputs_embeds": torch.zeros(1, 4)},
+        SimpleNamespace(prompt_len=np.array([1], dtype=np.int32), num_computed_tokens=None),
+    )
+    assert captured[0]["_omni_seed"] == 42
+    assert captured[0]["_omni_max_tokens"] == 128
+
+
 def _init_static(state, bsz, dim=3):
     state._mtp_input_ids = torch.zeros(bsz, dtype=torch.long)
     state._mtp_input_embeds = torch.zeros((bsz, dim))
@@ -152,6 +174,7 @@ def test_output_spans_follow_reordered_mixed_batch():
     # batch=[2, 0]: prefill (3 tokens) reordered ahead of decode (1 token).
     state = _make_state(have_multimodal_outputs=True)
     batch = _DummyInputBatch([2, 0])
+    batch.req_ids = ["prefill", "decode"]
     batch.num_scheduled_tokens = [3, 1]
     batch.query_start_loc_np = [0, 3]
     state.intermediate_buffer.buffers[2] = {"req_id": "prefill"}
@@ -162,6 +185,7 @@ def test_output_spans_follow_reordered_mixed_batch():
     )
     state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
     assert seen["request_token_spans"] == [(0, 3), (3, 4)]
+    assert seen["request_ids"] == ["prefill", "decode"]
     assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
 
 
@@ -272,6 +296,7 @@ def test_moss_local_decode_runs_depth_predictor_and_routes_eos(mocker):
             "hidden_states": {"last": torch.full((4,), float(idx + 1))},
         }
     batch = _DummyInputBatch([1, 0], num_computed_tokens_cpu=[1, 1])
+    batch.req_ids = ["r1", "r0"]
     inputs = {"input_ids": torch.tensor([2, 2]), "inputs_embeds": torch.zeros(2, 4)}
     request_state = mocker.Mock(spec=RequestState, prompt_len=np.array([1, 1]), num_computed_tokens=None)
     state.run_preprocess(batch, inputs, request_state)

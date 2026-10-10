@@ -12,17 +12,37 @@ import torch
 from vllm import SamplingParams
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
-from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner, _runner_assisted_batch_descriptor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(("num_reqs", "bucket"), [(2, 2), (3, 4), (4, 4), (5, 8), (6, 8), (7, 8), (8, 8)])
+def test_runner_assisted_decode_pads_to_unified_bucket(num_reqs: int, bucket: int) -> None:
+    original = BatchExecutionDescriptor(CUDAGraphMode.NONE, num_reqs, None)
+    request = RunnerAssistedFullAttentionMetadataRequest(bucket, True)
+    padded = _runner_assisted_batch_descriptor(original, request, num_reqs, 8)
+    assert padded is not None
+    assert (padded.num_reqs, padded.num_tokens, padded.cg_mode) == (bucket, bucket, CUDAGraphMode.NONE)
+
+
+def test_runner_assisted_decode_rejects_undersized_or_overbudget_bucket() -> None:
+    original = BatchExecutionDescriptor(CUDAGraphMode.NONE, 7, None)
+    for bucket in (4, 9):
+        assert (
+            _runner_assisted_batch_descriptor(original, RunnerAssistedFullAttentionMetadataRequest(bucket, False), 7, 8)
+            is None
+        )
 
 
 def _make_runner():
