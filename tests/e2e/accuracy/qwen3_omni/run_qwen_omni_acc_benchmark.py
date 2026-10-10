@@ -10,7 +10,7 @@ H100 / MI325) because they launch the live Omni server inside the test.
 
 1. **Daily-Omni** — MCQ accuracy fields in the saved JSON (``daily_omni_accuracy``, …); by default the
    run **fails** if accuracy is strictly below **0.69** (``--min-daily-omni-accuracy`` / ``ACC_BENCH_MIN_DAILY_OMNI_ACCURACY``).
-2. **Seed-TTS** — ``seed-tts-eval``-style metrics when ``--seed-tts-wer-eval`` is used
+2. **Seed-TTS** — ``seed-tts-eval``-style metrics when ``--wer-eval`` is used
    (WER / SIM / UTMOS keys from :func:`compute_seed_tts_wer_metrics`).
 3. **Video-MME** — opt-in via ``--run-videomme`` (skipped by default so Daily-Omni / Seed-TTS callers
    stay unchanged). MiniCPM-o 4.5 reports **70.4** on Video-MME (w/o subs); the default floor is
@@ -182,7 +182,7 @@ def _validate_seed_tts(
         return errs
     n = int(result.get("seed_tts_content_evaluated", 0) or 0)
     if n <= 0:
-        errs.append("seed_tts_content_evaluated is 0 (enable --seed-tts-wer-eval and check PCM capture).")
+        errs.append("seed_tts_content_evaluated is 0 (enable --wer-eval and check PCM capture).")
     mean_wer = result.get("seed_tts_content_error_mean")
     if mean_wer is not None and max_mean_wer is not None and float(mean_wer) > float(max_mean_wer) + 1e-12:
         errs.append(f"seed_tts_content_error_mean (WER)={mean_wer:.6f} > --max-seed-tts-mean-wer={max_mean_wer}")
@@ -292,8 +292,8 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
     pack_mode = getattr(ns, "daily_omni_pack_mode", None)
     if pack_mode:
         argv.extend(["--daily-omni-pack-mode", pack_mode])
-    if ns.daily_omni_save_eval_items:
-        argv.append("--daily-omni-save-eval-items")
+    if ns.save_eval_items:
+        argv.append("--save-eval-items")
     print("\n$", vllm, *argv, "\n", flush=True)
     run_vllm_bench_subprocess(vllm, argv)
     out = Path(ns.result_dir) / result_filename
@@ -326,8 +326,8 @@ def run_videomme(ns: argparse.Namespace, vllm: str) -> Path:
         argv.append("--videomme-use-subtitle")
     if ns.videomme_inline_local_video:
         argv.append("--videomme-inline-local-video")
-    if ns.videomme_save_eval_items:
-        argv.append("--videomme-save-eval-items")
+    if ns.save_eval_items or ns.videomme_save_eval_items:
+        argv.append("--save-eval-items")
     if ns.videomme_video_dir is not None:
         argv.extend(["--videomme-video-dir", str(Path(ns.videomme_video_dir).expanduser().resolve())])
     if ns.videomme_parquet is not None:
@@ -356,18 +356,18 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
         )
         + seed_tts_bench_argv(locale=ns.seed_tts_locale)
         + [
-            "--seed-tts-wer-eval",
+            "--wer-eval",
             "--extra-body",
             json.dumps(extra, ensure_ascii=False, separators=(",", ":")),
         ]
     )
     if ns.seed_tts_turns_per_session > 1:
         argv.extend(["--seed-tts-turns-per-session", str(ns.seed_tts_turns_per_session)])
-    if ns.seed_tts_wer_save_items:
-        argv.append("--seed-tts-wer-save-items")
+    if ns.save_eval_items:
+        argv.append("--save-eval-items")
     if ns.seed_tts_file_ref_audio:
         argv.append("--seed-tts-file-ref-audio")
-    extra_env: dict[str, str] = {"SEED_TTS_WER_EVAL": "1"}
+    extra_env: dict[str, str] = {"WER_EVAL": "1"}
     if ns.seed_tts_eval_device:
         extra_env["SEED_TTS_EVAL_DEVICE"] = ns.seed_tts_eval_device
     print("\n$", vllm, *argv, "\n", flush=True)
@@ -477,7 +477,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="JSON merged into each chat request for Daily-Omni (default matches common L4 / text-output runs).",
     )
     p.add_argument(
-        "--daily-omni-save-eval-items",
+        "--save-eval-items",
+        dest="save_eval_items",
         action="store_true",
         help="Sets env via CLI flag so per-item rows are stored in the result JSON.",
     )
@@ -599,7 +600,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Group this many Seed-TTS target texts into each Realtime session.",
     )
-    p.add_argument("--seed-tts-wer-save-items", action="store_true")
     p.add_argument(
         "--seed-tts-file-ref-audio",
         action="store_true",

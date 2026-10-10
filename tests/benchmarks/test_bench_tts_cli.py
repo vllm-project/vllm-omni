@@ -195,7 +195,7 @@ def test_build_bench_args_wer_eval_adds_flag(model_configs_path: Path) -> None:
         result_filename=None,
         extra_cli_args=[],
     )
-    assert "--seed-tts-wer-eval" in cmd
+    assert "--wer-eval" in cmd
 
 
 def test_build_bench_args_supports_local_model_and_shared_sweep_options(model_configs_path: Path) -> None:

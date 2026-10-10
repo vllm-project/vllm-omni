@@ -260,23 +260,31 @@ def test_compute_videomme_accuracy_metrics_saves_eval_items() -> None:
     assert metrics["videomme_eval_items"][0]["question_id"] == "q1"
 
 
-def test_videomme_save_eval_items_cli_sets_env(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "save_eval_items,videomme_save_eval_items",
+    [(True, False), (False, True), (True, True)],
+    ids=["generic-flag", "videomme-flag", "both-flags"],
+)
+def test_save_eval_items_cli_sets_env(
+    monkeypatch: pytest.MonkeyPatch,
+    save_eval_items: bool,
+    videomme_save_eval_items: bool,
+) -> None:
     from vllm_omni.benchmarks import serve
 
     seen: dict[str, str | None] = {}
 
     async def fake_main_async(args: Namespace) -> dict[str, str]:
-        seen["env"] = os.environ.get("VIDEOMME_SAVE_EVAL_ITEMS")
+        seen["env"] = os.environ.get("SAVE_EVAL_ITEMS")
         return {"ok": "1"}
 
-    monkeypatch.delenv("VIDEOMME_SAVE_EVAL_ITEMS", raising=False)
+    monkeypatch.delenv("SAVE_EVAL_ITEMS", raising=False)
     monkeypatch.setattr(serve, "main_async", fake_main_async)
 
     args = Namespace(
-        videomme_save_eval_items=True,
-        seed_tts_wer_eval=False,
-        seed_tts_wer_save_items=False,
-        daily_omni_save_eval_items=False,
+        videomme_save_eval_items=videomme_save_eval_items,
+        wer_eval=False,
+        save_eval_items=save_eval_items,
         omni_request_timeout_s=None,
         endpoint=None,
         backend="openai-chat-omni",
