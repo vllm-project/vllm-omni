@@ -15,6 +15,8 @@ import os
 import subprocess
 import time
 
+import psutil
+
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -273,9 +275,33 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
         _print_device_processes()
 
 
+# Lower-cased substrings that identify engine worker processes spawned under the
+# test process: vLLM ``VLLM::EngineCore`` / ``VLLM::Worker_*`` titles, vLLM-Omni
+# diffusion workers (``vLLM-Omni::DiffusionWorker_*``) and the
+# ``StageDiffusionProc`` subprocess. Matched against the psutil name and cmdline
+# (``setproctitle`` rewrites both).
+ENGINE_WORKER_PROCESS_MARKERS: tuple[str, ...] = (
+    "enginecore",
+    "stagediffusionproc",
+    "vllm::worker",
+    "vllm-omni::",
+)
+
+
+def is_engine_worker_process(proc: psutil.Process) -> bool:
+    """True when *proc* looks like an engine worker (see ``ENGINE_WORKER_PROCESS_MARKERS``)."""
+    try:
+        blob = " ".join([proc.name(), *proc.cmdline()]).lower()
+    except psutil.Error:
+        return False
+    return any(marker in blob for marker in ENGINE_WORKER_PROCESS_MARKERS)
+
+
 __all__ = [
+    "ENGINE_WORKER_PROCESS_MARKERS",
     "cleanup_test_environment",
     "get_physical_device_indices",
+    "is_engine_worker_process",
     "pick_least_used_device_indices",
     "wait_for_gpu_memory_to_clear",
 ]

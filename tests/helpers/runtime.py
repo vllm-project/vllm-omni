@@ -15,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -27,7 +27,10 @@ from filelock import FileLock, Timeout
 from vllm import TextPrompt
 from vllm.logger import init_logger
 
-from tests.helpers.clean import cleanup_test_environment
+from tests.helpers.clean import (
+    cleanup_test_environment,
+    is_engine_worker_process,
+)
 from tests.helpers.media import (
     release_audio_transcriber,
 )
@@ -137,6 +140,19 @@ class OmniServerParams(NamedTuple):
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
     startup_timeout: int = SERVER_STARTUP_TIMEOUT_S
+
+
+class AsyncOmniParams(NamedTuple):
+    """Indirect parameter for the ``async_omni_runner`` / ``async_omni_runner_function`` fixtures.
+
+    ``extra_omni_kwargs`` are forwarded to :class:`AsyncOmniRunner` and from
+    there to ``AsyncOmni`` (``enforce_eager``, ``enable_sleep_mode``,
+    ``worker_extension_cls``, ``custom_pipeline_args``, ``max_num_seqs``, …).
+    """
+
+    model: str
+    deploy_config: str | None = None
+    extra_omni_kwargs: dict[str, Any] | None = None
 
 
 class OmniServer:
@@ -635,7 +651,107 @@ class OmniServerStageCli(OmniServer):
         cleanup_test_environment()
 
 
-class OmniRunner:
+class _EngineWorkerOwner:
+    """Engine-worker ownership and teardown shared by :class:`OmniRunner` and
+    :class:`AsyncOmniRunner`.
+
+    A runner owns the engine workers that appeared under this process while its
+    engine was starting, plus their later descendants. Workers that were already
+    running (another runner, a shared transcriber) are never touched.
+    """
+
+    def _snapshot_initial_children(self) -> None:
+        """Record the children that exist before the engine starts; call first in ``__init__``."""
+        self._runner_process = psutil.Process()
+        self._initial_child_ids: set[tuple[int, float]] = set()
+        self._owned_engine_processes: dict[int, float] = {}
+        for child in self._runner_process.children(recursive=True):
+            try:
+                self._initial_child_ids.add((child.pid, child.create_time()))
+            except psutil.Error:
+                pass
+
+    def _remember_engine_processes(self, *, startup: bool = False) -> None:
+        """Track startup workers, then only descendants of those workers.
+
+        Existing children may belong to another runner or a shared transcriber.
+        Record identities before close() can reparent surviving workers: daemon
+        diffusion workers are children of ``StageDiffusionProc`` and a scan after
+        it is joined no longer finds them under this process.
+        """
+        try:
+            if startup:
+                candidates = self._runner_process.children(recursive=True)
+            else:
+                candidates = []
+                for pid, created in list(self._owned_engine_processes.items()):
+                    try:
+                        proc = psutil.Process(pid)
+                        if proc.create_time() == created:
+                            candidates.extend(proc.children(recursive=True))
+                    except psutil.Error:
+                        pass
+            for proc in candidates:
+                try:
+                    identity = (proc.pid, proc.create_time())
+                    if identity in self._initial_child_ids:
+                        continue
+                    if startup and any(
+                        (parent.pid, parent.create_time()) in self._initial_child_ids for parent in proc.parents()
+                    ):
+                        continue
+                    if is_engine_worker_process(proc):
+                        self._owned_engine_processes[identity[0]] = identity[1]
+                except psutil.Error:
+                    pass
+        except psutil.Error as error:
+            print(f"Warning: could not inspect runner workers: {error}")
+
+    def _cleanup_process(self):
+        try:
+            matched = []
+            for pid, created in self._owned_engine_processes.items():
+                try:
+                    proc = psutil.Process(pid)
+                    if proc.create_time() == created:
+                        print(f"Found owned vllm process: PID={proc.pid}")
+                        matched.append(proc)
+                except psutil.Error:
+                    pass
+            for proc in matched:
+                try:
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            _, still_alive = psutil.wait_procs(matched, timeout=5)
+            for proc in still_alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if still_alive:
+                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
+                if stubborn:
+                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
+                else:
+                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
+            elif matched:
+                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
+        except Exception as e:
+            print(f"Error in psutil vllm cleanup: {e}")
+
+    def _teardown_engine(self, close: Callable[[], None] | None) -> None:
+        """Close the engine, stop the owned workers that survived, reset the device."""
+        self._remember_engine_processes()
+        try:
+            if close is not None:
+                close()
+        finally:
+            self._cleanup_process()
+            cleanup_test_environment()
+
+
+class OmniRunner(_EngineWorkerOwner):
     def __init__(
         self,
         model_name: str,
@@ -659,14 +775,7 @@ class OmniRunner:
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
         self.omni: Any = None
-        self._runner_process = psutil.Process()
-        self._initial_child_ids: set[tuple[int, float]] = set()
-        self._owned_engine_processes: dict[int, float] = {}
-        for child in self._runner_process.children(recursive=True):
-            try:
-                self._initial_child_ids.add((child.pid, child.create_time()))
-            except psutil.Error:
-                pass
+        self._snapshot_initial_children()
         try:
             from vllm_omni.entrypoints.omni import Omni
 
@@ -909,86 +1018,91 @@ class OmniRunner:
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         return self.omni.stop_profile(stages=stages)
 
-    def _remember_engine_processes(self, *, startup: bool = False) -> None:
-        """Track startup workers, then only descendants of those workers.
-
-        Existing children may belong to another runner or a shared transcriber.
-        Record identities before close() can reparent surviving workers.
-        """
-        try:
-            if startup:
-                candidates = self._runner_process.children(recursive=True)
-            else:
-                candidates = []
-                for pid, created in list(self._owned_engine_processes.items()):
-                    try:
-                        proc = psutil.Process(pid)
-                        if proc.create_time() == created:
-                            candidates.extend(proc.children(recursive=True))
-                    except psutil.Error:
-                        pass
-            for proc in candidates:
-                try:
-                    identity = (proc.pid, proc.create_time())
-                    if identity in self._initial_child_ids:
-                        continue
-                    if startup and any(
-                        (parent.pid, parent.create_time()) in self._initial_child_ids for parent in proc.parents()
-                    ):
-                        continue
-                    cmdline = " ".join(proc.cmdline()).lower()
-                    if "enginecore" in cmdline or "enginecore" in proc.name().lower():
-                        self._owned_engine_processes[identity[0]] = identity[1]
-                except psutil.Error:
-                    pass
-        except psutil.Error as error:
-            print(f"Warning: could not inspect runner workers: {error}")
-
-    def _cleanup_process(self):
-        try:
-            matched = []
-            for pid, created in self._owned_engine_processes.items():
-                try:
-                    proc = psutil.Process(pid)
-                    if proc.create_time() == created:
-                        print(f"Found owned vllm process: PID={proc.pid}")
-                        matched.append(proc)
-                except psutil.Error:
-                    pass
-            for proc in matched:
-                try:
-                    proc.terminate()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            _, still_alive = psutil.wait_procs(matched, timeout=5)
-            for proc in still_alive:
-                try:
-                    proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            if still_alive:
-                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
-                if stubborn:
-                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
-                else:
-                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
-            elif matched:
-                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
-        except Exception as e:
-            print(f"Error in psutil vllm cleanup: {e}")
-
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._remember_engine_processes()
+        omni = getattr(self, "omni", None)
+        self._teardown_engine(omni.close if omni is not None and hasattr(omni, "close") else None)
+
+
+class AsyncOmniRunner(_EngineWorkerOwner):
+    """In-process :class:`~vllm_omni.entrypoints.async_omni.AsyncOmni` with the
+    :class:`OmniRunner` lifecycle contract.
+
+    ``cleanup_test_environment`` runs before construction. On exit (normal,
+    test failure, or a constructor that raised after workers were spawned) the
+    runner shuts the engine down, stops the engine workers it owns that
+    survived ``shutdown()``, and runs ``cleanup_test_environment`` again. It
+    owns the workers that appeared while its engine was starting and their
+    descendants; workers of another runner are left alone, so a module-scoped
+    runner can coexist with other live engines.
+
+    ``AsyncOmni.__init__`` is synchronous; the coroutine methods bind to the
+    event loop of their first call, so keep one runner per event loop (the
+    function-scoped ``async_omni_runner_function`` fixture) unless every
+    consumer shares the same ``loop_scope``.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        stage_init_timeout: int = 600,
+        init_timeout: int = 1800,
+        log_stats: bool = False,
+        deploy_config: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        startup_t0 = time.perf_counter()
+        cleanup_test_environment()
+        self.model_name = model_name
+        self.engine: Any = None
+        self._closed = False
+        self._snapshot_initial_children()
         try:
-            omni = getattr(self, "omni", None)
-            if omni is not None and hasattr(omni, "close"):
-                omni.close()
-        finally:
-            self._cleanup_process()
-            cleanup_test_environment()
+            from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+            self.engine = AsyncOmni(
+                model=model_name,
+                log_stats=log_stats,
+                stage_init_timeout=stage_init_timeout,
+                init_timeout=init_timeout,
+                deploy_config=deploy_config,
+                **kwargs,
+            )
+        except BaseException:
+            # ``with AsyncOmniRunner(...)`` never reaches ``__enter__``/``__exit__``
+            # when construction fails after worker processes have started.
+            self._remember_engine_processes(startup=True)
+            self.close()
+            raise
+        self._remember_engine_processes(startup=True)
+        if log_stats:
+            startup_s = time.perf_counter() - startup_t0
+            print(f"AsyncOmniRunner startup took {startup_s:.3f}s (model={model_name})", flush=True)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails: forward to the live engine so
+        # tests can call ``runner.generate(...)`` without unwrapping.
+        engine = self.__dict__.get("engine")
+        if engine is None or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(engine, name)
+
+    def close(self) -> None:
+        """Shut down, stop leftover owned engine workers, and reset the device. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        engine, self.engine = self.engine, None
+        self._teardown_engine(engine.shutdown if engine is not None else None)
+
+    def __enter__(self) -> "AsyncOmniRunner":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1254,41 @@ def iter_omni_runner(
             print("OmniRunner stopping...")
 
         print("OmniRunner stopped")
+
+
+def iter_async_omni(
+    request: Any,
+    run_level: str,
+    omni_fixture_lock: threading.Lock,
+) -> Generator[Any, None, None]:
+    """Yield an :class:`AsyncOmniRunner`; used by ``async_omni_runner`` / ``async_omni_runner_function`` fixtures.
+
+    Applies the same model prefix, run-level deploy YAML patching and
+    ``core_model`` tiny-model rewrite (``diffusion``-marked tests) as
+    :func:`iter_omni_runner`.
+    """
+    from tests.helpers.stage_config import stage_config_path_for_run_level
+
+    params = getattr(request, "param", None)
+    if not isinstance(params, AsyncOmniParams):
+        fixture_name = getattr(request, "fixturename", "async_omni_runner_function")
+        raise ValueError(
+            f"{fixture_name} must be parametrized (indirect=True) with "
+            f"AsyncOmniParams(model, deploy_config=..., extra_omni_kwargs=...), got {params!r}"
+        )
+    model_prefix = get_model_prefix()
+    with omni_fixture_lock, _whisper_device_free_around():
+        model = model_prefix + params.model
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
+        deploy_config = stage_config_path_for_run_level(params.deploy_config, run_level)
+        extra_omni_kwargs = dict(params.extra_omni_kwargs or {})
+        with AsyncOmniRunner(model, deploy_config=deploy_config, **extra_omni_kwargs) as runner:
+            print("AsyncOmniRunner started successfully")
+            yield runner
+            print("AsyncOmniRunner stopping...")
+
+        print("AsyncOmniRunner stopped")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1319,6 +1468,8 @@ __all__ = [
     "OpenPIWebSocketSession",
     "OmniResponse",
     "OmniRunner",
+    "AsyncOmniParams",
+    "AsyncOmniRunner",
     "OfflineOmniClient",
     "OmniServer",
     "OmniServerParams",
