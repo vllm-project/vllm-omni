@@ -252,6 +252,7 @@ class StagePipelineConfig:
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
+    supports_duplex_mrv2: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
@@ -1012,9 +1013,11 @@ def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, 
 
     Streaming-session prompt replacement exists only in the V1 chunk adapter,
     so a stage that receives from an upstream stage on MRv2 supports
-    turn-based sessions only.
+    turn-based sessions only unless it explicitly declares supports_duplex_mrv2.
     """
     if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
+        return
+    if deploy.session_mode == "duplex" and ps.supports_duplex_mrv2:
         return
     if deploy.session_mode != "turn":
         raise ValueError(

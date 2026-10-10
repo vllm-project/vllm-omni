@@ -843,6 +843,15 @@ class MiniCPMO45DuplexWorkerHelper:
                     actual_group = group_idx if group_idx < len(raw_blocks) else 0
                     return [int(b) for b in raw_blocks[actual_group]]
                 return [int(b) for b in raw_blocks]
+        # MRv2 owns request slots and block tables on the runner, rather than
+        # on its transient InputBatch. Read after staged writes are applied.
+        req_states = getattr(runner, "req_states", None)
+        block_tables = getattr(runner, "block_tables", None)
+        if req_states is not None and block_tables is not None:
+            slot = req_states.req_id_to_index.get(req_id)
+            if slot is not None:
+                num_blocks = int(block_tables.num_blocks.np[group_idx, slot])
+                return block_tables.block_tables[group_idx].gpu[slot, :num_blocks].tolist()
         # Fallback to input_batch block_table
         bt = getattr(getattr(runner, "input_batch", None), "block_table", None)
         if bt is not None:
@@ -859,16 +868,26 @@ class MiniCPMO45DuplexWorkerHelper:
     @classmethod
     def maybe_apply_reanchor(cls, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
-        if not hasattr(runner, "input_batch") or runner.input_batch is None:
-            return
-        num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
-        req_ids = runner.input_batch.req_ids[:num_reqs]
+        req_states = getattr(runner, "req_states", None)
+        if req_states is not None and scheduler_output is not None:
+            req_ids = list(scheduler_output.num_scheduled_tokens)
+        else:
+            if not hasattr(runner, "input_batch") or runner.input_batch is None:
+                return
+            num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
+            req_ids = runner.input_batch.req_ids[:num_reqs]
         applied_reanchors = getattr(runner, "_applied_stage0_reanchor_ids", None)
         if applied_reanchors is None:
             applied_reanchors = runner._applied_stage0_reanchor_ids = set()
 
         for req_idx, req_id in enumerate(req_ids):
-            info = runner.model_intermediate_buffer.get(req_id)
+            if req_states is not None:
+                slot = req_states.req_id_to_index.get(req_id)
+                if slot is None:
+                    continue
+                info = runner.model_state.intermediate_buffer.buffers[slot]
+            else:
+                info = runner.model_intermediate_buffer.get(req_id)
             if not isinstance(info, dict):
                 continue
             duplex = info.get("duplex")
@@ -906,12 +925,14 @@ class MiniCPMO45DuplexWorkerHelper:
             # Scheduler is authoritative for logical state (block_table and computed tokens).
             # The parent runner's _update_states() already installed the post-compaction block IDs
             # and decremented num_computed_tokens_cpu. We do NOT double-compact or double-decrement here.
-            old_computed = int(
-                reanchor.get(
-                    "old_computed_tokens",
-                    int(runner.input_batch.num_computed_tokens_cpu[req_idx]) + plan.delta,
-                )
-            )
+            old_computed = reanchor.get("old_computed_tokens")
+            if old_computed is None:
+                if req_states is not None:
+                    slot = req_states.req_id_to_index[req_id]
+                    old_computed = int(req_states.num_computed_tokens_np[slot]) + plan.delta
+                else:
+                    old_computed = int(runner.input_batch.num_computed_tokens_cpu[req_idx]) + plan.delta
+            old_computed = int(old_computed)
 
             req_state = runner.requests.get(req_id) if hasattr(runner, "requests") else None
             mrope_pos = getattr(req_state, "mrope_positions", None) if req_state is not None else None
@@ -938,9 +959,14 @@ class MiniCPMO45DuplexWorkerHelper:
                 inv_freq = cls.get_rope_inv_freq(runner)
                 kv_groups = getattr(runner, "kv_cache_group_ids", None)
                 block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+                # Layers share their KV group's table; on MRv2 each lookup is a device read.
+                group_block_ids: dict[int, list[int]] = {}
                 for layer_idx, kv_cache in enumerate(runner.kv_caches):
                     group_idx = kv_groups[layer_idx] if (kv_groups and layer_idx < len(kv_groups)) else 0
-                    layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
+                    layer_block_ids = group_block_ids.get(group_idx)
+                    if layer_block_ids is None:
+                        layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
+                        group_block_ids[group_idx] = layer_block_ids
                     rotate_cached_keys(
                         kv_cache,
                         block_ids=layer_block_ids,

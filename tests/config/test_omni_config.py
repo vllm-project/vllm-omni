@@ -2365,3 +2365,23 @@ def test_async_chunk_auto_disabled_without_processor():
     # since doing so will just raise a ValueError in validation.
     merge_pipeline_deploy(pipeline, deploy)
     assert not deploy.async_chunk
+
+
+def test_mrv2_duplex_session_validation():
+    from vllm_omni.config.stage_config import validate_native_mrv2_session
+
+    ps = StagePipelineConfig(
+        stage_id=1,
+        model_stage="tts",
+        input_sources=(0,),
+        supports_native_mrv2_data_plane=True,
+        supports_duplex_mrv2=True,
+    )
+    # Allowed when supports_duplex_mrv2 is True
+    deploy_duplex = DeployConfig(session_mode="duplex")
+    validate_native_mrv2_session(deploy_duplex, ps, "v2")
+
+    # Rejected when supports_duplex_mrv2 is False
+    ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
+    with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
+        validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")

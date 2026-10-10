@@ -1,8 +1,8 @@
 # Opt-in CUDA Model Runner V2 profile for MiniCPM-o 4.5 turn serving: the
 # Thinker (stage 0), Talker (stage 1) and Code2Wav (stage 2) run on MRv2.
 # The Thinker uses native multimodal encoding and tensor-only FULL graphs;
-# downstream stages use the native data plane. These stages support
-# turn-based sessions only (duplex needs the V1 chunk adapter).
+# downstream stages use the native data plane. This profile serves
+# turn-based sessions; duplex on MRv2 uses minicpmo_4_5_duplex_mrv2.yaml.
 #
 # On MRv2 the Talker keeps its sampled codec id, 16-frame penalty history and
 # EOS state on the device (no per-step D2H wait), and Code2Wav schedules

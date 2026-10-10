@@ -102,7 +102,8 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     assert info["ids"]["tts"] == [11, 12]
 
 
-def test_native_duplex_speak_segment_reaches_split_talker() -> None:
+@pytest.mark.parametrize("metadata_layout", ["scalar", "list", "tensor", "flat_tensor"])
+def test_native_duplex_speak_segment_reaches_split_talker(metadata_layout: str) -> None:
     prompt_ids = [101, 102]
     output_ids = [9304, 21, 22, 9308]
     latent = torch.arange(24, dtype=torch.float32).reshape(6, 4)
@@ -123,6 +124,17 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
             },
         },
     )
+    # Per-step boundary snapshots are accumulated as lists or concatenated
+    # tensors by the output processor before the native duplex handoff.
+    meta = source.outputs[0].multimodal_output["meta"]
+    if metadata_layout == "list":
+        meta.update({key: [value, value] for key, value in meta.items()})
+    elif metadata_layout in ("tensor", "flat_tensor"):
+        meta.update({key: torch.tensor([[value], [value]]) for key, value in meta.items()})
+    if metadata_layout == "flat_tensor":
+        mm_output = source.outputs[0].multimodal_output
+        mm_output.pop("meta")
+        mm_output.update({f"meta.{key}": value for key, value in meta.items()})
     context = SimpleNamespace(
         bridge_states={
             "duplex": {

@@ -1479,6 +1479,72 @@ def test_exactly_once_reanchor_across_metadata_refreshes():
     assert torch.equal(k_pool, k_pool_after_first)
 
 
+@pytest.mark.parametrize("explicit_old_computed", [False, True])
+def test_mrv2_reanchor_uses_request_slot_without_persistent_input_batch(explicit_old_computed):
+    reanchor = {"delta": 16, "moved_from": 48, "sink_blocks": 2}
+    if explicit_old_computed:
+        reanchor["old_computed_tokens"] = 64
+    pool = torch.randn(8, 1, 16, 16)
+    original = pool.clone()
+    inv_freq = _get_inv_freq(head_dim=16)
+    block_ids = [0, 1, 2, 3]
+    info = {"duplex": {"stage0_reanchor": dict(reanchor)}}
+    runner = SimpleNamespace(
+        req_states=SimpleNamespace(req_id_to_index={"r": 2}, num_computed_tokens_np=np.array([0, 0, 48])),
+        model_state=SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[{}, {}, info])),
+        block_tables=SimpleNamespace(
+            num_blocks=SimpleNamespace(np=np.array([[0, 0, 4]])),
+            block_tables=[SimpleNamespace(gpu=torch.tensor([[0] * 4, [0] * 4, block_ids]))],
+        ),
+        device=torch.device("cpu"),
+        cache_config=SimpleNamespace(block_size=16),
+        kv_caches=[pool],
+        _duplex_inv_freq=inv_freq,
+    )
+    scheduler = SimpleNamespace(num_scheduled_tokens={"r": 1}, scheduled_new_reqs=[])
+    MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner, scheduler_output=scheduler)
+    # Only the retained tail in compacted block 2 is shifted; sink and
+    # unrelated pages stay untouched and scheduler counts are not decremented twice.
+    torch.testing.assert_close(pool[2], rotate_keys(original[2], 16, inv_freq), rtol=1e-5, atol=1e-6)
+    assert torch.equal(pool[:2], original[:2])
+    assert torch.equal(pool[3:], original[3:])
+    assert runner.req_states.num_computed_tokens_np.tolist() == [0, 0, 48]
+    assert "stage0_reanchor" not in info["duplex"]
+
+
+def test_mrv2_reanchor_reads_each_group_block_table_once(monkeypatch):
+    pools = [torch.randn(8, 1, 16, 16) for _ in range(3)]
+    originals = [pool.clone() for pool in pools]
+    inv_freq = _get_inv_freq(head_dim=16)
+    info = {"duplex": {"stage0_reanchor": {"delta": 16, "moved_from": 48, "sink_blocks": 2}}}
+    runner = SimpleNamespace(
+        req_states=SimpleNamespace(req_id_to_index={"r": 0}, num_computed_tokens_np=np.array([48])),
+        model_state=SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[info])),
+        block_tables=SimpleNamespace(
+            num_blocks=SimpleNamespace(np=np.array([[4]])),
+            block_tables=[SimpleNamespace(gpu=torch.tensor([[0, 1, 2, 3]]))],
+        ),
+        device=torch.device("cpu"),
+        cache_config=SimpleNamespace(block_size=16),
+        kv_caches=pools,
+        _duplex_inv_freq=inv_freq,
+    )
+    resolve = MiniCPMO45DuplexWorkerHelper.resolve_group_block_ids
+    calls = []
+
+    def counted(runner_, req_id, req_idx, group_idx=0):
+        calls.append(group_idx)
+        return resolve(runner_, req_id, req_idx, group_idx=group_idx)
+
+    monkeypatch.setattr(MiniCPMO45DuplexWorkerHelper, "resolve_group_block_ids", staticmethod(counted))
+    MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(
+        runner, scheduler_output=SimpleNamespace(num_scheduled_tokens={"r": 1}, scheduled_new_reqs=[])
+    )
+    assert calls == [0]
+    for pool, original in zip(pools, originals):
+        torch.testing.assert_close(pool[2], rotate_keys(original[2], 16, inv_freq), rtol=1e-5, atol=1e-6)
+
+
 def test_history_slicing_multi_row_embeddings_and_non_aligned_prefix():
     """Verify that history eviction properly handles:
     1. Non-aligned prefix: tokens in [prefix_tokens, sink_end) are kept in the sink!
