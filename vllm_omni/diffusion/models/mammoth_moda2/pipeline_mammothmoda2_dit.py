@@ -8,7 +8,6 @@ from typing import ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from vllm.logger import init_logger
@@ -20,6 +19,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     RequestScopedCacheDiTRuntime,
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -374,12 +374,9 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         if self.config.gen_vae_config is None or self.config.gen_dit_config is None:
             raise ValueError("Mammothmoda2Config.gen_vae_config / gen_dit_config must not be None")
 
-        self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
-        # The registry applies the stage's VAE memory modes to ``model.vae``
-        # (vllm_omni/diffusion/registry.py), but this pipeline owns ``gen_vae``,
-        # so read the standard fields here -- as the diffusers adapter and ltx2
-        # do for the VAEs they own.  Tiling only engages above the checkpoint's
-        # tile threshold.
+        self.gen_vae = DistributedAutoencoderKL.from_config(self.config.gen_vae_config)
+        # Preserve the stage's memory modes at construction; registry
+        # initialization also configures the discovered VAE's parallel mode.
         self.gen_vae.use_slicing = bool(od_config.vae_use_slicing)
         self.gen_vae.use_tiling = bool(od_config.vae_use_tiling)
         if self.gen_vae.use_slicing or self.gen_vae.use_tiling:

@@ -492,18 +492,34 @@ def initialize_model(
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         vae_mode = od_config.parallel_config.vae_parallel_mode
-        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
-        if vae_mode == "batch" and not isinstance(getattr(model, "vae", None), DistributedAutoencoderKL_base):
+        distributed_vae = getattr(model, "vae", None)
+        if not isinstance(distributed_vae, DistributedVaeMixin):
+            distributed_vae = None
+        if (
+            vae_pp_size > 1 or od_config.vae_use_tiling or od_config.vae_use_slicing or vae_mode != "tile"
+        ) and distributed_vae is None:
+            from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+            declared_vaes = [
+                vae for vae in ModuleDiscovery.discover(model).vaes if isinstance(vae, DistributedVaeMixin)
+            ]
+            if len(declared_vaes) == 1:
+                distributed_vae = declared_vaes[0]
+            elif len(declared_vaes) > 1 or vae_pp_size > 1 or vae_mode != "tile":
+                logger.warning(
+                    "Declared VAE settings for %s are ignored: found %d compatible distributed VAEs "
+                    "(vae_patch_parallel_size=%d, vae_parallel_mode=%s).",
+                    od_config.model_class_name,
+                    len(declared_vaes),
+                    vae_pp_size,
+                    vae_mode,
+                )
+
+        if vae_mode == "batch" and not isinstance(distributed_vae, DistributedAutoencoderKL_base):
             raise ValueError(
                 "VAE batch parallel decode requires DistributedAutoencoderKL or DistributedAutoencoderKLFlux2"
             )
-        if vae_pp_size > 1 and not is_distributed_vae:
-            logger.warning(
-                "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
-                vae_pp_size,
-                od_config.model_class_name,
-            )
-        if vae_pp_size > 1 and is_distributed_vae and vae_mode != "batch" and not od_config.vae_use_tiling:
+        if vae_pp_size > 1 and distributed_vae is not None and vae_mode != "batch" and not od_config.vae_use_tiling:
             logger.info(
                 "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
@@ -516,8 +532,11 @@ def initialize_model(
         if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
-        if is_distributed_vae:
-            model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
+        if distributed_vae is not None:
+            if hasattr(distributed_vae, "use_slicing"):
+                distributed_vae.use_slicing = od_config.vae_use_slicing
+            setattr(distributed_vae, "use_tiling", od_config.vae_use_tiling)
+            distributed_vae.set_parallel_size(vae_pp_size, mode=vae_mode)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
