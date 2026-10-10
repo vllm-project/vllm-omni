@@ -286,6 +286,28 @@ def test_sequence_layout_keeps_inference_mode_entries_apart() -> None:
 
 
 @pytest.mark.cpu
+def test_moving_the_model_drops_cached_layouts() -> None:
+    model = _tiny_model()
+    builds = _count_rope_builds(model)
+    coords, modalities = _layout_inputs([V, A, T, TIME])
+    with torch.inference_mode():
+        first = model._sequence_layout(coords, modalities)
+        assert model._sequence_layout(coords, modalities) is first
+    assert len(model._sequence_layouts) == 1
+    # The output rank stages the transformer to the host and back around prompt encoding.
+    with torch.inference_mode():
+        model.to("cpu")
+    assert not model._sequence_layouts
+    with torch.inference_mode():
+        rebuilt = model._sequence_layout(coords, modalities)
+        assert model._sequence_layout(coords, modalities) is rebuilt
+        assert len(builds) == 2
+        expected = _rebuilt_metadata(model, coords, modalities)
+    assert rebuilt is not first
+    _assert_same_metadata(rebuilt, expected)
+
+
+@pytest.mark.cpu
 def test_invalid_coordinates_are_rejected_on_every_call() -> None:
     model = _tiny_model()
     coords, modalities = _layout_inputs([V, A, T])
@@ -311,3 +333,11 @@ def test_musa_device_sequence_layout_matches_rebuilding() -> None:
     assert len(builds) == 2
     assert second is first
     _assert_same_metadata(first, expected)
+    with torch.inference_mode():
+        model.to("cpu")
+    assert not model._sequence_layouts
+    with torch.inference_mode():
+        model.to("musa")
+        rebuilt = model._sequence_layout(coords, modality_mapping)
+    assert len(builds) == 3
+    _assert_same_metadata(rebuilt, expected)
