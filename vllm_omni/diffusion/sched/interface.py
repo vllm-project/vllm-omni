@@ -92,6 +92,8 @@ class StepBatchSamplingParamsKey:
     # separate batches so the worker can activate exactly one adapter per step.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
+    # Same request-schedule identity as the request-batch key.
+    attention_schedule: tuple[Any, ...] | None = None
 
 
 @dataclass(frozen=True, eq=True)
@@ -157,6 +159,9 @@ class RequestBatchSamplingParamsKey:
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
+
+    # Immutable request schedule. None inherits; () disables; different ranges must not share a batch.
+    attention_schedule: tuple[Any, ...] | None = None
 
 
 @dataclass

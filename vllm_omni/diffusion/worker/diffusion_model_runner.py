@@ -84,6 +84,7 @@ from vllm_omni.diffusion.worker.utils import (
     merge_stage_durations,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -977,6 +978,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output = runner_output.runner_outputs[0].result
             assert output is not None
             return output
+        except OmniClientError as exc:
+            # Preserve request errors before the worker RPC serializes them.
+            return DiffusionOutput.from_exception(exc)
         finally:
             if installed_request:
                 self.remove_diffusion_kv_requests([req.request_id])
@@ -1054,12 +1058,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 metadata=new_req.diffusion_kv_metadata,
             )
         installed_request_ids: list[str] = []
+        reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         try:
             for new_req in scheduler_output.scheduled_new_reqs:
                 if new_req.diffusion_kv_metadata is not None:
                     self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
                     installed_request_ids.append(new_req.request_id)
-            reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
             return self._execute_request_list(
                 reqs,
                 od_config=od_config,
@@ -1073,6 +1077,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 ]
                 or None,
             )
+        except OmniClientError as exc:
+            return self._runner_output_from_outputs(reqs, [DiffusionOutput.from_exception(exc) for _ in reqs])
         finally:
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)

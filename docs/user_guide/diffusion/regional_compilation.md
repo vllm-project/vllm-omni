@@ -26,8 +26,8 @@ For an experimental whole-transformer compile scope, set
 `--diffusion-compile-granularity full` or use
 `diffusion_compile_granularity: full` in the deploy configuration. Full scope may
 still contain graph breaks; it does not force one graph. It is rejected when
-HSDP, sequence parallelism, CPU offload, or layerwise offload is enabled. Use
-regional scope with those features.
+HSDP, sequence parallelism, CPU offload, or layerwise offload is enabled, or
+attention schedule profiles are configured. Use regional scope with those features.
 
 These settings control the generic model-runner compilation path. Pipelines
 that provide their own `setup_compile()` implementation manage their compilation
