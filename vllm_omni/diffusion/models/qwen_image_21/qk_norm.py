@@ -80,7 +80,14 @@ if HAS_TRITON:
         tl.store(output_ptr + out + 3, tl.fma(d, cb, c * sb).to(tl.bfloat16), mask)
 
 
-def qk_rotary(q, k, wq, wk, f, eps):
+def qk_rotary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    f: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     if (
         not HAS_TRITON
         or not _EXACT_CUDA_STACK

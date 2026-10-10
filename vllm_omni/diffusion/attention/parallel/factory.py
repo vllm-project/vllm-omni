@@ -59,6 +59,7 @@ def build_parallel_attention_strategy(
         and getattr(cfg, "dtype", None) == torch.bfloat16
         and ulysses_degree > 1
         and ring_degree == 1
+        and allgather_degree == 1
         and getattr(p, "ulysses_mode", "strict") == "strict"
         and (getattr(cfg, "extras", None) or {}).get("qwen21_auto_symmem_ulysses", True)
         and current_omni_platform.is_cuda()

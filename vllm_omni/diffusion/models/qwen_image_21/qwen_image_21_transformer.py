@@ -293,7 +293,6 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out",
         )
-        self.activation_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor, *, _pointwise_validated: bool = False) -> torch.Tensor:
         return self.out(
@@ -1289,7 +1288,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
 
-        block_extras: dict[str, Any] = {}
+        prepared_modulation = None
+        pointwise_validated = False
         if (
             joint_hidden_states.device.type == "cuda"
             and not torch.is_grad_enabled()
@@ -1299,7 +1299,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             # The model shares one modulation across all blocks. Materialize
             # its token selection/scale/tanh once per step, using the same ops.
             scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
-            block_extras["prepared_modulation"] = (
+            prepared_modulation = (
                 1 + _select_modulation_rows(scale1, local_mask),
                 _select_modulation_rows(gate1, local_mask).tanh(),
                 1 + _select_modulation_rows(scale2, local_mask),
@@ -1309,8 +1309,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 # Native unquantized linear/norm operations preserve dtype,
                 # device and dense row layout. Validate the shared gates once
                 # per step, instead of repeating it at every pointwise call.
-                prepared = block_extras["prepared_modulation"]
-                block_extras["_pointwise_validated"] = pointwise_eligible(joint_hidden_states, prepared[1], prepared[3])
+                pointwise_validated = pointwise_eligible(
+                    joint_hidden_states, prepared_modulation[1], prepared_modulation[3]
+                )
         for index_block, block in enumerate(self.transformer_blocks):
             block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
             joint_hidden_states = block(
@@ -1324,7 +1325,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
-                **block_extras,
+                prepared_modulation=prepared_modulation,
+                _pointwise_validated=pointwise_validated,
             )
 
         if (

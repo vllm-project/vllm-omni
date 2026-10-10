@@ -73,7 +73,7 @@ def _unpack(
         tl.store(v_ptr + index, value, index < elements)
 
 
-def eligible(q, k, v, world_size):
+def eligible(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int) -> bool:
     return (
         world_size > 1
         and q.ndim == 4
@@ -132,6 +132,8 @@ def qkv_fwd_batched(
 
 
 @qkv_fwd_batched.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, group_name: str, world_size: int):
+def _(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, group_name: str, world_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     shape = (q.shape[0], q.shape[1] * world_size, q.shape[2] // world_size, q.shape[3])
-    return tuple(q.new_empty(shape) for _ in range(3))
+    return q.new_empty(shape), q.new_empty(shape), q.new_empty(shape)

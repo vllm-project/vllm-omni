@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -17,9 +17,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 def pipeline():
     result = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
     nn.Module.__init__(result)
-    result.text_encoder = SimpleNamespace(dtype=torch.float32, training=False)
+    result.text_encoder = Mock(spec=nn.Module, dtype=torch.float32, training=False)
     result.processor = object()
-    result.od_config = SimpleNamespace(lora_config=None, enable_cpu_offload=False)
+    result.od_config = Mock(spec=OmniDiffusionConfig, lora_config=None, enable_cpu_offload=False)
     result.device = torch.device("cpu")
     result.prompt_template_t2i = "{}"
     result._drop_idx = 0
@@ -50,7 +50,7 @@ def test_changed_prompt_limit_role_or_encoder_cannot_hit(pipeline):
     pipeline.encode_prompt("B")
     pipeline.encode_prompt("A", max_sequence_length=10)
     pipeline.encode_prompt("A", prompt_name="negative_prompt")
-    pipeline.text_encoder = SimpleNamespace(dtype=torch.float32, training=False)
+    pipeline.text_encoder = Mock(spec=nn.Module, dtype=torch.float32, training=False)
     pipeline.encode_prompt("A")
     assert pipeline._get_qwen_prompt_embeds.call_count == 5
 
