@@ -1,3 +1,4 @@
 -r common.txt
 onnxruntime>=1.23.2
+onnx>=1.16.0  # CosyVoice3 dynamic-batch TensorRT estimator graph metadata rewrite
 fa3-fwd==0.0.3

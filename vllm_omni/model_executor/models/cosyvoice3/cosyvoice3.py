@@ -72,6 +72,12 @@ logger = init_logger(__name__)
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
 _RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
 
+# The generic CosyVoice3 Stage-1 scheduler defaults to 8 sequences. Keep the
+# TensorRT fast-path profile bounded to that proven range; larger scheduler
+# batches remain correct because CFM serializes unsupported 2N CFG shapes
+# through the single-request profile.
+_MAX_TRT_FLOW_BATCH_REQUESTS = 8
+
 
 def _normalize_request_conditioning(payload: dict) -> dict:
     """Unwrap singleton conditioning containers at the per-request boundary.
@@ -767,6 +773,8 @@ class CosyVoice3Model(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        self._max_num_seqs = max(1, int(getattr(scheduler_config, "max_num_seqs", 1)))
         standard_sampling = cosyvoice3_standard_sampling(self.config)
         logger.info("CosyVoice3 sampling policy: %s", "standard" if standard_sampling else "ras")
         self.have_multimodal_outputs = True
@@ -1438,14 +1446,24 @@ class CosyVoice3Model(
                 build_flow_estimator_trt,
             )
 
-            wrapper = build_flow_estimator_trt(onnx_path, device="cuda")
-            # ``estimator`` is a registered nn.Module submodule; delete it first
-            # (frees the torch estimator weights) so the TRT wrapper can be set
-            # as a plain attribute — nn.Module.__setattr__ rejects non-Modules.
             decoder = self.code2wav.flow_model.decoder
+            batch_flow = cosyvoice3_batch_flow_enabled()
+            max_cfg_batch = 2 * min(self._max_num_seqs, _MAX_TRT_FLOW_BATCH_REQUESTS) if batch_flow else None
+            wrapper = build_flow_estimator_trt(
+                onnx_path,
+                device="cuda",
+                max_cfg_batch=max_cfg_batch,
+            )
+            # ``estimator`` is a registered nn.Module submodule; delete it only
+            # after the requested TRT engine is ready. If the dual-profile build
+            # fails, the outer exception path keeps the original Torch estimator
+            # so cross-request 2N CFG semantics remain correct.
             del decoder.estimator
             decoder.estimator = wrapper
-            logger.info("CosyVoice3: using TensorRT flow-decoder estimator (code2wav)")
+            logger.info(
+                "CosyVoice3: using TensorRT flow-decoder estimator (code2wav)%s",
+                f" with dynamic CFG batch <= {max_cfg_batch}" if max_cfg_batch and max_cfg_batch > 2 else "",
+            )
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.warning(
                 "CosyVoice3 code2wav: TensorRT estimator build failed (%s); keeping torch estimator",
