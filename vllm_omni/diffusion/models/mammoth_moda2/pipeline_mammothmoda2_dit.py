@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -20,6 +20,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     RequestScopedCacheDiTRuntime,
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -338,7 +339,12 @@ class _RequestConditioning:
     image_mask: torch.Tensor
 
 
-class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+class MammothModa2DiTPipeline(
+    nn.Module,
+    CFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
+):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -366,6 +372,13 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         super().__init__()
         del prefix
         self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+        cache_backend = str(getattr(od_config, "cache_backend", "") or "").lower()
+        if (self.parallel_config.cfg_parallel_size or 1) > 1 and cache_backend == "cache_dit":
+            raise NotImplementedError(
+                "MammothModa2 does not support Cache-DiT with CFG parallelism because "
+                "Cache-DiT relies on sequential conditional/unconditional call parity."
+            )
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
         self.weights_sources = [_root_weight_source(od_config)]
@@ -440,7 +453,7 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
 
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
         self._cache_dit_config: DiffusionCacheConfig | None = None
-        if str(getattr(od_config, "cache_backend", "") or "").lower() == "cache_dit":
+        if cache_backend == "cache_dit":
             cache_config = od_config.cache_config
             self._cache_dit_config = (
                 cache_config
@@ -657,6 +670,65 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
             )
         return text_cond, image_cond
 
+    def predict_noise(self, **kwargs: Any) -> torch.Tensor:
+        """Run one conditional or unconditional MammothModa2 DiT branch."""
+        return self.gen_transformer(**kwargs)
+
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        true_cfg_scale: float,
+        cfg_normalize: bool = False,
+        kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        positive_items = positive_noise_pred if isinstance(positive_noise_pred, tuple) else (positive_noise_pred,)
+
+        negative_items = negative_noise_pred if isinstance(negative_noise_pred, tuple) else (negative_noise_pred,)
+
+        if len(positive_items) != 1 or len(negative_items) != 1:
+            raise ValueError("MammothModa2 CFG requires exactly one positive and one negative noise prediction")
+
+        positive_noise_pred = positive_items[0]
+        negative_noise_pred = negative_items[0]
+
+        if kwargs is None:
+            raise ValueError("MammothModa2 CFG requires per-request combine context.")
+
+        scale_vec = kwargs.get("scale_vec")
+        active_mask = kwargs.get("active_mask")
+        all_active = kwargs.get("all_active")
+
+        if not isinstance(scale_vec, torch.Tensor):
+            raise ValueError("MammothModa2 CFG requires a scale_vec tensor.")
+        if not isinstance(active_mask, torch.Tensor):
+            raise ValueError("MammothModa2 CFG requires an active_mask tensor.")
+        if not isinstance(all_active, bool):
+            raise ValueError("MammothModa2 CFG requires an all_active boolean.")
+
+        del true_cfg_scale
+
+        blended = torch.lerp(
+            negative_noise_pred,
+            positive_noise_pred,
+            scale_vec,
+        )
+
+        if cfg_normalize:
+            blended = self.cfg_normalize_function(
+                positive_noise_pred,
+                blended,
+            )
+
+        if all_active:
+            return blended
+
+        return torch.where(
+            active_mask,
+            blended,
+            positive_noise_pred,
+        )
+
     def _build_conditioning(
         self,
         text_cond: torch.Tensor,
@@ -801,6 +873,11 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         # all rows; rows that never take the CFG branch select their cond
         # prediction directly via torch.where below.
         needs_uncond = any(s.text_guidance_scale > 1.0 for s in specs)
+        for spec in specs:
+            self.check_cfg_parallel_validity(
+                spec.text_guidance_scale,
+                has_neg_prompt=spec.text_guidance_scale > 1.0,
+            )
         negative_prompt_embeds = None
         negative_prompt_attention_mask = None
         if needs_uncond:
@@ -859,41 +936,47 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
         for i, t in enumerate(scheduler.timesteps):
             timestep = timesteps_dtype[i].expand(batch)
-            model_pred = self.gen_transformer(
-                hidden_states=latents,
-                timestep=timestep,
-                text_hidden_states=prompt_embeds,
-                text_attention_mask=prompt_attention_mask,
-                ref_image_hidden_states=None,
-                ar_image_hidden_states=ar_image_embeds,
-                ar_image_attention_mask=ar_image_attention_mask,
-                freqs_cis=self.gen_freqs_cis,
-                teacache_branch="positive",
-            )
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep,
+                "text_hidden_states": prompt_embeds,
+                "text_attention_mask": prompt_attention_mask,
+                "ref_image_hidden_states": None,
+                "ar_image_hidden_states": ar_image_embeds,
+                "ar_image_attention_mask": ar_image_attention_mask,
+                "freqs_cis": self.gen_freqs_cis,
+                "teacache_branch": "positive",
+            }
             run_uncond = (any_active_per_step is not None and any_active_per_step[i]) if needs_uncond else False
             if requires_paired_cfg and negative_prompt_embeds is not None:
                 run_uncond = True
+            negative_kwargs = None
             if run_uncond:
-                model_pred_uncond = self.gen_transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_hidden_states=negative_prompt_embeds,
-                    text_attention_mask=negative_prompt_attention_mask,
-                    ref_image_hidden_states=None,
-                    freqs_cis=self.gen_freqs_cis,
-                    teacache_branch="negative",
-                )
-                # Fused CFG blend: torch.lerp fuses (uncond + scale * (cond - uncond)) into 1 kernel
-                blended = torch.lerp(model_pred_uncond, model_pred, scale_vec)
-                if all_active_per_step is not None and all_active_per_step[i]:
-                    # Fast path: all requests in the batch are active.
-                    model_pred = blended
-                else:
-                    # Inactive rows keep their conditional prediction exactly:
-                    # gating the blend with torch.where avoids propagating
-                    # uncond-branch NaN/rounding into CFG-free rows.
-                    active_tensor = precomputed_active_masks[i]
-                    model_pred = torch.where(active_tensor, blended, model_pred)
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep,
+                    "text_hidden_states": negative_prompt_embeds,
+                    "text_attention_mask": negative_prompt_attention_mask,
+                    "ref_image_hidden_states": None,
+                    "freqs_cis": self.gen_freqs_cis,
+                    "teacache_branch": "negative",
+                }
+
+            combine_context = None
+            if run_uncond:
+                combine_context = {
+                    "scale_vec": scale_vec,
+                    "active_mask": precomputed_active_masks[i],
+                    "all_active": all_active_per_step[i],
+                }
+            model_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=run_uncond,
+                true_cfg_scale=1.0,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+                kwargs=combine_context,
+            )
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=target_dtype)
 
@@ -942,6 +1025,10 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
         del kwargs
         prompt = state.prompt if isinstance(state.prompt, dict) else {}
         spec = self._parse_request_inputs(prompt, state.sampling, state.request_id)
+        self.check_cfg_parallel_validity(
+            spec.text_guidance_scale,
+            has_neg_prompt=spec.text_guidance_scale > 1.0,
+        )
         text_cond, image_cond = self._split_request_conditions(spec)
 
         model_device, target_dtype = self._model_device_and_dtype()
@@ -1014,46 +1101,56 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
 
         batch_size = int(input_batch.latents.shape[0])
         timesteps = input_batch.timesteps.reshape(-1).expand(batch_size).to(input_batch.latents.dtype)
-        model_pred = self.gen_transformer(
-            hidden_states=input_batch.latents,
-            timestep=timesteps,
-            text_hidden_states=input_batch.prompt_embeds,
-            text_attention_mask=input_batch.prompt_embeds_mask,
-            ref_image_hidden_states=None,
-            ar_image_hidden_states=ar_image_embeds,
-            ar_image_attention_mask=ar_image_attention_mask,
-            freqs_cis=self.gen_freqs_cis,
-        )
-
         guidance_scales = [float(state.extra["mammoth_text_guidance_scale"]) for state in batch_states]
         active_cfg = []
         for state, guidance_scale in zip(batch_states, guidance_scales):
             cfg_start, cfg_end = state.extra["mammoth_cfg_range"]
             fraction = state.step_index / max(1, state.total_steps)
             active_cfg.append(guidance_scale > 1.0 and cfg_start <= fraction <= cfg_end)
-        if not any(active_cfg):
-            return model_pred
-        if input_batch.negative_prompt_embeds is None or input_batch.negative_prompt_embeds_mask is None:
-            raise ValueError("MammothModa2 CFG batch is missing negative conditioning")
 
-        model_pred_uncond = self.gen_transformer(
-            hidden_states=input_batch.latents,
-            timestep=timesteps,
-            text_hidden_states=input_batch.negative_prompt_embeds,
-            text_attention_mask=input_batch.negative_prompt_embeds_mask,
-            ref_image_hidden_states=None,
-            freqs_cis=self.gen_freqs_cis,
+        positive_kwargs = {
+            "hidden_states": input_batch.latents,
+            "timestep": timesteps,
+            "text_hidden_states": input_batch.prompt_embeds,
+            "text_attention_mask": input_batch.prompt_embeds_mask,
+            "ref_image_hidden_states": None,
+            "ar_image_hidden_states": ar_image_embeds,
+            "ar_image_attention_mask": ar_image_attention_mask,
+            "freqs_cis": self.gen_freqs_cis,
+            "teacache_branch": "positive",
+        }
+        run_uncond = any(active_cfg)
+        negative_kwargs = None
+        combine_context = None
+        if run_uncond:
+            if input_batch.negative_prompt_embeds is None or input_batch.negative_prompt_embeds_mask is None:
+                raise ValueError("MammothModa2 CFG batch is missing negative conditioning")
+            negative_kwargs = {
+                "hidden_states": input_batch.latents,
+                "timestep": timesteps,
+                "text_hidden_states": input_batch.negative_prompt_embeds,
+                "text_attention_mask": input_batch.negative_prompt_embeds_mask,
+                "ref_image_hidden_states": None,
+                "freqs_cis": self.gen_freqs_cis,
+                "teacache_branch": "negative",
+            }
+            combine_context = {
+                "scale_vec": input_batch.latents.new_tensor(guidance_scales).view(batch_size, 1, 1, 1),
+                "active_mask": torch.tensor(
+                    active_cfg,
+                    device=input_batch.latents.device,
+                    dtype=torch.bool,
+                ).view(batch_size, 1, 1, 1),
+                "all_active": all(active_cfg),
+            }
+        return self.predict_noise_maybe_with_cfg(
+            do_true_cfg=run_uncond,
+            true_cfg_scale=1.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+            kwargs=combine_context,
         )
-        scale = model_pred.new_tensor(guidance_scales).view(batch_size, 1, 1, 1)
-        blended = torch.lerp(model_pred_uncond, model_pred, scale)
-        if all(active_cfg):
-            return blended
-        active_tensor = torch.tensor(
-            active_cfg,
-            device=model_pred.device,
-            dtype=torch.bool,
-        ).view(batch_size, 1, 1, 1)
-        return torch.where(active_tensor, blended, model_pred)
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs) -> None:
         del kwargs

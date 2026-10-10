@@ -22,6 +22,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     TransformerConfig,
 )
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.models.interface import adopt_request_scoped_cache_dit
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
@@ -94,6 +95,7 @@ def test_root_weight_source_forwards_revision() -> None:
 
 
 def test_pipeline_declares_native_components_and_batch_modes() -> None:
+    assert issubclass(MammothModa2DiTPipeline, CFGParallelMixin)
     assert MammothModa2DiTPipeline._dit_modules == ["gen_transformer"]
     assert MammothModa2DiTPipeline._encoder_modules == ["gen_image_condition_refiner"]
     assert MammothModa2DiTPipeline._vae_modules == ["gen_vae"]
@@ -340,7 +342,8 @@ class _FakeTransformer(nn.Module):
         self.time_caption_embed = _FakeTimeCaptionEmbed()
         self.calls = 0
 
-    def forward(self, *, hidden_states, **kwargs):
+    def forward(self, *, hidden_states, text_hidden_states=None, **kwargs):
+        del text_hidden_states, kwargs
         self.calls += 1
         return torch.zeros_like(hidden_states)
 
@@ -358,6 +361,54 @@ class _FakeImageRefiner(nn.Module):
             self.num_queries,
             image_embeds.shape[-1],
         )
+
+
+class _CfgSignalTransformer(_FakeTransformer):
+    """Make conditional and unconditional branches numerically distinct."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.branch_token_lengths: list[int] = []
+
+    def forward(self, *, hidden_states, text_hidden_states=None, **kwargs):
+        del kwargs
+        assert text_hidden_states is not None
+        self.calls += 1
+        token_length = int(text_hidden_states.shape[1])
+        self.branch_token_lengths.append(token_length)
+        branch_bias = 10.0 if token_length > 0 else -5.0
+        return hidden_states + branch_bias
+
+
+class _TwoBranchCfgGroup:
+    """Fake two-rank CFG group that reconstructs the peer branch."""
+
+    def __init__(self, rank: int) -> None:
+        self.rank_in_group = rank
+        self.world_size = 2
+        self.gather_calls = 0
+
+    def all_gather(self, input_, dim=0, separate_tensors=False):
+        del dim
+        assert separate_tensors
+        self.gather_calls += 1
+        if self.rank_in_group == 0:
+            positive = input_
+            negative = input_ - 15.0
+        else:
+            negative = input_
+            positive = input_ + 15.0
+        return [positive, negative]
+
+
+def _patch_cfg_parallel_state(monkeypatch, *, rank: int, fake_group: _TwoBranchCfgGroup) -> None:
+    from vllm_omni.diffusion.distributed import cfg_parallel, parallel_state
+
+    monkeypatch.setattr(parallel_state, "_CFG", fake_group)
+    for module in (parallel_state, cfg_parallel):
+        monkeypatch.setattr(module, "get_classifier_free_guidance_world_size", lambda: 2)
+        monkeypatch.setattr(module, "get_classifier_free_guidance_rank", lambda: rank)
+        monkeypatch.setattr(module, "get_cfg_group", lambda: fake_group)
 
 
 @dataclass
@@ -429,6 +480,70 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
     assert pipeline.gen_transformer.calls == 2
 
 
+def test_batched_cfg_parallel_matches_sequential_with_mixed_scales_and_ranges(monkeypatch) -> None:
+    module = pipeline_mammothmoda2_dit
+    monkeypatch.setattr(module, "FlowMatchEulerDiscreteScheduler", _FakeScheduler)
+    monkeypatch.setattr(
+        module,
+        "randn_tensor",
+        lambda shape, **kwargs: torch.zeros(shape, device=kwargs["device"], dtype=kwargs["dtype"]),
+    )
+
+    requests = [
+        _batch(
+            request_id="cfg-full",
+            sampling=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                seed=1,
+                guidance_scale=4.0,
+                num_inference_steps=2,
+                extra_args={"cfg_range": [0.0, 1.0]},
+            ),
+        ).requests[0],
+        _batch(
+            request_id="cfg-first-step",
+            sampling=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                seed=2,
+                guidance_scale=7.0,
+                num_inference_steps=2,
+                extra_args={"cfg_range": [0.0, 0.25]},
+            ),
+        ).requests[0],
+    ]
+    request_batch = DiffusionRequestBatch(requests)
+
+    def run_pipeline() -> tuple[list[DiffusionOutput], list[int]]:
+        pipeline = _pipeline_shell()
+        transformer = _CfgSignalTransformer()
+        pipeline.gen_transformer = transformer
+        pipeline.gen_image_condition_refiner = None
+        pipeline.gen_vae = _FakeVae()
+        pipeline.gen_freqs_cis = torch.zeros(1)
+        outputs = pipeline.forward(request_batch)
+        return outputs, transformer.branch_token_lengths
+
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    monkeypatch.setattr(parallel_state, "_CFG", None)
+    sequential_outputs, sequential_branches = run_pipeline()
+    assert sequential_branches == [4, 0, 4, 0]
+    torch.testing.assert_close(sequential_outputs[0].output, torch.full((1, 3, 32, 48), -55.0))
+    torch.testing.assert_close(sequential_outputs[1].output, torch.full((1, 3, 32, 48), -10.0))
+
+    for rank, expected_branch_length in ((0, 4), (1, 0)):
+        fake_group = _TwoBranchCfgGroup(rank)
+        _patch_cfg_parallel_state(monkeypatch, rank=rank, fake_group=fake_group)
+        rank_outputs, rank_branches = run_pipeline()
+
+        assert rank_branches == [expected_branch_length, expected_branch_length]
+        assert fake_group.gather_calls == 2
+        for actual, expected in zip(rank_outputs, sequential_outputs):
+            torch.testing.assert_close(actual.output, expected.output, rtol=0, atol=0)
+
+
 def test_forward_rejects_missing_visual_tokens_before_model_access() -> None:
     prompt = {
         "prompt": "",
@@ -493,6 +608,14 @@ def _cache_dit_od_config() -> OmniDiffusionConfig:
         cache_backend="cache_dit",
         cache_config=DiffusionCacheConfig(),
     )
+
+
+def test_init_rejects_cache_dit_with_cfg_parallel() -> None:
+    config = _cache_dit_od_config()
+    config.parallel_config.cfg_parallel_size = 2
+
+    with pytest.raises(NotImplementedError, match="does not support Cache-DiT with CFG parallelism"):
+        MammothModa2DiTPipeline(od_config=config)
 
 
 @pytest.mark.skipif(
@@ -1068,6 +1191,65 @@ def _step_state(batch: DiffusionRequestBatch) -> StepRequestState:
     )
 
 
+def test_step_cfg_parallel_matches_sequential_with_mixed_scales_and_ranges(monkeypatch) -> None:
+    monkeypatch.setattr(
+        pipeline_mammothmoda2_dit,
+        "randn_tensor",
+        lambda shape, **kwargs: torch.zeros(shape, device=kwargs["device"], dtype=kwargs["dtype"]),
+    )
+    requests = [
+        _batch(
+            request_id="cfg-full",
+            sampling=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                seed=1,
+                guidance_scale=4.0,
+                num_inference_steps=2,
+                extra_args={"cfg_range": [0.0, 1.0]},
+            ),
+        ).requests[0],
+        _batch(
+            request_id="cfg-first-step",
+            sampling=OmniDiffusionSamplingParams(
+                height=32,
+                width=48,
+                seed=2,
+                guidance_scale=7.0,
+                num_inference_steps=2,
+                extra_args={"cfg_range": [0.0, 0.25]},
+            ),
+        ).requests[0],
+    ]
+
+    def run_step() -> tuple[torch.Tensor, list[int]]:
+        pipeline = _pipeline_shell()
+        transformer = _CfgSignalTransformer()
+        pipeline.gen_transformer = transformer
+        pipeline.gen_image_condition_refiner = None
+        pipeline.gen_freqs_cis = torch.zeros(1)
+        states = [pipeline.prepare_encode(_step_state(DiffusionRequestBatch([request]))) for request in requests]
+        for state in states:
+            state.step_index = 1
+        predictions = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+        return predictions, transformer.branch_token_lengths
+
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    monkeypatch.setattr(parallel_state, "_CFG", None)
+    sequential, sequential_branches = run_step()
+    assert sequential_branches == [4, 0]
+
+    for rank, expected_branch_length in ((0, 4), (1, 0)):
+        fake_group = _TwoBranchCfgGroup(rank)
+        _patch_cfg_parallel_state(monkeypatch, rank=rank, fake_group=fake_group)
+        parallel, rank_branches = run_step()
+
+        assert rank_branches == [expected_branch_length]
+        assert fake_group.gather_calls == 1
+        torch.testing.assert_close(parallel, sequential, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("step_execution", [False, True])
 @pytest.mark.parametrize(
     ("standard_steps", "extra_args", "extra_info", "expected_steps"),
@@ -1323,7 +1505,18 @@ def test_step_protocol_keeps_request_schedulers_and_progress_independent() -> No
 class _InputDependentTransformer(_FakeTransformer):
     """Expose dropped masks, timesteps, conditioning and latent rows in outputs."""
 
-    def forward(self, *, hidden_states, timestep, text_hidden_states, text_attention_mask, **kwargs):
+    def forward(
+        self,
+        *,
+        hidden_states,
+        timestep=None,
+        text_hidden_states=None,
+        text_attention_mask=None,
+        **kwargs,
+    ):
+        assert timestep is not None
+        assert text_hidden_states is not None
+        assert text_attention_mask is not None
         self.calls += 1
         conditioning = (text_hidden_states * text_attention_mask.unsqueeze(-1)).sum(dim=(1, 2)) / 100
         return hidden_states * 0.125 + timestep[:, None, None, None] + conditioning[:, None, None, None]
@@ -1395,10 +1588,16 @@ def test_step_protocol_handles_arrival_reordering_and_retirement() -> None:
         if tick == 1:
             short = pipeline.prepare_encode(_step_state(_step_test_request("short", seed=22, steps=2, text_tokens=5)))
             assert short.scheduler is not long.scheduler
-        active = [short, long] if tick in (1, 2) else [long]
-        references = [solo_short, solo_long] if tick in (1, 2) else [solo_long]
+        if tick in (1, 2):
+            assert short is not None
+            active = [short, long]
+            references = [solo_short, solo_long]
+        else:
+            active = [long]
+            references = [solo_long]
         cached_batch = InputBatch.make_batch(active, cached_batch=cached_batch)
         if tick == 1:
+            assert short is not None
             assert long.current_timestep != short.current_timestep
             assert cached_batch.prompt_embeds_mask.sum(dim=1).tolist() == [7, 4]
         predictions = pipeline.denoise_step(cached_batch, states=active)
@@ -1413,10 +1612,12 @@ def test_step_protocol_handles_arrival_reordering_and_retirement() -> None:
                 completed[state.request_id] = pipeline.post_decode(state).output
                 torch.testing.assert_close(completed[state.request_id], pipeline.post_decode(reference).output)
         if tick == 2:
+            assert short is not None
             assert short.denoise_completed and not long.denoise_completed
             assert list(completed) == ["short"]
             retired_latents = short.latents.clone()
 
+    assert short is not None
     assert list(completed) == ["short", "long"]
     assert (short.step_index, long.step_index) == (2, 4)
     torch.testing.assert_close(short.latents, retired_latents, rtol=0, atol=0)
