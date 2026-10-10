@@ -205,9 +205,19 @@ class MiniCPMO45Stage0DuplexRuntime:
             if state.streaming_processor is not None:
                 return state.streaming_processor
             processor = copy.copy(processor)
+            # The streaming mel processor sets its feature extractor's log-mel floor
+            # on every chunk (set_spac_log_norm). The shallow copy would share that
+            # extractor with self.processor, whose process_audio then normalises the
+            # next session's reference voice under whatever floor the last chunk of
+            # any session left. One memo also binds the copied mel processor to the
+            # session's own extractor; set_streaming_mode rebuilds it on that one.
+            memo: dict[int, Any] = {}
+            shared_fe = getattr(self.processor, "audio_processor", None)
+            if shared_fe is not None:
+                processor.audio_processor = copy.deepcopy(shared_fe, memo)
             shared_mel = getattr(self.processor, "_streaming_mel_processor", None)
             if shared_mel is not None:
-                processor._streaming_mel_processor = copy.deepcopy(shared_mel)
+                processor._streaming_mel_processor = copy.deepcopy(shared_mel, memo)
             state.streaming_processor = processor
         if processor is None:
             return None
