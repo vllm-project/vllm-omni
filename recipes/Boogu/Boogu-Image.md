@@ -48,6 +48,9 @@ pipeline supports single-GPU inference and classifier-free-guidance (CFG)
 parallelism. CPU offload, cache acceleration, and other multi-GPU dimensions
 remain unsupported (see Notes).
 
+The distilled Turbo checkpoint is additionally verified on Ascend NPU
+(single Atlas 910B3); see [Ascend NPU](#ascend-npu).
+
 ## GPU
 
 ### 1 x A100/H100 (Single GPU, 40GB+ VRAM)
@@ -262,6 +265,33 @@ curl -X POST http://localhost:8091/v1/images/edits \
   -F seed=42 \
   | jq -r '.data[0].b64_json' | base64 -d > edited_fp8.png
 ```
+
+## Ascend NPU
+
+### 1 x Atlas 910B3 (Single NPU, 64 GB HBM)
+
+Verified with the official `quay.io/ascend/vllm-omni` container on a commit
+containing the Ascend real-valued RoPE for Boogu (PR #6571).
+
+#### Command
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 vllm serve Boogu/Boogu-Image-0.1-Turbo --omni --port 8091
+```
+
+#### Verification
+
+The four-step DMD path serves `1024x1024` requests in roughly 2.8 s with the
+same request as the CUDA section. No NPU-specific flags are required: the
+attention backend resolves to the NPU platform default (`FLASH_ATTN`) and
+`torch.compile` is skipped on NPU (expected).
+
+#### Notes
+
+- Verified for the Turbo checkpoint only; Base and Edit share the same
+  transformer code path but their scheduler-driven serving is unvalidated
+  on NPU.
+- CPU offload, Cache-DiT, and multi-GPU parallelism are not validated on NPU.
 
 ## Fast text-to-image (Boogu-Image-0.1-Turbo)
 
