@@ -241,11 +241,8 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
     stage_connectors_config = {}
     target_stage = str(stage_id)
 
-    # Iterate through all configured edges and inject direction-specific role.
-    # The shared edge-level ConnectorSpec is role-neutral; each stage gets
-    # the correct role ("sender" or "receiver") based on its position in
-    # the edge so that MooncakeTransferEngineConnector (and any future
-    # role-aware connector) initializes correctly.
+    # Fill a missing role from the stage's direction, preserving explicit roles
+    # in the shared edge-level ConnectorSpec for compatibility.
     for (from_stage, to_stage), spec in transfer_config.connectors.items():
         if to_stage == target_stage:
             # Incoming edge → this stage is the receiver
@@ -264,6 +261,50 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
 
     return stage_connectors_config
+
+
+def _register_connector_spec(
+    connectors: dict[tuple[str, str], ConnectorSpec],
+    connector_sources: dict[tuple[str, str], str],
+    edge_key: tuple[str, str],
+    connector: ConnectorSpec,
+    source: str,
+) -> None:
+    """Register one edge spec and reject conflicting duplicate definitions."""
+    existing = connectors.get(edge_key)
+    if existing is None:
+        connectors[edge_key] = connector
+        connector_sources[edge_key] = source
+        return
+
+    edge = f"{edge_key[0]}->{edge_key[1]}"
+    previous_source = connector_sources[edge_key]
+    if existing.name != connector.name:
+        raise ValueError(
+            f"Connector type mismatch for edge {edge}: "
+            f"{previous_source} registered '{existing.name}', "
+            f"but {source} specifies '{connector.name}'"
+        )
+
+    # Keep the first spec, including its explicit role or the absence of one.
+    # Direction-specific role differences do not conflict with equivalent
+    # edge-level backend options.
+    existing_extra = {key: value for key, value in existing.extra.items() if key != "role"}
+    connector_extra = {key: value for key, value in connector.extra.items() if key != "role"}
+    conflicting_fields = sorted(
+        {
+            str(key)
+            for key in set(existing_extra) | set(connector_extra)
+            if existing_extra.get(key) != connector_extra.get(key)
+            or (key not in existing_extra) != (key not in connector_extra)
+        }
+    )
+    if conflicting_fields:
+        raise ValueError(
+            f"Conflicting connector options for edge {edge}: "
+            f"{previous_source} and {source} specify different values for "
+            f"{', '.join(conflicting_fields)}"
+        )
 
 
 def load_omni_transfer_config(
@@ -312,6 +353,7 @@ def load_omni_transfer_config(
 
     # Parse connectors
     connectors: dict[tuple[str, str], ConnectorSpec] = {}
+    connector_sources: dict[tuple[str, str], str] = {}
     runtime_config = config_dict.get("runtime", {})
 
     # Parse global connectors (from runtime.connectors)
@@ -324,38 +366,33 @@ def load_omni_transfer_config(
         stage_id = str(stage_config["stage_id"])
 
         # Input connectors (this stage is the receiver)
-        # NOTE: role is NOT injected here — the shared edge-level ConnectorSpec
-        # must remain role-neutral.  Role is injected per-stage in
-        # get_connectors_config_for_stage() / resolve_omni_kv_config_for_stage().
+        # Preserve configured roles without injecting defaults during parsing.
+        # get_connectors_config_for_stage() / resolve_omni_kv_config_for_stage()
+        # fill missing roles from each stage's direction.
         for input_key, conn_ref in stage_config.get("input_connectors", {}).items():
             if isinstance(conn_ref, str):
                 # Reference to global connector
                 if conn_ref in global_connectors:
                     conn_config = global_connectors[conn_ref]
-                    extra = dict(conn_config.get("extra", {}))
+                    extra = dict(conn_config.get("extra") or {})
                 else:
                     raise ValueError(f"Undefined connector reference: {conn_ref}")
                 connector = ConnectorSpec(name=conn_config["name"], extra=extra)
             else:
                 # Inline connector definition
-                extra = dict(conn_ref.get("extra", {}))
+                extra = dict(conn_ref.get("extra") or {})
                 connector = ConnectorSpec(name=conn_ref["name"], extra=extra)
 
             # Parse from_stage from key (e.g., "from_stage_0" -> "0")
             from_stage = input_key.replace("from_stage_", "")
             edge_key = (from_stage, stage_id)
-            # Both sides of an edge may define the same connector reference;
-            # verify consistency if already registered.
-            if edge_key in connectors:
-                existing = connectors[edge_key]
-                if existing.name != connector.name:
-                    raise ValueError(
-                        f"Connector type mismatch for edge {edge_key[0]}->{edge_key[1]}: "
-                        f"previously registered as '{existing.name}', "
-                        f"but input_connectors of stage {stage_id} specifies '{connector.name}'"
-                    )
-            else:
-                connectors[edge_key] = connector
+            _register_connector_spec(
+                connectors,
+                connector_sources,
+                edge_key,
+                connector,
+                f"input_connectors of stage {stage_id} ({input_key})",
+            )
             expected_edges.add(edge_key)
 
         # Output connectors (this stage is the sender)
@@ -364,28 +401,25 @@ def load_omni_transfer_config(
                 # Reference to global connector
                 if conn_ref in global_connectors:
                     conn_config = global_connectors[conn_ref]
-                    extra = dict(conn_config.get("extra", {}))
+                    extra = dict(conn_config.get("extra") or {})
                 else:
                     raise ValueError(f"Undefined connector reference: {conn_ref}")
                 connector = ConnectorSpec(name=conn_config["name"], extra=extra)
             else:
                 # Inline connector definition
-                extra = dict(conn_ref.get("extra", {}))
+                extra = dict(conn_ref.get("extra") or {})
                 connector = ConnectorSpec(name=conn_ref["name"], extra=extra)
 
             # Parse to_stage from key (e.g., "to_stage_1" -> "1")
             to_stage = output_key.replace("to_stage_", "")
             edge_key = (stage_id, to_stage)
-            if edge_key in connectors:
-                existing = connectors[edge_key]
-                if existing.name != connector.name:
-                    raise ValueError(
-                        f"Connector type mismatch for edge {edge_key[0]}->{edge_key[1]}: "
-                        f"previously registered as '{existing.name}', "
-                        f"but output_connectors of stage {stage_id} specifies '{connector.name}'"
-                    )
-            else:
-                connectors[edge_key] = connector
+            _register_connector_spec(
+                connectors,
+                connector_sources,
+                edge_key,
+                connector,
+                f"output_connectors of stage {stage_id} ({output_key})",
+            )
             expected_edges.add(edge_key)
 
     # Auto-configure SharedMemoryConnector for missing edges based on runtime edges / engine_input_source
