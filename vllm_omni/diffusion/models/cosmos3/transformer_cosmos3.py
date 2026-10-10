@@ -36,6 +36,7 @@ from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
@@ -43,6 +44,7 @@ from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import (
     ComponentQuantizationConfig,
@@ -1061,6 +1063,34 @@ class Cosmos3GenDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 # Language Model (Understanding pathway)
 # ---------------------------------------------------------------------------
+class _Cosmos3StagedEmbedding(nn.Embedding):
+    """Stage the large UND embedding only when selected for on-demand offload."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
+        super().__init__(num_embeddings, embedding_dim)
+        self._stager: PinnedModuleStager | None = None
+
+    def load_to_device(self) -> None:
+        if self._stager is not None:
+            self._stager.load()
+
+    def offload_to_cpu(self) -> None:
+        # The backend calls this after checkpoint loading. Snapshotting earlier
+        # would retain uninitialized or meta weights instead of the checkpoint.
+        if self._stager is None:
+            self._stager = PinnedModuleStager(self, get_local_device())
+        self._stager.offload()
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self._stager is None:
+            return super().forward(input)
+        try:
+            self.load_to_device()
+            return super().forward(input)
+        finally:
+            self.offload_to_cpu()
+
+
 class Cosmos3LanguageModel(nn.Module):
     """Understanding pathway: a standard causal LM that processes text tokens.
 
@@ -1089,7 +1119,7 @@ class Cosmos3LanguageModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.embed_tokens = _Cosmos3StagedEmbedding(vocab_size, hidden_size)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=rope_theta,
