@@ -325,6 +325,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "frame_rate": None,
         "resolved_frame_rate": None,
         "max_sequence_length": None,
+        "output_type": None,
         "extra_args": {},
     }
     values.update(overrides)
@@ -1068,7 +1069,7 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
             ),
         )
         output = pipeline.forward(request)
-        return output.output["video"]
+        return output.media.video.tensor
 
     first = run(123)
     second = run(123)
@@ -2942,7 +2943,11 @@ class TestForwardRouting:
 
         output = pipeline.forward(make_request_batch(prompt, sampling_params))
 
-        assert expected["key"] in output.output
+        if expected["key"] == "video":
+            assert output.media is not None
+            assert output.output is None
+        else:
+            assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]

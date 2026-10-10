@@ -388,6 +388,7 @@ def _pack_diffusion_media(
             "encoding": video.spec.encoding.value,
             "value_range": video.spec.value_range.value,
             "color_model": video.spec.color_model.value,
+            "preserve_input_dtype": video.spec.preserve_input_dtype,
             "pending_float_consumers": sorted(consumer.value for consumer in video.constraints.pending_float_consumers),
         },
     }
@@ -415,6 +416,7 @@ def _unpack_diffusion_media(packed: dict[str, Any]) -> DiffusionMediaOutput:
                 encoding=VideoTensorEncoding(video_payload["encoding"]),
                 value_range=VideoValueRange(video_payload["value_range"]),
                 color_model=VideoColorModel(video_payload["color_model"]),
+                preserve_input_dtype=video_payload.get("preserve_input_dtype", False),
             ),
             constraints=VideoTransportConstraints(
                 pending_float_consumers=frozenset(
