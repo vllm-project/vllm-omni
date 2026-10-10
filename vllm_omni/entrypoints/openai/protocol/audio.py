@@ -157,6 +157,21 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Use speaker embedding only without in-context learning (Base task)",
     )
+    cache_salt: str | None = Field(
+        default=None,
+        description="Caller-supplied prefix-cache salt. Honored over the "
+        "server-derived default; adapter-computed salts still win. Same "
+        "contract as vLLM chat/completions: callers own the isolation it draws.",
+    )
+
+    @field_validator("cache_salt", mode="before")
+    @classmethod
+    def _validate_cache_salt(cls, cache_salt):
+        from vllm.entrypoints.generate.base.protocol import validate_cache_salt
+
+        validate_cache_salt(cache_salt)
+        return cache_salt
+
     speaker_embedding: list[float] | list[list[float]] | None = Field(
         default=None,
         max_length=_MAX_EMBEDDING_DIM,
