@@ -3,7 +3,7 @@
 
 """Unit tests for OmniARModelRunner v2: async output staging, snapshot ownership, payload slicing."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+import vllm.utils.torch_utils as torch_utils
 from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
@@ -19,6 +20,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 import vllm_omni.worker_v2.omni_ar_model_runner as omni_ar_model_runner
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
+from vllm_omni.worker_v2.model_states.lychee_sampler import LycheeSampler
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput
 from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 
@@ -105,6 +107,8 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
 
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
+    # This CPU orchestration test does not require CUDA pinned-memory staging.
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
     input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])
@@ -225,6 +229,75 @@ def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     expected = hidden[1:3].log_softmax(dim=-1)[:, [2, 0]].cpu()
     assert output.prompt_token_id_logprobs_dict["req"].device.type == "cpu"
     torch.testing.assert_close(output.prompt_token_id_logprobs_dict["req"], expected)
+
+
+@pytest.mark.parametrize("failure_phase", ["postprocess", "sample", "constrain", "merge"])
+def test_post_main_failure_marks_registered_model_state_before_reraising(monkeypatch, failure_phase) -> None:
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    input_batch = SimpleNamespace(
+        req_ids=["req"],
+        num_reqs=1,
+        seq_lens=torch.tensor([1]),
+        idx_mapping=torch.tensor([0]),
+        num_tokens_after_padding=1,
+        is_padding=False,
+    )
+    state = SimpleNamespace(
+        input_batch=input_batch,
+        hidden_states=torch.zeros(1, 2),
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        routed_experts=None,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        dp_sync=None,
+    )
+    runner.execute_model_state = state
+    runner._kv_extracted_req_ids = None
+    runner._last_aux_output = None
+    runner._last_multimodal_outputs = {"branch": torch.zeros(1, 2)}
+    runner.eplb = MagicMock()
+    runner.aux_output_connector = None
+    runner.sampler = None
+    runner.model_config = SimpleNamespace(async_chunk=False)
+    runner.vllm_config = SimpleNamespace()
+    mark_failed = MagicMock()
+    runner.model_state = SimpleNamespace(
+        postprocess_model_output=MagicMock(return_value=(torch.zeros(1, 2), {"branch": torch.zeros(1, 2)})),
+        constrain_primary_sample=MagicMock(return_value=torch.tensor([[2]])),
+        continue_after_primary_sample=MagicMock(side_effect=RuntimeError("merge failed")),
+        mark_primary_continuation_failed=mark_failed,
+    )
+    runner.model = SimpleNamespace(logitsprocs_need_output_token_ids=False)
+    runner.sample = MagicMock(
+        return_value=(
+            SimpleNamespace(sampled_token_ids=torch.tensor([[2]])),
+            torch.tensor([1]),
+            torch.tensor([0]),
+        )
+    )
+    runner.req_states = SimpleNamespace()
+    runner.sampler = LycheeSampler(SimpleNamespace(), runner.model_state)
+    if failure_phase == "postprocess":
+        runner.model_state.postprocess_model_output.side_effect = RuntimeError("post-main failed")
+    elif failure_phase == "sample":
+        runner.sample.side_effect = RuntimeError("post-main failed")
+    elif failure_phase == "constrain":
+        runner.model_state.constrain_primary_sample.side_effect = RuntimeError("post-main failed")
+    else:
+        runner.model_state.continue_after_primary_sample.side_effect = RuntimeError("post-main failed")
+    monkeypatch.setattr(
+        omni_ar_model_runner,
+        "set_forward_context",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    with pytest.raises(RuntimeError, match="post-main failed"):
+        runner.sample_tokens(None)
+
+    mark_failed.assert_called_once()
+    assert mark_failed.call_args.kwargs["input_batch"] is input_batch
+    assert runner.sampler._sampling_context is None
 
 
 def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
@@ -415,6 +488,37 @@ def test_async_chunk_output_stages_mm_on_copy_stream_before_get_output(monkeypat
     assert output._mm_snapshot["codes"]["audio"].device.type == "cpu"
     source_codes.fill_(99)  # a later graph replay cannot leak into the snapshot
     assert torch.equal(output.get_output().inter_stage_outputs[0]["codes.audio"], torch.tensor([[7, 8]]))
+
+
+def test_native_sync_output_does_not_mirror_client_payload_into_pooler(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    monkeypatch.setattr(
+        omni_ar_model_runner,
+        "_async_copy_tensor",
+        lambda tensor, **_: tensor.clone(),
+    )
+    monkeypatch.setattr(
+        omni_ar_model_runner,
+        "_async_copy_mm",
+        lambda outputs, _total_tokens, **_: {key: value.clone() for key, value in (outputs or {}).items()},
+    )
+    input_batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 1]),
+        num_scheduled_tokens=[1],
+        num_reqs=1,
+        num_tokens_after_padding=1,
+    )
+
+    result = _async_output(
+        text_hidden=torch.tensor([[1.0, 2.0]]),
+        multimodal_outputs={"lychee_speech_token_ids": torch.tensor([158359])},
+        input_batch=input_batch,
+        emit_pooler_output=False,
+    ).get_output()
+
+    assert result.pooler_output is None
+    assert result.inter_stage_outputs[0]["lychee_speech_token_ids"].item() == 158359
+    assert result.multimodal_outputs[0]["lychee_speech_token_ids"].item() == 158359
 
 
 @pytest.mark.parametrize("prefill_first", [False, True])
@@ -862,3 +966,63 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_registered_lychee_sampler_keeps_tick_payload_without_hidden_states(monkeypatch, async_chunk):
+    from vllm_omni.worker_v2.omni_sampler import OmniSamplingContext, sample_with_output
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    copied = []
+
+    def copy_mm(outputs, _total_tokens, **_kwargs):
+        copied.append(outputs)
+        return {key: value.clone() for key, value in outputs.items()}
+
+    monkeypatch.setattr(omni_ar_model_runner, "_async_copy_mm", copy_mm)
+    counts, rejected = torch.tensor([1, 0]), torch.tensor([0, 0])
+    tokens = torch.tensor([[7], [0]])
+    sampled = SamplerOutput(tokens, None, None, counts, rejected)
+    payload = {"lychee_tick": torch.tensor([9, -1, -1]), "lychee_control_token_ids": torch.tensor([158370, -1, -1])}
+    state = SimpleNamespace(
+        constrain_primary_sample=MagicMock(return_value=tokens),
+        continue_after_primary_sample=MagicMock(return_value=payload),
+        mark_primary_continuation_failed=MagicMock(),
+    )
+    sampler = LycheeSampler(SimpleNamespace(), state)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 1, 3]),
+        num_scheduled_tokens=np.array([1, 2]),
+        num_tokens_after_padding=3,
+    )
+    with sampler.set_sampling_context(OmniSamplingContext(batch, nullcontext)):
+        result = sample_with_output(
+            sampler, MagicMock(return_value=(sampled, counts, rejected)), torch.zeros(3, 4), batch, object(), None
+        )
+    output = _async_output(
+        req_ids=["active", "prefill"],
+        sampler_output=result.sampler_output,
+        num_sampled_tokens=result.num_sampled,
+        text_hidden=None,
+        multimodal_outputs=result.multimodal_outputs,
+        input_batch=batch,
+        async_chunk=async_chunk,
+        emit_pooler_output=False,
+        finalize_multimodal=result.finalize_multimodal,
+    )
+    # Later batch reuse must not change the finalizer's captured request rows.
+    batch.query_start_loc_np[:] = 0
+    materialized = output.get_output()
+    assert len(copied) == 1
+    assert copied[0].keys() == payload.keys()
+    # Output staging copies the two owned request rows, excluding padding.
+    for name, values in payload.items():
+        torch.testing.assert_close(copied[0][name], values[[0, 1]].to(torch.int32))
+        assert values.shape == (3,)
+    assert materialized.pooler_output is None
+    assert materialized.inter_stage_outputs[0]["lychee_tick"].tolist() == [9]
+    assert materialized.multimodal_outputs[0]["lychee_control_token_ids"].tolist() == [158370]
+    assert materialized.inter_stage_outputs[1] is None
+    assert materialized.multimodal_outputs[1] == {}
+    state.mark_primary_continuation_failed.assert_not_called()

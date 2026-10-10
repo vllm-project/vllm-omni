@@ -39,27 +39,24 @@ logger = init_logger(__name__)
 
 def _modality_to_type_string(modality: OutputModality) -> str:
     """Convert an OutputModality flag to a lowercase type string."""
-    try:
-        if OutputModality.AUDIO in modality:
-            return "audio"
-        if OutputModality.IMAGE in modality:
-            return "image"
-        if OutputModality.LATENT in modality:
-            return "latent"
-        if OutputModality.TOKEN_IDS in modality:
-            return "token_ids"
-    except TypeError:
-        # Flag identity mismatch (e.g. after module reload in tests).
-        name = getattr(modality, "name", "") or ""
-        lowered = name.lower()
-        if "audio" in lowered:
-            return "audio"
-        if "image" in lowered:
-            return "image"
-        if "latent" in lowered:
-            return "latent"
-        if "token_ids" in lowered:
-            return "token_ids"
+    if isinstance(modality, OutputModality):
+        for flag, name in (
+            (OutputModality.AUDIO, "audio"),
+            (OutputModality.IMAGE, "image"),
+            (OutputModality.LATENT, "latent"),
+            (OutputModality.TOKEN_IDS, "token_ids"),
+        ):
+            if flag in modality:
+                return name
+    else:
+        # Python 3.10 returns False for a foreign Flag membership check
+        # and leaves composite .name unset. Resolve exact members from the
+        # value's own enum class after reload, preserving the native priority.
+        members = getattr(type(modality), "__members__", {})
+        for name in ("audio", "image", "latent", "token_ids"):
+            flag = members.get(name.upper())
+            if flag is not None and flag in modality:
+                return name
     return "text"
 
 
@@ -79,8 +76,12 @@ def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, ne
     """Weight one decode step by its token count. ITL stays one sample per step."""
     if new_tokens <= 0:
         return
-    total_elapsed_ms = float(record.get(_TPOT_ELAPSED_MS) or 0.0) + elapsed_ms
-    total_intervals = int(record.get(_TPOT_INTERVALS) or 0) + new_tokens
+    previous_elapsed_ms = record.get(_TPOT_ELAPSED_MS) or 0.0
+    previous_intervals = record.get(_TPOT_INTERVALS) or 0
+    if not isinstance(previous_elapsed_ms, (float, int)) or not isinstance(previous_intervals, int):
+        raise TypeError("Segment TPOT state must contain numeric elapsed time and integer intervals")
+    total_elapsed_ms = float(previous_elapsed_ms) + elapsed_ms
+    total_intervals = previous_intervals + new_tokens
     record[_TPOT_ELAPSED_MS] = total_elapsed_ms
     record[_TPOT_INTERVALS] = total_intervals
     record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
@@ -93,6 +94,9 @@ class OmniRequestState(RequestState):
     multimodal tensor outputs (e.g., images, audio, latents) that
     are produced incrementally during generation.
     """
+
+    # Initialized by the upstream RequestState constructor.
+    sent_tokens_offset: int
 
     def __init__(
         self,

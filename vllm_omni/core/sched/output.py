@@ -92,6 +92,24 @@ class OmniCachedRequestData(CachedRequestData):
 
     prompt_token_ids: dict[str, list[int]]
     additional_information: dict[str, dict | None]
+    model_intermediate_buffer: dict[str, dict | None]
+
+    @classmethod
+    def from_base(
+        cls,
+        data: CachedRequestData,
+        requests: dict[str, Request],
+    ) -> "OmniCachedRequestData":
+        """Preserve scheduler state and attach runner-owned request payloads."""
+        base_data = {field.name: getattr(data, field.name) for field in fields(CachedRequestData)}
+        return cls(
+            **base_data,
+            prompt_token_ids=dict(getattr(data, "prompt_token_ids", None) or {}),
+            additional_information=dict(getattr(data, "additional_information", None) or {}),
+            model_intermediate_buffer={
+                req_id: getattr(requests.get(req_id), "model_intermediate_buffer", None) for req_id in data.req_ids
+            },
+        )
 
 
 @dataclass

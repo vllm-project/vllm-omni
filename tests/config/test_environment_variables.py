@@ -167,7 +167,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         EnvironmentVariableCategory.PUBLIC_OMNI: 32,
         EnvironmentVariableCategory.INHERITED_VLLM: 20,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 29,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 96,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 100,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 21,
         EnvironmentVariableCategory.INTERNAL: 7,
     }
@@ -178,12 +178,28 @@ def test_inventory_matches_reviewed_snapshot_counts():
         if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
-        ModelEnvironmentVariableDisposition.PROMOTE: 67,
-        ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
+        ModelEnvironmentVariableDisposition.PROMOTE: 69,
+        ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 6,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
-        ModelEnvironmentVariableDisposition.INTERNALIZE: 17,
+        ModelEnvironmentVariableDisposition.INTERNALIZE: 18,
         ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 7,
     }
+
+
+@pytest.mark.parametrize(
+    "name,disposition",
+    [
+        ("LYCHEEFD_TOKEN2WAV_PATH", ModelEnvironmentVariableDisposition.PROMOTE),
+        ("LYCHEEFD_TTS_VOCODER_HOP_SIZE", ModelEnvironmentVariableDisposition.PROMOTE),
+        ("LYCHEEFD_T2W_PROMPT_WAV", ModelEnvironmentVariableDisposition.REQUEST_SCOPE),
+        ("LYCHEE_RELEASED_LIBDEVICE_PATH", ModelEnvironmentVariableDisposition.INTERNALIZE),
+    ],
+)
+def test_lychee_compatibility_variables_have_scoped_dispositions(name, disposition):
+    entry = ENVIRONMENT_VARIABLE_INVENTORY[name]
+    assert entry.category is EnvironmentVariableCategory.MODEL_SPECIFIC
+    assert entry.model_disposition is disposition
+    assert not entry.is_public_omni
 
 
 def test_new_public_omni_names_use_project_prefix():

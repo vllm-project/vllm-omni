@@ -53,6 +53,13 @@ class DuplexCommand(RealtimeCommand):
 
     Adds the mailbox channel (``type``) and its rendering on top of the wire
     command; every concrete class below pairs this with its protocol twin.
+
+    This intermediate diamond base intentionally has a ``__dict__``.  Python
+    3.10 repeats inherited dataclass slots when creating a slotted subclass;
+    combining that subclass with its protocol twin then raises an instance
+    layout conflict at import time.  The concrete command leaves remain
+    frozen and slotted, while this non-slotted base works on every supported
+    Python version.
     """
 
     # No instance fields of its own, so the slots are empty. Spelled out rather
@@ -93,7 +100,8 @@ class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "session.update"
-        data["payload"] = dict(data.pop("patch", {}) or {})
+        data.pop("patch", None)
+        data["payload"] = dict(self.patch or {})
         return data
 
 
@@ -170,7 +178,8 @@ class CreateItem(DuplexCommand, _duplex_wire.CreateItem):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "conversation.item.create"
-        payload: dict[str, object] = {"item": dict(data.pop("item"))}
+        data.pop("item")
+        payload: dict[str, object] = {"item": dict(self.item)}
         previous = data.pop("previous_item_id", None)
         if previous is not None:
             payload["previous_item_id"] = previous

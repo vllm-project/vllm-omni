@@ -234,24 +234,41 @@ class OmniGPUModelRunner(GPUModelRunner):
                         sampling_params,
                         logits_vocab,
                     )
+        # vLLM removes and re-adds streaming inputs under the same id. Give
+        # model-specific request state an explicit chance to survive that
+        # slot release; ordinary removals and finished requests still clean up.
+        rebind = getattr(getattr(self, "model_state", None), "on_request_rebind", None)
+        if callable(rebind):
+            for request_data in scheduler_output.scheduled_new_reqs:
+                req_id = request_data.req_id
+                req_index = self.req_states.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    rebind(req_id, req_index)
         super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
-        sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
-        if sender is not None:
-            sender.close()
-        # Every owner must release its resources even if an earlier drain fails.
+        # Every owner must release resources even if an earlier drain fails.
         try:
-            worker = getattr(self, "_native_output_materializer", None)
-            if worker is not None:
-                worker.close()
+            sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
+            if sender is not None:
+                sender.close()
         finally:
-            self._native_output_materializer = None
             try:
-                if self._omni_data_plane is not None:
-                    self._omni_data_plane.close()
+                worker = getattr(self, "_native_output_materializer", None)
+                if worker is not None:
+                    worker.close()
             finally:
-                super().shutdown()
+                self._native_output_materializer = None
+                try:
+                    if self._omni_data_plane is not None:
+                        self._omni_data_plane.close()
+                finally:
+                    try:
+                        release_resources = getattr(getattr(self, "model", None), "release_worker_resources", None)
+                        if callable(release_resources):
+                            release_resources()
+                    finally:
+                        super().shutdown()
 
     def _prepare_native_data_plane(self, scheduler_output: SchedulerOutput) -> None:
         plane = getattr(self, "_omni_data_plane", None)
@@ -727,19 +744,27 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().update_requests(scheduler_output)
 
         cached = scheduler_output.scheduled_cached_reqs
-        addl_info = getattr(cached, "additional_information", None)
-        if not addl_info:
+        addl_info = getattr(cached, "additional_information", None) or {}
+        model_buffers = getattr(cached, "model_intermediate_buffer", None) or {}
+        if not addl_info and not model_buffers:
             return
-        for req_id, info in addl_info.items():
-            if info is None:
-                continue
+        for req_id in dict.fromkeys([*addl_info, *model_buffers]):
             req_idx = self.req_states.req_id_to_index.get(req_id)
             if req_idx is None:
                 continue
-            resolved = _resolve_additional_information(info)
-            if resolved:
-                gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
-                self.model_state.intermediate_buffer.update(req_idx, resolved, gpu_keys)
+            gpu_keys: set[tuple[str, str]] = getattr(self.model, "gpu_resident_buffer_keys", set())
+            info = addl_info.get(req_id)
+            if info is not None:
+                resolved = _resolve_additional_information(info)
+                if resolved:
+                    self.model_state.intermediate_buffer.update(req_idx, resolved, gpu_keys)
+            model_buffer = model_buffers.get(req_id)
+            if model_buffer is not None:
+                if not isinstance(model_buffer, dict):
+                    raise TypeError(
+                        f"cached model_intermediate_buffer must be a dict, got {type(model_buffer).__name__}"
+                    )
+                self.model_state.intermediate_buffer.update(req_idx, model_buffer, gpu_keys)
 
     # ------------------------------------------------------------------
     # Request lifecycle: clean up intermediate buffer on finish

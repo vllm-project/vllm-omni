@@ -203,6 +203,25 @@ def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch)
     assert sorted(c.args[0] for c in runner.model_state.remove_request.call_args_list) == [0]
 
 
+def test_update_requests_merges_cached_model_buffer_after_legacy_payload(monkeypatch):
+    runner = _make_runner()
+    runner.model = SimpleNamespace(gpu_resident_buffer_keys=set())
+    runner.model_state = SimpleNamespace(intermediate_buffer=SimpleNamespace(update=MagicMock()))
+    monkeypatch.setattr(GPUModelRunner, "update_requests", lambda *args: None)
+    output = SimpleNamespace(
+        scheduled_cached_reqs=SimpleNamespace(
+            additional_information={"r1": {"duplex": {"seq": 1}, "legacy": True}},
+            model_intermediate_buffer={"r1": {"duplex": {"seq": 2}}},
+        )
+    )
+
+    runner.update_requests(output)
+
+    calls = runner.model_state.intermediate_buffer.update.call_args_list
+    assert calls[0].args[:2] == (0, {"duplex": {"seq": 1}, "legacy": True})
+    assert calls[1].args[:2] == (0, {"duplex": {"seq": 2}})
+
+
 @pytest.mark.parametrize("stage,declared", [("thinker", False), ("custom_ar", True)])
 def test_capture_contract_uses_model_declaration(stage, declared):
     runner = _make_runner()

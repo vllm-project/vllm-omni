@@ -35,6 +35,9 @@ class DuplexOutputAction(str, Enum):
 @dataclass(frozen=True)
 class DuplexAppendPlan:
     prompt: dict[str, object]
+    # An append may consume a different generation budget from the session
+    # default, without changing parameters owned by another in-flight segment.
+    sampling_params: object | None = None
 
 
 @dataclass(frozen=True)

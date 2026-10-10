@@ -118,6 +118,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
     def __init__(self, *args, **kwargs):
+        config = args[0] if args else kwargs.get("vllm_config")
+        if config is not None and not getattr(config.model_config, "supports_native_preemption", True):
+            if config.cache_config.enable_prefix_caching:
+                raise ValueError("A stage without native preemption support requires enable_prefix_caching=False")
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
@@ -160,6 +164,44 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        self._capacity_preemption_errors: dict[str, tuple[int, str]] = {}
+
+    def _preempt_request(self, request: Request, timestamp: float, drop_stale_output: bool = False) -> None:
+        if getattr(self.vllm_config.model_config, "supports_native_preemption", True):
+            super()._preempt_request(request, timestamp, drop_stale_output)
+            return
+        # The base scheduler has already removed this victim from RUNNING.
+        # Its auxiliary channel state cannot be regenerated from the text-only
+        # request token list. Terminate explicitly rather than queueing replay.
+        reason = "Native KV capacity exhausted; this stage requires a fresh binding from committed session history"
+        request.status = RequestStatus.FINISHED_ERROR
+        request.stop_reason = reason
+        request.resumable = False
+        request.drop_stale_output = True
+        request.num_stale_output_tokens = request.num_in_flight_tokens
+        request.num_output_placeholders = 0
+        request.spec_token_ids = []
+        if self.aux_output_connector is not None:
+            self.aux_output_connector.request_finished(request)
+        pending = getattr(self, "_capacity_preemption_errors", None)
+        if pending is None:
+            pending = self._capacity_preemption_errors = {}
+        pending[request.request_id] = (request.client_index, reason)
+        self._free_request(request)
+        self._cleanup_kv_tracking((request.request_id,))
+        logger.error("Request %s: %s", request.request_id, reason)
+
+    def _emit_capacity_preemption_errors(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        pending = getattr(self, "_capacity_preemption_errors", None)
+        if not pending:
+            return
+        for request_id, (client_index, reason) in pending.items():
+            outputs.setdefault(client_index, []).append(
+                OmniEngineCoreOutput(
+                    request_id=request_id, new_token_ids=[], finish_reason=FinishReason.ERROR, stop_reason=reason
+                )
+            )
+        pending.clear()
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -425,6 +467,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
+        request_errors = getattr(model_runner_output, "request_errors", {})
+        if not isinstance(request_errors, dict):
+            request_errors = {}
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         prompt_token_id_logprobs_dict = getattr(model_runner_output, "prompt_token_id_logprobs_dict", {})
@@ -564,6 +609,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             status_before_stop = request.status
             new_logprobs = None
             logprob_validation_failed = False
+            transaction_error = request_errors.get(req_id)
+            if transaction_error is not None:
+                # Half-written KV cannot be resumed, even if an append is
+                # queued. Error output is observable and a new binding must
+                # rebuild exclusively from committed channel evidence.
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = transaction_error
+                request.resumable = False
+                generated_token_ids = []
+                logprob_validation_failed = True
 
             # Validate before mutating request token state. A bad runner output
             # is request-local: terminate only this request and keep processing
@@ -619,6 +674,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
+            if transaction_error is not None:
+                pooler_output = mm_output = inter_stage_output = None
             kv_transfer_params = None
             ec_transfer_params = None
             finish_reason = None
@@ -861,6 +918,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             outputs,
         )
         self._emit_streaming_context_overflow_outputs(outputs)
+        OmniARScheduler._emit_capacity_preemption_errors(self, outputs)
         if self.chunk_transfer_adapter is not None:
             for request in failed_requests:
                 self.chunk_transfer_adapter.cleanup_receiver(request.request_id)
@@ -930,6 +988,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         stage 0.
         """
         req_id = session.request_id
+        stage_id = self.vllm_config.model_config.stage_id
+        update_infos = (
+            getattr(update, "model_intermediate_buffer", None),
+            getattr(update, "additional_information", None),
+        )
+        replace_streaming_prompt = any(
+            isinstance(info, dict)
+            and isinstance(info.get("meta"), dict)
+            and info["meta"].get("replace_streaming_prompt") is True
+            for info in update_infos
+        )
+        if stage_id == 0 and replace_streaming_prompt:
+            # Full AR rebuilds may replace only an inactive owner or the
+            # segment currently completing through _handle_stopped_request.
+            # Validate before snapshots/async counters or payloads change.
+            if not self._admit_streaming_prompt_replacement(session):
+                return
+            if self._streaming_update_overflows(session, update, projected_len=len(update.prompt_token_ids or ())):
+                return
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         # Use the same confirmed span that upstream preserves when extending
@@ -962,12 +1039,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []
-        stage_id = self.vllm_config.model_config.stage_id
-
-        update_infos = (
-            getattr(update, "model_intermediate_buffer", None),
-            getattr(update, "additional_information", None),
-        )
         if self.chunk_transfer_adapter and self.chunk_transfer_adapter.receives_chunks:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
             if stage_id != 0:
@@ -1075,12 +1146,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         session.mm_features.extend(update.mm_features)
                 self._finish_streaming_session_update(session, update)
                 return
-        replace_streaming_prompt = any(
-            isinstance(info, dict)
-            and isinstance(info.get("meta"), dict)
-            and info["meta"].get("replace_streaming_prompt") is True
-            for info in update_infos
-        )
         if replace_streaming_prompt:
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
@@ -1290,6 +1355,36 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         session._minicpmo45_window_open_start = new_preserve_len + sum(int(unit["length"]) for unit in retained_units)
         return True
 
+    def _admit_streaming_prompt_replacement(self, session: Request) -> bool:
+        """Reject an AR rebuild that could replace a still executing prompt."""
+        completed_stop = (
+            getattr(self, "_completed_streaming_segment_stop", None) is session
+            and session.is_finished()
+            and session.resumable
+        )
+        if completed_stop:
+            # Upstream invokes a queued update before removing this finished
+            # segment from running. Its remaining lookahead is fenced in
+            # scheduled-token units and native block-free defers GPU pages.
+            return True
+        pending = any(
+            int(getattr(session, name, 0) or 0) > 0
+            for name in ("num_in_flight_tokens", "num_output_placeholders", "num_stale_output_tokens")
+        )
+        if (
+            session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            and not pending
+            and session not in getattr(self, "running", ())
+            and session not in getattr(self, "_inflight_prefills", ())
+        ):
+            return True
+        reason = (
+            "streaming_prompt_replacement_rejected: full AR prompt replacement requires "
+            "an inactive streaming-input owner or its completed segment boundary"
+        )
+        self._finish_streaming_update_with_error(session, reason)
+        return False
+
     # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
     # serving side can map it to a stable error code.
     STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
@@ -1356,11 +1451,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
             f"{projected} tokens, leaving no room to sample within max_model_len {int(max_model_len)}"
         )
-        logger.error(
-            "[Omni] %s: %s; finishing the request instead of extending it",
-            session.request_id,
-            reason,
-        )
+        self._finish_streaming_update_with_error(session, reason)
+        return True
+
+    def _finish_streaming_update_with_error(self, session: Request, reason: str) -> None:
+        """Finish one invalid update, emitting its error without crashing EngineCore."""
+        logger.error("[Omni] %s: %s; finishing this streaming request", session.request_id, reason)
+        # Keep the existing terminal-update map/stop cleanup shared with
+        # context overflow. Contract failures need the same immediate output
+        # for parked requests and the same single-free queued-stop handling.
         overflow = getattr(self, "_streaming_context_overflow", None)
         if overflow is None:
             overflow = self._streaming_context_overflow = {}
@@ -1371,9 +1470,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # finished, so finishing the session here too would free it twice.
             # ``_handle_stopped_request`` below takes it out of admission and
             # leaves the single free to the caller.
-            return True
+            return
         self.finish_requests((session.request_id,), RequestStatus.FINISHED_ERROR)
-        return True
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Do not resume a session whose queued update overflowed the model.
@@ -1387,7 +1485,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         exists to keep alive. The same holds for a session whose overflow was
         recorded before this call and that upstream still reports as resumed.
         """
-        finished = super()._handle_stopped_request(request)
+        previous_stop = getattr(self, "_completed_streaming_segment_stop", None)
+        self._completed_streaming_segment_stop = request if request.is_finished() and request.resumable else None
+        try:
+            finished = super()._handle_stopped_request(request)
+        finally:
+            self._completed_streaming_segment_stop = previous_stop
         if finished:
             return True
         overflow = getattr(self, "_streaming_context_overflow", None)
@@ -1623,6 +1726,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not self._get_omni_kv_config_value("need_send_cache", False):
             return False
         request = self.requests.get(req_id)
+        if request is not None and request.status == RequestStatus.FINISHED_ERROR:
+            return False
         if request is not None and self._request_omits_kv_transfer_to_next_stage(request):
             return False
         return True

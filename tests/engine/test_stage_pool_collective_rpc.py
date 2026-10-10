@@ -238,3 +238,21 @@ def test_cache_reset_failure_is_serialized_and_pool_remains_usable(method, failu
         assert await pool.collective_rpc(0, "is_sleeping") == {"via": "collective"}
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("exception_type", [asyncio.TimeoutError, TimeoutError])
+def test_collective_rpc_serializes_both_python_timeout_types(exception_type):
+    async def run():
+        pool, client = _make_pool(
+            collective_rpc_async=AsyncMock(side_effect=exception_type(), return_value={"via": "collective"})
+        )
+        result = await pool.collective_rpc(0, "probe", timeout=1.5)
+        assert result == {
+            "supported": False,
+            "error": f"{exception_type.__name__}: probe timed out after 1.5s",
+        }
+        client.collective_rpc_async.side_effect = None
+        assert await pool.collective_rpc(0, "is_sleeping") == {"via": "collective"}
+
+    asyncio.run(run())

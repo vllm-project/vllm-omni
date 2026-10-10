@@ -247,6 +247,7 @@ class StagePipelineConfig:
     retains_state_across_chunks: bool = False
     # Some stateful audio stages cannot roll back already consumed frames.
     supports_running_prefix_cache_reset: bool = True
+    supports_native_preemption: bool = True
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -416,6 +417,8 @@ class StageDeployConfig:
     # Overrides the deploy-level ``model_runner`` for this stage, so a pipeline
     # can run e.g. its LLM stage on v1 and its codec stages on MRv2.
     model_runner: Literal["v1", "v2"] | None = None
+    supports_native_preemption: bool | None = None
+    supports_running_prefix_cache_reset: bool | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -1130,6 +1133,8 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    if not ps.supports_native_preemption:
+        engine_args["supports_native_preemption"] = False
     if not ps.supports_running_prefix_cache_reset:
         engine_args["supports_running_prefix_cache_reset"] = False
     return engine_args
@@ -1380,6 +1385,8 @@ class StageConfig:
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output
+        if self.yaml_engine_args.get("supports_native_preemption") is False:
+            engine_args["supports_native_preemption"] = False
         if self.yaml_engine_args.get("supports_running_prefix_cache_reset") is False:
             engine_args["supports_running_prefix_cache_reset"] = False
 

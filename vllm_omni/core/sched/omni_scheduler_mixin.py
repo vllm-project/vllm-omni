@@ -37,6 +37,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.output import (
+    OmniCachedRequestData,
     OmniChunkRecvHandle,
     OmniNewRequestData,
     OmniRequestPrewarm,
@@ -196,6 +197,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # ``_update_states``). The stage's model config carries the choice
         # (deploy ``model_runner``, optionally per stage).
         model_config = self.vllm_config.model_config
+        # The scheduler and worker must make the same runner selection. Native
+        # MRV2 stages now carry Omni lifecycle hooks, while legacy stages keep
+        # the v1 request-resume representation.
         self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
         self._native_data_plane = uses_native_mrv2_data_plane(
             model_config,
@@ -298,6 +302,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         )
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
+        session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
@@ -712,6 +717,18 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             for data in scheduler_output.scheduled_new_reqs
         ]
 
+    def _rewrap_scheduled_cached_reqs(self, scheduler_output: SchedulerOutput) -> None:
+        """Carry current runner-owned payloads for already admitted requests."""
+        data = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if data is None:
+            return
+        if isinstance(data, OmniCachedRequestData):
+            return
+        scheduler_output.scheduled_cached_reqs = OmniCachedRequestData.from_base(
+            data,
+            self.requests,
+        )
+
     def _postprocess_omni_schedule_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -720,6 +737,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     ) -> None:
         """Enrich new requests and apply async-chunk output bookkeeping."""
         self._rewrap_scheduled_new_reqs(scheduler_output)
+        self._rewrap_scheduled_cached_reqs(scheduler_output)
         if not self.chunk_transfer_adapter:
             return
         if include_cached_payloads:

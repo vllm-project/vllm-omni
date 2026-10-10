@@ -278,6 +278,7 @@ class PartialStageForward:
     is_final_update: bool
     close_only: bool = False
     queue_close_after: bool = False
+    following_updates: tuple[PartialStageForward, ...] = ()
 
 
 class DuplexModelPlugin(ABC):
@@ -352,6 +353,23 @@ class DuplexModelPlugin(ABC):
         sampling_params: object,
     ) -> DuplexAppendPlan: ...
 
+    def project_request_error(self, *, stage_id: int, request_id: str, error: str) -> dict[str, object] | None:
+        """Choose a model-owned recovery event for a terminal worker request error."""
+        del stage_id, request_id, error
+        return None
+
+    def record_accepted_append_plan(self, *, request_id: str, fence: DuplexFence, plan: DuplexAppendPlan) -> None:
+        """Record acknowledged model inputs before append validation or compensation.
+
+        This records input facts only; session binding and marker consumption
+        remain the responsibility of commit_append_plan.
+        """
+        del request_id, fence, plan
+
+    def commit_append_plan(self, *, request_id: str, fence: DuplexFence, plan: DuplexAppendPlan) -> None:
+        """Commit model-owned binding state after a stage accepted the append."""
+        del request_id, fence, plan
+
     @abstractmethod
     def decide_output(
         self,
@@ -421,6 +439,10 @@ class DuplexModelPlugin(ABC):
         """
         del plan, req_state
         return None
+
+    def discard_pending_input(self, *, session_id: str) -> None:
+        """Discard unconsumed model input evidence for explicit input.cancel."""
+        del session_id
 
     def commit_model_context(self, *, session_id: str | None, assistant_text: str) -> None:
         """Persist model-context history at a turn boundary. Default is a no-op.

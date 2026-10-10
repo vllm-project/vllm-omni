@@ -681,3 +681,67 @@ async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() 
 def test_default_plugin_declares_no_draining_stages() -> None:
     plugin = MiniCPMO45DuplexPlugin(_encode_audio)
     assert plugin.draining_stage_ids(stage_count=4) == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_ordered_partial_updates_keep_distinct_response_packets() -> None:
+    from vllm_omni.engine.duplex.plugin import PartialStageForward
+
+    orchestrator, *_ = _build(stages=2)
+    forwarded = []
+
+    async def record_forward(req_id, stage_id, output, req_state, **kwargs):
+        forwarded.append((output, kwargs["is_final_update"]))
+
+    async def no_intercept(*args, **kwargs):
+        return False
+
+    orchestrator._forward_to_next_stage = record_forward
+    orchestrator._intercept_stage_output = no_intercept
+    orchestrator.async_chunk = True
+    orchestrator._stage_receives_async_chunks = lambda stage_id: False
+    first, second, final = object(), object(), object()
+    plan = PartialStageForward(first, False, following_updates=(PartialStageForward(second, False),))
+    orchestrator.plugin.plan_partial_stage_output = lambda *args: plan
+    orchestrator.plugin.partial_stage_followup = lambda update, state: (
+        PartialStageForward(final, True) if update.output is second else None
+    )
+    state = DuplexOrchestratorRequestState(
+        request_id="r",
+        final_stage_id=1,
+        session_owned=True,
+        sampling_params_list=[SimpleNamespace(), SimpleNamespace()],
+    )
+    await orchestrator._route_output(0, 0, SimpleNamespace(request_id="r", finished=True), state, None)
+    assert forwarded == [(first, False), (second, False), (final, True)]
+    assert state.skip_legacy_stage_forward is False
+
+
+@pytest.mark.asyncio
+async def test_raw_terminal_error_routes_to_session_instead_of_ordinary_request_queue():
+    from unittest.mock import Mock
+
+    from vllm.v1.engine import FinishReason
+
+    orchestrator, _, _, output_q = _build()
+    runner = Mock()
+    orchestrator.session_manager.runner_for_request_id = Mock(return_value=runner)
+    req_state = DuplexOrchestratorRequestState(
+        request_id="duplex-error",
+        session_owned=True,
+        fence=DuplexFence("s", epoch=4),
+        stage_fences={0: DuplexFence("s", epoch=3)},
+    )
+    try:
+        eco = SimpleNamespace(finish_reason=FinishReason.ERROR, is_segment_finished=False, stop_reason="worker fault")
+        await orchestrator._report_duplex_session_request_error(0, 0, eco, req_state)
+        runner.on_stage_request_error.assert_called_once_with(
+            0, "worker fault", request_id="duplex-error", expected_epoch=3
+        )
+        assert output_q.empty()
+        runner.reset_mock()
+        eco.is_segment_finished = True
+        await orchestrator._report_duplex_session_request_error(0, 0, eco, req_state)
+        runner.on_stage_request_error.assert_not_called()
+    finally:
+        await orchestrator.session_manager.shutdown()

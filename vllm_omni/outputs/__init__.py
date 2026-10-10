@@ -65,6 +65,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # MRv2 consumers must treat the value as immutable and must not perform
     # another device-to-host conversion or rebuild it from sampler tensors.
     sampled_token_ids_materialized: bool = False
+    # Synchronous model transactions that failed after touching native KV.
+    # These are explicit terminal request failures, never successful empty steps.
+    request_errors: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from vllm.config import SchedulerConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.request import Request
@@ -15,7 +16,7 @@ from vllm.v1.request import Request
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched import omni_scheduler_mixin
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
-from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniChunkRecvHandle
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -201,6 +202,29 @@ def test_chunk_receive_handle_carries_minimal_registration_fields():
     handle = OmniChunkRecvHandle(request_id="req", external_req_id="external")
     assert handle.request_id == "req"
     assert handle.external_req_id == "external"
+
+
+def test_cached_request_wrapper_carries_current_model_intermediate_buffer():
+    cached = CachedRequestData(
+        req_ids=["req"],
+        resumed_req_ids=set(),
+        new_token_ids=[[]],
+        all_token_ids={"req": [1]},
+        new_block_ids=[None],
+        num_computed_tokens=[1],
+        num_output_tokens=[0],
+    )
+    payload = {"duplex": {"seq": 7}}
+
+    wrapped = OmniCachedRequestData.from_base(
+        cached,
+        {"req": SimpleNamespace(model_intermediate_buffer=payload)},
+    )
+
+    assert wrapped.req_ids == ["req"]
+    assert wrapped.model_intermediate_buffer == {"req": payload}
+    assert wrapped.prompt_token_ids == {}
+    assert wrapped.additional_information == {}
 
 
 def test_output_helper_preserves_required_nan_counter_default():

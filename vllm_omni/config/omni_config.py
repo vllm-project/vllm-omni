@@ -176,6 +176,8 @@ class _ModelEngineOverrides(TypedDict, total=False):
     active_stream_window: int
     use_v2_model_runner: bool
     supports_native_mrv2_data_plane: bool
+    supports_native_preemption: bool
+    supports_running_prefix_cache_reset: bool
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     silence_ban_frames: int
@@ -483,6 +485,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     media_io_kwargs: dict[str, Any] | None = None
     final_output: bool = False
     supports_running_prefix_cache_reset: bool = True
+    supports_native_preemption: bool = True
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
@@ -1338,6 +1341,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "model_stage",
         "retains_state_across_chunks",
         "supports_running_prefix_cache_reset",
+        "supports_native_preemption",
         "scheduler_cls",
         "stage_connector_spec",
         "worker_type",
@@ -1989,6 +1993,8 @@ def _build_model_config(
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     kwargs["final_output"] = topology.final_output
+    if not topology.supports_native_preemption:
+        kwargs["supports_native_preemption"] = False
     if not topology.supports_running_prefix_cache_reset:
         kwargs["supports_running_prefix_cache_reset"] = False
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:

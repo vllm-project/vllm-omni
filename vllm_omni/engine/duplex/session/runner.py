@@ -96,7 +96,7 @@ from vllm_omni.engine.duplex.session.context import (
 )
 from vllm_omni.engine.duplex.session.control import SessionControl
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
-from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexRequestResource
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.turn_detection import (
@@ -296,7 +296,30 @@ class DuplexSessionRunner:
             return
         self._mailbox.put_nowait(_Internal("stage_metrics", {"stage_metrics": snapshot}))
 
-    def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
+    def on_stage_request_error(self, stage_id: int, error: str, *, request_id: str, expected_epoch: int) -> None:
+        """Route a raw worker error through the owning session's ordered mailbox."""
+        if self.closing:
+            return
+        self._mailbox.put_nowait(
+            _Internal(
+                "stage_request_error",
+                {
+                    "stage_id": stage_id,
+                    "error": error,
+                    "request_id": request_id,
+                    "epoch": expected_epoch,
+                },
+            )
+        )
+
+    def on_stage_failure(
+        self,
+        stage_id: int,
+        exc: BaseException,
+        *,
+        request_id: str | None = None,
+        retain_resources: bool = False,
+    ) -> None:
         """A stage rejected this session's request: fail the owning response.
 
         Under concurrent turn requests the failing request may belong to a draining
@@ -326,7 +349,7 @@ class DuplexSessionRunner:
             return
         if draining_response_id is not None:
             session.clear_draining_for_response(draining_response_id)
-            if isinstance(request_id, str):
+            if isinstance(request_id, str) and not retain_resources:
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
@@ -507,7 +530,103 @@ class DuplexSessionRunner:
             return
         await self._on_command(item)
 
+    def _accept_stage_request_error(self, stage_id: int, request_id: str, *, expected_epoch: object) -> bool:
+        """Recheck the original owner when a queued worker error is consumed."""
+        session = self.session
+        if self.closing or expected_epoch != session.epoch or session.lease.terminal_reason is not None:
+            return False
+        if self.plugin.data_plane.is_terminal(request_id):
+            return False
+        resource = session.request_resources.get((stage_id, request_id))
+        if resource is None or resource.fence.session_id != session.session_id or resource.fence.epoch != session.epoch:
+            return False
+        draining = session.is_draining_request(request_id)
+        if draining:
+            return session.capabilities.supports_concurrent_turn_requests
+        active_request_id = session.active_request_id
+        if self.out.auto_responds() and active_request_id is not None and active_request_id != request_id:
+            return False
+        return True
+
+    def _fail_draining_request(self, stage_id: int, request_id: str, error: str) -> None:
+        """Fail only the old response; keep cleanup ownership until abort ACK."""
+        session = self.session
+        response_id = session.response_id_for_request(request_id)
+        request_ids = {
+            owner for owner in session.draining_request_ids() if session.response_id_for_request(owner) == response_id
+        }
+        resources = {
+            key: resource for key, resource in session.request_resources.items() if resource.request_id in request_ids
+        }
+        self.on_stage_failure(stage_id, RuntimeError(error), request_id=request_id, retain_resources=True)
+        for owner in request_ids:
+            self.plugin.data_plane.close_stream(owner)
+            self.plugin.data_plane.mark_terminal(owner)
+        self.spawn(self._abort_failed_draining_resources(resources), name="duplex-draining-request-error-cleanup")
+
+    async def _abort_failed_draining_resources(
+        self, resources: Mapping[tuple[int, str], DuplexRequestResource]
+    ) -> None:
+        """Bound retries to old captured owners; shutdown retains manager cleanup."""
+        session = self.session
+        for attempt in range(3):
+            if self.closing:
+                return
+            owned = {
+                key: resource
+                for key, resource in resources.items()
+                if session.request_resources.get(key) is resource and resource.fence.epoch == session.epoch
+            }
+            if not owned:
+                return
+            submitted_ids = list(
+                dict.fromkeys(resource.request_id for resource in owned.values() if resource.submitted)
+            )
+            try:
+                if submitted_ids:
+                    await self.stage_port.cleanup(submitted_ids, abort=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Duplex session %s draining-owner abort failed (attempt %d/3); retained owners %s",
+                    session.session_id,
+                    attempt + 1,
+                    submitted_ids,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.01 * (attempt + 1))
+                # On exhaustion durable records stay available to manager close
+                # and its existing cleanup retry; the new response stays open.
+                continue
+            for key, resource in owned.items():
+                if session.request_resources.get(key) is resource:
+                    session.request_resources.pop(key)
+            for owner in {resource.request_id for resource in owned.values()}:
+                if owner not in session.resource_request_ids():
+                    self.manager.unregister_request(owner)
+            return
+
     async def _on_internal(self, item: _Internal) -> None:
+        if item.kind == "stage_request_error":
+            session = self.session
+            stage_id = item.payload["stage_id"]
+            if not isinstance(stage_id, int):
+                raise TypeError("Internal stage request error requires an integer stage_id")
+            request_id = str(item.payload["request_id"])
+            if not self._accept_stage_request_error(stage_id, request_id, expected_epoch=item.payload["epoch"]):
+                return
+            error = str(item.payload["error"])
+            if session.is_draining_request(request_id):
+                self._fail_draining_request(stage_id, request_id, error)
+                return
+            projected = self.plugin.project_request_error(stage_id=stage_id, request_id=request_id, error=error)
+            if projected is not None:
+                await self.model._send_one_model_output_event(projected, expected_epoch=session.epoch)
+            else:
+                self.on_stage_failure(stage_id, RuntimeError(error), request_id=request_id)
+                await self._close_from_runtime("runtime_data_plane_stream_failed")
+            return
         if item.kind == "stage_metrics":
             stage_metrics = item.payload.get("stage_metrics")
             if isinstance(stage_metrics, Mapping):
@@ -1336,6 +1455,7 @@ class DuplexSessionRunner:
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
         playback_was_active = helpers.assistant_playback_active(self.session)
         if event_type in {"input.cancel", "barge_in"}:
+            self.plugin.discard_pending_input(session_id=session.session_id)
             model_state.audio_buffer.clear()
             session.release_all_input_bytes()
             model_state.input_since_commit = False

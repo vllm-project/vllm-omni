@@ -75,6 +75,26 @@ def test_slot_lifecycle_fields_reuse_and_remove_idempotent():
     assert buf.buffers[0] == {}
 
 
+def test_model_intermediate_buffer_is_authoritative_on_add() -> None:
+    buf = OmniIntermediateBuffer(max_num_reqs=1)
+    buf.add_request(
+        0,
+        _make_new_req_data(
+            "r0",
+            additional_information={"duplex": {"seq": 0}, "legacy": True},
+            model_intermediate_buffer={"duplex": {"seq": 1}},
+        ),
+    )
+    assert buf.buffers[0]["duplex"] == {"seq": 1}
+    assert buf.buffers[0]["legacy"] is True
+
+
+def test_model_intermediate_buffer_rejects_non_mapping() -> None:
+    buf = OmniIntermediateBuffer(max_num_reqs=1)
+    with pytest.raises(TypeError, match="model_intermediate_buffer must be a dict"):
+        buf.add_request(0, _make_new_req_data("r0", model_intermediate_buffer=[]))
+
+
 def test_update_merge_semantics(monkeypatch):
     buf = OmniIntermediateBuffer(max_num_reqs=1)
     buf.add_request(0, _make_new_req_data("r0"))

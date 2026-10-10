@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -66,8 +67,24 @@ def test_cfg_companion_forces_kv_transfer_without_downstream_payload():
     assert metadata["omni_force_kv_transfer"] is True
 
 
-class _ChunkRequest(SimpleNamespace):
-    def __hash__(self):
+class _ChunkRequest:
+    def __init__(self, request_id: str, **values: object) -> None:
+        self.request_id = request_id
+        self.__dict__.update(values)
+
+    def is_finished(self) -> bool:
+        return False
+
+    def get_finished_reason(self) -> None:
+        return None
+
+    def take_prefill_stats(self) -> None:
+        return None
+
+    def take_events(self) -> None:
+        return None
+
+    def __hash__(self) -> int:
         return hash(self.request_id)
 
     def __eq__(self, other):
@@ -99,10 +116,6 @@ def _make_chunk_request(final_stage_id: int, *, force_kv_transfer: bool = False)
         client_index=0,
         trace_headers=None,
     )
-    request.is_finished = lambda: False
-    request.get_finished_reason = lambda: None
-    request.take_prefill_stats = lambda: None
-    request.take_events = lambda: None
     return request
 
 
@@ -190,8 +203,12 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
     scheduler.log_stats = False
     tagged = apply_omni_final_stage_metadata(_make_engine_request(), final_stage_id=0)
 
-    class Session(SimpleNamespace):
-        __hash__ = object.__hash__
+    @dataclass(eq=False)
+    class Session:
+        request_id: str
+        additional_information: object
+        status: RequestStatus
+        max_tokens: int = 0
 
     session = Session(
         request_id="req",
@@ -205,11 +222,13 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
         model_intermediate_buffer=None,
         arrival_time=0.0,
         sampling_params=None,
+        max_tokens=11,
     )
 
     OmniSchedulerMixin._finish_streaming_session_update(scheduler, session, update)
 
     assert scheduler._omits_kv_transfer_cache == {}
+    assert session.max_tokens == 11
     assert session.additional_information == {"omni_final_stage_id": 1}
     assert not scheduler._request_omits_chunk_transfer_to_next_stage(session)
     assert not scheduler._request_omits_kv_transfer_to_next_stage(session)

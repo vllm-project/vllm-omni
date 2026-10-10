@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.v1.engine import FinishReason
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -189,6 +190,22 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request_id=request_id,
             context=context,
         )
+
+    async def _report_duplex_session_request_error(self, stage_id, replica_id, eco, req_state) -> None:
+        if not req_state.session_owned:
+            await super()._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
+            return
+        if getattr(eco, "finish_reason", None) != FinishReason.ERROR or getattr(eco, "is_segment_finished", False):
+            return
+        runner = self.session_manager.runner_for_request_id(req_state.request_id)
+        if runner is None:
+            return
+        fence = getattr(req_state, "stage_fences", {}).get(stage_id) or getattr(req_state, "fence", None)
+        if fence is None:
+            return
+        reason = getattr(eco, "stop_reason", None)
+        error = reason if isinstance(reason, str) and reason else "duplex session request failed"
+        runner.on_stage_request_error(stage_id, error, request_id=req_state.request_id, expected_epoch=fence.epoch)
 
     async def _handle_forward_failure(
         self,
@@ -434,28 +451,29 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> None:
         plan = self.plugin.plan_partial_stage_output(self, stage_id, replica_id, output, req_state)
         if plan is not None:
-            # A text-bearing final is not itself the end sentinel. Submit the
-            # sentence resumable first; the follow-up, if any, closes the stream.
-            await self._forward_to_next_stage(
-                req_state.request_id,
-                stage_id,
-                plan.output,
-                req_state,
-                src_replica_id=replica_id,
-                is_streaming_session=True,
-                is_final_update=plan.is_final_update and not plan.queue_close_after,
-            )
-            followup = self.plugin.partial_stage_followup(plan, req_state)
-            if followup is not None:
+            # Preserve model response boundaries and submission order when
+            # one cumulative snapshot contains several downstream updates.
+            for update in (plan, *plan.following_updates):
                 await self._forward_to_next_stage(
                     req_state.request_id,
                     stage_id,
-                    followup.output,
+                    update.output,
                     req_state,
                     src_replica_id=replica_id,
                     is_streaming_session=True,
-                    is_final_update=followup.is_final_update,
+                    is_final_update=update.is_final_update and not update.queue_close_after,
                 )
+                followup = self.plugin.partial_stage_followup(update, req_state)
+                if followup is not None:
+                    await self._forward_to_next_stage(
+                        req_state.request_id,
+                        stage_id,
+                        followup.output,
+                        req_state,
+                        src_replica_id=replica_id,
+                        is_streaming_session=True,
+                        is_final_update=followup.is_final_update,
+                    )
             # Sentence TTS already handed this Stage1 result to Talker. The
             # legacy path below would run aura2tts on the original full text
             # again when the next stage is not connector-fed (AURA Talker is

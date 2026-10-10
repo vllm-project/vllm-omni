@@ -391,6 +391,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         cached_prompt_token_ids: dict[str, list[int]] = {}
         cached_additional_information: dict[str, dict | None] = {}
+        cached_model_intermediate_buffer: dict[str, dict | None] = {}
 
         # Temporary queue: preserve waiting order while requests await input.
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -495,6 +496,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
             cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
+            cached_model_intermediate_buffer[request.request_id] = getattr(
+                request,
+                "model_intermediate_buffer",
+                None,
+            )
             token_budget -= num_new_tokens
             scheduled_running_reqs.append(request)
             req_index += 1
@@ -667,6 +673,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             num_output_tokens=cached_reqs_data.num_output_tokens,
             prompt_token_ids=cached_prompt_token_ids,
             additional_information=cached_additional_information,
+            model_intermediate_buffer=cached_model_intermediate_buffer,
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

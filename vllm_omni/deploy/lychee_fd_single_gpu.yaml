@@ -1,0 +1,44 @@
+# Lychee-FD correctness profile: native MRV2 AR and Token2Wav stages sharing one GPU.
+pipeline: step_audio_2_full_duplex
+model_runner: v2
+async_chunk: false
+session_mode: duplex
+duplex_session:
+  # P4 scope is deliberately one request/session on one GPU.
+  max_sessions: 1
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    supports_native_preemption: false
+    supports_running_prefix_cache_reset: false
+    enable_prefix_caching: false
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.70
+    enforce_eager: true
+    async_scheduling: false
+    max_model_len: 8192
+    max_num_batched_tokens: 1024
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 0
+
+  - stage_id: 1
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.10
+    enforce_eager: true
+    async_scheduling: false
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      detokenize: false

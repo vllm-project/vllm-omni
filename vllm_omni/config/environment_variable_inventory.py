@@ -166,6 +166,8 @@ _MODEL_PROMOTE = (
     "INTERNVLA_A1_COSMOS_DIR",
     "INTERNVLA_A1_COSMOS_ENCODER_PATH",
     "INTERNVLA_A1_PROCESSOR_DIR",
+    "LYCHEEFD_TOKEN2WAV_PATH",  # Checkpoint selection belongs in typed model configuration.
+    "LYCHEEFD_TTS_VOCODER_HOP_SIZE",  # Streaming cadence belongs in model configuration.
     "MAGI2_DETERMINISTIC",
     "MAGI2_FLASH_ATTN_VERSION",
     "MIMO_AUDIO_TOKENIZER_CUDA_GRAPH",
@@ -214,6 +216,7 @@ _MODEL_PROMOTE = (
 )
 
 _MODEL_REQUEST_SCOPE = (
+    "LYCHEEFD_T2W_PROMPT_WAV",  # Voice conditioning belongs to the session/request.
     "MAGI2_NEGATIVE_PROMPT",
     "STEP_AUDIO2_DEFAULT_PROMPT_WAV",
     "VLLM_GEPARD_END_FADE_MS",
@@ -231,6 +234,7 @@ _MODEL_INTERNALIZE = (
     "COSYVOICE3_F0_ON_CPU",
     "COSYVOICE3_REFERENCE_CACHE_DEBUG",
     "DZ_PHASE_TIMING",
+    "LYCHEE_RELEASED_LIBDEVICE_PATH",  # Fixed compatibility toolchain detail, not a public tuning knob.
     "MAGI2_ALLOW_UNSUPPORTED_TOPOLOGY",
     "MAGI2_ROUTER_BIAS_SOURCE",
     "MING_TTS_STAGE1_FINAL_LOG",
