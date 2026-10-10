@@ -2169,7 +2169,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # A preprocess_decode_batch row: build what scalar preprocess
                 # would have stored, from this step's host copy of the ids.
                 host_ids, row = pending
-                code_id = host_ids.values()[row]
+                code_id = int(host_ids[row])
                 if code_id == int(self._codec_eos_id):
                     state["finished"] = True
                     audio = None
