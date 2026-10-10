@@ -543,6 +543,7 @@ def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() 
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 7
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+    assert session.max_tokens == 32
 
 
 def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder() -> None:
@@ -562,6 +563,32 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert session._output_token_ids == []
     assert session.num_prompt_tokens == 8
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
+
+
+@pytest.mark.parametrize("max_tokens", [4, 32])
+def test_downstream_async_chunk_resume_updates_max_tokens(max_tokens: int) -> None:
+    sched = _make_scheduler(stage_id=1)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        requests_num_chunks_sent={},
+        segment_finished_requests={"req-ar-streaming-test"},
+    )
+    session = _make_request()
+    session.external_req_id = session.request_id
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    sched.num_waiting_for_streaming_input = 1
+
+    update = _make_update([10, 20])
+    update.max_tokens = max_tokens
+    sched._update_request_as_session(session, update)
+
+    assert session.max_tokens == max_tokens
+    assert session.sampling_params is update.sampling_params
+    assert session.prompt_token_ids == [1, 2, 3]
+    assert session.status == RequestStatus.WAITING
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session._omni_segment_generation == 1
+    assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
 
 
 def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
@@ -809,6 +836,7 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
         "ids": {"tts": [41, 42, 99]},
         "meta": {"turn_eos_token_id": 99},
     }
+    assert session.max_tokens == 32
     assert session.status == RequestStatus.WAITING
     sched._free_request_blocks.assert_called_once_with(session)
     sched.encoder_cache_manager.free.assert_called_once_with(session)

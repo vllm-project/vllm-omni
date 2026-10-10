@@ -287,6 +287,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def _finish_streaming_session_update(self, session: Request, update: StreamingUpdate) -> None:
         """Install payload metadata and send an updated session to admission."""
+        session.max_tokens = update.max_tokens
         cache = getattr(self, "_omits_kv_transfer_cache", None)
         if cache is not None:
             cache.pop(session.request_id, None)
