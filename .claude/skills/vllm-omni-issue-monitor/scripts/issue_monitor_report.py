@@ -377,12 +377,6 @@ def _format_di_value(value: float) -> str:
     return s if s else "0"
 
 
-def _shorten_title(title: str, max_len: int = 60) -> str:
-    if len(title) <= max_len:
-        return title
-    return title[: max_len - 1].rstrip() + "…"
-
-
 def _build_mock_issues(now: datetime) -> list[dict[str, Any]]:
     """Synthesize ~25 representative issues so the preview exercises every
     rendering path (all 5 priorities, red threshold crossed, Expand-to-Top-40
@@ -714,7 +708,7 @@ def _render_top_di_table_html(
         assignee: str,
         linked: list[int],
     ) -> str:
-        title_disp = html.escape(_shorten_title(title))
+        title_disp = html.escape(title)
         issue_url = f"{_REPO_URL}/issues/{issue_number}"
         days_disp = f"{int(days_open)}"
         di_disp = html.escape(_format_di_value(di))
@@ -835,7 +829,7 @@ def _render_stale_bugs_subcard_html(
         assignee: str,
         linked: list[int],
     ) -> str:
-        title_disp = html.escape(_shorten_title(title))
+        title_disp = html.escape(title)
         issue_url = f"{_REPO_URL}/issues/{issue_number}"
         days_disp = f"{int(days_open)}"
         di_disp = html.escape(_format_di_value(di))
