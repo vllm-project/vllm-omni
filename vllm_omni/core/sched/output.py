@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass, field, fields
+from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -112,6 +113,21 @@ class OmniChunkRecvHandle:
 
 
 @dataclass
+class OmniRequestPrewarm:
+    """Warm-up payload for an async-chunk placeholder, handed to the runner once.
+
+    The orchestrator attaches it to a downstream stage's prewarm placeholder so
+    the model can prepare per-request state before the first chunk arrives.
+    ``payload`` is the ``ASYNC_CHUNK_PREWARM_NS`` namespace of the placeholder's
+    additional_information, deserialized (e.g. ``{"ref_audio": Tensor,
+    "ref_audio_sr": int}``).
+    """
+
+    request_id: str
+    payload: dict[str, Any]
+
+
+@dataclass
 class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
@@ -119,3 +135,4 @@ class OmniSchedulerOutput(SchedulerOutput):
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
+    pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
