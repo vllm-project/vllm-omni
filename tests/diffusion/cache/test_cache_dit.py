@@ -62,6 +62,7 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
         "Kandinsky6TI2VAPipeline": cd_model_specific.enable_cache_for_kandinsky6,
         "Magi2Pipeline": cd_model_specific.enable_cache_for_magi2,
         "MammothModa2DiTPipeline": cd_model_specific.enable_cache_for_mammothmoda2,
+        "SenseNovaU1Pipeline": cd_model_specific.enable_cache_for_sensenova_u1,
     }
 
     with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):
@@ -91,6 +92,45 @@ def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
 )
 def test_cosmos3_aliases_use_cosmos3_custom_cache_dit_enabler(pipeline_name: str):
     assert cd_backend.CUSTOM_DIT_ENABLERS[pipeline_name] is cd_model_specific.enable_cache_for_cosmos3
+
+
+def test_sensenova_cache_dit_targets_nested_decoder_model(mocker):
+    cached_adapter_cls = type("FakeSensenovaCachedAdapter", (), {})
+    adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={"layers": object()},
+        has_separate_cfg=True,
+        cached_adapter_cls=cached_adapter_cls,
+    )
+    decoder_model = Mock()
+    decoder_model.layers = object()
+    decoder_model._cache_dit_adapter_config = adapter_config
+    pipeline = Mock()
+    pipeline.language_model.model = decoder_model
+    block_adapter = mocker.Mock()
+    block_adapter.pipe = object()
+    build_block_adapter = mocker.patch(
+        "vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter",
+        return_value=block_adapter,
+    )
+    refresh = mocker.Mock()
+    enable_cache = mocker.patch(
+        "vllm_omni.diffusion.cache.cachedit.model_specific.enable_cache_for_dit",
+        return_value=refresh,
+    )
+
+    result = cd_model_specific.enable_cache_for_sensenova_u1(pipeline, SAMPLE_CACHE_CONFIG)
+
+    build_block_adapter.assert_called_once()
+    adapter_kwargs = build_block_adapter.call_args.kwargs
+    assert adapter_kwargs["transformer"] is decoder_model
+    assert adapter_kwargs["blocks"] == [decoder_model.layers]
+    assert adapter_kwargs["has_separate_cfg"] is True
+    enable_kwargs = enable_cache.call_args.kwargs
+    assert enable_kwargs["block_adapter"] is block_adapter
+    assert enable_kwargs["adapter_cls"] is cached_adapter_cls
+    assert enable_kwargs["get_pipeline_transformer"](pipeline) is decoder_model
+    assert result.refresh is refresh
+    assert result.targets == (block_adapter,)
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.enable_cache_for_dit")
