@@ -75,20 +75,30 @@ all-random batches and 28.44–59.43% for mixed batches. All within-run paired
 confidence intervals were positive. These numbers describe sampler replay;
 they do not establish E2E gains or isolate the benefit of simplification alone.
 
-The pre-simplification real-model experiment used V1 RAS, Torch Flow, chunk 25, seed 42,
+The latest-source real-model experiment used V1 RAS, Torch Flow, chunk 25, seed 42,
 two texts and four independent AB/BA server pairs per concurrency. Each server
 ran four warmups and 16 measured requests. All 256 measured requests succeeded:
 
 | Concurrency | Baseline/head matching PCM | Mean E2E baseline → head |
 | --- | --- | --- |
-| 1 | 64/64 | 1413.76 → 1413.37 ms |
-| 4 | 9/64 | 4754.22 → 4895.08 ms |
+| 1 | 64/64 | 1427.69 → 1409.38 ms |
+| 4 | 1/64 | 4702.57 → 4870.30 ms |
 
-The serial paired saving was 0.39 ms, with a 95% interval of [-30.79, 20.44] ms:
-no significant E2E improvement. Concurrent raw latency increased 2.96%, with
-different outputs and some different lengths; the baseline itself was not
-repeatable across concurrent runs. This result does not establish attribution
-or absence of regression. Full-chain performance acceptance remains open.
+The serial paired saving was 18.31 ms (1.28%), with a 95% interval of
+[-12.64, 46.73] ms: no demonstrated stable E2E improvement. Concurrent raw latency
+increased 3.57%, with a paired saving interval of [-397.99, 158.47] ms. Only 17/64
+concurrent output lengths matched; total generated audio increased 1.71%, and
+the baseline itself was not repeatable across concurrent runs. These differences
+confound attribution but do not establish absence of regression. All 256 measured
+PCM files were independently checked against recorded byte counts and hashes.
+
+Serial Stage-0 elapsed time decreased in all four pairs (mean 692 → 618 ms),
+while E2E improved in three of four pairs. Stage durations include waiting and
+overlap; they are not additive GPU compute times. Downstream processing/queueing
+is a plausible limit on transmitting the sampler gain, not a measured root cause.
+Full-chain performance acceptance remains open. The earlier pre-simplification
+experiment likewise did not demonstrate E2E improvement; the two experiments do
+not isolate the incremental effect of simplification.
 
 Request seed controls token sampling; default Flow uses global process noise.
 Controlled cross-version audio equivalence is distinct from arbitrary-concurrency

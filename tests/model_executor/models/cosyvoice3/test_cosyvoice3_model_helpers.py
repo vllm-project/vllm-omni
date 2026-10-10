@@ -823,7 +823,7 @@ def test_mixed_ras_greedy_rows_never_draw_random_numbers(temperature, monkeypatc
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[1] * 10, [0] * 10])
     metadata.all_random = False
-    metadata.temperature = torch.tensor([temperature])
+    metadata.temperature = torch.full((2,), temperature)
     assert float(metadata.temperature[0]) < model._sampling_eps
     monkeypatch.setattr(cosyvoice3, "random_sample", lambda *a, **k: pytest.fail("greedy must not consume RNG"))
     out = model.sample(torch.tensor([[0.0, 2.0], [3.0, 0.0]]), metadata)
