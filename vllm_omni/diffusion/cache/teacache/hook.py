@@ -24,6 +24,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
     get_sp_group,
+    is_cfg_group_initialized,
     model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
@@ -154,7 +155,8 @@ class TeaCacheHook(ModelHook):
                 raise ValueError(f"Invalid teacache_branch={branch_hint!r}; expected 'positive' or 'negative'.")
             cache_branch = branch_hint
         elif getattr(module, "do_true_cfg", False):
-            cfg_parallel_size = get_classifier_free_guidance_world_size()
+            # Direct pipeline calls may not initialize a CFG process group.
+            cfg_parallel_size = get_classifier_free_guidance_world_size() if is_cfg_group_initialized() else 1
             if cfg_parallel_size > 1:
                 cfg_rank = get_classifier_free_guidance_rank()
                 cache_branch = "negative" if cfg_rank > 0 else "positive"

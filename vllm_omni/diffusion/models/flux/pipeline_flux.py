@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import logging
@@ -436,7 +436,6 @@ class FluxPipeline(
     ) -> torch.Tensor:
         """Diffusion loop with optional image conditioning."""
         self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
