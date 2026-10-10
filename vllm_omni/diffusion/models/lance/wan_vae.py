@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Ported from ByteDance Lance upstream (https://github.com/bytedance/Lance,
 # modeling/vae/wan/{vae2_2.py,model.py}). Upstream copyright:
@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.models.lance.vae_output import can_use_fused_output, write_unpatchified
 
 logger = init_logger(__name__)
 
@@ -584,7 +586,7 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return mu, log_var
 
-    def decode(self, z, scale):
+    def decode(self, z, scale, *, clamp_output: bool = False):
         self.clear_cache()
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1)
@@ -593,16 +595,32 @@ class WanVAE_(nn.Module):
         iter_ = z.shape[2]
         x = self.conv2(z)
         out = None
+        fused_output = False
+        frame_offset = 0
         for i in range(iter_):
             self._conv_idx = [0]
+            chunk = self.decoder(
+                x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=i == 0
+            )
             if i == 0:
-                out = self.decoder(
-                    x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=True
-                )
-            else:
-                out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
-        out = _unpatchify(out, patch_size=2)
+                fused_output = can_use_fused_output(chunk)
+                if fused_output:
+                    batch, channels, frames, height, width = chunk.shape
+                    temporal_factor = 2 ** sum(self.temporal_upsample[: len(self.dim_mult)])
+                    total_frames = frames + (iter_ - 1) * temporal_factor
+                    out = chunk.new_empty((batch, channels // 4, total_frames, height * 2, width * 2))
+                else:
+                    out = chunk
+            if fused_output:
+                write_unpatchified(chunk, out, frame_offset, clamp=clamp_output)
+                frame_offset += chunk.shape[2]
+            elif i > 0:
+                out = torch.cat([out, chunk], 2)
+            del chunk
+        if not fused_output:
+            out = _unpatchify(out, patch_size=2)
+            if clamp_output:
+                out = out.clamp_(-1.0, 1.0)
         self.clear_cache()
         return out
 
@@ -819,8 +837,7 @@ class LanceWanVAE(nn.Module):
         """Decode a 5-D latent ``[B, 48, t, h, w]`` -> video ``[B, 3, T, H, W]``."""
         self._ensure_built()
         latent = latent.to(self.model.decoder.conv1.weight.dtype)
-        out = self.model.decode(latent, [self._latent_mean, self._latent_inv_std])
-        return out.clamp_(-1.0, 1.0)
+        return self.model.decode(latent, [self._latent_mean, self._latent_inv_std], clamp_output=True)
 
     # ----- BAGEL image-VAE surface (4-D) -------------------------------- #
 
