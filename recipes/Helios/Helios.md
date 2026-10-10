@@ -90,10 +90,19 @@ Saved generated video to helios_t2v_base.mp4
   diffusion forward passes.
 - No separate deploy config is required for this offline recipe; the shared
   `text_to_video.py` example configures the pipeline through its arguments.
+- The VAE decodes in float32 by default. To run it in bfloat16 instead, set
+  `"vae_dtype": "bfloat16"` in the `model_config` supplied to `Omni` /
+  `AsyncOmni` (not a per-request `extra_body` option). On one A100-PCIE-40GB
+  this cuts a 33-frame 384x640 chunk decode from 1253 ms to 665 ms (~1.9x) at
+  PSNR 59.0 dB / SSIM 0.9997 versus float32, and lowers VAE peak memory from
+  6.2 GiB to 4.0 GiB.
+- `vae_patch_parallel_size > 1` now also distributes the Helios VAE decode
+  across the diffusion group (tiling is enabled automatically), like the other
+  Wan-VAE video models.
 - Helios-specific knobs (declared in `vllm_omni/model_extras/helios.py`) are
   passed via the generic `--extra-body` JSON flag:
-  - Helios-Mid: `--extra-body '{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [20, 20, 20], "use_cfg_zero_star": true, "use_zero_init": true, "zero_steps": 1}'`
-  - Helios-Distilled: `--extra-body '{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}'`
+    - Helios-Mid: `--extra-body '{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [20, 20, 20], "use_cfg_zero_star": true, "use_zero_init": true, "zero_steps": 1}'`
+    - Helios-Distilled: `--extra-body '{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}'`
 
 #### Known limitations
 

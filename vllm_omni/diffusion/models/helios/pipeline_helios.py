@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
@@ -22,6 +21,7 @@ from typing_extensions import override
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = logging.getLogger(__name__)
+
+# ``model_config["vae_dtype"]``: the VAE runs in float32 unless bfloat16 is requested.
+_VAE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
 
 def calculate_shift(
@@ -214,8 +217,11 @@ class HeliosPipeline(
         self.text_encoder = UMT5EncoderModel.from_pretrained(
             model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
-        self.vae = AutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+        vae_dtype = od_config.model_config.get("vae_dtype", "float32")
+        if vae_dtype not in _VAE_DTYPES:
+            raise ValueError(f"Helios vae_dtype must be one of {sorted(_VAE_DTYPES)}, got {vae_dtype!r}")
+        self.vae = DistributedAutoencoderKLWan.from_pretrained(
+            model, subfolder="vae", torch_dtype=_VAE_DTYPES[vae_dtype], local_files_only=local_files_only
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
