@@ -11,10 +11,12 @@ import pytest
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -138,19 +140,20 @@ def _make_sampling_metadata(
     output_token_ids: list[list[int]],
     repetition_penalty: float = 2.0,
 ) -> SamplingMetadata:
+    batch_size = len(output_token_ids)
     return SamplingMetadata(
-        temperature=torch.tensor([1.0], dtype=torch.float32),
+        temperature=torch.ones(batch_size, dtype=torch.float32),
         all_greedy=False,
         all_random=True,
-        top_p=torch.tensor([0.8], dtype=torch.float32),
-        top_k=torch.tensor([25], dtype=torch.int32),
+        top_p=torch.full((batch_size,), 0.8, dtype=torch.float32),
+        top_k=torch.full((batch_size,), 25, dtype=torch.int32),
         generators={},
         max_num_logprobs=None,
         no_penalties=False,
         prompt_token_ids=None,
-        frequency_penalties=torch.zeros(1, dtype=torch.float32),
-        presence_penalties=torch.zeros(1, dtype=torch.float32),
-        repetition_penalties=torch.tensor([repetition_penalty], dtype=torch.float32),
+        frequency_penalties=torch.zeros(batch_size, dtype=torch.float32),
+        presence_penalties=torch.zeros(batch_size, dtype=torch.float32),
+        repetition_penalties=torch.full((batch_size,), repetition_penalty, dtype=torch.float32),
         output_token_ids=output_token_ids,
         allowed_token_ids_mask=None,
         bad_words_token_ids={},
@@ -665,6 +668,33 @@ def test_sample_keeps_only_finite_token_after_ras_rejection():
     assert out.sampled_token_ids.tolist() == [[1]]
 
 
+def _reference_param(param, row, default):
+    if param is None or param.numel() == 0:
+        return default
+    value = param.reshape(-1)[min(row, param.numel() - 1)].item()
+    return int(value) if isinstance(default, int) else float(value)
+
+
+def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_r, generator):
+    """Serial RAS oracle from the pre-B1 implementation, including RNG draws."""
+    probs, ids = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
+    keep = probs.cumsum(dim=0) - probs < top_p
+    if top_k > 0:
+        keep &= torch.arange(probs.numel(), device=probs.device) < top_k
+    generators = {} if generator is None else {0: generator}
+    draw = random_sample((probs * keep).unsqueeze(0), generators).reshape(())
+    token = int(ids[draw].item())
+    if win_size > 0 and history:
+        recent = torch.tensor(history[-win_size:], device=probs.device)
+        if int((recent == token).sum().item()) >= win_size * tau_r:
+            scores = weighted_scores.clone()
+            original = scores[token].clone()
+            scores[token] = float("-inf")
+            scores[token] = torch.where(torch.isfinite(scores).any(), scores[token], original)
+            token = int(random_sample(scores.softmax(dim=0).unsqueeze(0), generators).item())
+    return token
+
+
 def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
     model = _make_talker_model()
     logits = torch.tensor([[2.0, 1.0, 0.0, -1.0], [0.0, 3.0, 1.0, -2.0], [1.0, 0.0, 2.0, -1.0]])
@@ -679,7 +709,7 @@ def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
         for i in range(3):
             scores = torch.log_softmax(logits[i] / metadata.temperature[i], dim=0)
             expected.append(
-                model._ras_sample_one(
+                _reference_ras_one(
                     scores,
                     metadata.output_token_ids[i],
                     top_p=float(metadata.top_p[i]),
@@ -694,6 +724,150 @@ def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
         for i, token in enumerate(expected):
             assert torch.equal(metadata.generators[i].get_state(), reference_generators[i].get_state())
             metadata.output_token_ids[i].append(token)
+
+
+@pytest.mark.parametrize("parameters", ["mixed", "defaults", "all_random"])
+@pytest.mark.parametrize("seeded_rows", [(0, 1, 2, 3), (0, 2)])
+@pytest.mark.parametrize("use_host_params", [False, True])
+def test_mixed_ras_preserves_seeded_trajectories_and_greedy_rng(parameters, seeded_rows, use_host_params, device="cpu"):
+    model = _make_talker_model()
+    logits = torch.tensor([[4.0, 1.0, 0.0, -1.0], [0.0, 2.0, 1.0, -2.0]] * 2, device=device)
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [1], [], [1] * 10])
+    metadata.all_random = parameters == "all_random"
+    # Include a greedy row between random rows to exercise both compactions.
+    temperatures = [0.6, 0.7, 1.2, 1.1] if metadata.all_random else [0.0, 0.7, 1.2, 0.0]
+    metadata.temperature = torch.tensor(temperatures)
+    host_params = [SamplingParams(temperature=t) for t in temperatures]
+    metadata.top_p = torch.tensor([0.8, 0.6, 0.9, 1.0])
+    metadata.top_k = torch.tensor([1, 1, -1, 4], dtype=torch.int32)
+    if parameters == "defaults":
+        metadata.top_p = metadata.top_k = None
+    for name in ("temperature", "top_p", "top_k", "frequency_penalties", "presence_penalties"):
+        value = getattr(metadata, name)
+        if value is not None:
+            setattr(metadata, name, value.to(device))
+    metadata.generators = {i: torch.Generator(device=device).manual_seed(800 + i) for i in seeded_rows}
+    reference_generators = {i: torch.Generator(device=device).manual_seed(800 + i) for i in seeded_rows}
+    for step in range(40):
+        if step == 20:
+            # A previously greedy request must start from its untouched RNG.
+            temperatures = [1.0, 0.9, 1.1, 0.5] if metadata.all_random else [1.0, 0.0, 0.0, 0.5]
+            metadata.temperature = torch.tensor(temperatures, device=device)
+            for params, temperature in zip(host_params, temperatures):
+                params.temperature = temperature
+        expected = {}
+        for i in range(len(logits)):
+            temperature = _reference_param(metadata.temperature, i, 1.0)
+            if temperature < model._sampling_eps:
+                expected[i] = int(logits[i].argmax())
+            elif i in seeded_rows:
+                expected[i] = _reference_ras_one(
+                    torch.log_softmax(logits[i] / temperature, dim=0),
+                    metadata.output_token_ids[i],
+                    top_p=_reference_param(metadata.top_p, i, 0.8),
+                    top_k=_reference_param(metadata.top_k, i, 25),
+                    win_size=10,
+                    tau_r=0.1,
+                    generator=reference_generators[i],
+                )
+        out = model.sample(logits.clone(), metadata, per_req_sampling_params=host_params if use_host_params else None)
+        assert out.sampled_token_ids.dtype == torch.int32
+        assert out.sampled_token_ids.shape == (4, 1)
+        tokens = out.sampled_token_ids[:, 0].tolist()
+        for i, token in enumerate(tokens):
+            if i in expected:
+                assert token == expected[i]
+            assert 0 <= token < logits.shape[1]
+            metadata.output_token_ids[i].append(token)
+        for i in seeded_rows:
+            assert torch.equal(metadata.generators[i].get_state(), reference_generators[i].get_state())
+
+
+def test_mixed_ras_request_reordering_preserves_generator_ownership():
+    model = _make_talker_model()
+    logits = torch.tensor([[1.0, 4.0, 0.0], [3.0, 0.0, 1.0], [0.0, 2.0, 5.0]])
+    temperatures = torch.tensor([0.7, 0.0, 1.2])
+    histories = [[1] * 10, [], [2]]
+    actual_generators = [torch.Generator().manual_seed(90 + i) for i in range(3)]
+    reference_generators = [torch.Generator().manual_seed(90 + i) for i in range(3)]
+    for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0], [2, 1, 0]):
+        metadata = _make_sampling_metadata(output_token_ids=[histories[i] for i in order])
+        metadata.all_random = False
+        metadata.temperature = temperatures[order]
+        metadata.generators = {row: actual_generators[req] for row, req in enumerate(order)}
+        expected = []
+        for req in order:
+            if float(temperatures[req]) < model._sampling_eps:
+                expected.append(int(logits[req].argmax()))
+            else:
+                expected.append(
+                    _reference_ras_one(
+                        torch.log_softmax(logits[req] / float(temperatures[req]), dim=0),
+                        histories[req],
+                        top_p=float(metadata.top_p[0]),
+                        top_k=25,
+                        win_size=10,
+                        tau_r=0.1,
+                        generator=reference_generators[req],
+                    )
+                )
+        out = model.sample(logits[order].clone(), metadata)
+        assert out.sampled_token_ids[:, 0].tolist() == expected
+        for req, token in zip(order, expected):
+            histories[req].append(token)
+            assert torch.equal(actual_generators[req].get_state(), reference_generators[req].get_state())
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1e-6, 1e-5])
+def test_mixed_ras_greedy_rows_never_draw_random_numbers(temperature, monkeypatch):
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10, [0] * 10])
+    metadata.all_random = False
+    metadata.temperature = torch.full((2,), temperature)
+    assert float(metadata.temperature[0]) < model._sampling_eps
+    monkeypatch.setattr(cosyvoice3, "random_sample", lambda *a, **k: pytest.fail("greedy must not consume RNG"))
+    out = model.sample(torch.tensor([[0.0, 2.0], [3.0, 0.0]]), metadata)
+    assert out.sampled_token_ids.tolist() == [[1], [0]]
+
+
+def test_mixed_ras_restores_single_valid_token_and_handles_empty_history():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [1] * 10, []])
+    metadata.all_random = False
+    metadata.temperature = torch.tensor([0.0, 1.0, 1.0])
+    metadata.allowed_token_ids_mask = torch.tensor([[False, True], [True, False], [True, False]])
+    logits = torch.tensor([[3.0, 1.0], [0.0, 2.0], [float("nan"), 1.0]])
+    out = model.sample(logits, metadata)
+    assert out.sampled_token_ids.tolist() == [[0], [1], [1]]
+
+
+def test_mixed_ras_applies_processors_before_greedy_and_random_selection():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[], []])
+    metadata.all_random = False
+    metadata.temperature = torch.tensor([0.0, 1.0])
+
+    class OnlyLastToken:
+        def apply(self, logits):
+            logits[:, :-1] = float("-inf")
+            return logits
+
+    metadata.logitsprocs.non_argmax_invariant.append(OnlyLastToken())
+    out = model.sample(torch.tensor([[10.0, 1.0], [10.0, 1.0]]), metadata)
+    assert out.sampled_token_ids.tolist() == [[1], [1]]
+
+
+def test_mixed_ras_rejects_invalid_random_row_before_consuming_rng():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[], []])
+    metadata.all_random = False
+    metadata.temperature = torch.tensor([0.0, 1.0])
+    generator = torch.Generator().manual_seed(123)
+    metadata.generators = {1: generator}
+    before = generator.get_state().clone()
+    with pytest.raises(ValueError, match="no finite logits"):
+        model.sample(torch.tensor([[1.0, 0.0], [float("nan"), float("-inf")]]), metadata)
+    assert torch.equal(generator.get_state(), before)
 
 
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
