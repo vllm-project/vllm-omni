@@ -10,6 +10,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -43,7 +44,7 @@ class Gr00tN1d7Pipeline(nn.Module):
         self.model_path = od_config.model
         self.embodiment_tag = str(model_config.get("embodiment_tag") or "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT")
         self.strict = bool(model_config.get("strict", True))
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = str(get_local_device())
 
         logger.info("Loading GR00T N1.7 policy from %s with embodiment_tag=%s", self.model_path, self.embodiment_tag)
         self.policy = Gr00tPolicy(
