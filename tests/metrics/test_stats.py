@@ -194,3 +194,78 @@ def test_log_timing_summary_skips_tables_unless_debug(monkeypatch) -> None:
     agg.log_timing_summary()
     assert not tables
     assert len(lines) == 1 and lines[0].startswith("[OmniTiming] req=r1 total=")
+
+
+_PHASE_FIELDS = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+
+
+def _phase_split_summary(**phase_split) -> dict:
+    agg = OrchestratorAggregator(num_stages=2, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=1)
+    for stage_id, split in ((0, phase_split), (1, {})):  # stage 1 stands in for a diffusion stage
+        agg.on_stage_metrics(
+            stage_id,
+            "r1",
+            StageRequestStats(
+                batch_id=1,
+                batch_size=1,
+                num_tokens_in=0,
+                num_tokens_out=4,
+                stage_gen_time_ms=20.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+                stage_stats=StageStats(),
+                **split,
+            ),
+        )
+    agg.on_finalize_request(1, "r1", req_start_ts=0.0)
+    return agg.build_and_log_summary()
+
+
+def _logged_stage_table_rows(monkeypatch, **phase_split) -> dict[str, list[str]]:
+    from vllm_omni.metrics import stats
+
+    tables: list[str] = []
+    monkeypatch.setattr(stats.logger, "isEnabledFor", lambda level: True)
+    monkeypatch.setattr(stats.logger, "debug", lambda msg, *args: tables.append(msg % args))
+    monkeypatch.setattr(stats.logger, "info", lambda *args, **kwargs: None)
+    _phase_split_summary(**phase_split)
+    table = next(table for table in tables if "[StageRequestStats [request_id=r1]]" in table)
+    rows = {}
+    for line in table.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        rows[cells[0]] = cells[1:]
+    return rows
+
+
+def test_stage_table_summary_keeps_measured_zero_apart_from_missing_phase_split() -> None:
+    summary = _phase_split_summary(vllm_queued_ms=3.0, vllm_prefill_ms=40.0, vllm_decode_ms=0.0, vllm_num_preemptions=0)
+
+    ar_row, diffusion_row = _get_request_entry(summary["stage_table"], "r1")["stages"]
+    assert {field: ar_row[field] for field in _PHASE_FIELDS} == {
+        "vllm_queued_ms": 3.0,
+        "vllm_prefill_ms": 40.0,
+        "vllm_decode_ms": 0.0,
+        "vllm_num_preemptions": 0,
+    }
+    assert all(diffusion_row[field] is None for field in _PHASE_FIELDS)
+
+
+def test_logged_stage_table_renders_phase_split_rows(monkeypatch) -> None:
+    rows = _logged_stage_table_rows(
+        monkeypatch, vllm_queued_ms=3.0, vllm_prefill_ms=40.0, vllm_decode_ms=900.0, vllm_num_preemptions=2
+    )
+
+    assert {field: rows[field] for field in _PHASE_FIELDS} == {
+        "vllm_queued_ms": ["3.000", "None"],
+        "vllm_prefill_ms": ["40.000", "None"],
+        "vllm_decode_ms": ["900.000", "None"],
+        "vllm_num_preemptions": ["2", "None"],
+    }
+
+
+def test_logged_stage_table_has_no_phase_split_rows_when_unobserved(monkeypatch) -> None:
+    rows = _logged_stage_table_rows(monkeypatch)
+
+    assert "stage_gen_time_ms" in rows
+    assert not set(_PHASE_FIELDS) & set(rows)

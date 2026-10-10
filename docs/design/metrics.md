@@ -270,8 +270,43 @@ After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency,
 
 ## Logging vs. Prometheus
 
-`OrchestratorAggregator` (in `vllm_omni/metrics/stats.py`) is the logging-oriented metrics path. It collects detailed per-request, per-stage, and per-transfer statistics and prints formatted tables to the `INFO` log. This is designed for development and debugging — individual request traces, transfer bandwidth, inter-stage timing.
+`OrchestratorAggregator` (in `vllm_omni/metrics/stats.py`) is the logging-oriented metrics path. It collects detailed per-request, per-stage, and per-transfer statistics and prints formatted tables to the log (per-request tables at `DEBUG`, the `[OmniTiming]` summary at `INFO`). This is designed for development and debugging — individual request traces, transfer bandwidth, inter-stage timing.
 
 `OmniPrometheusMetrics` / `OmniModalityMetrics` / `OmniTransferMetrics` form the Prometheus-oriented path. They record aggregate counters, gauges, and histograms suitable for time-series monitoring and alerting. Both paths share the same source data (`StageRequestStats`, `TransferEdgeStats`) — `OrchestratorAggregator.record_transfer_tx/rx` in particular calls both the existing accumulator code and the Prometheus emit hook in the same method body. The two consumption models can run simultaneously without coupling.
 
 The separation follows upstream vLLM's pattern of `LoggingStatLogger` vs. `PrometheusStatLogger` — same underlying data, different consumption models.
+
+### LLM-stage phase split in `StageRequestStats`
+
+With `--log-stats`, a stage served by a vLLM engine core (AR and generation stages) adds the engine-core phase split of the finished request to its `StageRequestStats` row:
+
+| Field | Interval |
+| ----- | -------- |
+| `vllm_queued_ms` | `QUEUED` event to first `SCHEDULED` event |
+| `vllm_prefill_ms` | First `SCHEDULED` event to first engine-core output (the first token for an AR stage) |
+| `vllm_decode_ms` | First engine-core output to last engine-core output |
+| `vllm_num_preemptions` | Number of `PREEMPTED` events |
+
+The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. Two differences: upstream subtracts an unobserved timestamp as `0.0`, and it reports a negative interval as is, while these fields leave either interval out. No Prometheus family is added.
+
+The first engine-core output ends prefill even when it carries no token. A generation stage that emits one output when it stops therefore reports its whole run as `vllm_prefill_ms`, with a measured `vllm_decode_ms` of `0`.
+
+`vllm_queued_ms` runs from the stage's engine core accepting the request to its first scheduling. For stage 0 this is scheduler wait. A downstream stage can also wait there for its input:
+
+- With `async_chunk`, a downstream stage that receives chunks is submitted together with stage 0, and the request stays in `WAITING_FOR_CHUNK` until the first upstream chunk arrives. Later waits for the next chunk fall inside `vllm_decode_ms`.
+- A stage with `requires_full_payload_input` stays in `WAITING_FOR_INPUT` until the connector delivers the payload.
+
+For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
+
+These intervals can overlap with other timings of the same request: the upstream stage's run, the transfer times in `TransferEdgeStats` and `vllm_omni:transfer_tx_s` / `vllm_omni:transfer_rx_s`, and stage-to-stage handoff events. Do not add them together into an end-to-end breakdown of a request unless the intervals are known not to overlap and use the same clock.
+
+Two more cases where an interval covers more than its name suggests:
+
+- A KV-transfer sender (a stage with `kv_transfer_criteria`) keeps the request running until the KV extraction is acknowledged, and the token-less `kv_ready` output it emits still advances the last-token timestamp. `vllm_decode_ms` therefore includes the wait for that acknowledgement.
+- `vllm_num_preemptions` counts `PREEMPTED` events. In the default (non-windowed) path, when the chunk transfer adapter moves running requests over `max_num_seqs` back to the waiting queue, it sets `PREEMPTED` without recording an event, so that wait is not counted as a preemption and stays inside prefill or decode.
+
+The per-request `[StageRequestStats]` table is logged at `DEBUG` (for example `VLLM_LOGGING_LEVEL=DEBUG`); at `INFO` only the `[OmniTiming]` line is printed.
+
+Missing and zero are different. A field is `None` when its interval was not observed: a diffusion stage, `--log-stats` off, or an engine-core event that never arrived. A measured `0` stays `0`. In the `[StageRequestStats]` table a missing value prints as `None`, and, as for every other field, a row whose values are all zero or missing is hidden.
+
+For a streaming-input request, only the terminal event carries the split, and it covers the last input segment, because the request stats restart at each streaming update. The last segment's `QUEUED` event can arrive with the previous segment's final output, before that restart, so its `vllm_queued_ms` may be missing. The fields are not added to the `stage_metrics` snapshot returned to clients and benchmarks. The duplex per-response table leaves them out (`DUPLEX_STAGE_TABLE_EXCLUDE`): they describe one engine-core request, not a response turn.

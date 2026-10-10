@@ -13,8 +13,10 @@ import torch
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
+from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
-from vllm.v1.metrics.stats import IterationStats, PrefillStats
+from vllm.v1.metrics.stats import IterationStats, PrefillStats, RequestStateStats
 
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import output_processor
@@ -913,6 +915,215 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.finish_reason == FinishReason.STOP
     assert finished.num_prompt_tokens == state.prompt_len
     assert finished.num_generation_tokens == 2
+
+
+_PHASE_KEYS = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+
+
+@pytest.mark.parametrize(
+    ("timestamps", "expected"),
+    [
+        pytest.param(
+            dict(num_preemptions=1, queued_ts=100.0, scheduled_ts=100.25, first_token_ts=100.75, last_token_ts=102.0),
+            {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 1},
+            id="all_events",
+        ),
+        pytest.param(
+            # A one-token output and an immediate schedule are measured zeros.
+            dict(queued_ts=10.0, scheduled_ts=10.0, first_token_ts=10.5, last_token_ts=10.5),
+            {"vllm_queued_ms": 0.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0},
+            id="measured_zero",
+        ),
+        pytest.param(dict(), {}, id="nothing_observed"),
+        pytest.param(
+            # No QUEUED/SCHEDULED: "first_token_ts - 0.0" would invent a prefill.
+            dict(first_token_ts=50.0, last_token_ts=50.5),
+            {"vllm_decode_ms": 500.0},
+            id="no_engine_core_events",
+        ),
+        pytest.param(
+            dict(scheduled_ts=5.0, first_token_ts=6.0, last_token_ts=7.0),
+            {"vllm_prefill_ms": 1000.0, "vllm_decode_ms": 1000.0, "vllm_num_preemptions": 0},
+            id="no_queued_event",
+        ),
+        pytest.param(
+            # Finished (e.g. aborted) before it was ever scheduled.
+            dict(queued_ts=7.0),
+            {"vllm_num_preemptions": 0},
+            id="never_scheduled",
+        ),
+        pytest.param(
+            # The first output was processed without stats, so no first token.
+            dict(queued_ts=1.0, scheduled_ts=2.0, last_token_ts=3.0),
+            {"vllm_queued_ms": 1000.0, "vllm_num_preemptions": 0},
+            id="no_first_token",
+        ),
+        pytest.param(
+            dict(queued_ts=5.0, scheduled_ts=4.0, first_token_ts=6.0, last_token_ts=5.5),
+            {"vllm_prefill_ms": 2000.0, "vllm_num_preemptions": 0},
+            id="negative_intervals",
+        ),
+    ],
+)
+def test_native_phase_split_omits_unobserved_intervals(timestamps, expected):
+    metrics = output_processor._native_phase_metrics(RequestStateStats(**timestamps))
+
+    assert metrics == pytest.approx(expected)
+
+
+def _make_text_stage_state() -> OmniRequestState:
+    # vLLM's no-tokenizer detokenizer keeps the output on the AR text path
+    # (upstream process_outputs) instead of the multimodal-only path.
+    return OmniRequestState(
+        **{
+            **_DEFAULT_STATE_KWARGS,
+            "detokenizer": IncrementalDetokenizer(),
+            "logprobs_processor": LogprobsProcessor(
+                tokenizer=None,
+                logprobs=None,
+                prompt_logprobs=None,
+                cumulative_logprob=None,
+                num_logprobs=None,
+                num_prompt_logprobs=None,
+            ),
+        },
+        output_kind=RequestOutputKind.CUMULATIVE,
+    )
+
+
+def _stats_processor(state: OmniRequestState) -> MultimodalOutputProcessor:
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=True, engine_core_output_type=AUDIO)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    return processor
+
+
+def _stats_output(
+    *, events=None, finish_reason=None, is_segment_finished=False, new_token_ids=(10,)
+) -> OmniEngineCoreOutput:
+    return OmniEngineCoreOutput(
+        request_id="r",
+        new_token_ids=list(new_token_ids),
+        events=events,
+        finish_reason=finish_reason,
+        is_segment_finished=is_segment_finished,
+        multimodal_output={AUDIO: torch.ones(1, 4)},
+    )
+
+
+@pytest.mark.parametrize(
+    "make_state",
+    [_make_text_stage_state, lambda: _make_no_detok_state(RequestOutputKind.CUMULATIVE)],
+    ids=["ar_text_path", "mm_only_path"],
+)
+def test_engine_core_events_reach_native_phase_split(make_state):
+    state = make_state()
+    processor = _stats_processor(state)
+    prefill = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+        ]
+    )
+    processor.process_outputs([prefill], engine_core_timestamp=1.75, iteration_stats=IterationStats())
+    decode = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.PREEMPTED, 2.0),
+            # Re-scheduling after preemption must not move the prefill start.
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 2.5),
+        ],
+        finish_reason=FinishReason.LENGTH,
+    )
+    iteration_stats = IterationStats()
+    processor.process_outputs([decode], engine_core_timestamp=3.0, iteration_stats=iteration_stats)
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert {key: record[key] for key in _PHASE_KEYS} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 1}
+    )
+    finished = iteration_stats.finished_requests[0]
+    assert record["vllm_queued_ms"] == pytest.approx(finished.queued_time * 1000.0)
+    assert record["vllm_prefill_ms"] == pytest.approx(finished.prefill_time * 1000.0)
+    assert record["vllm_decode_ms"] == pytest.approx(finished.decode_time * 1000.0)
+    assert record["vllm_num_preemptions"] == finished.num_preemptions
+
+
+def test_one_shot_generation_phase_split_reports_whole_run_as_prefill():
+    # A generation stage that emits a single token-less output at stop: the
+    # first engine-core output sets the first-token timestamp, so the whole
+    # run is prefill and decode is a measured 0.
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor = _stats_processor(state)
+    only = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+        ],
+        finish_reason=FinishReason.STOP,
+        new_token_ids=(),
+    )
+    processor.process_outputs([only], engine_core_timestamp=2.0, iteration_stats=IterationStats())
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert {key: record[key] for key in _PHASE_KEYS} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 750.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0}
+    )
+
+
+def test_first_output_without_stats_leaves_prefill_and_decode_out():
+    # The orchestrator flushes a codec stage's first audio frame without
+    # iteration stats, so the native first-token timestamp is never set.
+    processor = _stats_processor(_make_no_detok_state(RequestOutputKind.CUMULATIVE))
+    processor.process_outputs([_stats_output()], engine_core_timestamp=1.5, iteration_stats=None)
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ],
+                finish_reason=FinishReason.STOP,
+            )
+        ],
+        engine_core_timestamp=2.0,
+        iteration_stats=IterationStats(),
+    )
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert {key: record[key] for key in _PHASE_KEYS if key in record} == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_num_preemptions": 0}
+    )
+
+
+@pytest.mark.parametrize(
+    ("stats_on", "is_segment_finished"),
+    [(False, False), (True, True)],
+    ids=["stats_off", "segment_finish"],
+)
+def test_no_native_phase_split_without_finished_request_stats(stats_on, is_segment_finished):
+    # Only a terminal finish with stats on is a finished vLLM request.
+    processor = _stats_processor(_make_no_detok_state(RequestOutputKind.CUMULATIVE))
+    processor.process_outputs(
+        [
+            _stats_output(
+                events=[
+                    EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                    EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+                ],
+                finish_reason=FinishReason.STOP,
+                is_segment_finished=is_segment_finished,
+            )
+        ],
+        engine_core_timestamp=1.75,
+        iteration_stats=IterationStats() if stats_on else None,
+    )
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert not set(_PHASE_KEYS) & set(record)
 
 
 def test_ec_transfer_params_survive_both_construction_paths():

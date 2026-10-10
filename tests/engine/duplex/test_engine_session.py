@@ -949,6 +949,61 @@ def test_end_response_omits_serving_time_to_first_output_from_stage_table(
     assert [event.serving_time_to_first_output_ms for event in events] == pytest.approx([80.631, 418.829, 487.109])
 
 
+def test_end_response_omits_engine_core_phase_split_from_stage_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase_fields = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+    original = OrchestratorAggregator.build_and_log_summary
+    captured: list[tuple[OrchestratorAggregator, dict[str, object]]] = []
+
+    def _capture(self: OrchestratorAggregator) -> dict[str, object]:
+        summary = original(self)
+        captured.append((self, summary))
+        return summary
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _capture)
+    session = _session(num_stages=2, log_stats=True)
+    response_id = session.begin_response()
+    for stage_id in (0, 1):
+        stats = _stage_stats(stage_id=stage_id)
+        stats.vllm_queued_ms = 1.5
+        stats.vllm_prefill_ms = 20.0
+        stats.vllm_decode_ms = 300.0
+        stats.vllm_num_preemptions = 0
+        session.observe_stage_request_stats(stage_id, stats)
+    session.end_response()
+
+    assert len(captured) == 1
+    aggregator, summary = captured[0]
+    stage_table = summary.get("stage_table")
+    assert isinstance(stage_table, list) and stage_table
+    rows = stage_table[0]["stages"]
+    assert isinstance(rows, list)
+    assert [row["stage_id"] for row in rows] == [0, 1]
+    assert all(field not in row for row in rows for field in phase_fields)
+    assert all("vllm_ttft_ms" in row for row in rows)
+    events = aggregator.stage_events[response_id]
+    assert [event.vllm_prefill_ms for event in events] == pytest.approx([20.0, 20.0])
+
+
+def test_http_stage_table_keeps_engine_core_phase_split() -> None:
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    stats = _stage_stats(stage_id=0)
+    stats.vllm_queued_ms = 1.5
+    stats.vllm_prefill_ms = 20.0
+    stats.vllm_decode_ms = 300.0
+    stats.vllm_num_preemptions = 0
+    agg.on_stage_metrics(0, "r1", stats)
+    agg.on_finalize_request(0, "r1", req_start_ts=0.0)
+
+    summary = agg.build_and_log_summary()
+    stage_table = summary.get("stage_table")
+    assert isinstance(stage_table, list) and stage_table
+    row = stage_table[0]["stages"][0]
+    assert row["vllm_prefill_ms"] == pytest.approx(20.0)
+    assert row["vllm_num_preemptions"] == 0
+
+
 def test_http_stage_table_keeps_serving_time_to_first_output() -> None:
     agg = OrchestratorAggregator(num_stages=2, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=1)
     agg.on_stage_metrics(0, "r1", _stage_stats(stage_id=0, serving_time_to_first_output_ms=80.0))

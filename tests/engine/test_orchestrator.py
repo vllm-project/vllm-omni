@@ -1633,6 +1633,40 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     assert metrics.finish_reason == "length"
 
 
+@pytest.mark.parametrize(
+    ("native_record", "expected"),
+    [
+        pytest.param(
+            {"vllm_queued_ms": 2.5, "vllm_prefill_ms": 30.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0},
+            {"vllm_queued_ms": 2.5, "vllm_prefill_ms": 30.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0},
+            id="observed",
+        ),
+        pytest.param(
+            # An absent key is an unobserved phase and must not become 0.
+            {"vllm_decode_ms": 12.0},
+            {"vllm_queued_ms": None, "vllm_prefill_ms": None, "vllm_decode_ms": 12.0, "vllm_num_preemptions": None},
+            id="partly_unobserved",
+        ),
+    ],
+)
+def test_stage_pool_metrics_copy_native_phase_split(native_record, expected) -> None:
+    class PhaseMetricsOutputProcessor(FakeOutputProcessor):
+        def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
+            assert request_id == "req-ar"
+            return {"num_generation_tokens": 2, **native_record}
+
+    pool = StagePool(0, [FakeStageClient(stage_type="llm")], output_processor=PhaseMetricsOutputProcessor())
+
+    metrics = pool.build_stage_metrics(
+        [_build_request_output("req-ar")],
+        submit_ts=time.time(),
+        request_timestamp=time.time(),
+        replica_id=0,
+    )
+
+    assert {key: getattr(metrics, key) for key in expected} == expected
+
+
 def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
     stage = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     pool = StagePool(
@@ -1653,6 +1687,9 @@ def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
 
     assert metrics.serving_time_to_first_output_ms == pytest.approx(12000.0)
     assert metrics.image_time_to_first_output_ms == pytest.approx(2000.0)
+    # A diffusion stage has no engine-core phase split.
+    assert metrics.vllm_queued_ms is None and metrics.vllm_prefill_ms is None
+    assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
 
 
 @pytest.mark.asyncio

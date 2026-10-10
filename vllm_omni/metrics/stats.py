@@ -69,6 +69,14 @@ class StageRequestStats:
     vllm_tpot_ms: float = 0.0
     vllm_itl_ms: float = 0.0
     vllm_itls_ms: list[float] | None = None
+    # Engine-core phase split of a finished vLLM request: queued -> scheduled
+    # -> first token -> last token, as in vLLM's FinishedRequestStats.
+    # None means not observed (diffusion stage, --log-stats off, or a missing
+    # engine-core event); 0 is a measured value.
+    vllm_queued_ms: float | None = None
+    vllm_prefill_ms: float | None = None
+    vllm_decode_ms: float | None = None
+    vllm_num_preemptions: int | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -135,8 +143,18 @@ STAGE_EXCLUDE = {
 # Duplex logs one StageRequestStats table per response. Chunk submits refresh
 # ``request_timestamp``, so serving_time_to_first_output_ms is often a clamped
 # 0 on the audio column and is not a useful TTFP. HTTP ``--print-stage`` keeps
-# the row.
-DUPLEX_STAGE_TABLE_EXCLUDE = frozenset({defs.SERVING_TIME_TO_FIRST_OUTPUT_MS})
+# the row. The engine-core phase split describes one vLLM request, not a
+# response turn, so it stays out of the duplex table until turn semantics are
+# defined; the non-duplex ``[StageRequestStats]`` table keeps it.
+DUPLEX_STAGE_TABLE_EXCLUDE = frozenset(
+    {
+        defs.SERVING_TIME_TO_FIRST_OUTPUT_MS,
+        "vllm_queued_ms",
+        "vllm_prefill_ms",
+        "vllm_decode_ms",
+        "vllm_num_preemptions",
+    }
+)
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}
 
