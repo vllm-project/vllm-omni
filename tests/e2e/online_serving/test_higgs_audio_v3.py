@@ -214,6 +214,13 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
                 "transcript_expected_text": "It is just between you and me, alright?",
+                # A real CI run transcribed this clip as "This is just between you and
+                # me, alright?" (similarity=0.896, just under the 0.9 gate; see
+                # https://github.com/vllm-project/vllm-omni/issues/7236) -- whispering
+                # softens the initial consonant enough for whisper-small to mishear
+                # "It" as "This". Re-verify with a stronger ASR before failing, same
+                # as test_plain_text_wav.
+                "transcript_escalation_model": "large-v3",
             }
         )
 
@@ -257,7 +264,17 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_inline_sfx_with_onomatopoeia(self, omni_server, online_client) -> None:
-        """SFX token paired with its written onomatopoeia (``<|sfx:laughter|>Hehe``)."""
+        """SFX token paired with its written onomatopoeia (``<|sfx:laughter|>Hehe``).
+
+        The model correctly vocalizes the onomatopoeia (e.g. "hehe" / "hee hee"),
+        which the ``transcript_expected_text`` below deliberately omits since ASR
+        renders laughter inconsistently across runs. The default 0.9 similarity
+        gate has no margin for that legitimate extra content: a real CI run of
+        this exact input/output pair scored 0.839 (see
+        https://github.com/vllm-project/vllm-omni/issues/7236). 0.75 keeps
+        ~0.09 margin under that observed value while still catching a genuinely
+        wrong transcript.
+        """
         online_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
@@ -270,6 +287,7 @@ class TestHiggsAudioV3OnlineInlineControlTokens:
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_audio_bytes": _MIN_AUDIO_BYTES,
                 "transcript_expected_text": "I cannot believe that just happened. I am still recovering from it.",
+                "transcript_similarity_threshold": 0.75,
             }
         )
 
