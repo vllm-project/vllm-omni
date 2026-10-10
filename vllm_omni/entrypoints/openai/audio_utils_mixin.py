@@ -1,5 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Audio serving utility mixin.
+
+PUT HERE:
+  - AudioMixin helpers that convert audio tensors/bytes/formats for speech
+    and audio serving classes (shared by multiple serving paths).
+
+DO NOT PUT HERE:
+  - FastAPI route / form / job orchestration peeled from ``api_server.py``.
+    Put those under an audio package ``helpers.py`` (or audio serving modules)
+    when extracted.
+
+LONGEVITY:
+  - This root mixin is a **temporary shared home**.
+  - TODO(#5227, P1.1): tidy up / move with the audio/speech family split
+    in the Phase 1 audio PR; do not treat this file as the long-term owner.
+  - Endpoint-family helpers under an audio package are the longer home for
+    route-adjacent logic.
+
+See ``openai/README.md`` (utils vs helpers, no overlap).
+"""
 
 from io import BytesIO
 
@@ -8,7 +28,15 @@ import torch
 import torchaudio
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.protocol.audio import DEFAULT_AUDIO_FORMAT, AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    DEFAULT_AUDIO_FORMAT,
+    AudioChunkMetadata,
+    AudioResponse,
+    CreateAudio,
+)
+
+# Re-exported: serving_speech and the audio tests import it from here.
+from vllm_omni.utils.audio_resample import StreamingAudioResampler  # noqa: F401
 
 try:
     import soundfile
@@ -18,86 +46,22 @@ except ImportError:
 logger = init_logger(__name__)
 
 
-class StreamingAudioResampler:
-    """Stateful resampler for streaming mono audio.
+def _float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    """Convert channels-last float32 audio to interleaved little-endian PCM.
 
-    Only integer downsampling ratios are supported so every input chunk can
-    produce output without buffering the complete stream.
+    Match libsndfile's clipped float32 -> int32 -> PCM16 conversion, including
+    rounding at the int32 boundary before dropping its low 16 bits. Directly
+    rounding or truncating audio * 32768 produces different output samples.
+    Build a C-contiguous temporary so planar stereo input is interleaved once.
     """
-
-    def __init__(self, source_rate: int, target_rate: int):
-        if source_rate <= 0 or target_rate <= 0:
-            raise ValueError("Audio sample rates must be positive")
-        self.source_rate = source_rate
-        self.target_rate = target_rate
-        if source_rate < target_rate or source_rate % target_rate != 0:
-            raise ValueError(
-                "Streaming audio resampling requires an integer downsampling ratio, "
-                f"got {source_rate} Hz to {target_rate} Hz"
-            )
-
-        self._ratio = source_rate // target_rate
-        self._buffer = np.empty((0,), dtype=np.float32)
-        self._buffer_start = 0
-        self._total_samples = 0
-        self._next_center = 0
-
-        if self._ratio == 1:
-            self._taps = np.ones((1,), dtype=np.float32)
-        else:
-            # Use a Kaiser-windowed sinc and leave a small transition band
-            # below the target Nyquist frequency.
-            num_taps = 20 * self._ratio + 1
-            half = num_taps // 2
-            offsets = np.arange(num_taps, dtype=np.float64) - half
-            cutoff = 0.95 / self._ratio
-            taps = cutoff * np.sinc(cutoff * offsets) * np.kaiser(num_taps, 5.0)
-            self._taps = (taps / taps.sum()).astype(np.float32)
-
-    def process(self, audio: np.ndarray, *, final: bool = False) -> np.ndarray:
-        chunk = np.asarray(audio, dtype=np.float32)
-        if chunk.ndim != 1:
-            raise ValueError(f"Streaming audio resampling only supports mono audio, got shape {chunk.shape}")
-
-        if self._ratio == 1:
-            return chunk
-
-        if chunk.size:
-            self._buffer = np.concatenate((self._buffer, chunk))
-            self._total_samples += int(chunk.size)
-
-        half = self._taps.size // 2
-        max_center = self._total_samples - 1 if final else self._total_samples - 1 - half
-        if self._next_center > max_center:
-            return np.empty((0,), dtype=np.float32)
-
-        centers = np.arange(self._next_center, max_center + 1, self._ratio, dtype=np.int64)
-        first_center = int(centers[0])
-        last_center = int(centers[-1])
-        window_start = first_center - half
-        window_end = last_center + half
-        segment = np.zeros((window_end - window_start + 1,), dtype=np.float32)
-
-        copy_start = max(window_start, self._buffer_start, 0)
-        copy_end = min(window_end + 1, self._buffer_start + self._buffer.size)
-        if copy_end > copy_start:
-            dst_start = copy_start - window_start
-            src_start = copy_start - self._buffer_start
-            segment[dst_start : dst_start + copy_end - copy_start] = self._buffer[
-                src_start : src_start + copy_end - copy_start
-            ]
-
-        windows = np.lib.stride_tricks.sliding_window_view(segment, self._taps.size)[:: self._ratio]
-        output = windows @ self._taps[::-1]
-        self._next_center = last_center + self._ratio
-
-        keep_from = max(0, self._next_center - half)
-        drop = min(max(keep_from - self._buffer_start, 0), self._buffer.size)
-        if drop:
-            self._buffer = self._buffer[drop:]
-            self._buffer_start += int(drop)
-
-        return np.asarray(output, dtype=np.float32)
+    scaled = np.fmax(audio, np.float32(-1), order="C")
+    # Largest float32 below 1 keeps the int32 conversion in range.
+    np.minimum(scaled, np.float32(1 - 2**-24), out=scaled)
+    scaled *= 2147483648.0
+    np.rint(scaled, out=scaled)
+    pcm32 = scaled.astype(np.int32)
+    pcm32 >>= 16
+    return pcm32.astype("<i2").tobytes()
 
 
 class AudioMixin:
@@ -147,16 +111,31 @@ class AudioMixin:
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
 
-        with BytesIO() as buffer:
-            soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
-            audio_data = buffer.getvalue()
+        audio_data: bytes | str
+        if response_format == "pcm" and isinstance(audio_tensor, np.ndarray) and audio_tensor.dtype == np.float32:
+            # Through BytesIO, soundfile makes a Python callback per block;
+            # streamed chunks made that the API workers' largest cost.
+            audio_data = _float32_to_pcm16_bytes(audio_tensor)
+        else:
+            with BytesIO() as buffer:
+                soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
+                audio_data = buffer.getvalue()
 
         if base64_encode:
             import base64
 
             audio_data = base64.b64encode(audio_data).decode("utf-8")
 
-        return AudioResponse(audio_data=audio_data, media_type=media_type)
+        return AudioResponse(
+            audio_data=audio_data,
+            media_type=media_type,
+            audio_metadata=AudioChunkMetadata(
+                format=response_format,
+                sample_rate_hz=int(sample_rate),
+                frame_count=int(audio_tensor.shape[0]),
+                channels=1 if audio_tensor.ndim == 1 else int(audio_tensor.shape[1]),
+            ),
+        )
 
     @staticmethod
     def _resample_audio(audio_tensor: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:

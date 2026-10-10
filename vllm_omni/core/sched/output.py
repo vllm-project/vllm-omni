@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass, field, fields
+from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -18,14 +22,14 @@ class OmniNewRequestData(NewRequestData):
 
     Args:
         external_req_id: Optional external request ID for tracking
-        additional_information: Optional serialized additional information
+        additional_information: Optional serialized or materialized additional information
             dictionary containing tensors or lists
         model_intermediate_buffer: Optional runner-owned payload for
             GPUModelRunner.model_intermediate_buffer
     """
 
     external_req_id: str | None = None
-    additional_information: AdditionalInformationPayload | None = None
+    additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
 
     @classmethod
@@ -105,6 +109,22 @@ class OmniChunkRecvHandle:
 
     request_id: str
     external_req_id: str | None = None
+    payload_sender_info: dict[str, object] | None = None
+
+
+@dataclass
+class OmniRequestPrewarm:
+    """Warm-up payload for an async-chunk placeholder, handed to the runner once.
+
+    The orchestrator attaches it to a downstream stage's prewarm placeholder so
+    the model can prepare per-request state before the first chunk arrives.
+    ``payload`` is the ``ASYNC_CHUNK_PREWARM_NS`` namespace of the placeholder's
+    additional_information, deserialized (e.g. ``{"ref_audio": Tensor,
+    "ref_audio_sr": int}``).
+    """
+
+    request_id: str
+    payload: dict[str, Any]
 
 
 @dataclass
@@ -113,3 +133,6 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    data_plane_terminal_req_ids: set[str] = field(default_factory=set)
+    input_terminal_req_ids: set[str] = field(default_factory=set)
+    pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)

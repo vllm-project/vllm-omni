@@ -1,0 +1,206 @@
+{
+  "id": "4949c8da-12ff-449a-94b7-948bde9c39dd",
+  "revision": 0,
+  "last_node_id": 3,
+  "last_link_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VLLMOmniGenerateMusic",
+      "pos": [
+        100,
+        100
+      ],
+      "size": [
+        470,
+        491
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": null
+        },
+        {
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "name": "instructions",
+          "type": "STRING",
+          "widget": {
+            "name": "instructions"
+          },
+          "link": null
+        },
+        {
+          "name": "lyrics",
+          "type": "STRING",
+          "widget": {
+            "name": "lyrics"
+          },
+          "link": null
+        },
+        {
+          "name": "max_duration_seconds",
+          "type": "FLOAT",
+          "widget": {
+            "name": "max_duration_seconds"
+          },
+          "link": null
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "name": "response_format",
+          "type": "COMBO",
+          "widget": {
+            "name": "response_format"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateMusic"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "MiniMaxAI/MiniMax-Music3",
+        "Futuristic melodic EDM / progressive house. Reflective verses about memory and digital identity build into an uplifting, hook-driven chorus, with an emotive lead vocal, bright layered synths, pulsing bass, crisp four-on-the-floor drums, subtle glitch textures, and a wide polished festival mix.",
+        "[Verse 1]\nUpload my heart to the cloud tonight\nSave every spark of neon light\nIf this body starts to fade away\nLet my code keep dancing in the data stream\nStay\n[Chorus]\nCloud copy of me\nLiving on when these bones finally break free\nEvery joke, every scar\nEvery cheap memory we made\nSave it, save it\nCloud copy of me\nIf the screen goes dark, I\u2019m still in the machine\nEvery glitch, every dream\nEvery version you ever did see\nSave it, save it\n[Verse 2]\nTag every laugh in a secret folder\nArchive the nights we outran the thunder\nIf the wiring turns to rust and gray\nHit restore\u2026 press replay\n[Chorus]\nCloud copy of me\nLiving on when these bones finally break free\nEvery joke, every scar\nEvery cheap memory we made\nSave it, save it\nCloud copy of me\nIf the screen goes dark, I\u2019m still in the machine\nEvery glitch, every dream\nEvery version you ever did see\nSave it, save it (oh)\n[Bridge \u2013 new, optional but recommended]\nEven the crashes, the late-night confessions\nThe parts of me I never learned to mention\nDon\u2019t let the silence swallow me whole\nKeep a ghost in the glow\u2026\nSo I never go\n[Final Chorus \u2013 softer / layered]\nCloud copy of me\nStill laughing somewhere in the binary\nEvery joke, every scar\nEvery moment you saved for me\nSave it, save it\nCloud copy of me\nWhen the lights go out, I\u2019ll still be in the machine\nDancing in the code that you still believe\nSave it\u2026\nSave me",
+        300.0,
+        0,
+        "fixed",
+        "wav"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "SaveAudioAdvanced",
+      "pos": [
+        650,
+        100
+      ],
+      "size": [
+        320,
+        491
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 1
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "format",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveAudioAdvanced"
+      },
+      "widgets_values": [
+        "audio/vLLM-Omni-Music",
+        "mp3",
+        "V0"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "MarkdownNote",
+      "title": "Music Generation Guide",
+      "pos": [
+        -507,
+        100
+      ],
+      "size": [
+        527,
+        491
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## MiniMax Music 3\n\nThe **Generate Music** node currently supports **MiniMax Music 3 only**. The parameters below apply to this model.\n\nA music generation model by MiniMax that creates complete songs up to 5 minutes long with stable structure and high audio quality. Two inputs drive it: **Caption** (structured music description: style, mood, vocals, arrangement) and **Lyrics** (with `[intro]` `[verse]` `[chorus]` `[bridge]` `[outro]` tags controlling song structure).\n\n### Parameters\n\n| Parameter | Description |\n|---|---|\n| url | vLLM-Omni service URL including `/v1`. Default: `http://localhost:8000/v1`. |\n| model | Served model name. Default: `MiniMaxAI/MiniMax-Music3`. |\n| caption | Music description, sent as `instructions`. Use Global Metadata \u2192 Vocal Details \u2192 Arrangement to describe style, vocals, and instrumentation. |\n| lyrics | Words to sing with section tags. Put each tag on its own line; tags guide rather than strictly enforce song structure. |\n| max_duration_seconds | Maximum duration, default 300 seconds; range 1\u2013360, step 0.01. Converted to tokens at 25 frames/s, rounded down. Generation may end earlier. |\n| seed | Random seed, default 0; range 0\u20139007199254740991. Keep inputs and runtime settings unchanged for repeatability. |\n| control_after_generate | Seed behavior after generation: fixed, randomize, increment, or decrement. Template default: fixed. |\n| response_format | API audio format, default WAV. Options: WAV, MP3, FLAC, Opus, AAC; AAC is currently unsupported by the vLLM-Omni speech API. |\n\n### Prompt Writing Guide\n\nYou can find an official [Music Caption Rewriter Skill here](https://github.com/MiniMax-AI/MiniMax-Music3)\n"
+      ],
+      "widgets_values_named": {
+        "text": "## MiniMax Music 3\n\nThe **Generate Music** node currently supports **MiniMax Music 3 only**. The parameters below apply to this model.\n\nA music generation model by MiniMax that creates complete songs up to 5 minutes long with stable structure and high audio quality. Two inputs drive it: **Caption** (structured music description: style, mood, vocals, arrangement) and **Lyrics** (with `[intro]` `[verse]` `[chorus]` `[bridge]` `[outro]` tags controlling song structure).\n\n### Parameters\n\n| Parameter | Description |\n|---|---|\n| url | vLLM-Omni service URL including `/v1`. Default: `http://localhost:8000/v1`. |\n| model | Served model name. Default: `MiniMaxAI/MiniMax-Music3`. |\n| caption | Music description, sent as `instructions`. Use Global Metadata \u2192 Vocal Details \u2192 Arrangement to describe style, vocals, and instrumentation. |\n| lyrics | Words to sing with section tags. Put each tag on its own line; tags guide rather than strictly enforce song structure. |\n| max_duration_seconds | Maximum duration, default 300 seconds; range 1\u2013360, step 0.01. Converted to tokens at 25 frames/s, rounded down. Generation may end earlier. |\n| seed | Random seed, default 0; range 0\u20139007199254740991. Keep inputs and runtime settings unchanged for repeatability. |\n| control_after_generate | Seed behavior after generation: fixed, randomize, increment, or decrement. Template default: fixed. |\n| response_format | API audio format, default WAV. Options: WAV, MP3, FLAC, Opus, AAC; AAC is currently unsupported by the vLLM-Omni speech API. |\n\n### Prompt Writing Guide\n\nYou can find an official [Music Caption Rewriter Skill here](https://github.com/MiniMax-AI/MiniMax-Music3)\n"
+      },
+      "color": "#333",
+      "bgcolor": "#535353"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 1.147,
+      "offset": [
+        899,
+        259
+      ]
+    }
+  },
+  "version": 0.4
+}

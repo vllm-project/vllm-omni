@@ -24,6 +24,9 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
+_NATIVE_CHAT_TEMPLATE = (
+    Path(__file__).resolve().parents[3] / "vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja"
+)
 _CI_DEPLOY = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5.yaml"),
     updates={
@@ -63,13 +66,39 @@ test_params = [
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=False,
-            server_args=["--trust-remote-code", "--async-chunk"],
+            server_args=[
+                "--trust-remote-code",
+                "--async-chunk",
+                "--chat-template",
+                str(_NATIVE_CHAT_TEMPLATE),
+                "--chat-template-content-format",
+                "openai",
+            ],
             env_dict={
                 "VLLM_CONFIGURE_LOGGING": "1",
                 "VLLM_LOGGING_CONFIG_PATH": str(_PROMPT_LOGGING_CONFIG_PATH),
             },
         ),
         id="async_chunk",
+    ),
+]
+
+turn_test_params = [
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=modify_stage_config(_CI_DEPLOY, updates={"session_mode": "turn"}),
+            use_stage_cli=False,
+            server_args=[
+                "--trust-remote-code",
+                "--async-chunk",
+                "--chat-template",
+                str(_NATIVE_CHAT_TEMPLATE),
+                "--chat-template-content-format",
+                "openai",
+            ],
+        ),
+        id="turn_async_chunk",
     ),
 ]
 
@@ -128,7 +157,7 @@ def _read_prompt_selection_log(offset: int) -> str:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text output via OpenAI API.
@@ -153,7 +182,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
     Test text-only input generating text + audio output via OpenAI API.
@@ -265,11 +294,18 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     Input Setting: stream=True
     """
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(),
-        image_data_url=image_data_url,
-        content_text=get_prompt("text_image"),
-    )
+    # Match the native image-chat layout explicitly; do not rely on the
+    # renderer moving media placeholders ahead of text.
+    messages = [
+        get_system_prompt(),
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+                {"type": "text", "text": get_prompt("text_image")},
+            ],
+        },
+    ]
 
     request_config = {
         "model": omni_server.model,
@@ -325,13 +361,20 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
     video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 20)['base64']}"
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    # A loop of the default single word "test" can make the answer repeat
+    # to the token limit, leaving TTS/ASR to count a long run of identical words
+    # (#7630). Exercise speech perception with a meaningful phrase instead.
+    audio = generate_synthetic_audio(5, 1, phrase_text="The weather is sunny today.")
+    audio_data_url = f"data:audio/wav;base64,{audio['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
         image_data_url=image_data_url,
         audio_data_url=audio_data_url,
-        content_text=get_prompt("mix"),
+        content_text=(
+            "Briefly describe the image and video, and summarize what the voice says. "
+            "Answer in one short sentence without repeating the spoken phrase."
+        ),
     )
 
     request_config = {

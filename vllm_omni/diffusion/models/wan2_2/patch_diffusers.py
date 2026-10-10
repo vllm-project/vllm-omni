@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 
-from vllm_omni.diffusion.layers.norm import RMSNormVAE
+from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
 
 
 def patch_wan_rms_norm():

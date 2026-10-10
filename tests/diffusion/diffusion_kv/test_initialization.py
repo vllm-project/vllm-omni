@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -58,6 +58,7 @@ def _od_config(**overrides):
         gpu_memory_utilization=0.9,
         kv_cache_memory_bytes=None,
         max_num_seqs=1,
+        diffusion_kv_max_rows_per_request=1,
         max_num_batched_tokens=64,
         num_gpus=1,
     )
@@ -224,6 +225,22 @@ def test_paged_config_forwards_gpu_memory_utilization_to_native_cache_config() -
     assert vllm_config.cache_config.gpu_memory_utilization == 0.42
 
 
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+@pytest.mark.parametrize("requests,rows", [(1, 2), (2, 3)])
+def test_native_config_counts_cfg_rows_once(enable_prefix_caching, requests, rows) -> None:
+    od_config = _od_config(
+        max_num_seqs=requests,
+        diffusion_kv_max_rows_per_request=rows,
+        enable_prefix_caching=enable_prefix_caching,
+    )
+    config = diffusion_vllm_config.create_diffusion_vllm_config(torch.device("cpu"), od_config)
+    # Engine and Worker must see the same row capacity, including on reconfiguration.
+    diffusion_vllm_config.configure_diffusion_vllm_config(config, od_config)
+    assert config.scheduler_config.max_num_seqs == requests * rows
+    assert od_config.max_num_seqs == requests
+    assert config.cache_config.enable_prefix_caching is enable_prefix_caching
+
+
 def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:
     quantization_config = build_quant_config(
         {
@@ -299,8 +316,10 @@ def test_minus_one_max_model_len_is_auto_fitted_by_native_cache_sizing() -> None
     )
 
     assert vllm_config.model_config.original_max_model_len == -1
-    # Sixteen physical pages provide ``16 * block_size`` tokens.  The native
-    # backend chooses the block geometry, so keep this assertion backend
+    # Sixteen physical pages provide ``(16 - 1) * block_size`` tokens: vLLM 0.29
+    # subtracts the null block that BlockPool permanently holds back before
+    # sizing (check_enough_kv_cache_memory), so only 15 pages are usable.  The
+    # native backend chooses the block geometry, so keep this assertion backend
     # independent instead of assuming the generic 16-token block size.
-    expected_max_model_len = min(model_limit, spec.block_size * 16)
+    expected_max_model_len = min(model_limit, spec.block_size * (16 - 1))
     assert vllm_config.model_config.max_model_len == expected_max_model_len

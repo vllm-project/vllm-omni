@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for CosyVoice3 components."""
 
+import types
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
+    HiFTGenerator,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -27,6 +29,23 @@ def _force_torch_sdpa():
     )
     with set_current_diffusion_config(od_config):
         yield
+
+
+def test_batch_flow_runtime_flags_are_opt_in(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+        cosyvoice3_batch_flow_debug,
+        cosyvoice3_batch_flow_enabled,
+    )
+
+    monkeypatch.delenv("COSYVOICE3_BATCH_FLOW", raising=False)
+    monkeypatch.delenv("COSYVOICE3_BATCH_FLOW_DEBUG", raising=False)
+    assert not cosyvoice3_batch_flow_enabled()
+    assert not cosyvoice3_batch_flow_debug()
+
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW_DEBUG", "1")
+    assert cosyvoice3_batch_flow_enabled()
+    assert cosyvoice3_batch_flow_debug()
 
 
 @pytest.fixture
@@ -55,6 +74,108 @@ def test_causal_hift_stft_moves_window_to_input_device(causal_hift):
     assert real.device == waveform.device
     assert imag.device == waveform.device
     assert causal_hift.stft_window.device == waveform.device
+
+
+class _MinimalF0Predictor(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Conv1d(80, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x).squeeze(1).abs()
+
+
+@pytest.mark.parametrize("sampling_rate", [22050, 24000])
+def test_noncausal_hift_inference_runs_with_real_sinegen(sampling_rate):
+    """Base (non-causal) HiFTGenerator with a real SineGen/SineGen2 (not a
+    test double) must still run: SourceModuleHnNSF/SineGen/SineGen2/_f02sine
+    all branch on `self.causal` to return the pre-streaming (shorter) tuple
+    contract for non-causal callers, and any one of them regressing back to
+    always returning the streaming-length tuple breaks this immediately.
+    """
+    hift = HiFTGenerator(
+        base_channels=32,
+        sampling_rate=sampling_rate,
+        upsample_rates=[8, 5, 3],
+        upsample_kernel_sizes=[16, 11, 7],
+        source_resblock_kernel_sizes=[7, 7, 11],
+        source_resblock_dilation_sizes=[[1, 3, 5]] * 3,
+        f0_predictor=_MinimalF0Predictor(),
+    ).eval()
+
+    speech, _ = hift.inference(torch.randn(1, 80, 20))
+
+    assert speech.shape[0] == 1
+    assert torch.isfinite(speech).all()
+
+
+def test_causal_hift_routes_npu_transforms_to_cpu_fallback(causal_hift, monkeypatch):
+    class NpuTensor:
+        device = SimpleNamespace(type="npu")
+
+    tensor = NpuTensor()
+    stft_calls = []
+    istft_calls = []
+
+    def fake_stft(value):
+        stft_calls.append(value)
+        return ("real", "imag")
+
+    def fake_istft(magnitude, phase):
+        istft_calls.append((magnitude, phase))
+        return "waveform"
+
+    monkeypatch.setattr(causal_hift, "_stft_on_cpu", fake_stft)
+    monkeypatch.setattr(causal_hift, "_istft_on_cpu", fake_istft)
+
+    assert causal_hift._stft(tensor) == ("real", "imag")
+    assert causal_hift._istft(tensor, tensor) == "waveform"
+    assert stft_calls == [tensor]
+    assert istft_calls == [(tensor, tensor)]
+
+
+def test_causal_hift_stft_cpu_fallback_uses_float32(causal_hift, monkeypatch):
+    original_stft = torch.stft
+
+    def assert_cpu_float32_stft(input, *args, window, **kwargs):
+        assert input.device.type == "cpu"
+        assert input.dtype == torch.float32
+        assert window.device.type == "cpu"
+        assert window.dtype == torch.float32
+        return original_stft(input, *args, window=window, **kwargs)
+
+    monkeypatch.setattr(torch, "stft", assert_cpu_float32_stft)
+
+    waveform = torch.randn(1, 64, dtype=torch.float64)
+    real, imag = causal_hift._stft_on_cpu(waveform)
+
+    assert real.device == waveform.device
+    assert imag.device == waveform.device
+    assert real.dtype == waveform.dtype
+    assert imag.dtype == waveform.dtype
+
+
+def test_causal_hift_istft_cpu_fallback_uses_float32(causal_hift, monkeypatch):
+    original_istft = torch.istft
+
+    def assert_cpu_complex64_istft(input, *args, window, **kwargs):
+        assert input.device.type == "cpu"
+        assert input.dtype == torch.complex64
+        assert window.device.type == "cpu"
+        assert window.dtype == torch.float32
+        return original_istft(input, *args, window=window, **kwargs)
+
+    monkeypatch.setattr(torch, "istft", assert_cpu_complex64_istft)
+
+    waveform = torch.randn(1, 64, dtype=torch.float32)
+    spec = torch.stft(waveform, 16, 4, 16, window=causal_hift.stft_window, return_complex=True)
+    magnitude = torch.abs(spec).to(torch.float64)
+    phase = torch.angle(spec).to(torch.float64)
+    reconstructed = causal_hift._istft_on_cpu(magnitude, phase)
+
+    assert reconstructed.device == magnitude.device
+    assert reconstructed.dtype == magnitude.dtype
+    torch.testing.assert_close(reconstructed, waveform.to(torch.float64), rtol=1e-5, atol=1e-5)
 
 
 class TestPreLookaheadLayer:
@@ -138,6 +259,70 @@ class TestDiTAttention:
         assert attention.to_q.out_features == 512  # heads * dim_head
         assert attention.to_k.out_features == 512
         assert attention.to_v.out_features == 512
+
+    def test_embedded_dit_honors_diffusion_attention_backend(self, monkeypatch):
+        """The LLM-hosted code2wav DiT must consume the diffusion env override."""
+        from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+        from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import _build_dit_estimator
+
+        monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
+
+        estimator = _build_dit_estimator(
+            {
+                "dim": 32,
+                "depth": 1,
+                "heads": 2,
+                "dim_head": 16,
+                "dropout": 0.0,
+                "ff_mult": 2,
+                "mel_dim": 8,
+                "mu_dim": 8,
+                "spk_dim": 4,
+                "out_channels": 8,
+                "static_chunk_size": 4,
+                "num_decoding_left_chunks": 1,
+            }
+        )
+
+        attention = estimator.transformer_blocks[0].attn.attn
+        assert attention.backend_pref == "TORCH_SDPA"
+        assert attention.backend_explicit is True
+        assert attention.attn_backend is not None
+        assert attention.attn_backend.get_name() == "SDPA"
+        assert get_current_diffusion_config_or_none() is None
+
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_forward_passes_2d_mask_without_casting_qkv(self):
+        """The float32 fallback receives the per-row validity mask."""
+        from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTAttention
+
+        class CaptureAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.last_metadata = None
+                self.last_dtype = None
+
+            def forward(self, q, k, v, attn_metadata=None):
+                self.last_metadata = attn_metadata
+                self.last_dtype = q.dtype
+                return torch.zeros_like(q)
+
+        attention = DiTAttention(dim=16, heads=2, dim_head=8, dropout=0.0)
+        capture = CaptureAttention()
+        attention.attn = capture
+
+        x = torch.randn(2, 5, 16)
+        mask = torch.tensor([[True, True, True, False, False], [True, True, True, True, False]])
+
+        out = attention(x, mask=mask)
+
+        assert out.shape == x.shape
+        assert capture.last_metadata is not None
+        assert torch.equal(capture.last_metadata.attn_mask, mask)
+        assert capture.last_dtype == x.dtype
+        assert out.dtype == x.dtype
+        assert torch.allclose(out[~mask], torch.zeros_like(out[~mask]))
 
 
 class TestDiTBlock:
@@ -422,6 +607,52 @@ class TestCFM:
         assert reused_context is context
         assert reused_stream is stream
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_causal_conditional_cfm_batches_cfg_estimator(self):
+        """Batched flow calls should invoke the CFG estimator with 2B rows."""
+        from omegaconf import DictConfig
+
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
+
+        class RecordingEstimator(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.shapes: list[tuple[int, ...]] = []
+
+            def forward(self, x, mask, mu, t, spks=None, cond=None):
+                self.shapes.append(tuple(x.shape))
+                return torch.zeros_like(x)
+
+        estimator = RecordingEstimator()
+        cfm_params = DictConfig(
+            {
+                "sigma_min": 1e-6,
+                "solver": "euler",
+                "t_scheduler": "cosine",
+                "training_cfg_rate": 0.2,
+                "inference_cfg_rate": 0.7,
+            }
+        )
+        cfm = CausalConditionalCFM(
+            in_channels=80,
+            cfm_params=cfm_params,
+            n_spks=1,
+            spk_emb_dim=80,
+            estimator=estimator,
+        )
+
+        batch, mel_dim, seq_len = 3, 80, 16
+        mu = torch.randn(batch, mel_dim, seq_len)
+        mask = torch.ones(batch, 1, seq_len)
+        spks = torch.randn(batch, 80)
+        cond = torch.randn(batch, mel_dim, seq_len)
+
+        out, _ = cfm(mu, mask, n_timesteps=2, spks=spks, cond=cond)
+
+        assert out.shape == mu.shape
+        assert estimator.shapes == [(2 * batch, mel_dim, seq_len)] * 2
+
 
 class TestSDPAFallback:
     """Test SDPA fallback for float32 inputs."""
@@ -461,7 +692,11 @@ def test_code2wav_forward_finalizes_hift_tail():
 
         def inference(self, speech_feat, finalize=True):
             self.finalize_calls.append(bool(finalize))
-            return torch.zeros((speech_feat.shape[0], 1, speech_feat.shape[-1]), dtype=speech_feat.dtype), None
+            return (
+                torch.zeros((speech_feat.shape[0], 1, speech_feat.shape[-1]), dtype=speech_feat.dtype),
+                None,
+                None,
+            )
 
     model = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
@@ -484,3 +719,46 @@ def test_code2wav_forward_finalizes_hift_tail():
     assert out.shape == (1, 1, 8)
     assert model.hift.finalize_calls == [True]
     assert forward_mel_calls[0]["token_offset_tokens"] == 0
+
+
+def test_code2wav_streaming_batch_pads_codec_tokens_and_preserves_lengths():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    model.flow_model = SimpleNamespace(pre_lookahead_len=1, token_mel_ratio=2)
+    forward_mel_calls = []
+
+    def fake_forward_mel(self, **kwargs):
+        forward_mel_calls.append(kwargs)
+        return torch.arange(2 * 80 * 8, dtype=torch.float32).reshape(2, 80, 8)
+
+    def fake_stream_hift(self, feat, *, cache_state=None, finalize=False):
+        return feat, None
+
+    model._forward_mel = types.MethodType(fake_forward_mel, model)
+    model._stream_hift_from_feat = types.MethodType(fake_stream_hift, model)
+    items = [
+        {
+            "token": torch.ones(1, 3, dtype=torch.int32),
+            "prompt_token": torch.ones(1, 4, dtype=torch.int32),
+            "prompt_feat": torch.ones(1, 8, 80),
+            "embedding": torch.ones(1, 192),
+            "finalize": False,
+        },
+        {
+            "token": torch.ones(1, 5, dtype=torch.int32),
+            "prompt_token": torch.ones(1, 4, dtype=torch.int32),
+            "prompt_feat": torch.ones(1, 8, 80),
+            "embedding": torch.ones(1, 192),
+            "finalize": False,
+        },
+    ]
+
+    results = model.forward_streaming_batch(items)
+
+    assert len(forward_mel_calls) == 1
+    call = forward_mel_calls[0]
+    assert call["token"].shape == (2, 5)
+    assert torch.equal(call["token_lens"], torch.tensor([3, 5], dtype=torch.int32))
+    assert results[0][0].shape[-1] == 4
+    assert results[1][0].shape[-1] == 8

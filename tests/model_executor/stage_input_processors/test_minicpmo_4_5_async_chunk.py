@@ -9,6 +9,7 @@ import torch
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
+    _extract_codec_delta,
     tts2code2wav_async_chunk,
     tts2code2wav_full_payload,
     tts2code2wav_token_only,
@@ -80,6 +81,34 @@ def test_empty_full_payload_releases_consumer_wait_gate() -> None:
     assert payload.meta.left_context_size == 0
     assert payload.meta.last_chunk is True
     assert payload.meta.finished.item() is True
+
+
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("audio_shape", [(0,), (0, 1)])
+def test_empty_device_codec_prefill_preserves_next_chunk(flat: bool, audio_shape: tuple[int, ...]) -> None:
+    audio = torch.empty(audio_shape, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+    empty_output = (
+        {"codes.audio": audio, "meta.codec_frame_valid": valid}
+        if flat
+        else {"codes": {"audio": audio}, "meta": {"codec_frame_valid": valid}}
+    )
+    assert _extract_codec_delta(empty_output, "req") == []
+    manager = _manager()
+    request = _request("req")
+    assert tts2code2wav_async_chunk(manager, empty_output, request, False) is None
+    payload = tts2code2wav_async_chunk(manager, _delta(*range(25)), request, False)
+    assert payload is not None
+    assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+    assert payload.meta.chunk_seq == 0
+
+
+def test_device_codec_validity_filters_terminal_token() -> None:
+    output = {
+        "codes": {"audio": torch.tensor([[2], [6561], [3]])},
+        "meta": {"codec_frame_valid": torch.tensor([True, False, True])},
+    }
+    assert _extract_codec_delta(output, "req") == [2, 3]
 
 
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])
@@ -281,12 +310,16 @@ def test_sync_token_only_reserves_codec_and_silence_slots() -> None:
     assert prompts[0]["additional_information"] is None
 
 
-def test_empty_final_releases_wait_gate_once() -> None:
+@pytest.mark.parametrize("with_validity", [False, True])
+def test_empty_final_releases_wait_gate_once(with_validity: bool) -> None:
     manager = _manager()
     request = _request("req")
 
-    final = tts2code2wav_async_chunk(manager, None, request, True)
-    duplicate = tts2code2wav_async_chunk(manager, None, request, True)
+    output = _delta() if with_validity else None
+    if output is not None:
+        output["meta"]["codec_frame_valid"] = torch.empty(0, dtype=torch.bool)
+    final = tts2code2wav_async_chunk(manager, output, request, True)
+    duplicate = tts2code2wav_async_chunk(manager, output, request, True)
 
     assert final is not None
     assert _codes(final) == []
@@ -519,3 +552,25 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert payload is not None
     assert payload.meta.cache_epoch == 1
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+
+
+@pytest.mark.parametrize("last_valid", [False, True])
+def test_full_payload_accumulates_codec_validity_per_frame(last_valid):
+    """A final invalid/EOS row must not invalidate the whole utterance."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    transport = _OmniConnectorPayloadTransportMixin()
+    transport._pending_full_payload_send = {}
+    transport._full_payload_replace_keys_cached = frozenset()
+    request = _request("req")
+    for code, valid in [(10, True), (0, False), (11, True), (12, last_valid)]:
+        transport.accumulate_full_payload_output(
+            "req",
+            {"codes.audio": torch.tensor([[code]]), "meta.codec_frame_valid": torch.tensor([valid])},
+            request,
+        )
+    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["req"])
+    payload = tts2code2wav_full_payload(_manager(), full, request)
+    assert _codes(payload) == [4218, 4218, 4218, 10, 11] + ([12] if last_valid else [])

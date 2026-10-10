@@ -4,6 +4,11 @@ This directory contains benchmark suites for evaluating different model families
 
 ## Benchmark families
 
+### [Qwen2.5-Omni](qwen2_5_omni/README.md) — Embedding Wrapper Latency
+
+CPU-observed A/B timings for redundant text embedding removal, with real checkpoint
+embeddings, warmup, paired blocks, and embedding call-count validation.
+
 ### [TTS](tts/README.md) — Text-to-Speech
 
 Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS and VoxCPM2.
@@ -36,6 +41,17 @@ LingBot-Video MoE transformer.
 - **Dense pipeline**: decoded-video MAE, MSE, PSNR, latency, and optional steady-state timings
 - **MoE transformer**: bitwise router, sparse-block, shared-expert, and full-transformer parity
 
+### [LingBot-World](lingbot_world/README.md) — Realtime Streaming Cadence
+
+Client-side benchmark for a `WS /v1/realtime/video` world-model session, where one
+request is a whole rollout and one AR block streams out as one video chunk. It
+measures a cadence rather than a throughput: there is exactly one session, and what
+matters is whether the next chunk arrives before the viewer finishes the last one.
+
+- **Layout**: `lingbot_world/benchmark_lingbot_world_realtime.py` (WS client), `lingbot_world/workload.py` (rollout and metric math), `lingbot_world/configs/` (single-GPU eager and Ulysses-4 compiled deploy configs)
+- **Workload**: built-in image-conditioned rollout with a generated camera script, or a JSON spec with per-chunk actions and mid-rollout prompt updates
+- **Key metrics**: TTFC (time to first chunk), steady-state chunk inter-arrival percentiles, VIDEO_RTF (wall seconds per video second; lower is better), chunk-deadline attainment, and simulated playback underruns
+
 ### [Distributed](distributed/omni_connectors/README.md) — RDMA Connector Testing
 
 RDMA environment setup and transfer tests for `MooncakeTransferEngineConnector`, including pytest-based single-node checks and manual cross-node benchmarks.
@@ -49,6 +65,13 @@ Accuracy benchmarks for image generation/editing models, adapting external suite
 
 - **Layout**: `accuracy/text_to_image/` (GEBench), `accuracy/image_to_image/` (GEdit-Bench)
 - **Method**: generation and judge scoring both run through local `vllm-omni serve` endpoints
+
+### [MammothModa2](mammoth_moda2/README.md) — Startup and Weight Loading
+
+Startup / model-loading benchmark for the two-stage MammothModa2 (AR → DiT) deployment, plus a raw safetensors loading micro-benchmark.
+
+- **Layout**: `mammoth_moda2/bench_startup.py` (single-process startup and first/steady request timing), `mammoth_moda2/parse_startup_log.py` (per-stage breakdown from engine logs), `mammoth_moda2/bench_storage_scenarios.sh` (cold/warm page cache on local disk vs. network storage), `mammoth_moda2/raw_load_bench.py` (safetensors → GPU without vLLM)
+- **Key metrics**: time to engine ready, per-stage spawn/init/weight-load/profile time, first vs. steady-state request latency
 
 ### Common serving metrics framework
 

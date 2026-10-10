@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,8 +23,9 @@ class _FakeDecoder(nn.Module):
     def __init__(self, total_upsample: int = _TOTAL_UPSAMPLE):
         super().__init__()
         self.total_upsample = total_upsample
-        self.decode_calls: list[dict[str, int]] = []
+        self.decode_calls: list[dict[str, object]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
+        self.batched_decode_codes: list[torch.Tensor] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
@@ -63,7 +64,8 @@ class _FakeDecoder(nn.Module):
         chunk_size: int = 300,
         left_context_size: int = 25,
         max_batch_size: int = 0,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
+        self.batched_decode_codes.append(codes.detach().cpu().clone())
         self.batched_decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -91,8 +93,8 @@ class _FakeDecoder(nn.Module):
         wav_len = frames * self.total_upsample + 6
         wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
         offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
-        outputs = wav.expand(batch, 1, wav_len) + offsets
-        return [outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
+        batched_outputs = wav.expand(batch, 1, wav_len) + offsets
+        return [batched_outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
@@ -131,6 +133,7 @@ def _make_model(
                 load_config=SimpleNamespace(),
                 model_config=SimpleNamespace(
                     model="unused",
+                    dtype=torch.bfloat16,
                     revision=None,
                     stage_connector_config=stage_connector_config,
                     async_chunk=async_chunk,
@@ -157,7 +160,10 @@ def _load_weights_noop(model: Qwen3TTSCode2Wav) -> set[str]:
         def __init__(self, *_: object, **__: object):
             pass
 
-        def load_weights(self, _weights: object) -> set[str]:
+        def load_weights(self, _weights: object, *, mapper: object | None = None) -> set[str]:
+            # vLLM 0.29 dropped skip_prefixes from AutoWeightsLoader; the model
+            # now passes the stage exclusions as a WeightsMapper instead.
+            del mapper
             return {"decoder.fake_weight"}
 
     with (
@@ -197,6 +203,26 @@ def test_forward_uses_decoder_audio_contract_without_context():
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
+
+
+def test_forward_reads_current_model_intermediate_buffer_for_full_payload():
+    """Full-payload sync mode must decode connector codec ids, not placeholders."""
+    model = _make_model()
+    placeholder_ids = torch.zeros(12, dtype=torch.long)
+    payload_codes = torch.arange(12, dtype=torch.long) + 17
+
+    model.forward(
+        input_ids=placeholder_ids,
+        runtime_additional_information=[],
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": payload_codes},
+                "meta": {"left_context_size": 0},
+            }
+        ],
+    )
+
+    torch.testing.assert_close(model.decoder.batched_decode_codes[-1], payload_codes.reshape(1, _NUM_QUANTIZERS, 6))
 
 
 @pytest.mark.parametrize("skipped_length", [0, 1], ids=["empty", "malformed"])
@@ -265,6 +291,31 @@ def test_request_aware_forward_passes_only_delta_frames_to_decoder():
         (1, _NUM_QUANTIZERS, 3),
         (1, _NUM_QUANTIZERS, 2),
     ]
+
+
+def test_forward_reports_the_codec_frames_past_the_left_context():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"left_context_size": 2}}],
+    )
+
+    # Codebook-major ids [[0..5], [6..11]]: the four frames after the two context
+    # frames, one row of codebooks per frame.
+    frames = out.multimodal_outputs["codec_frames"][0]
+    torch.testing.assert_close(frames, torch.tensor([[2, 8], [3, 9], [4, 10], [5, 11]]))
+
+
+def test_request_aware_forward_reports_each_delta_frame():
+    model = _make_model(async_chunk=True)
+    info = [{"meta": {"request_id": "rid", "left_context_size": 0}}]
+
+    first = model.forward(input_ids=torch.arange(6, dtype=torch.long), runtime_additional_information=info)
+    second = model.forward(input_ids=torch.arange(4, dtype=torch.long), runtime_additional_information=info)
+
+    torch.testing.assert_close(first.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 3], [1, 4], [2, 5]]))
+    torch.testing.assert_close(second.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 2], [1, 3]]))
 
 
 def test_four_frame_first_chunk_uses_configured_initial_size_without_ramp():
@@ -573,6 +624,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     _load_weights_noop(model)
 
     assert model.decoder.cudagraph_calls[-1] == {
+        "capture_modes": ("icl", "xvec"),
         "capture_batch_sizes": None,
         "stateless_capture_sizes": None,
         "device": torch.device("cuda"),
@@ -601,6 +653,13 @@ def test_cudagraph_batch_config_is_preserved():
 
     call = model.decoder.cudagraph_calls[-1]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
+
+
+def test_cudagraph_captures_only_modes_used_by_the_model():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+    model.decoder_cudagraph_modes = ("xvec",)
+    _load_weights_noop(model)
+    assert model.decoder.cudagraph_calls[-1]["capture_modes"] == ("xvec",)
 
 
 def test_stateless_cudagraph_capture_sizes_are_passed_from_config():
@@ -705,3 +764,50 @@ def test_invalid_decode_chunking_is_rejected():
 
     with pytest.raises(ValueError, match="decode_chunk_frames=0"):
         _load_weights_noop(model)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
+    model = _make_model()
+    model.vllm_config.model_config.dtype = dtype
+    model.decoder = nn.Linear(2, 2)
+    cache_dtypes = []
+    model.decoder.precompute_snake_caches = lambda: cache_dtypes.append(model.decoder.weight.dtype)
+
+    assert _load_weights_noop(model) == {"decoder.fake_weight"}
+    assert model.decoder.weight.dtype is dtype
+    assert cache_dtypes == [dtype]
+
+
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fails):
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark_limit", 5)
+    original = (torch.backends.cudnn.enabled, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32)
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {"decode_cudnn_benchmark": True}},
+    )
+
+    observed = []
+
+    def capture(**kwargs):
+        observed.append(
+            (
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.benchmark_limit,
+                torch.backends.cudnn.enabled,
+                torch.backends.cudnn.deterministic,
+                torch.backends.cudnn.allow_tf32,
+            )
+        )
+        if capture_fails:
+            raise RuntimeError("capture failed")
+
+    capture_mock = mocker.patch.object(model, "_maybe_enable_decoder_cudagraph", side_effect=capture)
+    _load_weights_noop(model)
+    capture_mock.assert_called_once()
+    assert observed == [(True, 10, *original)]
+    assert torch.backends.cudnn.benchmark is False
+    assert torch.backends.cudnn.benchmark_limit == 5

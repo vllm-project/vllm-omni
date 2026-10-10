@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import av
+from camera_utils import wasd_to_camera_payload
 
 try:
     from websockets.asyncio.client import connect  # pyright: ignore[reportMissingImports]
@@ -54,6 +55,15 @@ class ScheduledPromptUpdate:
     at: float
     prompt: str
     transition_chunks: int
+
+
+@dataclass(frozen=True)
+class ScheduledCameraUpdate:
+    """Client-side schedule entry for a midway camera ``session.interaction``."""
+
+    at: float
+    camera: dict[str, Any]
+    transition_chunks: int | None
 
 
 def _image_reference(value: str) -> dict[str, Any]:
@@ -119,6 +129,61 @@ def _parse_prompt_updates(value: str) -> list[ScheduledPromptUpdate]:
     return sorted(updates, key=lambda update: update.at)
 
 
+def _parse_camera_updates(value: str) -> list[ScheduledCameraUpdate]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--camera-updates must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise argparse.ArgumentTypeError("--camera-updates must be a JSON array")
+
+    updates: list[ScheduledCameraUpdate] = []
+    for index, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}] must be a JSON object")
+        try:
+            at = float(item["at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}] must have a valid 'at' field") from exc
+        if at < 0:
+            raise argparse.ArgumentTypeError(f"--camera-updates[{index}].at must be >= 0")
+
+        if "camera" in item:
+            camera = item["camera"]
+            if not isinstance(camera, dict):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].camera must be an object")
+        elif "actions" in item:
+            actions = item["actions"]
+            if not isinstance(actions, list):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].actions must be a list of WASD/IJKL keys")
+            mode = item.get("mode", "velocity")
+            if mode not in ("target", "velocity"):
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].mode must be target or velocity")
+            camera = wasd_to_camera_payload(actions, mode=mode)
+        else:
+            raise argparse.ArgumentTypeError(
+                f"--camera-updates[{index}] must provide 'camera' (structural SE3) "
+                "or 'actions' (client-side WASD helper)"
+            )
+
+        transition_chunks: int | None
+        if "transition_chunks" not in item:
+            transition_chunks = None if camera.get("mode") == "velocity" else DEFAULT_TRANSITION_CHUNKS
+        else:
+            try:
+                transition_chunks = int(item["transition_chunks"])
+            except (TypeError, ValueError) as exc:
+                raise argparse.ArgumentTypeError(
+                    f"--camera-updates[{index}].transition_chunks must be an integer"
+                ) from exc
+            if transition_chunks < 0:
+                raise argparse.ArgumentTypeError(f"--camera-updates[{index}].transition_chunks must be >= 0")
+
+        updates.append(ScheduledCameraUpdate(at=at, camera=camera, transition_chunks=transition_chunks))
+
+    return sorted(updates, key=lambda update: update.at)
+
+
 def _maybe_set(payload: dict[str, Any], key: str, value: Any) -> None:
     if value is not None:
         payload[key] = value
@@ -173,11 +238,35 @@ async def _run_prompt_update_scheduler(
         payload = {
             "type": "session.interaction",
             "interaction": {
-                "event_id": f"scheduled-{update.at:.3f}",
+                "event_id": f"scheduled-prompt-{update.at:.3f}",
                 "event": {"prompt": update.prompt},
                 "transition_chunks": update.transition_chunks,
             },
         }
+        async with send_lock:
+            await websocket.send(json.dumps(payload, ensure_ascii=False))
+        print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
+
+
+async def _run_camera_update_scheduler(
+    websocket: Any,
+    updates: list[ScheduledCameraUpdate],
+    *,
+    video_started_at: float,
+    send_lock: asyncio.Lock,
+) -> None:
+    for update in updates:
+        delay = (video_started_at + update.at) - time.perf_counter()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        interaction: dict[str, Any] = {
+            "event_id": f"scheduled-camera-{update.at:.3f}",
+            "event": {"multi_modal_data": {"camera": update.camera}},
+        }
+        if update.transition_chunks is not None:
+            interaction["transition_chunks"] = update.transition_chunks
+        payload = {"type": "session.interaction", "interaction": interaction}
         async with send_lock:
             await websocket.send(json.dumps(payload, ensure_ascii=False))
         print(f"Sent session.interaction at t={update.at:.2f}s: {json.dumps(payload, ensure_ascii=False)}")
@@ -241,6 +330,7 @@ async def stream_video(args: argparse.Namespace) -> None:
     ws = None
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
+    camera_update_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
@@ -295,12 +385,21 @@ async def stream_video(args: argparse.Namespace) -> None:
                 if msg_type == "video.start":
                     stream_format = msg.get("format") or stream_format
                     print(f"Video session started: request_id={msg.get('request_id')} format={msg.get('format')}")
+                    video_started_at = time.perf_counter()
                     if args.prompt_updates and prompt_update_task is None:
-                        video_started_at = time.perf_counter()
                         prompt_update_task = asyncio.create_task(
                             _run_prompt_update_scheduler(
                                 websocket,
                                 args.prompt_updates,
+                                video_started_at=video_started_at,
+                                send_lock=send_lock,
+                            )
+                        )
+                    if args.camera_updates and camera_update_task is None:
+                        camera_update_task = asyncio.create_task(
+                            _run_camera_update_scheduler(
+                                websocket,
+                                args.camera_updates,
                                 video_started_at=video_started_at,
                                 send_lock=send_lock,
                             )
@@ -315,6 +414,8 @@ async def stream_video(args: argparse.Namespace) -> None:
                     done = True
                     if prompt_update_task is not None:
                         prompt_update_task.cancel()
+                    if camera_update_task is not None:
+                        camera_update_task.cancel()
                     break
                 elif msg_type == "error":
                     print(f"ERROR: {msg.get('message', msg)}")
@@ -335,6 +436,10 @@ async def stream_video(args: argparse.Namespace) -> None:
             prompt_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await prompt_update_task
+        if camera_update_task is not None:
+            camera_update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await camera_update_task
         print(
             "Saving video... (May take a while. Remuxing concatenated chunks into one progressive MP4 file with total duration metadata in file header)"
         )
@@ -405,9 +510,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="JSON object merged into extra_params; overrides preset keys on conflict.",
     )
-    # Midway prompt updates are pipeline-specific: a model that does not implement
-    # them (LingBot-World, for one) rejects the whole session on the first one, so
-    # nothing is scheduled unless the caller asks for it.
+    # Midway interactions are pipeline-specific: unsupported modalities reject
+    # the update (and may leave the session running). Nothing is scheduled unless
+    # the caller asks for it.
     parser.add_argument(
         "--prompt-updates",
         type=_parse_prompt_updates,
@@ -417,6 +522,19 @@ def parse_args() -> argparse.Namespace:
             "Each object requires "
             "'at' (seconds after video.start) and 'prompt'. Optional "
             f"'transition_chunks' defaults to {DEFAULT_TRANSITION_CHUNKS}."
+        ),
+    )
+    parser.add_argument(
+        "--camera-updates",
+        type=_parse_camera_updates,
+        default=[],
+        help=(
+            "JSON array of scheduled camera updates for models that register the "
+            "camera modality (e.g. LingBot-World). Each object needs 'at' and either "
+            "'camera' (structural SE3: mode + translation/rotation) or "
+            "'actions' (client-side WASD/IJKL helper converted before send). "
+            "Optional 'transition_chunks' defaults to None for velocity and "
+            f"{DEFAULT_TRANSITION_CHUNKS} for target."
         ),
     )
     return parser.parse_args()

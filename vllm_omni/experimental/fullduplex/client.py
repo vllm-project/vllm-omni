@@ -116,25 +116,21 @@ def build_realtime_url(
     model: str | None,
     *,
     autostart: bool | None = None,
-    native_duplex: bool | None = True,
-    session_id: str | None = None,
 ) -> str:
-    """Add the explicit native-duplex query parameters to a Realtime URL."""
+    """Select the duplex route; new session IDs are assigned by the server."""
     parts = urlsplit(url)
     if parts.scheme in {"http", "https"}:
         parts = parts._replace(scheme="ws" if parts.scheme == "http" else "wss")
     if parts.scheme not in {"ws", "wss"} or not parts.netloc:
         raise ValueError(f"Unsupported Realtime URL: {url!r}")
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.pop("native_duplex", None)
+    query.pop("session_id", None)
     query["duplex"] = "1"
     if model:
         query["model"] = model
-    if native_duplex is not None:
-        query["native_duplex"] = "1" if native_duplex else "0"
     if autostart is not None:
         query["autostart"] = "1" if autostart else "0"
-    if session_id:
-        query["session_id"] = session_id
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -234,7 +230,7 @@ class RealtimeEventCollector:
         event_type = stored_event.get("type")
         if event_type == "response.created" and response_id and response_id not in self.response_ids:
             self.response_ids.append(response_id)
-        if event_type == "response.audio.delta":
+        if event_type == "response.output_audio.delta":
             delta = stored_event.get("delta") or stored_event.get("audio")
             if isinstance(delta, str) and response_id:
                 try:
@@ -263,7 +259,7 @@ class RealtimeEventCollector:
             if self.response_id(event) == response_id
             and event.get("type")
             in {
-                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
                 "response.output_text.delta",
                 "response.text.delta",
             }
@@ -322,7 +318,7 @@ class RealtimeEventCollector:
             if (
                 event.get("type")
                 in {
-                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
                     "response.output_text.delta",
                     "response.text.delta",
                 }
@@ -337,7 +333,7 @@ class RealtimeEventCollector:
             if isinstance(stage0, dict):
                 stage0_metrics = stage0
 
-            if event.get("type") != "response.audio.delta" or (
+            if event.get("type") != "response.output_audio.delta" or (
                 response_id is not None and event_response_id != response_id
             ):
                 continue
@@ -512,26 +508,16 @@ class RealtimeDuplexClient:
         ref_audio: str | None = None,
         instructions: str | None = None,
         initial_user_text: str | None = None,
-        native_duplex: bool = True,
         auto_response: bool = True,
         temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
         turn_detection: dict[str, object] | None = None,
-        session_id: str | None = None,
         idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
     ) -> None:
         session_extra_body = dict(extra_body or {})
-        if native_duplex:
-            session_extra_body.update(
-                {
-                    "auto_response": auto_response,
-                    "native_duplex": True,
-                    "force_listen_count": 0,
-                }
-            )
-        else:
-            session_extra_body["native_duplex"] = False
+        session_extra_body.pop("native_duplex", None)
+        session_extra_body.update(auto_response=auto_response, force_listen_count=0)
         session: dict[str, object] = {
             "model": model,
             "modalities": ["audio", "text"],
@@ -556,8 +542,6 @@ class RealtimeDuplexClient:
             session_extra = session["extra_body"]
             assert isinstance(session_extra, dict)
             session_extra["duplex_initial_user_text"] = initial_user_text
-        if session_id:
-            session["session_id"] = session_id
         if idle_timeout_s is not None:
             session["idle_timeout_s"] = idle_timeout_s
         await self.send({"type": "session.update", "session": session})

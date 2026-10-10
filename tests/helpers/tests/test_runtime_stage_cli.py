@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.helpers.runtime import OmniServerStageCli
+from tests.helpers import runtime
+from tests.helpers.runtime import OmniServerParams, OmniServerStageCli
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -47,6 +50,39 @@ def test_stage_cli_loads_stage_ids_and_replica_counts(tmp_path: Path) -> None:
 
     assert server.stage_ids == [0, 1]
     assert server.stage_replica_counts == {0: 1, 1: 3}
+
+
+def test_stage_cli_fixture_leaves_deploy_config_to_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stage_config_path = _write_stage_config(tmp_path)
+    captured_args: list[str] = []
+
+    def fake_stage_cli(model, config_path, serve_args, **kwargs):
+        del kwargs
+        assert config_path == stage_config_path
+        captured_args.extend(serve_args)
+        return nullcontext(SimpleNamespace(model=model))
+
+    monkeypatch.setattr(runtime, "OmniServerStageCli", fake_stage_cli)
+    monkeypatch.setattr(runtime, "_whisper_device_free_around", nullcontext)
+    monkeypatch.setattr(
+        "tests.helpers.stage_config.stage_config_path_for_run_level",
+        lambda config_path, _run_level: config_path,
+    )
+    request = SimpleNamespace(
+        param=OmniServerParams(
+            model="fake-model",
+            stage_config_path=stage_config_path,
+            use_stage_cli=True,
+        ),
+        node=SimpleNamespace(get_closest_marker=lambda _name: None),
+    )
+
+    server_fixture = runtime.iter_omni_server(request, "core_model", threading.Lock())
+    next(server_fixture)
+    with pytest.raises(StopIteration):
+        next(server_fixture)
+
+    assert "--deploy-config" not in captured_args
 
 
 def test_stage_cli_enter_rolls_back_launched_stages_on_startup_failure(
