@@ -189,6 +189,50 @@ def _run_5d_identity(
     destroy_distributed_env()
 
 
+def _run_combined_qkv_equivalence(
+    local_rank: int,
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    seq_len_per_rank: int,
+    num_heads: int,
+    head_size: int,
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    """Verify 1x SeqAllToAll5D on stacked QKV == 3x SeqAllToAll4D on separate Q, K, V."""
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
+
+    _init_worker(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(ulysses_degree=world_size)
+    sp_group = get_sp_group().ulysses_group
+
+    torch.manual_seed(42 + local_rank)
+    shape = (batch_size, seq_len_per_rank, num_heads, head_size)
+    query = torch.randn(shape, dtype=dtype, device=device)
+    key = torch.randn(shape, dtype=dtype, device=device)
+    value = torch.randn(shape, dtype=dtype, device=device)
+
+    # Path A: 3x separate SeqAllToAll4D
+    q4 = SeqAllToAll4D.apply(sp_group, query.clone(), 2, 1, False)
+    k4 = SeqAllToAll4D.apply(sp_group, key.clone(), 2, 1, False)
+    v4 = SeqAllToAll4D.apply(sp_group, value.clone(), 2, 1, False)
+
+    # Path B: 1x combined SeqAllToAll5D
+    qkv = torch.stack([query, key, value], dim=2)  # (B, S/P, 3, H, D)
+    qkv = SeqAllToAll5D.apply(sp_group, qkv, 3, 1, False)  # (B, S, 3, H/P, D)
+    q5, k5, v5 = qkv.unbind(dim=2)
+
+    rtol, atol = _close_tolerance(dtype)
+    torch.testing.assert_close(q4, q5, rtol=rtol, atol=atol, msg="Query mismatch: 4D vs 5D combined")
+    torch.testing.assert_close(k4, k5, rtol=rtol, atol=atol, msg="Key mismatch: 4D vs 5D combined")
+    torch.testing.assert_close(v4, v5, rtol=rtol, atol=atol, msg="Value mismatch: 4D vs 5D combined")
+
+    destroy_distributed_env()
+
+
 def _run_ring_p2p(
     local_rank: int,
     world_size: int,
@@ -313,6 +357,33 @@ def _spawn_ring_p2p(
         args=(world_size, dtype, batch_size, num_heads, head_size, device_kind, master_port),
         nprocs=world_size,
         device_kind=device_kind,
+    )
+
+
+def _spawn_combined_qkv_equivalence(
+    *,
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    seq_len_per_rank: int,
+    num_heads: int,
+    head_size: int,
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    torch.multiprocessing.spawn(
+        _run_combined_qkv_equivalence,
+        args=(
+            world_size,
+            dtype,
+            batch_size,
+            seq_len_per_rank,
+            num_heads,
+            head_size,
+            device_kind,
+            master_port,
+        ),
+        nprocs=world_size,
     )
 
 
@@ -514,4 +585,30 @@ def test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu(world_size: int) ->
         args=(world_size, "cpu", 29613),
         nprocs=world_size,
         device_kind="cpu",
+    )
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@pytest.mark.parametrize(
+    "world_size",
+    [
+        pytest.param(2, marks=_L4_TWO_GPU),
+        pytest.param(4, marks=_L4_FOUR_GPU),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_combined_qkv_equivalence_parity(world_size: int, dtype: torch.dtype):
+    _require_gpus(world_size)
+    _require_heads_divisible(8, world_size)
+    _spawn_combined_qkv_equivalence(
+        world_size=world_size,
+        dtype=dtype,
+        batch_size=2,
+        seq_len_per_rank=8,
+        num_heads=8,
+        head_size=32,
+        device_kind="cuda",
+        master_port=29503,
     )
