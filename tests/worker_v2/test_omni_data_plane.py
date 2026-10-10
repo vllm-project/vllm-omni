@@ -113,6 +113,28 @@ def test_full_payload_waits_for_terminal_and_last_deferred_frame(plane):
     assert plane.request_terminal({"internal"}) == 0
 
 
+def test_preemption_preserves_sampled_history_and_deferred_outputs(plane):
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(max_tokens=3, stop_token_ids=[2150])
+    plane.register_request(request)
+    state = plane._native_requests["internal"]
+    state.accept_tokens([21, 22])
+    plane.reserve_outputs(["internal"])
+    request.num_computed_tokens = 0
+
+    plane.register_request(request)
+
+    resumed = plane._native_requests["internal"]
+    assert resumed is state
+    assert resumed.snapshot(include_token_history=False).output_token_count == 2
+    assert resumed.num_computed_tokens == 0
+    assert plane._native_outputs_in_flight["internal"] == 1
+    resumed.accept_tokens([23])
+    assert resumed.output_token_ids == [21, 22, 23]
+    assert resumed.output_stopped
+
+
 def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     plane._async_chunk = False
     plane._full_payload_replace_keys_cached = frozenset()

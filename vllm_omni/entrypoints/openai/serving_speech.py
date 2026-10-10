@@ -463,23 +463,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
+        adapter_cls = resolve_adapter(self._tts_model_type) if self._tts_stage is not None else None
 
         # Shared executor for blocking adapter preprocessing. It must exist
         # before adapter construction so adapters can create their make_async
         # wrappers during their own lifecycle initialization.
-        self._tts_executor = ThreadPoolExecutor(max_workers=1)
+        self._tts_executor = ThreadPoolExecutor(
+            max_workers=adapter_cls.preprocessing_workers if adapter_cls is not None else 1
+        )
         # Resolve the per-model serving adapter (RFC #4327), keyed on the
         # detected model-type. Every dedicated TTS model has an adapter; the
         # adapter owns request validation, prompt/param building, capability
         # metadata, and sampling overrides. The model-type label remains in the
         # orchestrator for compatibility during this incremental migration.
         self._adapter = None
-        if self._tts_stage is not None:
-            adapter_cls = resolve_adapter(self._tts_model_type)
-            if adapter_cls is not None:
-                ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
-                self._adapter = adapter_cls(ctx)
-                logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
+        if adapter_cls is not None:
+            ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
+            self._adapter = adapter_cls(ctx)
+            logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
 
         adapter = self._adapter
         if adapter is not None:
@@ -1969,7 +1970,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             ) as chunks:
                 async for chunk in chunks:
-                    payload = {
+                    payload: dict[str, Any] = {
                         "type": "speech.audio.delta",
                         "audio": base64.b64encode(chunk).decode("ascii"),
                         "response_format": response_format,

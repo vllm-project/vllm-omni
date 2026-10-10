@@ -238,6 +238,8 @@ class TTSModelAdapter(ABC):
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
+    #: Concurrent blocking preprocessing calls; the server owns their executor.
+    preprocessing_workers: ClassVar[int] = 1
 
     max_new_tokens_min = 1
 

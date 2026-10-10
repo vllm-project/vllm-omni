@@ -77,6 +77,7 @@ dev = [
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
+    "pyloudnorm==0.1.1",
 ]
 
 demo = [
@@ -109,6 +110,11 @@ longcat-video-avatar = [
     "audio-separator==0.44.2",
     "pyloudnorm==0.1.1",
     "soundfile>=0.13.1",
+]
+
+# Chatterbox normalizes its reference clip to -27 LUFS, as upstream does.
+chatterbox = [
+    "pyloudnorm==0.1.1",
 ]
 
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported

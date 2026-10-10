@@ -37,6 +37,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
     "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
+    "ChatterboxConfig": "vllm_omni.transformers_utils.configs.chatterbox",
 }
 
 __all__ = [
@@ -67,6 +68,7 @@ __all__ = [
     "WhisperEncoderConfig",
     "SenseNovaU1Config",
     "SenseNovaU1MoELLMConfig",
+    "ChatterboxConfig",
 ]
 
 
@@ -87,6 +89,7 @@ def __dir__():
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import chatterbox as _chatterbox  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
