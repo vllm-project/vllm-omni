@@ -2,26 +2,30 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import multiprocessing as mp
+import os
 import socket
 import time
+import weakref
+from contextlib import closing
 from dataclasses import fields
 from typing import Any
 
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.data_entry_keys import EmbeddingsStruct, HiddenStatesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.parallel]
 
 
-def _native_nixl_available() -> bool:
+def _native_nixl_available(min_devices: int = 2) -> bool:
     try:
         from vllm.distributed.nixl_utils import NixlWrapper
     except ImportError:
         return False
-    return NixlWrapper is not None and torch.cuda.is_available() and torch.accelerator.device_count() >= 2
+    return NixlWrapper is not None and torch.cuda.is_available() and torch.accelerator.device_count() >= min_devices
 
 
 def _free_port() -> int:
@@ -305,3 +309,94 @@ def test_native_two_process_structured_mixed_device_transfer(direct, payload_kin
         print(f"Native H3 exact wire/semantic roundtrip: {get_record}")
     assert next(record for record in records if record[0] == "cleanup") == ("cleanup", 0, 0)
     assert next(record for record in records if record[0] == "source_retained") == ("source_retained", 1)
+
+
+def _exit_after_native_read(metadata, status) -> None:
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+
+    current_omni_platform.set_device(0)
+    receiver = NixlConnector({"role": "receiver", "receive_device": "cuda:0"})
+
+    def exit_without_releasing(handle, key):
+        status.send(receiver._agent.check_xfer_state(handle))
+        # Only this test-owned process exits. Leave its native READ unacknowledged.
+        os._exit(88)
+
+    receiver._wait_for_transfer = exit_without_releasing
+    receiver.get("0", "2", "reader-loss_0_0", metadata)
+    raise AssertionError("The receiver did not submit a native READ")
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
+def test_native_reader_exit_reclaims_only_its_prefix_and_allows_key_reuse():
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+
+    current_omni_platform.set_device(0)
+    with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
+        payload = torch.ones(8 * 1024 * 1024, device="cuda:0")
+        source_ref = weakref.ref(payload)
+        success, _, metadata = producer.put("0", "2", "reader-loss_0_0", payload)
+        assert success
+        del payload
+        success, _, other_metadata = producer.put("0", "2", "survivor_0_0", torch.arange(32, device="cuda:0"))
+        assert success
+        lost_agent = weakref.ref(producer._pending["reader-loss_0_0"].agent)
+        survivor_agent = producer._pending["survivor_0_0"].agent
+        assert lost_agent() is not survivor_agent
+
+        context = mp.get_context("spawn")
+        parent, child = context.Pipe(duplex=False)
+        reader = context.Process(target=_exit_after_native_read, args=(metadata, child))
+        reader.start()
+        child.close()
+        try:
+            assert parent.poll(30), "The receiver did not report its native READ"
+            assert parent.recv() in {"PROC", "DONE"}
+            reader.join(timeout=30)
+            assert reader.exitcode == 88
+        finally:
+            parent.close()
+            if reader.is_alive():
+                reader.terminate()
+                reader.join(timeout=10)
+            reader.close()
+
+        assert producer._pending["reader-loss_0_0"].claims
+        assert producer.cleanup_prefix("reader-loss_0_") == 1
+        assert source_ref() is None and lost_agent() is None
+        assert producer._pending["survivor_0_0"].agent is survivor_agent
+        success, _, reused_metadata = producer.put("0", "2", "reader-loss_0_0", torch.arange(32, device="cuda:0"))
+        assert success
+
+        with closing(NixlConnector({"role": "receiver", "receive_device": "cuda:0"})) as receiver:
+            for key, wire in (("survivor_0_0", other_metadata), ("reader-loss_0_0", reused_metadata)):
+                received = receiver.get("0", "2", key, wire)
+                assert received is not None
+                torch.testing.assert_close(received[0].cpu(), torch.arange(32), rtol=0, atol=0)
+        assert not producer._pending and not producer._registered_descs
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not _native_nixl_available(1), reason="requires NIXL and CUDA")
+def test_native_publication_waits_for_cuda_producer_stream():
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+
+    current_omni_platform.set_device(0)
+    with closing(NixlConnector({"role": "sender", "host": "127.0.0.1"})) as producer:
+        payload = torch.zeros(32, device="cuda:0")
+        torch.accelerator.synchronize()
+        stream = torch.cuda.Stream(device=0)
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(100_000_000)
+            payload.fill_(37)
+        success, _, metadata = producer.put("0", "2", "delayed_0_0", payload)
+        assert success
+        assert stream.query(), "Publication returned before producer work completed"
+        with closing(NixlConnector({"role": "receiver", "receive_device": "cuda:0"})) as receiver:
+            received = receiver.get("0", "2", "delayed_0_0", metadata)
+            assert received is not None
+            torch.testing.assert_close(received[0].cpu(), torch.full((32,), 37.0), rtol=0, atol=0)
+        assert not producer._pending and not producer._registered_descs
