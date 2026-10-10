@@ -76,7 +76,7 @@ def test_stage_attributes_resolve_on_the_stage_001(unified: ChatterboxForConditi
         (
             ChatterboxS3Gen,
             ["have_multimodal_outputs", "requires_request_ids", "on_requests_finished", "decode_step"],
-            ["has_preprocess", "make_omni_output", "retains_state_across_chunks"],
+            ["has_preprocess", "make_omni_output"],
         ),
     ],
     ids=["chatterbox_t3", "chatterbox_s3gen"],

@@ -29,6 +29,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 LOOKAHEAD = 3
 HOPS = [20, 30, 60]
+# Stage 1's context in the deploy file: the longest utterance a decoder is built for.
+CONTEXT = 2048
 
 
 def chunk_plan(total: int) -> list[tuple[int, int, bool]]:
@@ -87,7 +89,7 @@ def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
 @pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
     torch.manual_seed(0)
-    return S3GenDecoder(ChatterboxConfig()).eval()
+    return S3GenDecoder(ChatterboxConfig(), CONTEXT).eval()
 
 
 @pytest.fixture(scope="module")
@@ -197,17 +199,18 @@ def test_decode_step_keeps_state_until_the_stream_finishes_001(
 
 
 def decode_stream(
-    decoder: S3GenDecoder, tokens: torch.Tensor, request_id: str, ref: Reference, voice_in_every_chunk: bool
+    decoder: S3GenDecoder, tokens: torch.Tensor, request_id: str, ref: Reference, later: Reference | None
 ) -> list[torch.Tensor]:
     """One request's chunks through ``decode_step``, one step each.
 
-    The vocoder's own draw is pinned per chunk, so two decodes of the same
-    stream can be compared sample for sample.
+    The first chunk's payload carries ``ref``, every later one ``later``
+    (or no voice). The vocoder's own draw is pinned per chunk, so two
+    decodes of the same stream can be compared sample for sample.
     """
     pieces = []
     for step, (prefix, offset, finalize) in enumerate(chunk_plan(tokens.numel())):
         torch.manual_seed(step)
-        voice = ref if offset == 0 or voice_in_every_chunk else None
+        voice = ref if offset == 0 else later
         (piece,) = decoder.decode_step(
             tokens[:prefix], [prefix], [stream_payload(voice, finalize, offset)], [request_id]
         )
@@ -218,25 +221,33 @@ def decode_stream(
 def test_the_voice_arrives_once_and_is_kept_for_the_stream_001(
     decoder: S3GenDecoder, references: list[Reference]
 ) -> None:
-    """The runner-side transport hands stage 1 each chunk's own payload, and only the first has the voice."""
+    """A stream decodes in the voice of its first chunk, whatever a later payload holds.
+
+    The runner-side transport hands stage 1 each chunk's own payload, so a
+    later chunk may have no voice at all; the scheduler-side one keeps
+    merging payloads, so a later chunk may have one. A decoder that took a
+    later payload's voice when it found one would fail the second
+    comparison: there the later payloads hold a different voice.
+    """
     tokens = torch.randint(0, 6561, (70,))
     assert [offset for _, offset, _ in chunk_plan(70)] == [0, 20, 50]
 
-    once = decode_stream(decoder, tokens, "once", references[0], voice_in_every_chunk=False)
-    every = decode_stream(decoder, tokens, "every", references[0], voice_in_every_chunk=True)
+    once = decode_stream(decoder, tokens, "once", references[0], later=None)
+    other_later = decode_stream(decoder, tokens, "other-later", references[0], later=references[1])
 
     assert sum(piece.numel() for piece in once) == 2 * (70 + 3) * SAMPLES_PER_FRAME
-    assert all(torch.equal(a, b) for a, b in zip(once, every, strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(once, other_later, strict=True))
     assert decoder.streams == {}
-    # Not vacuous: another voice gives other audio from the second chunk on too.
-    other = decode_stream(decoder, tokens, "other", references[1], voice_in_every_chunk=False)
+    # Not vacuous: the other voice from the first chunk on gives other audio in the later chunks.
+    other = decode_stream(decoder, tokens, "other", references[1], later=None)
     assert not torch.allclose(other[1], once[1], atol=1e-3)
+    assert not torch.allclose(other[2], once[2], atol=1e-3)
 
 
 def test_interleaved_streams_keep_their_own_voices_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
     """Two live streams, a step each in turn; neither later chunk carries a voice."""
     tokens = [torch.randint(0, 6561, (70,)) for _ in range(2)]
-    alone = [decode_stream(decoder, row, "alone", ref, False) for row, ref in zip(tokens, references, strict=True)]
+    alone = [decode_stream(decoder, row, "alone", ref, None) for row, ref in zip(tokens, references, strict=True)]
 
     interleaved: list[list[torch.Tensor]] = [[], []]
     for step, (prefix, offset, finalize) in enumerate(chunk_plan(70)):
@@ -251,20 +262,6 @@ def test_interleaved_streams_keep_their_own_voices_001(decoder: S3GenDecoder, re
 
     for stream in (0, 1):
         assert all(torch.equal(a, b) for a, b in zip(interleaved[stream], alone[stream], strict=True))
-
-
-def test_a_first_chunk_without_a_voice_is_refused_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
-    """Nothing stands in for it: no other request's voice, no default."""
-    tokens = torch.randint(0, 6561, (23,))
-    decoder.decode_step(tokens, [23], [stream_payload(references[0], False, 0)], ["someone-else"])
-    with pytest.raises(RuntimeError, match="first chunk of request x without a voice"):
-        decoder.decode_step(tokens, [23], [stream_payload(None, False, 0)], ["x"])
-    partial = stream_payload(references[0], False, 0)
-    del partial["embed"]["speech_feat"]
-    with pytest.raises(RuntimeError, match="first chunk of request x without a voice"):
-        decoder.decode_step(tokens, [23], [partial], ["x"])
-    decoder.on_requests_finished({"someone-else"})
-    assert decoder.streams == {}
 
 
 def test_abort_frees_stream_state_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
@@ -388,7 +385,7 @@ def test_noise_is_taken_by_position_for_every_prompt_length_001(
 def test_noise_is_the_same_draw_when_built_on_a_default_device_001(decoder: S3GenDecoder) -> None:
     """vLLM builds the stage inside a default-device context."""
     with torch.device("cuda"):
-        built = S3GenDecoder(ChatterboxConfig())
+        built = S3GenDecoder(ChatterboxConfig(), CONTEXT)
     assert built.flow_noise.device.type == built.trim_fade.device.type == "cuda"
     assert torch.equal(built.flow_noise.cpu(), decoder.flow_noise)
 
@@ -429,11 +426,68 @@ def test_a_non_final_chunk_shorter_than_the_mel_cache_is_refused_001(
         decoder.chunked_decode_streaming([Chunk(tokens, 0, references[0], None, False)])
 
 
-def test_tokens_past_the_noise_buffer_are_refused_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
-    """The buffer covers ``max_new_tokens`` and the silence; nothing wraps."""
-    tokens = torch.randint(0, 6561, (1001,))
-    with pytest.raises(RuntimeError, match="1004 speech tokens after a 20-token reference.*holds 1003 and 250"):
-        decoder.chunked_decode_streaming([Chunk(tokens, 960, references[0], None, True)])
+def test_a_longer_context_keeps_the_noise_of_the_default_cap():
+    """The buffer of a longer context begins with the buffer sized for the default output cap.
+
+    A buffer redrawn at the longer size would give every position other
+    noise, and with it every utterance other audio than before the context
+    could be longer than the cap. The first part must also be the one draw
+    it has always been.
+    """
+    config = ChatterboxConfig()
+    capped = S3GenDecoder(config, config.max_new_tokens).flow_noise
+    longer = S3GenDecoder(config, CONTEXT).flow_noise
+
+    frames = 2 * (250 + config.max_new_tokens + config.n_silence_tokens)
+    assert capped.shape == (1, 80, frames)
+    assert torch.equal(capped, torch.randn(1, 80, frames, generator=torch.Generator().manual_seed(0)))
+    assert longer.shape == (1, 80, 2 * (250 + CONTEXT + config.n_silence_tokens))
+    assert torch.equal(longer[:, :, :frames], capped)
+    # A context under the cap still gets the capped buffer.
+    assert torch.equal(S3GenDecoder(config, 300).flow_noise, capped)
+
+
+def test_an_utterance_at_the_context_limit_has_noise_for_its_last_frame(
+    decoder: S3GenDecoder, references: list[Reference]
+) -> None:
+    """The last chunk of the longest utterance, silence included, ends exactly at the end of the buffer.
+
+    A buffer one frame short would leave the flow to draw the rest itself,
+    and that chunk would no longer decode the same way twice.
+    """
+    tokens = torch.randint(0, 6561, (CONTEXT,))
+    kept = torch.cat([tokens[CONTEXT - 48 - LEFT_CONTEXT_TOKENS :], decoder.silence])
+    prompt = 2 * references[0].prompt_token.shape[1]
+    start = decoder.prompt_noise_frames + 2 * (CONTEXT - 48 - LEFT_CONTEXT_TOKENS)
+    assert start + 2 * kept.numel() == decoder.flow_noise.shape[2]
+
+    (mel,) = decoder.chunk_mels([Chunk(tokens, CONTEXT - 48, references[0], None, True)])
+
+    noise = torch.cat([decoder.flow_noise[:, :, :prompt], decoder.flow_noise[:, :, start:]], dim=2)
+    (whole,) = flow_mels(decoder.flow, [kept], [references[0]], [True], 2, True, noise)
+    assert mel.shape == (1, 80, 2 * (48 + 3))
+    assert torch.equal(mel, whole[:, :, 2 * LEFT_CONTEXT_TOKENS :])
+
+
+@pytest.mark.parametrize("length", [1, 2, 3])
+def test_an_utterance_of_a_few_tokens_decodes_as_one_final_chunk(
+    decoder: S3GenDecoder, references: list[Reference], length: int
+) -> None:
+    """A request can end after one token (``max_tokens=1``, an early stop token).
+
+    Its only chunk is final, shorter than the lookahead and far shorter than
+    the cross-fade's cache; an exception here would stop the stage for every
+    request.
+    """
+    tokens = torch.randint(0, 6561, (length,))
+
+    (audio,) = decoder.decode_step(tokens, [length], [stream_payload(references[0], True, 0)], ["short"])
+
+    assert audio.shape == (2 * (length + 3) * SAMPLES_PER_FRAME,)
+    assert torch.isfinite(audio).all() and audio.abs().max() > 0
+    # Upstream's trim: the first 20 ms are silenced.
+    assert torch.count_nonzero(audio[:SAMPLES_PER_FRAME]) == 0
+    assert decoder.streams == {}
 
 
 def test_a_row_is_vocoded_as_it_is_alone_whatever_shares_the_step_001(decoder: S3GenDecoder) -> None:
@@ -533,22 +587,6 @@ def test_tokens_without_a_payload_list_are_refused_001(decoder: S3GenDecoder) ->
     """Only the profiling run, which has no request ids, comes without payloads."""
     with pytest.raises(RuntimeError, match="23 tokens for request x without stream metadata"):
         decoder.decode_step(torch.randint(0, 6561, (23,)), [23], None, ["x"])
-
-
-def test_token_offset_and_stream_state_must_agree_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
-    """Either mismatch would play a chunk with the wrong seam and no error."""
-    tokens = torch.randint(0, 6561, (53,))
-    with pytest.raises(RuntimeError, match="token offset 20 for request lost, which has no earlier chunk"):
-        decoder.decode_step(tokens, [53], [stream_payload(references[0], False, 20)], ["lost"])
-    # The same without a voice in the payload, as a later chunk arrives.
-    with pytest.raises(RuntimeError, match="token offset 20 for request lost, which has no earlier chunk"):
-        decoder.decode_step(tokens, [53], [stream_payload(None, False, 20)], ["lost"])
-
-    decoder.decode_step(tokens[:23], [23], [stream_payload(references[0], False, 0)], ["restarted"])
-    with pytest.raises(RuntimeError, match="token offset 0 for request restarted, which already has an earlier chunk"):
-        decoder.decode_step(tokens[:23], [23], [stream_payload(references[0], False, 0)], ["restarted"])
-    decoder.on_requests_finished({"restarted"})
-    assert decoder.streams == {}
 
 
 def stage_config(

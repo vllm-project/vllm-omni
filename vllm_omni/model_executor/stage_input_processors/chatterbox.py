@@ -19,7 +19,12 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
+# S3Gen's constants, the same for every checkpoint that decodes with it.
 SPEECH_TOKEN_LIMIT = ChatterboxConfig().speech_token_limit
+# Tokens the flow reads ahead of a chunk that is not the last. Stage 1 does
+# not play their frames, so a chunk must be sent with exactly this many
+# tokens beyond its own: the decoder's number, not a setting.
+PRE_LOOKAHEAD = ChatterboxConfig().pre_lookahead_len
 
 
 def t3_to_s3gen_async_chunk(
@@ -34,8 +39,8 @@ def t3_to_s3gen_async_chunk(
     tokens plus the padding that aligns the reference prompt to that size,
     each later chunk is ``codec_stream_scale_factor`` times the one before up
     to ``codec_max_chunk_frames``, and a chunk that is not the last waits for
-    ``codec_pre_lookahead_frames`` tokens beyond its own, which the flow
-    reads ahead and stage 1 does not play. A chunk is sent as the whole
+    the flow's lookahead (``PRE_LOOKAHEAD`` tokens beyond its own, which the
+    flow reads ahead and stage 1 does not play). A chunk is sent as the whole
     utterance so far through that lookahead, with the offset of its new part.
 
     Tokens come from the request snapshot, never from ``multimodal_output``.
@@ -50,7 +55,7 @@ def t3_to_s3gen_async_chunk(
 
     Args:
         transfer_manager: The stage's transport, one of two classes with no
-            common type. Its connector's config holds the four ``codec_*``
+            common type. Its connector's config holds the three ``codec_*``
             settings of the deploy file.
         multimodal_output: The step's payload for the request, unused.
         request: The transport's snapshot of the request, a different type
@@ -75,8 +80,8 @@ def t3_to_s3gen_async_chunk(
     request_id = request.external_req_id
     # A connector's config is its ``extra`` section of the deploy file.
     settings = transfer_manager.connector.config
-    chunk, lookahead = settings["codec_chunk_frames"], settings["codec_pre_lookahead_frames"]
-    largest, growth = settings["codec_max_chunk_frames"], settings["codec_stream_scale_factor"]
+    chunk, largest = settings["codec_chunk_frames"], settings["codec_max_chunk_frames"]
+    growth = settings["codec_stream_scale_factor"]
 
     state = transfer_manager.request_payload.get(request_id)
     if state is None:
@@ -128,7 +133,7 @@ def t3_to_s3gen_async_chunk(
             )
         end = len(tokens)
     else:
-        end = sent + hop + lookahead
+        end = sent + hop + PRE_LOOKAHEAD
         if len(tokens) < end:
             return None
         state["sent"] = sent + hop
@@ -168,9 +173,10 @@ def t3_to_s3gen(
 
     Returns:
         One prompt per finished output that has speech tokens: the valid
-        ones, with the request's reference and the stream metadata. None for
-        an utterance without any, which the orchestrator then ends with
-        empty audio, as streaming ends it.
+        ones, with the request's reference and the stream metadata. An
+        utterance without any gets no prompt (the list is empty), and the
+        orchestrator then ends the request with empty audio; streaming ends
+        it with an empty final chunk.
     """
     reference = prompt["additional_information"]["embed"]
     stage_inputs: list[OmniTokensPrompt] = []

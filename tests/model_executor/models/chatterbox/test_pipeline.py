@@ -56,6 +56,10 @@ def test_stage_topology_001() -> None:
     # On Model Runner V2 both stages use its native data plane; without the
     # declaration a stage falls back to the scheduler-side transport.
     assert talker.supports_native_mrv2_data_plane and decoder.supports_native_mrv2_data_plane
+    # Read by the generation scheduler from this field. False: a stream holds
+    # a decoder slot for the step that decodes its chunk, not for its
+    # lifetime, so more streams than slots can be live at once.
+    assert decoder.retains_state_across_chunks is False
     for path in (talker.async_chunk_process_next_stage_input_func, decoder.sync_process_input_func):
         module, _, function = path.rpartition(".")
         assert callable(getattr(importlib.import_module(module), function))
@@ -68,16 +72,10 @@ def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
 
     assert deploy["pipeline"] == "chatterbox_turbo"
     assert deploy["async_chunk"] is True
-    # The chunk processor reads exactly these four and has no default for any.
-    assert set(extra) == {
-        "codec_chunk_frames",
-        "codec_pre_lookahead_frames",
-        "codec_max_chunk_frames",
-        "codec_stream_scale_factor",
-    }
-    # The flow reads this many tokens ahead and stage 1 does not play them:
-    # a chunk that waited for fewer would lose the difference.
-    assert extra["codec_pre_lookahead_frames"] == config.pre_lookahead_len
+    # The chunk processor reads exactly these three and has no default for
+    # any. The flow's lookahead is not among them: the processor takes it
+    # from the model config, where the decoder takes it.
+    assert set(extra) == {"codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"}
     assert talker["default_sampling_params"] == {
         "temperature": 0.8,
         "top_k": 1000,

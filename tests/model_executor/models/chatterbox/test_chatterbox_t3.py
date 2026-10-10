@@ -184,7 +184,7 @@ def test_batched_decode_embedding_matches_per_request_preprocess_001(
 
 
 def test_forward_returns_the_backbones_tensor_unwrapped_001(
-    talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig
+    talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Model Runner V2 sizes its CUDA graph's output from what ``forward`` returns."""
     hidden = torch.randn(3, config.hidden_size)
@@ -194,7 +194,7 @@ def test_forward_returns_the_backbones_tensor_unwrapped_001(
         seen.append(inputs)
         return hidden
 
-    talker.tfmr = backbone
+    monkeypatch.setattr(talker, "tfmr", backbone, raising=False)
     input_ids, positions, embeds = torch.tensor([1, 2, 3]), torch.arange(3), torch.randn(3, config.hidden_size)
 
     assert talker.forward(input_ids, positions, None, embeds, seq_token_counts=[3]) is hidden

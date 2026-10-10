@@ -75,7 +75,11 @@ def test_an_utterance_with_no_speech_tokens_gets_no_stage_1_request_001() -> Non
     Raising here instead stops the orchestrator, and with it every other
     request; streaming ends the same utterance with an empty final chunk.
     """
-    assert t3_to_s3gen([talker_output([6562])], request_prompt(250)) == []
+    prompt = request_prompt(250)
+    assert t3_to_s3gen([talker_output([6562])], prompt) == []
+    # Only that utterance is left out.
+    (stage_input,) = t3_to_s3gen([talker_output([6562]), talker_output([10, 6562])], prompt)
+    assert stage_input["prompt_token_ids"] == [10]
 
 
 @pytest.fixture(scope="module")
@@ -87,7 +91,7 @@ def connector_extra() -> dict:
 
 @pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
-    return S3GenDecoder(ChatterboxConfig()).eval()
+    return S3GenDecoder(ChatterboxConfig(), 2048).eval()
 
 
 @pytest.fixture
@@ -183,8 +187,8 @@ def runner_side_payloads(
             sampling_params=SimpleNamespace(stop_token_ids=[STOP], max_tokens=len(tokens) if capped else None),
         )
     )
-    # A step's payload for the request: any key at all, see ``make_omni_output``.
-    step_payload = {"meta.codec_streaming": torch.ones(1, dtype=torch.bool)}
+    # A decode step's payload for the request, as stage 0's ``make_omni_output`` leaves the runner.
+    step_payload = {"meta.codec_frame_valid": torch.zeros(1, dtype=torch.bool)}
     for token in tokens if capped else [*tokens, STOP]:
         plane.complete_outputs(req_ids=["internal-id"], inter_stage_outputs=[step_payload], sampled_token_ids=[[token]])
     # A step already in flight when the request stopped: its token is not the request's.
@@ -278,7 +282,7 @@ def test_every_utterance_length_is_sent_once_and_finished_once_001(
     sends one final chunk, the runner-side one has already sent that chunk
     as an ordinary one when it learns.
     """
-    chunk, lookahead = connector_extra["codec_chunk_frames"], connector_extra["codec_pre_lookahead_frames"]
+    chunk, lookahead = connector_extra["codec_chunk_frames"], ChatterboxConfig().pre_lookahead_len
     # The first hop also pads the reference prompt to a multiple of the chunk; later hops double up to the cap.
     hops = [chunk + -prompt_tokens % chunk]
     while sum(hops) < 240:
@@ -394,7 +398,7 @@ def test_a_stream_aborted_between_chunks_is_flushed_and_freed_001(
     for token in tokens:
         plane.complete_outputs(
             req_ids=["internal-id"],
-            inter_stage_outputs=[{"meta.codec_streaming": torch.ones(1, dtype=torch.bool)}],
+            inter_stage_outputs=[{"meta.codec_frame_valid": torch.zeros(1, dtype=torch.bool)}],
             sampled_token_ids=[[token]],
         )
     assert set(plane.request_payload) == set(plane.code_prompt_token_ids) == {"external-id"}
@@ -434,10 +438,7 @@ def test_tokens_sampled_but_never_shown_are_an_error_001(connector_extra: dict) 
         call([], 6, 15)
 
 
-@pytest.mark.parametrize(
-    "key",
-    ["codec_chunk_frames", "codec_pre_lookahead_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"],
-)
+@pytest.mark.parametrize("key", ["codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"])
 def test_a_deploy_file_without_a_chunk_setting_is_an_error_001(connector_extra: dict, key: str) -> None:
     """The schedule is the deploy file's; no setting has a default to fall back on."""
     extra = {name: value for name, value in connector_extra.items() if name != key}

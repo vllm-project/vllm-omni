@@ -27,9 +27,10 @@
 #
 # Chunking: the first chunk is 15 tokens plus the padding that aligns the
 # reference prompt to 15 (20 for a ten-second reference), then 30, then 60;
-# every chunk waits for the flow's 3-token lookahead. Smaller chunks start
-# audio sooner and cost more flow work. Stage 1 decodes each chunk from a
-# fixed 50-token left context of its own, so no left-context key is set here.
+# every chunk waits for the flow's 3-token lookahead, which is the model's
+# and not a setting. Smaller chunks start audio sooner and cost more flow
+# work. Stage 1 decodes each chunk from a fixed 50-token left context of its
+# own, so no left-context key is set here.
 #
 # Sized on one 24 GB card (see the recipe for the measurements). TUNE PER
 # GPU: on a slower card lower max_num_seqs before raising the chunk size.
@@ -41,7 +42,6 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_chunk_frames: 15
-      codec_pre_lookahead_frames: 3
       codec_max_chunk_frames: 60
       codec_stream_scale_factor: 2
 
@@ -77,9 +77,12 @@ stages:
   - stage_id: 1
     dtype: float32
     max_num_seqs: 8
-    # Stage 0's max_model_len, which bounds an utterance whatever max_tokens
-    # a request asks for: each step hands the stage the whole utterance so
-    # far. Keep the two equal.
+    # The longest utterance this stage is built for: its noise buffer and
+    # the budget below are sized from it. It must not be smaller than stage
+    # 0's max_model_len, which is what bounds an utterance whatever
+    # max_tokens a request asks for; the engine does not compare a streamed
+    # chunk with this value, so a smaller one would let an utterance outgrow
+    # both with no error.
     max_model_len: 2048
     # At least max_num_seqs * max_model_len (8 * 2048); the stage refuses to
     # start with less. A new request the step's budget cannot cover is

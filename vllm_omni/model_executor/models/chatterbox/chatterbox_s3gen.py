@@ -271,9 +271,12 @@ class S3GenDecoder(nn.Module):
     Args:
         config: The checkpoint's constants; the flow's variant, its step
             count and the silence tokens all come from it.
+        max_utterance_tokens: The longest utterance the decoder will be
+            handed, in speech tokens: the stage's context length. The noise
+            buffer covers it, so no utterance runs past the buffer.
     """
 
-    def __init__(self, config: ChatterboxConfig) -> None:
+    def __init__(self, config: ChatterboxConfig, max_utterance_tokens: int) -> None:
         super().__init__()
         self.config = config
         # The architecture ``S3Token2Mel`` and ``S3Token2Wav`` build (0.1.7).
@@ -336,21 +339,29 @@ class S3GenDecoder(nn.Module):
         )
 
         # The flow's noise by position: the reference prompt's frames, then
-        # the utterance's. Sized for the longest of each the config allows.
+        # the utterance's. The prompt region holds the longest reference the
+        # conditioning can produce (``dec_cond_seconds`` of tokens). The
+        # utterance region is drawn in two parts from one generator: first
+        # the frames of the default output cap and the silence, then the
+        # frames up to ``max_utterance_tokens``. The first part is the whole
+        # buffer of a decoder sized for the default cap, so every position an
+        # utterance within the cap uses has the same noise whatever the
+        # context is.
         # Drawn on the CPU and then moved: vLLM builds the stage inside a
         # default-device context, where a CPU generator cannot fill the
         # tensor and a device generator would draw different noise.
         ratio = config.token_mel_ratio
         self.prompt_noise_frames = config.dec_cond_seconds * config.token_rate * ratio
-        utterance_frames = (config.max_new_tokens + config.n_silence_tokens) * ratio
+        capped_frames = self.prompt_noise_frames + (config.max_new_tokens + config.n_silence_tokens) * ratio
+        generator = torch.Generator().manual_seed(NOISE_SEED)
         self.register_buffer(
             "flow_noise",
-            torch.randn(
-                1,
-                config.mel["num_mels"],
-                self.prompt_noise_frames + utterance_frames,
-                generator=torch.Generator().manual_seed(NOISE_SEED),
-                device="cpu",
+            torch.cat(
+                [
+                    torch.randn(1, config.mel["num_mels"], frames, generator=generator, device="cpu")
+                    for frames in (capped_frames, max(0, max_utterance_tokens - config.max_new_tokens) * ratio)
+                ],
+                dim=2,
             ).to(trim_fade.device),
             persistent=False,
         )
@@ -406,8 +417,7 @@ class S3GenDecoder(nn.Module):
 
         Raises:
             RuntimeError: If a non-final chunk brings fewer new frames than
-                the mel cache holds, or a reference or an utterance is longer
-                than the noise buffer.
+                the mel cache holds.
         """
         ratio = self.config.token_mel_ratio
         rows: list[torch.Tensor] = []
@@ -427,13 +437,6 @@ class S3GenDecoder(nn.Module):
             # ``kept`` is the tail of the utterance so far.
             start = self.prompt_noise_frames + (chunk.tokens.numel() - kept.numel()) * ratio
             end = start + row.numel() * ratio
-            if prompt_frames > self.prompt_noise_frames or end > self.flow_noise.shape[2]:
-                raise RuntimeError(
-                    f"chatterbox_s3gen got {(end - self.prompt_noise_frames) // ratio} speech tokens after a "
-                    f"{prompt_frames // ratio}-token reference; the noise buffer holds "
-                    f"{(self.flow_noise.shape[2] - self.prompt_noise_frames) // ratio} and "
-                    f"{self.prompt_noise_frames // ratio}"
-                )
             rows.append(row)
             offsets.append(offset)
             # (F_i, 80), the layout pad_sequence pads.
@@ -534,10 +537,7 @@ class S3GenDecoder(nn.Module):
         Raises:
             RuntimeError: If a request has tokens but no stream metadata:
                 decoding such a chunk as a whole utterance would play wrong
-                audio with no error. If its token offset and its stored
-                stream state disagree, where a first chunk would be
-                cross-faded or a later one faded in. If its first chunk
-                carries no voice.
+                audio with no error.
         """
         device, dtype = self.trim_fade.device, self.trim_fade.dtype
         audios = [torch.zeros(0, device=input_ids.device)] * len(counts)
@@ -565,23 +565,20 @@ class S3GenDecoder(nn.Module):
                 raise RuntimeError(
                     f"chatterbox_s3gen got {count} tokens for request {request_id} without stream metadata"
                 )
+            # A stream has state from the end of its first chunk to its
+            # last, so a chunk without state is a first chunk and brings the
+            # voice. A later chunk decodes in the voice the stream began
+            # with, whatever its own payload holds.
             state = self.streams.get(request_id)
-            if (state is None) != (offset == 0):
-                raise RuntimeError(
-                    f"chatterbox_s3gen got token offset {offset} for request {request_id}, "
-                    f"which {'has no' if state is None else 'already has an'} earlier chunk"
-                )
-            if state is not None:
-                # The voice the stream began with, whatever this payload holds.
-                reference = state.reference
-            elif any(embed.get(name) is None for name in ("speech_token", "speech_feat", "embedding")):
-                raise RuntimeError(f"chatterbox_s3gen got the first chunk of request {request_id} without a voice")
-            else:
-                reference = Reference(
+            reference = (
+                state.reference
+                if state is not None
+                else Reference(
                     prompt_token=embed["speech_token"].to(device),
                     prompt_feat=embed["speech_feat"].to(device=device, dtype=dtype),
                     embedding=embed["embedding"].to(device=device, dtype=dtype),
                 )
+            )
             chunks.append(
                 Chunk(
                     tokens=tokens.to(device),
@@ -632,8 +629,11 @@ class ChatterboxS3Gen(S3GenDecoder):
 
     # Without this the runner discards OmniOutput.multimodal_outputs.
     have_multimodal_outputs = True
-    # Has the default runner keep and merge each request's inter-stage
-    # payload. Model Runner V2 always does and does not read this.
+    # Has the default runner keep each request's inter-stage payload and
+    # merge every chunk into it. Model Runner V2 does not read this: it
+    # builds the payload anew for every chunk, from the request's own
+    # additional_information and that chunk alone, which is why the voice
+    # is kept in the stream state.
     enable_update_additional_information = True
     # Has the runner pass the scheduler's request ids, the ids that
     # on_requests_finished is later given. The payload's own id is the
@@ -645,9 +645,9 @@ class ChatterboxS3Gen(S3GenDecoder):
         # The scheduler gives a new request what is left of the step's token
         # budget, and the decoder cannot tell part of an utterance from one.
         # That budget is the field vLLM's scheduler reads: the scheduled-token
-        # limit whenever one is set, 0 included. An utterance is at most this
-        # stage's own context long, so the bound needs no assumption about
-        # the max_tokens a request asks for.
+        # limit whenever one is set, 0 included. No utterance is longer than
+        # stage 0's context, whatever max_tokens a request asks for, and the
+        # deploy file keeps this stage's context at least that long.
         scheduler = vllm_config.scheduler_config
         field = "max_num_batched_tokens" if scheduler.max_num_scheduled_tokens is None else "max_num_scheduled_tokens"
         budget = getattr(scheduler, field)
@@ -659,7 +659,7 @@ class ChatterboxS3Gen(S3GenDecoder):
                 f"max_model_len ({max_model_len}) = {needed}, got {budget}: an utterance scheduled in part "
                 "would be decoded as a whole one"
             )
-        super().__init__(config)
+        super().__init__(config, max_model_len)
         # The repo holds other checkpoints too; this stage loads its own.
         self.allow_patterns_overrides = [config.s3gen_weights]
 
