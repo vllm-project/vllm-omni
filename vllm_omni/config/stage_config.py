@@ -842,6 +842,52 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
+# Same TND ceiling as stage 0: at most 16 query positions per sequence. Hard
+# cap on the K-step frame count (minicpmo_4_5_omni_tts._parse_k_step_frames).
+_MINICPMO_TALKER_FRAMES_MAX = 16
+
+# Stage 1's frame count, recorded when the deploy YAML is parsed because its
+# reader (ascend_warmup_patch._kstep_armed) can run in a spawned stage worker
+# with no vllm_config. 1 means the multi-frame decode is not armed.
+_resolved_talker_frames: int = 1
+
+
+def talker_frames_per_step() -> int:
+    """Codec frames one stage-1 step produces; 1 when the deploy layer asked for none."""
+    return _resolved_talker_frames
+
+
+def _record_talker_frames(
+    stages: list[StageDeployConfig],
+    platforms: dict[str, Any] | None = None,
+) -> None:
+    """Record stage 1's frame count (its n-gram ``num_speculative_tokens`` is K - 1).
+
+    This runs before the per-platform merge, and the K block sits under
+    ``platforms.npu`` (the loop is NPU-only), so that overlay is consulted when
+    the base stage carries no ``speculative_config``.
+    """
+    global _resolved_talker_frames
+    npu_stage1: dict[str, Any] = {}
+    for stage_override in ((platforms or {}).get("npu") or {}).get("stages") or []:
+        if isinstance(stage_override, dict) and stage_override.get("stage_id") == 1:
+            npu_stage1 = stage_override
+    for stage in stages:
+        if stage.stage_id != 1:
+            continue
+        spec = (stage.engine_extras or {}).get("speculative_config")
+        if spec is None:
+            # Flat platform layout: every key but stage_id/devices/env is an
+            # engine or stage override (see _extract_platform_overrides).
+            spec = npu_stage1.get("speculative_config")
+        frames = 1
+        if isinstance(spec, dict) and spec.get("method") == "ngram":
+            num_spec = spec.get("num_speculative_tokens", 0) or 0
+            if num_spec > 0:
+                frames = int(num_spec) + 1
+        _resolved_talker_frames = frames
+
+
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
     raw_dict = resolve_deploy_yaml(path)
@@ -855,6 +901,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     if not isinstance(speech_cache, dict):
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
+    _record_talker_frames(stages, raw_dict.get("platforms"))
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):

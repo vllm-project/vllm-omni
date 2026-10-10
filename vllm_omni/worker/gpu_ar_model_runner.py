@@ -52,6 +52,7 @@ from vllm_omni.utils.mm_outputs import (
     partition_payload_list,
     snapshot_mm_payload,
 )
+from vllm_omni.worker import gpu_talker_multiframe
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -401,6 +402,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        if getattr(self, "num_spec_tokens", 0) > 0:
+            gpu_talker_multiframe.ensure_codec_vocab(self)
+
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
+        drafts = gpu_talker_multiframe.propose_drafts(self, sampled_token_ids)
+        if drafts is not None:
+            self._draft_probs = None
+            self._draft_prob_req_ids = None
+            return drafts
+        return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1379,6 +1390,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         fallthrough is load-bearing, not an error path; it is logged once per
         model for visibility.
         """
+        # The multi-frame forward already sampled every accepted codec row.
+        # Return it once instead of sampling stale K-wide logits again.
+        sampled = gpu_talker_multiframe.take_sampler_output(self)
+        if sampled is not None:
+            return sampled
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)

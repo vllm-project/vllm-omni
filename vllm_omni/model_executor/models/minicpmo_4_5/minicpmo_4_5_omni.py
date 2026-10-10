@@ -200,7 +200,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # decode row runs scalar preprocess, which reads its codec id with
             # a blocking ``.item()``.
             batch_decode = getattr(self.talker, "preprocess_decode_batch", None)
-            if callable(batch_decode):
+            # CUDA K-step commits its frame plan to host codec state.
+            if callable(batch_decode) and not self.talker._cuda_multi_frame_decode and self.talker._k_step_frames <= 0:
                 self.preprocess_decode_batch = batch_decode
             # Model Runner V2 hooks: device-side codec output, EOS control and
             # codec penalty (see MiniCPMO45OmniTTSForConditionalGeneration).
@@ -1733,3 +1734,74 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if self._module_device(self.thinker).type != "cuda":
             return
         self._duplex_data_plane_helper().build_audio_cuda_graph()
+
+    @property
+    def requires_request_sample_eligibility(self) -> bool:
+        """Forward the Talker's sampling-eligibility contract to the runner.
+
+        The runner only supplies ``request_sample_eligible`` when the model it
+        sees declares the flag, and it always sees this wrapper -- never the
+        inner Talker (the same resolution rule as talker_multiframe.applies
+        below). Without the forward, the Talker's K-step branch falls back to
+        treating every request as eligible, so an incomplete prefill chunk
+        advances codec history and RNG state and the generated audio starts
+        depending on prefill chunking.
+        """
+        talker = getattr(self, "talker", None)
+        return talker is not None and bool(getattr(talker, "requires_request_sample_eligibility", False))
+
+    @property
+    def supports_multi_frame_decode(self) -> bool:
+        # "This wrapper implements the multi-frame path", not "the loop is
+        # running": the Talker (tts) stage has it, the Thinker does not. Whether
+        # a step actually runs it is decided per deployment by stage 1's
+        # speculative_config (the runner checks its num_spec_tokens for that).
+        return self.model_stage == "tts"
+
+    @property
+    def _batch_stop_logits(self):
+        # The runner probes this attribute on the registered architecture
+        # (getattr in npu_model_runner); without the forward it reads None and
+        # the gate always falls back to text_hidden_states.
+        if self.model_stage != "tts":
+            return None
+        return self.talker._batch_stop_logits
+
+    def take_batch_stop_logits(self):
+        if self.model_stage != "tts":
+            return None
+        return self.talker.take_batch_stop_logits()
+
+    def set_batch_stop_logits(self, logits) -> None:
+        if self.model_stage != "tts":
+            return
+        self.talker.set_batch_stop_logits(logits)
+
+    def merge_frame_outputs(self, frame_outputs, frame_stop_logits):
+        if self.model_stage != "tts":
+            return frame_outputs
+        return self.talker.merge_frame_outputs(frame_outputs, frame_stop_logits)
+
+    @property
+    def codec_eos_token_id(self) -> int:
+        return int(self.talker._codec_eos_id)
+
+    @property
+    def codec_vocab_size(self) -> int | None:
+        # The codec head's width. Stage 1's config (MiniCPMTTSConfig) has no
+        # vocab_size, so the CUDA runner takes the stage's vocab size from
+        # here (gpu_talker_multiframe.ensure_codec_vocab).
+        if self.model_stage != "tts" or self.talker is None:
+            return None
+        width = getattr(self.talker, "_num_audio_tokens", None)
+        return int(width) if width is not None else None
+
+    def plan_codec_frames(self, infos, frames: int):
+        from vllm_omni.model_executor.models.minicpmo_4_5.talker_frame_plan import plan_codec_frames
+
+        return plan_codec_frames(self.talker, infos, frames)
+
+    def commit_codec_frames(self, plan, forwarded: list[list[int]]) -> list[bool]:
+        from vllm_omni.model_executor.models.minicpmo_4_5.talker_frame_plan import commit_codec_frames
+
+        return commit_codec_frames(self.talker, plan, forwarded)
