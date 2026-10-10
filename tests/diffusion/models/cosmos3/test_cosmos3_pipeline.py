@@ -56,6 +56,41 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cosmos3_conditioning_with_encoder_fastpath(dtype):
+    from types import MethodType
+
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG, bits_equal
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install_wan_vae_encoder_fastpath
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    torch.manual_seed(7)
+    vae = OmniAutoencoderKLWan(**CONFIG).eval().to(dtype)
+    vae.register_to_config(latents_mean=[0.1, -0.2, 0.3, -0.4], latents_std=[0.5, 0.6, 0.7, 0.8])
+    pipeline = SimpleNamespace(vae=vae, dtype=dtype, device=torch.device("cpu"), vae_scale_factor_spatial=16)
+    for name in (
+        "_to_vae_device",
+        "_get_latents_mean_std",
+        "_normalize_vae_latent",
+        "_latent_hw_from_image_size",
+        "_crop_latent_to_image_size",
+    ):
+        setattr(pipeline, name, MethodType(getattr(Cosmos3OmniDiffusersPipeline, name), pipeline))
+    image = torch.rand(1, 3, 32, 32) * 2 - 1
+    video = torch.rand(1, 3, 5, 32, 32) * 2 - 1
+    encode_image = Cosmos3OmniDiffusersPipeline._encode_conditioning_image_latent
+    encode_video = Cosmos3OmniDiffusersPipeline._encode_video_tensor
+    expected_image = encode_image(pipeline, image)
+    expected_video = encode_video(pipeline, video, image_size=[32, 32, 16, 32])
+    assert install_wan_vae_encoder_fastpath(vae).installed
+    bits_equal(encode_image(pipeline, image), expected_image)
+    bits_equal(encode_video(pipeline, video, image_size=[32, 32, 16, 32]), expected_video)
+    assert expected_image.shape == (1, 4, 1, 2, 2)
+    assert expected_video.shape == (1, 4, 2, 1, 2)
+
+
 def test_component_selective_model_offload_fails_before_component_loading(monkeypatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 
