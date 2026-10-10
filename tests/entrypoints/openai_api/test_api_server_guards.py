@@ -997,6 +997,168 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     assert state.diffusion_engine is engine
 
 
+@pytest.fixture
+def fingerprint_state():
+    """Snapshot and restore the module-level fingerprint mode.
+
+    The configured mode lives in module globals, so a test that overrides it
+    would leak into every later test in the process.
+    """
+    from vllm.entrypoints.serve.utils import fingerprint
+
+    before = (fingerprint._DEFAULT_MODE, fingerprint._CUSTOM_VALUE)
+    yield fingerprint
+    fingerprint.set_default_fingerprint_mode(*before)
+
+
+def _fingerprint_config() -> SimpleNamespace:
+    """Stand-in ``vllm_config`` for ``get_system_fingerprint``.
+
+    ``full`` and ``hash`` modes hash it; ``parallel_config`` is absent so the
+    parallelism decoration is skipped.
+    """
+    return SimpleNamespace(compute_hash=lambda: "0123456789abcdef")
+
+
+async def _init_multistage_state(monkeypatch, args) -> None:
+    """Run the real multi-stage init with the standard fake serving classes."""
+    engine = _FakeEngineClient(
+        stage_configs=[object(), object()],
+        vllm_config=SimpleNamespace(
+            lora_config=None,
+            model_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(_api_process_rank=0),
+        ),
+    )
+
+    class _FakeModels:
+        def __init__(self, *args, **kwargs):
+            self.base_model_paths = kwargs.get("base_model_paths") or []
+
+        async def init_static_loras(self):
+            return None
+
+    class _FakeCtor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def warmup(self):
+            return None
+
+    class _FakeSpeech(_FakeCtor):
+        async def warmup(self):
+            return None
+
+    monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
+    monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
+    monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingCompletion", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingPooling", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingEmbedding", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingClassification", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingScores", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingTokenization", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingTranslation", _FakeCtor)
+    monkeypatch.setattr(api_server, "AnthropicServingMessages", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingTokens", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingSpeech", _FakeSpeech)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
+    monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
+    monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+
+    await api_server.omni_init_app_state(engine, State(), args)
+
+
+@pytest.mark.asyncio
+async def test_cli_fingerprint_mode_reaches_the_serving_layer(monkeypatch, fingerprint_state) -> None:
+    """``--fingerprint-mode`` / ``--fingerprint-value`` must not be ignored.
+
+    Upstream applies the mode at the top of ``init_generate_state``, before any
+    serving class is constructed, because ``BaseServing.__init__`` reads the
+    module-level mode once and caches the result on ``self.system_fingerprint``.
+    omni builds those classes itself (multi-stage, duplex, diffusion) and never
+    calls ``init_generate_state``, so without the same call every omni response
+    keeps the default fingerprint no matter what the CLI says.
+    """
+    fingerprint = fingerprint_state
+    config = _fingerprint_config()
+
+    # Control: the default mode really does stamp a fingerprint.
+    fingerprint.set_default_fingerprint_mode("full", None)
+    assert fingerprint.get_system_fingerprint(config).startswith("vllm-")
+
+    await _init_multistage_state(monkeypatch, _minimal_args(fingerprint_mode="none"))
+    assert fingerprint.get_system_fingerprint(config) is None
+
+    await _init_multistage_state(
+        monkeypatch,
+        _minimal_args(fingerprint_mode="custom", fingerprint_value="omni-fingerprint"),
+    )
+    assert fingerprint.get_system_fingerprint(config) == "omni-fingerprint"
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_mode_keeps_upstream_default_when_args_omit_it(monkeypatch, fingerprint_state) -> None:
+    """Args objects without these attributes keep upstream's ``full`` default.
+
+    Guards the ``getattr`` fallbacks: omitting the flags must not raise, clear
+    the mode, or leave a previously configured custom value in place.
+    """
+    fingerprint = fingerprint_state
+    config = _fingerprint_config()
+    fingerprint.set_default_fingerprint_mode("none", "stale-value")
+
+    args = _minimal_args()
+    assert not hasattr(args, "fingerprint_mode")
+    assert not hasattr(args, "fingerprint_value")
+
+    await _init_multistage_state(monkeypatch, args)
+
+    assert fingerprint.get_system_fingerprint(config).startswith("vllm-")
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_mode_is_set_before_the_duplex_init_path(monkeypatch, fingerprint_state) -> None:
+    """Duplex returns before the multi-stage branch, so the mode must be set above it.
+
+    The duplex path builds its own chat handler (``_init_duplex_app_state`` ->
+    ``_init_duplex_chat``) and returns early; a mode applied further down would
+    never run for duplex servers.
+    """
+    fingerprint = fingerprint_state
+    fingerprint.set_default_fingerprint_mode("full", None)
+    seen: dict[str, str | None] = {}
+
+    async def fake_duplex_init(*_args, **_kwargs) -> None:
+        seen["fingerprint"] = fingerprint.get_system_fingerprint(_fingerprint_config())
+
+    monkeypatch.setattr(api_server, "_init_duplex_app_state", fake_duplex_init)
+    monkeypatch.setattr(api_server, "DuplexOmni", object)
+
+    engine = _FakeEngineClient(
+        stage_configs=[],
+        vllm_config=SimpleNamespace(
+            lora_config=None,
+            model_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(_api_process_rank=0),
+        ),
+    )
+    await api_server.omni_init_app_state(
+        engine,
+        State(),
+        _minimal_args(fingerprint_mode="custom", fingerprint_value="omni-duplex"),
+    )
+
+    assert seen == {"fingerprint": "omni-duplex"}
+
+
 @pytest.mark.asyncio
 async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp_path) -> None:
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
