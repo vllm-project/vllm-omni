@@ -41,6 +41,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
+from vllm_omni.model_executor.models.qwen3_tts import text_stream
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -1570,6 +1571,19 @@ class Qwen3TTSPromptEmbedsBuilder:
         else:
             raise ValueError(f"Unsupported task_type={task_type}")
 
+        lead = text_stream.text_lead(info_dict)
+        stream = text_stream.stream_key(info_dict)
+        if task_type == "CustomVoice" and not non_streaming_mode and (lead or stream):
+            talker_prompt, trailing_text_hidden = self._lead_layout(
+                talker_prompt,
+                input_ids,
+                lead=lead,
+                stream=stream,
+                info_dict=info_dict,
+                tts_eos_embed=tts_eos_embed,
+                tts_pad_embed=tts_pad_embed,
+            )
+
         if instruct_embed is not None:
             talker_prompt = torch.cat([instruct_embed, talker_prompt], dim=1)
 
@@ -1579,6 +1593,69 @@ class Qwen3TTSPromptEmbedsBuilder:
             ref_code_len,
             ref_code_prompt.contiguous() if isinstance(ref_code_prompt, torch.Tensor) else None,
         )
+
+    def _lead_layout(
+        self,
+        talker_prompt: torch.Tensor,
+        input_ids: torch.Tensor,
+        *,
+        lead: int,
+        stream: str | None,
+        info_dict: dict[str, Any],
+        tts_eos_embed: torch.Tensor,
+        tts_pad_embed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Re-lay a streaming CustomVoice prompt with ``lead`` text ids before codec BOS.
+
+        In: the streaming layout, whose last prompt row is text[0] + codec BOS.
+        Out: text[:lead] each + codec PAD (text END too when the lead holds all
+        N ids and END, ``lead = N + 1``), then text[lead] (END at ``lead = N``,
+        PAD past it) + codec BOS, and the rest trailing. The lead rows, the BOS
+        row and the trailing rows are projected in three calls, as the stock
+        streaming layout projects its first text row and its trailing rows
+        apart, so an implementation that groups them the same way gets
+        bit-identical rows. A streamed take reads its ids from the stream; one
+        that has not ended trails no END, and the talker appends what arrives
+        later (``info_dict["_text_stream_built"]`` records what this prompt holds).
+        """
+        talker_config = self._talker_config
+        if stream is not None:
+            ids, ended = text_stream.read_ids(stream)
+            ids_t = torch.as_tensor(ids, dtype=torch.long, device=input_ids.device).reshape(1, -1)
+            info_dict["_text_stream_built"] = (int(ids_t.shape[1]), bool(ended))
+        else:
+            ids_t, ended = input_ids[:, 3:-5], True
+        n = int(ids_t.shape[1])
+        if lead > n + 1 or (lead >= n and not ended):
+            raise ValueError(f"text lead {lead} needs {lead + 1} text rows; the take has {n} ids")
+
+        def project(ids: torch.Tensor) -> torch.Tensor:
+            if ids.shape[1] == 0:
+                return talker_prompt[:, :0]
+            return self._text_projection(self._text_embedding(ids))
+
+        pad, bos = self._codec_embed(
+            torch.tensor(
+                [[talker_config.codec_pad_id, talker_config.codec_bos_id]],
+                device=input_ids.device,
+                dtype=torch.long,
+            )
+        ).chunk(2, dim=1)
+        lead_text = project(ids_t[:, : min(lead, n)])
+        if lead == n + 1:
+            lead_text = torch.cat([lead_text, tts_eos_embed], dim=1)
+        if lead < n:
+            bos_text = project(ids_t[:, lead : lead + 1])
+        else:
+            bos_text = tts_eos_embed if lead == n else tts_pad_embed
+        if lead < n:
+            trailing = project(ids_t[:, lead + 1 :])
+            if ended:
+                trailing = torch.cat([trailing, tts_eos_embed], dim=1)
+        else:
+            trailing = tts_pad_embed
+        prompt = torch.cat([talker_prompt[:, :-1], lead_text + pad, bos_text + bos], dim=1)
+        return prompt, trailing
 
     # -------------------- prompt-length estimator --------------------
 
@@ -1664,8 +1741,10 @@ class Qwen3TTSPromptEmbedsBuilder:
                 # model: full text ids (input_ids[:, 3:-5]) + eos + codec_bos step
                 prompt_len += assistant_len - 6
             else:
-                # model: only first text token in prefill
+                # model: only first text token in prefill, after any text lead
                 prompt_len += 1
+                if task_type == "CustomVoice":
+                    prompt_len += text_stream.text_lead(info)
 
         if task_type == "Base":
             xvec_only = bool(_first(info.get("x_vector_only_mode"), False))
