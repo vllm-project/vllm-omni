@@ -1853,6 +1853,9 @@ class DiffusionOutput:
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
 
+    # Engine-side async materialization wait (seconds), separate from model stages.
+    output_ready_wait_time: float = 0.0
+
     # memory usage info
     peak_memory_mb: float = 0.0
 

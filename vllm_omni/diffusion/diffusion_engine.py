@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 from collections.abc import AsyncGenerator, Iterable
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -409,6 +410,11 @@ class DiffusionEngine:
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
         self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
+        # Track ownership by stream because request IDs can be reused.
+        self._unclaimed_async_outputs: dict[asyncio.Queue[DiffusionOutput], set[str]] = {}
+        self._shutdown_output_futures: dict[
+            asyncio.Queue[DiffusionOutput], dict[str, concurrent.futures.Future[DiffusionOutput]]
+        ] = {}
         self._closed = False
         self._shutting_down = False
         self._shutdown_complete = False
@@ -473,26 +479,10 @@ class DiffusionEngine:
         request_id = self._add_prepared_request(request)
         generator = self.get_output_stream(request_id)
         async for output in generator:
-            exec_total_time = time.perf_counter() - exec_start_time
-            output_ready_wait_time = 0.0
-            # Async mode: wait for background D2H/SHM to complete.
-            if output.async_output_id:
-                output_ready_wait_start_time = time.perf_counter()
-                fut = self.executor.wait_output_ready(output.async_output_id)
-                timeout = _async_output_timeout()
-                try:
-                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
-                except (TimeoutError, asyncio.TimeoutError):
-                    describe = getattr(self.executor, "describe_pending_state", None)
-                    logger.error(
-                        "Timed out after %.1fs waiting for async output; set %s to a larger value "
-                        "to allow slower steps. Executor state: %s",
-                        timeout,
-                        _ASYNC_OUTPUT_TIMEOUT_ENV,
-                        describe(output.async_output_id) if describe else "unavailable",
-                    )
-                    raise
-                output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
+            output_ready_wait_time = output.output_ready_wait_time
+            # The stream now materializes async outputs before yielding. Keep
+            # that wait separate from execution time in the timing breakdown.
+            exec_total_time = time.perf_counter() - exec_start_time - output_ready_wait_time
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
@@ -1166,6 +1156,45 @@ class DiffusionEngine:
         try:
             while True:
                 output: DiffusionOutput = await queue.get()
+                async_output_id = output.async_output_id
+                if async_output_id is not None:
+                    with self._cv:
+                        saved_futures = self._shutdown_output_futures.get(queue, {})
+                        fut = saved_futures.pop(async_output_id, None)
+                        if not saved_futures:
+                            self._shutdown_output_futures.pop(queue, None)
+                        if fut is None:
+                            fut = self.executor.wait_output_ready(async_output_id)
+                        # The consumer now owns this future. Shutdown must not
+                        # claim it again after the executor retires delivery.
+                        pending_ids = self._unclaimed_async_outputs.get(queue)
+                        if pending_ids is not None:
+                            pending_ids.discard(async_output_id)
+                            if not pending_ids:
+                                self._unclaimed_async_outputs.pop(queue, None)
+                    timeout = _async_output_timeout()
+                    output_ready_wait_start_time = time.perf_counter()
+                    try:
+                        output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+                        output.output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
+                    except asyncio.CancelledError:
+                        # Delivery already retires completed futures; dropping
+                        # them again would create an orphaned executor waiter.
+                        if not fut.done():
+                            self.executor.drop_output(async_output_id)
+                        raise
+                    except (TimeoutError, asyncio.TimeoutError):
+                        if not fut.done():
+                            self.executor.drop_output(async_output_id)
+                        describe = getattr(self.executor, "describe_pending_state", None)
+                        logger.error(
+                            "Timed out after %.1fs waiting for async output; set %s to a larger value "
+                            "to allow slower steps. Executor state: %s",
+                            timeout,
+                            _ASYNC_OUTPUT_TIMEOUT_ENV,
+                            describe(async_output_id) if describe else "unavailable",
+                        )
+                        raise
                 yield output
                 if output.finished:
                     break
@@ -1176,10 +1205,20 @@ class DiffusionEngine:
             with self._cv:
                 if self._out_streams.get(request_id) is queue:
                     self._out_streams.pop(request_id, None)
+                abandoned_ids = self._unclaimed_async_outputs.pop(queue, set())
+                self._shutdown_output_futures.pop(queue, None)
+            for async_output_id in abandoned_ids:
+                self.executor.drop_output(async_output_id)
 
     def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
         request_id = self.add_request(request)
-        return self.get_output_stream(request_id)
+
+        async def stream_response() -> AsyncGenerator[DiffusionOutput, None]:
+            async with aclosing(self.get_output_stream(request_id)) as stream:
+                async for output in stream:
+                    yield output
+
+        return stream_response()
 
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Deprecated compatibility wrapper over ``async_add_req_and_stream_response()``.
@@ -1546,14 +1585,20 @@ class DiffusionEngine:
             queue.put_nowait(output)
 
     def _put_output(self, request_id: str, output: DiffusionOutput) -> None:
+        async_output_id = output.async_output_id
         with self._cv:
             queue = self._out_streams.get(request_id)
+            if queue is not None and async_output_id is not None:
+                self._unclaimed_async_outputs.setdefault(queue, set()).add(async_output_id)
         if queue is None:
+            if async_output_id is not None:
+                self.executor.drop_output(async_output_id)
             return
         self._put_queue_output(queue, output)
 
     def close(self) -> None:
         pending_streams: list[asyncio.Queue[DiffusionOutput]] = []
+        abandoned_ids: set[str] = set()
         with self._cv:
             if self._closed and self._shutdown_complete:
                 return
@@ -1565,7 +1610,24 @@ class DiffusionEngine:
                     self.stop_event.set()
                 pending_streams = list(self._out_streams.values())
                 self._out_streams.clear()
+                # Registered streams retain ownership of queued outputs until
+                # their consumers finish draining or close their generators.
+                live_streams = set(pending_streams)
+                for stream in list(self._unclaimed_async_outputs):
+                    if stream not in live_streams:
+                        abandoned_ids.update(self._unclaimed_async_outputs.pop(stream))
+                    else:
+                        # Transfer cached results out of the executor before
+                        # shutdown clears its cache. Pending futures receive
+                        # the executor's shutdown error instead.
+                        self._shutdown_output_futures[stream] = {
+                            output_id: self.executor.wait_output_ready(output_id)
+                            for output_id in self._unclaimed_async_outputs[stream]
+                        }
                 self._cv.notify_all()
+
+        for async_output_id in abandoned_ids:
+            self.executor.drop_output(async_output_id)
 
         closed_output = DiffusionOutput(error="DiffusionEngine is closed.")
         for stream in pending_streams:

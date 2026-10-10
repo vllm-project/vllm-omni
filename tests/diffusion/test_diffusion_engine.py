@@ -870,8 +870,44 @@ async def _consume_final_output(generator):
 
 
 @pytest.mark.cpu
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_wait", [0.0, 4.0])
+async def test_step_streaming_excludes_output_wait_from_execution_time(
+    output_wait: float, mocker: MockerFixture
+) -> None:
+    clock = [0.0]
+    mocker.patch.object(diffusion_engine_module.time, "perf_counter", side_effect=lambda: clock[0])
+    output = DiffusionOutput(stage_durations={"denoise": 10.0}, output_ready_wait_time=output_wait)
+    formatted_output = SimpleNamespace(metrics={})
+    request = SimpleNamespace(scheduler_queue_wait_ms=None)
+
+    async def output_stream(request_id):
+        # Ten seconds of execution followed by output materialization.
+        clock[0] = 10.0 + output_wait
+        yield output
+
+    engine = mocker.Mock(
+        pre_process_func=None,
+        _scheduler_num_waiting_reqs=0,
+        _check_and_start_background_loop=mocker.AsyncMock(),
+        _prepare_request_for_admission=mocker.Mock(return_value=request),
+        _add_prepared_request=mocker.Mock(return_value="timed-request"),
+        get_output_stream=output_stream,
+        postprocess_output=mocker.Mock(return_value=[formatted_output]),
+    )
+
+    results = [batch async for batch in DiffusionEngine.step_streaming(engine, request)]
+
+    assert results == [[formatted_output]]
+    assert formatted_output.metrics["diffusion_engine_exec_time_ms"] == pytest.approx(10_000.0)
+    assert formatted_output.metrics["output_ready_wait_time_ms"] == pytest.approx(output_wait * 1000)
+    assert formatted_output.metrics["postprocess_time_ms"] == 0.0
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("entrypoint", ["add_request", "async_add_req_and_stream_response"])
-def test_engine_admission_preprocesses_request_once(entrypoint: str) -> None:
+@pytest.mark.asyncio
+async def test_engine_admission_preprocesses_request_once(entrypoint: str, mocker: MockerFixture) -> None:
     raw_request = OmniDiffusionRequest(
         prompt="raw",
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
@@ -891,7 +927,17 @@ def test_engine_admission_preprocesses_request_once(entrypoint: str) -> None:
 
     engine = _make_admission_engine(preprocess)
 
-    getattr(engine, entrypoint)(raw_request)
+    if entrypoint == "async_add_req_and_stream_response":
+        output = DiffusionOutput(output="prepared", finished=True)
+
+        async def output_stream(request_id):
+            assert request_id == prepared_request.request_id
+            yield output
+
+        mocker.patch.object(engine, "get_output_stream", side_effect=output_stream)
+        assert [result async for result in engine.async_add_req_and_stream_response(raw_request)] == [output]
+    else:
+        engine.add_request(raw_request)
 
     assert preprocess_calls == [raw_request]
     assert engine.scheduler._waiting_queue == [prepared_request]
@@ -903,6 +949,8 @@ async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()
     engine._out_streams = {}
+    engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
     engine.abort_queue: queue.Queue[str] = queue.Queue()
     engine._rpc_queue = queue.Queue()
     engine._rpc_lock = threading.RLock()
@@ -924,7 +972,7 @@ async def test_async_add_req_and_stream_response():
 
     def _finalize(rid, out, err=None, **kwargs):
         # Stream consumers stop on ``finished``; keep result_data for assertions.
-        return SimpleNamespace(result_data=out.result.result_data, finished=True)
+        return SimpleNamespace(result_data=out.result.result_data, finished=True, async_output_id=None)
 
     engine._finalize_finished_request = _finalize
 

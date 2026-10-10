@@ -178,6 +178,8 @@ def _make_engine_with_loop(
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
+    engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
     engine._closed = False
     engine.abort_queue = queue.Queue()
     engine._rpc_queue = queue.Queue()
@@ -521,14 +523,8 @@ async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loo
     request.diffusion_kv_requests = (object(),)
     try:
         response_stream = engine.async_add_req_and_stream_response(request)
-        output_queue = engine._out_streams[request.request_id]
-        for _ in range(300):
-            if not output_queue.empty():
-                break
-            await asyncio.sleep(0.01)
-        assert not output_queue.empty(), "terminal KV allocation error was not delivered to the request stream"
-
-        output = await anext(response_stream)
+        assert request.request_id in engine._out_streams
+        output = await asyncio.wait_for(anext(response_stream), timeout=3.0)
         assert output.error == "native allocation bug"
         assert output.finished
         assert engine.worker_thread.is_alive()
