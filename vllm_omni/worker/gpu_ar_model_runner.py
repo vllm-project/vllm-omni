@@ -1188,6 +1188,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
                 num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
                 input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
+                mm_features_by_req={rid: self.requests[rid].mm_features for rid in req_ids[:num_reqs]},
             )
 
         runner_assisted_context_enabled = False
