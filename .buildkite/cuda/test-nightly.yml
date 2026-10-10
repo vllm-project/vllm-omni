@@ -268,6 +268,25 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and B200 and cards_1" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
 
+      # Numerical bounds are a proposal pending selection and H100 calibration.
+      - label: ":full_moon: Qwen-Image-2.1 · Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        mirror_hardwares: h100_1
+        timeout_in_minutes: 60
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/Qwen-Image-2_1/**/*
+        commands:
+          - git init .ci-references/qwen-image-21-diffusers
+          - git -C .ci-references/qwen-image-21-diffusers fetch --depth=1 https://github.com/huggingface/diffusers.git 8d3c30bfda9b511c00992f40cff4170a5502814d
+          - git -C .ci-references/qwen-image-21-diffusers checkout --detach FETCH_HEAD
+          - export QWEN_IMAGE_21_REFERENCE_ROOT="$PWD/.ci-references/qwen-image-21-diffusers"
+          - python3 -m venv --system-site-packages .ci-references/qwen-image-21-env
+          - .ci-references/qwen-image-21-env/bin/python -m pip install --no-deps torchao==0.16.0
+          - export QWEN_IMAGE_21_REFERENCE_PYTHON="$PWD/.ci-references/qwen-image-21-env/bin/python"
+          - mkdir -p tests/e2e/accuracy/artifacts/Qwen-Image-2_1
+          - set -o pipefail
+          - pytest -s -v tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py -m "full_model and diffusion and H100 and cards_1" --run-level full_model --junitxml=tests/e2e/accuracy/artifacts/Qwen-Image-2_1/pytest.xml 2>&1 | tee tests/e2e/accuracy/artifacts/Qwen-Image-2_1/pytest.log
+
       - label: ":full_moon: JoyAI-Image-Edit · Accuracy Test"
         source_file_dependencies: diffusion_joy_image_accuracy
         timeout_in_minutes: 180

@@ -588,6 +588,11 @@ Implementation strategy:
 | **Perf** | `· Perf Test · <Model>` | Throughput / latency / memory benchmarks | `tests/dfx/perf/tests/test_<model>_vllm_omni.json` + runner script |
 | **Doc** (optional) | `· Doc Test` | Runnable doc examples | `tests/examples/*/test_text_to_image.py`, … |
 
+For diffusion image/video **Accuracy** cases, use
+[diffusion-accuracy-ci](../diffusion-accuracy-ci/SKILL.md) for reference
+alignment, modality-specific comparisons, threshold calibration, and
+nightly/weekly Accuracy wiring. Retain this skill's test mechanics where needed.
+
 **Default when the user asks for “L4 functional cases”:** deliver **Function** pillar only (`*_expansion.py` + Function Test shard in `test-nightly.yml`). **Do not** silently add Perf or Accuracy unless the user also asks for **performance** / **benchmark** / **accuracy** / **full L4** / **full L4 coverage**.
 
 **When the user explicitly asks for L4 perf (or full L4 including perf):**

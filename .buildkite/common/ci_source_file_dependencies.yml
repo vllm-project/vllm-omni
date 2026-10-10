@@ -412,6 +412,19 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
+  diffusion_qwen_image_21_accuracy:
+    - vllm_omni/diffusion/models/qwen_image_21/
+    - vllm_omni/diffusion/models/qwen_image/
+    - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py
+    - vllm_omni/diffusion/attention/
+    - vllm_omni/diffusion/registry.py
+    - vllm_omni/diffusion/model_metadata.py
+    - tests/e2e/accuracy/qwen_image_21/
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    # tests/helpers/ is covered by source_filter_fallback; keep its broad routing.
+    - recipes/Qwen/Qwen-Image-2.1.md
+
   diffusion_joy_image_accuracy:
     - *joy_image
     - tests/diffusion/models/joy_image/
