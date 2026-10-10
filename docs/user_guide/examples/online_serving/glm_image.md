@@ -154,7 +154,7 @@ cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -
 
 GLM-Image uses a 2-stage pipeline:
 
-```
+```text
 Stage 0 (AR Model)                Stage 1 (Diffusion)
 ┌───────────────────┐            ┌─────────────────────┐
 │ vLLM-optimized    │  prior     │  GlmImagePipeline   │
@@ -168,6 +168,21 @@ Stage 0 (AR Model)                Stage 1 (Diffusion)
    Text / Image                  └─────────────────────┘
      Input
 ```
+
+## VAE Patch Parallelism (decode)
+
+GLM-Image supports decode-only VAE patch parallelism on the diffusion stage when
+stage 1 spans multiple GPUs. Pair it with tensor parallelism on the same two
+GPUs:
+
+```bash
+vllm serve zai-org/GLM-Image --omni --port 8091 \
+  --stage-overrides '{"0": {"devices": "0"}, "1": {"devices": "0,1", "tensor_parallel_size": 2, "parallel_config": {"tensor_parallel_size": 2, "vae_patch_parallel_size": 2}}}' \
+  --vae-use-tiling
+```
+
+This path distributes VAE decode tiles across the diffusion-stage world group.
+Image-edit `vae.encode` remains sequential in the current release.
 
 ## VRAM Requirements
 

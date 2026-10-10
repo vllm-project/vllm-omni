@@ -12,6 +12,7 @@ Coverage (per mode):
 - Tensor-Parallel
 - HSDP
 - Sequence parallel
+- Tensor-Parallel + VAE patch parallel
 
 Topology for multi-GPU cases uses runtime deploy YAML (except TP)
 so stage-1 parallel fields reach the diffusion worker without relying on CLI
@@ -91,6 +92,22 @@ GLM_SP_2_DEPLOY = modify_stage_config(
         },
     },
 )
+GLM_TP_VAE_PP_2_DEPLOY = modify_stage_config(
+    GLM_DEPLOY,
+    updates={
+        "stages": {
+            0: {"devices": "0", "tensor_parallel_size": 1},
+            1: {
+                "devices": "0,1",
+                "tensor_parallel_size": 2,
+                "parallel_config": {
+                    "tensor_parallel_size": 2,
+                    "vae_patch_parallel_size": 2,
+                },
+            },
+        },
+    },
+)
 
 
 def _get_diffusion_feature_cases(model: str):
@@ -138,6 +155,18 @@ def _get_diffusion_feature_cases(model: str):
                 stage_config_path=GLM_SP_2_DEPLOY,
             ),
             id="sequence_parallel_2",
+            marks=TWO_CARD_FEATURE_MARKS,
+        ),
+        # Tensor Parallelism (TP) + VAE patch parallel (size=2)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                stage_config_path=GLM_TP_VAE_PP_2_DEPLOY,
+                server_args=[
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="tp_vae_patch_parallel_2",
             marks=TWO_CARD_FEATURE_MARKS,
         ),
     ]
