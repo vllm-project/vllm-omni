@@ -27,6 +27,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     SupportStatus,
 )
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -668,6 +669,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
+            IS_AITER,
             IS_FLASH_ATTN_4,
             flash_attn_func,
             flash_attn_varlen_func,
@@ -754,6 +756,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "causal": self.causal,
                 "softmax_scale": self.softmax_scale,
             }
+
+            if IS_AITER:
+                mode = 2  # RTZ, Round Towards Zero
+                if is_forward_context_available():
+                    cfg = get_forward_context().omni_diffusion_config
+                    if cfg is not None:
+                        mode = cfg.aiter_bf16_cvt_mode
+                fa_kwargs["how_v3_bf16_cvt"] = mode
+
             if self.fa_deterministic:
                 fa_kwargs["deterministic"] = True
             out = flash_attn_func(query, key, value, **fa_kwargs)

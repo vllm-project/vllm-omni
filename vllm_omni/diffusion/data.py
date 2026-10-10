@@ -1116,6 +1116,14 @@ class OmniDiffusionConfig:
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
 
+    # V3 BF16 conversion kernel variant for aiter flash attention on ROCm.
+    # Selects one of three pre-compiled assembly kernels:
+    #   0 = RTNE (round to nearest even, IEEE default)
+    #   1 = RTNA (round to nearest away, aiter API default)
+    #   2 = RTZ  (round to zero / truncate) — default
+    # On gfx950 the kernel falls back to RTNE regardless of this setting.
+    aiter_bf16_cvt_mode: int = 2
+
     # Runtime diffusion attention method (not vLLM's --kv-cache-dtype for AR models).
     # None/"auto" keeps native dtype; other values are validated by the selected backend.
     diffusion_kv_cache_dtype: str | None = None
