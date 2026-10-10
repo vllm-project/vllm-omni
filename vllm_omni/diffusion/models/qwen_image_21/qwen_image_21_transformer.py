@@ -34,6 +34,8 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.pointwise import residual, rotary, silu_mul
+from vllm_omni.diffusion.models.qwen_image_21.qk_norm import qk_rotary
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
@@ -88,6 +90,9 @@ def _apply_qwen_image21_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torc
     Same contract as the reference `apply_rotary_emb_qwen(..., use_real=False)`:
     `x` is [B, S, H, D], `freqs` is the complex frequency tensor [S, D // 2].
     """
+    fused = rotary(x, freqs)
+    if fused is not None:
+        return fused
     paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
 
@@ -290,7 +295,7 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
         self.activation_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.out(self.activation_fn(self.gate_layer(hidden_states)) * self.proj(hidden_states))
+        return self.out(silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states)))
 
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
@@ -529,11 +534,16 @@ class QwenImage21Attention(nn.Module):
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
 
-        query = self.norm_q(query).to(value.dtype)
-        key = self.norm_k(key).to(value.dtype)
-
-        query = self._apply_rotary_emb(query, freqs)
-        key = self._apply_rotary_emb(key, freqs)
+        fused_qk = None
+        if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
+            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+        if fused_qk is not None:
+            query, key = fused_qk
+        else:
+            query = self.norm_q(query).to(value.dtype)
+            key = self.norm_k(key).to(value.dtype)
+            query = self._apply_rotary_emb(query, freqs)
+            key = self._apply_rotary_emb(key, freqs)
 
         cached_key = cached_value = None
         if kv_cache is not None:
@@ -681,14 +691,14 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        hidden_states = hidden_states + img_gate1 * attn_output
+        hidden_states = residual(hidden_states, attn_output, img_gate1)
 
         if prepared_modulation is None:
             img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
             img_gate2 = img_gate2.tanh()
         else:
             img_modulated2 = self.img_norm2(hidden_states) * scale2
-        hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
+        hidden_states = residual(hidden_states, self.img_mlp(img_modulated2), img_gate2)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
