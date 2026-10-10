@@ -948,6 +948,7 @@ class OmniDiffusionConfig:
     # This avoids AllGather synchronization, while host memory follows the
     # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
     # Final-layout Host Weight Runtime policy. The loader only activates this
@@ -1223,6 +1224,9 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if type(self.dlo_chunk_size_mb) is not int or self.dlo_chunk_size_mb <= 0:
+            raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {self.dlo_chunk_size_mb!r}")
+
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
