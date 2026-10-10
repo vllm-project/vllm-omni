@@ -141,6 +141,8 @@ _PIPELINE_STAGES = [
     "aura",
     "breeze_tts_2",
     "breeze_tts_2_codec",
+    "chatterbox_s3gen",
+    "chatterbox_t3",
     "code2wav",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
