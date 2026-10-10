@@ -5,6 +5,47 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serv
 
 This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
 
+### Mage-Flow
+
+Mage-Flow uses the same text-to-image endpoint. It supports CUDA BF16
+request-level batching on one GPU:
+
+```bash
+vllm serve microsoft/Mage-Flow --omni --port 8091 --dtype bfloat16 \
+  --max-num-seqs 2 --request-batch-max-wait-ms 20
+```
+
+Compatible requests are padded and processed together; prompt lengths may
+differ, output resolution may not. Increase `max_num_seqs` only after measuring
+available activation-memory headroom.
+
+For multi-GPU serving, CFG parallelism gives the largest single-dimension gain
+because it exchanges only one prediction per denoising step:
+
+```bash
+# 2 GPUs: one guidance branch per rank
+vllm serve microsoft/Mage-Flow --omni --port 8091 --dtype bfloat16 \
+  --cfg-parallel-size 2
+
+# 4 GPUs: shard the image sequence on top of the guidance split
+vllm serve microsoft/Mage-Flow --omni --port 8091 --dtype bfloat16 \
+  --cfg-parallel-size 2 --usp 2
+```
+
+Tensor parallelism (`--tensor-parallel-size`) mainly reduces per-GPU memory
+rather than latency; reach for it when the model plus activations do not fit,
+not to speed up a single request. Sequence parallelism cannot shard a padded
+batch, so combine `--usp` with `--cfg-parallel-size 2` instead of relying on
+packed CFG. `--usp` also requires `--max-num-seqs 1` — the default — since
+batched requests of differing token counts cannot be sharded; raising it
+alongside `--usp` is refused at startup.
+See the [Mage-Flow recipe](../../../../recipes/microsoft/Mage-Flow.md)
+for measured latency, memory, and quality across these configurations.
+
+The `microsoft/Mage-Flow-Base`, `microsoft/Mage-Flow`, and
+`microsoft/Mage-Flow-Turbo` checkpoints default to 30/20/4 denoising steps and
+CFG 5.0/5.0/1.0 respectively when those values are omitted.
+
 ## Start Server
 
 ### Basic Start
@@ -253,6 +294,7 @@ directly. For image dimensions and count, use `size` and `n` rather than
 | `seed`                   | int   | None    | Random seed (reproducible)     |
 | `negative_prompt`        | str   | None    | Negative prompt                |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
+| `mage_vision_long_edge` | int | 384 | Mage-Flow Edit Qwen3-VL visual-conditioning long edge |
 
 ## Response Format
 
