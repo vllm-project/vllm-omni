@@ -607,6 +607,16 @@ class LingBotWorldCausalDMDPipeline(
         parallel_config = getattr(od_config, "parallel_config", None)
         self.od_config = od_config
         model_config = getattr(od_config, "model_config", None) or {}
+        from vllm_omni.diffusion.layers.lingbot_pixel_output import validate_mode
+
+        self._lingbot_pixel_output_mode = validate_mode(model_config.get("lingbot_npu_pixel_output_mode", "native"))
+        self._lingbot_leased_post_attention = model_config.get("lingbot_npu_leased_post_attention", False)
+        if type(self._lingbot_leased_post_attention) is not bool:
+            raise ValueError("lingbot_npu_leased_post_attention must be a bool")
+        if self._lingbot_leased_post_attention or self._lingbot_pixel_output_mode != "native":
+            from vllm_omni.diffusion.layers.lingbot_sp8_fatal import ensure_protocol
+
+            ensure_protocol()
         reuse_last_step_kv = model_config.get("lingbot_reuse_last_step_kv", False)
         if not isinstance(reuse_last_step_kv, bool):
             raise ValueError("model_config.lingbot_reuse_last_step_kv must be a bool.")
@@ -1808,7 +1818,7 @@ class LingBotWorldCausalDMDPipeline(
         if state is not None:
             state.release()
 
-    def _decode_chunk_to_pixels(self, latents: torch.Tensor, *, session_id: str | None = None) -> np.ndarray:
+    def _decode_chunk_to_pixels(self, latents: torch.Tensor, *, session_id: str | None = None) -> np.ndarray | None:
         """Decode one AR block so streaming consumers receive pixels, not latents.
 
         The block comes back as ``(F, H, W, 3)`` uint8 whatever pixel output
@@ -1838,14 +1848,45 @@ class LingBotWorldCausalDMDPipeline(
         decoder = None
         if session_id is not None and not self._vae_would_tile(vae_latents):
             decoder = self._streaming_decoder()
+        pixel_policy = None
+        mode = getattr(self, "_lingbot_pixel_output_mode", "native")
+        # Unsupported geometry chooses the native path before any decoder cache write.
+        if (
+            mode != "native"
+            and decoder is not None
+            and latents.device.type == "npu"
+            and getattr(self.vae, "_vllm_omni_wan_spatial_shard_installed", False)
+            and getattr(self.vae.config, "patch_size", None) is None
+            and getattr(self, "_vae_shard_split_dim", None) == "width"
+        ):
+            import torch.distributed as dist
+
+            from vllm_omni.diffusion.layers.lingbot_pixel_output import PixelOutputPolicy
+
+            group, degree = self._vae_shard_group()
+            if degree == 8:
+                pixel_policy = PixelOutputPolicy(mode, group, dist.get_rank(group), degree)
         if decoder is None:
             video = self.vae.decode(vae_latents, return_dict=False)[0]
-        else:
+        elif pixel_policy is None:
             video = self._streaming_decode_chunk(decoder, vae_latents, cast(str, session_id))
+        else:
+            video = self._streaming_decode_chunk(decoder, vae_latents, cast(str, session_id), pixel_policy=pixel_policy)
+        if pixel_policy is not None and not pixel_policy.produce_output:
+            return None
+        if pixel_policy is not None and pixel_policy.planar_uint8:
+            from vllm_omni.diffusion.layers.lingbot_pixel_output import planar_pixels_to_host
+
+            return planar_pixels_to_host(video)
         return _uint8_frames(video)
 
     def _streaming_decode_chunk(
-        self, decoder: WanStreamingDecoder, vae_latents: torch.Tensor, session_id: str
+        self,
+        decoder: WanStreamingDecoder,
+        vae_latents: torch.Tensor,
+        session_id: str,
+        *,
+        pixel_policy=None,
     ) -> torch.Tensor:
         """Decode one chunk through ``session_id``'s temporal cache.
 
@@ -1855,12 +1896,26 @@ class LingBotWorldCausalDMDPipeline(
         """
         state = self._streaming_decode_state(decoder, session_id)
         try:
+            if pixel_policy is not None:
+                from vllm_omni.diffusion.layers.lingbot_pixel_output import pixel_output_context
+
+                with pixel_output_context(pixel_policy):
+                    return decoder.decode_chunk(
+                        vae_latents,
+                        state,
+                        output_format="planar_uint8" if pixel_policy.planar_uint8 else "video",
+                        produce_output=pixel_policy.produce_output,
+                    )
             return decoder.decode_chunk(vae_latents, state)
-        except Exception:
+        except Exception as error:
             # A half-advanced cache cannot be resumed: the session's next chunk
             # would continue from a temporal context that was never completed,
             # so drop it here rather than at close.
             self._release_streaming_decode_state(session_id)
+            if pixel_policy is not None:
+                from vllm_omni.diffusion.layers.lingbot_sp8_fatal import report_failure
+
+                report_failure("streaming_pixel_output", str(error), (self, vae_latents, state, pixel_policy))
             raise
 
     def _require_bound_ar_state(self) -> None:
@@ -2164,7 +2219,8 @@ class LingBotWorldCausalDMDPipeline(
         if inputs.output_type == "latent":
             payload: dict[str, Any] = {"latents": latents}
         else:
-            payload = {"video": self._decode_chunk_to_pixels(latents, session_id=state.request_id)}
+            pixels = self._decode_chunk_to_pixels(latents, session_id=state.request_id)
+            payload = {} if pixels is None else {"video": pixels}
         output = {
             "payload": payload,
             "metadata": {
@@ -2224,4 +2280,9 @@ class LingBotWorldCausalDMDPipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return cast(set[str], loader.load_weights(weights))
+        loaded = loader.load_weights(weights)
+        if self._lingbot_leased_post_attention:
+            from vllm_omni.diffusion.layers.lingbot_leased_post_attention import install
+
+            install(self.transformer, enabled=True)
+        return cast(set[str], loaded)

@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation and Jiarui Fang
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # DeepSpeed Team & Jiarui Fang
 #  from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/comm/all_to_all.py
 from typing import Any
@@ -14,7 +15,13 @@ __all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "
 
 
 def all_to_all_4D(
-    input: torch.tensor, scatter_idx: int = 2, gather_idx: int = 1, group=None, use_sync: bool = False
+    input: torch.tensor,
+    scatter_idx: int = 2,
+    gather_idx: int = 1,
+    group=None,
+    use_sync: bool = False,
+    *,
+    _output_destination: torch.Tensor | None = None,
 ) -> torch.tensor:
     """
     all-to-all for QKV
@@ -32,6 +39,21 @@ def all_to_all_4D(
     assert input.dim() == 4, f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
 
     seq_world_size = dist.get_world_size(group)
+    if _output_destination is not None:
+        bs, seqlen, shard_hc, hs = input.shape
+        expected = (bs, seqlen // seq_world_size, shard_hc * seq_world_size, hs)
+        if (
+            (scatter_idx, gather_idx) != (1, 2)
+            or bs != 1
+            or seqlen % seq_world_size
+            or tuple(_output_destination.shape) != expected
+            or _output_destination.dtype != input.dtype
+            or _output_destination.device != input.device
+            or not _output_destination.is_contiguous()
+            or _output_destination.untyped_storage().data_ptr() == input.untyped_storage().data_ptr()
+        ):
+            raise ValueError("Owned reverse All-to-All destination contract is invalid before communication")
+        return _owned_reverse_all_to_all(input, _output_destination, group, seq_world_size, use_sync)
 
     if scatter_idx == 2 and gather_idx == 1:
         # input (torch.tensor): a tensor sharded along dim 1 (bs, seqlen/P, hc, hs) output: (bs, seqlen, hc/P, hs)
@@ -98,6 +120,35 @@ def all_to_all_4D(
         return output
     else:
         raise RuntimeError("scatter_idx must be 1 or 2 and gather_idx must be 1 or 2")
+
+
+def _owned_reverse_all_to_all(input, destination, group, world_size, use_sync):
+    """Retain all producers/receive owners after any candidate submission failure."""
+    input_t = output = None
+    try:
+        bs, seqlen, heads, width = input.shape
+        tokens = seqlen // world_size
+        input_t = (
+            input.reshape(bs, world_size, tokens, heads, width)
+            .transpose(0, 3)
+            .transpose(0, 1)
+            .contiguous()
+            .reshape(world_size, heads, tokens, bs, width)
+        )
+        output = torch.empty_like(input_t)
+        if world_size > 1:
+            dist.all_to_all_single(output, input_t, group=group)
+            if use_sync:
+                current_omni_platform.synchronize()
+        else:
+            output = input_t
+        destination.copy_(output.reshape(heads * world_size, tokens, bs, width).transpose(0, 2))
+        return destination
+    except BaseException as error:
+        from vllm_omni.diffusion.layers.lingbot_sp8_fatal import report_failure
+
+        report_failure("leased_reverse_a2a", str(error), (input, input_t, output, destination, group))
+        raise
 
 
 class SeqAllToAll4D(torch.autograd.Function):
@@ -230,7 +281,7 @@ class RingComm:
 
     def __init__(self, process_group: dist.ProcessGroup):
         self._process_group = process_group
-        self._ops = []
+        self._ops: list[dist.P2POp] = []
         self.rank = dist.get_rank(self._process_group)
         self.world_size = dist.get_world_size(self._process_group)
         self._reqs = None
