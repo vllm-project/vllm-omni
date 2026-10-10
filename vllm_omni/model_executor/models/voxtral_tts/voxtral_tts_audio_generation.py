@@ -199,6 +199,25 @@ def from_nested_dict(cls, d):
     return cls(**kwargs)
 
 
+def fill_seeded_noise(
+    noise: torch.Tensor,
+    noise_generators: Sequence[torch.Generator | None] | None,
+) -> None:
+    """Redraw the flow-matching noise rows of seeded requests in place.
+
+    ``SamplingParams.seed`` reaches vLLM's sampler but not the acoustic
+    transformer's initial noise, so a seeded request carries its own
+    generator (row-aligned with ``noise``). Its row is drawn from that
+    generator alone, so the audio does not depend on the global RNG stream
+    or on which other requests share the batch.
+    """
+    if not noise_generators:
+        return
+    for row, generator in enumerate(noise_generators[: noise.shape[0]]):
+        if generator is not None:
+            noise[row].normal_(generator=generator)
+
+
 def _is_fp8_quant_config(quant_config) -> bool:
     return quant_config is not None and quant_config.get_name() == "fp8"
 
@@ -510,6 +529,7 @@ class FlowMatchingAudioTransformer(nn.Module):
         semantic_code: torch.Tensor,
         llm_hidden: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise_generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         B = semantic_code.shape[0]
 
@@ -518,6 +538,7 @@ class FlowMatchingAudioTransformer(nn.Module):
 
         # acoustic_codes starts from x_0; generate directly on device to skip H2D.
         x_0 = torch.randn(B, self.model_args.n_acoustic_codebook, dtype=llm_hidden.dtype, device=llm_hidden.device)
+        fill_seeded_noise(x_0, noise_generators)
         x_0 = self._noise_scale * x_0
 
         # Build the schedule constants once per dtype and reuse them every frame.
@@ -598,6 +619,7 @@ class FlowMatchingAudioTransformer(nn.Module):
         self,
         llm_hidden: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise_generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         # llm_hidden: BxD
         semantic_logit = self.semantic_codebook_output(llm_hidden).float()
@@ -611,6 +633,7 @@ class FlowMatchingAudioTransformer(nn.Module):
             semantic_code.squeeze(1),
             llm_hidden,
             cfg_alpha=cfg_alpha,
+            noise_generators=noise_generators,
         )
 
         audio_codes = torch.concatenate(
@@ -1056,10 +1079,12 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise_generators: Sequence[torch.Generator | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         audio_codes = self.acoustic_transformer(
             llm_hidden=hidden_states,
             cfg_alpha=cfg_alpha,
+            noise_generators=noise_generators,
         )
         # Cache device-resident 1.0/0.0 scalars to avoid a per-call H2D transfer.
         consts = self._fake_eos_consts.get(audio_codes.device)

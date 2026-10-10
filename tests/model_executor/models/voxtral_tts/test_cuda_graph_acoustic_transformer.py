@@ -113,8 +113,11 @@ class SyntheticModel(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise_generators=None,
     ):
         """Eager fallback path: replicate what the wrapper does."""
+        from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import fill_seeded_noise
+
         _, AudioSpecialTokens = _voxtral_cudagraph_deps()
         at = self.acoustic_transformer
         B = hidden_states.shape[0]
@@ -132,6 +135,7 @@ class SyntheticModel(nn.Module):
         # Flow matching Euler ODE
         should_decode = semantic_code.squeeze(1) != end_audio_id
         x = torch.randn(B, at.model_args.n_acoustic_codebook, device=hidden_states.device, dtype=hidden_states.dtype)
+        fill_seeded_noise(x, noise_generators)
         hidden_zero = torch.zeros_like(hidden_states)
         timesteps = torch.linspace(0, 1, 16, device=hidden_states.device, dtype=hidden_states.dtype)
 
@@ -325,3 +329,18 @@ def test_deterministic_across_calls(model, wrapper):
         eos2, codes2 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha))
     torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
     torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)
+
+
+def test_seeded_rows_ignore_global_rng(model, wrapper):
+    """A row with its own generator reproduces regardless of the global RNG."""
+
+    def seeded_row_codes(global_seed: int) -> torch.Tensor:
+        generators = [None, torch.Generator(device=DEVICE).manual_seed(7), None]
+        torch.manual_seed(global_seed)
+        with torch.no_grad():
+            _, codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise_generators=generators))
+        return codes[1]
+
+    hidden = _random_hidden(3)
+    alpha = _cfg_alpha(3)
+    torch.testing.assert_close(seeded_row_codes(global_seed=1), seeded_row_codes(global_seed=2), atol=0, rtol=0)
