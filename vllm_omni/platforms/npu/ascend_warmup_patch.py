@@ -139,12 +139,88 @@ def _make_guard(name: str, original: Callable[[Any], Any]) -> Callable[[Any], An
     return _guarded
 
 
+def _apply_contiguous_kv_patch() -> None:
+    """Force the contiguous KV layout for the K-step Talker's layers.
+
+    vllm-ascend's block-major strided allocation regressed this model's
+    static-shape decode scan by ~19x (12.7 ms per frame vs 0.66 ms on the
+    previous build). The upstream fix that keeps K/V contiguous for paged
+    attention (``requires_contiguous_pa_kv_cache``) explicitly excludes
+    speculative configs, and the K-step Talker runs under one, so its layers
+    kept landing in the strided set. The strided layout only pays off for
+    paged attention; the one-query FIA graph reads every KV slot of its
+    bucket each frame, so it only ever pays for the stride indirection.
+
+    Patched on the consumer module: ``model_runner_v1`` binds the function
+    with a from-import, so patching ``vllm_ascend.attention.utils`` alone
+    would not be seen at the call site. Gated on the K-step config so any
+    other worker (stage 0, non-speculative deployments) keeps its stock
+    layout choice.
+    """
+    try:
+        import importlib
+
+        runner_module = importlib.import_module("vllm_ascend.worker.model_runner_v1")
+    except Exception as error:  # pragma: no cover - non-ascend builds
+        logger.warning("[npu] contiguous KV patch not applied: %s", error)
+        return
+
+    original = getattr(runner_module, "requires_contiguous_pa_kv_cache", None)
+    if original is None or getattr(original, "_vllm_omni_contiguous", False):
+        return
+
+    def _contiguous_for_kstep(layer, vllm_config, spec, *args, **kwargs):
+        try:
+            # Reproduce the original guard verbatim minus the one condition
+            # this patch overrides (using_paged_attention, which is
+            # unconditionally False under speculative configs).
+            from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+            impl = getattr(layer, "impl", None)
+            armed = _kstep_armed(vllm_config)
+            # isinstance, not type() is: the K-step Talker layers run the
+            # OmniStaticShapeAttentionBackendImpl subclass of the ascend
+            # backend, and the upstream strict-type check would exclude them.
+            backend_ok = isinstance(impl, AscendAttentionBackendImpl)
+            sliding = getattr(impl, "sliding_window", "MISSING")
+            runner = getattr(vllm_config.model_config, "runner_type", None)
+            page_eq = spec.page_size_bytes == spec.real_page_size_bytes
+            passed = backend_ok and sliding is None and runner != "pooling" and page_eq
+            logger.info(
+                "[npu] contiguous KV probe: layer=%s armed=%s impl=%s backend_ok=%s "
+                "sliding_window=%s runner=%s page_eq=%s -> return=%s",
+                getattr(layer, "layer_name", "?"),
+                armed,
+                type(impl).__name__,
+                backend_ok,
+                sliding,
+                runner,
+                page_eq,
+                bool(armed and passed),
+            )
+            if armed and passed:
+                return True
+        except Exception:
+            logger.exception("[npu] contiguous KV probe failed")
+        return original(layer, vllm_config, spec, *args, **kwargs)
+
+    _contiguous_for_kstep._vllm_omni_contiguous = True  # type: ignore[attr-defined]
+    runner_module.requires_contiguous_pa_kv_cache = _contiguous_for_kstep  # type: ignore[attr-defined]
+    logger.info(
+        "[npu] contiguous KV patch applied: the K-step Talker's layers leave "
+        "the strided block-major set (its one-query FIA decode reads the "
+        "whole bucket every frame and only loses on the indirection)",
+    )
+
+
 def apply_ascend_warmup_patch() -> None:
     """Guard the ascend warmups so a faulting one can be skipped per call."""
     global _PATCHED
     if _PATCHED:
         return
     _PATCHED = True
+
+    _apply_contiguous_kv_patch()
 
     try:
         import importlib
