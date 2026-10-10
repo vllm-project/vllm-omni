@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import json
@@ -1150,6 +1150,8 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
             self.transformer.config.axes_lens,
             theta=10000,
         )
+        if device.type != "mps":
+            freqs_cis = [freqs.to(device) for freqs in freqs_cis]
 
         image = self.processing(
             latents=latents,
