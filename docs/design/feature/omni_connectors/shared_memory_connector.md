@@ -115,6 +115,8 @@ Locking is done with `fcntl.flock`:
 
 Both sides acquire an exclusive lock. This ensures that the shared-memory segment is not read while it is still being written and makes the handoff safer in a multi-process environment.
 
+Lock-file lifecycle: a lock file has no lifecycle of its own — it exists exactly while its segment does. It is removed on the successful receiving read, on a read whose segment is already gone, on a key-based poll whose segment no longer exists, on a failed `put()` (the segment never came to life), and by `cleanup()` / `close()` for keys still tracked in `_pending_keys`. Abnormally terminated processes leave lock files behind once their segments are reaped by `resource_tracker`; a time-gated sweep (at most once per 60 s, from `__init__` / `put()` / `get()`) reaps such orphans with a check–lock–recheck protocol that never touches a young, held, or live-segment lock.
+
 ### 5. Put / Get Flow
 
 #### 5.1 Producer Flow: `put()`
@@ -124,7 +126,7 @@ The producer-side flow is:
 1. Serialize the input object to bytes.
 2. Compute the payload size.
 3. Acquire the per-request lock file.
-4. Write the bytes into shared memory.
+4. Write the bytes into shared memory. If this write fails, remove the lock file (while still holding it) before returning the failure — the segment never came to life, so the lock file must not survive it.
 5. Return lightweight metadata to the caller.
 
 The returned tuple is:
@@ -143,7 +145,7 @@ The primary consumer path is metadata-driven:
 2. Acquire the exclusive lock.
 3. Read the raw bytes from shared memory.
 4. Deserialize the bytes back into the original Python object.
-5. Remove the lock file if it still exists.
+5. Remove the lock file when the segment is gone (successful read, or a failed read after the segment was unlinked); keep it while the segment still exists so the transfer can be retried.
 
 This is the path used by the current stage-to-stage connector flow.
 
@@ -155,7 +157,7 @@ The connector also keeps a compatibility path for callers that only know the key
 2. If the segment exists and has non-zero size, acquire the exclusive lock and read the bytes.
 3. Deserialize the bytes and return the object.
 
-If the segment does not exist or any exception occurs, the call returns `None` immediately. There is no retry loop in this path -- it is a single-attempt open.
+If the segment does not exist or any exception occurs, the call returns `None` immediately. There is no retry loop in this path -- it is a single-attempt open. When the segment is missing because the owner process died and `resource_tracker` reaped it, the poll additionally reclaims the orphan lock file once it is older than the 60 s grace window (the grace protects a concurrent `put()` between its `open()` and `flock()`).
 
 This path is mainly for older code paths and is not the preferred mode for the current connector pipeline.
 
