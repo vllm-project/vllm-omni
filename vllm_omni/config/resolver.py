@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ class OmniConfigResolution:
     stage_configs: tuple[Any, ...]
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
+    tail_aware_scheduling_config: dict[str, Any] = field(default_factory=lambda: {"enabled": False})
 
     @property
     def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
@@ -174,6 +175,7 @@ def _build_registered_resolution(
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
+        tail_aware_scheduling_config=dict(structured_config.orchestrator_config.tail_aware_scheduling_config),
     )
 
 
@@ -234,12 +236,15 @@ def resolve_omni_config(
         )
     if model_class_name is not None:
         normalized_overrides.setdefault("model_class_name", model_class_name)
-    default_config = StageConfigFactory.create_typed_default_diffusion(model, normalized_overrides)
+    default_config = StageConfigFactory.create_typed_default_diffusion(
+        model, normalized_overrides, deploy_config_path=deploy_config_path
+    )
 
     return OmniConfigResolution(
         config_path=deploy_config_path,
         stage_configs=tuple(default_config.stage_configs),
         pipeline_config=default_config.pipeline_config,
+        tail_aware_scheduling_config=dict(default_config.orchestrator_config.tail_aware_scheduling_config),
     )
 
 

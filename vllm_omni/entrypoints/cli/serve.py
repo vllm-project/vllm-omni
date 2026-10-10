@@ -827,6 +827,18 @@ class OmniServeCommand(CLISubcommand):
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
         omni_config_group.add_argument(
+            "--enable-tail-aware-scheduling",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable centralized, non-preemptive FIFO scheduling for local diffusion replicas.",
+        )
+        omni_config_group.add_argument(
+            "--tail-aware-scheduling-config",
+            type=_json_object,
+            default=None,
+            help="JSON scheduling settings, including max_pending_requests for the central queue.",
+        )
+        omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=_nonneg_finite_float,
             default=0.0,
