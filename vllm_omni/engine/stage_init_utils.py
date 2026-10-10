@@ -1177,6 +1177,8 @@ def _project_omni_stage_engine_args(
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
+    # Preserve the legacy adapter key even when the topology leaves it unset.
+    engine_args["scheduling_metadata_adapter"] = stage_config.model_config.scheduling_metadata_adapter
     _maybe_set_qwen3_omni_moe_backend(
         engine_args,
         moe_backend_is_explicit="moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ()),

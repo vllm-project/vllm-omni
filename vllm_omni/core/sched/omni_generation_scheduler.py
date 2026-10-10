@@ -146,9 +146,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             for output in new_outputs:
                 ready.update(output.chunk_ready_req_ids)
                 terminal.update(output.chunk_finished_req_ids)
-                terminal.update(
-                    req_id for req_id, metadata in output.request_metadata.items() if metadata.get("input_terminal")
-                )
+                terminal.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
             runnable = {
                 req_id
                 for req_id in ready | terminal
