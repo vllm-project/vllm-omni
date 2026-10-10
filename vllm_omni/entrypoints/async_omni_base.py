@@ -314,15 +314,13 @@ class AsyncOmniBase(OmniBase):
 
         engine = self.engine
 
-        # Event-driven drain (explicit env value or the engine pipeline default): block on the
+        # Event-driven drain (the default; VLLM_OMNI_EVENT_DRIVEN_ORCH=0 opts out): block on the
         # queue's condition variable in a dedicated thread instead of the
         # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
         # event-driven loop (vllm_omni/engine/orchestrator.py).
         from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
 
-        event_driven_drain = _event_driven_orch_enabled(
-            default=bool(getattr(engine, "_event_driven_orch_default", False))
-        ) and hasattr(engine, "get_output_blocking_async")
+        event_driven_drain = _event_driven_orch_enabled() and hasattr(engine, "get_output_blocking_async")
 
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""

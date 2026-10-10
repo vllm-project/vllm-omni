@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -144,6 +144,9 @@ class StagePool:
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
+        # Invoked whenever the replica set changes, so the event-driven loop can
+        # re-bind its readers without waiting for a tick. Must be thread-safe.
+        self.membership_listener: Callable[[], None] | None = None
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
         self._output_timestamps_by_request: dict[str, list[float]] = {}
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
@@ -253,6 +256,11 @@ class StagePool:
                 return addr
         return None
 
+    def _notify_membership_changed(self) -> None:
+        listener = self.membership_listener
+        if listener is not None:
+            listener()
+
     def add_client(self, input_addr: str, client: Any, *, replica_id: int | None = None) -> int:
         """Register a head-side client for ``input_addr``.
 
@@ -288,6 +296,7 @@ class StagePool:
         self.clients[replica_id] = client
         self._addr_to_replica_id[input_addr] = replica_id
         self._unavailable_replicas.discard(replica_id)
+        self._notify_membership_changed()
         return replica_id
 
     def remove_client(self, input_addr: str) -> Any | None:
@@ -300,6 +309,7 @@ class StagePool:
             return None
         client = self.clients[replica_id]
         self.clients[replica_id] = None
+        self._notify_membership_changed()
         return client
 
     def get_client_by_addr(self, input_addr: str) -> Any | None:
@@ -559,6 +569,7 @@ class StagePool:
         """Evict a failed replica from admission and release its bindings."""
         if 0 <= replica_id < self.num_replicas:
             self._unavailable_replicas.add(replica_id)
+            self._notify_membership_changed()
         return self.release_replica_bindings(replica_id)
 
     def is_replica_available(self, replica_id: int) -> bool:
@@ -1156,6 +1167,15 @@ class StagePool:
         self._rehydrate_pooling_output_payloads(outputs)
         return outputs
 
+    async def read_llm_raw_output(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
+        """Await one raw EngineCore batch from *client*; ``None`` if it is empty.
+
+        Untimed counterpart of ``poll_llm_raw_output`` for the event-driven
+        orchestration loop, so both loops share the keep/drop rule and the
+        MR V2 payload rehydration.
+        """
+        return await self._poll_stage_raw(client)
+
     @staticmethod
     def _rehydrate_pooling_output_payloads(outputs: EngineCoreOutputs) -> None:
         """Restore dict-shaped pooling_output from its bytes carrier (MR V2).
@@ -1428,3 +1448,4 @@ class StagePool:
             raise ValueError(f"evict_replica: replica_id {replica_id} out of range (num_replicas={len(self.clients)})")
         self.shutdown_replica(replica_id)
         self.clients[replica_id] = None
+        self._notify_membership_changed()

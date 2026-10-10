@@ -15,6 +15,7 @@ from typing import Any
 
 import janus
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -40,6 +41,7 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -543,12 +545,15 @@ async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, requ
     orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=request_ids))
 
 
-@pytest.fixture
-def orchestrator_factory():
+@pytest.fixture(params=["0", "1"], ids=["legacy", "event-driven"])
+def orchestrator_factory(request, monkeypatch):
+    # Every scenario runs on both orchestration loops, which must behave identically.
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", request.param)
     fixtures: list[OrchestratorFixture] = []
 
     def _factory(*args, **kwargs) -> OrchestratorFixture:
         fixture = _build_harness(*args, **kwargs)
+        assert fixture.orchestrator._event_driven_orch is (request.param == "1")
         fixtures.append(fixture)
         return fixture
 
@@ -1881,6 +1886,33 @@ async def test_orchestrator_records_scheduler_stats_without_outputs(orchestrator
         assert iteration_stats is None
         assert engine_idx == 0
         assert processor.process_calls[0][0][2] is None
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_rehydrates_mrv2_pooling_payload_before_output_processing(orchestrator_factory) -> None:
+    """A dict pooling output shipped as the MR V2 bytes carrier reaches the output processor as a dict."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    processor = RecordingOutputProcessor()
+    orchestrator_fixture = orchestrator_factory([stage0], output_processors=[processor])
+    codes = torch.tensor([[1, 2, 3]])
+    engine_output = SimpleNamespace(
+        request_id="req-mrv2-payload",
+        pooling_output=None,
+        pooling_output_payload=serialize_additional_information({"codes.audio": codes}),
+    )
+
+    try:
+        stage0.push_engine_core_outputs(
+            SimpleNamespace(outputs=[engine_output], timestamp=1.0, scheduler_stats=None, finished_requests=None)
+        )
+
+        await _wait_for(lambda: len(processor.process_calls) == 1)
+        (seen,) = processor.process_calls[0][0][0]
+        assert seen.pooling_output_payload is None
+        assert set(seen.pooling_output) == {"codes.audio"}
+        assert torch.equal(seen.pooling_output["codes.audio"], codes)
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

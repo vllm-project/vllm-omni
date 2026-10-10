@@ -988,18 +988,19 @@ Multi-stage omni deployments route stage outputs through a single orchestrator
 loop. The legacy loop polls every stage replica on a 1 ms cadence. The
 event-driven mode replaces the poll with one reader task per live stage
 replica awaiting its client directly, and switches the serving-side
-final-output drain to a condition-variable wakeup at the same time. Qwen3-TTS
-uses this mode by default; other pipelines keep the legacy poll unless enabled.
+final-output drain to a condition-variable wakeup at the same time. Every
+pipeline uses the event-driven mode by default; the legacy poll remains
+available as an opt-out.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction and separately when the final-output drain starts. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On | Selects between event-driven wakeups and the legacy 1 ms poll for the orchestration loop and the final-output drain. The value is resolved at orchestrator construction and separately when the final-output drain starts. `1`, `true`, `yes`, or `on` keeps event-driven mode, ignoring case and surrounding whitespace; any other value, such as `0`, selects the legacy poll loop. |
 
 Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
-before starting the server when overriding the pipeline default. For example,
-explicitly disable event-driven orchestration for Qwen3-TTS:
+before starting the server when overriding the default. For example,
+select the legacy poll loop for Qwen3-TTS:
 
 ```bash
 VLLM_OMNI_EVENT_DRIVEN_ORCH=0 \
@@ -1012,9 +1013,8 @@ The server logs the selected loop mode and its reader/poller counts once at
 startup, so you can confirm which loop is live.
 
 Routing, output ordering, and terminal-state behavior are identical on both
-loops; only the poll cadence changes. Leaving the variable unset selects the
-pipeline default: event-driven for Qwen3-TTS, and legacy polling for other
-pipelines, including Qwen3-Omni.
+loops; only the poll cadence changes. Leaving the variable unset selects
+event-driven orchestration for every pipeline.
 
 **Known limitations:**
 
@@ -1024,9 +1024,6 @@ pipelines, including Qwen3-Omni.
   changed dead-replica handling and reader/poller lifecycle rather than the
   steady-state output path, and the parity suite covers it, but the serving
   A/B has not been re-run on the current head.
-- The diffusion-poller branch is covered by unit tests only. Deployments whose
-  stages all run as standard engine cores never exercise it, including GLM-TTS,
-  which deploys its DiT without `stage_type: diffusion`.
 - Concurrency 1 and 32 measured at parity with the legacy loop. At 32 the
   latency is admission-bound, which this mode does not address.
 

@@ -79,12 +79,11 @@ def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
         shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
-# VLLM_OMNI_EVENT_DRIVEN_ORCH=1 switches the orchestration loop (and the
-# serving-side final-output drain in entrypoints/async_omni.py) from the legacy
-# 1 ms poll cadence to event-driven wakeups: one reader task per live LLM stage
-# replica awaits `client.get_output_async()` directly — the same pattern vLLM's
+# The orchestration loop (and the serving-side final-output drain in
+# entrypoints/async_omni.py) is event-driven by default: one reader task per
+# live LLM stage replica awaits its client directly — the same pattern vLLM's
 # own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
-# Default is off except for pipelines with an explicit validated default.
+# VLLM_OMNI_EVENT_DRIVEN_ORCH=0 selects the legacy 1 ms poll loop instead.
 _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 
 # How often the event-driven loop reconciles its reader-task set against
@@ -92,16 +91,11 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
 
-def _event_driven_orch_enabled(*, default: bool = False) -> bool:
+def _event_driven_orch_enabled() -> bool:
     value = os.environ.get(_EVENT_DRIVEN_ORCH_ENV)
     if value is None:
-        return default
+        return True
     return value.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> bool:
-    """Return whether a pipeline has a validated event-driven default."""
-    return pipeline_model_type == "qwen3_tts"
 
 
 def _build_terminal_empty_output(
@@ -354,7 +348,6 @@ class OrchestratorBase:
         prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
-        event_driven_orch_default: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -399,7 +392,7 @@ class OrchestratorBase:
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
-        self._event_driven_orch = _event_driven_orch_enabled(default=event_driven_orch_default)
+        self._event_driven_orch = _event_driven_orch_enabled()
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -1112,11 +1105,11 @@ class OrchestratorBase:
     async def _orchestration_loop_event_driven(self) -> None:
         """Event-driven variant of ``_orchestration_loop``.
 
-        Selected by the explicit ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` value or the
-        pipeline default computed at engine initialization. One reader task per
-        available LLM stage replica awaits ``client.get_output_async()``
-        directly — the same pattern vLLM's own ``AsyncLLM`` output handler uses
-        — and feeds a single dispatch queue. This coroutine consumes that queue
+        The default loop; ``VLLM_OMNI_EVENT_DRIVEN_ORCH=0`` selects the legacy
+        poll loop instead. One reader task per available LLM stage replica
+        awaits ``client.get_output_async()`` — the same pattern vLLM's own
+        ``AsyncLLM`` output handler uses — and feeds a single dispatch queue.
+        This coroutine consumes that queue
         serially, so routing/handling semantics are identical to the legacy
         loop; only the 1 ms poll cadence (and its per-tick ``asyncio.wait_for``
         task churn) is removed. Diffusion stages keep their nowait-poll contract
@@ -1129,20 +1122,16 @@ class OrchestratorBase:
 
         async def _llm_replica_reader(stage_id: int, replica_id: int, client: Any) -> None:
             try:
+                pool = self.stage_pools[stage_id]
                 while not self._shutdown_event.is_set():
-                    raw_outputs = await client.get_output_async()
-                    # Same keep/drop rule as StagePool._poll_stage_raw: a batch
-                    # with no request outputs still carries SchedulerStats on
-                    # throttled ticks, and dropping it loses the KV/queue gauges
-                    # for that interval. Only a fully empty batch is dropped. A
-                    # poll-style client returns one instead of blocking, so keep
-                    # the legacy 1 ms cadence for those; a blocking client only
+                    # Read through the pool so this loop shares the legacy
+                    # poll's keep/drop rule and MR V2 payload rehydration. Only
+                    # a fully empty batch comes back as None. A poll-style
+                    # client returns one instead of blocking, so keep the
+                    # legacy 1 ms cadence for those; a blocking client only
                     # lands here rarely, where 1 ms is irrelevant.
-                    if (
-                        not raw_outputs.outputs
-                        and raw_outputs.scheduler_stats is None
-                        and not raw_outputs.finished_requests
-                    ):
+                    raw_outputs = await pool.read_llm_raw_output(client)
+                    if raw_outputs is None:
                         await asyncio.sleep(0.001)
                         continue
                     await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
@@ -1249,23 +1238,38 @@ class OrchestratorBase:
                     task.cancel()
                     reaped.append(task)
 
-        _reconcile_readers()
-        logger.info(
-            "[Orchestrator] Event-driven orchestration loop enabled (%s): %d LLM replica readers, %d diffusion pollers",
-            _EVENT_DRIVEN_ORCH_ENV,
-            len(readers),
-            len(pollers),
-        )
+        # Membership changes (replica attach/detach/eviction) wake the dispatcher
+        # so a new replica gets its reader at once; the periodic reconcile stays
+        # as the backstop for anything that bypasses the pool API.
+        reconcile_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _wake_reconcile() -> None:
+            # Thread-safe so a pool mutated off the orchestrator loop still wakes us.
+            loop.call_soon_threadsafe(reconcile_event.set)
 
         shutdown_task = asyncio.create_task(self._shutdown_event.wait(), name="orch-shutdown-wait")
+        reconcile_task = asyncio.create_task(reconcile_event.wait(), name="orch-reconcile-wait")
         pending_get: asyncio.Task | None = None
         next_reconcile = _time.monotonic() + _ORCH_READER_RECONCILE_INTERVAL_S
         try:
+            for pool in self.stage_pools:
+                pool.membership_listener = _wake_reconcile
+
+            _reconcile_readers()
+            logger.info(
+                "[Orchestrator] Event-driven orchestration loop enabled (%s): "
+                "%d LLM replica readers, %d diffusion pollers",
+                _EVENT_DRIVEN_ORCH_ENV,
+                len(readers),
+                len(pollers),
+            )
+
             while not self._shutdown_event.is_set():
                 if pending_get is None:
                     pending_get = asyncio.create_task(ready_q.get(), name="orch-dispatch-get")
                 done, _ = await asyncio.wait(
-                    {pending_get, shutdown_task},
+                    {pending_get, shutdown_task, reconcile_task},
                     timeout=max(0.0, next_reconcile - _time.monotonic()),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -1276,11 +1280,17 @@ class OrchestratorBase:
                 # every output and a timeout-only reconcile would never fire,
                 # so a replica that registers at runtime would never get a
                 # reader and its outputs would never drain.
-                if _time.monotonic() >= next_reconcile:
+                if reconcile_task in done:
+                    reconcile_event.clear()
+                    reconcile_task = asyncio.create_task(reconcile_event.wait(), name="orch-reconcile-wait")
                     next_reconcile = _time.monotonic() + _ORCH_READER_RECONCILE_INTERVAL_S
                     _reconcile_readers()
-                if not done:
-                    self._orch_monitor.note_loop(idle=True)
+                elif _time.monotonic() >= next_reconcile:
+                    next_reconcile = _time.monotonic() + _ORCH_READER_RECONCILE_INTERVAL_S
+                    _reconcile_readers()
+                if pending_get not in done:
+                    if not done:
+                        self._orch_monitor.note_loop(idle=True)
                     continue
                 kind, stage_id, replica_id, payload = pending_get.result()
                 pending_get = None
@@ -1353,7 +1363,11 @@ class OrchestratorBase:
                 # `continue`s above without marking the tick active.
                 self._orch_monitor.note_loop(idle=False)
         finally:
+            for pool in self.stage_pools:
+                if pool.membership_listener is _wake_reconcile:
+                    pool.membership_listener = None
             shutdown_task.cancel()
+            reconcile_task.cancel()
             if pending_get is not None:
                 pending_get.cancel()
             reader_tasks = [task for task, _ in readers.values()]
@@ -1363,7 +1377,7 @@ class OrchestratorBase:
             # `reaped` holds readers/pollers retired mid-run (client swap,
             # eviction, stage teardown). They were cancelled but never awaited,
             # so gather them here too rather than leaving dangling tasks.
-            cleanup = [shutdown_task, *reader_tasks, *poller_tasks, *reaped]
+            cleanup = [shutdown_task, reconcile_task, *reader_tasks, *poller_tasks, *reaped]
             if pending_get is not None:
                 cleanup.append(pending_get)
             await asyncio.gather(*cleanup, return_exceptions=True)

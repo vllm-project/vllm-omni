@@ -450,19 +450,6 @@ class TestSingleStageModeDetection:
         )
         assert engine.single_stage_mode is True
 
-    @pytest.mark.parametrize("model_type, expected", [("qwen3_tts", True), ("qwen3_omni_moe", False)])
-    def test_event_driven_default_uses_resolved_pipeline(self, mocker, model_type, expected):
-        pipeline = PipelineConfig(
-            model_type=model_type,
-            stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),),
-        )
-        engine = self._make_engine_no_thread(mocker, resolved_pipeline=pipeline)
-
-        StageConfigFactory.get_pipeline_config.assert_called_once_with(
-            model="fake-model", trust_remote_code=False, deploy_config_path=None
-        )
-        assert engine._event_driven_orch_default is expected
-
     def test_stage_id_kwarg_promotes_to_single_stage_mode(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(
             mocker,
