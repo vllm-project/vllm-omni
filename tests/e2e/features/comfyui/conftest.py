@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Conftest for ComfyUI-vLLM-Omni tests.
 
@@ -5,10 +8,12 @@ This module sets up the test environment by:
 1. Adding the ComfyUI plugin to Python path
 2. Mocking comfy_api.input module (AudioInput, VideoInput) since comfyui is not installed
 3. Mocking comfy_extras.nodes_audio module
+4. Mocking comfy.model_management's interruption API
 """
 
 import os
 import sys
+from fractions import Fraction
 from types import ModuleType, SimpleNamespace
 from typing import BinaryIO, TypedDict
 
@@ -51,7 +56,10 @@ def _setup_comfyui_test_environment():
         def __init__(self, data: bytes = b"mock_video_data"):
             self._data = data
 
-        def save_to(self, file: str | BinaryIO):
+        def get_frame_rate(self):
+            return Fraction(24)
+
+        def save_to(self, file: str | BinaryIO, *, format: str = "auto"):
             """Save video data to file or file-like object."""
             if isinstance(file, str):
                 print("Called VideoInput.save_to with file path. Saving to a path is no-op in tests.")
@@ -60,15 +68,16 @@ def _setup_comfyui_test_environment():
 
     mock_comfy_api = ModuleType("comfy_api")
     mock_comfy_api_input = ModuleType("comfy_api.input")
-    mock_comfy_api_input.AudioInput = AudioInput
-    mock_comfy_api_input.VideoInput = VideoInput
-    mock_comfy_api.input = mock_comfy_api_input
+    vars(mock_comfy_api_input).update(AudioInput=AudioInput, VideoInput=VideoInput)
     mock_comfy_api_latest = ModuleType("comfy_api.latest")
-    mock_comfy_api_latest.Types = SimpleNamespace(VideoComponents=lambda **kwargs: kwargs)
-    mock_comfy_api_latest.InputImpl = SimpleNamespace(
-        VideoFromComponents=lambda _: VideoInput(b"mock_video_from_components")
+    vars(mock_comfy_api_latest).update(
+        Types=SimpleNamespace(VideoComponents=lambda **kwargs: kwargs),
+        InputImpl=SimpleNamespace(
+            VideoFromComponents=lambda _: VideoInput(b"mock_video_from_components"),
+            VideoFromFile=lambda buffer: VideoInput(buffer.getvalue()),
+        ),
     )
-    mock_comfy_api.latest = mock_comfy_api_latest
+    vars(mock_comfy_api).update(input=mock_comfy_api_input, latest=mock_comfy_api_latest)
 
     def mock_load(_: str | BinaryIO):
         """Mock nodes_audio.load that returns a waveform tensor (channels, samples) and sample rate."""
@@ -78,8 +87,18 @@ def _setup_comfyui_test_environment():
 
     mock_comfy_extras = ModuleType("comfy_extras")
     mock_nodes_audio = ModuleType("comfy_extras.nodes_audio")
-    mock_nodes_audio.load = mock_load
-    mock_comfy_extras.nodes_audio = mock_nodes_audio
+    vars(mock_nodes_audio).update(load=mock_load)
+    vars(mock_comfy_extras).update(nodes_audio=mock_nodes_audio)
+
+    class InterruptProcessingException(BaseException):
+        """Match ComfyUI's user-interruption exception."""
+
+    mock_model_management = ModuleType("comfy.model_management")
+    vars(mock_model_management).update(
+        InterruptProcessingException=InterruptProcessingException,
+        processing_interrupted=lambda: False,
+        throw_exception_if_processing_interrupted=lambda: None,
+    )
 
     # Install mock modules BEFORE importing any comfyui_vllm_omni code
     sys.modules["comfy_api"] = mock_comfy_api
@@ -87,3 +106,4 @@ def _setup_comfyui_test_environment():
     sys.modules["comfy_api.latest"] = mock_comfy_api_latest
     sys.modules["comfy_extras"] = mock_comfy_extras
     sys.modules["comfy_extras.nodes_audio"] = mock_nodes_audio
+    sys.modules["comfy.model_management"] = mock_model_management

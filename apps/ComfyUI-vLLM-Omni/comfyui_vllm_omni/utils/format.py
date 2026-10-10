@@ -129,10 +129,10 @@ def image_tensor_to_base64(tensor: torch.Tensor, filename: str = "image.png") ->
     return f"data:{mime_type};base64,{base64_str}"
 
 
-def video_to_bytes(video: VideoInput, filename: str = "video.mp4") -> BytesIO:
+def video_to_bytes(video: VideoInput, filename: str = "video.mp4", *, format: str = "auto") -> BytesIO:
     output_buffer = BytesIO()
     output_buffer.name = filename
-    video.save_to(output_buffer)
+    video.save_to(output_buffer, format=format)
     output_buffer.seek(0)
     return output_buffer
 
@@ -144,6 +144,35 @@ def video_to_base64(video: VideoInput, filename: str = "video.mp4") -> str:
     base64_str = base64.b64encode(byte_data).decode("utf-8")
     mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return f"data:{mime_type};base64,{base64_str}"
+
+
+def bytes_to_restored_video(video_bytes: bytes, frame_rate: Fraction) -> VideoInput:
+    """Keep encoded streams and restore exact source FPS rounded by MP4 encoders."""
+    output = BytesIO()
+    try:
+        with av.open(BytesIO(video_bytes)) as source, av.open(output, "w", format="mp4") as target:
+            if not source.streams.video:
+                raise ValueError("No video stream found in restored payload.")
+            video = source.streams.video[0]
+            streams = {stream.index: target.add_stream_from_template(stream) for stream in source.streams}
+            streams[video.index].time_base = 1 / frame_rate
+            for packet in source.demux():
+                if packet.dts is None:  # PyAV's flush packets contain no encoded data.
+                    continue
+                index = packet.stream.index
+                if index == video.index:
+                    # CFR timestamps become frame indices; audio timestamps stay unchanged.
+                    packet.pts = round(packet.pts * packet.time_base * video.average_rate)
+                    packet.dts = round(packet.dts * packet.time_base * video.average_rate)
+                    packet.duration = 1
+                    packet.time_base = 1 / frame_rate
+                packet.stream = streams[index]
+                target.mux(packet)
+    except (av.FFmpegError, ValueError) as e:
+        raise RuntimeError(f"Failed to remux restored video: {e}") from e
+    output.seek(0)
+    # File-backed VIDEO lets SaveVideo reuse streams instead of encoding again.
+    return InputImpl.VideoFromFile(output)
 
 
 def bytes_to_video(video_bytes: bytes) -> VideoInput:

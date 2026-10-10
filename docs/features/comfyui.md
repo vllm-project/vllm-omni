@@ -49,6 +49,9 @@ This extension offers the following nodes based on the output modalities:
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video and image-to-video tasks
+- **Restore Video (SeedVR2)** for remote VIDEO restoration with source FPS and audio.
+  [Standalone and remote H3 templates](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/seedvr2-restoration.md)
+  use separately configured model services and the whole-clip SeedVR2 API.
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
 - **Generate Music** for text-to-music tasks
