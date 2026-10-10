@@ -1342,7 +1342,16 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         local_heads = arch.num_attention_heads // get_tensor_model_parallel_world_size()
         ulysses_degree = int(self.parallel_config.ulysses_degree)
-        if local_heads % ulysses_degree:
+        # ``advanced_uaa`` pads the head count up to a multiple of the Ulysses
+        # degree before the all-to-all and drops the padding on the reverse
+        # transform, so a non-divisible head count is legal there
+        # (MiniMax-H3: 56 heads -> 64 at degree 16, a 1.14x attention cost).
+        # The padded heads only add work; their outputs are discarded by
+        # ``_ulysses_all_to_all_any_o(orig_head_cnt=...)``.  Strict mode keeps
+        # the original divisibility requirement.
+        from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+        if local_heads % ulysses_degree and get_ulysses_mode(default="strict") != "advanced_uaa":
             raise ValueError(
                 "MiniMax H3 local attention heads must be divisible by "
                 "ulysses_degree: "
