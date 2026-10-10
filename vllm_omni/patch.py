@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from functools import cached_property
+from typing import Any
 
 import torch
 from aenum import extend_enum
@@ -711,16 +712,10 @@ def _patch_cumem_free_callback_cuda() -> None:
     _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
 
 
-def _patch_xpumem_free_callback_xpu() -> None:
-    try:
-        from vllm.device_allocator.xpumem import XpuMemAllocator
-    except ImportError:
-        _PATCH_LOGGER.debug("[xpumem-xpu] XpuMemAllocator not available; skipping patch")
-        return
+def _patch_mem_allocator_free_callback(allocator_cls: Any, log_tag: str) -> None:
+    _original_free_callback = allocator_cls._python_free_callback
 
-    _original_free_callback = XpuMemAllocator._python_free_callback
-
-    if getattr(_original_free_callback, "_omni_xpumem_xpu_patched", False):
+    if getattr(_original_free_callback, "_omni_free_callback_patched", False):
         return
 
     def _patched_free_callback(self, ptr: int) -> tuple:
@@ -728,26 +723,44 @@ def _patch_xpumem_free_callback_xpu() -> None:
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
         if data.is_asleep:
+            # sleep() already called unmap_and_release() on this allocation.
+            # Return an empty chunk list so the C extension skips the
+            # release, avoiding a double-free.  Same logic as the existing
+            # ROCm guard, but applied to all platforms.
             device, size, d_mem, _ = data.handle
             result = (device, size, d_mem, [])
             _PATCH_LOGGER.debug(
-                "[xpumem-xpu] Free callback: asleep entry %s -> empty handle",
+                "[%s] Free callback: asleep entry %s -> empty handle",
+                log_tag,
                 ptr,
             )
             return result
-        # Drain pending kernels before the C extension's xpuMemUnmap.
+        # Drain pending kernels before the C extension unmaps.
         torch.accelerator.synchronize(data.handle[0])
         return data.handle
 
-    _patched_free_callback._omni_xpumem_xpu_patched = True
-    XpuMemAllocator._python_free_callback = _patched_free_callback
+    _patched_free_callback._omni_free_callback_patched = True
+    allocator_cls._python_free_callback = _patched_free_callback
     _PATCH_LOGGER.info(
-        "[xpumem-xpu] XpuMemAllocator._python_free_callback patched: asleep guard extended to intel GPU platforms."
+        "[%s] %s._python_free_callback patched: asleep guard extended to all platforms.",
+        log_tag,
+        allocator_cls.__name__,
     )
 
 
-_patch_cumem_free_callback_cuda()
-_patch_xpumem_free_callback_xpu()
+def _patch_sleep_allocator_free_callbacks() -> None:
+    _patch_cumem_free_callback_cuda()
+
+    try:
+        from vllm.device_allocator.xpumem import XpuMemAllocator, xpumem_available
+    except ImportError:
+        _PATCH_LOGGER.debug("[xpumem] XpuMemAllocator not available; skipping patch")
+    else:
+        if xpumem_available:
+            _patch_mem_allocator_free_callback(XpuMemAllocator, "xpumem")
+
+
+_patch_sleep_allocator_free_callbacks()
 
 
 def _patch_batched_seeded_random_sample() -> None:

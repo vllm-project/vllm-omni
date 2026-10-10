@@ -94,7 +94,6 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
-    from vllm.device_allocator.cumem import CuMemAllocator
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
 logger = init_logger(__name__)
@@ -1272,14 +1271,15 @@ class DiffusionWorker:
                 allocator = _get_mem_allocator_instance()
                 if allocator.get_current_usage():
                     gc.collect()
-                from vllm_omni.patch import release_cumem_allocations_for_shutdown
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
+                    from vllm_omni.patch import release_cumem_allocations_for_shutdown
 
-                retired_bytes = release_cumem_allocations_for_shutdown(allocator)
-                if retired_bytes:
-                    logger.info(
-                        "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
-                        retired_bytes / GiB_bytes,
-                    )
+                    retired_bytes = release_cumem_allocations_for_shutdown(allocator)
+                    if retired_bytes:
+                        logger.info(
+                            "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
+                            retired_bytes / GiB_bytes,
+                        )
                 allocator.release_pools()
                 self._owns_sleep_pool = False
                 # Re-collect after dropping the pool references so their
