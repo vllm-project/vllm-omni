@@ -26,6 +26,9 @@ from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
+    PersonaPlexTalkerForConditionalGeneration,
+)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import gpu_ar_model_runner, sparse_audio
 from vllm_omni.worker.gpu_ar_model_runner import (
@@ -121,6 +124,75 @@ def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
     # Mixed batches must retain outputs produced by non-duplex rows.
     assert audio[2].tolist() == [[90, 91, 92]]
     assert multimodal["meta"] == {"source": "temporal"}
+
+
+def test_post_sample_talker_mtp_skips_stale_epoch_after_metadata_merge() -> None:
+    depformer_batches: list[int] = []
+    recorded: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+
+    class _EchoDepformer:
+        def __call__(self, text_token, hidden, *, audio_tokens, audio_provided, num_steps):
+            depformer_batches.append(int(text_token.shape[0]))
+            return text_token[:, None].expand(-1, num_steps)
+
+    talker = PersonaPlexTalkerForConditionalGeneration.__new__(PersonaPlexTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._dtype = torch.float32
+    talker.mtp_hidden_size = 2
+    talker.num_active_codebooks = 8
+    talker.depformer = _EchoDepformer()
+    talker._depformer_graphs_enabled = False
+    talker._depformer_graph = None
+    talker._personaplex_duplex_stage0_runtime = SimpleNamespace(
+        prepared_depformer_state=lambda request_id: None,
+        record_sample=lambda *, request_id, text_token, effective_codes: recorded.append(
+            (request_id, text_token.clone(), effective_codes.clone())
+        ),
+    )
+    talker.gpu_resident_buffer_keys = set()
+
+    buffers = {
+        "old": {
+            "req_id": "old",
+            "duplex": {"data_plane": True, "session_id": "session", "epoch": 0},
+        },
+        "replacement": {
+            "req_id": "replacement",
+            "duplex": {"data_plane": True, "session_id": "session", "epoch": 1},
+            "pplex_depformer_audio_tokens": torch.zeros(16, dtype=torch.long),
+            "pplex_depformer_audio_provided": torch.zeros(16, dtype=torch.bool),
+        },
+    }
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = talker
+    runner.requests = {req_id: SimpleNamespace() for req_id in buffers}
+    runner.model_intermediate_buffer = buffers
+    runner.use_async_scheduling = False
+
+    _, _, stale_update = talker._stale_append_passthrough(torch.zeros(1, dtype=torch.long), 1)
+    runner._update_intermediate_buffer("old", stale_update)
+    assert buffers["old"]["duplex"] == {
+        "data_plane": True,
+        "session_id": "session",
+        "epoch": 0,
+        "stage0_stale": True,
+    }
+
+    multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["old", "replacement"],
+        valid_sampled_token_ids=[[101], [202]],
+        sampled_token_ids=torch.tensor([[101], [202]], dtype=torch.long),
+        invalid_req_indices=[],
+        sample_hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        multimodal_outputs=None,
+    )
+
+    assert depformer_batches == [1]
+    assert [row[0] for row in recorded] == ["replacement"]
+    audio = multimodal["codes"]["audio"]
+    assert audio[0].numel() == 0
+    assert audio[1].tolist() == [[202] * 8]
 
 
 def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:

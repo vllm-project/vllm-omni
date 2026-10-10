@@ -1477,6 +1477,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
                 continue
             duplex_indices.append(idx)
+            # Clear this row's prior audio below, but never run MTP for a stale epoch.
+            if duplex.get("stage0_stale") is True:
+                continue
             if use_async_scheduling:
                 if idx in invalid_indices:
                     continue
