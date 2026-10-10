@@ -538,14 +538,15 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     """Install the Wan VAE decoder fast path on every diffusers Wan VAE of the pipeline.
 
     Controlled by ``od_config.vae_fast_path`` (``off`` / ``lossless`` /
-    ``channels_last``). Only CUDA is supported; other platforms keep the
-    reference diffusers decoder. Failures never abort model loading.
+    ``channels_last``). CUDA supports the complete fast path. Ascend supports
+    the lossless causal-Conv3D spatial-padding optimization. Other platforms
+    keep the reference diffusers decoder. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
     if level == "off":
         return
-    if not current_omni_platform.is_cuda():
-        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
+    if not (current_omni_platform.is_cuda() or current_omni_platform.is_npu()):
+        logger.debug("Wan VAE fast path is only supported on CUDA and Ascend; skipping")
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan

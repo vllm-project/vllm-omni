@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Instance-level installer for the Wan VAE decoder fast path."""
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 REPORT_ATTR = "_vllm_omni_wan_fastpath_report"
 _UNDO_ATTR = "_vllm_omni_wan_fastpath_undo"
 
-_REPLACEMENT_FORWARDS = {
+_REPLACEMENT_FORWARDS: Mapping[type[nn.Module], Callable[..., Any]] = {
     WanDecoder3d: forwards.decoder_forward,
     WanCausalConv3d: forwards.causal_conv_forward,
     WanResidualBlock: forwards.residual_block_forward,
@@ -145,6 +145,14 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     if isinstance(parallel_mode, str) and parallel_mode.startswith("spatial_shard"):
         return _skip(level, f"vae_parallel_mode={parallel_mode!r} is not supported")
 
+    device = next((p.device for p in decoder.parameters()), torch.device("cpu"))
+    npu_spatial_padding_only = device.type == "npu"
+    if npu_spatial_padding_only and level == "channels_last":
+        return _skip(level, "channels_last is only supported on CUDA")
+    replacements: Mapping[type[nn.Module], Callable[..., Any]] = (
+        {WanCausalConv3d: forwards.causal_conv_forward} if npu_spatial_padding_only else _REPLACEMENT_FORWARDS
+    )
+
     modules = [(f"decoder.{name}" if name else "decoder", module) for name, module in decoder.named_modules()]
     post_quant_conv = getattr(vae, "post_quant_conv", None)
     if type(post_quant_conv) is WanCausalConv3d:
@@ -153,20 +161,21 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     convs: list[nn.Module] = []
     bypassed: set[nn.Module] = set()
     for _, module in modules:
-        replacement = _REPLACEMENT_FORWARDS.get(type(module))
-        if forwards.is_diffusers_rms_norm(module):
+        replacement = replacements.get(type(module))
+        if not npu_spatial_padding_only and forwards.is_diffusers_rms_norm(module):
             replacement = forwards.rms_norm_forward
             bypassed.add(module)
         if replacement is not None:
             bindings.append((module, replacement))
         if isinstance(module, (nn.Conv2d, nn.Conv3d)):
             convs.append(module)
-        if type(module) in (WanResample, DupUp3D, nn.SiLU) or (
-            type(module) is WanCausalConv3d and module is not post_quant_conv
-        ):
-            bypassed.add(module)
-        if type(module) is WanResample and forwards._is_upsample_conv_pair(module.resample):
-            bypassed.update((module.resample, module.resample[1]))
+        if not npu_spatial_padding_only:
+            if type(module) in (WanResample, DupUp3D, nn.SiLU) or (
+                type(module) is WanCausalConv3d and module is not post_quant_conv
+            ):
+                bypassed.add(module)
+            if type(module) is WanResample and forwards._is_upsample_conv_pair(module.resample):
+                bypassed.update((module.resample, module.resample[1]))
 
     replaced = {module for module, _ in bindings}
     for name, module in modules:
@@ -184,7 +193,6 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
         if module in bypassed and (module._forward_pre_hooks or module._forward_hooks):
             return _skip(level, f"{name} has forward hooks that the fast path would bypass")
 
-    device = next((p.device for p in decoder.parameters()), torch.device("cpu"))
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
     if device.type == "cuda":
         fused_silu_dtypes = frozenset(

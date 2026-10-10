@@ -169,6 +169,20 @@ def sync() -> None:
         dist.barrier()
 
 
+def reset_peak_memory_stats(device: torch.device) -> None:
+    """Reset peak allocation through the active device module.
+
+    PyTorch's generic accelerator memory API does not yet dispatch to all
+    out-of-tree accelerators, including torch-npu.
+    """
+    torch.get_device_module(device).reset_peak_memory_stats(device)
+
+
+def max_memory_allocated(device: torch.device) -> int:
+    """Return peak allocation through the active device module."""
+    return int(torch.get_device_module(device).max_memory_allocated(device))
+
+
 def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
     mse = torch.mean((a.float() - b.float()) ** 2).item()
     return math.inf if mse == 0 else 10 * math.log10(4.0 / mse)  # outputs live in [-1, 1]
@@ -231,7 +245,7 @@ def run_level(
     for _ in range(args.warmup):
         decode(vae, latents)
     sync()
-    torch.accelerator.reset_peak_memory_stats()
+    reset_peak_memory_stats(device)
     timings = []
     output = None
     for _ in range(args.iters):
@@ -240,7 +254,7 @@ def run_level(
         output = decode(vae, latents)
         sync()
         timings.append(time.perf_counter() - start)
-    peak = torch.tensor(torch.accelerator.max_memory_allocated() / 2**30, device=device)
+    peak = torch.tensor(max_memory_allocated(device) / 2**30, device=device)
     if dist.is_initialized():
         dist.all_reduce(peak, op=dist.ReduceOp.MAX)  # the largest rank decides whether the config fits
     stats = {
@@ -306,12 +320,12 @@ def run_first_frame_ablation(args: argparse.Namespace, dtype: torch.dtype, devic
         for arm in arms:
             with patch.object(forwards, "_first_frame_conv2d", helpers[arm]):
                 sync()
-                torch.accelerator.reset_peak_memory_stats()
+                reset_peak_memory_stats(device)
                 start = time.perf_counter()
                 output = decode(vae, latents)
                 sync()
                 elapsed = (time.perf_counter() - start) * 1000
-                peak = torch.accelerator.max_memory_allocated()
+                peak = max_memory_allocated(device)
             measurements.append({"arm": arm, "wall_ms": elapsed, "peak_allocated_bytes": peak})
             if len(outputs[arm]) < 2:
                 outputs[arm].append(output.cpu())
@@ -354,8 +368,8 @@ def main() -> None:
     args = parse_args()
     if args.latents and not args.first_frame_ablation:
         raise SystemExit("--latents requires --first-frame-ablation")
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA device required")
+    if not torch.accelerator.is_available():
+        raise SystemExit("Accelerator device required")
     rank, world_size = init_distributed()
     parallel = args.vae_patch_parallel_size > 1
     if parallel and world_size < args.vae_patch_parallel_size:
@@ -363,9 +377,13 @@ def main() -> None:
             f"--vae-patch-parallel-size {args.vae_patch_parallel_size} needs torchrun with at least that many "
             f"processes (WORLD_SIZE={world_size})"
         )
-    device = torch.device("cuda", torch.accelerator.current_device_index()) if world_size > 1 else torch.device("cuda")
+    accelerator = torch.accelerator.current_accelerator()
+    assert accelerator is not None
+    device = torch.device(accelerator.type, torch.accelerator.current_device_index()) if world_size > 1 else accelerator
     dtype = DTYPES[args.dtype]
     if args.first_frame_ablation:
+        if accelerator.type != "cuda":
+            raise SystemExit("--first-frame-ablation requires CUDA")
         if world_size != 1 or parallel:
             raise SystemExit("--first-frame-ablation requires one GPU")
         with torch.backends.cudnn.flags(benchmark=False, allow_tf32=False):
@@ -377,6 +395,8 @@ def main() -> None:
             raise SystemExit(f"unknown fast-path level {level!r}; choose from {VAE_FAST_PATH_LEVELS}")
     if "off" not in levels:
         levels = ["off", *levels]
+    if args.profile and accelerator.type != "cuda":
+        raise SystemExit("--profile currently requires CUDA")
 
     if rank == 0:
         parallel_desc = f" vae_parallel={args.vae_parallel_mode}x{args.vae_patch_parallel_size}" if parallel else ""

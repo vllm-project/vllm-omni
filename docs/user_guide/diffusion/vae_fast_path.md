@@ -6,9 +6,11 @@ end-to-end time decoding latents to pixels. The decoder is a chunked 3D
 convolutional network whose reference implementation in diffusers moves every
 activation through memory several times per layer (normalization, activation,
 causal padding, feature-cache bookkeeping, shortcut upsampling). vLLM-Omni
-installs a fast path on every loaded Wan VAE that fuses this data movement into
-a handful of Triton kernels. The opt-in `channels_last` level also specializes
-first-frame convolutions that have no history.
+installs a fast path on every supported Wan VAE. CUDA fuses this data movement
+into a handful of Triton kernels. Ascend delegates spatial padding to Conv3D
+after checking bitwise equivalence, avoiding the materialized padded tensor.
+The opt-in CUDA `channels_last` level also specializes first-frame convolutions
+that have no history.
 
 ## Levels
 
@@ -17,7 +19,7 @@ The fast path is controlled by `--vae-fast-path` (engine argument
 
 | Level | Default | Output vs. diffusers | What it does |
 | --- | --- | --- | --- |
-| `lossless` | yes | bit-identical | Fused RMSNorm epilogue, fused causal-conv input assembly and cache refresh, fused shortcut upsampling and residual adds (with the neighbouring convolution biases folded in), single-pass nearest 2x upsampling, preallocated output assembly. |
+| `lossless` | yes | bit-identical | On CUDA: fused RMSNorm epilogue, causal-conv input assembly and cache refresh, shortcut upsampling and residual adds, nearest 2x upsampling, and preallocated output assembly. On Ascend: internal causal-Conv3D spatial padding. |
 | `channels_last` | no | within tolerance (PSNR typically > 60 dB) | Everything in `lossless`, plus channels-last convolution weights, a single-pass channels-last RMSNorm+SiLU kernel that also absorbs the preceding `conv1` bias, and Conv2d for supported single-frame causal convolutions without history. |
 | `off` | no | bit-identical | Reference diffusers decoder. |
 
@@ -42,7 +44,10 @@ stages:
 
 ## Behavior and limitations
 
-- Only CUDA is supported. On other platforms the reference decoder runs.
+- CUDA supports the complete fast path. On Ascend, `lossless` avoids
+  materializing spatial padding for Wan causal Conv3D after a one-time bitwise
+  check for each module and input shape; the remaining decoder operations use
+  their reference implementations. Other platforms use the reference decoder.
 - The fast path is installed once per VAE instance when the pipeline is
   initialized. It rebinds the forwards of the loaded decoder modules; parameter
   names, `state_dict` keys and weight loading are unchanged.
@@ -115,6 +120,15 @@ python benchmarks/diffusion/bench_wan_vae_decode.py \
 The default input is a seeded latent tensor. `--latents /path/to/latents.pt`
 can instead load a saved VAE input after latent mean/std scaling; the benchmark
 selects the temporal prefix requested by `--frames` and checks its shape.
+
+On Ascend, compare the reference decoder with the lossless internal-padding
+path using the same command and an installed Wan-based pipeline:
+
+```bash
+python benchmarks/diffusion/bench_wan_vae_decode.py \
+    --model /path/to/Helios-Distilled --size 640x384 --frames 33 \
+    --dtype fp32 --fast-path off,lossless --warmup 1 --iters 5
+```
 
 The same script benchmarks multi-GPU VAE decode when launched with `torchrun`;
 the decode is timed across all ranks and rank 0 reports:
