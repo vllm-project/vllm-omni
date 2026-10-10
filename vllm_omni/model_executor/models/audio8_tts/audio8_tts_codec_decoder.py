@@ -101,6 +101,7 @@ class Audio8TTSCodecDecoder(nn.Module):
             device=device,
             dtype=self._codec_dtype,
             role="decode",
+            vllm_config=self.vllm_config,
             **self._codec_kwargs,
         )
         self._codec_device = torch.device(device)
@@ -207,6 +208,9 @@ class Audio8TTSCodecDecoder(nn.Module):
                 context_frames[index] = int(meta.get("left_context_size", 0) or 0)
 
         audios: list[torch.Tensor] = [empty] * num_req
+        total_frames_by_req: list[int] = [0] * num_req
+        decode_indices: list[int] = []
+        decode_codes: list[torch.Tensor] = []
         for index, request_ids in enumerate(per_request_ids):
             codes_qf = (
                 self._codes_from_runtime_info(runtime_additional_information[index], ids.device)
@@ -247,21 +251,26 @@ class Audio8TTSCodecDecoder(nn.Module):
                     self._sample_rate,
                 )
 
-            with torch.amp.autocast("cuda", enabled=False):
-                # Move codes to the codec's device explicitly: a mismatch here
-                # silently falls back to CPU or raises deep inside the decoder.
-                waveform = codec.decode(codes_qf.unsqueeze(0).to(device=self._codec_device))
-            waveform = waveform.reshape(-1).to(dtype=torch.float32)
+            total_frames_by_req[index] = total_frames
+            decode_indices.append(index)
+            decode_codes.append(codes_qf.to(device=self._codec_device))
 
-            # Trim the left-context prefix proportionally: the codec's padding /
-            # rounding means the decoded length is not exactly
-            # frames * frame_size.
-            if context_frames[index] > 0:
-                cut = int(round(context_frames[index] / total_frames * int(waveform.shape[0])))
-                cut = max(0, min(cut, int(waveform.shape[0])))
-                waveform = waveform[cut:]
-            if waveform.numel() > 0:
-                audios[index] = waveform.contiguous()
+        if decode_codes:
+            with torch.amp.autocast("cuda", enabled=False):
+                waveforms = codec.decode(decode_codes)
+
+            for index, waveform in zip(decode_indices, waveforms, strict=True):
+                waveform = waveform.reshape(-1).to(dtype=torch.float32)
+
+                # Trim the left-context prefix proportionally: the codec's padding /
+                # rounding means the decoded length is not exactly
+                # frames * frame_size.
+                if context_frames[index] > 0:
+                    cut = int(round(context_frames[index] / total_frames_by_req[index] * int(waveform.shape[0])))
+                    cut = max(0, min(cut, int(waveform.shape[0])))
+                    waveform = waveform[cut:]
+                if waveform.numel() > 0:
+                    audios[index] = waveform.contiguous()
 
         return OmniOutput(
             text_hidden_states=None,
