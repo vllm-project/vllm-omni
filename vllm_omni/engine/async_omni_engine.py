@@ -31,7 +31,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams, disable_watermarking
 
 logger = init_logger(__name__)
 
@@ -283,6 +283,13 @@ class AsyncOmniEngine(OmniEngineBase):
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
+
+        # Opting out on any stage opts the whole request out; pooling stages never watermark
+        if not all(
+            params.watermarking for params in effective_sampling_params_list if isinstance(params, OmniSamplingParams)
+        ):
+            effective_sampling_params_list = disable_watermarking(effective_sampling_params_list)
+
         params = effective_sampling_params_list[0]
 
         # Keep the original prompt for downstream stages (they need the raw

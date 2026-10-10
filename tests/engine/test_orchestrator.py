@@ -12,9 +12,11 @@ import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import janus
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
@@ -43,6 +45,7 @@ from vllm_omni.engine.orchestrator import (
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.watermarking import AudioTensor, AudioWatermarkerBase
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -645,6 +648,158 @@ async def test_run_single_stage_diffusion(orchestrator_factory) -> None:
         assert output_msg.finished is True
         assert output_msg.engine_outputs.request_id == "req-diff"
         assert "req-diff" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_type", ["llm", "diffusion"])
+@pytest.mark.parametrize("watermarking", [True, False])
+async def test_request_watermarking(stage_type: str, watermarking: bool) -> None:
+    watermarker = MagicMock()
+    watermarker.watermark_output.side_effect = lambda _request_id, samples, _metadata: samples
+
+    request = SimpleNamespace(request_id="r")
+    params = SamplingParams(watermarking=watermarking)
+    stage_pool_kwargs = {}
+
+    # Build the output for the correct stage type
+    if stage_type == "llm":
+        processor = FakeOutputProcessor()
+        processor.request_states = {"r": object()}
+        stage_pool_kwargs["output_processor"] = processor
+        output = OmniEngineCoreOutput(
+            request_id="r",
+            new_token_ids=[],
+            multimodal_output={"model_outputs": torch.zeros(8), "sr": 24_000},
+        )
+    else:
+        output = OmniRequestOutput.from_diffusion(
+            request_id="r",
+            images=[],
+            multimodal_output={
+                "audio": torch.zeros(1, 1, 8),
+                "audio_sample_rate": 44_100,
+            },
+            final_output_type="audio",
+        )
+
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type=stage_type, final_output=True, final_output_type="audio")],
+        watermarkers={"audio": watermarker},
+        **stage_pool_kwargs,
+    )
+
+    await pool.submit_initial("r", SimpleNamespace(sampling_params_list=[params]), request)
+
+    # Call the corresponding stage processor based on the type
+    if stage_type == "diffusion":
+        await pool.process_diffusion_output(output)
+    else:
+        await pool.process_llm_raw_outputs(
+            0,
+            SimpleNamespace(outputs=[output], timestamp=1.0, scheduler_stats=None),
+        )
+
+    # Then ensure the watermarking behavior is as expected
+    if watermarking:
+        watermarker.watermark_output.assert_called_once()
+    else:
+        watermarker.watermark_output.assert_not_called()
+
+
+class _OffsetAudioWatermarker(AudioWatermarkerBase[None]):
+    """A fake watermarker that just adds one to audio."""
+
+    def _new_audio_state(self, data: AudioTensor) -> None:
+        return None
+
+    def _watermark_audio(self, data: AudioTensor, state: None) -> AudioTensor:
+        return AudioTensor(data.samples + 1, data.sample_rate)
+
+    def _is_audio_watermarked(self, data: AudioTensor) -> bool:
+        raise NotImplementedError("detection is not exercised in these tests")
+
+
+def _audio_stage_pool(client: FakeStageClient, *, output_processor: FakeOutputProcessor | None = None) -> StagePool:
+    return StagePool(
+        0,
+        client,
+        output_processor=output_processor,
+        watermarkers={"audio": _OffsetAudioWatermarker()},
+        strict_watermarking=True,
+    )
+
+
+def _audio_stage_client(stage_type: str) -> FakeStageClient:
+    return FakeStageClient(stage_type=stage_type, final_output=True, final_output_type="audio")
+
+
+def _diffusion_audio_output(request_id: str, sample_rate: int | None) -> OmniRequestOutput:
+    return OmniRequestOutput.from_diffusion(
+        request_id=request_id,
+        images=[],
+        multimodal_output={"audio": torch.zeros(1, 1, 8), "audio_sample_rate": sample_rate},
+        final_output_type="audio",
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_watermark_failure_replaces_llm_output_with_error() -> None:
+    """Ensure strict LLM watermark failures never emit the unwatermarked output."""
+    processor = FakeOutputProcessor(request_outputs=[_build_request_output("bad"), _build_request_output("good")])
+    processor.request_states = {"bad": object(), "good": object()}
+    pool = _audio_stage_pool(_audio_stage_client("llm"), output_processor=processor)
+    params = SimpleNamespace(sampling_params_list=[SamplingParams()])
+    for request_id in ("bad", "good"):
+        await pool.submit_initial(request_id, params, SimpleNamespace(request_id=request_id))
+    raw_outputs = [
+        OmniEngineCoreOutput(request_id="bad", new_token_ids=[], multimodal_output={"model_outputs": torch.zeros(8)}),
+        OmniEngineCoreOutput(
+            request_id="good", new_token_ids=[], multimodal_output={"model_outputs": torch.zeros(8), "sr": 24_000}
+        ),
+    ]
+
+    outputs = await pool.process_llm_raw_outputs(
+        0, SimpleNamespace(outputs=raw_outputs, timestamp=1.0, scheduler_stats=None)
+    )
+
+    good_output, bad_output = outputs
+    assert good_output.request_id == "good"
+    assert (bad_output.request_id, bad_output.error) == ("bad", "Failed to watermark output")
+
+
+@pytest.mark.asyncio
+async def test_strict_watermark_failure_is_request_scoped(orchestrator_factory) -> None:
+    """Ensure a strict watermark failure only fails its request and the orchestrator keeps serving."""
+    stage0 = _audio_stage_client("diffusion")
+    orchestrator_fixture = orchestrator_factory([stage0], stage_pools=[_audio_stage_pool(stage0)])
+    try:
+        for request_id in ("req-bad", "req-good"):
+            await _enqueue_add_request(
+                orchestrator_fixture,
+                request_id=request_id,
+                prompt={"prompt": "a drum loop"},
+                original_prompt={"prompt": "a drum loop"},
+                sampling_params_list=[OmniDiffusionSamplingParams()],
+                final_stage_id=0,
+            )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 2)
+        stage0.push_diffusion_output(_diffusion_audio_output("req-bad", sample_rate=None))
+        stage0.push_diffusion_output(_diffusion_audio_output("req-good", sample_rate=16_000))
+
+        # Outputs are pushed in order, so the failed request's error arrives first
+        error_msg = orchestrator_fixture.output_sync_q.get(timeout=2.0)
+        output_msg = orchestrator_fixture.output_sync_q.get(timeout=2.0)
+
+        # Ensure that the bad req is sad, the other one isn't, and that the orchestrator is alive
+        assert isinstance(error_msg, ErrorMessage)
+        assert isinstance(output_msg, OutputMessage)
+        assert (error_msg.request_id, error_msg.fatal) == ("req-bad", False)
+        assert output_msg.request_id == "req-good"
+        assert torch.equal(output_msg.engine_outputs.multimodal_output["audio"], torch.ones(1, 1, 8))
+        assert orchestrator_fixture.thread.is_alive()
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
@@ -1959,6 +2114,65 @@ async def test_stage_pool_process_llm_raw_outputs_mutates_iteration_stats() -> N
     await pool.process_llm_raw_outputs(0, raw_outputs, iteration_stats=iteration_stats)
 
     assert iteration_stats.num_generation_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_watermark_cancellation_waits_before_abort() -> None:
+    """Ensure cancellation waits for watermark work before releasing the lock."""
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+
+    def watermark_output(_request_id, samples, _metadata):
+        worker_started.set()
+        try:
+            release_worker.wait()
+            return samples
+        finally:
+            worker_finished.set()
+
+    watermarker = MagicMock()
+    watermarker.watermark_output.side_effect = watermark_output
+    request_output = _build_request_output("r", finished=False)
+    engine_output = OmniEngineCoreOutput(
+        request_id="r",
+        new_token_ids=[],
+        multimodal_output={"model_outputs": torch.zeros(8), "sr": 24_000},
+    )
+    client = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    processor = FakeOutputProcessor(request_outputs=[request_output])
+    processor.request_states = {"r": object()}
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        watermarkers={"audio": watermarker},
+    )
+    pool._request_bindings["r"] = 0
+    pool._request_watermarking["r"] = True
+
+    processing = asyncio.create_task(
+        pool.process_llm_raw_outputs(
+            0,
+            SimpleNamespace(outputs=[engine_output], timestamp=1.0, scheduler_stats=None),
+        )
+    )
+    await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=5)
+    processing.cancel()
+    aborting = asyncio.create_task(pool.abort_requests(["r"]))
+    await asyncio.sleep(0)
+
+    assert not aborting.done()
+    assert not worker_finished.is_set()
+
+    release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await processing
+    assert worker_finished.is_set()
+    await aborting
+    watermarker.watermark_output.assert_called_once()
+    watermarker.discard_request_state.assert_called_once_with("r")
 
 
 @pytest.mark.asyncio

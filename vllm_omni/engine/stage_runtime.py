@@ -20,6 +20,7 @@ import janus
 from vllm.logger import init_logger
 
 from vllm_omni.config.omni_config import BaseVllmOmniStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -174,6 +175,7 @@ class StageRuntime:
         parallel_stage_init: bool = False,
         log_stats: bool = False,
         client_config: OmniClientConfig | None = None,
+        watermark_config: WatermarkConfig | None = None,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -187,6 +189,7 @@ class StageRuntime:
         # keeps the legacy per-device LOCK_EX serialization.
         self._parallel_stage_init = parallel_stage_init
         self._log_stats = log_stats
+        self._watermark_config = watermark_config
         self._num_stages = len(stage_configs)
         self._client_count = int((client_config or {}).get("client_count", 1))
         self._client_index = int((client_config or {}).get("client_index", 0))
@@ -1311,7 +1314,17 @@ class StageRuntime:
             clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
-            if plan.replicas[0].metadata.stage_type != "diffusion":
+            metadata = plan.replicas[0].metadata
+            # Initialize watermarkers based on the output type as needed
+            watermarkers = (
+                StagePool.initialize_watermarkers(
+                    metadata.final_output_type,
+                    self._watermark_config,
+                )
+                if metadata.final_output
+                else {}
+            )
+            if metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
@@ -1327,6 +1340,8 @@ class StageRuntime:
                     clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
+                    watermarkers=watermarkers,
+                    strict_watermarking=self._watermark_config is not None and self._watermark_config.strict,
                 )
             )
 
@@ -1361,6 +1376,7 @@ class DistStageRuntime(StageRuntime):
         omni_master_port: int,
         tokenizer: str | None = None,
         log_stats: bool = False,
+        watermark_config: WatermarkConfig | None = None,
         omni_dp_size_local: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
@@ -1376,6 +1392,7 @@ class DistStageRuntime(StageRuntime):
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
+            watermark_config=watermark_config,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1703,6 +1720,7 @@ def create_stage_runtime(
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
     log_stats: bool = False,
     client_config: OmniClientConfig | None = None,
+    watermark_config: WatermarkConfig | None = None,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1717,6 +1735,7 @@ def create_stage_runtime(
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
+            watermark_config=watermark_config,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1735,4 +1754,5 @@ def create_stage_runtime(
         parallel_stage_init=parallel_stage_init,
         log_stats=log_stats,
         client_config=client_config,
+        watermark_config=watermark_config,
     )

@@ -59,6 +59,7 @@ from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfi
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
+from vllm_omni.inputs.data import disable_watermarking
 
 if TYPE_CHECKING:
     import janus
@@ -490,6 +491,8 @@ class DuplexSessionManager:
             raise TypeError("duplex plugin must return sampling parameters as a tuple")
         if len(configured) != len(defaults):
             raise ValueError("duplex plugin must return one sampling parameter per stage")
+        if not session.config.watermarking:
+            configured = tuple(disable_watermarking(configured))
         return configured
 
     @staticmethod

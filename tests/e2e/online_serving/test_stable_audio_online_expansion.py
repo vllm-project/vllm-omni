@@ -8,11 +8,16 @@ Stable Audio Open is served through the OpenAI-compatible
 """
 
 import os
+from io import BytesIO
 
 import pytest
+import requests
+import soundfile
+import torch
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams
+from vllm_omni.watermarking import AudioSealWatermarker, AudioTensor
 
 # Stable Audio Open is gated; override to a local bundle locally if needed.
 STABLE_AUDIO_TEST_MODEL = os.environ.get("STABLE_AUDIO_TEST_MODEL", "stabilityai/stable-audio-open-1.0")
@@ -24,7 +29,10 @@ SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"})
 def _stable_audio_server_cases(model: str):
     return [
         pytest.param(
-            OmniServerParams(model=model),
+            OmniServerParams(
+                model=model,
+                server_args=["--watermark-config", '{"modalities":{"audio":{"algorithm":"audioseal"}}}'],
+            ),
             id="t2a",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
@@ -34,17 +42,22 @@ def _stable_audio_server_cases(model: str):
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _stable_audio_server_cases(STABLE_AUDIO_TEST_MODEL), indirect=True)
-def test_stable_audio_t2a_online(
+def test_stable_audio_t2a_online_with_watermarking(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client,
 ) -> None:
-    """Stable Audio Open text-to-audio: `/v1/audio/generate` returns a non-empty WAV.
+    """Stable Audio Open text-to-audio: `/v1/audio/generate` returns a non-empty
+    WAV.
 
     Uses tiny steps / short duration to keep CI light, matching the offline smoke
     test in `tests/e2e/offline_inference/test_stable_audio_expansion.py`.
+
+    We also check to ensure that we can watermark through the server's diffusion path
+    using this model.
     """
-    request_config = {
-        "json": {
+    with requests.post(
+        f"{online_client.base_url}/v1/audio/generate",
+        json={
             "model": omni_server.model,
             "input": T2A_PROMPT,
             "audio_length": 2.0,
@@ -54,10 +67,16 @@ def test_stable_audio_t2a_online(
             "seed": 42,
             "response_format": "wav",
         },
-        "timeout": 300,
-    }
-    responses = openai_client.send_audio_generate_http_request(request_config)
-    assert responses, "no response from /v1/audio/generate"
-    resp = responses[0]
-    assert resp.success, f"audio generate failed: {resp.status_code} {resp.error_message}"
-    assert resp.status_code == 200
+        timeout=300,
+    ) as response:
+        assert response.status_code == 200, response.text
+        content = response.content
+
+    audio, sample_rate = soundfile.read(BytesIO(content), dtype="float32", always_2d=True)
+    samples = torch.from_numpy(audio.T.copy()).unsqueeze(0)
+
+    watermarker = AudioSealWatermarker()
+    try:
+        assert watermarker.is_watermarked(AudioTensor(samples, sample_rate))
+    finally:
+        watermarker.close()

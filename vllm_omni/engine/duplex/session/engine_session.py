@@ -1755,6 +1755,7 @@ class DuplexEngineSession:
             "overlap_barge_in_ms": self.config.overlap_barge_in_ms,
             "overlap_silence_rms": self.config.overlap_silence_rms,
             "playback_commit_policy": self.config.playback_commit_policy,
+            "watermarking": self.config.watermarking,
             "playback": self.playback.as_dict(),
             "capabilities": self.capabilities.as_dict(),
         }

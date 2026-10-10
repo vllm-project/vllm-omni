@@ -754,3 +754,64 @@ async def test_rejected_response_create_does_not_cancel_active_response() -> Non
     assert not connection._response_cancel_event.is_set()
     assert len(websocket.messages) == 1
     assert "exceeds the model's input token limit" in websocket.messages[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_updates", "expected_wm_vals", "expected_error_codes", "expected_num_updated"),
+    [
+        ([], [], [], 0),
+        ([{"watermarking": False}, {"instructions": "Be brief."}], [False], [], 2),
+        ([{"watermarking": None}], [], ["invalid_request_error"], 0),
+    ],
+)
+async def test_realtime_watermarking_follows_session_updates(
+    session_updates,
+    expected_wm_vals,
+    expected_error_codes,
+    expected_num_updated,
+) -> None:
+    """Ensure responses use the session's latest valid watermarking setting and invalid updates are not applied."""
+    submitted_wm_vals: list[bool] = []
+
+    async def generate(**kwargs: Any):
+        if "watermarking" in kwargs:
+            submitted_wm_vals.append(kwargs["watermarking"])
+        yield SimpleNamespace(final_output_type="text", outputs=[])
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    for session in session_updates:
+        event = types.SessionUpdateEvent.model_validate(
+            {"type": "session.update", "session": {"type": "realtime", **session}}
+        )
+        await connection._dispatch_event(event)
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["text"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+    events = _websocket_events(websocket)
+    assert events and events[-1]["response"]["status"] == "completed"
+
+    actual_error_codes = [event["error"]["code"] for event in events if event["type"] == "error"]
+    actual_num_updated = sum(event["type"] == "session.updated" for event in events)
+
+    # Ensure the watermark value submitted to generate is correct
+    assert submitted_wm_vals == expected_wm_vals
+    # Ensure that we have the right numbers of errors vs successful updates
+    assert actual_error_codes == expected_error_codes
+    assert actual_num_updated == expected_num_updated

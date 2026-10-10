@@ -12,6 +12,7 @@ from dataclasses import FrozenInstanceError, dataclass, field
 from typing import Any
 
 import pytest
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import AppendAudio, CloseSession, Commit, DuplexCommand, Heartbeat
@@ -562,6 +563,24 @@ async def test_sampling_params_for_validates_the_plugin_policy() -> None:
         assert result.ok is False
         assert result.error_code == "invalid_argument"
         assert "as a tuple" in str(result.error_message)
+
+
+@pytest.mark.parametrize("watermarking", [True, False])
+async def test_sampling_params_for_applies_session_watermarking(watermarking: bool) -> None:
+    class SamplingParamsStagePort(FakeStagePort):
+        def sampling_defaults(self) -> tuple[SamplingParams, ...]:
+            return tuple(SamplingParams() for _ in range(self.stage_count))
+
+    class PassthroughSamplingPlugin(FakePlugin):
+        def configure_sampling_params(self, *, runtime_config, defaults):
+            return tuple(defaults)
+
+    async with Harness.create(plugin=PassthroughSamplingPlugin(), stage_port=SamplingParamsStagePort()) as harness:
+        await harness.open("sid-wm", DuplexSessionConfig(model="fake-model", watermarking=watermarking))
+
+        sampling_params = harness.manager.sampling_params_for(harness.session("sid-wm"))
+
+        assert [params.watermarking for params in sampling_params] == [watermarking] * len(sampling_params)
 
 
 async def test_duplicate_open_is_rejected_with_session_exists() -> None:
