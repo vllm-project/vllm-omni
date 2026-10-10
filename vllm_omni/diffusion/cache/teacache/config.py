@@ -124,13 +124,17 @@ _MODEL_COEFFICIENTS = {
         -4.232669906169421e00,
         2.173782527946167e-01,
     ],
-    # SD3 / SD3.5 coefficients (estimated for SD3.5).
+    # SD3.5 coefficients calibrated on stabilityai/stable-diffusion-3.5-medium:
+    # 70 Parti prompts x {28, 50} steps, 1024x1024, guidance_scale=4.5, positive and
+    # negative CFG calls paired within their own branch (10,640 consecutive-step
+    # pairs), 4th-order np.polyfit (Pearson r = 0.87, R^2 = 0.80).
+    # Not calibrated on stable-diffusion-3.5-large, which shares this class name.
     "SD3Transformer2DModel": [
-        -4.277698959844608e03,
-        5.002450261031280e02,
-        5.621228389518113e01,
-        -1.353017614952596e00,
-        3.800369667338725e-02,
+        -2.574165934925785e03,
+        7.589663246807888e02,
+        -4.549113078382407e01,
+        3.307856517911624e00,
+        -2.186532694828146e-03,
     ],
 }
 
@@ -138,6 +142,11 @@ _DEFAULT_REL_L1_THRESH = 0.2
 _MODEL_DEFAULT_REL_L1_THRESH = {
     "MammothModa2Transformer2DModel": 0.075,
     "MiniMaxH3DiTModel": 0.17,
+    # Over the first few steps SD3.5's output changes 10-30% per step while the
+    # modulated input moves 3-6%, so the polynomial under-predicts there. At 0.2
+    # TeaCache skips steps that set the composition and returns a different image
+    # (mean SSIM vs. uncached 0.79 at 28 steps); 0.1 keeps it at 0.90.
+    "SD3Transformer2DModel": 0.1,
 }
 
 

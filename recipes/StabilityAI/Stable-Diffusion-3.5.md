@@ -138,6 +138,46 @@ print('saved output.png')
 - `negative_prompt` requires `guidance_scale > 1` to take effect; SD3 defaults to 1.0 (no CFG).
 - 2048×2048 fits within 48 GB but leaves little headroom (~45.5 GiB used out of 49 GiB).
 
+### 1x NVIDIA RTX 5090 32GB — stable-diffusion-3.5-medium with TeaCache
+
+#### Environment
+
+- OS: Ubuntu 24.04
+- Python: 3.12
+- Driver / runtime: NVIDIA driver 580.173.02, CUDA 13.2
+- vLLM version: 0.31.0
+- vLLM-Omni version or commit: `main` at `4c5541c2` plus the SD3.5 TeaCache change
+
+#### Command
+
+```bash
+vllm serve stabilityai/stable-diffusion-3.5-medium --omni --port 8091 --cache-backend tea_cache
+```
+
+#### Verification
+
+Send the same request as in the RTX A6000 medium section above. The server log
+shows `TeaCache applied with rel_l1_thresh=0.1` at start-up.
+
+#### Notes
+
+- Measured offline at 1024×1024 with `guidance_scale=4.5`, 6 prompts × 2 seeds.
+  Each TeaCache image is compared with the uncached image for the same prompt,
+  seed and step count:
+
+  | Steps | Uncached | TeaCache | Speed-up | Mean SSIM (min) |
+  |------:|---------:|---------:|---------:|----------------:|
+  | 28    | 3.77 s   | 2.72 s   | 1.39×    | 0.90 (0.56)     |
+  | 40    | 5.35 s   | 3.23 s   | 1.66×    | 0.91 (0.77)     |
+  | 50    | 6.59 s   | 3.36 s   | 1.96×    | 0.86 (0.67)     |
+
+- Memory usage: peak 20.0 GiB reserved with CFG, the same with and without TeaCache.
+- SD3.5 defaults to `rel_l1_thresh=0.1` instead of the global 0.2. Higher values
+  change the image content on this model rather than just its details (mean
+  SSIM 0.62 at 0.15 and 28 steps), so prefer more steps over a higher threshold.
+- The coefficients were calibrated on the medium checkpoint only; the large
+  checkpoint was not measured.
+
 ## XPU
 
 ### 1x Intel Arc Pro B70 (32 GB) — stable-diffusion-3.5-medium

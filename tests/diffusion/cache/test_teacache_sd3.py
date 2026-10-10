@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
-
-from types import SimpleNamespace
 
 from vllm_omni.diffusion.cache.teacache.extractors import CacheContext, get_extractor
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
@@ -138,4 +138,3 @@ def test_sd3_diffuse_marks_cfg_branches_for_teacache(do_true_cfg: bool) -> None:
     )
 
     assert flags_seen_by_predict == [do_true_cfg] * 3
-
