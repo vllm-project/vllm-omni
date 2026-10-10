@@ -9,7 +9,12 @@ import yaml
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import StageExecutionType
+from vllm_omni.config.stage_config import (
+    StageExecutionType,
+    _apply_platform_overrides,
+    load_deploy_config,
+    merge_pipeline_deploy,
+)
 from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_TURBO_PIPELINE
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
@@ -99,3 +104,22 @@ def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
     # Prompts are token ids and nothing is detokenized. A tokenizer would
     # also have vLLM look in the repo for the config.json it does not ship.
     assert talker["skip_tokenizer_init"] is True and decoder["skip_tokenizer_init"] is True
+
+
+@pytest.mark.parametrize(
+    ("platform", "runner"), [("cuda", "v2"), ("npu", "v1"), ("xpu", "v1"), ("rocm", "v1"), ("musa", "v1")]
+)
+def test_deploy_file_selects_model_runner_v2_where_it_was_run_001(platform: str, runner: str) -> None:
+    """V2 with the native data plane on CUDA; the default runner where V2 is rejected or untried.
+
+    The choice must reach each stage's engine arguments, which is what the
+    workers dispatch on, and on V2 both stages must be on the native plane.
+    """
+    deploy = load_deploy_config(Path(get_deploy_config_path("chatterbox_turbo.yaml")))
+
+    deploy = _apply_platform_overrides(deploy, platform=platform)
+
+    assert deploy.model_runner == runner
+    stages = merge_pipeline_deploy(CHATTERBOX_TURBO_PIPELINE, deploy)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [runner == "v2"] * 2
+    assert [stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in stages] == [True, True]

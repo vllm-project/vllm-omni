@@ -4,6 +4,15 @@
 # ``--no-async-chunk`` to the serve CLI to have stage 1 decode each finished
 # utterance once instead.
 #
+# Runner: both stages run on Model Runner V2 with its native data plane on
+# CUDA, where it was measured: streaming is within a few percent of the
+# default runner at 1 and at 8 concurrent streams. Set ``model_runner: v1``
+# to use the default runner; both are supported. Without streaming
+# (``--no-async-chunk``) V2 is slower, about 0.2 against 0.15 real-time
+# factor on a 24 GB card, because it copies stage 0's hidden states to the
+# host on every step. The ``platforms:`` section at the end keeps V1 where
+# V2 is rejected (NPU, XPU) or has not been run (ROCm, MUSA).
+#
 # Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 runs in float32 (the
 # vocoder is not half-precision safe) and eagerly (its convolutions see a
 # different length every step).
@@ -25,6 +34,7 @@
 # Sized on one 24 GB card (see the recipe for the measurements). TUNE PER
 # GPU: on a slower card lower max_num_seqs before raising the chunk size.
 pipeline: chatterbox_turbo
+model_runner: v2
 async_chunk: true
 connectors:
   connector_of_shared_memory:
@@ -82,3 +92,13 @@ stages:
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
