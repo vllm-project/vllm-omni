@@ -838,6 +838,11 @@ class WanTransformer3DModel(nn.Module):
 
     _hsdp_shard_conditions = [_is_transformer_block]
 
+    # Read by apply_sequence_parallel (hooks/sequence_parallel.py). Wan masks SP padding only when
+    # parallel_config.mask_sp_padding is set (see forward), so the SP hook needs a mask-capable
+    # attention backend only in that case.
+    _sp_padding_mask_optional = True
+
     # Sequence Parallelism for Wan (following diffusers' _cp_plan pattern)
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:

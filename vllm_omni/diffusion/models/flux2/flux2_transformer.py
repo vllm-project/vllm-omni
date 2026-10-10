@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -769,6 +769,12 @@ class Flux2Transformer2DModel(nn.Module):
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
+
+    # Read by apply_sequence_parallel (hooks/sequence_parallel.py). This model masks SP padding only
+    # when parallel_config.mask_sp_padding is set (see forward), so the SP hook needs a mask-capable
+    # attention backend only in that case.
+    _sp_padding_mask_optional = True
+
     _sp_plan = {
         "": {
             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),

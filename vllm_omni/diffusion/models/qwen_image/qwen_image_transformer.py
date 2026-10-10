@@ -1007,6 +1007,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
     _hsdp_shard_conditions = [is_transformer_block_module]
 
+    # Read by apply_sequence_parallel (hooks/sequence_parallel.py). This model masks SP padding only
+    # when parallel_config.mask_sp_padding is set (see forward), so the SP hook needs a mask-capable
+    # attention backend only in that case.
+    _sp_padding_mask_optional = True
+
     # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
     # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
     # a module boundary where _sp_plan can shard hidden_states and vid_freqs together.
