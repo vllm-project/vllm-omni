@@ -316,11 +316,19 @@ class OmniModelConfig(ModelConfig):
 
         omni_cfg._maybe_override_text_config()
         omni_cfg._validate_startup_task_type()
+        omni_cfg._validate_response_judge_config()
 
         if omni_cfg.hf_config is not None:
             omni_cfg.hf_config.architectures = omni_cfg.architectures
 
         return omni_cfg
+
+    def _validate_response_judge_config(self) -> None:
+        from vllm_omni.model_executor.stage_input_processors.response_judge import RESPONSE_JUDGE_STAGE, JudgeSpec
+
+        if self.model_stage == RESPONSE_JUDGE_STAGE:
+            # Reject a bad judge configuration at startup, not on the first turn.
+            JudgeSpec.for_model_config(self)
 
     @classmethod
     def _validate_omni_fields(cls, **omni_kwargs):

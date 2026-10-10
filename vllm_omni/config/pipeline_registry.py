@@ -43,7 +43,10 @@ from vllm_omni.model_executor.models.audex.pipeline import (
 )
 from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
 from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
-from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
+from vllm_omni.model_executor.models.aura_omni.pipeline import (
+    AURA_OMNI_JUDGED_PIPELINE,
+    AURA_OMNI_PIPELINE,
+)
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
     BAGEL_SINGLE_STAGE_PIPELINE,
@@ -140,6 +143,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "audex_tts": AUDEX_TTS_PIPELINE,
     "auk": AUK_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
+    # Opt-in: only reachable through deploy/aura_omni_judged.yaml (``pipeline:`` key).
+    "aura_omni_judged": AURA_OMNI_JUDGED_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,

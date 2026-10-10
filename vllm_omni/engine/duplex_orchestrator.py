@@ -41,6 +41,10 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     build_engine_core_request_from_tokens,
 )
+from vllm_omni.model_executor.stage_input_processors.response_judge import (
+    RESPONSE_JUDGE_STAGE,
+    judge_rejects,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -181,6 +185,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_finished=finished,
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
+            response_judge_rejected=(
+                finished and self._is_response_judge_stage(stage_id) and judge_rejects(output, req_state.streaming)
+            ),
         )
         return runner.on_stage_output(
             stage_id,
@@ -189,6 +196,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request_id=request_id,
             context=context,
         )
+
+    def _is_response_judge_stage(self, stage_id: int) -> bool:
+        stage_vllm_config = getattr(self.stage_pools[stage_id], "stage_vllm_config", None)
+        model_config = getattr(stage_vllm_config, "model_config", None)
+        return getattr(model_config, "model_stage", None) == RESPONSE_JUDGE_STAGE
 
     async def _handle_forward_failure(
         self,
