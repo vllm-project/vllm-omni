@@ -132,10 +132,32 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
     ]
     for stage in stages:
         model_arch = stage.yaml_engine_args["model_arch"]
-        assert stage.yaml_engine_args["hf_overrides"] == {"mimi_cuda_graphs": True}
+        assert stage.yaml_engine_args["hf_overrides"]["mimi_cuda_graphs"] is True
         assert resolve(model_arch, dict(stage.yaml_engine_args["hf_overrides"])).mimi_cuda_graphs is True
         # Without the deploy override the flag keeps its default.
         assert resolve(model_arch, None).mimi_cuda_graphs is False
+
+
+def test_personaplex_deploy_serves_calls_past_the_sliding_window(tmp_path: Path) -> None:
+    """Stage 0's context and the temporal RoPE table both reach an hour of
+    80 ms frames, past the 3000-frame window Helium attends to."""
+    (tmp_path / "config.json").write_text("{}")
+    stage0 = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH))[0].yaml_engine_args
+
+    model_config = OmniEngineArgs(
+        model=str(tmp_path),
+        model_arch=stage0["model_arch"],
+        hf_overrides=dict(stage0["hf_overrides"]),
+        max_model_len=stage0["max_model_len"],
+        skip_tokenizer_init=True,
+        trust_remote_code=True,
+    ).create_model_config()
+
+    temporal = model_config.hf_config.temporal_config
+    assert model_config.hf_text_config is temporal
+    assert temporal.sliding_window == 3000
+    assert temporal.max_position_embeddings == 46_080  # 60 min of 80 ms frames + 1080 of prefill
+    assert model_config.max_model_len == 46_080
 
 
 # --------------------------------------------------------------------------- #

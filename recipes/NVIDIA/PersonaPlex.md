@@ -156,5 +156,20 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
 - Run the client near the server. The 80 ms cadence is sensitive to
   network jitter; over a high-latency link playback can stutter regardless of
   engine speed. On localhost it is smooth.
-- Sliding window is 3000 frames (~4 min). The ring KV recycles beyond that;
-  very long sessions keep running with a rolling context.
+- Sliding window is 3000 frames (~4 min): the model attends to the last four
+  minutes, and Stage 0 frees the KV pages behind the window, so a session's
+  KV stays at one window however long the call runs. The shipped profile
+  caps a call at Stage 0's 46,080-token context (`max_model_len`, with the
+  temporal RoPE table `hf_overrides.temporal_config.max_position_embeddings`
+  sized to match): 60 minutes of 80 ms frames after up to 86 s of persona
+  prefill. The checkpoint itself has no length limit; this is a deployment
+  default. Per-frame host work grows with the call, so a longer cap costs the
+  last minutes of long calls more. To change it, move both numbers together
+  by adding this to the serve command above (two hours here):
+
+  ```bash
+  --stage-overrides '{"0": {"max_model_len": 90000, "hf_overrides": {"temporal_config": {"max_position_embeddings": 90000}}}}'
+  ```
+
+  Use `--stage-overrides` rather than the global `--max-model-len`, which also
+  resizes Stage 1.

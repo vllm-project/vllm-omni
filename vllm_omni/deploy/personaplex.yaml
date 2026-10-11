@@ -16,7 +16,9 @@
 #     decode (Stage 1) frame steps instead replay model-local CUDA graphs
 #     (hf_overrides.mimi_cuda_graphs), bitwise equal to eager. The graphs add
 #     about 80 MiB on Stage 0 and 5 MiB per decoder slot on Stage 1.
-#   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0.
+#   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0,
+#     however long the call: Stage 0 frees the pages behind the window.
+#     Stage 0's max_model_len caps a call, persona prefill included.
 #     To serve more sessions, raise duplex_session.max_sessions and both stages'
 #     max_num_seqs together, and size Stage 0 gpu_memory_utilization for
 #     N x 1.5 GiB of KV: on a 141 GB card, utilization 0.75 holds about 60 full
@@ -57,11 +59,24 @@ stages:
     # Synchronous scheduling puts every waiting frame in one step.
     async_scheduling: false
     max_num_batched_tokens: 512
-    # Temporal transformer sliding_window is 3000 frames; keep model len within.
-    max_model_len: 3000
+    # One token per 80 ms frame plus the persona prefill, so this caps the
+    # call: 46080 is 60 minutes plus up to 1080 positions (86 s) of prefill.
+    # The checkpoint declares no length limit (the reference server runs until
+    # the client disconnects), so this is a deployment default, not a model
+    # limit: one hour, the session length hosted realtime voice APIs commonly
+    # allow. The temporal transformer attends only to its 3000-frame window,
+    # but every append still re-sends the whole prompt, so per-frame host work
+    # grows with the call. To change the cap, move both numbers together:
+    #   --stage-overrides '{"0": {"max_model_len": N, "hf_overrides":
+    #     {"temporal_config": {"max_position_embeddings": N}}}}'
+    max_model_len: 46080
     devices: "0"
     hf_overrides:
       mimi_cuda_graphs: true
+      temporal_config:
+        # RoPE table, one row per position the call can reach; Helium refuses
+        # a max_model_len past it.
+        max_position_embeddings: 46080
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
