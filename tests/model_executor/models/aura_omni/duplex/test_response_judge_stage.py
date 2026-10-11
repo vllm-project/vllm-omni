@@ -60,7 +60,7 @@ async def _pending_judge(orchestrator):
     assert duplex_resource_request_belongs_to_session(request_id, SESSION_ID)
     state = orchestrator.request_states[request_id]
     asr = SimpleNamespace(request_id=request_id, outputs=[SimpleNamespace(text="嗯嗯")])
-    rj._remember(request_id, rj._PendingTurn(rj.JudgeSpec("chat_yes_no", {}), "嗯嗯", asr), state.streaming)
+    rj._owned(state.streaming)[request_id] = rj._PendingTurn(rj.JudgeSpec("chat_yes_no", {}), "嗯嗯", asr)
     request = SimpleNamespace(request_id=request_id, prompt_token_ids=[1], resumable=False)
     replica_id = await orchestrator.stage_pools[_JUDGE].submit_initial(request_id, state, request)
     orchestrator._on_stage_submitted(_JUDGE, request_id, replica_id, state)
@@ -155,7 +155,8 @@ async def test_aura_silence_reports_its_own_listen_source():
 def test_runtime_metadata_forwards_only_a_named_listen_source(model_result, expected):
     payload: dict[str, object] = {}
     ModelChannel._attach_runtime_metadata(payload, {"model_turn_id": 1, **model_result})
-    assert payload["vllm_omni"].get("listen_source") == expected
+    metadata = payload["vllm_omni"]
+    assert isinstance(metadata, dict) and metadata.get("listen_source") == expected
 
 
 @pytest.mark.asyncio
@@ -241,7 +242,7 @@ def test_judged_pipeline_routes_asr_through_the_judge_before_aura():
     assert _resolve(AURA_OMNI_PIPELINE.stages[1].custom_process_input_func) is asr2aura
 
 
-@pytest.mark.parametrize("arch", ["ResponseJudgeQwen3ForCausalLM", "LayaDecisionModel", "ClmDecisionModel"])
+@pytest.mark.parametrize("arch", ["ResponseJudgeQwen3ForCausalLM", "LayaDecisionModel"])
 def test_judge_architectures_are_registered(arch):
     assert OmniModelRegistry._try_load_model_cls(arch) is not None
 
@@ -271,26 +272,6 @@ def test_laya_overlay_only_changes_the_judge_stage():
     assert max(judge["compilation_config"]["cudagraph_capture_sizes"]) >= 192
     options = judge["hf_overrides"]["response_judge"]
     assert options["reply_option"] in options["options"]
-
-
-def test_clm_overlay_only_changes_the_judge_stage():
-    base = resolve_deploy_yaml(get_deploy_config_path("aura_omni_judged.yaml"))
-    clm = resolve_deploy_yaml(get_deploy_config_path("aura_omni_judged_clm.yaml"))
-    assert [s for s in clm["stages"] if s["stage_id"] != 1] == [s for s in base["stages"] if s["stage_id"] != 1]
-    judge = next(s for s in clm["stages"] if s["stage_id"] == 1)
-    assert judge["model_arch"] == "ClmDecisionModel"
-    assert judge["runner"] == "pooling"
-    assert judge["default_pooling_params"] == {"task": "classify"}
-    # Capture sizes reach past the measured CLM prompts (about 36 tokens).
-    assert max(judge["compilation_config"]["cudagraph_capture_sizes"]) >= 64
-    # The prepared model directory's config.json carries format=clm; the base
-    # file's chat_yes_no options must not be inherited on top of it.
-    assert judge["hf_overrides"] == {}
-    pipeline = resolve_pipeline_config("aura_omni_judged")
-    stages, _ = StageConfigFactory._create_legacy_from_registry(
-        pipeline, cli_overrides={}, deploy_config_path=get_deploy_config_path("aura_omni_judged_clm.yaml")
-    )
-    assert "response_judge" not in (stages[1].yaml_engine_args.get("hf_overrides") or {})
 
 
 def _pool_with_decoder(name):

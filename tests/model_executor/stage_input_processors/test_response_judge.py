@@ -78,23 +78,22 @@ def _startup_model_config(response_judge, monkeypatch, model_stage=rj.RESPONSE_J
     # The HF config is already loaded; avoid unrelated text-config/model inspection.
     monkeypatch.setattr(OmniModelConfig, "_maybe_override_text_config", lambda self: None)
     base = SimpleNamespace(hf_config=SimpleNamespace(response_judge=response_judge))
-    return OmniModelConfig.from_vllm_model_config(base, model_stage=model_stage, model_arch="ClmDecisionModel")
+    return OmniModelConfig.from_vllm_model_config(base, model_stage=model_stage, model_arch="LayaDecisionModel")
 
 
 @pytest.mark.parametrize(
     ("raw", "error"),
     [
-        ({"format": "clm", "threshold": 0}, None),
-        ({"format": "clm", "threshold": 1}, None),
-        ({"format": "clm", "threshold": "0.0173"}, None),
+        ({"format": "laya", "threshold": 0}, None),
+        ({"format": "laya", "threshold": 1}, None),
+        ({"format": "laya", "threshold": "0.0173"}, None),
         ({"format": "chat_yes_no"}, None),
-        ({"format": "clm", "threshold": 1.01}, "threshold"),
-        ({"format": "clm", "threshold": float("nan")}, "threshold"),
-        ({"format": "clm", "threshold": "invalid"}, "threshold"),
-        ({"format": "clm", "options": {}}, "options"),
-        ({"format": "clm", "option_keys": []}, "option_keys"),
-        ({"format": "clm", "reply_option": "missing"}, "reply_option"),
-        ({"format": "clm", "reply_option": []}, "reply_option"),
+        ({"format": "laya", "threshold": 1.01}, "threshold"),
+        ({"format": "laya", "threshold": float("nan")}, "threshold"),
+        ({"format": "laya", "threshold": "invalid"}, "threshold"),
+        ({"format": "laya", "options": {}}, "options"),
+        ({"format": "laya", "reply_option": "missing"}, "reply_option"),
+        ({"format": "laya", "reply_option": []}, "reply_option"),
     ],
 )
 def test_judge_configuration_is_checked_at_startup(monkeypatch, raw, error):
@@ -106,8 +105,9 @@ def test_judge_configuration_is_checked_at_startup(monkeypatch, raw, error):
 
 
 def test_startup_spec_is_reused_for_later_transcripts(monkeypatch):
-    config = _startup_model_config({"format": "clm", "option_keys": ["request", "quiet"]}, monkeypatch)
+    config = _startup_model_config({"format": "chat_yes_no"}, monkeypatch)
     spec = rj.JudgeSpec.for_model_config(config)
+    monkeypatch.setattr("vllm.tokenizers.cached_tokenizer_from_config", lambda config: _ChatTokenizer())
 
     def unexpected_reload(cls, hf_config):
         pytest.fail("judge configuration must be validated at startup, not per transcript")
@@ -120,40 +120,22 @@ def test_startup_spec_is_reused_for_later_transcripts(monkeypatch):
 
 
 def test_other_stages_do_not_load_judge_configuration(monkeypatch):
-    config = _startup_model_config({"format": "clm", "threshold": 2}, monkeypatch, model_stage="other")
+    config = _startup_model_config({"format": "laya", "threshold": 2}, monkeypatch, model_stage="other")
     assert not hasattr(config, "_response_judge_spec")
-
-
-@pytest.fixture
-def prepared_clm_options():
-    # response_judge from a prepared CLM directory's config.json.
-    return {
-        "format": "clm",
-        "instructions": "What should the voice assistant do next?",
-        "option_keys": ["answer", "act", "ack", "other", "noise"],
-        "reply_option": ["answer", "act"],
-        "threshold": 0.300773,
-        "state_template": "{transcript}",
-    }
 
 
 @pytest.mark.parametrize(
     ("name", "fmt"),
-    [("aura_omni_judged", "chat_yes_no"), ("aura_omni_judged_laya", "laya"), ("aura_omni_judged_clm", "clm")],
+    [("aura_omni_judged", "chat_yes_no"), ("aura_omni_judged_laya", "laya")],
 )
-def test_example_deploy_judge_overrides_remain_valid(monkeypatch, prepared_clm_options, name, fmt):
+def test_example_deploy_judge_overrides_remain_valid(monkeypatch, name, fmt):
     import yaml
 
     path = Path(rj.__file__).parents[2] / "deploy" / f"{name}.yaml"
     deploy = yaml.safe_load(path.read_text())
     stage = next(s for s in deploy["stages"] if s["stage_id"] == 1)
-    raw = stage["hf_overrides"].get("response_judge", prepared_clm_options)
-    config = _startup_model_config(raw, monkeypatch)
-    spec = rj.JudgeSpec.for_model_config(config)
-    assert spec.format == fmt
-    if fmt == "clm":
-        assert spec.options["option_keys"] == ["answer", "act", "ack", "other", "noise"]
-        assert spec.options["reply_option"] == ["answer", "act"]
+    config = _startup_model_config(stage["hf_overrides"]["response_judge"], monkeypatch)
+    assert rj.JudgeSpec.for_model_config(config).format == fmt
 
 
 @pytest.mark.parametrize(
@@ -319,7 +301,7 @@ def test_a_cached_decision_belongs_to_its_judge_output(monkeypatch):
 
 
 def test_a_prompt_that_cannot_be_built_records_no_turn(monkeypatch):
-    config = _model_config({"format": "clm", "state_template": "User: {missing}"}, _ChatTokenizer(), monkeypatch)
+    config = _model_config({"format": "laya", "state_template": "User: {missing}"}, _LayaTokenizer(), monkeypatch)
     owner = _owner()
     with pytest.raises(KeyError):
         rj.asr2judge([_asr("r-bad", "hi")], None, False, owner, target_model_config=config)
@@ -416,27 +398,16 @@ def test_pooled_scores_that_cannot_be_read_let_the_turn_through(monkeypatch, log
     assert rj.judge_rejects(output, owner) is False
 
 
-def test_clm_prompt_is_context_blank_line_question(monkeypatch):
-    config = _model_config(
-        {"format": "clm", "instructions": "Does the assistant need to answer?", "state_template": "User: {transcript}"},
-        _ChatTokenizer(),
-        monkeypatch,
-    )
-    owner = _owner()
-    [judge_input] = rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
-    assert judge_input == {"prompt": "User: 嗯嗯\n\nDoes the assistant need to answer?"}
-
-
 @pytest.mark.parametrize(("logits", "rejected"), [([0.0, 0.0, 3.0], True), ([1.0, 1.0, 0.0], False)])
 def test_several_reply_options_add_up(monkeypatch, logits, rejected):
     config = _model_config(
         {
-            "format": "clm",
-            "option_keys": ["request", "answer", "backchannel"],
+            "format": "laya",
+            "options": {"request": "", "answer": "", "backchannel": ""},
             "reply_option": ["request", "answer"],
             "threshold": 0.5,
         },
-        _ChatTokenizer(),
+        _LayaTokenizer(),
         monkeypatch,
     )
     owner = _owner()

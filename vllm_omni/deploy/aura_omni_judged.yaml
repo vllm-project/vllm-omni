@@ -18,7 +18,6 @@ duplex_session:
 # DuplexOrchestrator forwards ASR/judge/AURA through their input processors;
 # only Talker → Code2Wav (stage 3 → 4) consumes asynchronous codec chunks.
 async_chunk: true
-
 connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
@@ -32,7 +31,6 @@ connectors:
       # initial=1 can stall Code2Wav on the first undersized chunk under duplex.
       initial_codec_chunk_frames: 8
       decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
-
 stages:
   - stage_id: 0
     max_num_seqs: 8
@@ -49,7 +47,6 @@ stages:
       top_p: 1.0
       top_k: -1
       max_tokens: 256
-
   - stage_id: 1
     # Response judge: one YES/NO token from the ASR transcript.
     hf_overrides:
@@ -67,7 +64,6 @@ stages:
     default_sampling_params:
       temperature: 0.0
       max_tokens: 1
-
   - stage_id: 2
     max_num_seqs: 4
     gpu_memory_utilization: 0.4
@@ -84,7 +80,6 @@ stages:
       top_k: -1
       max_tokens: 256
       repetition_penalty: 1.0
-
   - stage_id: 3
     max_num_seqs: 8
     gpu_memory_utilization: 0.2
@@ -109,7 +104,6 @@ stages:
       temperature: 0.9
       top_k: 50
       top_p: 1.0
-
   - stage_id: 4
     max_num_seqs: 8
     gpu_memory_utilization: 0.2
@@ -131,7 +125,6 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
-
 platforms:
   npu:
     stages:

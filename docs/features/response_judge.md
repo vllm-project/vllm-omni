@@ -53,7 +53,6 @@ The judge is configured on its own stage in the deploy config, under
 | --- | --- | --- | --- |
 | `chat_yes_no` | Any chat model; `ResponseJudgeQwen3ForCausalLM` for Qwen3 | generate (`max_tokens: 1`) | Rejects only when the answer is exactly `reject_label` (default `NO`) |
 | `laya` | LAYA decision models, `LayaDecisionModel` | pooling (`task: classify`) | Rejects when P(`reply_option`) < `threshold` |
-| `clm` | Contrastive-LM (CLM) encoder + heads, `ClmDecisionModel` | pooling (`task: classify`) | Rejects when P(`reply_option`) < `threshold` |
 
 Options per format:
 
@@ -63,28 +62,19 @@ Options per format:
 - `laya`: `question_type`, `instructions`, `options` (key -> description),
   `reply_option`, `threshold` and `state_template`. `question_type` defaults
   to the model's `laya_question_type`; if both are set they must agree.
-- `clm`: the option projections are fixed when the model directory is
-  prepared, and that directory's `config.json` carries the matching
-  `response_judge` options (`option_keys`, `reply_option`, `threshold`,
-  `instructions` and `state_template`).
 
 `reply_option` may be a list; the probabilities of the listed options are
 added.
 
-For `laya` and `clm`, the server refuses to start if `options` is empty,
+For `laya`, the server refuses to start if `options` is empty,
 `reply_option` names an option that is not configured, or `threshold` is not
 a number in [0, 1]. Loading also fails if a judge head weight does not have
 exactly the shape the model expects.
 
-The pooling judges load from a directory prepared for vLLM:
-
-- **LAYA:** the checkpoint's weights, `config.json` with
-  `architectures: [LayaDecisionModel]` and `laya_question_type`, and the
-  tokenizer files at the top level of the directory.
-- **CLM:** the Qwen3 encoder weights, `clm_head.safetensors` with the state
-  head, the option projections (computed once from the option texts) and the
-  logit scale, and `config.json` with `architectures: [ClmDecisionModel]`,
-  `clm_head`, `clm_num_options` and the `response_judge` options.
+LAYA loads from a directory prepared for vLLM: the checkpoint's weights,
+`config.json` with `architectures: [LayaDecisionModel]` and
+`laya_question_type`, and the tokenizer files at the top level of the
+directory.
 
 ## Example: AURA
 
@@ -108,8 +98,8 @@ It uses Qwen3-1.7B as the judge:
       max_tokens: 1
 ```
 
-`aura_omni_judged_laya.yaml` and `aura_omni_judged_clm.yaml` inherit it with
-`base_config` and replace only stage 1 with a pooling judge. Serve
+`aura_omni_judged_laya.yaml` inherits it with `base_config` and replaces only
+stage 1 with the LAYA pooling judge. Serve
 `aura_omni.yaml` to run AURA without a judge.
 
 ## Adding a judge
@@ -152,12 +142,10 @@ profile, one session at a time), most of its time was the model call, so:
 
 - **Give the judge CUDA graphs that cover its prompt.** vLLM's default capture
   sizes stop at `2 * max_num_seqs`, while a judge prompt without a prefix cache
-  is one prefill of tens of tokens. `aura_omni_judged_laya.yaml` and
-  `aura_omni_judged_clm.yaml` therefore set
-  `compilation_config.cudagraph_capture_sizes`. With it the LAYA forward pass
-  dropped from about 18 ms to about 8 ms in the pipeline; a standalone CLM
-  forward pass after an idle gap dropped from about 39 ms to about 31 ms. For the
-  Qwen3 judge, larger capture sizes showed no gain in a standalone test, so
+  is one prefill of tens of tokens. `aura_omni_judged_laya.yaml` therefore
+  sets `compilation_config.cudagraph_capture_sizes`. With it the LAYA forward
+  pass dropped from about 18 ms to about 8 ms in the pipeline. For the Qwen3
+  judge, larger capture sizes showed no gain in a standalone test, so
   `aura_omni_judged.yaml` keeps the defaults.
 - **Poll stage outputs event-driven.** `VLLM_OMNI_EVENT_DRIVEN_ORCH=1` lets
   the orchestrator pick up each stage's output as it arrives instead of on a
@@ -165,7 +153,7 @@ profile, one session at a time), most of its time was the model call, so:
   It cut the judge stage's output pickup from about 4 ms to about 1 ms.
 - **Expect host effects after idle gaps.** On a host with the `powersave` CPU
   governor, a judge call after a pause in the conversation was slower than
-  back to back: about 1.4x for CLM, 3x for Qwen3 and up to 4x for LAYA. This
+  back to back: about 3x for Qwen3 and up to 4x for LAYA. This
   is consistent with the CPU clocking back up; it was not compared against
   another governor.
 
@@ -178,7 +166,7 @@ went from 43.0 and 44.5 ms to 26.1 and 28.5 ms p50 in two repeats.
 - The judge only sees the transcript, so it cannot use acoustic cues such as
   laughter or who is speaking.
 - Judge quality depends on the model and the prompt. Zero-shot decision
-  models (LAYA, CLM) are weak at "does this need a reply"; fine-tuning their
+  models such as LAYA are weak at "does this need a reply"; fine-tuning their
   heads is future work.
 - Short answers to a question from the previous turn ("seven", "tomorrow")
   and interruptions ("wait") look like backchannels without the previous

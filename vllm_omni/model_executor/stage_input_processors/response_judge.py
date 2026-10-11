@@ -7,20 +7,8 @@ background speech runs the whole downstream pipeline. A pipeline can place a
 ``response_judge`` stage right after its ASR stage: a small judge model reads
 the transcript, and a turn that needs no reply ends there through the
 engine's existing no-output path (``[]`` from the next bridge, or a listen
-decision in duplex sessions).
-
-The judge model is configured on its own stage, as ``hf_overrides``:
-
-    response_judge:
-      format: chat_yes_no      # generative model, one token (YES / NO)
-      system_prompt: "..."
-    # or
-    response_judge:
-      format: laya             # LAYA decision model (pooling runner)
-      instructions: "..."
-      options: {yes: "...", no: "..."}
-      reply_option: yes
-    # or format: clm           # CLM encoder + heads (pooling runner)
+decision in duplex sessions). The judge is configured on its own stage as
+``hf_overrides.response_judge`` (docs/features/response_judge.md).
 
 Anything other than a clear "no reply" lets the turn through unchanged.
 """
@@ -61,23 +49,15 @@ class JudgeSpec:
     def __post_init__(self) -> None:
         if self.format not in _FORMATS:
             raise ValueError(f"unknown response_judge format {self.format!r}; expected one of {sorted(_FORMATS)}")
-        if self.format not in ("laya", "clm"):
+        if self.format != "laya":
             return
         opts = dict(self.options)
         options = opts.get("options", {"yes": None, "no": None})
         if not isinstance(options, Mapping) or not options:
             raise ValueError("response_judge.options must be a non-empty mapping")
-        # Prepared CLM directories name their fixed projections with option_keys.
-        keys = opts.get("option_keys", list(options))
-        if not isinstance(keys, (list, tuple)) or not keys:
-            raise ValueError("response_judge.option_keys must be a non-empty list")
-        reply = opts.get("reply_option", keys[0])
+        reply = opts.get("reply_option", next(iter(options)))
         reply_keys = [str(k) for k in (reply if isinstance(reply, list) else [reply])]
-        if (
-            not reply_keys
-            or any(k not in keys for k in reply_keys)
-            or ("options" in opts and any(k not in options for k in reply_keys))
-        ):
+        if not reply_keys or any(k not in options for k in reply_keys):
             raise ValueError("response_judge.reply_option must name one or more configured options")
         threshold = opts.get("threshold", 0.5)
         try:
@@ -130,20 +110,10 @@ def _owned(streaming_context: Any) -> dict[str, _PendingTurn]:
     return bridge_states.setdefault(_STATE_KEY, {})
 
 
-def _remember(request_id: str, pending: _PendingTurn, streaming_context: Any) -> None:
-    # The request owns its turn; cancel / failure / close release them together.
-    _owned(streaming_context)[request_id] = pending
-
-
 def _owned_turn(request_id: str, streaming_context: Any) -> _PendingTurn | None:
     # The turn stays with its request until the request ends (or the next turn
     # of the same request replaces it), so a repeated forward still finds it.
     return _owned(streaming_context).get(request_id)
-
-
-# --------------------------------------------------------------------------- #
-# Output helpers
-# --------------------------------------------------------------------------- #
 
 
 def _first_completion(output: Any) -> Any:
@@ -197,11 +167,6 @@ def _prompt_for(source_outputs: list[Any], prompt: Any) -> dict[str, Mapping[str
         item = prompts[idx] if idx < len(prompts) else (prompts[0] if len(prompts) == 1 else None)
         mapping[str(getattr(source_output, "request_id", idx))] = item if isinstance(item, Mapping) else {}
     return mapping
-
-
-# --------------------------------------------------------------------------- #
-# Judge formats: prompt building (orchestrator side) and decision reading
-# --------------------------------------------------------------------------- #
 
 
 def _chat_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[str, Any]:
@@ -267,9 +232,8 @@ def _laya_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[st
 
 
 def _option_scores_reject(spec: JudgeSpec, output: Any) -> bool:
-    """Pooling judges (LAYA, CLM): one logit per option -> P(reply) vs ``threshold``.
+    """Pooling judges: one logit per option, in ``options`` order -> P(reply) vs ``threshold``.
 
-    ``option_keys`` (or the keys of ``options``) name the logits in order;
     ``reply_option`` is one key or a list of keys whose probabilities add up.
     """
     import torch
@@ -277,7 +241,7 @@ def _option_scores_reject(spec: JudgeSpec, output: Any) -> bool:
     logits = _pooled_tensor(output)
     if logits is None:
         return False
-    keys = list(spec.options.get("option_keys") or (spec.options.get("options") or {"yes": None, "no": None}))
+    keys = list(spec.options.get("options") or {"yes": None, "no": None})
     reply = spec.options.get("reply_option", keys[0])
     reply_keys = [str(k) for k in (reply if isinstance(reply, list) else [reply])]
     scores = torch.as_tensor(logits)
@@ -296,26 +260,10 @@ def _option_scores_reject(spec: JudgeSpec, output: Any) -> bool:
     return p_reply < spec.options["threshold"]
 
 
-def _clm_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[str, Any]:
-    """CLM state text (clm.schema.state_text): context, a blank line, then the question."""
-    del model_config
-    state = str(spec.options.get("state_template", "{transcript}")).format(transcript=transcript).strip()
-    instructions = str(spec.options.get("instructions", "")).strip()
-    return {"prompt": f"{state}\n\n{instructions}" if state and instructions else (state or instructions)}
-
-
 _FORMATS: dict[str, tuple[Callable[..., dict[str, Any]], Callable[[JudgeSpec, Any], bool]]] = {
     "chat_yes_no": (_chat_prompt, _chat_rejects),
     "laya": (_laya_prompt, _option_scores_reject),
-    # Option projections are baked into the prepared CLM model directory, whose
-    # config.json also carries the matching response_judge options.
-    "clm": (_clm_prompt, _option_scores_reject),
 }
-
-
-# --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
 
 
 def _rejects(pending: _PendingTurn | None, output: Any) -> bool:
@@ -365,7 +313,8 @@ def judge_input(
             # Build first: a prompt that cannot be built must not leave a turn behind.
             next_input = build(spec, transcript, target_model_config)
             decoder = getattr(streaming_context, "source_token_decoder", None)
-            _remember(request_id, _PendingTurn(spec, transcript, source_output, decoder), streaming_context)
+            # The request owns its turn; cancel / failure / close release them together.
+            _owned(streaming_context)[request_id] = _PendingTurn(spec, transcript, source_output, decoder)
             next_inputs.append(next_input)
         return next_inputs
 

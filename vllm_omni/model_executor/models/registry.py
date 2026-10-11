@@ -533,11 +533,6 @@ _OMNI_MODELS = {
         "laya",
         "LayaDecisionModel",
     ),
-    "ClmDecisionModel": (
-        "response_judge",
-        "clm",
-        "ClmDecisionModel",
-    ),
     "MiniMaxH3Encoder": (
         "minimax_h3",
         "encoder",
