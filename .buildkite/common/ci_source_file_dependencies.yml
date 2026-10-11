@@ -1362,6 +1362,22 @@ source_file_dependencies:
     - vllm_omni/entrypoints/openai/serving_speech.py
     - tests/e2e/online_serving/test_cosyvoice3_voice_isolation.py
     - tests/helpers/speaker_similarity.py
+    - tests/helpers/voice_isolation.py
+
+  # Qwen3-TTS Base cross-request voice isolation, same step and same check as
+  # CosyVoice3: the Qwen3-TTS paths, plus the voice routes, speaker cache and
+  # payload path that carry per-request conditioning.
+  tts_qwen3_tts_voice_isolation:
+    - *qwen3_tts
+    - vllm_omni/entrypoints/openai/api_server.py
+    - vllm_omni/utils/mm_outputs.py
+    - vllm_omni/utils/speaker_cache.py
+    - vllm_omni/worker/gpu_ar_model_runner.py
+    # CAM++ scoring goes through extract_spk_embedding.
+    - vllm_omni/model_executor/models/cosyvoice3/utils.py
+    - tests/e2e/online_serving/test_qwen3_tts_voice_isolation.py
+    - tests/helpers/speaker_similarity.py
+    - tests/helpers/voice_isolation.py
 
   tts_lfm3_function:
     - *lfm3
