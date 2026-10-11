@@ -1869,6 +1869,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # call the custom process function
                 req_infos["request_id"] = req_id
                 req_infos["duplex_token_offset"] = int(self.input_batch.num_computed_tokens_cpu[req_index])
+                # Where this request's tokens start in the step's flat batch.
+                req_infos["_omni_token_start"] = s
                 req_infos["duplex_prompt_len"] = len(req_state.prompt_token_ids) if req_state is not None else None
                 prompt_token_ids = getattr(req_state, "prompt_token_ids", ()) if req_state is not None else ()
                 prompt_len = len(prompt_token_ids or ())

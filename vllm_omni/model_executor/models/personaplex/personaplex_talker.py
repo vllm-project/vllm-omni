@@ -120,6 +120,15 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # dep_q audio codebooks per frame; only cb 0..num_active are vocoded.
         self.dep_q = config.depformer_config.dep_q
         self.num_active_codebooks = config.depformer_config.num_active_codebooks
+        # Per scheduled token: the RoPE position base of a duplex session the
+        # scheduler rebased behind the KV window. Written by preprocess and
+        # consumed by the next forward.
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.register_buffer("_rope_position_base", torch.zeros(max_num_tokens, dtype=torch.long), persistent=False)
+        # The positions Helium rotates at, rewritten in place every forward:
+        # piecewise CUDA graphs replay from the input addresses seen at capture,
+        # so a fresh tensor there would be read at a stale address.
+        self.register_buffer("_rope_positions", torch.zeros(max_num_tokens, dtype=torch.long), persistent=False)
 
     # ------------------------------------------------------------------
     # Core forward / logits
@@ -146,7 +155,14 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        # Rebased duplex sessions rotate at their absolute positions; clear the
+        # base once used, so the next step starts from zero.
+        num_tokens = positions.shape[0]
+        position_base = self._rope_position_base[:num_tokens]
+        rope_positions = self._rope_positions[:num_tokens]
+        torch.add(positions, position_base, out=rope_positions)
+        position_base.zero_()
+        return self.model(input_ids, rope_positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(
         self,
@@ -271,6 +287,24 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             stack[0, 1 + n_user : 1 + 2 * n_user] = user[:n_user, None]
         return self.input_embeddings(stack).reshape(span, -1)  # [span, hidden]
 
+    def _write_rope_position_base(self, duplex: dict[str, Any], info_dict: dict[str, Any], span: int) -> None:
+        """Rotate a rebased session's tokens at their absolute positions.
+
+        The scheduler cuts a long session's placeholder prompt behind the KV
+        window and hands the cut length over as ``duplex.position_base``
+        (``OmniARScheduler._rebase_streaming_positions``): the runner's
+        positions then count from the cut, and ``forward`` adds the base back.
+        """
+        base = int(duplex.get("position_base", 0) or 0)
+        if base == 0:
+            return
+        start = info_dict.get("_omni_token_start")
+        if not isinstance(start, int):
+            raise RuntimeError(
+                "A rebased PersonaPlex duplex session needs the runner's token offset (_omni_token_start)"
+            )
+        self._rope_position_base[start : start + span].fill_(base)
+
     @staticmethod
     def _user_frame(info: dict[str, Any], frame_idx: int) -> torch.Tensor | None:
         """Fetch the Mimi-encoded user codes for ``frame_idx`` (or None / out of range)."""
@@ -360,6 +394,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                     "PersonaPlex duplex prompt slice is shorter than the scheduled span: "
                     f"offset={offset}, span={span}, prompt={prompt_len}"
                 )
+            self._write_rope_position_base(duplex, info_dict, span)
             return req_input_ids, req_embeds, prepared.info_update
 
         zero_hidden = torch.zeros((1, self.mtp_hidden_size), device=device, dtype=self._dtype)
