@@ -214,6 +214,7 @@ The following tables show which models support each feature:
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **[Hy-Nomas](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md)** (Diffusers-format weights) | ❌ | ❌ | ✅ (Ulysses only) | ❌ | ❌ | ❌ | ❌ | ✅ (module only) | ❌ | ❌ | ❌ |
 | **Self-Forcing**             |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |     ✅ (request mode)      |          ❌           |       ❓        |        ✅*        |
+| **minWM Action2V**           |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❓             |          ❌           |       ❓        |        ✅*        |
 
 > Notes:
 > 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
@@ -225,11 +226,12 @@ The following tables show which models support each feature:
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`. Self-Forcing streams one AR block per chunk only with
 > `self_forcing_stepwise.yaml` (ARDiffusionEngine, `max_num_seqs=1`); its four
-> fixed DMD steps leave nothing for TeaCache or Cache-DiT to skip.
+> fixed DMD steps leave nothing for TeaCache or Cache-DiT to skip. minWM Action2V
+> streams the same way with `minwm_action2v_stepwise.yaml`.
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM, Self-Forcing; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM, Self-Forcing, minWM Action2V; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
 
 ### AudioGen
 

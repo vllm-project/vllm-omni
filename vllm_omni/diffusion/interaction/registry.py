@@ -46,4 +46,7 @@ STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     "SelfForcingPipeline": {
         "prompt": PromptInteractionHandler,
     },
+    "MinWMAction2VPipeline": {
+        "prompt": PromptInteractionHandler,
+    },
 }

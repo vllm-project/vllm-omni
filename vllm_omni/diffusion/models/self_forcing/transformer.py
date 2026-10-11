@@ -22,6 +22,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.layers.norm import LayerNorm
+from vllm_omni.diffusion.layers.prope import PRoPECameras, apply_prope
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
     LingBotAttentionCache,
     LingBotCrossAttention,
@@ -81,10 +82,92 @@ class SelfForcingTransformerConfig:
     num_frames_per_block: int
     window_frames: int
     sink_frames: int
+    use_prope: bool
 
 
 def _prefixed(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
+
+
+class SelfForcingPRoPESelfAttention(LingBotSelfAttention):
+    """Self-attention plus a camera-relative PRoPE attention over a second K/V cache.
+
+    The PRoPE path transforms the normalized q/k/v before RoPE and adds its
+    output through ``prope_o``; without cameras the layer is plain self-attention.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        *,
+        eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(dim, num_heads, eps=eps, quant_config=quant_config, prefix=prefix)
+        if self.ulysses_world_size > 1:
+            raise ValueError("PRoPE self-attention does not support Ulysses sequence parallelism.")
+        self.prope_o = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_prefixed(prefix, "prope_o"),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        current_start: int,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sink_tokens: int,
+        update_cache: bool = True,
+        prope_cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs | None = None,
+        cameras: PRoPECameras | None = None,
+    ) -> torch.Tensor:
+        if cameras is None:
+            return super().forward(
+                hidden_states,
+                cache=cache,
+                current_start=current_start,
+                rotary_emb=rotary_emb,
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+            )
+        if prope_cache is None:
+            raise ValueError("PRoPE self-attention with cameras requires a PRoPE cache.")
+        query, key, value = self.project_qkv(hidden_states)
+        prope_query = apply_prope(query, cameras.query)
+        prope_key = apply_prope(key, cameras.key)
+        prope_value = apply_prope(value, cameras.key)
+        if rotary_emb is not None:
+            cos, sin = rotary_emb
+            query = self.rotary_embedding(query, cos, sin)
+            key = self.rotary_embedding(key, cos, sin)
+        output = self.attend(
+            query,
+            key,
+            value,
+            cache=cache,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            update_cache=update_cache,
+        )
+        prope_output = self.attend(
+            prope_query,
+            prope_key,
+            prope_value,
+            cache=prope_cache,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            update_cache=update_cache,
+        )
+        return self.o(output.flatten(2, 3)) + self.prope_o(apply_prope(prope_output, cameras.output).flatten(2, 3))
 
 
 class SelfForcingAttentionBlock(nn.Module):
@@ -98,13 +181,15 @@ class SelfForcingAttentionBlock(nn.Module):
         ffn_dim: int,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
+        use_prope: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.dim = dim
         self.norm1 = LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.self_attn = LingBotSelfAttention(
+        self_attention_class = SelfForcingPRoPESelfAttention if use_prope else LingBotSelfAttention
+        self.self_attn = self_attention_class(
             dim,
             num_heads,
             eps=eps,
@@ -155,6 +240,8 @@ class SelfForcingAttentionBlock(nn.Module):
         sink_tokens: int,
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        prope_cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs | None = None,
+        cameras: PRoPECameras | None = None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
         if (
@@ -173,14 +260,26 @@ class SelfForcingAttentionBlock(nn.Module):
         hidden_grid = hidden_states.unflatten(1, (num_frames, tokens_per_frame))
         normalized = self.norm1(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
         normalized = (normalized * (1 + scale_msa) + shift_msa).flatten(1, 2).to(hidden_states.dtype)
-        attention_output = self.self_attn(
-            normalized,
-            cache=self_cache,
-            current_start=current_start,
-            rotary_emb=rotary_emb,
-            sink_tokens=sink_tokens,
-            update_cache=update_cache,
-        )
+        if cameras is None:
+            attention_output = self.self_attn(
+                normalized,
+                cache=self_cache,
+                current_start=current_start,
+                rotary_emb=rotary_emb,
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+            )
+        else:
+            attention_output = self.self_attn(
+                normalized,
+                cache=self_cache,
+                current_start=current_start,
+                rotary_emb=rotary_emb,
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+                prope_cache=prope_cache,
+                cameras=cameras,
+            )
         hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
         hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
 
@@ -247,6 +346,7 @@ class SelfForcingTransformer3DModel(nn.Module):
         num_frames_per_block: int = 3,
         window_frames: int = 21,
         sink_frames: int = 0,
+        use_prope: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -279,6 +379,7 @@ class SelfForcingTransformer3DModel(nn.Module):
             num_frames_per_block=num_frames_per_block,
             window_frames=window_frames,
             sink_frames=sink_frames,
+            use_prope=use_prope,
         )
 
         self.patch_embedding = Conv3dLayer(
@@ -309,6 +410,7 @@ class SelfForcingTransformer3DModel(nn.Module):
                     ffn_dim=ffn_dim,
                     cross_attn_norm=cross_attn_norm,
                     eps=eps,
+                    use_prope=use_prope,
                     quant_config=quant_config,
                     prefix=_prefixed(prefix, f"blocks.{index}"),
                 )
@@ -353,7 +455,10 @@ class SelfForcingTransformer3DModel(nn.Module):
             kwargs[name] = actual
         for name, default in SELF_FORCING_ROLLOUT_DEFAULTS.items():
             kwargs[name] = int(config.get(name, default))
-        return cls(**kwargs, quant_config=quant_config, prefix=prefix)
+        use_prope = config.get("use_prope", False)
+        if not isinstance(use_prope, bool):
+            raise ValueError(f"Self-Forcing checkpoint config use_prope must be a bool, got {use_prope!r}.")
+        return cls(**kwargs, use_prope=use_prope, quant_config=quant_config, prefix=prefix)
 
     def tokens_per_frame(self, latent_height: int, latent_width: int) -> int:
         """Post-patch tokens in one latent frame of the given latent size."""
@@ -381,6 +486,20 @@ class SelfForcingTransformer3DModel(nn.Module):
             device=device,
             dtype=dtype,
         )
+
+    def allocate_prope_cache(
+        self,
+        *,
+        latent_height: int,
+        latent_width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> list[LingBotAttentionCache]:
+        """Allocate the request-local self-attention K/V of the PRoPE branch."""
+        if not self.config.use_prope:
+            raise ValueError("Only a PRoPE checkpoint has a PRoPE cache.")
+        cache = self.allocate_cache(latent_height=latent_height, latent_width=latent_width, device=device, dtype=dtype)
+        return cast(list[LingBotAttentionCache], cache.self_attention)
 
     def _rotary_embedding(
         self,
@@ -447,6 +566,19 @@ class SelfForcingTransformer3DModel(nn.Module):
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
+    @staticmethod
+    def _paged_layer_inputs(
+        contexts: list[ARDiffusionPagedLayerContext], *, tokens: int, device: torch.device
+    ) -> list[ARDiffusionPagedLayerInputs]:
+        forward_context = contexts[0].forward_ctx
+        if forward_context.seq_len != tokens:
+            raise RuntimeError(
+                "Self-Forcing paged context token count does not match this block: "
+                f"{forward_context.seq_len} != {tokens}."
+            )
+        forward_context.prepare(device=device, action_len=0, query_len=tokens)
+        return [layer_context.to_layer_inputs() for layer_context in contexts]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -456,6 +588,8 @@ class SelfForcingTransformer3DModel(nn.Module):
         cache: LingBotTransformerCache,
         start_frame: int,
         update_cache: bool,
+        prope_cache: list[LingBotAttentionCache] | list[ARDiffusionPagedLayerContext] | None = None,
+        cameras: PRoPECameras | None = None,
     ) -> torch.Tensor:
         """Predict flow for one AR block.
 
@@ -466,6 +600,8 @@ class SelfForcingTransformer3DModel(nn.Module):
             cache (LingBotTransformerCache): per-layer self- and cross-attention caches.
             start_frame (int): absolute latent frame index of the block's first frame.
             update_cache (bool): persist this block's K/V in a request-local cache.
+            prope_cache (list | None): per-layer PRoPE self-attention caches; required with ``cameras``.
+            cameras (PRoPECameras | None): this block's per-frame camera transforms, for PRoPE checkpoints.
 
         Returns:
             torch.Tensor: flow prediction with the shape of ``hidden_states``.
@@ -484,6 +620,13 @@ class SelfForcingTransformer3DModel(nn.Module):
             raise ValueError(f"encoder_hidden_states must be [batch, tokens, {self.config.text_dim}].")
         if len(cache.self_attention) != self.config.num_layers or len(cache.cross_attention) != self.config.num_layers:
             raise ValueError("Self-Forcing cache layer counts must match num_layers.")
+        if cameras is not None:
+            if not self.config.use_prope:
+                raise ValueError("Camera conditioning requires a PRoPE checkpoint.")
+            if len(cameras) != frames:
+                raise ValueError(f"cameras must describe the block's {frames} latent frames, got {len(cameras)}.")
+            if prope_cache is None or len(prope_cache) != self.config.num_layers:
+                raise ValueError("Camera conditioning requires one PRoPE cache per layer.")
 
         _, patch_height, patch_width = self.config.patch_size
         patched_height = height // patch_height
@@ -514,14 +657,17 @@ class SelfForcingTransformer3DModel(nn.Module):
         if cache.self_attention and isinstance(cache.self_attention[0], ARDiffusionPagedLayerContext):
             if batch_size != 1:
                 raise RuntimeError("Self-Forcing AR-Diffusion paged attention requires batch_size=1.")
-            forward_context = cache.self_attention[0].forward_ctx
-            if forward_context.seq_len != frames * tokens_per_frame:
-                raise RuntimeError(
-                    "Self-Forcing paged context token count does not match this block: "
-                    f"{forward_context.seq_len} != {frames * tokens_per_frame}."
-                )
-            forward_context.prepare(device=hidden_states.device, action_len=0, query_len=hidden_states.shape[1])
-            cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+            cache.self_attention = self._paged_layer_inputs(
+                cast(list[ARDiffusionPagedLayerContext], cache.self_attention),
+                tokens=frames * tokens_per_frame,
+                device=hidden_states.device,
+            )
+        if cameras is not None and isinstance(cast(list, prope_cache)[0], ARDiffusionPagedLayerContext):
+            prope_cache = self._paged_layer_inputs(
+                cast(list[ARDiffusionPagedLayerContext], prope_cache),
+                tokens=frames * tokens_per_frame,
+                device=hidden_states.device,
+            )
 
         for index, block in enumerate(self.blocks):
             hidden_states, cross_cache = block(
@@ -534,6 +680,8 @@ class SelfForcingTransformer3DModel(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
                 rotary_emb=rotary_emb,
+                prope_cache=None if cameras is None else cast(list, prope_cache)[index],
+                cameras=cameras,
             )
             cache.cross_attention[index] = cross_cache
 

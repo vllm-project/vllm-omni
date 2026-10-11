@@ -61,6 +61,7 @@ def test_video_pipeline_rejects_non_video_final_outputs(stage_configs):
         "WanDMDPipeline",
         "LingBotWorldCausalDMDPipeline",
         "SelfForcingPipeline",
+        "MinWMAction2VPipeline",
         "LongCatVideoAvatarPipeline",
         "SanaVideoPipeline",
         "SanaImageToVideoPipeline",
