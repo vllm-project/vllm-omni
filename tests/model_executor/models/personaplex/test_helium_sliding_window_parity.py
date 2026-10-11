@@ -62,17 +62,31 @@ def _random_moshi_weights(seed: int = 0) -> dict[str, torch.Tensor]:
 
 def _register_parity_model() -> None:
     from vllm import ModelRegistry
-    from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 
-    from vllm_omni.model_executor.models.personaplex.modeling_helium import HeliumForCausalLM
+    from vllm_omni.model_executor.models.personaplex.modeling_helium import HeliumModel
+    from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
+        PersonaPlexTalkerForConditionalGeneration as Talker,
+    )
 
-    class HeliumSlidingWindowParityLM(HeliumForCausalLM):
-        """Helium with a token embedding, so vLLM can drive it from token ids."""
+    class HeliumSlidingWindowParityLM(torch.nn.Module):
+        """The talker's Helium backbone with a token embedding and the text head,
+        so vLLM can drive it from token ids. The Moshi-format weights load
+        through the talker's own mapping."""
+
+        _load_temporal = Talker._load_temporal
+        _load_direct = staticmethod(Talker._load_direct)
+        _load_shard = staticmethod(Talker._load_shard)
 
         def __init__(self, *, vllm_config, prefix: str = "") -> None:
-            super().__init__(vllm_config=vllm_config, prefix=prefix)
+            super().__init__()
             config = vllm_config.model_config.hf_config
+            self.model = HeliumModel(vllm_config=vllm_config, prefix="model")
             self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix="lm_head")
+            self.logits_processor = LogitsProcessor(config.vocab_size)
+            self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
             # Piecewise CUDA graphs replay from the addresses seen at capture,
             # so the backbone reads its embeddings from one persistent buffer.
             self.register_buffer(
@@ -95,15 +109,21 @@ def _register_parity_model() -> None:
                 inputs_embeds=inputs_embeds,
             )
 
-        def load_weights(self, weights):
-            rest, loaded = [], set()
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+            return self.logits_processor(self.lm_head, hidden_states)
+
+        def load_weights(self, weights) -> set[str]:
+            params = dict(self.named_parameters(remove_duplicate=False))
+            loaded: set[str] = set()
             for name, weight in weights:
                 if name == "embed.weight":
                     self.embed.weight.data.copy_(weight)
                     loaded.add(name)
+                elif name == "text_linear.weight":
+                    self._load_direct("lm_head.weight", weight, params, loaded)
                 else:
-                    rest.append((name, weight))
-            return loaded | super().load_weights(rest)
+                    loaded |= self._load_temporal(name, weight, params)
+            return loaded
 
     ModelRegistry.register_model(ARCH, HeliumSlidingWindowParityLM)
 
