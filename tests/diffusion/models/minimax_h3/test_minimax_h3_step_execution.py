@@ -429,8 +429,10 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
 
 
 @pytest.mark.parametrize("batch_frames", [1, 33])
-def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
+@pytest.mark.parametrize("upscale", [False, True], ids=["native", "upscaled"])
+def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, upscale):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentUpscaleTarget
 
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=8)
     video_edit = object()
@@ -442,6 +444,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
         "width": 64,
         "preencode_mp4": True,
         "preencode_batch_frames": batch_frames,
+        "video_codec": "libx264",
+        "video_codec_options": {"crf": "0"},
         "latent_t": 2,
         "latent_h": 4,
         "latent_w": 6,
@@ -449,7 +453,10 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
         **{key: None for key in mod._MINIMAX_H3_DENOISE_INPUT_KEYS},
     }
 
+    target = MiniMaxH3LatentUpscaleTarget(latent_height=12, latent_width=8, scale=2.0) if upscale else None
+    context["latent_upscale"] = target
     pipeline = _step_pipeline(_SegmentMeanModel())
+    monkeypatch.setattr(pipeline, "_upscaled_latent", lambda latent, target: latent)
     conditioning = object()
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
@@ -507,7 +514,11 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
 
     monkeypatch.setattr(pipeline, "decode_to_mp4", decode_to_mp4)
     assert pipeline.post_decode(state).output == (b"mp4", None)
+    assert calls[0]["height"] == (192 if upscale else 96)
+    assert calls[0]["width"] == (128 if upscale else 64)
     assert calls[0]["batch_frames"] == batch_frames
+    assert calls[0]["video_codec"] == "libx264"
+    assert calls[0]["video_codec_options"] == {"crf": "0"}
 
 
 def test_prepare_encode_rejects_request_mode_only_features():

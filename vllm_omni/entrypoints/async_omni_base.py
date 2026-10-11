@@ -190,7 +190,17 @@ class AsyncOmniBase(OmniBase):
     def get_diffusion_od_config(self) -> Any | None:
         """Return the diffusion-stage config when the pipeline has one."""
         saw_diffusion_stage = any(stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs)
+        output_client = next(
+            (
+                client
+                for client in self.engine.stage_clients
+                if client.stage_type == "diffusion" and client.final_output
+            ),
+            None,
+        )
         for stage_client in self.engine.stage_clients:
+            if output_client is not None and stage_client is not output_client:
+                continue
             if getattr(stage_client, "stage_type", None) != "diffusion":
                 continue
 

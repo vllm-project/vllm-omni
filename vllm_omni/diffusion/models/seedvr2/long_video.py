@@ -190,6 +190,12 @@ def _restore(
         response.raise_for_status()
     except requests.HTTPError as error:
         raise JobError("SeedVR2 window restoration failed") from error
+    content_type = response.headers.get("content-type", "")
+    if not content_type.lower().startswith("video/"):
+        raise JobError(
+            "SeedVR2 window restoration requires transport_mode='bytes' from /v1/videos/sync; "
+            f"got content-type={content_type!r}"
+        )
     with av.open(io.BytesIO(response.content)) as container:
         video = container.streams.video[0]
         decoded = list(container.decode(video=0))

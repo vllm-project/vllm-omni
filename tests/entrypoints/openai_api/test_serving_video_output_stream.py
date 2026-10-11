@@ -18,8 +18,11 @@ from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
 from tests.helpers.media import generate_synthetic_image
+from vllm_omni.diffusion.data import VideoOutputTransportConfig
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
-from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
+from vllm_omni.entrypoints.openai.serving_video_output_stream import (
+    OmniStreamingVideoOutputHandler,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -69,8 +72,8 @@ def _build_test_app(
         def close(self):
             return final_chunk
 
-    def _make_encoder(*, output_format, fps, video_codec_options=None):
-        del output_format, fps, video_codec_options
+    def _make_encoder(*, output_format, fps, video_codec_options=None, video_codec=None):
+        del output_format, fps, video_codec_options, video_codec
         return FakeStreamingVideoEncoder()
 
     encoder_factory = mocker.MagicMock(side_effect=_make_encoder)
@@ -155,6 +158,59 @@ class TestStreamingVideoOutputWebSocket:
         _prompt, sampling_params, _video_params = asyncio.run(handler._build_prompt_and_sampling_params(request))
 
         assert sampling_params.quality == "high"
+
+    def test_streaming_session_ignores_artifact_output_overrides(self, mocker: MockerFixture) -> None:
+        """The MP4-only stream must not inherit WebM artifact encoder settings."""
+
+        async def mock_generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[_fake_video_frames(2)],
+                final_output_type="image",
+                finished=True,
+            )
+
+        app, _handler, engine_client = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[(b"mp4-chunk-0", True)],
+            mock_generate=mock_generate,
+        )
+        engine_client.get_diffusion_od_config.return_value = SimpleNamespace(
+            video_output_transport=VideoOutputTransportConfig(
+                output_format="webm",
+                video_codec="libvpx-vp9",
+                video_codec_options={"deadline": "realtime"},
+            )
+        )
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime/video") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.start",
+                        "prompt": "separate transport policy",
+                        "extra_params": {
+                            "output_format": "webm",
+                            "video_codec": "libvpx-vp9",
+                            "video_codec_options": {"deadline": "realtime"},
+                            "model_option": 7,
+                        },
+                    }
+                )
+                assert ws.receive_json()["type"] == "video.start"
+                assert _receive_video_chunk(ws)[1] == b"mp4-chunk-0"
+                assert ws.receive_json()["type"] == "session.done"
+
+        assert engine_client.streaming_encoder_factory.call_args.kwargs == {
+            "output_format": "m4s",
+            "fps": 24,
+            "video_codec": "h264",
+            "video_codec_options": {
+                "preset": "ultrafast",
+                "threads": "0",
+                "tune": "zerolatency",
+            },
+        }
 
     def test_streaming_session_emits_video_start_binary_chunks_and_done(self, mocker: MockerFixture):
         """A full session delivers video.start, binary chunks, then session.done."""
@@ -1050,8 +1106,12 @@ class TestStreamingVideoOutputExtraParams:
         assert "preencode_mp4" in excinfo.value.detail
 
     async def test_other_extra_params_still_reach_the_engine(self):
-        request = VideoGenerationRequest(prompt="p", extra_params={"flow_shift": 3.0})
+        request = VideoGenerationRequest(
+            prompt="p",
+            extra_params={"flow_shift": 3.0, "output_format": "webm"},
+        )
 
         _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
 
         assert gen_params.extra_args["flow_shift"] == 3.0
+        assert "output_format" not in gen_params.extra_args
