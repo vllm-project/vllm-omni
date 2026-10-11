@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""π0.5 eager-mode functional + latency sweep over batch size × camera views.
+"""π0.5 model-level functional + latency sweep over batch size × camera views.
 
 Runs the real ``lerobot/pi05_base`` weights on GPU and, for every
 (batch_size, num_views) cell, checks that a full 10-step flow-matching
@@ -10,8 +10,11 @@ it. Model level on purpose: the OpenPI serving path is B=1 by construction
 (``pi05.yaml`` sets ``max_num_seqs: 1``), so batch behaviour can only be
 exercised here.
 
-No CUDA Graph, no Triton, no caching — this is the eager baseline that later
-optimization work is measured against.
+The model is built by ``Pi05Pipeline`` as the server builds it, from the deploy
+config's ``model_config``: ``--dtype`` sets the serving dtype (bfloat16 is the
+mixed layout serving runs), and the optimized path (CUDA graphs over the fused
+Triton kernels) runs unless ``--enforce-eager`` is passed. The optimized path
+serves batch 1; other batch sizes run eagerly.
 
     python bench_pi05.py --out results/            # full sweep
     python bench_pi05.py --bs 1 --views 3 --iters 5
@@ -32,11 +35,10 @@ from pathlib import Path
 
 import torch
 
+# The deployed shapes (``vllm_omni/deploy/pi05.yaml``), which make_inputs feeds.
 ACTION_DIM = 32
-STATE_DIM = 32
 ACTION_HORIZON = 50
 MAX_TOKEN_LEN = 200
-NUM_STATE_BINS = 256
 NUM_STEPS = 10
 
 
@@ -48,28 +50,25 @@ def resolve_checkpoint(path: str) -> str:
     return snapshot_download(repo_id=path, repo_type="model")
 
 
-def build_model(checkpoint_dir: str, device: str, dtype: str):
-    from vllm_omni.diffusion.models.pi05 import Pi05Config, Pi05ForActionPrediction
+def build_model(checkpoint_dir: str, deploy_config: str, dtype: str, enforce_eager: bool):
+    """The model ``Pi05Pipeline`` serves: its dtype layout, KV cache, and with
+    ``enforce_eager`` unset its fused kernels and CUDA graphs."""
+    import yaml
+    from vllm.utils.torch_utils import set_default_torch_dtype
 
-    cfg = Pi05Config(
-        max_action_dim=ACTION_DIM,
-        max_state_dim=STATE_DIM,
-        chunk_size=ACTION_HORIZON,
-        num_inference_steps=NUM_STEPS,
-        tokenizer_max_length=MAX_TOKEN_LEN,
-        state_num_bins=NUM_STATE_BINS,
-        dtype=dtype,
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    with open(deploy_config, encoding="utf-8") as f:
+        (stage,) = yaml.safe_load(f)["stages"]
+    od_config = OmniDiffusionConfig(
+        model=checkpoint_dir, dtype=dtype, model_config=stage["model_config"], enforce_eager=enforce_eager
     )
-    model = Pi05ForActionPrediction(cfg)
-    model.to(device).eval()
-
-    import safetensors.torch
-
-    state = safetensors.torch.load_file(os.path.join(checkpoint_dir, "model.safetensors"))
-    filled = model.load_weights(list(state.items()))
-    if not filled:
-        raise RuntimeError("no weights loaded — the remap rules are broken")
-    return model, cfg
+    # Under the serving dtype as torch's default, as the server's loader builds
+    # (and captures) the pipeline.
+    with set_default_torch_dtype(od_config.dtype):
+        pipeline = Pi05Pipeline(od_config=od_config)
+    return pipeline.model.eval()
 
 
 def make_inputs(batch_size: int, num_views: int, device: str, seed: int = 0):
@@ -138,7 +137,7 @@ def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, 
     }
 
 
-def environment(device: str) -> dict:
+def environment(model, device: str) -> dict:
     import importlib.metadata as md
 
     def version(pkg):
@@ -156,7 +155,11 @@ def environment(device: str) -> dict:
         "vllm-omni": version("vllm-omni"),
         "transformers": version("transformers"),
         "num_steps": NUM_STEPS,
-        "mode": "eager (no CUDA Graph / Triton / caching)",
+        # What the built model runs, not what was asked for.
+        "path": "eager" if getattr(model, "cuda_graphs", None) is None else "optimized (CUDA graphs + fused kernels)",
+        "gemm_weight_dtype": str(
+            model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+        ),
     }
     if device.startswith("cuda"):
         info["gpu"] = torch.cuda.get_device_name(0)
@@ -174,7 +177,7 @@ def write_reports(rows: list[dict], env: dict, out_dir: Path) -> None:
         writer.writerows(rows)
 
     lines = [
-        "# π0.5 eager sweep: batch size × camera views",
+        "# π0.5 model-level sweep: batch size × camera views",
         "",
         "```",
         json.dumps(env, indent=2),
@@ -195,8 +198,17 @@ def write_reports(rows: list[dict], env: dict, out_dir: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("PI05_MODEL_PATH", "lerobot/pi05_base"))
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Deploy config whose model_config builds the model (default: the package's vllm_omni/deploy/pi05.yaml)",
+    )
+    parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Run the eager baseline instead of the optimized path (CUDA graphs + fused kernels)",
+    )
     parser.add_argument("--bs", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--views", type=int, nargs="+", default=[1, 2, 3])
     parser.add_argument("--warmup", type=int, default=2)
@@ -204,12 +216,17 @@ def main() -> int:
     parser.add_argument("--out", default="pi05_bench")
     args = parser.parse_args()
 
+    if args.deploy_config is None:
+        import vllm_omni
+
+        args.deploy_config = str(Path(vllm_omni.__file__).parent / "deploy" / "pi05.yaml")
     checkpoint_dir = resolve_checkpoint(args.model)
     print(f"checkpoint: {checkpoint_dir}")
-    env = environment(args.device)
-    print(json.dumps(env, indent=2))
 
-    model, _ = build_model(checkpoint_dir, args.device, args.dtype)
+    model = build_model(checkpoint_dir, args.deploy_config, args.dtype, args.enforce_eager)
+    device = str(next(model.parameters()).device)
+    env = environment(model, device)
+    print(json.dumps(env, indent=2))
     print("model built\n")
 
     rows = []
@@ -217,7 +234,7 @@ def main() -> int:
         for batch_size in args.bs:
             label = f"bs={batch_size} views={num_views}"
             try:
-                row = time_cell(model, batch_size, num_views, args.device, args.warmup, args.iters)
+                row = time_cell(model, batch_size, num_views, device, args.warmup, args.iters)
             except Exception as exc:  # a cell that OOMs or errors is a result, not a crash
                 row = {
                     "batch_size": batch_size,
@@ -235,7 +252,7 @@ def main() -> int:
                     "ms_per_sample": None,
                     "peak_mem_gb": None,
                 }
-                if args.device.startswith("cuda"):
+                if device.startswith("cuda"):
                     torch.accelerator.empty_cache()
             print(f"{label:22s} {row['status']:12s} p50={row['p50_ms']} ms  peak={row['peak_mem_gb']} GB")
             rows.append(row)
