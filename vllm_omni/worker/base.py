@@ -114,15 +114,14 @@ class OmniGPUWorkerBase(GPUWorker):
         """Device-level GPU memory profiling for the KV cache budget.
 
         Algorithm:
-            1. requested_memory = total_gpu_memory * gpu_memory_utilization
-               (computed in init_device from cache_config)
+            1. requested_memory comes from the startup utilization budget,
+               capped to free memory when multiple stages share a device.
 
-            2. profiled_usage = weights + peak_activation + non_torch_increase
-               (measured by ``memory_profiling`` around ``profile_run()``;
-               ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time)
+            2. non_kv_cache_memory = total device memory consumed since the
+               initial snapshot + transient activation peak headroom, as
+               measured by ``memory_profiling`` around ``profile_run()``.
 
-            3. available_kv_cache = requested_memory - profiled_usage
+            3. available_kv_cache = max(0, requested_memory - non_kv_cache_memory)
 
         Note:
             Process-scoped NVML estimation was removed in favour of the
@@ -146,25 +145,16 @@ class OmniGPUWorkerBase(GPUWorker):
             self.model_runner.profile_run()
 
         self.non_torch_memory = profile_result.non_torch_increase
-        self.peak_activation_memory = profile_result.torch_peak_increase
-        # Upstream 58b2012aa2 added `total_consumed` to the profiling result
-        # and reads it in GPUWorker.compile_or_warm_up_model() (when
-        # kv_cache_memory_bytes is None and peak_activation_memory is set, both
-        # true here). Mirror upstream so the omni override keeps it populated.
         self.total_consumed = profile_result.total_consumed
+        self.peak_activation_memory = profile_result.transient_peak_headroom
 
-        profiled_usage = (
-            int(self.model_runner.model_memory_usage)
-            + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
-        )
-        self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
+        self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profile_result.non_kv_cache_memory)
         logger.debug(
-            "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
+            "Profiling KV budget (PID %d, GPU %d): requested=%s, non_kv=%s, available=%s",
             os.getpid(),
             self.local_rank,
             format_gib(self.requested_memory),
-            format_gib(profiled_usage),
+            format_gib(profile_result.non_kv_cache_memory),
             format_gib(self.available_kv_cache_memory_bytes),
         )
         logger.info_once(

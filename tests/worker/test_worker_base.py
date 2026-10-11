@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.utils.mem_utils import MemoryProfilingResult, MemorySnapshot
 
 import vllm_omni.worker.base as base
 from vllm_omni.worker.base import OmniGPUWorkerBase
@@ -26,23 +27,24 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 GIB = 1024**3
 
 
-def _fake_memory_profiling(*, non_torch: int, torch_peak: int):
+def _fake_memory_profiling(*, non_torch: int, torch_peak: int, total_consumed: int, headroom: int):
     """A stand-in for ``vllm.utils.mem_utils.memory_profiling`` context manager."""
 
     @contextmanager
     def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
-        # total_consumed mirrors upstream vllm.utils.mem_utils.MemoryProfilingResult
-        # (added by upstream 58b2012aa2) and is read by OmniGPUWorkerBase.
-        yield SimpleNamespace(
+        yield MemoryProfilingResult(
+            before_create=MemorySnapshot(device="cpu", auto_measure=False),
             non_torch_increase=non_torch,
             torch_peak_increase=torch_peak,
-            total_consumed=torch_peak + non_torch,
+            total_consumed=total_consumed,
+            transient_peak_headroom=headroom,
+            non_kv_cache_memory=total_consumed + headroom,
         )
 
     return _mp
 
 
-def _make_worker(*, requested_memory: int, kv_cache_memory_bytes: int = 0, model_memory_usage: int = 0):
+def _make_worker(*, requested_memory: int, kv_cache_memory_bytes: int | None = None, model_memory_usage: int = 0):
     worker = object.__new__(OmniGPUWorkerBase)
     worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=kv_cache_memory_bytes)
     worker.model_runner = SimpleNamespace(
@@ -69,34 +71,92 @@ def test_no_process_scoped_collaborators_remain():
 
 
 def test_determine_available_memory_profiling_path(monkeypatch):
-    """available = requested - (weights + peak + non_torch); the only path."""
+    """Automatic sizing consumes the upstream non-KV aggregate."""
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, total_consumed=11 * GIB, headroom=2 * GIB),
+    )
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
-    profiled = 10 * GIB + 2 * GIB + 1 * GIB
-    assert out == 30 * GIB - profiled
+    assert out == 17 * GIB
+    assert worker.peak_activation_memory == 2 * GIB
+
+
+def test_determine_available_memory_uses_upstream_non_kv_total(monkeypatch):
+    """Persistent runner allocations before profiling must remain in the KV budget."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=3 * GIB, total_consumed=14 * GIB, headroom=2 * GIB),
+    )
+
+    assert OmniGPUWorkerBase.determine_available_memory(worker) == 14 * GIB
+    assert worker.total_consumed == 14 * GIB
+    assert worker.peak_activation_memory == 2 * GIB
 
 
 def test_determine_available_memory_populates_total_consumed(monkeypatch):
     """total_consumed mirrors upstream's MemoryProfilingResult field."""
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, total_consumed=11 * GIB, headroom=2 * GIB),
+    )
 
     OmniGPUWorkerBase.determine_available_memory(worker)
 
-    assert worker.total_consumed == 3 * GIB
+    assert worker.total_consumed == 11 * GIB
 
 
 def test_determine_available_memory_clamps_to_zero(monkeypatch):
     """Over-subscription clamps the KV budget to 0, never negative."""
     worker = _make_worker(requested_memory=5 * GIB, model_memory_usage=8 * GIB)
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=0, torch_peak=0))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=0, torch_peak=0, total_consumed=8 * GIB, headroom=0),
+    )
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
     assert out == 0
+
+
+@pytest.mark.parametrize(("non_torch", "torch_peak"), [(1, 3), (-2, 9)])
+def test_determine_available_memory_ignores_unreliable_legacy_components(monkeypatch, non_torch, torch_peak):
+    """Allocator-specific components must not replace the device aggregate."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(
+            non_torch=non_torch * GIB,
+            torch_peak=torch_peak * GIB,
+            total_consumed=14 * GIB,
+            headroom=2 * GIB,
+        ),
+    )
+
+    assert OmniGPUWorkerBase.determine_available_memory(worker) == 14 * GIB
+    assert worker.non_torch_memory == non_torch * GIB
+
+
+def test_determine_available_memory_respects_capped_request(monkeypatch):
+    """A stage's startup cap remains the basis for automatic KV sizing."""
+    worker = _make_worker(requested_memory=10 * GIB, model_memory_usage=4 * GIB)
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=0, torch_peak=2 * GIB, total_consumed=4 * GIB, headroom=2 * GIB),
+    )
+
+    assert OmniGPUWorkerBase.determine_available_memory(worker) == 4 * GIB
 
 
 def test_determine_available_memory_kv_cache_short_circuit(monkeypatch):
@@ -106,6 +166,7 @@ def test_determine_available_memory_kv_cache_short_circuit(monkeypatch):
     worker.model_runner.profile_run = lambda: profile_calls.append(True)
     # is_rocm gates only an extra synchronize on the short-circuit path.
     monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_rocm=lambda: False))
+    monkeypatch.setattr(base, "memory_profiling", lambda *args, **kwargs: pytest.fail("profiling must be bypassed"))
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
