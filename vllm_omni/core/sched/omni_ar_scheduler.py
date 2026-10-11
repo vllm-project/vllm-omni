@@ -28,6 +28,7 @@ from vllm_omni.core.sched.utils import (
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
 logger = init_logger(__name__)
 
@@ -425,8 +426,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         Both conditions come off the engine config: the stage must be the
         Talker (``model_config.model_stage == "tts"``) and it must carry the
         injected n-gram config whose ``num_speculative_tokens`` is exactly
-        ``K - 1``. The same stage-1 config feeds the model-side gate, so the
-        scheduler and the runner cannot disagree about K.
+        ``K - 1``. Interpretation is delegated to the shared
+        ``talker_kstep_contract`` module -- the model-side gate resolves the
+        same config through it, so the scheduler and the model cannot drift
+        apart (a missing ``method`` is disabled on both sides, and the frame
+        ceiling is enforced once).
         """
         cache = getattr(self, "_omni_talker_kstep_cache", None)
         if cache is None:
@@ -439,15 +443,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             spec = getattr(self, "speculative_config", None)
             if spec is None:
                 spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
-            if isinstance(spec, dict):
-                num_spec = spec.get("num_speculative_tokens", 0) or 0
-                is_ngram = spec.get("method", "ngram") == "ngram"
-            else:
-                num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
-                is_ngram = getattr(spec, "method", "ngram") == "ngram"
             model_cfg = getattr(vllm_cfg, "model_config", None)
-            is_talker = getattr(model_cfg, "model_stage", None) == "tts"
-            cache = self._omni_talker_kstep_cache = is_talker and is_ngram and num_spec > 0
+            cache = self._omni_talker_kstep_cache = (
+                talker_kstep_frames(getattr(model_cfg, "model_stage", None), spec) > 0
+            )
         return cache
 
     def _talker_waiting_prefill_may_run(self) -> bool:

@@ -49,6 +49,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     make_device_state,
     prepare_codec_logits,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
+    talker_kstep_frames,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
@@ -88,10 +91,6 @@ _CODEC_SAMPLING_SOURCES: tuple[tuple[str, str, Any, Any], ...] = (
 
 
 _REPETITION_PENALTY_CHUNK_SIZE = 16
-# Same TND ceiling as stage 0: at most 16 query positions per sequence. Hard
-# cap on the K-step frame count accepted from the deploy YAML (see
-# _parse_k_step_frames).
-_MINICPMO_TALKER_FRAMES_MAX = 16
 # ``past_window`` of MiniCPMTTS's codec repetition penalty: both generate() and
 # generate_chunk() build it through gen_logits(), which hardcodes
 # CustomRepetitionPenaltyLogitsProcessorRepeat(penalty, num_code, 16).
@@ -706,31 +705,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         Read back from the engine-side speculative_config that stage_config.py
         injects for stage 1 (method ``ngram`` with ``num_speculative_tokens ==
-        K - 1``). Deriving K from the engine config rather than from a separate
-        channel is what keeps the runner and the scheduler from disagreeing: a
+        K - 1``). The interpretation itself lives in the shared
+        ``talker_kstep_contract`` module, which the generic AR scheduler also
+        consumes -- deriving K through one contract instead of two independent
+        parsers is what keeps the runner and the scheduler from disagreeing: a
         mismatch either arms the loop with no drafts to consume, or leaves it
         off while the scheduler reserves K positions per request.
         """
         model_cfg = getattr(vllm_config, "model_config", None)
-        if getattr(model_cfg, "model_stage", None) != "tts":
-            return 0
-        spec = getattr(vllm_config, "speculative_config", None)
-        if isinstance(spec, dict):
-            method = spec.get("method")
-            num_spec = spec.get("num_speculative_tokens", 0) or 0
-        else:
-            method = getattr(spec, "method", None)
-            num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
-        if method != "ngram":
-            return 0
-        frames = int(num_spec) + 1
-        if frames < 2:
-            # K=1 degenerates to the ordinary one-frame path; treat it as off
-            # so the flag never silently half-arms the pipeline.
-            return 0
-        if frames > _MINICPMO_TALKER_FRAMES_MAX:
-            raise ValueError(f"K-step frame count is capped at {_MINICPMO_TALKER_FRAMES_MAX}, got {frames}")
-        logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
+        frames = talker_kstep_frames(
+            getattr(model_cfg, "model_stage", None),
+            getattr(vllm_config, "speculative_config", None),
+        )
+        if frames > 0:
+            logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
         return frames
 
     def _init_native_talker(self, prefix: str) -> None:
@@ -1478,10 +1466,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # takes the deterministic boundary sampler, same as single-frame.
             # Both boundary samplers return the full sample result; the device
             # state inside it owns the eos/stop-id/limit transition (single
-            # source). CPU unit tests historically stub these methods with the
-            # sampled tensor itself -- a bare tensor means no device state, and
-            # the stop routing falls back to the host recomputation below.
-            sample_result = None
+            # source).
             if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
                 greedy_result = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
@@ -1492,75 +1477,43 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     max_tokens,
                     eos_window_masked,
                 )
-                if isinstance(greedy_result, TalkerCodecSampleResult):
-                    sample_result = greedy_result
-                else:
-                    sampled = greedy_result.reshape(()).to(torch.long)
+                sample_result = greedy_result
             else:
-                stochastic_result = self._sample_audio_code(
+                sample_result = self._sample_audio_code(
                     hidden[end - 1 : end], codes, request_id, step, eos_window_masked
                 )
-                if isinstance(stochastic_result, TalkerCodecSampleResult):
-                    sample_result = stochastic_result
-                else:
-                    sampled = stochastic_result.reshape(()).to(torch.long)
-            if sample_result is not None:
-                # The kernel ABI is int32, while the existing connector/audio-code
-                # payload is int64.  Keep the compatibility cast outside the fused op.
-                sampled = sample_result.sampled_token.to(torch.long).reshape(())
-                # Review P2-3: the host needs sampled_id plus the device
-                # finished/emit decision every frame; pack the three scalars
-                # into one D2H transfer so a K-frame step costs one device
-                # sync per frame instead of three.
-                packed = torch.stack(
-                    (
-                        sampled,
-                        sample_result.state.finished.reshape(()).to(torch.long),
-                        sample_result.emit.reshape(()).to(torch.long),
-                    )
+            # The kernel ABI is int32, while the existing connector/audio-code
+            # payload is int64.  Keep the compatibility cast outside the fused op.
+            sampled = sample_result.sampled_token.to(torch.long).reshape(())
+            # Review P2-3: the host needs sampled_id plus the device
+            # finished/emit decision every frame; pack the three scalars
+            # into one D2H transfer so a K-frame step costs one device
+            # sync per frame instead of three.
+            packed = torch.stack(
+                (
+                    sampled,
+                    sample_result.state.finished.reshape(()).to(torch.long),
+                    sample_result.emit.reshape(()).to(torch.long),
                 )
-                packed_host = packed.cpu().tolist()
-                sampled_id = int(packed_host[0])
-                device_finished = bool(packed_host[1])
-                device_emit = bool(packed_host[2])
-            else:
-                sampled_id = int(sampled.item())
+            )
+            packed_host = packed.cpu().tolist()
+            sampled_id = int(packed_host[0])
+            device_finished = bool(packed_host[1])
+            device_emit = bool(packed_host[2])
             full_ids = state.get("codec_full_ids")
             if isinstance(full_ids, list):
                 full_ids.append(sampled_id)
             state["step"] = _codec_int_param(state, "step", 0) + 1
-            if sample_result is not None:
-                # Single-source stop routing: the device state owns the
-                # eos/stop-id/limit transition (codec_sample_result), so the
-                # host only consumes its finished/emit decision. Repetition
-                # detection stays host-side -- the scheduler never sees codec
-                # ids, so the engine's check_stop cannot police the codec
-                # stream; this mirrors it over codec_full_ids exactly as the
-                # engine does over its tokens (v1/core/sched/utils.py:125-133).
-                repetition_stop = _codec_repetition_detected(state)
-                finished = device_finished or repetition_stop
-                emit_frame = device_emit
-            else:
-                # Stub fallback: no device state behind the scripted sample.
-                if _codec_bool_param(state, "codec_ignore_eos", False):
-                    # ignore_eos blanks the engine's _eos_token_id
-                    # (vllm/sampling_params.py:670-671), so a sampled codec EOS is
-                    # just another frame and the request runs to its length budget.
-                    is_eos = False
-                else:
-                    is_eos = sampled_id == self._codec_eos_id
-                # stop_token_ids: the engine ends the request on any of these ids
-                # (v1/core/sched/utils.py:105); the codec stream ends it on the codec
-                # EOS, so both stop conditions apply here.
-                if not is_eos and sampled_id in _codec_stop_ids(state):
-                    is_eos = True
-                reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)
-                # The engine stops the request when check_stop sees the pattern
-                # (v1/core/sched/utils.py:125-133); the K-step path owns the
-                # codec ids, so it has to make that call itself.
-                repetition_stop = _codec_repetition_detected(state)
-                finished = is_eos or reached_limit or repetition_stop
-                emit_frame = not is_eos and not reached_limit
+            # Single-source stop routing: the device state owns the
+            # eos/stop-id/limit transition (codec_sample_result), so the host
+            # only consumes its finished/emit decision. Repetition detection
+            # stays host-side -- the scheduler never sees codec ids, so the
+            # engine's check_stop cannot police the codec stream; this mirrors
+            # it over codec_full_ids exactly as the engine does over its
+            # tokens (v1/core/sched/utils.py:125-133).
+            repetition_stop = _codec_repetition_detected(state)
+            finished = device_finished or repetition_stop
+            emit_frame = device_emit
             state["finished"] = finished
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
@@ -1802,6 +1755,67 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _codec_sample_setup(
+        self,
+        request_id: str,
+        hidden_state: torch.Tensor,
+        history: torch.Tensor,
+        request_state: dict,
+        step: int,
+        min_tokens: int,
+        max_tokens: int,
+        temperature: float,
+    ):
+        """Resolve the persistent per-request device state and sampler inputs.
+
+        Shared by the random and greedy boundary samplers, which used to
+        re-maintain the device-state dict, the in-place frame-ceiling refresh,
+        and the cached ``(min_tokens, temperature, penalty)`` device tuple
+        independently. The device state is created once per request and its
+        ceiling is refreshed in place -- the host state can tighten it after
+        creation, and swapping the tensor would re-capture the per-request
+        sampling graph. The input tuple is built once and cached; the greedy
+        sampler ignores temperature but fills the slot with a neutral 1.0 so
+        both samplers cache one tuple shape.
+        """
+        device_states = getattr(self, "_request_codec_device_states", None)
+        if device_states is None:
+            device_states = {}
+            self._request_codec_device_states = device_states
+        device_state = device_states.get(request_id)
+        if device_state is None:
+            device_state = make_device_state(
+                history,
+                step=step,
+                max_tokens=max_tokens,
+                finished=False,
+                full_bins=_codec_full_bins_input(request_state, hidden_state.device),
+            )
+            device_states[request_id] = device_state
+        else:
+            # Refresh in place, unconditionally: fill_ is a no-op when the
+            # budget did not move, and a .item() compare would sync every
+            # request every frame just to decide whether to write a value we
+            # can write regardless.
+            device_state.max_tokens.fill_(int(max_tokens))
+        device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
+        if device_inputs_by_request is None:
+            device_inputs_by_request = {}
+            self._request_codec_device_inputs = device_inputs_by_request
+        device_inputs = device_inputs_by_request.get(request_id)
+        if device_inputs is None:
+            device_inputs = (
+                torch.tensor([min_tokens], dtype=torch.int32, device=hidden_state.device),
+                torch.tensor([temperature], dtype=torch.float32, device=hidden_state.device),
+                torch.tensor(
+                    [_codec_float_param(request_state, "codec_repetition_penalty", self._codec_repetition_penalty)],
+                    dtype=torch.float32,
+                    device=hidden_state.device,
+                ),
+            )
+            device_inputs_by_request[request_id] = device_inputs
+        return device_state, device_inputs, device_states
+
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -1810,64 +1824,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         step: int,
         eos_window_masked: bool = False,
     ) -> TalkerCodecSampleResult:
-        device_states = getattr(self, "_request_codec_device_states", None)
-        if device_states is None:
-            device_states = {}
-            self._request_codec_device_states = device_states
-        request_states = getattr(self, "_request_audio_states", {})
-        request_state = request_states.get(request_id, {})
-        device_state = device_states.get(request_id)
-        if device_state is None:
-            device_state = make_device_state(
-                history,
-                step=step,
-                max_tokens=_codec_int_param(request_state, "max_tokens", self._codec_max_tokens),
-                finished=False,
-                full_bins=_codec_full_bins_input(request_state, hidden_state.device),
-            )
-            device_states[request_id] = device_state
-        else:
-            # The host state can tighten the frame ceiling after the device
-            # state was built: _merge_request_codec_params clamps
-            # state["max_tokens"] to the request's remaining output budget,
-            # while a reused device state still holds its creation-time value.
-            # Without this refresh the codec loop and the engine can stop at
-            # different frames, which is what the emitted codes must not do.
-            # Refresh in place: swapping the tensor would re-capture the
-            # per-request sampling graph.
-            budget = _codec_int_param(request_state, "max_tokens", self._codec_max_tokens)
-            # Refresh in place, unconditionally: fill_ is a no-op when the
-            # budget did not move, and the .item() compare would sync every
-            # request every frame just to decide whether to write a value we
-            # can write regardless. Swapping the tensor would re-capture the
-            # per-request sampling graph.
-            device_state.max_tokens.fill_(budget)
-        device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
-        if device_inputs_by_request is None:
-            device_inputs_by_request = {}
-            self._request_codec_device_inputs = device_inputs_by_request
-        device_inputs = device_inputs_by_request.get(request_id)
-        request_states = getattr(self, "_request_audio_states", {})
-        request_state = request_states.get(request_id, {})
-        if device_inputs is None:
-            device_inputs = (
-                torch.tensor(
-                    [_codec_int_param(request_state, "min_tokens", self._codec_min_tokens)],
-                    dtype=torch.int32,
-                    device=hidden_state.device,
-                ),
-                torch.tensor(
-                    [_codec_float_param(request_state, "codec_temperature", self._codec_temperature)],
-                    dtype=torch.float32,
-                    device=hidden_state.device,
-                ),
-                torch.tensor(
-                    [_codec_float_param(request_state, "codec_repetition_penalty", self._codec_repetition_penalty)],
-                    dtype=torch.float32,
-                    device=hidden_state.device,
-                ),
-            )
-            device_inputs_by_request[request_id] = device_inputs
+        request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
+        device_state, device_inputs, device_states = self._codec_sample_setup(
+            request_id,
+            hidden_state,
+            history,
+            request_state,
+            step,
+            min_tokens=_codec_int_param(request_state, "min_tokens", self._codec_min_tokens),
+            max_tokens=_codec_int_param(request_state, "max_tokens", self._codec_max_tokens),
+            temperature=_codec_float_param(request_state, "codec_temperature", self._codec_temperature),
+        )
         min_tokens_tensor, temperature_tensor, penalty_tensor = device_inputs
         eos_id = self._codec_eos_id
         logits = prepare_codec_logits(
@@ -1921,45 +1888,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         still reads ``sampled.item()`` for the connector payload; removing that
         sync requires a runner/connector state refactor and is not hidden here.
         """
-        device_states = getattr(self, "_request_codec_device_states", None)
-        if device_states is None:
-            device_states = {}
-            self._request_codec_device_states = device_states
         request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
-        device_state = device_states.get(request_id)
-        if device_state is None:
-            device_state = make_device_state(
-                history,
-                step=step,
-                max_tokens=max_tokens,
-                finished=False,
-                full_bins=_codec_full_bins_input(request_state, hidden_state.device),
-            )
-            device_states[request_id] = device_state
-        else:
-            # Same refresh as _sample_audio_code: the caller passes the host
-            # state's current frame ceiling, which the request's remaining
-            # output budget may have tightened after this device state was
-            # built. Refreshing in place keeps the per-request sampling graph,
-            # and fill_ is a no-op when the value already matches.
-            device_state.max_tokens.fill_(int(max_tokens))
-
-        device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
-        if device_inputs_by_request is None:
-            device_inputs_by_request = {}
-            self._request_codec_device_inputs = device_inputs_by_request
-        device_inputs = device_inputs_by_request.get(request_id)
-        if device_inputs is None:
-            device_inputs = (
-                torch.tensor([min_tokens], dtype=torch.int32, device=hidden_state.device),
-                torch.tensor([1.0], dtype=torch.float32, device=hidden_state.device),
-                torch.tensor(
-                    [_codec_float_param(request_state, "codec_repetition_penalty", self._codec_repetition_penalty)],
-                    dtype=torch.float32,
-                    device=hidden_state.device,
-                ),
-            )
-            device_inputs_by_request[request_id] = device_inputs
+        device_state, device_inputs, device_states = self._codec_sample_setup(
+            request_id,
+            hidden_state,
+            history,
+            request_state,
+            step,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            temperature=1.0,
+        )
         min_tokens_tensor, _, penalty_tensor = device_inputs
         result = greedy_codec_sample(
             self.head_code[0](hidden_state).float(),

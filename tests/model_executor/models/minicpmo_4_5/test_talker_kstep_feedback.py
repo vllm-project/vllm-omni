@@ -32,6 +32,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
     _codec_int_param,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+    codec_sample_result,
+    make_device_state,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -66,8 +70,13 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     model.emb_code = nn.ModuleList([emb])
     queue = iter(scripted_samples)
 
-    def _greedy(_hidden, _codes, _request_id, _step, _min_tokens, _max_tokens, _eos_window_masked=False):
-        return torch.tensor(next(queue), dtype=torch.long)
+    def _greedy(_hidden, codes, _request_id, step, _min_tokens, max_tokens, _eos_window_masked=False):
+        # Return a real sample result, not a bare tensor: the device state
+        # inside it owns the eos/limit transition, and the production
+        # bare-tensor fallback the old stub used to hit has been removed
+        # (review follow-up).
+        device_state = make_device_state(codes, step=step, max_tokens=max_tokens, finished=False)
+        return codec_sample_result(device_state, torch.tensor(next(queue), dtype=torch.long), eos_token_id=_EOS_ID)
 
     model._sample_audio_code_greedy = _greedy
     return model
