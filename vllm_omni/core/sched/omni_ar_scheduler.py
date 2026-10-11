@@ -28,6 +28,7 @@ from vllm_omni.core.sched.utils import (
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.models.qwen3_tts import text_stream
 
 logger = init_logger(__name__)
 
@@ -160,6 +161,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        # Qwen3-TTS takes whose text streams in: request id -> (stream key,
+        # text lead), or None for a take with no stream.
+        self._text_streams: dict[str, tuple[str, int] | None] = {}
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -304,6 +308,45 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
+    def _text_stream_of(self, request: Request) -> tuple[str, int] | None:
+        """The request's text stream and lead, read once from its additional information."""
+        rid = request.request_id
+        if rid in self._text_streams:
+            return self._text_streams[rid]
+        payload = getattr(request, "additional_information", None)
+        info = deserialize_additional_information(payload) if payload is not None else None
+        key = text_stream.stream_key(info)
+        found = (key, text_stream.text_lead(info)) if key is not None else None
+        if len(self._text_streams) > 4 * max(1, len(self.requests)):
+            self._text_streams = {r: v for r, v in self._text_streams.items() if r in self.requests}
+        self._text_streams[rid] = found
+        return found
+
+    def _hold_text_starved(self) -> list[Request]:
+        """Take out of ``running``, for this tick, every streamed take whose next decode step
+        would read a text row that has not arrived (it would read PAD before its text END).
+
+        The step about to be scheduled produces frame ``num_computed - prompt + 1``, which
+        reads text id ``lead + frame``; it may run once that id has arrived or the stream
+        has ended (its END row, then PAD, follow).
+        """
+        held: list[Request] = []
+        for request in list(self.running):
+            stream = self._text_stream_of(request)
+            if stream is None:
+                continue
+            key, lead = stream
+            prompt = request.num_prompt_tokens
+            if request.num_computed_tokens < prompt:
+                continue  # still prefilling: the prompt holds its text
+            frame = request.num_computed_tokens - prompt + 1
+            arrived, ended = text_stream.count(key)
+            if ended or lead + frame < arrived:
+                continue
+            self.running.remove(request)
+            held.append(request)
+        return held
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -396,9 +439,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
+        held = self._hold_text_starved()
+        # A held take keeps its KV cache, its state and its place: it simply runs
+        # no step this tick, as a running request outside the token budget does,
+        # and the cap keeps its seat so no waiting request is admitted into it.
+        self.max_num_running_reqs -= len(held)
+        # Admission into RUNNING reads max_num_active_reqs (vLLM 0.31); the finally
+        # below restores it from original_max_num_active_reqs.
+        self.max_num_active_reqs = max(0, self.max_num_active_reqs - len(held))
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_running_reqs += len(held)
+            self.running.extend(held)
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues

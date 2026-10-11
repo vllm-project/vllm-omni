@@ -60,6 +60,8 @@ def _make_talker(*, ban_frames: int, logits: torch.Tensor, modes=None):
     object.__setattr__(talker, "_codec_disallowed_mask", torch.zeros((_VOCAB,), dtype=torch.bool))
     object.__setattr__(talker, "_batch_req_ids", req_ids)
     object.__setattr__(talker, "_mrv2_silence_ban_mask", None)
+    object.__setattr__(talker, "_req_text_streams", {})
+    object.__setattr__(talker, "_mrv2_num_output_tokens", None)
     object.__setattr__(
         talker,
         "_req_x_vector_only",
@@ -205,6 +207,7 @@ def _mode_talker(ban_frames: int = 3):
     talker = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     object.__setattr__(talker, "_silence_ban_frames", ban_frames)
     object.__setattr__(talker, "_req_x_vector_only", {})
+    object.__setattr__(talker, "_req_text_streams", {})
     object.__setattr__(talker, "_batch_req_ids", [])
     object.__setattr__(talker, "_prompt_builder", SimpleNamespace(preprocess_batch=lambda **_kwargs: None))
     return talker
