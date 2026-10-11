@@ -802,6 +802,32 @@ class TestLockFileLifecycle:
             except OSError:
                 pass
 
+    def test_get_blocked_lock_survives_segment_replacement_window(self, connector):
+        """Lock contention must not steal the writer's lock.
+
+        During a same-key replacement the writer holds the lock while the old
+        segment is already unlinked and the new one not yet created; a reader
+        whose flock fails in that window must leave the lock alone.
+        """
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        try:
+            _, _, meta = connector.put("s0", "s1", key, {"data": "r" * 128})
+            fd = os.open(lock, os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)  # the "writer" holds the lock
+                self._force_unlink_segment(key)  # old segment gone, new not yet created
+                result = connector.get("s0", "s1", key, metadata=meta)
+                assert result is None
+                assert os.path.exists(lock)  # the held lock must survive
+            finally:
+                os.close(fd)
+        finally:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
     def test_sweep_removes_stale_lock_without_segment(self):
         key = self._fresh_key()
         lock = self._lock_path(key)
