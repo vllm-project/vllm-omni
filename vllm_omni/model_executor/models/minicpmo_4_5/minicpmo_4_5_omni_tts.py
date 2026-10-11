@@ -39,15 +39,16 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
-    VOCAB_SIZE as _CODEC_VOCAB_SIZE,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+    HISTORY_WINDOW,
     TalkerCodecDeviceState,
     TalkerCodecSampleResult,
     codec_sample_result,
     greedy_codec_sample,
     make_device_state,
     prepare_codec_logits,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
+    VOCAB_SIZE as _CODEC_VOCAB_SIZE,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     talker_kstep_frames,
@@ -62,7 +63,6 @@ logger = init_logger(__name__)
 # Codec-sampling fallbacks the multi-frame path reads directly. The deploy YAML
 # and the checkpoint's tts_config override them per request; these match what
 # the single-frame path falls back to.
-_REPETITION_WINDOW = 16
 _MIN_AUDIO_TOKENS = 64
 _CODEC_SEED = 42
 _CODEC_TEMPERATURE = 0.8
@@ -682,22 +682,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Rows the sampler must force to codec EOS, computed with this step's output.
         self._mrv2_forced_eos: torch.Tensor | None = None
         self._mrv2_decode_rows_logged = False
-
-    @staticmethod
-    def _probe_soc_name() -> str:
-        """torch_npu device-name string, or "" when the probe cannot run.
-
-        The integer SoCVersion encoding is not a documented ordering (a local
-        910B3 reports 223, which defeats any threshold guess), so the guard
-        matches on the name prefix instead -- exactly what torch_npu itself
-        does (utils/_module.py lists "Ascend910B" and "Ascend910_93").
-        """
-        try:
-            import torch_npu
-
-            return str(torch_npu.npu.get_device_name(torch_npu.npu.current_device()))
-        except Exception:
-            return ""
 
     @classmethod
     def _parse_k_step_frames(cls, vllm_config: Any = None) -> int:
@@ -1518,7 +1502,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
             if emit_frame:
-                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
+                codes = torch.cat([codes[-(HISTORY_WINDOW - 1) :], sampled.reshape(1)])
                 delta = sampled.reshape(1, 1)
                 if self._k_step_frames > 0:
                     # K-step: the multi-frame loop owns sampling, so the rows
