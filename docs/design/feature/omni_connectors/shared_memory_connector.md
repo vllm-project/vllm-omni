@@ -168,18 +168,13 @@ This path is mainly for older code paths and is not the preferred mode for the c
 `put()` writes every serialized payload to shared memory. The connector has no
 inline-payload path or size threshold.
 
-#### 6.2 Cleanup Is Currently Passive
+#### 6.2 Cleanup Unlinks the Exact Tracked Key
 
-`cleanup()` is currently a no-op. The intended assumption is:
+`cleanup(request_id)` unlinks the exact key passed to `put()` — never a request-id prefix — together with its lock file, and returns whether an unconsumed segment was actually unlinked. `cleanup_prefix()` applies the same unlink to every tracked key of the form `{key_prefix}{chunk_id}`. Keys no longer tracked (already consumed, or written by another process) are not touched. A key the consumer never reads and nobody cleans up stays allocated until the sender's `close()`.
 
-- the consumer reads the segment
-- the underlying shared-memory helpers unlink it
+#### 6.3 Close Drains Tracked Keys and Wakeups
 
-If the consumer never executes `get()`, the shared-memory segment may remain allocated. This means the connector relies on the normal success path for resource reclamation.
-
-#### 6.3 Close Is Currently Minimal
-
-`close()` is also a no-op. There is no connector-owned background thread, socket, or memory pool to tear down, so the lifecycle is simple. The trade-off is that `close()` does not scan or recover leaked shared-memory resources.
+`close()` runs the exact-key cleanup for every key still tracked in `_pending_keys`, then closes the receiver's wakeup FIFO. There is no connector-owned background thread or memory pool. Crash leftovers beyond the tracked keys are reaped by the time-gated orphan sweep described in §4.3.
 
 ### 7. Data Flow in the Pipeline
 
