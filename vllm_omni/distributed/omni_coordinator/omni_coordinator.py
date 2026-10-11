@@ -209,6 +209,7 @@ class OmniCoordinator:
                 event_type=str(data["event_type"]),
                 status=ReplicaStatus(data.get("status")),
                 queue_length=data.get("queue_length"),
+                topology_domain=data.get("topology_domain"),
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -299,6 +300,7 @@ class OmniCoordinator:
             if event.event_type == "heartbeat":
                 promote = False
                 queue_changed = False
+                topology_changed = False
                 with self._lock:
                     info = self._replicas.get(input_addr)
                     if info is not None:
@@ -306,10 +308,13 @@ class OmniCoordinator:
                         if event.queue_length is not None and info.queue_length != event.queue_length:
                             info.queue_length = event.queue_length
                             queue_changed = True
+                        if info.topology_domain != event.topology_domain:
+                            info.topology_domain = event.topology_domain
+                            topology_changed = True
                         if info.status == ReplicaStatus.ERROR:
                             info.status = ReplicaStatus.UP
                             promote = True
-                if promote or queue_changed:
+                if promote or queue_changed or topology_changed:
                     self._schedule_broadcast()
                 return
 
@@ -347,6 +352,7 @@ class OmniCoordinator:
             queue_length=event.queue_length,
             last_heartbeat=now,
             registered_at=now,
+            topology_domain=event.topology_domain,
         )
         self._replicas[input_addr] = info
 
@@ -359,6 +365,8 @@ class OmniCoordinator:
 
         if event.queue_length is not None:
             info.queue_length = event.queue_length
+
+        info.topology_domain = event.topology_domain
 
     def _remove_replica_locked(self, event: ReplicaEvent) -> None:
         input_addr = event.input_addr

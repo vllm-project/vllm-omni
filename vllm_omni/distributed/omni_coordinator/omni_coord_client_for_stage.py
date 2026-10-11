@@ -4,16 +4,164 @@
 import contextlib
 import json
 import logging
+import os
+import socket
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
+from pathlib import Path
+from typing import Any
 
 import zmq
 
 from .messages import ReplicaEvent, ReplicaStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _as_text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _normalize_pci_bus_id(value: object) -> str | None:
+    bus_id = _as_text(value).strip().lower()
+    if not bus_id:
+        return None
+    # NVML commonly emits 00000000:3b:00.0 while Linux sysfs uses
+    # 0000:3b:00.0. Keeping the last 12 characters normalizes both forms.
+    return bus_id[-12:]
+
+
+def _read_pci_locality(bus_id: str) -> str | None:
+    """Return a Linux NUMA or PCI-root locality label for ``bus_id``."""
+    device_path = Path("/sys/bus/pci/devices") / bus_id
+    try:
+        numa_node = int((device_path / "numa_node").read_text().strip())
+        if numa_node >= 0:
+            return f"numa:{numa_node}"
+    except (OSError, ValueError):
+        pass
+
+    try:
+        resolved = device_path.resolve(strict=True)
+    except OSError:
+        return None
+    for parent in resolved.parents:
+        if parent.name.startswith("pci") and ":" in parent.name:
+            return f"pci:{parent.name[3:]}"
+    return None
+
+
+def _visible_nvml_handles(pynvml: Any, all_handles: list[Any]) -> list[Any]:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices is None:
+        return all_handles
+    if not visible_devices.strip():
+        return []
+
+    selected: list[Any] = []
+    for raw_device in visible_devices.split(","):
+        device = raw_device.strip()
+        if not device:
+            continue
+        try:
+            if device.isdecimal():
+                selected.append(pynvml.nvmlDeviceGetHandleByIndex(int(device)))
+            else:
+                selected.append(pynvml.nvmlDeviceGetHandleByUUID(device))
+        except Exception:
+            logger.debug(
+                "Unable to resolve CUDA_VISIBLE_DEVICES entry %s with NVML",
+                device,
+                exc_info=True,
+            )
+            return []
+    return selected
+
+
+def _detect_cuda_topology_domain(hostname: str, *, pynvml: Any | None = None) -> str | None:
+    """Detect the NVLink island, NUMA node, or PCI root of visible GPUs."""
+    if pynvml is None:
+        try:
+            from vllm.utils.import_utils import import_pynvml
+
+            pynvml = import_pynvml()
+        except Exception:
+            return None
+
+    initialized = False
+    try:
+        pynvml.nvmlInit()
+        initialized = True
+        all_handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
+        selected_handles = _visible_nvml_handles(pynvml, all_handles)
+        if not selected_handles:
+            return None
+
+        handle_by_bus: dict[str, Any] = {}
+        selected_bus_ids: list[str] = []
+        for handle in all_handles:
+            bus_id = _normalize_pci_bus_id(pynvml.nvmlDeviceGetPciInfo(handle).busId)
+            if bus_id is not None:
+                handle_by_bus[bus_id] = handle
+        for handle in selected_handles:
+            bus_id = _normalize_pci_bus_id(pynvml.nvmlDeviceGetPciInfo(handle).busId)
+            if bus_id is None:
+                return None
+            selected_bus_ids.append(bus_id)
+
+        # Build NVLink connected components across all GPUs so independently
+        # launched replicas in the same island derive the same stable label.
+        parent = {bus_id: bus_id for bus_id in handle_by_bus}
+
+        def find(bus_id: str) -> str:
+            while parent[bus_id] != bus_id:
+                parent[bus_id] = parent[parent[bus_id]]
+                bus_id = parent[bus_id]
+            return bus_id
+
+        def union(left: str, right: str) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        max_links = int(getattr(pynvml, "NVML_NVLINK_MAX_LINKS", 18))
+        for local_bus, handle in handle_by_bus.items():
+            for link in range(max_links):
+                try:
+                    if not pynvml.nvmlDeviceGetNvLinkState(handle, link):
+                        continue
+                    remote_info = pynvml.nvmlDeviceGetNvLinkRemotePciInfo(handle, link)
+                    remote_bus = _normalize_pci_bus_id(remote_info.busId)
+                except Exception:
+                    continue
+                if remote_bus in handle_by_bus:
+                    union(local_bus, remote_bus)
+
+        selected_roots = {find(bus_id) for bus_id in selected_bus_ids}
+        if len(selected_roots) == 1:
+            root = next(iter(selected_roots))
+            nvlink_island = sorted(bus_id for bus_id in handle_by_bus if find(bus_id) == root)
+            if len(nvlink_island) > 1:
+                return f"{hostname}/nvlink:{','.join(nvlink_island)}"
+
+        locality = {_read_pci_locality(bus_id) for bus_id in selected_bus_ids}
+        if len(locality) == 1 and None not in locality:
+            return f"{hostname}/{next(iter(locality))}"
+
+        # Conservative last resort: use the exact GPU set. This never treats
+        # unrelated GPUs as local merely because they share a hostname.
+        return f"{hostname}/gpu:{','.join(sorted(set(selected_bus_ids)))}"
+    except Exception:
+        logger.debug("Automatic CUDA topology detection failed", exc_info=True)
+        return None
+    finally:
+        if initialized:
+            with contextlib.suppress(Exception):
+                pynvml.nvmlShutdown()
 
 
 class OmniCoordClientForStage:
@@ -29,12 +177,14 @@ class OmniCoordClientForStage:
         input_addr: str,
         output_addr: str,
         stage_id: int,
+        topology_domain: str | None = None,
     ) -> None:
         """Initialize client and send initial registration / status-up event."""
         self._coord_zmq_addr = coord_zmq_addr
         self._input_addr = input_addr
         self._output_addr = output_addr
         self._stage_id = stage_id
+        self._topology_domain = topology_domain
 
         self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.DEALER)
@@ -130,6 +280,7 @@ class OmniCoordClientForStage:
                 event_type=event_type,
                 status=self._status,
                 queue_length=self._queue_length,
+                topology_domain=self._topology_domain,
             )
             data = json.dumps(asdict(event)).encode("utf-8")
 
@@ -232,6 +383,39 @@ class OmniCoordClientForStage:
             self._closed = True
 
 
+def detect_topology_domain() -> str | None:
+    """Best-effort detection of the local NVLink/NUMA/IB topology domain.
+
+    Returns the value of the ``VLLM_OMNI_TOPOLOGY_DOMAIN`` environment variable
+    if set. Otherwise, CUDA replicas are grouped by NVLink connected component,
+    then NUMA node or PCI root complex. The exact visible GPU set is used as a
+    conservative last resort, including when NVML is unavailable. Replicas
+    that share a domain can communicate over fast local links, while
+    cross-domain transfers traverse InfiniBand or TCP.
+
+    Returns ``None`` if even the hostname cannot be determined, in which case
+    the topology-aware balancer falls back to ``least-queue-length``.
+    """
+    env_domain = os.environ.get("VLLM_OMNI_TOPOLOGY_DOMAIN")
+    if env_domain:
+        return env_domain
+    try:
+        hostname = socket.gethostname()
+    except OSError:
+        return None
+    detected_domain = _detect_cuda_topology_domain(hostname)
+    if detected_domain is not None:
+        return detected_domain
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices is None:
+        return None
+    device_ids = sorted({device.strip() for device in visible_devices.split(",") if device.strip()})
+    if not device_ids or device_ids == ["-1"]:
+        return None
+    return f"{hostname}/cuda-visible:{','.join(device_ids)}"
+
+
 def create_stage_coord_client(
     *,
     coord_zmq_addr: str,
@@ -239,6 +423,7 @@ def create_stage_coord_client(
     output_addr: str,
     stage_id: int,
     queue_length_getter: Callable[[], int] | None = None,
+    topology_domain: str | None = None,
 ) -> OmniCoordClientForStage:
     """Create a stage coordinator client with an optional heartbeat hook."""
     client = OmniCoordClientForStage(
@@ -246,6 +431,7 @@ def create_stage_coord_client(
         input_addr=input_addr,
         output_addr=output_addr,
         stage_id=stage_id,
+        topology_domain=topology_domain,
     )
     if queue_length_getter is not None:
 

@@ -103,8 +103,14 @@ class FakePrewarmPool:
 
     stage_type = "llm"
 
-    def __init__(self, role: str) -> None:
-        self.stage_client = SimpleNamespace()
+    def __init__(
+        self,
+        role: str,
+        *,
+        engine_input_source: list[int] | None = None,
+        topology_domain: str | None = None,
+    ) -> None:
+        self.stage_client = SimpleNamespace(engine_input_source=engine_input_source)
         self._bound_request_ids: set[str] = set()
         self.stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -113,14 +119,20 @@ class FakePrewarmPool:
             )
         )
         self.submitted: list[Any] = []
+        self.submit_kwargs: list[dict[str, Any]] = []
+        self.topology_domain = topology_domain
 
-    async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
+    async def submit_initial(self, request_id, _req_state, request, prompt_text=None, **kwargs):
         self.submitted.append(request)
+        self.submit_kwargs.append(kwargs)
         self._bound_request_ids.add(request_id)
         return 0
 
     def get_bound_replica_id(self, request_id):
         return 0 if request_id in self._bound_request_ids else None
+
+    def get_replica_topology_domain(self, _replica_id):
+        return self.topology_domain
 
     def get_bound_client(self, request_id):
         return self.stage_client if self.get_bound_replica_id(request_id) is not None else None
@@ -209,9 +221,10 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
 @pytest.mark.parametrize("payload_sender_info", [None, {"host": "10.0.0.2", "zmq_port": 52099}])
 async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> None:
     orchestrator = object.__new__(Orchestrator)
-    stage0 = FakePrewarmPool("sender")
+    stage0 = FakePrewarmPool("sender", topology_domain="node-a")
     stage1 = FakePrewarmPool("sender")
-    stage2 = FakePrewarmPool("receiver")
+    stage2 = FakePrewarmPool("receiver", engine_input_source=[0])
+    stage0._bound_request_ids.add("req-prewarm")
     if payload_sender_info is not None:
         stage1.stage_client.get_payload_sender_info = MagicMock(return_value=payload_sender_info)
     orchestrator.stage_pools = [stage0, stage1, stage2]
@@ -234,6 +247,7 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
     assert stage1.submitted == []
     assert stage1.get_bound_client("req-prewarm") is None
     assert len(stage2.submitted) == 1
+    assert stage2.submit_kwargs == [{"topology_domain": "node-a"}]
     assert stage2.get_bound_client("req-prewarm") is stage2.stage_client
     assert stage2.submitted[0].payload_sender_info == payload_sender_info
     if payload_sender_info is not None:
@@ -248,6 +262,30 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
         0,
         req_state,
     )
+
+
+def test_multi_source_topology_hint_requires_one_common_domain() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender", topology_domain="node-a")
+    stage1 = FakePrewarmPool("sender", topology_domain="node-a")
+    orchestrator.stage_pools = [stage0, stage1]
+    for pool in orchestrator.stage_pools:
+        pool._bound_request_ids.add("req-common-domain")
+
+    assert orchestrator._common_producer_topology_domain([0, 1], "req-common-domain") == "node-a"
+
+    stage1.topology_domain = "node-b"
+    assert orchestrator._common_producer_topology_domain([0, 1], "req-common-domain") is None
+
+
+def test_multi_source_topology_hint_requires_every_producer_binding() -> None:
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender", topology_domain="node-a")
+    stage1 = FakePrewarmPool("sender", topology_domain="node-a")
+    orchestrator.stage_pools = [stage0, stage1]
+    stage0._bound_request_ids.add("req-missing-producer")
+
+    assert orchestrator._common_producer_topology_domain([0, 1], "req-missing-producer") is None
 
 
 @pytest.mark.asyncio
