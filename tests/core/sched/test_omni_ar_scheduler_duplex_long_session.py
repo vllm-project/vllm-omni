@@ -220,3 +220,23 @@ def test_rebase_needs_room_past_the_window(tmp_path) -> None:
             break
     assert outputs["s"].finish_reason == FinishReason.ERROR
     assert f"max_model_len {WINDOW}" in outputs["s"].stop_reason
+
+
+def test_a_session_whose_blocks_are_hashed_is_never_cut(tmp_path) -> None:
+    """Prefix caching or a KV connector hashes a session's blocks in a chain from
+    token 0; cutting the prompt would misalign those hashes with the trimmed
+    block table, so such a session keeps its whole prompt."""
+    sched = _make_scheduler(tmp_path)
+    _join_rebased(sched, {"s": WINDOW - 100})
+    session = sched.requests["s"]
+    session.block_hashes.append(b"hashed")  # what the block hasher would have produced
+
+    frames = 0
+    for _ in range(MAX_MODEL_LEN - WINDOW):
+        sampled_at, _ = _append_frame(sched, "s")
+        assert "s" in sampled_at
+        frames += 1
+    # Far enough past the window that an unhashed session would have been cut.
+    assert session.num_computed_tokens > WINDOW + 512
+    assert _position_base(sched, "s") == 0
+    assert len(session.prompt_token_ids) == WINDOW - 100 + frames

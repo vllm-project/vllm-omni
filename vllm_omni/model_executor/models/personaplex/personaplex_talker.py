@@ -42,6 +42,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.engine.duplex.intermediate import duplex_position_base
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
     PersonaPlexConfig,
@@ -294,8 +295,10 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         window and hands the cut length over as ``duplex.position_base``
         (``OmniARScheduler._rebase_streaming_positions``): the runner's
         positions then count from the cut, and ``forward`` adds the base back.
+        Only the per-request ``preprocess`` path calls this; a batched
+        preprocess that prepares rows itself must write their base too.
         """
-        base = int(duplex.get("position_base", 0) or 0)
+        base = duplex_position_base(duplex)
         if base == 0:
             return
         start = info_dict.get("_omni_token_start")
