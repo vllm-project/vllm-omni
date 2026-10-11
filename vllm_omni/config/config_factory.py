@@ -721,7 +721,10 @@ class StageConfigFactory:
                 "stage_type": StageType.DIFFUSION.value,
                 "runtime": {
                     "process": True,
-                    "devices": ",".join(str(i) for i in range(parallel_config.world_size)),
+                    "devices": kwargs.get("stage_0_devices")
+                    or kwargs.get("devices")
+                    or ",".join(str(i) for i in range(parallel_config.world_size)),
+                    "num_replicas": kwargs["num_replicas"] if kwargs.get("num_replicas") is not None else 1,
                 },
                 "engine_args": engine_args,
                 "default_sampling_params": default_sampling_params,
@@ -767,6 +770,10 @@ class StageConfigFactory:
             or kwargs.get("devices")
             or ",".join(str(i) for i in range(parallel_config.world_size))
         )
+        # Replicas belong to the stage runtime, not the terminal diffusion
+        # engine, so they are absent from the normalized engine overrides.
+        if kwargs.get("num_replicas") is not None:
+            stage_overrides["stage_0_num_replicas"] = kwargs["num_replicas"]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
         deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)])

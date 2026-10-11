@@ -855,6 +855,82 @@ def test_generic_diffusion_uses_canonical_video_output_type(model_class_name):
     assert config.stage_configs[0].final_output_type == "video"
 
 
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize(
+    ("kwargs", "devices", "layout"),
+    [
+        ({}, "0", ([1], {})),
+        ({"num_replicas": None}, "0", ([1], {})),
+        ({"num_replicas": 2}, "0", ([2], {0: ["0", "1"]})),
+        ({"num_replicas": 2, "tensor_parallel_size": 2}, "0,1", ([2], {0: ["0,1", "2,3"]})),
+        (
+            {"num_replicas": 2, "tensor_parallel_size": 2, "devices": "2,3,6,7"},
+            "2,3,6,7",
+            ([2], {0: ["2,3", "6,7"]}),
+        ),
+        (
+            {"num_replicas": 2, "devices": "0,1", "stage_0_devices": "4,5"},
+            "4,5",
+            ([2], {0: ["4", "5"]}),
+        ),
+    ],
+    ids=["defaults", "unset-count", "replicas", "parallel-template", "device-pool", "stage-devices"],
+)
+def test_generic_diffusion_preserves_replica_layout(typed, kwargs, devices, layout):
+    from vllm_omni.config.yaml_util import create_config
+
+    original_kwargs = dict(kwargs)
+    if typed:
+        stage = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs[0]
+        assert stage.runtime_config.devices == devices
+    else:
+        stage = create_config(StageConfigFactory.create_default_diffusion(kwargs))[0]
+        assert stage.runtime.devices == devices
+        assert "num_replicas" not in stage.engine_args
+
+    assert stage_init_utils.compute_replica_layout([stage]) == layout
+    assert kwargs == original_kwargs
+
+
+@pytest.mark.parametrize("num_replicas", [0, -1])
+def test_generic_diffusion_rejects_invalid_replica_count(num_replicas):
+    with pytest.raises(ValidationError, match="num_replicas"):
+        StageConfigFactory.create_typed_default_diffusion("generic-diffusion", {"num_replicas": num_replicas})
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+def test_generic_diffusion_rejects_invalid_replica_device_pool(typed):
+    from vllm_omni.config.yaml_util import create_config
+
+    kwargs = {"num_replicas": 2, "tensor_parallel_size": 2, "devices": "0,1,2"}
+    if typed:
+        stages = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs
+    else:
+        stages = create_config(StageConfigFactory.create_default_diffusion(kwargs))
+
+    with pytest.raises(ValueError, match="need either 2 .* or 4"):
+        stage_init_utils.compute_replica_layout(stages)
+
+
+def test_generic_diffusion_stage_override_controls_replica_layout(mocker):
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "FakeDiffusionPipeline"),
+    )
+
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides={"num_replicas": 1, "devices": "0", "tensor_parallel_size": 2},
+        stage_overrides={"0": {"num_replicas": 2, "devices": "2,3,6,7"}},
+        strategy_config_path=None,
+    )
+
+    assert stage_init_utils.compute_replica_layout(resolved.stage_configs) == ([2], {0: ["2,3", "6,7"]})
+
+
 def test_generic_diffusion_resolves_structured_stage_without_legacy_conversion(mocker):
     """Generic diffusion reaches runtime as the structured stage itself."""
     mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
