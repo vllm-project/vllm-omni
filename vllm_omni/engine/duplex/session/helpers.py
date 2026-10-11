@@ -125,6 +125,25 @@ def audio_payload_size_bytes(payload: Mapping[str, object]) -> int:
         return 0
 
 
+def base64_payload_size_bytes(payload: Mapping[str, object]) -> int:
+    """Decoded size of a payload's base64 audio, from its length (no decode).
+
+    For audio the engine encoded itself (no whitespace); ``audio_payload_size_bytes``
+    validates client input.
+    """
+    audio = payload.get("audio") or payload.get("data")
+    if not isinstance(audio, str):
+        return 0
+    return len(audio) * 3 // 4 - len(audio[-2:]) + len(audio[-2:].rstrip("="))
+
+
+def pcm_bytes_per_sample(fmt: object) -> int:
+    """Bytes per mono sample of an engine-side PCM payload format."""
+    if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+        return 2
+    return 4  # pcm_f32le, the engine's decoded format
+
+
 # --------------------------------------------------------------------------- #
 # Turn transitions                                                            #
 # --------------------------------------------------------------------------- #

@@ -259,6 +259,16 @@ class DuplexAudioChunk:
     sample_rate_hz: int | None = None
 
 
+#: ``extra_body`` key and value that make a session input-clocked (``session/input_clock.py``).
+INPUT_CLOCK_KEY = "clock"
+INPUT_CLOCK_VALUE = "input"
+
+
+def input_clocked(extra_body: object) -> bool:
+    """Whether a session's ``extra_body`` opts into the input clock (``clock: "input"``)."""
+    return isinstance(extra_body, Mapping) and extra_body.get(INPUT_CLOCK_KEY) == INPUT_CLOCK_VALUE
+
+
 @dataclass
 class DuplexSessionConfig:
     model: str | None = None

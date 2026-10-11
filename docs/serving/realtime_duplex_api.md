@@ -443,6 +443,307 @@ without `extra_body.auto_response`, and `response.cancel` /
 `output_audio_buffer.clear` restart its conversation context (a new Stage 0
 request replays the voice/persona prefill).
 
+### Session options that control model time
+
+A few `extra_body` keys change how the server advances the model between
+client inputs. They are model-neutral. `silence_continuation` can be changed
+with any `session.update` and is on by default; turning it off also stops a
+silence unit that was already waiting for its slot. `clock` and the two
+`input_clock_unit_*` timeouts are set when the session is created and cannot
+be changed afterwards, and `clock` requires a model that supports it (see
+below).
+
+| `extra_body` key | Default | Effect |
+| --- | --- | --- |
+| `silence_continuation` | `true` | `false` stops the server from feeding the model silence units of its own while a response is running. Use it when the client streams its microphone continuously (silence included), so the model only ever hears audio the client sent. |
+| `clock` | unset | `"input"` makes the session *input-clocked*: model time advances only with client input, and every client input is acknowledged once its outputs are out (see below). Set it when the session is created. |
+| `input_clock_unit_timeout_s` | `15` | Input-clocked sessions only: liveness valve, see [Timeouts](#timeouts). Set it when the session is created. |
+| `input_clock_unit_max_s` | `60` | Input-clocked sessions only: maximum unit age, see [Timeouts](#timeouts). Set it when the session is created. |
+
+#### Input-clocked sessions
+
+By default a duplex session runs on wall-clock time: the client paces its
+input in real time, and the server fills gaps with silence so a turn keeps
+going. A client that drives the model from a simulation, an evaluation
+harness or an offline batch job wants the opposite: the model should advance
+exactly as fast as input arrives — faster than real time when input is
+already available, not at all while the client pauses — and the client must
+know which outputs were caused by which input, independent of timing.
+
+`extra_body.clock = "input"` in the configuration that creates the session
+(for a Realtime WebSocket client, the first `session.update`, which opens the
+session) gives that contract:
+
+- The server never invents input: silence continuation is off. If the client
+  sends nothing, nothing happens.
+- Idle handling and resources are those of any duplex session: the same
+  idle window (`idle_timeout_s`, default 300 s) and engine lease
+  (`idle_ttl_s`), and a client that pauses longer than that between inputs
+  is released like any idle session. The clock adds no resource handling of
+  its own.
+- A client that disconnects releases its session as usual: it is closed at
+  once, or, for a model that supports session resume, expired after the
+  deploy's `disconnect_grace_s`. Close the session (`session.close`) when an
+  episode ends.
+- After a resume (`session.resume`, for a model that supports it) the
+  journaled acknowledgements are replayed, and `session.resumed` carries
+  `session.input_index`: the `input_index` of the latest input that reached
+  the session when the resume was handled. The value is final only once the
+  old connection's reader has drained: the server does not wait for it, so
+  frames the old connection had already read but not yet handed to the
+  session (for example while the client resumed before the server saw the
+  old socket close, or while that reader was blocked on a slow append) can
+  still be admitted after `session.resumed`, with higher indices, and are
+  then acknowledged as usual. Inputs beyond `session.input_index` that never
+  reach the session are lost with the connection (no error, no
+  acknowledgement). To avoid sending an input twice, resend only those
+  after `session.input_index` that are not acknowledged on the new
+  connection once the old socket has been closed or replaced (the client
+  closed it, or saw it closed).
+- Every `input_audio_buffer.append`, `input_audio_buffer.commit` and
+  `response.create` that reaches the session gets exactly one
+  `input_audio_buffer.processed`, in input order (a teardown acknowledges all inputs still owed with one event that
+  covers `first_input_index` .. `input_index`). It is sent only after every
+  output that input caused has been sent:
+  for each model unit the input completed, the model's decision has been
+  taken and, if it spoke, the output the model emitted for that unit (its
+  text and audio deltas, and `response.done` if the response ended in that
+  unit) went out first. "Emitted for the unit" is what the model's plugin
+  marks as the end of the unit's output; a model whose last stage streams
+  across units can emit the end of a unit's audio later, as it does in
+  real-time operation. That lag is model-specific: each model documents
+  its own in its entry under *Input-clocked sessions*.
+- So the outputs of an input are bracketed by acknowledgements, up to that
+  model-specific lag: they come after the acknowledgement of an earlier
+  input and before the input's own.
+  (Units are acknowledged in order, so an acknowledgement can also cover
+  output of earlier inputs that was still pending. Events no input caused —
+  errors for other commands, session lifecycle events, the turn of a server
+  VAD commit — are not bracketed.) A client that sends one input, waits for
+  its acknowledgement, and repeats, gets the same event sequence whatever
+  its pacing, given deterministic sampling and the same concurrent load on
+  the server: which other sessions share a batch changes the model's
+  numerics, with or without the clock.
+
+```json
+{
+  "type": "input_audio_buffer.processed",
+  "event_id": "event_5c1e…",
+  "audio_end_ms": 3200,
+  "unit_end_ms": 3000,
+  "input_index": 16,
+  "trigger": "input_audio_buffer.append",
+  "units": [{"end_ms": 3000, "decision": "speak"}]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `audio_end_ms` | Total input audio the session had handled up to and including this input (on a teardown acknowledgement, all audio it handled): the client's input position. The audio of a refused input (`decision: "rejected"`) is not counted; audio the session handled but discarded without submitting it is (see below). |
+| `unit_end_ms` | Input audio covered by the settled model units (completed by the model, or settled as below) created up to and including this input. |
+| `input_index` | 1-based position of the acknowledged input among this session's acknowledged inputs. |
+| `first_input_index` | Only on the acknowledgement a teardown sends: it acknowledges inputs `first_input_index` .. `input_index` at once (see below). |
+| `trigger` | Client event type acknowledged (on a teardown acknowledgement, that of input `input_index`). |
+| `units` | Settled model units created up to and including this input that no earlier acknowledgement reported, oldest first: `end_ms`, `decision`, and `reason` for a unit settled as `cancelled`, `aborted` or `timed_out`. A unit of a later input that settled first waits for that input's acknowledgement. |
+| `decision`, `reason` | Only on the acknowledgement of an input the session refused before any of it reached the model: `"rejected"` and the error code. |
+
+For audio input, `unit_end_ms` never exceeds `audio_end_ms` (a unit of a
+commit-based model that also retains video frames counts the retained bytes,
+so the bound covers audio-only input buffers). The difference is the input
+not covered by a settled unit: audio still buffered toward the next unit,
+audio of units still open, and audio the session discarded without submitting
+it — an append the overlap policy dropped or did not buffer, a silent chunk
+skipped in turn mode (`response.listen` with `reason: "silence_or_noise"`),
+audio cleared by `input_audio_buffer.clear` or a cancel, and a committed turn
+settled before it was submitted. It is therefore not a measure of backlog;
+step on the acknowledgements themselves.
+
+`units[].decision` is the model's decision for a unit it completed —
+`listen`, `speak`, or a model-specific label — or one of these values for a
+unit that will produce no further model output:
+
+| `decision` | When | `reason` |
+| --- | --- | --- |
+| `dropped` | The unit's audio never reached the model (its append was called off, or queued behind a failed append). | — |
+| `cancelled` | A cancel cancelled the unit or called off its append: `response.cancel`, `output_audio_buffer.clear`, a barge-in (client `barge_in` / `input.cancel`, or an overlap barge-in decided by the server); or a committed turn deferred behind the active response was not submitted because a cancel ended that response or its audio was dropped (`input_audio_buffer.clear`, or a short interjection discarded while the model speaks). | `client_cancelled`, `output_audio_buffer_clear`, `barge_in`, `turn_detected`, `input_cleared` or `short_overlap_discarded` |
+| `aborted` | The session ended (closed, expired, or failed) with the unit open. | The close reason, e.g. `client_close`, `idle_ttl_expired`, `runtime_append_task_failed`. |
+| `timed_out` | A timeout settled the unit. | `no_progress` or `max_age` |
+
+The acknowledgement of an input the session refused before any of it reached
+the model carries the same two keys at the top level: `decision: "rejected"`
+and `reason` = the code of its `error` (see the contract below). Both keys
+are absent from every other acknowledgement, and from a teardown
+acknowledgement that covers several inputs.
+
+A *model unit* is one submission to the model's first stage: what the model's
+input buffer cuts from appends (`capabilities.chunk_period_ms`, e.g. a 1 s
+chunk or an 80 ms frame) or, for a commit-based model, one committed turn.
+Settling a unit only releases the acknowledgements: if the model's output
+for a settled unit still arrives, it is sent as usual and stays that unit's —
+it is never credited to the next unit (except output of a cancelled
+response, which is dropped). This includes a unit settled before the model had even accepted it, and a
+deferred committed turn whose slot timed out before the response it waited
+for ended and submitted it.
+
+Input clocking is available only for models whose plugin declares it
+(`DuplexModelPlugin.supports_input_clock`), because the engine needs the
+model's real unit boundaries to know when a unit's output is complete. On any
+other model, a session with `clock: "input"` is refused with error
+`input_clock_unsupported` — at session creation, or on a `session.update`
+that sets it.
+
+##### Acknowledgement contract
+
+- **An input that only buffers audio.** An append that does not complete a
+  unit (it buffers part of one), and a commit or `response.create` that
+  submits nothing, creates no unit: it is acknowledged as soon as the
+  acknowledgements of the inputs before it are out (its `units` lists
+  whatever settled since the previous acknowledgement, often nothing).
+- **An input that submits several units.** An append longer than one unit
+  submits every whole unit it completes, and a commit that flushes a backlog
+  may submit more than one unit. The input still gets exactly one
+  acknowledgement, after all of them, and `units` lists each of them. (This
+  needs a model whose input buffer can emit its backlog,
+  `PcmAppendBuffer.prepare_backlog`; on a model whose buffer does not, an
+  append submits at most one unit and the rest waits for later appends.)
+  Audio short of a whole unit stays buffered for the next append; at
+  teardown it is not submitted (`audio_end_ms` − `unit_end_ms` on the
+  teardown acknowledgement). Keep appends no longer than one unit to get one
+  unit per acknowledgement.
+- **An input rejected with an error.** An append, commit or
+  `response.create` the server rejects with an `error` event caused nothing,
+  and is acknowledged like an input that only buffers audio, in its input
+  order (after the acknowledgements of the inputs sent before it):
+    - Refused before any of it reached the model: when the session admits
+      it (`input_backpressure`, `invalid_input_modality`) or when it prepares
+      an append's audio (`input_backpressure`, `invalid_input_modality`,
+      `bad_audio`, `bad_event`). The acknowledgement carries
+      `decision: "rejected"` and `reason` = the error code, and the input's
+      audio is not counted in `audio_end_ms`. Send the input again (for
+      `input_backpressure`, after a short back-off) if the model should hear
+      it.
+    - Rejected while the session handles it otherwise (e.g.
+      `input_audio_buffer_empty`, `commit_aborted`, or `input_backpressure`
+      for audio a commit-based model already buffered): a plain
+      acknowledgement; the `error` says why.
+- **An input rejected before it reaches the session.** An event the server's
+  transport layer rejects gets only its `error`: it is not acknowledged and
+  is not assigned an `input_index`. This covers a frame that cannot be read
+  as an event (`invalid_json`, `event_too_large`, or `bad_event` for a frame
+  that is not an object with a string `type`), an event that cannot be
+  translated (e.g. `bad_audio` for undecodable audio,
+  `unsupported_audio_format`, `bad_event`), and an event the engine's request
+  queue did not take (`engine_backpressure`). The client identifies it by the
+  error's `event_id`, the `event_id` of the rejected client event (a frame
+  that could not be parsed has none), so give every input an `event_id`.
+  `bad_audio` and `bad_event` can also come from the session (above); a
+  client that keeps one input in flight tells the two apart by whether an
+  acknowledgement follows the error.
+  Inputs sent after the session began closing are refused with
+  `session_closed` and are not acknowledged either (see teardown below).
+- **A commit deferred behind an active response.** A commit that arrives
+  while the model is still responding is retained and submitted once the
+  response ends; its acknowledgement waits for that turn. This holds on
+  every model: an input-clocked session never starts a turn while the
+  previous one is still speaking, also on a model that otherwise overlaps
+  turns. If a cancel ends
+  the response first, or the turn's audio is dropped before it is submitted,
+  the turn is settled as `cancelled` and the acknowledgement is sent. A
+  cancel that keeps the committed audio (`output_audio_buffer.clear`, an
+  overlap barge-in) leaves it for the next commit, which merges it, or
+  `response.create`, which submits it; that input's acknowledgement then
+  waits for the turn.
+- **Cancellation.** `response.cancel`, `output_audio_buffer.clear`, a
+  barge-in and `input.cancel` drop all model output of the cancelled
+  response (the cancelled epoch). The units still open from it, and the
+  appends the cancel called off, are settled as `cancelled` right after the
+  cancellation's own events, and the acknowledgements they held back are
+  sent. The cancel command itself is not acknowledged.
+- **Failure after acceptance.** An append that fails after the model
+  accepted it does not leave its acknowledgement to the timeouts: the failure
+  closes the session, so its unit is settled with the teardown below
+  (`aborted`, `reason` = the failure, e.g. `runtime_append_task_failed`).
+- **Teardown / abandoned input.** When the session ends with
+  acknowledgements owed — `session.close`, an idle or disconnect expiry, a
+  runtime failure — the open units are settled as `aborted` and all owed
+  inputs are acknowledged by a single `input_audio_buffer.processed`
+  (`first_input_index` .. `input_index`, or the input's own acknowledgement
+  when only one input was owed), sent before `session.closed` / `session.expired`.
+  Owed inputs include those the session received but had not handled yet. A
+  teardown therefore adds at most one event to the session's output however
+  many inputs were in flight. Inputs that arrive after the session began
+  closing are not acknowledged, and no acknowledgement follows the terminal
+  event. (An engine shutdown sends no events at all. A session closed for
+  `output_backpressure` suppresses ordinary events, this acknowledgement
+  included; see [Output limits and slow consumers](#output-limits-and-slow-consumers).)
+- **Server VAD.** With server VAD turn detection the commit the server
+  derives is not a client input, so its response is reported with the next
+  acknowledged input; drive turns with explicit commits instead.
+
+##### Timeouts
+
+Two timeouts keep a client from waiting forever on a model that breaks the
+unit contract. Both settle the unit as `timed_out`, and the server logs a
+warning (at most one per session every 30 s; the rest at debug level). Each
+must be a positive number of seconds, or `null` for the default: any other
+value is refused with `invalid_duplex_runtime_config`.
+
+- **No progress** (`input_clock_unit_timeout_s`, default 15 s): units are
+  open and the session's model pipeline produced nothing at all for that
+  long (client input does not restart this window; it starts when the
+  pipeline was idle and gets work). The oldest open unit is settled
+  (`reason: "no_progress"`) and the window restarts.
+- **Maximum unit age** (`input_clock_unit_max_s`, default 60 s): a unit is
+  still open that long after it was submitted, although the model keeps
+  producing output (e.g. a final stage that never marks the unit complete).
+  The unit is settled (`reason: "max_age"`). Raise it for models with very
+  long responses.
+
+The timeouts guarantee that acknowledgements keep coming, not throughput. A
+settled speaking unit keeps its place for its final-stage output, which stays
+its own when it arrives, so attribution stays correct. If that output never
+comes, the speaking units after it in the same epoch wait for their own
+timeouts too (slow, but each acknowledgement still follows its own outputs),
+and the server logs a warning naming the unit. A cancel (`response.cancel`,
+or a barge-in) recovers from this state: it starts a new epoch, settles the
+open units of the old one as `cancelled`, and the units after it are no
+longer queued behind the missing output. No other event signals the state.
+
+The timeouts only settle units, which releases acknowledgements; they free no
+resources. A Stage-0 submission that stalls keeps holding its session's
+resources and engine lease exactly as in a session without the clock (the
+lease's idle expiry does not run while a submission is in flight). They are
+reclaimed by the existing session-level paths: `session.close`, or a
+disconnect (including the socket's `idle_timeout_s`) and, for a resumable
+model, its `disconnect_grace_s`.
+
+A commit or `session.update` is applied only after the appends sent before
+it, and the session handles nothing else (a cancel included) while it waits.
+If such an append stalls (its submission to the model never finishes), the
+command does not wait past the timeouts: once a timeout is due for an open
+unit of that append, or of an append it is queued behind (at the latest
+`input_clock_unit_max_s` after that unit was submitted), or one of them was
+already settled by a timeout, the command is rejected as for a failed append
+(`commit_aborted` / `session_update_aborted`; a `function_call_output` item
+waiting for it is dropped, as after a failed append), and the
+acknowledgements the timeout releases follow, after any output that arrived
+before it. A timeout due for any other unit does not abort the command; it
+is settled once the command is done, so while a command waits for a stalled
+append, an older unit's no-progress settling can be delayed up to that
+bound. (An append whose units the model already completed but whose
+submission never returns is waited for as in any duplex session.)
+
+##### Fixed at creation; sessions without the clock
+
+`clock`, `input_clock_unit_timeout_s` and `input_clock_unit_max_s` are fixed
+when the session is created: a `session.update` that changes any of them is
+rejected with error `input_clock_update_unsupported` and leaves the session
+unchanged (repeating the same values is accepted).
+
+A session without `clock: "input"` does not create the input clock: it
+never receives `input_audio_buffer.processed`, and the clock adds no work to
+its mailbox, appends or teardown.
+
 ### Compatibility with the OpenAI Realtime protocol
 
 The Realtime dialect is, by design, an OpenAI-Realtime-compatible surface:
@@ -618,6 +919,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input_audio_buffer.speech_stopped` | 1 | Speech end detected. |
 | `input_audio_buffer.committed` | 2 | Commit accepted. OpenAI name; wraps the native `input.committed` payload under `event` (`turn_id`, `epoch`, `response_create_deferred`, ...). |
 | `input_audio_buffer.cleared` | 1 | Input buffer cleared (after `input_audio_buffer.clear` or `input.cancel`). |
+| `input_audio_buffer.processed` | 3 | Input-clocked sessions only: one per append / commit / `response.create`, after all of its outputs (see [Input-clocked sessions](#input-clocked-sessions)). |
 | `conversation.item.added` | 2 | Item entered history (GA spelling). OpenAI name; carries `previous_item_id` and echoes the originating event. |
 | `conversation.item.created` | 2 | Same as `conversation.item.added` in the beta spelling; both are emitted. |
 | `conversation.item.done` | 2 | Item finalized (GA spelling). |
