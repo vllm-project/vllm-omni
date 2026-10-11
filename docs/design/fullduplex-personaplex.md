@@ -95,8 +95,10 @@ Session policy:
   (`personaplex_prefill_slots`, itself caching the tokenizer and the voice
   bundle row count). The result is server-owned runtime config
   (`personaplex_model_path`, `personaplex_voice_prompt`,
-  `personaplex_persona`, `personaplex_prefill_slots`); the same keys are
-  refused in a client's `extra_body`.
+  `personaplex_persona`, `personaplex_prefill_slots`, and
+  `duplex_position_rebase`, which lets Stage 0 cut a long call's prompt
+  behind the sliding window); the same keys are refused in a client's
+  `extra_body`.
 - `runtime_config_for_update`: persona and voice are immutable for the
   session (`persona_update_unsupported`, `voice_update_unsupported`).
 - session state, extra-body validation and data-plane context are the
