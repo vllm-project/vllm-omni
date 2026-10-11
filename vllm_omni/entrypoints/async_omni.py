@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
@@ -627,11 +627,18 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         request_id: str,
         *,
         interaction: OmniInteractionPrompt,
+        on_error: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         """Apply a midway interaction to an active streaming diffusion request.
 
         ``request_id`` is the external id created by the server-side session,
         matching the value passed to :meth:`generate`.
+
+        Submission only queues the interaction. If the engine rejects it later,
+        the request keeps generating and ``on_error`` is awaited with
+        ``(event_id, message)``. One callback serves all of the request's
+        interactions; the latest one passed applies. Without a callback the
+        rejection is logged.
         """
         event = interaction.get("event")
         prompt = event.get("prompt") if isinstance(event, dict) else None
@@ -655,6 +662,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 f"interaction requires exactly one active request for {request_id!r}, found {len(internal_ids)}"
             )
 
+        if on_error is not None:
+            self.request_states[internal_ids[0]].interaction_error_handler = on_error
         await self.engine.submit_interaction_async(
             internal_ids[0],
             interaction=interaction,
