@@ -77,7 +77,7 @@ def build_app(
     turn_mode: str = "manual",
     speech_input: bool = False,
 ) -> FastAPI:
-    if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn"}:
+    if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn", "personaplex-native"}:
         raise ValueError(f"Unknown profile: {profile}")
     if turn_mode not in {"manual", "vad", "semantic_vad"}:
         raise ValueError(f"Unknown turn mode: {turn_mode}")
@@ -89,7 +89,11 @@ def build_app(
         raise ValueError("AURA profile does not accept --ref-audio")
     if profile == "joyai-turn" and ref_audio:
         raise ValueError("JoyAI profile does not accept --ref-audio")
-    ws_backend = ws_backend or ("ws://127.0.0.1:8091" if profile == "qwen3-turn" else "ws://127.0.0.1:8099")
+    if profile == "personaplex-native" and ref_audio:
+        raise ValueError("PersonaPlex uses its bundled voice prompt")
+    ws_backend = ws_backend or (
+        "ws://127.0.0.1:8091" if profile in {"qwen3-turn", "personaplex-native"} else "ws://127.0.0.1:8099"
+    )
     model = (
         model
         or {
@@ -97,6 +101,7 @@ def build_app(
             "aura-ptt": "aurateam/AURA",
             "joyai-turn": "jdopensource/JoyAI-VL-Interaction-Preview",
             "qwen3-turn": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "personaplex-native": "nvidia/personaplex-7b-v1",
         }[profile]
     )
     app = FastAPI(title="Omni Realtime Web UI")
@@ -198,7 +203,7 @@ def main(default_profile: str = "minicpm-native") -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
     parser.add_argument(
-        "--profile", choices=("minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn"), default=default_profile
+        "--profile", choices=("minicpm-native", "qwen3-turn", "aura-ptt", "joyai-turn", "personaplex-native"), default=default_profile
     )
     parser.add_argument("--ws-backend", "--backend", dest="ws_backend")
     mode = parser.add_mutually_exclusive_group()
