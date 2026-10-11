@@ -44,6 +44,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.engine.duplex.intermediate import duplex_position_base
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
     PersonaPlexConfig,
@@ -363,8 +364,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         window and hands the cut length over as ``duplex.position_base``
         (``OmniARScheduler._rebase_streaming_positions``): the runner's
         positions then count from the cut, and ``forward`` adds the base back.
+        The batched path writes bases for all handled rows in ``preprocess_batch``.
         """
-        base = int(duplex.get("position_base", 0) or 0)
+        base = duplex_position_base(duplex)
         if base == 0:
             return
         start = info_dict.get("_omni_token_start")
@@ -626,7 +628,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # The per-request path copies the prepared zero placeholder ids.
         input_ids.index_fill_(0, dst, 0)
         # Handled rows skip preprocess, so write their RoPE bases at the same token offsets.
-        bases = [int(candidates[position][2].get("position_base", 0) or 0) for position in handled]
+        bases = [duplex_position_base(candidates[position][2]) for position in handled]
         if any(bases):
             self._rope_position_base.index_copy_(0, dst, index_to_device(bases, inputs_embeds.device))
         return {candidates[position][1] for position in handled}

@@ -40,6 +40,7 @@ from vllm_omni.core.sched.utils import (
     streaming_update_replaces_prompt as _streaming_update_replaces_prompt,
 )
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
+from vllm_omni.engine.duplex.intermediate import DUPLEX_POSITION_BASE_KEY, DUPLEX_POSITION_REBASE_KEY
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import CONTINUE_TOKEN_ID
 from vllm_omni.worker_v2.ngram_adapter import is_thinker_ngram, use_scheduler_ngram
@@ -2334,7 +2335,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     # Runtime-config flag a duplex plugin sets when its Stage 0 model adds the
     # session's ``duplex.position_base`` to its RoPE positions.
-    STREAMING_POSITION_REBASE_KEY = "duplex_position_rebase"
+    STREAMING_POSITION_REBASE_KEY = DUPLEX_POSITION_REBASE_KEY
     # A cut is a multiple of this many tokens (and of the KV page size).
     # FlashAttention reduces keys in tiles of up to 256 tokens counted from key
     # 0, so such a cut keeps every in-window key in its tile and the attention
@@ -2394,7 +2395,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 base,
             )
         session._omni_position_base = base
-        update.model_intermediate_buffer = {**buffer, "duplex": {**duplex, "position_base": base}}
+        update.model_intermediate_buffer = {**buffer, "duplex": {**duplex, DUPLEX_POSITION_BASE_KEY: base}}
         return False
 
     def _trim_streaming_prompt_behind_window(self, session: Request) -> int:
@@ -2429,7 +2430,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
             return 0
         computed = int(session.num_computed_tokens)
-        if computed < session.num_prompt_tokens or session.num_output_placeholders or session.num_in_flight_tokens:
+        if computed < session.num_prompt_tokens or session.num_in_flight_tokens:
+            return 0
+        if session.block_hashes:
+            # Block hashes (prefix caching or a KV connector) chain over the
+            # prompt from token 0; a cut would misalign them with the trimmed
+            # block table.
+            logger.warning_once(
+                "[Omni] %s: this session's blocks are hashed (prefix caching or a KV connector); not rebasing",
+                session.request_id,
+            )
             return 0
         # The next step attends to the last ``window - 1`` computed tokens.
         behind = computed - (window - 1)
@@ -2457,8 +2467,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request_id in manager.num_cached_block:
                 manager.num_cached_block[request_id] = max(0, manager.num_cached_block[request_id] - num_blocks)
         del session._all_token_ids[:cut]
-        if session.prompt_token_ids is not session._all_token_ids:
-            del session.prompt_token_ids[:cut]
+        del session.prompt_token_ids[:cut]
         session.num_prompt_tokens -= cut
         session.num_computed_tokens -= cut
         return cut
