@@ -157,10 +157,10 @@ class SharedMemoryConnector(OmniConnectorBase):
     Lock-file lifecycle contract: the zero-byte lock file
     ``/dev/shm/shm_{key}_lockfile.lock`` has no lifecycle of its own — it
     exists exactly while its segment does.  It is removed on the successful
-    receiving read, on a read whose segment is already gone, on a key-based
-    poll whose segment no longer exists (``_reclaim_orphan_lock_file``), on a
-    failed ``put()`` (the segment never came to life), and by ``cleanup()`` /
-    ``close()`` for keys still tracked in ``_pending_keys``.  Abnormally
+    receiving read, on a lock-acquired read whose segment is already gone, on
+    a key-based poll whose segment no longer exists
+    (``_reclaim_orphan_lock_file``), on a failed ``put()`` (the segment never
+    came to life), and by ``cleanup()`` / ``close()``.  Abnormally
     terminated processes leave lock files behind once their segments are
     reaped by ``resource_tracker``; a time-gated sweep
     (``_maybe_sweep_stale_lock_files``, called from ``__init__`` / ``put()`` /
@@ -365,9 +365,11 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
         consumed = False
+        locked = False
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
                 data_bytes = shm_read_bytes(shm_handle)
                 consumed = True
                 fcntl.flock(lockf, fcntl.LOCK_UN)
@@ -382,10 +384,14 @@ class SharedMemoryConnector(OmniConnectorBase):
         finally:
             # The lock file has no lifecycle of its own: once the segment is
             # gone (consumed by this read, or already reaped elsewhere) the
-            # lock guarding it must go too.  A failed read with the segment
-            # still alive keeps the lock — the transfer can be retried.
+            # lock guarding it must go too — but only when this call actually
+            # acquired the lock.  During a same-key replacement the writer
+            # holds it while the old segment is already unlinked and the new
+            # one not yet created, and that gap must not steal the writer's
+            # lock.  A failed read with the segment still alive keeps the
+            # lock — the transfer can be retried.
             seg_gone = not os.path.exists(f"/dev/shm/{shm_handle['name']}")
-            if consumed or seg_gone:
+            if consumed or (locked and seg_gone):
                 try:
                     os.remove(lock_file)
                 except OSError:

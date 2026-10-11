@@ -115,7 +115,7 @@ Locking is done with `fcntl.flock`:
 
 Both sides acquire an exclusive lock. This ensures that the shared-memory segment is not read while it is still being written and makes the handoff safer in a multi-process environment.
 
-Lock-file lifecycle: a lock file has no lifecycle of its own — it exists exactly while its segment does. It is removed on the successful receiving read, on a read whose segment is already gone, on a key-based poll whose segment no longer exists, on a failed `put()` (the segment never came to life), and by `cleanup()` / `close()` for keys still tracked in `_pending_keys`. Abnormally terminated processes leave lock files behind once their segments are reaped by `resource_tracker`; a time-gated sweep (at most once per 60 s, from `__init__` / `put()` / `get()`) reaps such orphans with a check–lock–recheck protocol that never touches a young, held, or live-segment lock.
+Lock-file lifecycle: a lock file has no lifecycle of its own — it exists exactly while its segment does. It is removed on the successful receiving read, on a lock-acquired read whose segment is already gone, on a key-based poll whose segment no longer exists, on a failed `put()` (the segment never came to life), and by `cleanup()` / `close()`. Abnormally terminated processes leave lock files behind once their segments are reaped by `resource_tracker`; a time-gated sweep (at most once per 60 s, from `__init__` / `put()` / `get()`) reaps such orphans with a check–lock–recheck protocol that never touches a young, held, or live-segment lock.
 
 ### 5. Put / Get Flow
 
@@ -145,7 +145,7 @@ The primary consumer path is metadata-driven:
 2. Acquire the exclusive lock.
 3. Read the raw bytes from shared memory.
 4. Deserialize the bytes back into the original Python object.
-5. Remove the lock file when the segment is gone (successful read, or a failed read after the segment was unlinked); keep it while the segment still exists so the transfer can be retried.
+5. Remove the lock file when the segment is gone (successful read, or a lock-acquired read that failed after the segment was unlinked); keep it while the segment still exists so the transfer can be retried — a read blocked on the lock never touches it.
 
 This is the path used by the current stage-to-stage connector flow.
 
@@ -168,9 +168,9 @@ This path is mainly for older code paths and is not the preferred mode for the c
 `put()` writes every serialized payload to shared memory. The connector has no
 inline-payload path or size threshold.
 
-#### 6.2 Cleanup Unlinks the Exact Tracked Key
+#### 6.2 Cleanup Unlinks the Exact Key
 
-`cleanup(request_id)` unlinks the exact key passed to `put()` — never a request-id prefix — together with its lock file, and returns whether an unconsumed segment was actually unlinked. `cleanup_prefix()` applies the same unlink to every tracked key of the form `{key_prefix}{chunk_id}`. Keys no longer tracked (already consumed, or written by another process) are not touched. A key the consumer never reads and nobody cleans up stays allocated until the sender's `close()`.
+`cleanup(request_id)` unlinks the exact key passed to `put()` — never a request-id prefix — together with its lock file, and returns whether a segment was actually unlinked. The cleanup is unconditional: the key does not need to be tracked in this connector's `_pending_keys`, so a caller may also reclaim a key it only knows by name. `cleanup_prefix()` and `close()` are the tracked-key operations: the former unlinks only tracked keys of the form `{key_prefix}{chunk_id}`, the latter drains the tracked keys (§6.3). A key the consumer never reads and nobody cleans up stays allocated until the sender's `close()` — or the orphan sweep, once its segment is gone (§4.3).
 
 #### 6.3 Close Drains Tracked Keys and Wakeups
 
