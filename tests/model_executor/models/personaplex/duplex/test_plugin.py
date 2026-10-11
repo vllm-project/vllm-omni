@@ -17,6 +17,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
@@ -155,7 +156,7 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
 
 @pytest.mark.parametrize("deploy", ["personaplex.yaml", "personaplex_duplex_mrv2.yaml"])
 def test_personaplex_deploy_config_keeps_context_past_the_sliding_window(tmp_path: Path, deploy: str) -> None:
-    """Both profiles configure an hour of 80 ms frames, past Helium's 3000-frame window."""
+    """Both profiles keep a 4096-token scheduler context and an hour of absolute RoPE positions."""
     (tmp_path / "config.json").write_text("{}")
     deploy_config = load_deploy_config(DEPLOY_PATH.with_name(deploy))
     # The historical mixed-runner profile inherits the context length but
@@ -176,7 +177,7 @@ def test_personaplex_deploy_config_keeps_context_past_the_sliding_window(tmp_pat
     assert model_config.hf_text_config is temporal
     assert temporal.sliding_window == 3000
     assert temporal.max_position_embeddings == 46_080  # 60 min of 80 ms frames + 1080 of prefill
-    assert model_config.max_model_len == 46_080
+    assert model_config.max_model_len == 4096
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +223,7 @@ def test_private_runtime_keys_are_rejected_in_extra_body() -> None:
         "personaplex_model_path",
         "personaplex_voice_prompt",
         "personaplex_persona",
+        "duplex_position_rebase",
     }
     plugin.validate_client_extra_body({"auto_response": True})
     plugin.validate_client_extra_body(None)
@@ -257,6 +259,8 @@ async def test_prepare_runtime_config_resolves_voice_and_prefill_slots_once(monk
         "personaplex_voice_prompt": "NATM1.pt",
         "personaplex_persona": "Be brief.",
         "personaplex_prefill_slots": 42,
+        # The talker restores absolute RoPE positions, so Stage 0 may rebase.
+        OmniARScheduler.STREAMING_POSITION_REBASE_KEY: True,
     }
     assert again == runtime_config
     assert defaults["personaplex_voice_prompt"] == "NATF2.pt"
