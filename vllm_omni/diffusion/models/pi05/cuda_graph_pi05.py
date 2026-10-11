@@ -12,9 +12,15 @@
 One graph per region is enough. Every shape is fixed for a serving instance:
 batch 1, ``max_cameras`` image slots (a missing camera only flips its mask),
 ``image_resolution`` images, a ``tokenizer_max_length`` text block and a
-``chunk_size`` suffix. The per-request step count only changes how often the
-region 3 graph replays, since the timestep is a graph input. And no region
-reads a tensor value on the host, so no captured control flow depends on data.
+``chunk_size`` suffix. With schedule precomputation off, the per-request step
+count only changes how often region 3 replays. With it on, the default schedule
+supplies a new conditioning/modulation row on every replay; unsupported
+schedules use eager denoising. No captured control flow depends on tensor data.
+
+Optional request-invariant masks, positions and RoPE tables are copied into
+stable buffers once per request, before its denoising loop. Optional KV-only
+prefix capture is used only by callers explicitly requesting KV-only output;
+generic prefix calls retain the eager full-hidden-state semantics.
 
 The graphs are captured once at init (``Pi05CUDAGraphs.capture``), in replay
 order and into one memory pool. Regions hand data to each other without
@@ -51,10 +57,13 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
+    Pi05DenoiseContext,
+    Pi05DenoiseStepData,
     Pi05KVCache,
     make_att_2d_masks,
     prepare_attention_masks_4d,
 )
+from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
@@ -82,6 +91,27 @@ def _load(static: torch.Tensor, src: torch.Tensor) -> None:
         static.copy_(src)
 
 
+def _rotary_matches(src, static: tuple[torch.Tensor, torch.Tensor] | None) -> bool:
+    if static is None:
+        return src is None
+    return (
+        isinstance(src, tuple)
+        and len(src) == 2
+        and all(_matches(tensor, buffer) for tensor, buffer in zip(src, static))
+    )
+
+
+def _step_data_matches(src: Pi05DenoiseStepData | None, static: Pi05DenoiseStepData | None) -> bool:
+    if static is None:
+        return src is None
+    return (
+        isinstance(src, Pi05DenoiseStepData)
+        and _matches(src.timestep, static.timestep)
+        and _matches(src.time_cond, static.time_cond)
+        and _matches(src.modulations, static.modulations)
+    )
+
+
 @dataclass
 class _EmbedPrefixGraph:
     graph: torch.cuda.CUDAGraph
@@ -103,6 +133,8 @@ class _PrefixForwardGraph:
     kv_cache: Pi05KVCache
     # ``([prefix_out, None], kv_cache)``
     outputs: tuple[list[torch.Tensor | None], Pi05KVCache]
+    prefix_kv_only: bool = False
+    rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -114,6 +146,8 @@ class _DenoiseStepGraph:
     x_t: torch.Tensor
     timestep: torch.Tensor
     v_t: torch.Tensor
+    context: Pi05DenoiseContext | None = None
+    step_data: Pi05DenoiseStepData | None = None
 
 
 class Pi05CUDAGraphs:
@@ -124,6 +158,9 @@ class Pi05CUDAGraphs:
         # reference back keeps that from forming a cycle, so dropping the model
         # frees its GPU memory immediately rather than at the next GC pass.
         self._model = weakref.proxy(model)
+        # Capture modes are initialization-only. The model's frozen options
+        # determine one graph per region, not a graph for every schedule row.
+        self._runtime_options = getattr(model, "runtime_options", Pi05RuntimeOptions())
         self._embed_prefix: _EmbedPrefixGraph | None = None
         self._prefix_forward: _PrefixForwardGraph | None = None
         self._denoise_step: _DenoiseStepGraph | None = None
@@ -155,9 +192,9 @@ class Pi05CUDAGraphs:
         height, width = config.image_resolution
         text_len = int(config.tokenizer_max_length)
 
-        # ``no_grad`` rather than ``inference_mode``: the static buffers stay
-        # normal tensors, which callers in either mode may copy into.
-        with torch.no_grad(), set_default_torch_dtype(_CAPTURE_DEFAULT_DTYPE):
+        # Override an outer loader inference_mode as well: static buffers must
+        # remain normal tensors, which callers in either mode may copy into.
+        with torch.inference_mode(False), torch.no_grad(), set_default_torch_dtype(_CAPTURE_DEFAULT_DTYPE):
             # Dummy inputs; only their shapes and dtypes are captured.
             images = [torch.zeros(1, 3, height, width, device=device) for _ in range(int(config.max_cameras))]
             image_masks = [torch.ones(1, dtype=torch.bool, device=device) for _ in images]
@@ -172,16 +209,46 @@ class Pi05CUDAGraphs:
             )
             attention_mask = prepare_attention_masks_4d(make_att_2d_masks(prefix_pad_masks, prefix_att_masks))
             position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_kwargs = {}
+            rotary_emb = None
+            if self._runtime_options.prefix_kv_only:
+                prefix_kwargs["prefix_kv_only"] = True
+            if self._runtime_options.hoist_denoise_invariants:
+                rotary_emb = model.prepare_prefix_rotary(prefix_embs, position_ids)
+                prefix_kwargs["rotary_emb"] = rotary_emb
             model.paligemma_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=kv_cache,
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
+                **prefix_kwargs,
             )
             x_t = torch.zeros(1, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
             timestep = torch.ones(1, dtype=torch.float32, device=device)
-            model.denoise_step(prefix_pad_masks=prefix_pad_masks, past_key_values=kv_cache, x_t=x_t, timestep=timestep)
+            context = None
+            step_data = None
+            denoise_kwargs = {}
+            if self._runtime_options.hoist_denoise_invariants:
+                context = model.prepare_denoise_context(prefix_pad_masks)
+                denoise_kwargs["context"] = context
+            if self._runtime_options.precompute_adarms:
+                table = model.runtime_step_table(model.num_inference_steps, 1)
+                if table is None:
+                    raise ValueError("Prepare the default BS=1 AdaRMS schedule after loading weights, before capture.")
+                row = table[0]
+                # All rows use these same static addresses. A replay loads the
+                # selected row in bulk; it never keeps using capture's row 0.
+                timestep = row.timestep.clone()
+                step_data = Pi05DenoiseStepData(timestep, row.time_cond.clone(), row.modulations.clone())
+                denoise_kwargs["step_data"] = step_data
+            model.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=kv_cache,
+                x_t=x_t,
+                timestep=timestep,
+                **denoise_kwargs,
+            )
             torch.accelerator.synchronize(device)
 
             # Graphs sharing a pool must replay in the order they were captured,
@@ -202,15 +269,29 @@ class Pi05CUDAGraphs:
                     past_key_values=kv_cache,
                     inputs_embeds=[prefix_embs, None],
                     use_cache=True,
+                    **prefix_kwargs,
                 )
-            prefix_forward = _PrefixForwardGraph(graph, attention_mask, position_ids, prefix_embs, kv_cache, outputs)
+            prefix_forward = _PrefixForwardGraph(
+                graph,
+                attention_mask,
+                position_ids,
+                prefix_embs,
+                kv_cache,
+                outputs,
+                self._runtime_options.prefix_kv_only,
+                rotary_emb,
+            )
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=pool):
                 v_t = model.denoise_step(
-                    prefix_pad_masks=prefix_pad_masks, past_key_values=kv_cache, x_t=x_t, timestep=timestep
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=kv_cache,
+                    x_t=x_t,
+                    timestep=timestep,
+                    **denoise_kwargs,
                 )
-            denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t)
+            denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context, step_data)
 
         self._embed_prefix, self._prefix_forward, self._denoise_step = embed_prefix, prefix_forward, denoise_step
 
@@ -256,6 +337,10 @@ class Pi05CUDAGraphs:
         inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool = False,
         adarms_cond: torch.Tensor | None = None,
+        *,
+        prefix_kv_only: bool = False,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        adarms_modulations: torch.Tensor | None = None,
     ):
         g = self._prefix_forward
         if g is not None and not (
@@ -263,7 +348,11 @@ class Pi05CUDAGraphs:
             and past_key_values is g.kv_cache
             and use_cache
             and adarms_cond is None
+            and adarms_modulations is None
+            and prefix_kv_only == g.prefix_kv_only
+            and _rotary_matches(rotary_emb, g.rotary_emb)
             and inputs_embeds is not None
+            and len(inputs_embeds) == 2
             and inputs_embeds[1] is None
             and _matches(inputs_embeds[0], g.inputs_embeds)
             and _matches(attention_mask, g.attention_mask)
@@ -272,6 +361,15 @@ class Pi05CUDAGraphs:
             logger.warning_once("π0.5 prefix forward inputs differ from the captured ones; it runs eagerly.")
             g = None
         if g is None:
+            # Omitting the optional flag still requests full prefix hidden
+            # states, even if this instance captured a KV-only prefix graph.
+            kwargs = {}
+            if prefix_kv_only:
+                kwargs["prefix_kv_only"] = True
+            if rotary_emb is not None:
+                kwargs["rotary_emb"] = rotary_emb
+            if adarms_modulations is not None:
+                kwargs["adarms_modulations"] = adarms_modulations
             return self._model.paligemma_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -279,22 +377,53 @@ class Pi05CUDAGraphs:
                 inputs_embeds=inputs_embeds,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond,
+                **kwargs,
             )
 
         _load(g.inputs_embeds, inputs_embeds[0])
         _load(g.attention_mask, attention_mask)
         _load(g.position_ids, position_ids)
+        if g.rotary_emb is not None:
+            for static, src in zip(g.rotary_emb, rotary_emb):
+                _load(static, src)
         g.graph.replay()
         self.num_replays["prefix_forward"] += 1
         return g.outputs
 
     # ── Region 3: one denoising step ─────────────────────────────────
+    def prepare_denoise_context(self, context: Pi05DenoiseContext) -> Pi05DenoiseContext:
+        """Copy this request's invariants once into the captured buffers.
+
+        ``sample_actions`` owns the request context and calls this before its
+        denoising loop. The returned static context is valid until the next
+        request prepares it; graph buffers do not support concurrent requests.
+        An incompatible context stays request-local and uses eager denoising.
+        """
+        g = self._denoise_step
+        if g is None or g.context is None:
+            return context
+        tensors = ("attention_mask", "position_ids", "cos", "sin")
+        if not (
+            torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
+            and isinstance(context, Pi05DenoiseContext)
+            and all(_matches(getattr(context, name), getattr(g.context, name)) for name in tensors)
+        ):
+            logger.warning_once("π0.5 denoising context differs from the captured one; it runs eagerly.")
+            return context
+        for name in tensors:
+            _load(getattr(g.context, name), getattr(context, name))
+        self.num_replays["prepare_denoise_context"] += 1
+        return g.context
+
     def denoise_step(
         self,
         prefix_pad_masks: torch.Tensor,
         past_key_values,
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        context: Pi05DenoiseContext | None = None,
+        step_data: Pi05DenoiseStepData | None = None,
     ) -> torch.Tensor:
         g = self._denoise_step
         if g is not None and not (
@@ -303,20 +432,34 @@ class Pi05CUDAGraphs:
             and _matches(prefix_pad_masks, g.prefix_pad_masks)
             and _matches(x_t, g.x_t)
             and _matches(timestep, g.timestep)
+            and context is g.context
+            and _step_data_matches(step_data, g.step_data)
         ):
             logger.warning_once("π0.5 denoise_step inputs differ from the captured ones; it runs eagerly.")
             g = None
         if g is None:
+            kwargs = {}
+            if context is not None:
+                kwargs["context"] = context
+            if step_data is not None:
+                kwargs["step_data"] = step_data
             return self._model.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 x_t=x_t,
                 timestep=timestep,
+                **kwargs,
             )
 
-        _load(g.prefix_pad_masks, prefix_pad_masks)
+        if g.context is None:
+            _load(g.prefix_pad_masks, prefix_pad_masks)
         _load(g.x_t, x_t)
         _load(g.timestep, timestep)
+        if g.step_data is not None:
+            # ``modulations`` contains every layer's input/post-attention norm
+            # and final norm in one tensor: one copy, not a copy per layer.
+            _load(g.step_data.time_cond, step_data.time_cond)
+            _load(g.step_data.modulations, step_data.modulations)
         g.graph.replay()
         self.num_replays["denoise_step"] += 1
         return g.v_t

@@ -31,6 +31,7 @@ import os
 import platform
 import statistics
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -39,7 +40,6 @@ import torch
 ACTION_DIM = 32
 ACTION_HORIZON = 50
 MAX_TOKEN_LEN = 200
-MAX_CAMERAS = 3
 NUM_STEPS = 10
 
 
@@ -51,7 +51,19 @@ def resolve_checkpoint(path: str) -> str:
     return snapshot_download(repo_id=path, repo_type="model")
 
 
-def build_model(checkpoint_dir: str, deploy_config: str, dtype: str, enforce_eager: bool):
+def build_model(
+    checkpoint_dir: str,
+    deploy_config: str,
+    dtype: str,
+    enforce_eager: bool,
+    vision_precision: str | None = None,
+    batch_cameras: bool | None = None,
+    *,
+    precompute_adarms: bool | None = None,
+    hoist_denoise_invariants: bool | None = None,
+    prefix_kv_only: bool | None = None,
+    execution_mode: str | None = None,
+):
     """The model ``Pi05Pipeline`` serves: its dtype layout, KV cache, and with
     ``enforce_eager`` unset its fused kernels and CUDA graphs."""
     import yaml
@@ -62,27 +74,50 @@ def build_model(checkpoint_dir: str, deploy_config: str, dtype: str, enforce_eag
 
     with open(deploy_config, encoding="utf-8") as f:
         (stage,) = yaml.safe_load(f)["stages"]
+    custom_args = dict(stage.get("custom_pipeline_args") or {})
+    if vision_precision is not None:
+        custom_args["pi05_vision_precision"] = vision_precision
+    if batch_cameras is not None:
+        custom_args["pi05_batch_cameras"] = batch_cameras
+    for key, value in (
+        ("pi05_precompute_adarms", precompute_adarms),
+        ("pi05_hoist_denoise_invariants", hoist_denoise_invariants),
+        ("pi05_prefix_kv_only", prefix_kv_only),
+    ):
+        if value is not None:
+            custom_args[key] = value
+    execution_mode = execution_mode or ("eager" if enforce_eager else "graph")
+    if execution_mode not in ("eager", "fused", "graph"):
+        raise ValueError(f"Unsupported execution_mode={execution_mode!r}.")
+    if enforce_eager and execution_mode != "eager":
+        raise ValueError("--enforce-eager conflicts with --execution-mode fused/graph.")
     od_config = OmniDiffusionConfig(
-        model=checkpoint_dir, dtype=dtype, model_config=stage["model_config"], enforce_eager=enforce_eager
+        model=checkpoint_dir,
+        dtype=dtype,
+        model_config=stage["model_config"],
+        enforce_eager=execution_mode != "graph",
+        custom_pipeline_args=custom_args,
     )
     # Under the serving dtype as torch's default, as the server's loader builds
     # (and captures) the pipeline.
     with set_default_torch_dtype(od_config.dtype):
         pipeline = Pi05Pipeline(od_config=od_config)
+    if execution_mode == "fused":
+        pipeline.model.enable_fused_kernels()
     return pipeline.model.eval()
 
 
-def make_inputs(batch_size: int, num_views: int, device: str, seed: int = 0):
+def make_inputs(batch_size: int, num_views: int, device: str, seed: int = 0, max_cameras: int = 3):
     """Synthetic but deterministic inputs, shaped exactly as the pipeline feeds
-    them: one (B, 3, 224, 224) tensor per camera slot plus a padded token block.
-    Slots past ``num_views`` are padded as ``Pi05Processor`` pads a missing
-    camera: an all -1 image with a false mask."""
+    them: one (B, 3, 224, 224) tensor per camera plus a padded token block."""
+    if not 1 <= num_views <= max_cameras:
+        raise ValueError(f"num_views must be between 1 and max_cameras={max_cameras}, got {num_views}.")
     g = torch.Generator(device="cpu").manual_seed(seed)
     images = [torch.rand(batch_size, 3, 224, 224, generator=g).to(device) * 2 - 1 for _ in range(num_views)]
     image_masks = [torch.ones(batch_size, dtype=torch.bool, device=device) for _ in range(num_views)]
-    for _ in range(num_views, MAX_CAMERAS):
-        images.append(torch.full((batch_size, 3, 224, 224), -1.0, device=device))
-        image_masks.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
+    for _ in range(max_cameras - num_views):
+        images.append(torch.full_like(images[0], -1.0))
+        image_masks.append(torch.zeros_like(image_masks[0]))
     # π0.5 pads the prompt (task text + discretized state) to 200 tokens.
     lang_tokens = torch.randint(0, 1000, (batch_size, MAX_TOKEN_LEN), generator=g).to(device)
     lang_masks = torch.ones(batch_size, MAX_TOKEN_LEN, dtype=torch.bool, device=device)
@@ -91,7 +126,9 @@ def make_inputs(batch_size: int, num_views: int, device: str, seed: int = 0):
 
 
 def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, iters: int) -> dict:
-    images, image_masks, lang_tokens, lang_masks, noise = make_inputs(batch_size, num_views, device)
+    images, image_masks, lang_tokens, lang_masks, noise = make_inputs(
+        batch_size, num_views, device, max_cameras=model.config.max_cameras
+    )
     kwargs = dict(
         images=images,
         image_masks=image_masks,
@@ -152,6 +189,7 @@ def environment(model, device: str) -> dict:
         except Exception:
             return "MISSING"
 
+    schedule = model.runtime_step_table(NUM_STEPS, batch_size=1)
     info = {
         "host": platform.node(),
         "python": platform.python_version(),
@@ -161,8 +199,21 @@ def environment(model, device: str) -> dict:
         "vllm-omni": version("vllm-omni"),
         "transformers": version("transformers"),
         "num_steps": NUM_STEPS,
+        "vision_precision": model.paligemma_with_expert.vision_options.precision,
+        "batch_cameras": model.paligemma_with_expert.vision_options.batch_cameras,
+        "runtime_options": asdict(model.runtime_options),
+        "precomputed_schedule_steps": len(schedule) if schedule is not None else 0,
+        "projector_weight_dtype": str(
+            next(model.paligemma_with_expert.paligemma.model.multi_modal_projector.parameters()).dtype
+        ),
         # What the built model runs, not what was asked for.
-        "path": "eager" if getattr(model, "cuda_graphs", None) is None else "optimized (CUDA graphs + fused kernels)",
+        "path": (
+            "graph"
+            if model.cuda_graphs is not None
+            else "fused"
+            if model.paligemma_with_expert.fused_kernels
+            else "eager"
+        ),
         "gemm_weight_dtype": str(
             model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
         ),
@@ -210,6 +261,12 @@ def main() -> int:
         help="Deploy config whose model_config builds the model (default: the package's vllm_omni/deploy/pi05.yaml)",
     )
     parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+    parser.add_argument("--vision-precision", choices=["fp32", "bf16_autocast", "selective_bf16"], default=None)
+    parser.add_argument("--batch-cameras", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--precompute-adarms", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--hoist-denoise-invariants", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--prefix-kv-only", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--execution-mode", choices=["eager", "fused", "graph"], default=None)
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
@@ -221,6 +278,8 @@ def main() -> int:
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--out", default="pi05_bench")
     args = parser.parse_args()
+    if args.enforce_eager and args.execution_mode not in (None, "eager"):
+        parser.error("--enforce-eager conflicts with --execution-mode fused/graph")
 
     if args.deploy_config is None:
         import vllm_omni
@@ -229,7 +288,18 @@ def main() -> int:
     checkpoint_dir = resolve_checkpoint(args.model)
     print(f"checkpoint: {checkpoint_dir}")
 
-    model = build_model(checkpoint_dir, args.deploy_config, args.dtype, args.enforce_eager)
+    model = build_model(
+        checkpoint_dir,
+        args.deploy_config,
+        args.dtype,
+        args.enforce_eager,
+        args.vision_precision,
+        args.batch_cameras,
+        precompute_adarms=args.precompute_adarms,
+        hoist_denoise_invariants=args.hoist_denoise_invariants,
+        prefix_kv_only=args.prefix_kv_only,
+        execution_mode=args.execution_mode,
+    )
     device = str(next(model.parameters()).device)
     env = environment(model, device)
     print(json.dumps(env, indent=2))
@@ -263,6 +333,8 @@ def main() -> int:
             print(f"{label:22s} {row['status']:12s} p50={row['p50_ms']} ms  peak={row['peak_mem_gb']} GB")
             rows.append(row)
 
+    if model.cuda_graphs is not None:
+        env["graph_replays_total"] = dict(model.cuda_graphs.num_replays)
     write_reports(rows, env, Path(args.out))
     failed = [r for r in rows if r["status"] != "PASS"]
     print(f"\n{len(rows) - len(failed)}/{len(rows)} cells PASS")

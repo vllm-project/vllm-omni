@@ -45,12 +45,16 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma.modeling_gemma import (
     GemmaForCausalLM,
     apply_rotary_pos_emb,
+    rotate_half,
 )
 from transformers.models.paligemma.modeling_paligemma import (
     PaliGemmaForConditionalGeneration,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+
+from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
+from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions, configure_vision_precision
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
@@ -71,6 +75,30 @@ DEFAULT_STATE_NUM_BINS = 256  # openpi PaliGemmaTokenizer.tokenize()
 # Matches OpenPI's constant exactly so that numerics line up during parity.
 # Ref: openpi/src/openpi/models/gemma.py
 OPENPI_ATTENTION_MASK_VALUE = -2.3819763e38
+
+
+@dataclass(frozen=True)
+class Pi05DenoiseContext:
+    """Observation-dependent invariants, owned by a single action request."""
+
+    attention_mask: torch.Tensor
+    position_ids: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Pi05DenoiseStepData:
+    """Weight/schedule-derived data for one BS=1 denoising step.
+
+    ``modulations`` is contiguous ``(2 * layers + 1, 1, 3 * expert_width)``
+    in input-norm, post-attention-norm order, followed by the final norm.
+    Unlike prefix KV, these tensors contain no observation-dependent data.
+    """
+
+    timestep: torch.Tensor
+    time_cond: torch.Tensor
+    modulations: torch.Tensor
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -192,6 +220,8 @@ class Pi05AdaRMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         cond: torch.Tensor | None = None,
+        *,
+        modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return ``(normed, gate)``; ``gate`` is ``None`` in the unconditioned case."""
         dtype = x.dtype
@@ -200,7 +230,7 @@ class Pi05AdaRMSNorm(nn.Module):
             normed = normed * (1.0 + self.weight.float())
             return normed.to(dtype), None
 
-        if cond is None:
+        if cond is None and modulation is None:
             # A conditioned norm silently falling back to an unconditioned one
             # would drop the entire timestep signal and still return a
             # well-shaped, finite tensor.
@@ -209,10 +239,13 @@ class Pi05AdaRMSNorm(nn.Module):
                 f"{self.cond_dim} but called without an AdaRMS conditioning vector."
             )
 
-        if cond.shape[-1] != self.cond_dim:
+        if cond is not None and cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
 
-        modulation = self.dense(cond.to(self.dense.weight.dtype))
+        if modulation is None:
+            modulation = self.dense(cond.to(self.dense.weight.dtype))
+        elif modulation.shape != (x.shape[0], 3 * self.dim):
+            raise ValueError(f"Expected modulation shape {(x.shape[0], 3 * self.dim)}, got {modulation.shape}.")
         if x.ndim == 3:
             # (B, 3*dim) → (B, 1, 3*dim), broadcast across the token axis: the
             # timestep is a per-sample scalar, identical for every action token.
@@ -313,7 +346,9 @@ def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
     return tensor.to(module.weight.dtype) if tensor.dtype != module.weight.dtype else tensor
 
 
-def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, position_ids, paligemma):
+def _compute_layer_prefix_only(
+    layer_idx, hidden_states, attention_mask, position_ids, paligemma, *, kv_only=False, rotary_emb=None
+):
     """Run one PaliGemma LM layer on the prefix, returning the layer output and
     the post-RoPE ``(k, v)`` for the suffix pass.
 
@@ -326,11 +361,14 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
     x = _match(layer.input_layernorm(hidden_states), layer.self_attn.q_proj)
 
     hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
-    q = layer.self_attn.q_proj(x).view(hidden_shape).transpose(1, 2)
+    q = None if kv_only else layer.self_attn.q_proj(x).view(hidden_shape).transpose(1, 2)
     k = layer.self_attn.k_proj(x).view(hidden_shape).transpose(1, 2)
     v = layer.self_attn.v_proj(x).view(hidden_shape).transpose(1, 2)
 
-    cos, sin = model.rotary_emb(v, position_ids)
+    cos, sin = model.rotary_emb(v, position_ids) if rotary_emb is None else rotary_emb
+    if kv_only:
+        k = k * cos.unsqueeze(1) + rotate_half(k) * sin.unsqueeze(1)
+        return None, (k, v)
     q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
     att = _attend(
@@ -358,6 +396,9 @@ def _compute_layer_suffix_only(
     position_ids,
     gemma_expert,
     adarms_cond,
+    *,
+    rotary_emb=None,
+    adarms_modulations=None,
 ):
     """Run one action-expert layer on the suffix with AdaRMS conditioning.
 
@@ -370,7 +411,8 @@ def _compute_layer_suffix_only(
     layer = gemma_expert.model.layers[layer_idx]
 
     residual = hidden_states
-    x, gate = layer.input_layernorm(hidden_states, adarms_cond)
+    modulation = None if adarms_modulations is None else adarms_modulations[2 * layer_idx]
+    x, gate = layer.input_layernorm(hidden_states, adarms_cond, modulation=modulation)
     x = _match(x, layer.self_attn.q_proj)
 
     hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
@@ -379,7 +421,7 @@ def _compute_layer_suffix_only(
     v_suf = layer.self_attn.v_proj(x).view(hidden_shape).transpose(1, 2)
 
     # RoPE frequencies are shared between PaliGemma and the expert.
-    cos, sin = gemma_expert.model.rotary_emb(v_suf, position_ids)
+    cos, sin = gemma_expert.model.rotary_emb(v_suf, position_ids) if rotary_emb is None else rotary_emb
     q, k_suf = apply_rotary_pos_emb(q, k_suf, cos, sin, unsqueeze_dim=1)
 
     # Attend over [cached prefix K/V | suffix K/V], written in place rather
@@ -399,7 +441,8 @@ def _compute_layer_suffix_only(
     hidden_states = _gated_residual(residual, layer.self_attn.o_proj(_match(att, layer.self_attn.o_proj)), gate)
 
     residual = hidden_states
-    x, gate = layer.post_attention_layernorm(hidden_states, adarms_cond)
+    modulation = None if adarms_modulations is None else adarms_modulations[2 * layer_idx + 1]
+    x, gate = layer.post_attention_layernorm(hidden_states, adarms_cond, modulation=modulation)
     return _gated_residual(residual, layer.mlp(_match(x, layer.mlp.up_proj)), gate)
 
 
@@ -1142,15 +1185,18 @@ def _fused_prefix_forward(
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
     kv_cache: Pi05KVCache,
-) -> torch.Tensor:
+    *,
+    prefix_kv_only: bool = False,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor | None:
     """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass, batch 1, with fused kernels.
 
     Bit-exact with the eager pass: every denoising step attends over the
     prefix K/V and amplifies any rounding difference in it, so the norms,
     residual adds, GEMMs and attention are the torch ops eager runs. Fused are
     only RoPE, which writes the layer's K/V straight into ``kv_cache``, and the
-    GELU. Returns the final norm's output, as the eager pass does;
-    ``inputs_embeds`` is not modified.
+    GELU. ``prefix_kv_only`` explicitly discards the unused final hidden
+    state and skips the last layer's Q/attention/MLP plus final norm.
     """
     lm = paligemma.model.language_model
     x_in = inputs_embeds[0]
@@ -1165,7 +1211,7 @@ def _fused_prefix_forward(
     x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
     q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
     # Every eager layer builds this same table, in its V projection's dtype.
-    cos, sin = lm.rotary_emb(x_normed, position_ids)
+    cos, sin = lm.rotary_emb(x_normed, position_ids) if rotary_emb is None else rotary_emb
 
     residual, mlp_out = x_in, None
     for layer_idx, layer in enumerate(lm.layers):
@@ -1177,6 +1223,16 @@ def _fused_prefix_forward(
             x_normed.copy_(layer.input_layernorm(hidden_states))
             residual = hidden_states
         key, value = kv_cache.key[layer_idx, 0, 0], kv_cache.value[layer_idx, 0, 0]
+        if prefix_kv_only and layer_idx == len(lm.layers) - 1:
+            # Keep the separate cuBLAS K/V projections and the exact eager
+            # RoPE arithmetic; concatenating the weights changes BF16 GEMM
+            # accumulation. No Q projection or decoder output is needed.
+            shape = (1, seq_len, -1, head_dim)
+            k = attn.k_proj(x_normed[None]).view(shape).transpose(1, 2)
+            v = attn.v_proj(x_normed[None]).view(shape).transpose(1, 2)
+            k = k * cos.unsqueeze(1) + rotate_half(k) * sin.unsqueeze(1)
+            kv_cache.write_prefix(layer_idx, k, v)
+            return None
         _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[:seq_len], value[:seq_len], triton_gemm=False)
         att = _attend(
             q[None],
@@ -1206,6 +1262,9 @@ def _fused_denoise_forward(
     kv_cache: Pi05KVCache,
     adarms_cond: torch.Tensor,
     action_out_proj: nn.Linear,
+    *,
+    rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    adarms_modulations: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The suffix pass and output head of ``denoise_step``, batch 1, with fused kernels.
 
@@ -1233,7 +1292,7 @@ def _fused_denoise_forward(
     scores = torch.empty(num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
     att = torch.empty(seq_len, num_heads * head_dim, dtype=proj_dtype, device=device)
     mlp_hidden = torch.empty(seq_len, first_layer.mlp.gate_proj.out_features, dtype=proj_dtype, device=device)
-    cos, sin = expert.rotary_emb(x_normed, position_ids)
+    cos, sin = expert.rotary_emb(x_normed, position_ids) if rotary_emb is None else rotary_emb
     mask = attention_mask[0, 0]
 
     residual = x_in
@@ -1241,14 +1300,22 @@ def _fused_denoise_forward(
         attn = layer.self_attn
         key, value = kv_cache.key[layer_idx, 0, 0], kv_cache.value[layer_idx, 0, 0]
 
-        modulation = _adarms_modulation(layer.input_layernorm, adarms_cond)
+        modulation = (
+            _adarms_modulation(layer.input_layernorm, adarms_cond)
+            if adarms_modulations is None
+            else adarms_modulations[2 * layer_idx, 0]
+        )
         _fused_rms_norm(residual, layer.input_layernorm, x_normed, modulation=modulation)
         _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[prefix_len:], value[prefix_len:])
         _fused_attention(q, key, value, mask, 1.0 / math.sqrt(head_dim), scores, att)
         _fused_linear_residual(att, attn.o_proj, residual, hidden_states, gate=modulation[2 * width :])
         residual = hidden_states
 
-        modulation = _adarms_modulation(layer.post_attention_layernorm, adarms_cond)
+        modulation = (
+            _adarms_modulation(layer.post_attention_layernorm, adarms_cond)
+            if adarms_modulations is None
+            else adarms_modulations[2 * layer_idx + 1, 0]
+        )
         _fused_rms_norm(hidden_states, layer.post_attention_layernorm, x_normed, modulation=modulation)
         _fused_linear_gelu_mul(x_normed, layer.mlp, mlp_hidden)
         _fused_linear_residual(
@@ -1256,7 +1323,10 @@ def _fused_denoise_forward(
         )
 
     v_t = torch.empty(1, seq_len, action_out_proj.out_features, dtype=action_out_proj.weight.dtype, device=device)
-    _fused_final_head(hidden_states, expert.norm, _adarms_modulation(expert.norm, adarms_cond), action_out_proj, v_t[0])
+    modulation = (
+        _adarms_modulation(expert.norm, adarms_cond) if adarms_modulations is None else adarms_modulations[-1, 0]
+    )
+    _fused_final_head(hidden_states, expert.norm, modulation, action_out_proj, v_t[0])
     return v_t
 
 
@@ -1331,6 +1401,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         # Set by ``Pi05ForActionPrediction.enable_fused_kernels`` on the
         # optimized path; ``False`` is the eager baseline.
         self.fused_kernels = False
+        self.vision_options = Pi05VisionOptions()
 
     def _install_adarms_norms(self, action_expert_config) -> None:
         """Replace every action-expert RMSNorm with a conditioned AdaRMS norm."""
@@ -1352,9 +1423,18 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         """
         # Shapes: pixel_values (B, 3, 224, 224) → SigLIP (B, 256, 1152)
         #                                      → projector (B, 256, 2048)
+        if self.vision_options.precision == "bf16_autocast":
+            # Keep casts in the captured graph instead of retaining an autocast
+            # weight cache whose lifetime could end after capture.
+            with torch.autocast(pixel_values.device.type, dtype=torch.bfloat16, cache_enabled=False):
+                vision_outputs = self.paligemma.model.vision_tower(pixel_values)
+                image_features = self.paligemma.model.multi_modal_projector(vision_outputs.last_hidden_state)
+            # The R0 prefix residual stream inherits this FP32 interface. Keep
+            # it fixed so the experiment changes only vision/projector precision.
+            return image_features.float()
         vision_outputs = self.paligemma.model.vision_tower(pixel_values)
-        image_features = vision_outputs.last_hidden_state
-        return self.paligemma.model.multi_modal_projector(image_features)
+        image_features = self.paligemma.model.multi_modal_projector(vision_outputs.last_hidden_state)
+        return image_features.float() if self.vision_options.precision == "selective_bf16" else image_features
 
     def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """Embed language tokens, returning the ``* sqrt(hidden)``-scaled embedding.
@@ -1378,6 +1458,10 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool = False,
         adarms_cond: torch.Tensor | None = None,
+        *,
+        prefix_kv_only: bool = False,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        adarms_modulations: torch.Tensor | None = None,
     ):
         """Dispatch to prefix_only / suffix_only and return
         ``([prefix_out, suffix_out], past_key_values_or_None)``.
@@ -1390,6 +1474,9 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         num_layers = self.paligemma.config.text_config.num_hidden_layers
         pali_lm = self.paligemma.model.language_model
         expert_lm = self.gemma_expert.model
+
+        if prefix_kv_only and (not use_cache or inputs_embeds[1] is not None):
+            raise ValueError("prefix_kv_only requires a prefix-only forward with use_cache=True.")
 
         if (use_cache or inputs_embeds[1] is not None) and not isinstance(past_key_values, Pi05KVCache):
             raise TypeError(
@@ -1408,7 +1495,13 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 and past_key_values.prefix_len == hidden_states.shape[1]
             ):
                 hidden_states = _fused_prefix_forward(
-                    self.paligemma, hidden_states, attention_mask, position_ids, past_key_values
+                    self.paligemma,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    prefix_kv_only=prefix_kv_only,
+                    rotary_emb=rotary_emb,
                 )
                 return [hidden_states, None], past_key_values
             for layer_idx in range(num_layers):
@@ -1418,10 +1511,13 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                     attention_mask,
                     position_ids,
                     paligemma=self.paligemma,
+                    kv_only=prefix_kv_only and layer_idx == num_layers - 1,
+                    rotary_emb=rotary_emb,
                 )
                 if use_cache:
                     past_key_values.write_prefix(layer_idx, k, v)
-            hidden_states = pali_lm.norm(hidden_states)
+            if not prefix_kv_only:
+                hidden_states = pali_lm.norm(hidden_states)
             return [hidden_states, None], (past_key_values if use_cache else None)
 
         if inputs_embeds[0] is not None:
@@ -1439,8 +1535,11 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 position_ids,
                 gemma_expert=self.gemma_expert,
                 adarms_cond=adarms_cond,
+                rotary_emb=rotary_emb,
+                adarms_modulations=adarms_modulations,
             )
-        hidden_states, _ = expert_lm.norm(hidden_states, adarms_cond)
+        final_modulation = None if adarms_modulations is None else adarms_modulations[-1]
+        hidden_states, _ = expert_lm.norm(hidden_states, adarms_cond, modulation=final_modulation)
         return [None, hidden_states], None
 
 
@@ -1503,6 +1602,149 @@ class Pi05ForActionPrediction(nn.Module):
         # and dtype. ``sample_actions`` falls back to a one-off cache when this
         # is unset or sized for another batch or prefix length.
         self.kv_cache: Pi05KVCache | None = None
+        self._vision_configured = False
+        self.runtime_options = Pi05RuntimeOptions()
+        self._runtime_configured = False
+        self._runtime_steps: tuple[Pi05DenoiseStepData, ...] | None = None
+        self._runtime_signature: tuple | None = None
+
+    def configure_vision(self, options: Pi05VisionOptions) -> None:
+        """Fix experimental vision settings before checkpoint load and capture."""
+        if self._vision_configured or self.cuda_graphs is not None:
+            raise RuntimeError("Pi0.5 vision options are initialization-only; construct a new pipeline to change them.")
+        configure_vision_precision(self.paligemma_with_expert.paligemma, options.precision)
+        self.paligemma_with_expert.vision_options = options
+        self._vision_configured = True
+
+    def configure_runtime(self, options: Pi05RuntimeOptions) -> None:
+        """Choose inference optimizations before checkpoint loading and capture."""
+        if getattr(self, "_runtime_configured", False) or self.cuda_graphs is not None:
+            raise RuntimeError(
+                "Pi0.5 runtime options are initialization-only; construct a new pipeline to change them."
+            )
+        self.runtime_options = options
+        self._runtime_configured = True
+        self._runtime_steps = None
+        self._runtime_signature = None
+
+    def _adarms_norms(self) -> list[Pi05AdaRMSNorm]:
+        expert = self.paligemma_with_expert.gemma_expert.model
+        return [norm for layer in expert.layers for norm in (layer.input_layernorm, layer.post_attention_layernorm)] + [
+            expert.norm
+        ]
+
+    def _runtime_cache_key(self) -> tuple | None:
+        """Detect ordinary parameter replacement, in-place writes and dtype/device moves.
+
+        PyTorch inference tensors have no version counter, so derived tables
+        are not reused for such parameters. Mutating parameters through
+        ``.data`` is unsupported, as it also bypasses PyTorch's own checks.
+        """
+        modules = [self.time_mlp_in, self.time_mlp_out] + [norm.dense for norm in self._adarms_norms()]
+        try:
+            parameters = tuple(
+                (id(p), p._version, p.device, p.dtype) for module in modules for p in module.parameters()
+            )
+        except RuntimeError:
+            return None
+        return (
+            self.num_inference_steps,
+            getattr(self.config, "min_period", 4e-3),
+            getattr(self.config, "max_period", 4.0),
+            self.action_in_proj.weight.device,
+            self.action_in_proj.weight.dtype,
+            parameters,
+        )
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def prepare_runtime_caches(self) -> None:
+        """Build only the deployed BS=1 schedule from the final inference weights.
+
+        Each step uses the original scalar timestep expression and each norm's
+        original dense operation. Batching steps/projections together could
+        select a different GEMM and change BF16 rounding. This bounded table
+        removes the time MLP and all AdaRMS dense calls from request execution.
+        """
+        if self.cuda_graphs is not None:
+            raise RuntimeError("Prepare Pi0.5 runtime caches before CUDA Graph capture.")
+        self._runtime_steps = None
+        self._runtime_signature = None
+        if not getattr(self, "runtime_options", Pi05RuntimeOptions()).precompute_adarms:
+            return
+        if self.training:
+            raise RuntimeError("Pi0.5 runtime caches require eval() and finalized inference weights.")
+        if self.num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be positive.")
+        key = self._runtime_cache_key()
+        if key is None:
+            return
+        device = self.action_in_proj.weight.device
+        norms = self._adarms_norms()
+        dt = -1.0 / self.num_inference_steps
+        rows = []
+        for step in range(self.num_inference_steps):
+            timestep = torch.full((1,), 1.0 + step * dt, dtype=torch.float32, device=device)
+            time_cond = self.embed_timestep(timestep)
+            modulations = torch.stack([norm.dense(time_cond.to(norm.dense.weight.dtype)) for norm in norms])
+            rows.append(Pi05DenoiseStepData(timestep, time_cond, modulations.contiguous()))
+        self._runtime_steps = tuple(rows)
+        self._runtime_signature = key
+
+    def runtime_step_table(self, num_steps: int, batch_size: int) -> tuple[Pi05DenoiseStepData, ...] | None:
+        """Select the initialized table, or preserve the ordinary path unchanged.
+
+        Alternate schedules and batches are intentionally not cached online.
+        A weight update invalidates the whole table, never a subset of norms.
+        """
+        rows = getattr(self, "_runtime_steps", None)
+        if (
+            rows is None
+            or self.training
+            or batch_size != 1
+            or num_steps != self.num_inference_steps
+            or not getattr(self, "runtime_options", Pi05RuntimeOptions()).precompute_adarms
+        ):
+            return None
+        if self._runtime_signature != self._runtime_cache_key():
+            self._runtime_steps = None
+            self._runtime_signature = None
+            return None
+        return rows
+
+    def _apply(self, fn, recurse=True):
+        if getattr(self, "cuda_graphs", None) is not None:
+            raise RuntimeError("Pi0.5 device/dtype changes after CUDA Graph capture require a new pipeline.")
+        self._runtime_steps = None
+        self._runtime_signature = None
+        return super()._apply(fn, recurse=recurse)
+
+    def prepare_prefix_rotary(
+        self, prefix_embs: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One RoPE table shared by this request's prefix decoder layers."""
+        lm = self.paligemma_with_expert.paligemma.model.language_model
+        # Gemma rotary embedding reads only the input's dtype and device.
+        ref = prefix_embs.new_empty((), dtype=lm.layers[0].self_attn.v_proj.weight.dtype)
+        return lm.rotary_emb(ref, position_ids)
+
+    def prepare_denoise_context(self, prefix_pad_masks: torch.Tensor) -> Pi05DenoiseContext:
+        """Build mask, positions and RoPE once per observation, never globally."""
+        batch_size, prefix_len = prefix_pad_masks.shape
+        suffix_len = self.action_horizon
+        device = prefix_pad_masks.device
+        suffix_pad_masks = torch.ones(batch_size, suffix_len, dtype=torch.bool, device=device)
+        suffix_att_masks = torch.zeros(batch_size, suffix_len, dtype=self.action_in_proj.weight.dtype, device=device)
+        suffix_att_masks[:, :1].fill_(1)
+        prefix_mask = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_mask = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        attention_mask = prepare_attention_masks_4d(torch.cat([prefix_mask, suffix_mask], dim=2))
+        offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        expert = self.paligemma_with_expert.gemma_expert.model
+        ref = torch.empty((), dtype=expert.layers[0].self_attn.v_proj.weight.dtype, device=device)
+        cos, sin = expert.rotary_emb(ref, position_ids)
+        return Pi05DenoiseContext(attention_mask, position_ids, cos, sin)
 
     def new_kv_cache(self, batch_size: int, prefix_len: int | None = None) -> Pi05KVCache:
         """Create a new `Pi05KVCache` object on this model's device, in the expert's K/V dtype.
@@ -1583,7 +1825,8 @@ class Pi05ForActionPrediction(nn.Module):
         bidirectional attention (all-zero ``att_masks``). Identical to π0 — the
         state is inside ``lang_tokens``, so nothing here changes shape-wise.
 
-        Cameras are embedded one at a time; each call is ``(B, 3, 224, 224)``.
+        Cameras are embedded one at a time by default. The experimental batching
+        option stacks camera slots on the batch axis for a single vision call.
         The number of slots is fixed by ``config.max_cameras`` for the deployed
         model; missing cameras occupy their slot with a false image mask.
         """
@@ -1599,8 +1842,18 @@ class Pi05ForActionPrediction(nn.Module):
         embs: list[torch.Tensor] = []
         pad_masks: list[torch.Tensor] = []
 
-        for img, img_mask in zip(images, image_masks):
-            img_emb = self.paligemma_with_expert.embed_image(img)
+        if self.paligemma_with_expert.vision_options.batch_cameras:
+            # Keep padded slots, camera order, and per-sample masks intact. In
+            # particular, never compact live cameras based on mask values.
+            bsize = images[0].shape[0]
+            if any(img.shape != images[0].shape for img in images):
+                raise ValueError("Camera batching requires identical image shapes for every camera slot.")
+            all_embs = self.paligemma_with_expert.embed_image(torch.cat(images, dim=0))
+            image_embeddings = all_embs.split(bsize, dim=0)
+        else:
+            image_embeddings = [self.paligemma_with_expert.embed_image(img) for img in images]
+
+        for img_emb, img_mask in zip(image_embeddings, image_masks):
             bsize, num_img_embs = img_emb.shape[:2]
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
@@ -1642,6 +1895,8 @@ class Pi05ForActionPrediction(nn.Module):
         self,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        time_cond: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the suffix: **action tokens only**, plus the AdaRMS condition.
 
@@ -1654,7 +1909,8 @@ class Pi05ForActionPrediction(nn.Module):
         model_dtype = self.action_in_proj.weight.dtype
         noisy_actions = noisy_actions.to(dtype=model_dtype)
 
-        time_cond = self.embed_timestep(timestep)
+        if time_cond is None:
+            time_cond = self.embed_timestep(timestep)
         action_emb = self.action_in_proj(noisy_actions)  # (B, H, W)
 
         bsize, action_len = action_emb.shape[:2]
@@ -1674,6 +1930,9 @@ class Pi05ForActionPrediction(nn.Module):
         past_key_values,
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        context: Pi05DenoiseContext | None = None,
+        step_data: Pi05DenoiseStepData | None = None,
     ) -> torch.Tensor:
         """Apply one flow-matching denoising step: predict ``v_t`` from ``x_t``.
 
@@ -1681,21 +1940,38 @@ class Pi05ForActionPrediction(nn.Module):
         the fused kernels enabled, a batch-1 step runs the action expert and
         its output head on them (``_fused_denoise_forward``).
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, time_cond = self.embed_suffix(x_t, timestep)
-
         batch_size = prefix_pad_masks.shape[0]
-        suffix_len = suffix_pad_masks.shape[1]
         prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        # Position IDs continue from where the prefix's last valid token left off.
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
+        time_cond = None if step_data is None else step_data.time_cond
+        adarms_modulations = None if step_data is None else step_data.modulations
+        rotary_emb = None
+        if context is None:
+            if time_cond is None:
+                suffix_embs, suffix_pad_masks, suffix_att_masks, time_cond = self.embed_suffix(x_t, timestep)
+            else:
+                suffix_embs, suffix_pad_masks, suffix_att_masks, time_cond = self.embed_suffix(
+                    x_t, timestep, time_cond=time_cond
+                )
+            suffix_len = suffix_pad_masks.shape[1]
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
+        else:
+            # Do not rebuild suffix masks just to discard them. The prepared
+            # context contains every observation-dependent tensor needed by
+            # all steps; prefix_pad_masks is used only for shape metadata here.
+            suffix_embs = self.action_in_proj(x_t.to(dtype=self.action_in_proj.weight.dtype))
+            suffix_len = suffix_embs.shape[1]
+            if context.attention_mask.shape != (batch_size, 1, suffix_len, prefix_len + suffix_len):
+                raise ValueError("Pi0.5 denoise context does not match the request shape.")
+            if time_cond is None:
+                time_cond = self.embed_timestep(timestep)
+            full_att_2d_masks_4d = context.attention_mask
+            position_ids = context.position_ids
+            rotary_emb = (context.cos, context.sin)
 
         if (
             _fused_kernels_serve(self.paligemma_with_expert, past_key_values, batch_size)
@@ -1710,6 +1986,8 @@ class Pi05ForActionPrediction(nn.Module):
                 past_key_values,
                 time_cond,
                 self.action_out_proj,
+                rotary_emb=rotary_emb,
+                adarms_modulations=adarms_modulations,
             )
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
@@ -1719,6 +1997,8 @@ class Pi05ForActionPrediction(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=time_cond,
+            rotary_emb=rotary_emb,
+            adarms_modulations=adarms_modulations,
         )
 
         # Every suffix token is an action token in π0.5 (no state token to drop).
@@ -1747,6 +2027,8 @@ class Pi05ForActionPrediction(nn.Module):
         """
         if num_steps is None:
             num_steps = self.num_inference_steps
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive.")
 
         bsize = lang_tokens.shape[0]
         device = lang_tokens.device
@@ -1773,12 +2055,19 @@ class Pi05ForActionPrediction(nn.Module):
         embed_prefix = self.embed_prefix if graphs is None else graphs.embed_prefix
         prefix_forward = self.paligemma_with_expert.forward if graphs is None else graphs.prefix_forward
         denoise_step = self.denoise_step if graphs is None else graphs.denoise_step
+        options = getattr(self, "runtime_options", Pi05RuntimeOptions())
+        step_table = self.runtime_step_table(num_steps, bsize)
 
         # 1. Prefix embeddings + mask building.
         prefix_embs, prefix_pad_masks, prefix_att_masks = embed_prefix(images, image_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+        prefix_options = {}
+        if options.prefix_kv_only:
+            prefix_options["prefix_kv_only"] = True
+        if options.hoist_denoise_invariants:
+            prefix_options["rotary_emb"] = self.prepare_prefix_rotary(prefix_embs, prefix_position_ids)
 
         # 2. Forward prefix through PaliGemma LM, writing its per-layer K/V into
         #    the cache the denoising steps then extend and read.
@@ -1791,19 +2080,35 @@ class Pi05ForActionPrediction(nn.Module):
             past_key_values=kv_cache,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
+            **prefix_options,
         )
+
+        context = None
+        if options.hoist_denoise_invariants:
+            context = self.prepare_denoise_context(prefix_pad_masks)
+            if graphs is not None:
+                context = graphs.prepare_denoise_context(context)
 
         # 3. Euler-integrated denoising from t=1 down to t=0.
         dt = -1.0 / num_steps
         x_t = noise
         for step in range(num_steps):
             t = 1.0 + step * dt
-            time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
+            step_options = {}
+            if context is not None:
+                step_options["context"] = context
+            if step_table is None:
+                time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
+            else:
+                step_data = step_table[step]
+                time_tensor = step_data.timestep
+                step_options["step_data"] = step_data
             v_t = denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 x_t=x_t,
                 timestep=time_tensor,
+                **step_options,
             )
             x_t = x_t + dt * v_t
         return x_t
@@ -1835,6 +2140,10 @@ class Pi05ForActionPrediction(nn.Module):
         remapping unit tests that intentionally provide a partial state dict;
         the serving path always uses the strict default.
         """
+        if getattr(self, "cuda_graphs", None) is not None:
+            raise RuntimeError("Pi0.5 weight loading after CUDA Graph capture requires a new pipeline.")
+        self._runtime_steps = None
+        self._runtime_signature = None
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
 

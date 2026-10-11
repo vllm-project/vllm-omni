@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import fields as dataclass_fields
 
 import numpy as np
@@ -37,6 +38,8 @@ from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Co
 from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
+from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
+from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -133,6 +136,8 @@ class Pi05Pipeline(nn.Module):
         self.config = self._build_config(od_config)
 
         custom_args = od_config.custom_pipeline_args or {}
+        self.vision_options = Pi05VisionOptions.from_pipeline_args(custom_args)
+        self.runtime_options = Pi05RuntimeOptions.from_pipeline_args(custom_args)
         self.tokenizer_source = str(custom_args.get("tokenizer", self._resolve_tokenizer_source()))
 
         self._torch_dtype = self._resolve_dtype(od_config)
@@ -141,10 +146,33 @@ class Pi05Pipeline(nn.Module):
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
         # OpenPI serving is one observation per call (``max_num_seqs: 1``).
-        self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
-        self._install_cuda_graphs(od_config)
+        # Reusable buffers must also accept writes from ordinary no_grad callers
+        # after an outer inference_mode initialization scope has ended.
+        with torch.inference_mode(False), torch.no_grad():
+            self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
+            self._install_cuda_graphs(od_config)
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
+
+    def to(self, *args, **kwargs):
+        # The custom-pipeline loader repeats device placement after construction.
+        # Our graphs are already captured, so only an actual no-op is safe.
+        model = getattr(self, "model", None)
+        if model is None or model.cuda_graphs is None:
+            return super().to(*args, **kwargs)
+        device, dtype, _non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
+        if device is not None and device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        if (
+            dtype is not None
+            or memory_format is not None
+            or (device is not None and any(tensor.device != device for tensor in self.parameters()))
+            or (device is not None and any(tensor.device != device for tensor in self.buffers()))
+        ):
+            raise RuntimeError(
+                "Pi0.5 device/dtype/memory-format changes after CUDA Graph capture require a new pipeline."
+            )
+        return self
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -239,11 +267,25 @@ class Pi05Pipeline(nn.Module):
         if not self.has_real_checkpoint():
             expected = os.path.join(self.model_dir or "<missing-model-dir>", "model.safetensors")
             raise FileNotFoundError(f"π0.5 serving requires checkpoint weights at {expected}.")
-        model = Pi05ForActionPrediction(self.config)
-        _set_inference_dtype(model, self._torch_dtype)
-        model.to(device=self._device)
-        self._load_checkpoint(model)
-        model.eval()
+        # Cached projections use parameter version counters for invalidation.
+        # Serving may construct us inside inference_mode; keep these weights
+        # and tables as ordinary tensors, without recording gradients.
+        init_context = torch.inference_mode(False) if self.runtime_options.precompute_adarms else nullcontext()
+        with init_context, torch.no_grad():
+            model = Pi05ForActionPrediction(self.config)
+            _set_inference_dtype(model, self._torch_dtype)
+            model.configure_vision(self.vision_options)
+            model.configure_runtime(self.runtime_options)
+            model.to(device=self._device)
+            self._load_checkpoint(model)
+            model.eval()
+            model.prepare_runtime_caches()
+        logger.info(
+            "Pi05Pipeline: vision precision=%s, camera batching=%s, runtime=%s (experimental options).",
+            self.vision_options.precision,
+            self.vision_options.batch_cameras,
+            self.runtime_options,
+        )
         return model
 
     def _install_cuda_graphs(self, od_config: OmniDiffusionConfig) -> None:
