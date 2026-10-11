@@ -573,7 +573,7 @@ def _build_bare_orchestrator(stage_pools) -> tuple[Orchestrator, tuple[janus.Que
 
 
 def _register_request(orchestrator: Orchestrator, request_id: str, *, submitted_stage: int | None = 0) -> None:
-    state = OrchestratorRequestState(request_id=request_id)
+    state = OrchestratorRequestState(request_id=request_id, final_stage_id=len(orchestrator.stage_pools) - 1)
     if submitted_stage is not None:
         state.stage_submit_ts[submitted_stage] = time.time()
     orchestrator.request_states[request_id] = state
@@ -1182,7 +1182,7 @@ async def test_diffusion_client_error_output_propagates_non_400_status(
 
 
 @pytest.mark.asyncio
-async def test_control_rpc_failure_is_reported_to_the_caller_not_fatal() -> None:
+async def test_control_rpc_failure_is_reported_to_the_caller_not_fatal(mocker) -> None:
     """A control RPC that fails on one replica must come back as that
     replica's error result instead of raising out of _request_handler.
     """
@@ -1192,7 +1192,7 @@ async def test_control_rpc_failure_is_reported_to_the_caller_not_fatal() -> None
             raise TimeoutError("outputs did not drain")
 
     ok = FakeStageClient(stage_type="diffusion")
-    ok.collective_rpc_async = AsyncMock(return_value=None)
+    mocker.patch.object(ok, "collective_rpc_async", new_callable=AsyncMock, return_value=None)
     orchestrator, queues = _build_bare_orchestrator(
         _build_stage_pools([[ok], [_FailingClient(stage_type="diffusion")]])
     )

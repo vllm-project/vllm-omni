@@ -66,7 +66,7 @@ class AsyncEventResolver:
         }
         return fut
 
-    async def resolve(self, ack: OmniACK):
+    async def resolve(self, ack: OmniACK | dict):
         tid = getattr(ack, "task_id", None)
 
         if tid is None and isinstance(ack, dict):
@@ -359,6 +359,11 @@ class AsyncOmniBase(OmniBase):
                         await self.event_resolver.resolve(msg)
                         continue
 
+                    request_id = getattr(msg, "request_id", None)
+                    req_state = self.request_states.get(request_id) if request_id is not None else None
+                    if req_state is not None and req_state.cleanup_pending:
+                        continue
+
                     if isinstance(msg, ErrorMessage):
                         # Route request-scoped errors to that request's queue and
                         # keep the loop alive. A request whose stage replica died
@@ -396,6 +401,8 @@ class AsyncOmniBase(OmniBase):
             except OmniEngineDeadError as e:
                 logger.error("[%s] Engine dead: %s", self._name, e)
                 for req_state in list(self.request_states.values()):
+                    if req_state.cleanup_pending:
+                        continue
                     error_msg = ErrorMessage(
                         error=str(e),
                         fatal=True,
@@ -407,6 +414,8 @@ class AsyncOmniBase(OmniBase):
             except EngineDeadError as e:
                 logger.error("[%s] Engine dead: %s", self._name, e)
                 for req_state in list(self.request_states.values()):
+                    if req_state.cleanup_pending:
+                        continue
                     error_msg = ErrorMessage(
                         error=str(e),
                         fatal=True,
@@ -417,6 +426,8 @@ class AsyncOmniBase(OmniBase):
             except Exception as e:
                 logger.exception("[%s] final_output_loop failed.", self._name)
                 for req_state in list(self.request_states.values()):
+                    if req_state.cleanup_pending:
+                        continue
                     error_msg = ErrorMessage(
                         request_id=req_state.request_id,
                         error=str(e),
@@ -433,7 +444,7 @@ class AsyncOmniBase(OmniBase):
         request_id: str | Iterable[str],
         *,
         timeout: float = ABORT_TIMEOUT_S,
-    ):
+    ) -> bool:
         """Abort request(s) via the Orchestrator given internal request IDs,
         which take the format <external_request_id>-<UUID>.
         """
@@ -443,6 +454,7 @@ class AsyncOmniBase(OmniBase):
         try:
             # Unbind generate() if abort_async blocks in the executor.
             await asyncio.wait_for(self._abort(internal_req_ids, timeout=timeout), timeout=timeout)
+            return True
         except TimeoutError:
             logger.warning(
                 "[AsyncOmni] Timed out aborting %s after %.1fs; "
@@ -452,6 +464,7 @@ class AsyncOmniBase(OmniBase):
             )
         except Exception:
             logger.exception("[AsyncOmni] Cleanup abort failed for %s", ",".join(internal_req_ids))
+        return False
 
     async def _abort(self, request_ids: list[str], *, timeout: float | None = None) -> None:
         """Abort request IDs via the engine and enqueue terminal abort outputs.
@@ -473,14 +486,14 @@ class AsyncOmniBase(OmniBase):
             if req_id is None:
                 continue
             state = self.request_states.get(req_id)
-            if state is None:
+            if state is None or state.cleanup_pending:
                 logger.debug("[AsyncOmni] Dropping abort output for unknown req %s", req_id)
                 continue
             await state.queue.put(output_msg)
             delivered.add(req_id)
         for rid in request_ids:
             state = self.request_states.get(rid)
-            if state is not None and rid not in delivered:
+            if state is not None and not state.cleanup_pending and rid not in delivered:
                 queue = getattr(state, "queue", None)
                 if queue is not None:
                     final_stage_id = getattr(state, "final_stage_id", None)
@@ -506,6 +519,9 @@ class AsyncOmniBase(OmniBase):
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
+            if state is not None and state.cleanup_pending:
+                self.request_states.pop(rid)
+        self._publish_request_gauges(len(self.request_states))
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 

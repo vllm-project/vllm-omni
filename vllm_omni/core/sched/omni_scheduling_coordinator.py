@@ -457,6 +457,7 @@ class OmniSchedulingCoordinator:
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
                         external_req_id=request.external_req_id,
+                        payload_sender_info=request.payload_sender_info,
                     )
                 )
                 request.status = RequestStatus.WAITING_FOR_CHUNK

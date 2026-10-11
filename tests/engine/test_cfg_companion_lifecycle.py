@@ -19,9 +19,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -103,6 +104,7 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     orch._cfg_tracker = CfgCompanionTracker()
     orch.request_states = {}
     orch.stage_pools = [_FakePool("llm"), _FakePool("diffusion")][:num_stages]
+    orch._stage_routing = StageRouting.from_transitions(len(orch.stage_pools))
     orch.output_async_queue = asyncio.Queue()
     orch.async_chunk = False
     orch.duplex_control_plane = None
@@ -113,12 +115,12 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     return orch
 
 
-def _req_state(final_stage_id: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(
+def _req_state(final_stage_id: int = 1, request_id: str = "p") -> OrchestratorRequestState:
+    return OrchestratorRequestState(
+        request_id=request_id,
         final_stage_id=final_stage_id,
         stage_submit_ts={},
         sampling_params_list=[SimpleNamespace(output_kind=None)] * (final_stage_id + 1),
-        streaming=SimpleNamespace(enabled=False, segment_finished=False),
         running_counter_registered=False,
         prompt={"prompt": "x"},
         pipeline_timings={},
@@ -131,7 +133,7 @@ async def test_kv_ready_does_not_mark_companion_done():
     output (set_companion_output) may. Guards the original race."""
     orch = _make_orchestrator()
     orch._cfg_tracker.register_companion("p", "neg", "p__neg")
-    orch.request_states["p__neg"] = _req_state()
+    orch.request_states["p__neg"] = _req_state(request_id="p__neg")
 
     raw = SimpleNamespace(request_id="p__neg", kv_transfer_params={"kv_ready": True})
     await orch._handle_kv_ready_raw_outputs(0, SimpleNamespace(outputs=[raw]))

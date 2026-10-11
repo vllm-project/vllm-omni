@@ -25,6 +25,7 @@ from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed
 from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.diffusion.registry import resolve_native_single_file
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
@@ -1187,6 +1188,7 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
         stage_init_timeout=int(getattr(args, "stage_init_timeout", 300)),
         parallel_stage_init=bool(getattr(args, "parallel_stage_init", False)),
         async_chunk=async_chunk,
+        stage_transitions=resolved.pipeline_config.stage_transitions if resolved.pipeline_config is not None else None,
         tokenizer=getattr(args, "tokenizer", None),
         log_stats=not bool(getattr(args, "disable_log_stats", False)),
     )
@@ -1435,6 +1437,11 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
+        stage_routing=(
+            StageRouting.from_transitions(len(stage_configs), resolved.pipeline_config.stage_transitions)
+            if resolved.pipeline_config is not None and resolved.pipeline_config.stage_transitions is not None
+            else None
+        ),
         async_chunk=bool(
             getattr(getattr(stage_cfg, "connector_config", None), "async_chunk", None)
             if hasattr(stage_cfg, "connector_config")

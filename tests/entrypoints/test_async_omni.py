@@ -12,11 +12,16 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.kv_hints import KvHintsEnvelope
 
+from tests.engine.test_configured_stage_routing import _direct_orchestrator
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.errors import ResourceReleaseError
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.orchestrator import OrchestratorRequestState
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
@@ -80,8 +85,122 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._compute_final_stage_id = lambda output_modalities: 0
     omni._compute_final_output_stage_ids = lambda output_modalities: [0]
     omni._process_orchestrator_results = fake_process_results
-    omni._log_summary_and_cleanup = lambda request_id: omni.request_states.pop(request_id, None)
     return omni
+
+
+@pytest.mark.cpu
+def test_generate_retains_public_id_until_failed_cleanup_retry_succeeds():
+    async def run():
+        orch, _, _ = _direct_orchestrator()
+        orch.request_states.clear()
+        fail_release = True
+        abort_calls = []
+
+        async def release(_ids):
+            if fail_release:
+                raise ResourceReleaseError("receiver still owns the payload")
+
+        orch.stage_pools[0].release_request_resources = release
+
+        async def add(*, request_id, sampling_params_list, final_stage_id, final_output_stage_ids, **kwargs):
+            orch.request_states[request_id] = OrchestratorRequestState(
+                request_id=request_id,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=set(final_output_stage_ids),
+            )
+            await orch._cleanup_request_ids([request_id])
+            await omni.request_states[request_id].queue.put(orch.output_async_queue.get_nowait())
+
+        async def abort(ids, timeout=None):
+            abort_calls.append(list(ids))
+            return await orch._cleanup_request_ids(list(ids), abort=True)
+
+        omni = get_async_omni_instance(fake_add_request=add, fake_abort_request=abort)
+        omni.engine.num_stages = len(orch.stage_pools)
+        omni._compute_final_stage_id = lambda _modalities: 2
+        omni._compute_final_output_stage_ids = lambda _modalities: [2]
+        omni._process_orchestrator_results = AsyncOmni._process_orchestrator_results.__get__(omni)
+        with pytest.raises(RuntimeError, match="receiver still owns the payload"):
+            async for _ in omni.generate(
+                prompt={"prompt": "test"},
+                request_id="public-r",
+                sampling_params_list=[SamplingParams(max_tokens=1) for _ in orch.stage_pools],
+                output_modalities=["text"],
+            ):
+                pass
+        (internal_id,) = orch.request_states
+        state = omni.request_states[internal_id]
+        assert state.cleanup_pending and state.external_request_id == "public-r"
+        assert orch.request_states[internal_id].closing
+        with pytest.raises(ResourceReleaseError):
+            await omni.abort("public-r")
+        assert omni.request_states[internal_id] is state
+        fail_release = False
+        await omni.abort("public-r")
+        assert abort_calls == [[internal_id], [internal_id], [internal_id]]
+        assert not omni.request_states and not orch.request_states
+        assert state.queue.empty()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_retry_keeps_active_requests_with_the_same_public_id():
+    async def run():
+        calls: list[list[str]] = []
+        omni = get_async_omni_instance(fake_abort_request=get_fake_abort(calls))
+        closed = ClientRequestState("closed", external_request_id="public")
+        closed.cleanup_pending = True
+        active = ClientRequestState("active", external_request_id="public")
+        unrelated = ClientRequestState("unrelated", external_request_id="other")
+        omni.request_states = {state.request_id: state for state in (closed, active, unrelated)}
+        await omni.abort("public")
+        assert calls == [["closed", "active"]]
+        assert omni.request_states == {"active": active, "unrelated": unrelated}
+        assert closed.queue.empty() and unrelated.queue.empty()
+        terminal = active.queue.get_nowait()
+        assert terminal.finished and terminal.engine_outputs.outputs[0].finish_reason == "abort"
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_output_dispatcher_drops_messages_for_requests_pending_cleanup():
+    async def run():
+        omni = get_async_omni_instance()
+        pending = ClientRequestState("pending")
+        pending.cleanup_pending = True
+        active = ClientRequestState("active")
+        omni.request_states = {"pending": pending, "active": active}
+        messages: asyncio.Queue = asyncio.Queue()
+        omni.engine.try_get_output_async = messages.get
+        omni.final_output_task = None
+        for _ in range(64):
+            messages.put_nowait(ErrorMessage(request_id="pending", error="late release failure"))
+            messages.put_nowait(
+                OutputMessage(
+                    request_id="pending",
+                    stage_id=0,
+                    engine_outputs=OmniRequestOutput(request_id="pending", stage_id=0, finished=True, outputs=[]),
+                    finished=True,
+                )
+            )
+        marker = ErrorMessage(request_id="active", error="active request failure")
+        messages.put_nowait(marker)
+        AsyncOmni._final_output_handler(omni)
+        task = omni.final_output_task
+        assert task is not None
+        try:
+            assert await asyncio.wait_for(active.queue.get(), timeout=1) is marker
+            assert pending.queue.empty() and not pending.consumed_metric_message_ids
+            assert omni.request_states["pending"] is pending
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
 
 
 @pytest.mark.cpu
@@ -243,10 +362,9 @@ def test_abort_keeps_request_states_until_generate_cleanup():
             await release.wait()
 
         omni = get_async_omni_instance(fake_abort_request=slow_abort_async)
-        omni.request_states["req-1-aaaa"] = SimpleNamespace(
+        omni.request_states["req-1-aaaa"] = ClientRequestState(
             request_id="req-1-aaaa",
             external_request_id="req-1",
-            input_stream_task=None,
         )
 
         task = asyncio.create_task(omni.abort("req-1"))
@@ -270,10 +388,9 @@ def test_abort_propagates_engine_errors_without_popping_state():
             raise RuntimeError("orchestrator abort failed")
 
         omni = get_async_omni_instance(fake_abort_request=failing_abort_async)
-        omni.request_states["req-1-bbbb"] = SimpleNamespace(
+        omni.request_states["req-1-bbbb"] = ClientRequestState(
             request_id="req-1-bbbb",
             external_request_id="req-1",
-            input_stream_task=None,
         )
 
         with pytest.raises(RuntimeError, match="orchestrator abort failed"):
@@ -327,10 +444,9 @@ def test_abort_enqueues_prefix_tokens_from_engine():
             ]
 
         omni = get_async_omni_instance(fake_abort_request=abort_with_prefix)
-        omni.request_states["req-1-cccc"] = SimpleNamespace(
+        omni.request_states["req-1-cccc"] = ClientRequestState(
             request_id="req-1-cccc",
             external_request_id="req-1",
-            input_stream_task=None,
             queue=queue,
         )
         await omni._abort(["req-1-cccc"])
@@ -355,10 +471,9 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
             return []
 
         omni = get_async_omni_instance(fake_abort_request=empty_abort_async)
-        omni.request_states["req-1-dddd"] = SimpleNamespace(
+        omni.request_states["req-1-dddd"] = ClientRequestState(
             request_id="req-1-dddd",
             external_request_id="req-1",
-            input_stream_task=None,
             queue=queue,
         )
         await omni._abort(["req-1-dddd"])
@@ -387,7 +502,6 @@ def test_abort_drops_consumed_metric_message_ids_with_state():
     from collections.abc import Mapping
 
     from vllm_omni.engine.messages import OutputMessage
-    from vllm_omni.entrypoints.client_request_state import ClientRequestState
     from vllm_omni.metrics.stats import OrchestratorAggregator
 
     async def run():
@@ -595,7 +709,50 @@ def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
             await asyncio.wait_for(task, timeout=1.0)
         assert seen_timeouts
         assert seen_timeouts[-1] == 0.05
-        assert omni.request_states == {}
+        (state,) = omni.request_states.values()
+        assert state.cleanup_pending and state.external_request_id == "cancel-hang-abort"
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_generate_keeps_public_id_if_cleanup_abort_is_cancelled_again():
+    async def run():
+        submitted, abort_started, resume = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        calls: list[list[str]] = []
+
+        async def add(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids, timeout=None):
+            calls.append(list(request_ids))
+            abort_started.set()
+            await resume.wait()
+
+        omni = get_async_omni_instance(fake_add_request=add, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "test"},
+                request_id="cancel-twice",
+                sampling_params_list=[SamplingParams(max_tokens=1)],
+                output_modalities=["text"],
+            ):
+                pass
+
+        task = asyncio.create_task(collect())
+        await asyncio.wait_for(submitted.wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(abort_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        (state,) = omni.request_states.values()
+        assert state.cleanup_pending and state.external_request_id == "cancel-twice"
+        resume.set()
+        await omni.abort("cancel-twice")
+        assert calls == [[state.request_id], [state.request_id]]
+        assert not omni.request_states and state.queue.empty()
 
     asyncio.run(run())
 
@@ -713,7 +870,16 @@ def test_generate_bounds_abort_inside_cancelled_asgi_scope(monkeypatch):
         await asyncio.wait_for(cancel_request(), timeout=1.0)
         assert abort_started.is_set()
         assert abort_finished.is_set()
-        assert omni.request_states == {}
+        (state,) = omni.request_states.values()
+        assert state.cleanup_pending
+        assert state.external_request_id == "cancel-asgi-hanging-abort"
+
+        async def recovered_abort(request_ids, timeout=None):
+            assert request_ids == [state.request_id]
+
+        omni.engine.abort_async = recovered_abort
+        await omni.abort(state.external_request_id)
+        assert omni.request_states == {} and state.queue.empty()
 
     asyncio.run(run_test())
 

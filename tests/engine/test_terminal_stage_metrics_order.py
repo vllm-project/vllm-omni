@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -23,6 +24,7 @@ def build():
             final_output=True, build_stage_metrics=lambda *a, **k: SimpleNamespace(stage_id=1, num_tokens_out=0)
         ),
     ]
+    o._stage_routing = StageRouting.from_transitions(len(o.stage_pools))
     state = OrchestratorRequestState(
         request_id="r",
         final_stage_id=1,

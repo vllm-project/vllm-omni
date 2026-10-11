@@ -2234,7 +2234,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # `request_id` we have here is the external (user-visible) id,
                     # so resolve via the external_request_id field.
                     req_state = next(
-                        (s for s in self.engine_client.request_states.values() if s.external_request_id == request_id),
+                        (
+                            s
+                            for s in self.engine_client.request_states.values()
+                            if s.external_request_id == request_id and not s.cleanup_pending
+                        ),
                         None,
                     )
                     if req_state is not None and req_state_audio_ref is None:

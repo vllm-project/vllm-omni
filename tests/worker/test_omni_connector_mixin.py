@@ -79,10 +79,29 @@ def _make_model_config(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         stage_connector_config=None,
+        use_v2_model_runner=True,
+        supports_native_mrv2_data_plane=True,
         async_chunk=async_chunk,
         worker_type=worker_type,
         custom_process_next_stage_input_func=custom_func,
     )
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("role", ["sender", "receiver"])
+def test_async_transport_has_one_owner_for_runner_and_scheduler(mocker, native, role):
+    config = _make_model_config(async_chunk=True, custom_func="stage.payload")
+    config.stage_connector_config = {"role": role}
+    config.use_v2_model_runner = native
+    host = MixinHost()
+    create = mocker.patch.object(host, "_create_connector", return_value=None)
+    mocker.patch.object(host, "_load_custom_func", return_value=(None, None))
+    host.init_omni_connectors(config)
+    try:
+        assert create.call_count == int(native)
+        assert host._omni_connector is None
+    finally:
+        host.shutdown_omni_connectors()
 
 
 def _make_request(req_id: str, external_req_id: str | None = None):

@@ -10,6 +10,7 @@ additional_information. Every other path submits the plain placeholder.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -50,6 +51,8 @@ class _FakePool:
     """Single-replica LLM pool that records the requests it is sent."""
 
     stage_type = "llm"
+    final_output = True
+    num_replicas = 1
 
     def __init__(self, role: str, stage_client: Any = None) -> None:
         self.stage_client = stage_client if stage_client is not None else SimpleNamespace()
@@ -60,6 +63,12 @@ class _FakePool:
 
     def live_replica_ids(self) -> list[int]:
         return [0]
+
+    def available_replica_ids(self) -> list[int]:
+        return [0]
+
+    async def pick(self, request_id, *, request_state=None):
+        return 0
 
     async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
         self.submitted.append(request)
@@ -79,9 +88,14 @@ def _orchestrator(payload_func: Any = None, cls: type[Orchestrator] = Orchestrat
     """Thinker -> Talker (no payload hook) -> Code2Wav (``payload_func``, if any)."""
     code2wav_client = None if payload_func is None else _client(payload_func)
     orchestrator = object.__new__(cls)
-    orchestrator.stage_pools = [_FakePool("sender"), _FakePool("receiver"), _FakePool("receiver", code2wav_client)]
-    orchestrator.async_chunk = True
-    orchestrator.request_states = {}
+    Orchestrator.__init__(
+        orchestrator,
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[_FakePool("sender"), _FakePool("receiver"), _FakePool("receiver", code2wav_client)],
+        async_chunk=True,
+    )
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     return orchestrator
 
@@ -194,6 +208,7 @@ async def test_prewarm_submits_plain_placeholder(case: dict[str, Any], expected_
         final_stage_id=2,
         session_owned=case.get("session_owned", False),
     )
+    orchestrator.request_states["req"] = req_state
     streaming = case.get("streaming", False)
     req_state.streaming.enabled = streaming
     stage0_kwargs = case.get("stage0", {"resumable": False})

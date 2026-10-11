@@ -386,7 +386,7 @@ def flatten_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return flat
 
 
-def unflatten_payload(flat: dict[str, Any]) -> dict[str, Any]:
+def unflatten_payload(flat: Mapping[str, Any]) -> dict[str, Any]:
     """Unflatten dotted keys back to nested dicts.
 
     Reverse of :func:`flatten_payload`.

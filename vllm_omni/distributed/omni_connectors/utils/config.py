@@ -2,11 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from .logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
+
+REQUEST_RESOURCE_RELEASE_TIMEOUT_S = 5.0
+
+
+def get_stage_connector_peer(
+    model_config: Any, stage_id: int, direction: Literal["from_stage", "to_stage"]
+) -> int | None:
+    """Read a projected route endpoint, retaining sequential legacy defaults."""
+    config = getattr(model_config, "stage_connector_config", None)
+    if isinstance(config, dict) and direction in config:
+        value = config[direction]
+        if value is None:
+            return None
+    else:
+        value = getattr(config, direction, None)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip():
+        return int(value)
+    return stage_id + (1 if direction == "to_stage" else -1)
+
 
 TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
     {

@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import Future
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from queue import Full, Queue
@@ -16,6 +17,10 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload, unflatten_payload
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    REQUEST_RESOURCE_RELEASE_TIMEOUT_S,
+    get_stage_connector_peer,
+)
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     should_accumulate_full_payload_output,
@@ -337,6 +342,34 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 sampled_token_ids=None,
                 terminal_req_ids=active_req_ids,
             )
+
+    def release_request_resources(self, request_ids: list[str]) -> None:
+        """Fence publications and apply the existing backend cleanup contract."""
+        if self._omni_connector is None:
+            return
+        # The scheduler's final runner step may follow the release RPC. Fence
+        # late publications with the existing abort lifecycle before reclaiming.
+        self.abort_requests(set(request_ids))
+        deadline = time.monotonic() + REQUEST_RESOURCE_RELEASE_TIMEOUT_S
+        from_stage = get_stage_connector_peer(self.model_config, self._stage_id, "from_stage")
+        completions: list[Future[None]] = []
+        with self._native_send_lock, self._lock:
+            for request_id in request_ids:
+                completion: Future[None] = Future()
+                completions.append(completion)
+                self._pending_save_reqs.setdefault(request_id, deque()).append(
+                    {
+                        "request_id": request_id,
+                        "release_prefix": f"{request_id}_{self._stage_id}_",
+                        "receive_prefix": f"{request_id}_{from_stage}_" if from_stage is not None else None,
+                        "release_completion": completion,
+                        "release_deadline": deadline,
+                    }
+                )
+                self._pending_save_counts[request_id] += 1
+        self._save_work_available.set()
+        for completion in completions:
+            completion.result(timeout=max(0, deadline - time.monotonic()))
 
     def complete_outputs(
         self,

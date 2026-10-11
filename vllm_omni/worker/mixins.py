@@ -9,6 +9,14 @@ from typing import Any
 class OmniWorkerMixin:
     """Shared Omni plugin and native KV connector setup for workers."""
 
+    model_runner: Any
+
+    def omni_release_request_resources(self, request_ids: list[str]) -> None:
+        """Release native runner payloads once the pipeline is done."""
+        plane = self.model_runner._omni_data_plane
+        if plane is not None:
+            plane.release_request_resources(request_ids)
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         from vllm_omni.plugins import load_omni_general_plugins

@@ -15,9 +15,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
+    get_stage_connector_peer,
     get_stage_connector_role,
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
@@ -51,6 +53,12 @@ def _should_create_payload_connector(model_config: Any) -> bool:
     Sender edges may instead be owned solely by KV transfer. Receivers still
     need a connector even though they do not declare a downstream payload hook.
     """
+    if getattr(model_config, "async_chunk", False) and not uses_native_mrv2_data_plane(
+        model_config, use_v2_model_runner=getattr(model_config, "use_v2_model_runner", False)
+    ):
+        # The scheduler's chunk adapter owns V1 transport. Creating another
+        # runner connector duplicates its endpoint and payload ownership.
+        return False
     if get_stage_connector_role(model_config) != "sender":
         return True
 
@@ -112,7 +120,7 @@ class _OmniConnectorRuntimeMixin:
     _async_chunk: bool
     _model_mode: str
     _stage_id: int
-    _next_stage_id: int
+    _next_stage_id: int | None
     _from_tp: int
     _to_tp: int
     _local_rank: int
@@ -218,7 +226,7 @@ class _OmniConnectorRuntimeMixin:
         )
 
         # -- next stage ID (from connector config or default stage_id + 1) --
-        self._next_stage_id: int = self._resolve_next_stage_id(model_config)
+        self._next_stage_id = self._resolve_next_stage_id(model_config)
 
         # -- heterogeneous TP rank support --
         rank_cfg = self._parse_rank_mapping(model_config)
@@ -678,23 +686,13 @@ class _OmniConnectorRuntimeMixin:
             raise ValueError("Connector request has neither an external nor an internal request ID")
         return fallback_req_id
 
-    def _resolve_next_stage_id(self, model_config: Any) -> int:
+    def _resolve_next_stage_id(self, model_config: Any) -> int | None:
         """Determine the downstream stage ID from connector config.
 
         Falls back to ``stage_id + 1`` when the config does not specify
         a ``to_stage`` explicitly.
         """
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is not None:
-            if isinstance(connector_config, dict):
-                to_stage = connector_config.get("to_stage")
-            else:
-                to_stage = getattr(connector_config, "to_stage", None)
-            if isinstance(to_stage, int):
-                return to_stage
-            if isinstance(to_stage, str) and to_stage.strip():
-                return int(to_stage)
-        return self._stage_id + 1
+        return get_stage_connector_peer(model_config, self._stage_id, "to_stage")
 
     @staticmethod
     def _parse_rank_mapping(model_config: Any) -> dict[str, int]:

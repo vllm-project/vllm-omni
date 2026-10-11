@@ -21,6 +21,7 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -29,6 +30,63 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_pipeline_release_preserves_legacy_backend_and_fences_queued_puts(build_adapter, mocker):
+    adapter, _ = build_adapter(stage_id=0)
+    connector = mocker.Mock(spec=OmniConnectorBase)
+    connector.stage_id = 0
+    connector.put.return_value = (True, 1, {})
+    adapter.connector = connector
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    request = _req("internal", RequestStatus.RUNNING, external_req_id="external")
+    adapter.save_async(None, request)
+    completion = adapter.release_request_resources("external")
+    assert not completion.done()
+    connector.put.assert_not_called()
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    connector.put.assert_called_once()
+    assert not completion.done()
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    completion.result(timeout=0)
+    assert not adapter._pending_save_reqs
+    connector.cleanup.assert_not_called()
+
+
+@pytest.mark.parametrize(("source", "target"), [(0, 2), (2, 1)])
+def test_configured_edge_transfers_ordered_chunks_through_real_shm(build_adapter, source, target):
+    """Exercise actual SHM put/get with scheduler threads stepped by the test."""
+    from vllm_omni.config.stage_routing import StageRouting
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+    route = StageRouting.from_transitions(3, ((0, 2), (2, 1)))
+    sender, _ = build_adapter(stage_id=source)
+    receiver, _ = build_adapter(stage_id=target)
+    sender.config.stage_connector_config = get_stage_connector_spec(None, source, True, route)
+    receiver.config.stage_connector_config = get_stage_connector_spec(None, target, True, route)
+    send_connector = SharedMemoryConnector({"stage_id": source})
+    recv_connector = SharedMemoryConnector({"stage_id": target})
+    sender.connector = send_connector
+    receiver.connector = recv_connector
+    external_id = f"configured-route-{uuid.uuid4().hex}"
+    send_request = _req("sender", RequestStatus.RUNNING, external_req_id=external_id)
+    recv_request = _req("receiver", RequestStatus.WAITING, external_req_id=external_id)
+    try:
+        for index in range(3):
+            sender.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.tensor([index], dtype=torch.long))
+            )
+            sender.save_async(None, send_request)
+            sender._send_single_request(sender._pending_save_reqs.popleft())
+            entry = _dequeue_load_entry(receiver, recv_request)
+            assert receiver._poll_single_request(entry)
+            assert receiver.get_req_chunk["receiver"] == index + 1
+            payload = receiver._pending_ar_prompt_updates["receiver"][1]
+            assert payload["codes"]["audio"].tolist() == [index]
+        assert sender.put_req_chunk[external_id] == 3
+    finally:
+        send_connector.close()
+        recv_connector.close()
 
 
 @pytest.fixture
@@ -97,6 +155,36 @@ def test_shm_abort_reclaims_inflight_put_without_blocking(shm_sender, monkeypatc
     assert not adapter.code_prompt_token_ids
 
 
+def test_connector_release_is_queued_after_payload_put(build_adapter):
+    adapter, connector = build_adapter(stage_id=0)
+    events = []
+
+    def put(**kwargs):
+        events.append("put")
+        return True, 1, {}
+
+    def cleanup_prefix(prefix):
+        events.append(prefix)
+        return 1
+
+    connector.put.side_effect = put
+    connector.cleanup_prefix.side_effect = cleanup_prefix
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1]))
+    )
+    request = _req("internal", RequestStatus.RUNNING, external_req_id="external")
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    adapter.save_async(None, request)
+    completion = adapter.release_request_resources(request.request_id)
+    assert completion is not None and not completion.done()
+    assert events == []
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert events == ["put", "external_0_"]
+    completion.result(timeout=0)
+    assert adapter._reclaimed_payload_total == 1
+
+
 def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
     adapter, connector = shm_sender
     ext_id = f"release_{uuid.uuid4().hex}"
@@ -109,13 +197,13 @@ def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
     # The consumer read only the first chunk before its own request ended.
     assert connector.get("0", "1", f"{ext_id}_0_0") is not None
 
-    adapter.release_shm_resources(ext_id)
+    adapter.release_request_resources(ext_id)
     # The release is queued behind sends; nothing is unlinked on the caller.
     assert f"{ext_id}_0_1" in connector._pending_keys
     while adapter._pending_save_reqs:
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
 
-    assert adapter._reclaimed_shm_total == 2
+    assert adapter._reclaimed_payload_total == 2
     assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
     assert connector.get("0", "1", f"{ext_id}_0_1") is None
     assert connector.get("0", "1", sibling_key)[0] == "sibling"

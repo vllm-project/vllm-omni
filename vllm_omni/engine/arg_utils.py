@@ -328,6 +328,9 @@ class OmniEngineArgs(EngineArgs):
             "extra": self.stage_connector_spec.get("extra", {}).copy(),
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
+        for direction in ("from_stage", "to_stage"):
+            if direction in self.stage_connector_spec:
+                stage_connector_config[direction] = self.stage_connector_spec[direction]
 
         hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))
         # If model_arch is specified, inject it into hf_overrides so vLLM can

@@ -49,9 +49,11 @@ from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
 )
 from vllm_omni.config.stage_config import StageType
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
+    OmniTransferConfig,
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
@@ -1933,9 +1935,48 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
 
 
 def get_stage_connector_spec(
-    omni_transfer_config: Any,
+    omni_transfer_config: OmniTransferConfig | None,
     stage_id: int,
     async_chunk: bool,
+    stage_routing: StageRouting | None = None,
+) -> dict[str, Any]:
+    """Project the control route onto payload connector endpoints."""
+    if stage_routing is None:
+        return _select_stage_connector_spec(omni_transfer_config, stage_id)
+    order = stage_routing.stage_order
+    if stage_id not in order:
+        return {"from_stage": None, "to_stage": None, "extra": {"role": "sender"}}
+    position = order.index(stage_id)
+    source = order[position - 1] if position else None
+    target = order[position + 1] if position + 1 < len(order) else None
+    transfer_config = omni_transfer_config
+    if omni_transfer_config is not None:
+        incoming = (
+            omni_transfer_config.get_connector_for_edge(str(source), str(stage_id)) if source is not None else None
+        )
+        outgoing = (
+            omni_transfer_config.get_connector_for_edge(str(stage_id), str(target)) if target is not None else None
+        )
+        if incoming is not None and outgoing is not None and incoming.name != outgoing.name:
+            raise ValueError(f"Stage {stage_id} requires the same connector backend on its incoming and outgoing edges")
+        edges = tuple((str(src), str(dst)) for src, dst in zip(order, order[1:]))
+        transfer_config = replace(
+            omni_transfer_config,
+            connectors={
+                edge: backend_spec
+                for edge in edges
+                if (backend_spec := omni_transfer_config.get_connector_for_edge(*edge)) is not None
+            },
+        )
+    spec = {**_select_stage_connector_spec(transfer_config, stage_id), "from_stage": source, "to_stage": target}
+    if source is None:
+        spec["extra"] = {**spec.get("extra", {}), "role": "sender"}
+    return spec
+
+
+def _select_stage_connector_spec(
+    omni_transfer_config: OmniTransferConfig | None,
+    stage_id: int,
 ) -> dict[str, Any]:
     """Return the first connector spec for a stage data-plane edge."""
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config

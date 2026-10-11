@@ -187,6 +187,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
 
         input_stream_task: asyncio.Task | None = None
+        cleanup_complete = False
         try:
             _sleeping_tags = getattr(self, "_sleeping_tags", None)
             if _sleeping_tags:
@@ -320,6 +321,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             ):
                 yield output
 
+            cleanup_complete = True
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
         except (asyncio.CancelledError, GeneratorExit):
@@ -327,12 +329,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             # ASGI cancellation also affects subsequent awaits. Shield the
             # bounded engine abort before removing the local request state.
             with anyio.CancelScope(shield=True):
-                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+                cleanup_complete = await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
             self._record_request_failure_once(request_id, reason="stage_error")
-            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            cleanup_complete = await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
@@ -340,6 +342,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 input_stream_task.cancel()
             if admitting:
                 await self._release_generate_admission()
+            if request_id in self.request_states:
+                self.request_states[request_id].cleanup_pending = not cleanup_complete
             self._log_summary_and_cleanup(request_id)
 
     async def _release_generate_admission(self) -> None:
@@ -647,7 +651,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         if stage_meta.stage_type != "diffusion":
             raise ValueError("interaction requires a diffusion stage")
 
-        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
+        internal_ids = [
+            s.request_id
+            for s in self.request_states.values()
+            if s.external_request_id == request_id and not s.cleanup_pending
+        ]
         if not internal_ids:
             raise ValueError(f"No active request for interaction: {request_id!r}")
         if len(internal_ids) > 1:

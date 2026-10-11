@@ -228,12 +228,14 @@ async def test_single_modality_audio_only_one_stop():
     ],
 )
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pending_cleanup", [False, True])
 async def test_streaming_audio_metrics_resolve_replica_id(
     monkeypatch,
     output_replica_id,
     pool_replica_id,
     expected_replica_id,
     pool_lookup,
+    pending_cleanup,
 ):
     import vllm_omni.entrypoints.openai.serving_chat as serving_chat_mod
     from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -245,7 +247,11 @@ async def test_streaming_audio_metrics_resolve_replica_id(
         external_request_id="test-req",
     )
     req_state.request_arrival_ts = time.time() - 1.0
-    serving_chat.engine_client.request_states = {"internal-req": req_state}
+    closed = ClientRequestState(request_id="old-req", external_request_id="test-req")
+    closed.cleanup_pending = True
+    serving_chat.engine_client.request_states = (
+        {"old-req": closed, "internal-req": req_state} if pending_cleanup else {"internal-req": req_state}
+    )
     serving_chat.engine_client.mod_metrics = object()
     serving_chat.engine_client.engine = MagicMock()
     serving_chat.engine_client.engine.stage_pools = [MagicMock(), MagicMock(), MagicMock()]
@@ -286,6 +292,7 @@ async def test_streaming_audio_metrics_resolve_replica_id(
     assert first_packet_calls[0]["replica_id"] == expected_replica_id
     assert finalize_calls[0]["stage_id"] == 2
     assert finalize_calls[0]["replica_id"] == expected_replica_id
+    assert req_state.first_audio_ts is not None and closed.first_audio_ts is None
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Entrypoint contract tests for ``AsyncOmni.submit_interaction_async``."""
 
 from __future__ import annotations
@@ -69,6 +69,18 @@ async def test_submit_interaction_async_maps_external_to_internal_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_interaction_async_ignores_requests_pending_cleanup() -> None:
+    omni = _make_async_omni()
+    closed = omni.request_states["external-abc-uuid-1"]
+    closed.cleanup_pending = True
+    await omni.submit_interaction_async("external-abc", interaction=_prompt_interaction())
+    omni.engine.submit_interaction_async.assert_awaited_once_with(
+        "external-abc-uuid-2", interaction=_prompt_interaction()
+    )
+    assert omni.request_states["external-abc-uuid-1"] is closed
+
+
+@pytest.mark.asyncio
 async def test_submit_interaction_async_passes_missing_transition_chunks() -> None:
     omni = _make_async_omni()
     omni.request_states.pop("external-abc-uuid-2")
@@ -99,11 +111,18 @@ async def test_submit_interaction_async_rejects_negative_transition_chunks() -> 
 
 
 @pytest.mark.asyncio
-async def test_submit_interaction_async_rejects_inactive_request() -> None:
+@pytest.mark.parametrize("pending_cleanup", [False, True])
+async def test_submit_interaction_async_rejects_inactive_request(pending_cleanup) -> None:
     omni = _make_async_omni()
-    omni.request_states.clear()
+    if pending_cleanup:
+        for state in omni.request_states.values():
+            state.cleanup_pending = True
+        request_id = "external-abc"
+    else:
+        omni.request_states.clear()
+        request_id = "missing"
     with pytest.raises(ValueError, match="No active request"):
-        await omni.submit_interaction_async("missing", interaction=_prompt_interaction(transition_chunks=2))
+        await omni.submit_interaction_async(request_id, interaction=_prompt_interaction(transition_chunks=2))
 
 
 @pytest.mark.asyncio

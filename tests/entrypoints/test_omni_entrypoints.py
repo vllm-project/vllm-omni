@@ -104,6 +104,7 @@ class FakeAsyncOmniEngine:
     ) -> None:
         self.model = model
         self.config_path = None
+        self.pipeline_config = None
         self.stage_metadata = stage_metadata or [THREE_STAGE_META[-1]]
         self.num_stages = len(self.stage_metadata)
         self.stage_configs = [

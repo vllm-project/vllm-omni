@@ -3,6 +3,8 @@
 
 """Tests for data_entry_keys."""
 
+from types import MappingProxyType
+
 import msgspec
 import pytest
 import torch
@@ -257,34 +259,38 @@ class TestFlattenPayload:
         assert set(flat.keys()) == {"codes.audio", "latent", "meta.finished"}
 
 
+@pytest.mark.parametrize("mapping_type", [dict, MappingProxyType])
 class TestUnflattenPayload:
-    def test_basic_dotted_to_nested(self):
+    def test_basic_dotted_to_nested(self, mapping_type):
         flat = {
             "codes.audio": torch.tensor([1.0]),
             "meta.finished": torch.tensor(True, dtype=torch.bool),
             "meta.left_context_size": 5,
         }
-        nested = unflatten_payload(flat)
+        nested = unflatten_payload(mapping_type(flat))
         assert torch.equal(nested["codes"]["audio"], torch.tensor([1.0]))
+        assert nested["codes"]["audio"] is flat["codes.audio"]
         assert nested["meta"]["finished"].item() is True
         assert nested["meta"]["left_context_size"] == 5
 
-    def test_top_level_keys_preserved(self):
+    def test_top_level_keys_preserved(self, mapping_type):
         flat = {"latent": torch.tensor([9.0]), "generated_len": 42}
-        nested = unflatten_payload(flat)
+        nested = unflatten_payload(mapping_type(flat))
         assert torch.equal(nested["latent"], torch.tensor([9.0]))
+        assert nested["latent"] is flat["latent"]
         assert nested["generated_len"] == 42
 
-    def test_hidden_states_layers_collected(self):
+    def test_hidden_states_layers_collected(self, mapping_type):
         flat = {
             "hidden_states.output": torch.tensor([1.0]),
             "hidden_states.layer_0": torch.tensor([2.0]),
             "hidden_states.layer_24": torch.tensor([3.0]),
         }
-        nested = unflatten_payload(flat)
+        nested = unflatten_payload(mapping_type(flat))
         assert torch.equal(nested["hidden_states"]["output"], torch.tensor([1.0]))
         assert torch.equal(nested["hidden_states"]["layers"][0], torch.tensor([2.0]))
         assert torch.equal(nested["hidden_states"]["layers"][24], torch.tensor([3.0]))
+        assert nested["hidden_states"]["layers"][24] is flat["hidden_states.layer_24"]
 
 
 class TestFlattenUnflattenRoundTrip:

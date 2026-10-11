@@ -19,6 +19,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -345,6 +346,9 @@ class PipelineConfig:
     default_deploy_config_name: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
+    # Developer-owned control flow. None preserves numeric sequential routing;
+    # an explicit tuple replaces the route completely (no implicit edges).
+    stage_transitions: tuple[tuple[int, int], ...] | None = None
 
     def __post_init__(self) -> None:
         errors = self.get_validation_errors()
@@ -387,6 +391,23 @@ class PipelineConfig:
         # pipeline without one can never emit a result, so every request hangs.
         if not any(s.final_output for s in self.stages):
             errors.append("No terminal stage (stage with final_output=True)")
+        if self.stage_transitions is not None:
+            if any(type(stage_id) is not int for stage_id in stage_ids) or stage_ids != list(range(len(self.stages))):
+                errors.append("Explicit transitions require stages ordered by contiguous IDs starting at 0")
+                return errors
+            try:
+                route = StageRouting.from_transitions(len(self.stages), self.stage_transitions)
+            except ValueError as exc:
+                errors.append(str(exc))
+                return errors
+            if not self.stages[route.stage_order[-1]].final_output:
+                errors.append("The last stage of the explicit route must declare final_output=True")
+            visited: set[int] = set()
+            for stage_id in route.stage_order:
+                for source in self.stages[stage_id].input_sources:
+                    if source not in visited:
+                        errors.append(f"Stage {stage_id} input source {source} must precede it in the explicit route")
+                visited.add(stage_id)
         return errors
 
 

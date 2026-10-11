@@ -47,6 +47,7 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_error=None,
         _native_output_error_lock=threading.Lock(),
         _native_output_closed=False,
+        model_config=SimpleNamespace(stage_connector_config={"from_stage": None}),
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
         _async_chunk=True,
@@ -258,6 +259,108 @@ def _stop_save_thread(plane):
     plane._save_work_available.set()
     plane._save_thread.join(timeout=2)
     assert not plane._save_thread.is_alive()
+
+
+def test_pipeline_release_preserves_legacy_backend_and_retires_request(plane):
+    connector = SimpleNamespace(cleanup=lambda request_id: None)
+    plane.register_request(_new_request("external", "external"))
+    _start_save_thread(plane, connector)
+    try:
+        plane.release_request_resources(["external"])
+        assert "external" not in plane._native_requests
+        assert not plane._pending_save_reqs
+        assert not plane._pending_save_counts
+    finally:
+        _stop_save_thread(plane)
+
+
+def test_pipeline_release_without_a_transport_owner(plane):
+    plane._omni_connector = None
+    plane.release_request_resources(["external"])
+
+
+def test_pipeline_release_fences_scheduler_terminal_arriving_later(plane):
+    plane._omni_connector = SimpleNamespace(cleanup_prefix=lambda prefix: 0)
+    plane._stage_id = 0
+    plane._lock = threading.Lock()
+    plane._pending_save_reqs = {}
+    plane._pending_save_counts = defaultdict(int)
+    plane._save_work_available = threading.Event()
+    plane.register_request(_new_request("external", "external"))
+    plane.reserve_outputs(["external"])
+
+    _start_save_thread(plane, plane._omni_connector)
+    try:
+        plane.release_request_resources(["external"])
+    finally:
+        _stop_save_thread(plane)
+
+    assert not plane._native_requests
+    assert plane.record.cleaned == ["external"]
+    assert len(plane.record.batches) == 1
+    assert plane.record.batches[0][0][0].is_finished()
+    assert plane.abort_requests({"external"}) == 0
+    assert _complete(plane, [{"codes.audio": "late"}], req="external") == 0
+    assert len(plane.record.batches) == 1
+    assert not plane._pending_save_reqs
+    assert not plane._pending_save_counts
+
+
+def test_pipeline_release_waits_for_queued_payloads_and_uses_external_prefix(raw_plane):
+    connector = _gated_connector()
+    reclaimed = threading.Event()
+    prefixes = []
+
+    def cleanup_prefix(prefix):
+        prefixes.append(prefix)
+        reclaimed.set()
+
+    connector.cleanup_prefix = cleanup_prefix
+    _start_save_thread(raw_plane, connector)
+    try:
+        request = SimpleNamespace(request_id="external")
+        raw_plane._enqueue_chunk_payload(request, {"c": 1}, wait_for_delivery=False)
+        raw_plane._enqueue_chunk_payload(request, {"c": 2}, wait_for_delivery=False)
+        assert connector.put_started.wait(timeout=1)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            release = executor.submit(raw_plane.release_request_resources, ["external"])
+            assert not reclaimed.is_set()
+            assert not release.done()
+            connector.release.set()
+            release.result(timeout=2)
+        assert reclaimed.is_set()
+        assert connector.put_keys == ["external_0_0", "external_0_1"]
+        assert prefixes == ["external_0_"]
+    finally:
+        connector.release.set()
+        _stop_save_thread(raw_plane)
+    assert not raw_plane._pending_save_reqs
+    assert not raw_plane._pending_save_counts
+
+
+@pytest.mark.parametrize("failure_method", ["cleanup_prefix", "wait_for_cleanup"])
+def test_pipeline_release_failure_is_reported_and_retry_is_request_scoped(raw_plane, failure_method):
+    connector = _gated_connector()
+    connector.cleanup_prefix = lambda prefix: None
+    connector.wait_for_cleanup = lambda prefix, **kwargs: None
+
+    def fail(*args, **kwargs):
+        raise TimeoutError("READ claim remains active")
+
+    original = getattr(connector, failure_method)
+    setattr(connector, failure_method, fail)
+    _start_save_thread(raw_plane, connector)
+    try:
+        with pytest.raises(TimeoutError, match="READ claim remains active"):
+            raw_plane.release_request_resources(["external"])
+        assert not raw_plane._pending_save_reqs
+        assert not raw_plane._pending_save_counts
+        assert not raw_plane._delivery_manager.is_quarantined
+        setattr(connector, failure_method, original)
+        raw_plane.release_request_resources(["external"])
+        assert not raw_plane._pending_save_counts
+    finally:
+        _stop_save_thread(raw_plane)
 
 
 class _Output:

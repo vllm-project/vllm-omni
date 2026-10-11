@@ -23,6 +23,9 @@ class ClientRequestState:
         self.queue = queue if queue is not None else asyncio.Queue()
         self.metrics: OrchestratorAggregator | None = None
         self.input_stream_task: asyncio.Task | None = None
+        # generate() has exited, but engine cleanup still needs an acknowledgment.
+        # Retain the public ID mapping for abort retries without queuing outputs.
+        self.cleanup_pending = False
         # Request-scoped idempotency guard for Prometheus failure counters.
         self.failure_recorded = False
         # Wall-clock time at which the user's request arrived in the engine

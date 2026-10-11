@@ -47,6 +47,39 @@ def test_decoder_capability_matches_sink_binding(mocker, backend, executor_class
     assert runner.model_state.set_first_audio_sink.call_count == int(expected)
 
 
+@pytest.mark.parametrize("has_plane", [False, True])
+def test_native_resource_release_reaches_worker_owned_plane(mocker, has_plane):
+    from vllm_omni.worker.mixins import OmniWorkerMixin
+
+    plane = mocker.Mock() if has_plane else None
+    worker = SimpleNamespace(model_runner=SimpleNamespace(_omni_data_plane=plane))
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_v2_model_runner=True, supports_native_mrv2_data_plane=True)
+    )
+    engine.model_executor = mocker.Mock()
+    engine.model_executor.collective_rpc.side_effect = lambda method, args: getattr(OmniWorkerMixin, method)(
+        worker, *args
+    )
+    engine.omni_release_request_resources(["external"])
+    engine.model_executor.collective_rpc.assert_called_once_with("omni_release_request_resources", args=(["external"],))
+    if has_plane:
+        plane.release_request_resources.assert_called_once_with(["external"])
+
+
+def test_legacy_resource_release_reaches_scheduler_adapter(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.vllm_config = SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=False))
+    adapter = mocker.Mock()
+    engine.scheduler = SimpleNamespace(chunk_transfer_adapter=adapter)
+    engine.omni_release_request_resources(["external"])
+    adapter.release_request_resources.assert_called_once()
+    args, kwargs = adapter.release_request_resources.call_args
+    assert args == ("external",)
+    assert kwargs["deadline"] > 0
+    adapter.release_request_resources.return_value.result.assert_called_once()
+
+
 @pytest.mark.parametrize(
     "first_decoder,stream_decoder,stream_first_audio,expected",
     [(True, False, False, True), (False, True, False, False), (False, True, True, True), (False, False, True, False)],
