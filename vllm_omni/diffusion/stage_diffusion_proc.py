@@ -287,7 +287,8 @@ class StageDiffusionProc:
         if method == "profile":
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await run_executor(self._engine.profile, is_start, profile_prefix)
+            # Not run_in_executor: the profiler must start on the busy-loop thread.
+            return await self._engine.async_profile(is_start, profile_prefix)
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
