@@ -10,20 +10,27 @@ Latency benchmarks for π0.5 (`lerobot/pi05_base`) serving, used for the measure
 ## Client E2E latency
 
 Start a server with the recipe's command, then run the client per camera count.
-Pass `--enforce-eager` to the server to measure the eager baseline, and set `dtype: bfloat16` in the deploy config to measure bfloat16.
+It serves the optimized path in the deploy config's `float32`; pass `--enforce-eager` to the server for the eager baseline and `--dtype bfloat16` for bfloat16.
 
 ```bash
+# optimized path (CUDA graphs + fused kernels)
 vllm serve lerobot/pi05_base --omni --port 8000 --deploy-config vllm_omni/deploy/pi05.yaml --disable-log-stats
+# eager baseline
+vllm serve lerobot/pi05_base --omni --port 8000 --deploy-config vllm_omni/deploy/pi05.yaml --enforce-eager --disable-log-stats
 
 python benchmarks/pi05/e2e_latency_pi05.py --host 127.0.0.1 --port 8000 --views 3 --warmup 3 --iters 30 --out e2e.json
 ```
 
 ## Model-level latency
 
-Pass `--enforce-eager` to the server to measure the eager baseline.
+The script builds the model through `Pi05Pipeline`, as the server does, from the deploy config's `model_config`.
+It runs the optimized path by default; pass `--enforce-eager` for the eager baseline and `--dtype bfloat16` for bfloat16.
 
 ```bash
+# optimized path (CUDA graphs + fused kernels)
 python benchmarks/pi05/bench_pi05.py --bs 1 --views 3 --warmup 5 --iters 30 --out pi05_bench/
+# eager baseline
+python benchmarks/pi05/bench_pi05.py --enforce-eager --bs 1 --views 3 --warmup 5 --iters 30 --out pi05_bench_eager/
 ```
 
 ## Reference results
@@ -43,7 +50,7 @@ RTX 5080 16 GB, batch size 1, 10 denoising steps, p50/p95 of 30 round trips afte
 
 RTX 5080 16 GB, batch size 1, 3 cameras, 10 steps, 5 warmup:
 
-| dtype | eager path | optimized path (CUDA graph + fused Triton kernels) |
-| --- | ---: | ---: |
-| float32 | 260.4 ms | 237.7 ms |
-| bfloat16 | 168.3 ms | 114.0 ms |
+| dtype | PR 6950 (eager) | eager path | optimized path (CUDA graph + fused Triton kernels) |
+| --- | ---: | ---: | ---: |
+| float32 | 264.0 ms | 260.4 ms | 237.7 ms |
+| bfloat16 | 173.0 ms | 168.3 ms | 114.0 ms |
