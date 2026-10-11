@@ -37,11 +37,14 @@ def make_engine_duplex_scheduler(
     *,
     max_model_len: int = DUPLEX_MAX_MODEL_LEN,
     sliding_window: int = DUPLEX_MAX_MODEL_LEN,
+    max_position_embeddings: int | None = None,
 ) -> OmniARScheduler:
     """A Stage-0 duplex scheduler built from real vLLM configs with a real KV
     cache manager, so admission, chunked prefill, the resumable stop and the
     streaming update all run production code. The KV spec mirrors Helium's
-    per-layer sliding window; the pool holds ``DUPLEX_MAX_NUM_SEQS`` full contexts."""
+    per-layer sliding window; the pool holds ``DUPLEX_MAX_NUM_SEQS`` full contexts.
+    ``max_position_embeddings`` (the RoPE table a rebased session's absolute
+    position is checked against) defaults to ``max_model_len``."""
     LlamaConfig(
         hidden_size=64,
         intermediate_size=128,
@@ -49,7 +52,7 @@ def make_engine_duplex_scheduler(
         num_attention_heads=2,
         num_key_value_heads=2,
         vocab_size=128,
-        max_position_embeddings=max_model_len,
+        max_position_embeddings=max_position_embeddings or max_model_len,
     ).save_pretrained(tmp_path)
     model_config = ModelConfig(
         model=str(tmp_path), skip_tokenizer_init=True, dtype="float16", max_model_len=max_model_len
