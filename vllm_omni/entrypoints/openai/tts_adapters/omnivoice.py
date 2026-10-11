@@ -35,7 +35,7 @@ class OmniVoiceAdapter(ARTTSAdapter):
         if request.ref_audio:
             wav, sr, _ = await server._resolve_ref_audio(request.ref_audio)
             prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
-        if request.ref_text:
+        if request.ref_text and request.ref_text.strip():
             prompt["ref_text"] = request.ref_text
         if request.voice:
             voice_lower = request.voice.lower()
