@@ -150,6 +150,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SelfForcingPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "MinWMAction2VPipeline": DiffusionModelMetadata(final_output_type="video"),
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),

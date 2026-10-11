@@ -93,6 +93,11 @@ from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
 from vllm_omni.model_extras.minimax_h3 import minimax_h3_transformer_subfolder
+from vllm_omni.model_extras.minwm import (
+    MINWM_EXTRA_BODY_PARAMS,
+    MINWM_EXTRA_OUTPUT_PARAMS,
+    get_minwm_video_generation_defaults,
+)
 from vllm_omni.model_extras.qwen_image_21 import (
     QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
 )
@@ -253,6 +258,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": SELF_FORCING_EXTRA_BODY_PARAMS,
         "extra_output_params": SELF_FORCING_EXTRA_OUTPUT_PARAMS,
         "video_generation_defaults_builder": get_self_forcing_video_generation_defaults,
+    },
+    "MinWMAction2VPipeline": {
+        "extra_body_params": MINWM_EXTRA_BODY_PARAMS,
+        "extra_output_params": MINWM_EXTRA_OUTPUT_PARAMS,
+        "video_generation_defaults_builder": get_minwm_video_generation_defaults,
     },
     "Magi2Pipeline": {
         "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,

@@ -213,15 +213,16 @@ def test_window_keeps_only_the_most_recent_frames() -> None:
     assert cache.self_attention[0].absolute_end == 5 * tokens_per_frame
 
 
-def _pipeline():
-    """The pipeline around the tiny transformer and a tiny Wan VAE, without loading a checkpoint."""
+def _pipeline(pipeline_class=None, **transformer_overrides):
+    """A pipeline around the tiny transformer and a tiny Wan VAE, without loading a checkpoint."""
     from diffusers import AutoencoderKLWan
 
     from vllm_omni.diffusion.models.self_forcing.pipeline_self_forcing import SelfForcingPipeline
 
-    pipeline = SelfForcingPipeline.__new__(SelfForcingPipeline)
+    pipeline_class = pipeline_class or SelfForcingPipeline
+    pipeline = pipeline_class.__new__(pipeline_class)
     torch.nn.Module.__init__(pipeline)
-    pipeline.transformer = _tiny_model(num_frames_per_block=3, window_frames=21)
+    pipeline.transformer = _tiny_model(**{"num_frames_per_block": 3, "window_frames": 21, **transformer_overrides})
     pipeline.vae = AutoencoderKLWan(
         base_dim=8, z_dim=4, dim_mult=[1, 2], num_res_blocks=1, temperal_downsample=[True], attn_scales=[]
     ).to(torch.bfloat16)
@@ -229,7 +230,14 @@ def _pipeline():
     pipeline.vae_scale_factor_spatial, pipeline.vae_scale_factor_temporal = 8, 4
     pipeline._ar_height, pipeline._ar_width = 480, 832
     pipeline._streaming_decoder_instance = None
+    pipeline.device = torch.device("cpu")
     return pipeline
+
+
+def _minwm_pipeline():
+    from vllm_omni.diffusion.models.minwm.pipeline_minwm import MinWMAction2VPipeline
+
+    return _pipeline(MinWMAction2VPipeline, use_prope=True, num_frames_per_block=4, window_frames=20)
 
 
 @pytest.mark.cpu
@@ -318,3 +326,93 @@ def test_request_rejects_settings_the_dmd_generator_cannot_honor(overrides, mess
     pipeline = _pipeline()
     with pytest.raises(OmniClientError, match=message):
         pipeline._parse_request(_request(**overrides))
+
+
+@pytest.mark.cpu
+@pytest.mark.usefixtures("native_ops")
+def test_kv_cache_spec_adds_the_prope_branch_for_camera_checkpoints() -> None:
+    spec = _pipeline(use_prope=True).ar_diffusion_kv_cache_spec()
+    assert [(branch.name, branch.local_index) for branch in spec.kv_branches] == [("main", 0), ("prope", 1)]
+
+
+@pytest.mark.cpu
+@pytest.mark.usefixtures("native_ops")
+def test_minwm_request_maps_its_trajectory_to_one_camera_per_latent_frame() -> None:
+    inputs = _minwm_pipeline()._parse_request(_request(extra_args={"trajectory": "a*4,w*8,s*7"}))
+    assert (inputs.num_frames, inputs.num_latent_frames) == (77, 20)
+    assert inputs.cameras is not None and len(inputs.cameras) == 20
+
+
+@pytest.mark.cpu
+@pytest.mark.usefixtures("native_ops")
+def test_minwm_without_a_trajectory_renders_without_the_camera_branch() -> None:
+    assert _minwm_pipeline()._parse_request(_request()).cameras is None
+
+
+@pytest.mark.cpu
+@pytest.mark.usefixtures("native_ops")
+def test_minwm_rejects_a_trajectory_of_another_length() -> None:
+    with pytest.raises(ValueError, match="describes 4 latent frames"):
+        _minwm_pipeline()._parse_request(_request(extra_args={"trajectory": "w*3"}))
+
+
+def _cameras(frames: int):
+    from vllm_omni.diffusion.layers.prope import PRoPECameras
+    from vllm_omni.diffusion.models.minwm.camera import trajectory_cameras
+
+    viewmats, intrinsics = trajectory_cameras(f"w*{frames - 1}")
+    return PRoPECameras.from_views(viewmats.cuda(), intrinsics.cuda(), dtype=torch.bfloat16)
+
+
+@hardware_test(res={"cuda": "L4"})
+def test_cameras_reach_the_flow_only_through_prope_o() -> None:
+    """With prope_o zeroed the camera branch is inert; with weights it steers the flow."""
+    model = _tiny_model(device="cuda", dtype=torch.bfloat16, use_prope=True)
+    text = _text(model)
+
+    def flow(with_cameras: bool) -> torch.Tensor:
+        return model(
+            _block(model, 1),
+            _timestep(model, 937.5),
+            text,
+            cache=_cache(model),
+            start_frame=0,
+            update_cache=False,
+            prope_cache=_prope_cache(model) if with_cameras else None,
+            cameras=_cameras(1) if with_cameras else None,
+        )
+
+    for block in model.blocks:
+        block.self_attn.prope_o.weight.zero_()
+        block.self_attn.prope_o.bias.zero_()
+    torch.testing.assert_close(flow(True), flow(False), rtol=0, atol=0)
+    for block in model.blocks:
+        block.self_attn.prope_o.weight.normal_(0, 0.2)
+    assert not torch.allclose(flow(True), flow(False))
+
+
+@hardware_test(res={"cuda": "L4"})
+def test_probes_leave_the_prope_cache_untouched_and_commits_extend_it() -> None:
+    model = _tiny_model(device="cuda", dtype=torch.bfloat16, use_prope=True)
+    cache, prope_cache, text, cameras = _cache(model), _prope_cache(model), _text(model), _cameras(1)
+    for timestep, commit in ((937.5, False), (0.0, True)):
+        model(
+            _block(model, 1),
+            _timestep(model, timestep),
+            text,
+            cache=cache,
+            start_frame=0,
+            update_cache=commit,
+            prope_cache=prope_cache,
+            cameras=cameras,
+        )
+        assert prope_cache[0].end == (model.tokens_per_frame(_LATENT_HEIGHT, _LATENT_WIDTH) if commit else 0)
+
+
+def _prope_cache(model):
+    return model.allocate_prope_cache(
+        latent_height=_LATENT_HEIGHT,
+        latent_width=_LATENT_WIDTH,
+        device=model.patch_embedding.weight.device,
+        dtype=model.dtype,
+    )

@@ -32,6 +32,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import prompt_update_versions
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+from vllm_omni.diffusion.layers.prope import PRoPECameras
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, SupportsStepExecution
@@ -57,7 +58,9 @@ if TYPE_CHECKING:
 
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ARDiffusionPagedLayerContext
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
 
@@ -124,6 +127,8 @@ class _SelfForcingRequestInputs:
     num_latent_frames: int
     output_type: str
     generator: torch.Generator
+    # Per-latent-frame camera transforms of a PRoPE request; None runs without the camera branch.
+    cameras: PRoPECameras | None = None
 
 
 @dataclass
@@ -163,7 +168,9 @@ class SelfForcingPipeline(
     # The generic warmup request (two steps, 512x512) is not a valid DMD rollout.
     dummy_run_num_frames: ClassVar[int] = 0
     _AR_BRANCH = "main"
+    _AR_PROPE_BRANCH = "prope"
     _AR_TEXT_CACHE = "text"
+    _default_num_frames: ClassVar[int] = SELF_FORCING_DEFAULT_NUM_FRAMES
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -260,7 +267,8 @@ class SelfForcingPipeline(
             frames_per_block=config.num_frames_per_block,
             window_frames=config.window_frames - config.sink_frames,
             sink_frames=config.sink_frames,
-            kv_branches=(ARDiffusionKVBranchSpec(self._AR_BRANCH, 0),),
+            kv_branches=(ARDiffusionKVBranchSpec(self._AR_BRANCH, 0),)
+            + ((ARDiffusionKVBranchSpec(self._AR_PROPE_BRANCH, 1),) if config.use_prope else ()),
             session_capacity=2,
             cross_attention=(
                 ARDiffusionCrossAttentionKVSpec(
@@ -345,9 +353,9 @@ class SelfForcingPipeline(
                 logger.warning_once(
                     "Self-Forcing treats num_frames=1, the generic sampling default, as unset and generates its "
                     "%d-frame default; pass num_frames to choose the clip length.",
-                    SELF_FORCING_DEFAULT_NUM_FRAMES,
+                    self._default_num_frames,
                 )
-            num_frames = SELF_FORCING_DEFAULT_NUM_FRAMES
+            num_frames = self._default_num_frames
         temporal = self.vae_scale_factor_temporal
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or (num_frames - 1) % temporal:
             raise OmniClientError(f"num_frames must satisfy (num_frames - 1) % {temporal} == 0, got {num_frames!r}.")
@@ -366,7 +374,13 @@ class SelfForcingPipeline(
             num_latent_frames=num_latent_frames,
             output_type=getattr(sampling, "output_type", None) or "np",
             generator=generator,
+            cameras=self._parse_cameras(sampling, num_latent_frames),
         )
+
+    def _parse_cameras(self, sampling: OmniDiffusionSamplingParams, num_latent_frames: int) -> PRoPECameras | None:
+        """Camera transforms of the request's latent frames; Self-Forcing itself takes no camera."""
+        del sampling, num_latent_frames
+        return None
 
     def encode_prompt(
         self,
@@ -473,6 +487,38 @@ class SelfForcingPipeline(
             cross_attention=ar.cross_attention,
         )
 
+    def _run_transformer(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        prompt_embeds: torch.Tensor,
+        cache: LingBotTransformerCache | None,
+        ar: _ARBlockContext | None,
+        start_frame: int,
+        commit: bool,
+        cameras: PRoPECameras | None,
+        prope_cache: list[LingBotAttentionCache] | None,
+    ) -> torch.Tensor:
+        seq_len = self._block_tokens(latents)
+        camera_cache: list[LingBotAttentionCache] | list[ARDiffusionPagedLayerContext] | None = None
+        if cameras is not None:
+            camera_cache = (
+                prope_cache
+                if ar is None
+                else ar.state.get_kv_caches(self._AR_PROPE_BRANCH, seq_len=seq_len, commit_current=commit)
+            )
+        return self.transformer(
+            latents.to(dtype=self.transformer.dtype),
+            timestep,
+            prompt_embeds,
+            cache=self._block_cache(cache=cache, ar=ar, seq_len=seq_len, commit_current=commit),
+            start_frame=start_frame,
+            update_cache=commit,
+            prope_cache=camera_cache,
+            cameras=cameras,
+        )
+
     def _probe(
         self,
         latents: torch.Tensor,
@@ -482,19 +528,24 @@ class SelfForcingPipeline(
         ar: _ARBlockContext | None,
         start_frame: int,
         step_index: int,
+        cameras: PRoPECameras | None = None,
+        prope_cache: list[LingBotAttentionCache] | None = None,
     ) -> torch.Tensor:
         """Predict flow for one DMD step of the current block."""
         if not self.od_config.enforce_eager:
             torch.compiler.cudagraph_mark_step_begin()
         set_forward_context_denoise_step_idx(step_index)
         timestep = torch.full((1,), self._schedule[step_index][0], device=self.device, dtype=torch.float32)
-        return self.transformer(
-            latents.to(dtype=self.transformer.dtype),
+        return self._run_transformer(
+            latents,
             timestep,
-            prompt_embeds,
-            cache=self._block_cache(cache=cache, ar=ar, seq_len=self._block_tokens(latents), commit_current=False),
+            prompt_embeds=prompt_embeds,
+            cache=cache,
+            ar=ar,
             start_frame=start_frame,
-            update_cache=False,
+            commit=False,
+            cameras=cameras,
+            prope_cache=prope_cache,
         )
 
     def _transition(
@@ -521,23 +572,35 @@ class SelfForcingPipeline(
         cache: LingBotTransformerCache | None,
         ar: _ARBlockContext | None,
         start_frame: int,
+        cameras: PRoPECameras | None = None,
+        prope_cache: list[LingBotAttentionCache] | None = None,
     ) -> None:
         """Write the finished block's clean K/V with the ``t=0`` pass."""
         if not self.od_config.enforce_eager:
             torch.compiler.cudagraph_mark_step_begin()
-        self.transformer(
-            latents.to(dtype=self.transformer.dtype),
+        self._run_transformer(
+            latents,
             torch.zeros(1, device=self.device, dtype=torch.float32),
-            prompt_embeds,
-            cache=self._block_cache(cache=cache, ar=ar, seq_len=self._block_tokens(latents), commit_current=True),
+            prompt_embeds=prompt_embeds,
+            cache=cache,
+            ar=ar,
             start_frame=start_frame,
-            update_cache=True,
+            commit=True,
+            cameras=cameras,
+            prope_cache=prope_cache,
         )
         if ar is not None:
             ar.state.commit_paged_context(self._AR_BRANCH)
+            if cameras is not None:
+                ar.state.commit_paged_context(self._AR_PROPE_BRANCH)
 
     def _block_tokens(self, latents: torch.Tensor) -> int:
         return latents.shape[2] * self.transformer.tokens_per_frame(latents.shape[-2], latents.shape[-1])
+
+    def _block_cameras(self, inputs: _SelfForcingRequestInputs, start_frame: int) -> PRoPECameras | None:
+        if inputs.cameras is None:
+            return None
+        return inputs.cameras.frames(start_frame, start_frame + self.transformer.config.num_frames_per_block)
 
     def _generate_block(
         self,
@@ -549,6 +612,8 @@ class SelfForcingPipeline(
         start_frame: int,
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        cameras: PRoPECameras | None = None,
+        prope_cache: list[LingBotAttentionCache] | None = None,
     ) -> torch.Tensor:
         """Request mode: all DMD probes of one block, then its commit."""
         shape = (1, self.transformer.config.out_channels, self.transformer.config.num_frames_per_block, *latent_shape)
@@ -561,10 +626,20 @@ class SelfForcingPipeline(
                 ar=ar,
                 start_frame=start_frame,
                 step_index=step_index,
+                cameras=cameras,
+                prope_cache=prope_cache,
             )
             latents = self._transition(latents, flow, step_index, generator=generator)
             progress_bar.update()
-        self._commit(latents, prompt_embeds=prompt_embeds, cache=cache, ar=ar, start_frame=start_frame)
+        self._commit(
+            latents,
+            prompt_embeds=prompt_embeds,
+            cache=cache,
+            ar=ar,
+            start_frame=start_frame,
+            cameras=cameras,
+            prope_cache=prope_cache,
+        )
         return latents
 
     # ── request mode ──────────────────────────────────────────────────────
@@ -588,25 +663,35 @@ class SelfForcingPipeline(
         cache = self.transformer.allocate_cache(
             latent_height=latent_shape[0], latent_width=latent_shape[1], device=self.device, dtype=dtype
         )
+        prope_cache = (
+            None
+            if inputs.cameras is None
+            else self.transformer.allocate_prope_cache(
+                latent_height=latent_shape[0], latent_width=latent_shape[1], device=self.device, dtype=dtype
+            )
+        )
         block_frames = self.transformer.config.num_frames_per_block
         num_blocks = inputs.num_latent_frames // block_frames
         blocks: list[torch.Tensor] = []
         with self.progress_bar(total=num_blocks * len(self._schedule)) as progress_bar:
             for block_index in range(num_blocks):
+                start_frame = block_index * block_frames
                 blocks.append(
                     self._generate_block(
                         latent_shape=latent_shape,
                         prompt_embeds=prompt_embeds,
                         cache=cache,
                         ar=None,
-                        start_frame=block_index * block_frames,
+                        start_frame=start_frame,
                         generator=inputs.generator,
                         progress_bar=progress_bar,
+                        cameras=self._block_cameras(inputs, start_frame),
+                        prope_cache=prope_cache,
                     )
                 )
         latents = torch.cat(blocks, dim=2)
         # Release the request-local K/V before the decoder allocates.
-        del cache
+        del cache, prope_cache
         if inputs.output_type == "latent":
             output = latents
         else:
@@ -739,13 +824,15 @@ class SelfForcingPipeline(
         state = states[0]
         if state.latents is None:
             raise RuntimeError("Self-Forcing step execution requires prepared latents before denoise_step.")
+        start_frame = int(state.extra["start_frame"])
         return self._probe(
             state.latents,
             prompt_embeds=cast(torch.Tensor, state.prompt_embeds),
             cache=None,
             ar=self._step_block_context(state),
-            start_frame=int(state.extra["start_frame"]),
+            start_frame=start_frame,
             step_index=state.step_in_chunk,
+            cameras=self._block_cameras(state.extra["inputs"], start_frame),
         )
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
@@ -761,19 +848,21 @@ class SelfForcingPipeline(
         del kwargs
         if state.latents is None:
             raise RuntimeError("Self-Forcing step execution requires latents before post_decode.")
+        inputs: _SelfForcingRequestInputs = state.extra["inputs"]
+        start_frame = int(state.extra["start_frame"])
         self._commit(
             state.latents,
             prompt_embeds=cast(torch.Tensor, state.prompt_embeds),
             cache=None,
             ar=self._step_block_context(state),
-            start_frame=int(state.extra["start_frame"]),
+            start_frame=start_frame,
+            cameras=self._block_cameras(inputs, start_frame),
         )
         # The counters move with the commit, so the session's K/V and its chunk indices never disagree; a
         # decode failure below finishes the request, and the runner then releases the session.
         completed_chunk_index = state.chunk_index
         self._ar_sessions[state.request_id].next_chunk_index += 1
         state.chunk_index += 1
-        inputs: _SelfForcingRequestInputs = state.extra["inputs"]
         if inputs.output_type == "latent":
             payload: dict[str, Any] = {"latents": state.latents}
         else:

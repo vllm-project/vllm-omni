@@ -44,6 +44,7 @@ th {
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
 | `ABotWorldCausalPipeline` | ABot-World (experimental) | `acvlab/ABot-World-0-5B-LF` | Experimental | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ACVLab/ABot-World.md) |
 | `SelfForcingPipeline` | Self-Forcing (causal Wan2.1-T2V-1.3B, 4-step DMD) | `gdhe17/Self-Forcing` (assemble with `tools/prepare_self_forcing_checkpoint.py`) | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/gdhe17/Self-Forcing-A800.md) |
+| `MinWMAction2VPipeline` | minWM Wan2.1 Action2V (camera-controlled causal Wan2.1-T2V-1.3B, 4-step DMD) | `MIN-Lab/minWM` (`Wan21/Action2V/dmd`; assemble with `tools/prepare_self_forcing_checkpoint.py --release minwm-action2v`) | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MIN-Lab/minWM-Action2V-A800.md) |
 | `Cosmos3OmniDiffusersPipeline` | Cosmos3 T2I, T2V, I2V, V2V, T2V with sound, action policy | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `SanaWmPipeline` | SANA-WM | `BBBBruce/SANA-WM_bidirectional-stage1-diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-WM.md) |
 | `Wan22S2VPipeline` | Wan2.2-S2V | `Wan-AI/Wan2.2-S2V-14B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
