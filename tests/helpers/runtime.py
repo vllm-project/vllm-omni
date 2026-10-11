@@ -137,6 +137,10 @@ class OmniServerParams(NamedTuple):
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
     startup_timeout: int = SERVER_STARTUP_TIMEOUT_S
+    # Capture the server's own stdout/stderr to a temp file so a test can assert on
+    # server-side log lines. Off by default: the subprocess otherwise inherits the
+    # test process's descriptors.
+    log_capture: bool = False
 
 
 class OmniServer:
@@ -151,8 +155,15 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
+        log_capture: bool = False,
     ) -> None:
         cleanup_test_environment()
+        self.log_path: Path | None = None
+        self._log_file: Any = None
+        if log_capture:
+            handle, path = tempfile.mkstemp(prefix="omni_server_", suffix=".log")
+            self._log_file = os.fdopen(handle, "w", buffering=1)
+            self.log_path = Path(path)
         self.startup_timeout = startup_timeout
         self.model = model
         self.serve_args = list(serve_args)
@@ -234,6 +245,8 @@ class OmniServer:
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT if self._log_file is not None else None,
         )
 
         max_wait = self.startup_timeout
@@ -407,6 +420,23 @@ class OmniServer:
             raise
         return self
 
+    def _close_capture_log(self) -> None:
+        """Flush and close the capture file, if this server owns one."""
+        log_file = getattr(self, "_log_file", None)
+        if log_file is not None:
+            try:
+                log_file.close()
+            finally:
+                self._log_file = None
+
+    def read_captured_log(self) -> str:
+        """Return everything the server has written so far (empty without capture)."""
+        if self.log_path is None or not self.log_path.exists():
+            return ""
+        if self._log_file is not None:
+            self._log_file.flush()
+        return self.log_path.read_text(encoding="utf-8", errors="replace")
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if self.proc:
@@ -415,6 +445,7 @@ class OmniServer:
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
+            self._close_capture_log()
             cleanup_test_environment()
 
 
@@ -1089,6 +1120,7 @@ def iter_omni_server(
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
                     startup_timeout=params.startup_timeout,
+                    log_capture=params.log_capture,
                 )
                 if port
                 else OmniServer(
@@ -1097,6 +1129,7 @@ def iter_omni_server(
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
                     startup_timeout=params.startup_timeout,
+                    log_capture=params.log_capture,
                 )
             ) as server:
                 if model != original_model:

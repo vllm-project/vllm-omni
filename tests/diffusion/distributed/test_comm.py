@@ -515,3 +515,75 @@ def test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu(world_size: int) ->
         nprocs=world_size,
         device_kind="cpu",
     )
+
+
+def _run_registered_exchange_backend(
+    local_rank: int,
+    world_size: int,
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    """A registered transport must be used, and must never silently fall back to stock."""
+
+    from vllm_omni.diffusion.distributed.comm import all_to_all_4D, register_seq_all_to_all_backend
+
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
+    _init_worker(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(ulysses_degree=world_size)
+    sp_group = get_sp_group().ulysses_group
+
+    batch, seq_per_rank, heads, head_size = 1, 8, 4 * world_size, 16
+    torch.manual_seed(7 + local_rank)
+    x = torch.randn(batch, seq_per_rank, heads, head_size, dtype=torch.float32, device=device)
+
+    try:
+        # Nothing registered: the stock exchange.
+        register_seq_all_to_all_backend()
+        stock = all_to_all_4D(x, 2, 1, group=sp_group)
+
+        # A registered exchange is called and its result reaches the caller. The backend
+        # returns a constant, so the layout transforms around it can only preserve it.
+        calls: list[tuple[int, ...]] = []
+
+        def constant_exchange(input_t, group):
+            calls.append(tuple(input_t.shape))
+            return torch.full_like(input_t, 7.0)
+
+        register_seq_all_to_all_backend(exchange=constant_exchange)
+        registered = all_to_all_4D(x, 2, 1, group=sp_group)
+        assert calls, "the registered exchange was not called"
+        assert torch.equal(registered, torch.full_like(stock, 7.0)), "the registered result was discarded"
+
+        # A whole-call override wins; returning None falls through to the stock path.
+        sentinel = torch.full_like(stock, 3.0)
+        register_seq_all_to_all_backend(fused_4d=lambda *args: sentinel)
+        assert all_to_all_4D(x, 2, 1, group=sp_group) is sentinel
+
+        register_seq_all_to_all_backend(fused_4d=lambda *args: None)
+        assert torch.equal(all_to_all_4D(x, 2, 1, group=sp_group), stock)
+
+        # A failing transport must raise. Swallowing it into a bf16 exchange is how an
+        # optimisation silently stops being exercised while every test still passes.
+        def broken(input_t, group):
+            raise RuntimeError("registered transport failed")
+
+        register_seq_all_to_all_backend(exchange=broken)
+        with pytest.raises(RuntimeError, match="registered transport failed"):
+            all_to_all_4D(x, 2, 1, group=sp_group)
+    finally:
+        register_seq_all_to_all_backend()
+        destroy_distributed_env()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_registered_exchange_backend_is_used_and_never_silently_falls_back(world_size: int) -> None:
+    torch.multiprocessing.spawn(
+        _run_registered_exchange_backend,
+        args=(world_size, "cpu", 29631),
+        nprocs=world_size,
+    )

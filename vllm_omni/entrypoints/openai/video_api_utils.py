@@ -801,6 +801,7 @@ def _encode_prepared_video_bytes_legacy(
     fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
+    video_codec: str = "h264",
     video_codec_options: dict[str, str] | None = None,
 ) -> bytes:
     """Encode validated frames through the compatibility path used before planar encoding."""
@@ -812,8 +813,29 @@ def _encode_prepared_video_bytes_legacy(
         audio_np,
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
+        video_codec=video_codec,
         video_codec_options=video_codec_options,
     )
+
+
+def resolve_video_encoding_request(extra_params: Any) -> tuple[str, dict[str, Any]]:
+    """Resolve a request's video encoder choice from ``extra_params``.
+
+    The libx264 default with unbounded threads is the largest host-side cost of serving
+    video, and images that ship h264_nvenc / av1_nvenc should be able to use them, so a
+    request may name both the codec and its options.
+
+    Returns:
+        ``(video_codec, video_codec_options)`` ready for the encoder helpers.
+    """
+    video_codec = "h264"
+    video_codec_options: dict[str, Any] = {"preset": "ultrafast", "threads": "0"}
+    if isinstance(extra_params, dict):
+        if extra_params.get("video_codec") is not None:
+            video_codec = str(extra_params["video_codec"])
+        if "video_codec_options" in extra_params:
+            video_codec_options = extra_params["video_codec_options"]
+    return video_codec, video_codec_options
 
 
 def _encode_video_bytes_legacy(
@@ -821,6 +843,7 @@ def _encode_video_bytes_legacy(
     fps: int,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
+    video_codec: str = "h264",
     video_codec_options: dict[str, str] | None = None,
 ) -> bytes:
     """Encode through the compatibility path used before planar encoding."""
@@ -832,6 +855,7 @@ def _encode_video_bytes_legacy(
         fps,
         audio=audio,
         audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
+        video_codec=video_codec,
         video_codec_options=video_codec_options,
     )
 
@@ -841,6 +865,7 @@ def _encode_video_bytes(
     fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
+    video_codec: str = "h264",
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
     enable_borrowed_frames: bool = False,
@@ -877,6 +902,7 @@ def _encode_video_bytes(
             audio_waveform=audio_np,
             fps=float(fps),
             audio_sample_rate=effective_audio_sample_rate,
+            video_codec=video_codec,
             video_codec_options=video_codec_options,
         )
     fallback_reason = _direct_planar_fallback_reason(
@@ -904,6 +930,7 @@ def _encode_video_bytes(
             fps,
             audio=audio,
             audio_sample_rate=effective_audio_sample_rate,
+            video_codec=video_codec,
             video_codec_options=video_codec_options,
         )
 
@@ -929,6 +956,7 @@ def _encode_video_bytes(
             audio_waveform=audio_np,
             fps=float(fps),
             audio_sample_rate=effective_audio_sample_rate,
+            video_codec=video_codec,
             video_codec_options=video_codec_options,
         )
     finally:
@@ -991,6 +1019,7 @@ def encode_video_base64(
     fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
+    video_codec: str = "h264",
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
     enable_borrowed_frames: bool = False,
@@ -1001,6 +1030,7 @@ def encode_video_base64(
         fps=fps,
         audio=audio,
         audio_sample_rate=audio_sample_rate,
+        video_codec=video_codec,
         video_codec_options=video_codec_options,
         frame_converter=frame_converter,
         **({"enable_borrowed_frames": True} if enable_borrowed_frames else {}),

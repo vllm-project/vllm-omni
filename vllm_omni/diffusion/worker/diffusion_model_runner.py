@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import os
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -264,6 +265,26 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         try:
+            # [experiment] opt-in torch.compile mode, e.g. OMNI_COMPILE_MODE=reduce-overhead
+            # enables CUDA graph trees (the default is inductor's plain default mode).
+            _omni_mode = os.environ.get("OMNI_COMPILE_MODE") or None
+            _omni_mode_kw = {"mode": _omni_mode} if _omni_mode else {}
+
+            # [experiment] OMNI_CUDAGRAPH_TREES=0 -> plain per-region cudagraphs (no tree tracking)
+            _omni_trees = os.environ.get("OMNI_CUDAGRAPH_TREES")
+            if _omni_trees is not None:
+                try:
+                    import torch._inductor.config as _omni_ic
+
+                    _omni_ic.triton.cudagraph_trees = _omni_trees == "1"
+                    logger.info(
+                        "Model runner: inductor triton.cudagraph_trees=%s (OMNI_CUDAGRAPH_TREES=%s)",
+                        _omni_ic.triton.cudagraph_trees,
+                        _omni_trees,
+                    )
+                except Exception as _omni_exc:  # pragma: no cover - config probe
+                    logger.warning("Model runner: cudagraph_trees override failed: %s", _omni_exc)
+            compile_kwargs.update(_omni_mode_kw)
             if compile_granularity == "full":
                 model.compile(**compile_kwargs)
                 compiled_model = model

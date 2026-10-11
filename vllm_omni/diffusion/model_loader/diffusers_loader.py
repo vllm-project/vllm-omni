@@ -5,13 +5,13 @@ import dataclasses
 import glob
 import json
 import os
-import re
 import time
 from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
 import huggingface_hub
+import regex as re
 import torch
 from torch import nn
 from vllm.config.load import LoadConfig
@@ -64,6 +64,29 @@ from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
+
+
+def _h3_prequant_manifest_keys() -> set[str]:
+    """Names the MiniMax-H3 pre-quantised loader released at construction.
+
+    H3_MX_PREQUANT stashes the stored e4m3 values and zero-sizes the wide bf16 projections, then
+    rebuilds each one as an Mxfp8Linear, so those names never reach a weight_loader and look
+    unloaded to the completeness check. Only active for that explicit env.
+    """
+    if os.environ.get("H3_MX_PREQUANT") != "1":
+        return set()
+    path = os.environ.get("H3_MX_PREQUANT_MANIFEST")
+    if not path:
+        return set()
+    try:
+        with open(path) as fh:
+            manifest = json.load(fh)
+    except Exception:
+        return set()
+    keys = manifest.get("quantized") if isinstance(manifest, dict) else manifest
+    if not isinstance(keys, (list, tuple, set)):
+        return set()
+    return {str(k) for k in keys}
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -1164,7 +1187,22 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             }
             weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
-                self._check_unloaded_weights(weights_not_loaded)
+                # The MiniMax-H3 pre-quantised path releases the wide
+                # bf16 projections at construction and rebuilds each as an Mxfp8Linear from the
+                # stored e4m3 values, so those names never reach a weight_loader. They are not
+                # missing weights -- exempt exactly the manifest keys.
+                released = _h3_prequant_manifest_keys()
+                if released:
+                    exempt = {name for name in weights_not_loaded if any(name.endswith(key) for key in released)}
+                    if exempt:
+                        logger.info(
+                            "MiniMax-H3 pre-quantised path: %d released wide weights are rebuilt as "
+                            "Mxfp8Linear and are exempt from the unloaded-weight check",
+                            len(exempt),
+                        )
+                        weights_not_loaded = weights_not_loaded - exempt
+                if weights_not_loaded:
+                    self._check_unloaded_weights(weights_not_loaded)
             if weights_scale_not_loaded:
                 logger.warning(
                     f"Following weight_scale weights were not initialized from checkpoint: {weights_scale_not_loaded}"

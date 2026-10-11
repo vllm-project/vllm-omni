@@ -38,6 +38,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
+    resolve_video_encoding_request,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import count_video_frames
@@ -553,10 +554,7 @@ class OmniOpenAIServingVideo:
             latent_edit_input=latent_edit_input,
         )
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
+        video_codec, video_codec_options = resolve_video_encoding_request(request.extra_params)
 
         encoding_options = self._video_encoding_options()
 
@@ -568,6 +566,7 @@ class OmniOpenAIServingVideo:
                 fps=artifacts.output_fps,
                 audio=artifacts.audios[idx],
                 audio_sample_rate=artifacts.audio_sample_rate,
+                video_codec=video_codec,
                 video_codec_options=video_codec_options,
                 frame_converter=self._video_frame_converter,
                 **encoding_options,
@@ -619,10 +618,7 @@ class OmniOpenAIServingVideo:
             )
         audio = artifacts.audios[0]
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
+        video_codec, video_codec_options = resolve_video_encoding_request(request.extra_params)
 
         action = artifacts.actions[0]
         video_metadata = _video_metadata_from_artifacts(artifacts)
@@ -648,6 +644,7 @@ class OmniOpenAIServingVideo:
         video_bytes = _encode_video_bytes(
             artifacts.videos[0],
             fps=artifacts.output_fps,
+            video_codec=video_codec,
             video_codec_options=video_codec_options,
             frame_converter=self._video_frame_converter,
             **encoding_options,
