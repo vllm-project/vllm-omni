@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.model_local_kv import collect_model_local_k
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device
+from vllm_omni.worker import gpu_talker_multiframe
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1424,12 +1425,40 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
                 if getattr(self.model, "requires_request_sample_eligibility", False):
+                    # One request lookup per row; every list below is in
+                    # input_batch order, like request_token_spans.
+                    reqs = [self.requests.get(req_id) for req_id in self.input_batch.req_ids]
                     model_kwargs_extra["request_sample_eligible"] = [
-                        bool(
-                            (req := self.requests.get(req_id)) is not None
-                            and int(req.num_computed_tokens) + int(nstp[req_index]) >= int(req.num_tokens)
+                        req is not None and req.num_computed_tokens + int(num_scheduled) >= req.num_tokens
+                        for req, num_scheduled in zip(reqs, nstp)
+                    ]
+                    # Effective per-request sampling params (stage defaults
+                    # merged with request overrides), so the in-model K-step
+                    # codec sampler keeps the single-frame sampling contract.
+                    model_kwargs_extra["request_sampling_params"] = [
+                        req.sampling_params if req is not None else None for req in reqs
+                    ]
+                    # Remaining output budget, so the in-model K-step codec
+                    # loop stops emitting frames where the engine stops
+                    # accepting tokens (the connector would otherwise still
+                    # concatenate every emitted frame). Folds in both engine
+                    # length stops (v1/core/sched/utils.py): max_tokens minus
+                    # the tokens already emitted, and max_model_len minus
+                    # num_tokens. None (no max_tokens) leaves the stage-resolved
+                    # codec budget in charge. CachedRequestState has no
+                    # num_output_tokens (that is the scheduler-side Request);
+                    # the emitted count is len(output_token_ids).
+                    model_kwargs_extra["request_max_tokens_remaining"] = [
+                        None
+                        if req is None or req.sampling_params is None or req.sampling_params.max_tokens is None
+                        else max(
+                            min(
+                                int(req.sampling_params.max_tokens) - len(req.output_token_ids),
+                                self.max_model_len - req.num_tokens,
+                            ),
+                            0,
                         )
-                        for req_index, req_id in enumerate(self.input_batch.req_ids)
+                        for req in reqs
                     ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
@@ -2140,19 +2169,22 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 req_ids=self.input_batch.req_ids,
             )
 
-        try:
-            model_output = super()._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-                **model_kwargs_extra,
-            )
-        finally:
-            finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
-            if callable(finish_decode_step):
-                finish_decode_step()
+        def run_model():
+            try:
+                return super(OmniGPUModelRunner, self)._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                    **model_kwargs_extra,
+                )
+            finally:
+                finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
+                if callable(finish_decode_step):
+                    finish_decode_step()
+
+        model_output = run_model()
         # CUDAGraphWrapper's weak_ref_tensors preserves the fields but turns
         # NamedTuple outputs into plain tuples. Restore the Omni envelope
         # before a model adapter or extraction discards its multimodal fields.
@@ -2165,6 +2197,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             model_output = OmniOutput(*model_output)
         if not isinstance(model_output, (OmniOutput, IntermediateTensors)) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+        # MiniCPM-o Talker K-frame step (a no-op for every other step): replays
+        # the forward once per extra frame and stashes the step's sampled ids.
+        model_output = gpu_talker_multiframe.maybe_run(
+            self,
+            model_output,
+            run_model=run_model,
+            inputs_embeds=inputs_embeds,
+            model_kwargs_extra=model_kwargs_extra,
+        )
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output

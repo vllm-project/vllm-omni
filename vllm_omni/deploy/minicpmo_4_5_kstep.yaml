@@ -1,0 +1,28 @@
+# MiniCPM-o 4.5 with the Talker's multi-frame (K-step) decode on CUDA: stage 1
+# produces up to 8 codec frames per engine step (worker/gpu_talker_multiframe.py;
+# design from PR #7929). Opt-in: the base minicpmo_4_5.yaml keeps one frame per
+# step on CUDA until the parity and throughput runs in VALIDATION_talker.md pass
+# on the target GPU. Everything else is inherited from the base.
+#
+# The CUDA path keeps the single-frame contract -- codec head, codec EOS as the
+# stop id, vLLM's sampler per frame -- so unlike the NPU block it adds no
+# stop_token_ids and leaves the Stage-1 -> Stage-2 chunking untouched.
+base_config: minicpmo_4_5.yaml
+pipeline: minicpmo_4_5
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        kv_cache_memory_bytes: 4294967296  # 4 GiB, as in the base
+        # K = num_speculative_tokens + 1 frames per step. The drafts carry no
+        # prediction: they only make the scheduler reserve K positions.
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+        async_scheduling: false
+        # The default FULL_AND_PIECEWISE mode captures the K-wide uniform
+        # decode as a FULL graph (replayed once per frame); prefill, mixed and
+        # one-frame steps run PIECEWISE.
