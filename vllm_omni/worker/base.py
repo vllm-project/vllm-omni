@@ -117,12 +117,11 @@ class OmniGPUWorkerBase(GPUWorker):
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. profiled_usage = weights + peak_activation + non_torch_increase
-               (measured by ``memory_profiling`` around ``profile_run()``;
-               ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time)
+            2. Use upstream's authoritative non_kv_cache_memory from memory_profiling,
+               which includes weights, peak activation, non-torch allocations, and
+               transient peak headroom (see vllm-project/vllm#49208).
 
-            3. available_kv_cache = requested_memory - profiled_usage
+            3. available_kv_cache = requested_memory - non_kv_cache_memory
 
         Note:
             Process-scoped NVML estimation was removed in favour of the
@@ -153,18 +152,17 @@ class OmniGPUWorkerBase(GPUWorker):
         # true here). Mirror upstream so the omni override keeps it populated.
         self.total_consumed = profile_result.total_consumed
 
-        profiled_usage = (
-            int(self.model_runner.model_memory_usage)
-            + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
-        )
-        self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
+        # Use upstream's authoritative non_kv_cache_memory result instead of
+        # reconstructing the legacy formula. This matches the behavior of
+        # upstream GPUWorker and the diffusion worker's KV cache sizing.
+        # See vllm-project/vllm#49208 and issue #7839.
+        self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profile_result.non_kv_cache_memory)
         logger.debug(
-            "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
+            "Profiling KV budget (PID %d, GPU %d): requested=%s, non_kv=%s, available=%s",
             os.getpid(),
             self.local_rank,
             format_gib(self.requested_memory),
-            format_gib(profiled_usage),
+            format_gib(profile_result.non_kv_cache_memory),
             format_gib(self.available_kv_cache_memory_bytes),
         )
         logger.info_once(

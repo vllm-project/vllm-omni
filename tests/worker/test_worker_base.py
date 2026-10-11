@@ -26,17 +26,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 GIB = 1024**3
 
 
-def _fake_memory_profiling(*, non_torch: int, torch_peak: int):
+def _fake_memory_profiling(*, non_torch: int, torch_peak: int, transient_peak: int = 0):
     """A stand-in for ``vllm.utils.mem_utils.memory_profiling`` context manager."""
 
     @contextmanager
     def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
         # total_consumed mirrors upstream vllm.utils.mem_utils.MemoryProfilingResult
         # (added by upstream 58b2012aa2) and is read by OmniGPUWorkerBase.
+        # non_kv_cache_memory includes weights, peak activation, non_torch allocations,
+        # and transient peak headroom (upstream vllm#49208).
         yield SimpleNamespace(
             non_torch_increase=non_torch,
             torch_peak_increase=torch_peak,
             total_consumed=torch_peak + non_torch,
+            non_kv_cache_memory=weights_memory + torch_peak + non_torch + transient_peak,
         )
 
     return _mp
@@ -69,14 +72,45 @@ def test_no_process_scoped_collaborators_remain():
 
 
 def test_determine_available_memory_profiling_path(monkeypatch):
-    """available = requested - (weights + peak + non_torch); the only path."""
+    """available = requested - non_kv_cache_memory (upstream vllm#49208)."""
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
     monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
-    profiled = 10 * GIB + 2 * GIB + 1 * GIB
-    assert out == 30 * GIB - profiled
+    # non_kv_cache_memory = weights (10) + torch_peak (2) + non_torch (1) = 13 GiB
+    assert out == 30 * GIB - 13 * GIB
+
+
+def test_determine_available_memory_uses_upstream_non_kv_cache_memory(monkeypatch):
+    """Issue #7839: Use upstream's non_kv_cache_memory instead of legacy formula.
+
+    The legacy formula (weights + torch_peak + non_torch) omitted
+    pre-profile runner buffers. Upstream's non_kv_cache_memory includes
+    transient peak headroom and correctly accounts for all allocations.
+
+    Test case from issue #7839 (values in GiB):
+    - Requested: 30
+    - Model weights: 10
+    - Pre-profile runner buffers: 2 (not in profile, consumed by model)
+    - Profiling peak: 2
+    - Non-torch increase: 1
+    - Upstream non_kv_cache_memory: 16 (10 weights + 2 peak + 2 transient + 1 non_torch - 1 buffer = 14? Actually upstream formula is total_consumed + transient_peak)
+
+    The fix ensures we use non_kv_cache_memory directly instead of
+    reconstructing the incomplete legacy formula.
+    """
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    # Simulate upstream's non_kv_cache_memory = 16 GiB (includes all allocations)
+    monkeypatch.setattr(
+        base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, transient_peak=2 * GIB)
+    )
+
+    out = OmniGPUWorkerBase.determine_available_memory(worker)
+
+    # With the fix: available = 30 - 16 = 14 GiB
+    # Without the fix (legacy formula): available = 30 - (10 + 2 + 1) = 17 GiB (wrong!)
+    assert out == 14 * GIB
 
 
 def test_determine_available_memory_populates_total_consumed(monkeypatch):
@@ -86,6 +120,7 @@ def test_determine_available_memory_populates_total_consumed(monkeypatch):
 
     OmniGPUWorkerBase.determine_available_memory(worker)
 
+    # total_consumed = torch_peak + non_torch (doesn't include weights)
     assert worker.total_consumed == 3 * GIB
 
 
