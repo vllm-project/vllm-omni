@@ -39,6 +39,7 @@ import torch
 ACTION_DIM = 32
 ACTION_HORIZON = 50
 MAX_TOKEN_LEN = 200
+MAX_CAMERAS = 3
 NUM_STEPS = 10
 
 
@@ -73,10 +74,15 @@ def build_model(checkpoint_dir: str, deploy_config: str, dtype: str, enforce_eag
 
 def make_inputs(batch_size: int, num_views: int, device: str, seed: int = 0):
     """Synthetic but deterministic inputs, shaped exactly as the pipeline feeds
-    them: one (B, 3, 224, 224) tensor per camera plus a padded token block."""
+    them: one (B, 3, 224, 224) tensor per camera slot plus a padded token block.
+    Slots past ``num_views`` are padded as ``Pi05Processor`` pads a missing
+    camera: an all -1 image with a false mask."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     images = [torch.rand(batch_size, 3, 224, 224, generator=g).to(device) * 2 - 1 for _ in range(num_views)]
     image_masks = [torch.ones(batch_size, dtype=torch.bool, device=device) for _ in range(num_views)]
+    for _ in range(num_views, MAX_CAMERAS):
+        images.append(torch.full((batch_size, 3, 224, 224), -1.0, device=device))
+        image_masks.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
     # π0.5 pads the prompt (task text + discretized state) to 200 tokens.
     lang_tokens = torch.randint(0, 1000, (batch_size, MAX_TOKEN_LEN), generator=g).to(device)
     lang_masks = torch.ones(batch_size, MAX_TOKEN_LEN, dtype=torch.bool, device=device)
