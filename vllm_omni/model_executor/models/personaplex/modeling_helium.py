@@ -104,6 +104,18 @@ class HeliumMLP(nn.Module):
         return x
 
 
+def moshi_attention_window(context: int) -> int:
+    """How many keys, counting its own, a Moshi streaming query attends to.
+
+    Moshi's ``RingKVCache`` holds ``context`` cells but labels the oldest as the
+    next write position, so once it wraps a query attends to the last
+    ``context - 1`` keys (``personaplex_temporal._ringkv_positions`` keeps the
+    same convention). vLLM's sliding window counts the query too, so this is
+    the window that matches Moshi at every position.
+    """
+    return context - 1
+
+
 def _get_helium_rope(config: HeliumConfig):
     rope_kwargs = {
         "head_size": config.head_dim,
@@ -178,7 +190,7 @@ class HeliumAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
-            per_layer_sliding_window=config.sliding_window,
+            per_layer_sliding_window=moshi_attention_window(config.sliding_window),
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
