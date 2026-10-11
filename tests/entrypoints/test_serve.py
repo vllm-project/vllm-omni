@@ -107,6 +107,13 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     return parser.parse_args(argv)
 
 
+def test_serve_parser_accepts_cost_aware_load_balancing() -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--omni-lb-policy", "cost-aware"])
+
+    assert args.omni_lb_policy == "cost-aware"
+    assert args.get_explicit_kwargs_dict()["omni_lb_policy"] == "cost-aware"
+
+
 def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) -> None:
     """The CLI alias must not reach the strict diffusion config validator."""
     parser = TrackingArgumentParser()
