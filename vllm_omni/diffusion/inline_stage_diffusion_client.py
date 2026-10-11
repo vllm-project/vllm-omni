@@ -14,7 +14,6 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -255,10 +254,8 @@ class InlineStageDiffusionClient(StageClientBase):
             profile_prefix = args[1] if len(args) > 1 else None
             if is_start and profile_prefix is None:
                 profile_prefix = f"stage_{self.stage_id}_rep_{self.replica_id}_diffusion_{int(time.time())}"
-            return await loop.run_in_executor(
-                self._executor,
-                partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})),
-            )
+            # Not run_in_executor: the profiler must start on the busy-loop thread.
+            return await self._engine.async_profile(is_start, profile_prefix, **(kwargs or {}))
 
         kwargs = kwargs or {}
 
