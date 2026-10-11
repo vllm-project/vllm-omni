@@ -206,7 +206,7 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
 
     completed.status = RequestStatus.WAITING_FOR_CHUNK
     scheduler._pending_finish_reqs = []
-    scheduler._requeue_completed_native_chunks()
+    scheduler._requeue_completed_generation_chunks()
     assert completed.status == RequestStatus.WAITING_FOR_CHUNK
     assert completed.num_computed_tokens == 2
     assert not scheduler.running
@@ -318,6 +318,7 @@ def test_first_chunk_express_slack_guard_tracks_emitted_audio(monkeypatch):
     # Started, but no chunk to decode now: never blocks an express step.
     idle = SimpleNamespace(request_id="idle", num_in_flight_tokens=0, prompt_token_ids=[0] * 28, num_computed_tokens=28)
     scheduler.running = [ready, idle]
+    scheduler.kv_holding_waiting = []
     scheduler.waiting = []
     clock = [100.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])

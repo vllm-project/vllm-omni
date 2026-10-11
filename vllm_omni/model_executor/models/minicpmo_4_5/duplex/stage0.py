@@ -384,6 +384,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         epoch: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
+        close_turn: bool = False,
         final: bool = False,
         stage0_window: dict[str, object] | None = None,
         stage0_reanchor: dict[str, object] | None = None,
@@ -501,6 +502,17 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # the closure; the model's listen/speak policy depends on
                 # seeing its own past decisions in context.
                 pending_terminator = state.pending_terminator_token
+                if close_turn and units_built == 0 and pending_terminator is not None and not state.current_turn_ended:
+                    # A cancelled response ends the model's turn where it stands:
+                    # the unit closes on <|turn_eos|> in place of the sampled
+                    # terminator (same length, so the scheduler reserve holds),
+                    # and the model listens until new speech, as after a turn it
+                    # ended itself. The conversation stays in this request's KV.
+                    pending_terminator = self.turn_eos_token_id
+                    state.current_turn_ended = True
+                    state.last_terminator_token = self.turn_eos_token_id
+                    state.pending_speech_context = False
+                    state.pending_speech_response_open = False
                 closure_token_ids: list[int] = []
                 if pending_terminator is not None and units_built == 0:
                     state.pending_terminator_token = None

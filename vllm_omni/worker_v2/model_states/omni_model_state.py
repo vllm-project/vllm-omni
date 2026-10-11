@@ -464,6 +464,17 @@ class OmniModelState(DefaultModelState):
             # FA3's captured GQA layout must match the runtime AOT schedule.
             # Keep explicit bounds (e.g. varlen decode) and runtime metadata.
             input_batch = replace(input_batch, max_query_len=input_batch.num_tokens)
+        elif (
+            not for_capture
+            and cudagraph_mode == CUDAGraphMode.FULL
+            and not self.vllm_config.compilation_config.cudagraph_mode.separate_routine()
+        ):
+            # Replaying such a graph: rebuild the attention metadata with the
+            # same bucket-wide query bound used at capture. FA3 derives its
+            # causal flag and tile schedule from max_seqlen_q, so a decode-only
+            # replay (true max 1) would otherwise feed the captured kernel a
+            # schedule built for a different launch.
+            input_batch = replace(input_batch, max_query_len=input_batch.num_tokens_after_padding)
         return super().prepare_attn(
             input_batch,
             cudagraph_mode,

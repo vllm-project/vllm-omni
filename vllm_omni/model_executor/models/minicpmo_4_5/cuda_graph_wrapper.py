@@ -138,6 +138,10 @@ class HiFTGraphWrapper:
         self.static_phase_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.static_cache_source_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.static_cache_source_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
+        # Replays are serial and return owned speech/source tensors. Copy the
+        # graph-private outputs here before releasing their references, so
+        # hundreds of exact graphs can reuse the same pool's temporary storage.
+        self._output_arenas: list[torch.Tensor | None] = [None, None, None]
         parameter = next(token2wav.hift.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
@@ -174,14 +178,20 @@ class HiFTGraphWrapper:
         return list(dict.fromkeys(s for s in shapes if s[0] > 0 and s not in self._legit_shapes))
 
     def capture(self):
-        for batch_size in self.capture_batch_sizes:
-            for mel_frames, source_cache_len in zip(
-                self.capture_bucket_size,
-                self.capture_source_cache_len,
-                strict=True,
-            ):
-                self._capture(batch_size, mel_frames, source_cache_len)
-        self.capture_exact()
+        keys = {(b, *shape) for b in self.capture_batch_sizes for shape in self._legit_shapes}
+        keys.update(self._exact_keys)
+        before, started, memory_before = len(self.graph), time.perf_counter(), _memory_snapshot(self.device)
+        # Prime arena capacity first, preserving each graph's exact contiguous
+        # layout. A later lazy growth leaves old views alive in the dictionaries.
+        for key in sorted(keys, key=lambda key: (key[0] * key[1], key[1], key[0], key[2]), reverse=True):
+            # ``_capture`` primes the cached ISTFT/cuFFT plans for every row count.
+            self._capture(*key)
+        logger.info(
+            "Captured %d HiFT CUDA Graphs in %.1f s%s",
+            len(self.graph) - before,
+            time.perf_counter() - started,
+            _format_memory_delta(memory_before, _memory_snapshot(self.device)),
+        )
 
     def capture_exact(self) -> int:
         """Capture the exact-shape graphs (``derive_exact_shapes``); returns how many are new."""
@@ -196,6 +206,16 @@ class HiFTGraphWrapper:
                 _format_memory_delta(memory_before, _memory_snapshot(self.device)),
             )
         return len(self.graph) - before
+
+    def _output_views(self, outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> list[torch.Tensor]:
+        views = []
+        for index, output in enumerate(outputs):
+            arena = self._output_arenas[index]
+            if arena is None or arena.numel() < output.numel():
+                arena = torch.empty(output.numel(), dtype=output.dtype, device=output.device)
+                self._output_arenas[index] = arena
+            views.append(arena[: output.numel()].view(output.shape))
+        return views
 
     def _capture(
         self,
@@ -220,22 +240,26 @@ class HiFTGraphWrapper:
             for _ in range(3):
                 warmup_outputs = self.graph_fn(static_mel, static_source_cache)
         current_stream.wait_stream(warmup_stream)
+        output_views = self._output_views(warmup_outputs)
         del warmup_outputs
 
         graph = CUDAGraph()
         with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-            static_magnitude_output, static_phase_output, static_cache_source_output = self.graph_fn(
-                static_mel,
-                static_source_cache,
-            )
+            outputs = self.graph_fn(static_mel, static_source_cache)
+            for view, output in zip(output_views, outputs, strict=True):
+                view.copy_(output)
+        # Retaining these graph-private tensors pins one output allocation per
+        # graph. Their copies are now in externally owned, reusable arenas.
+        del outputs, view, output
 
         self.graph[key] = graph
         self.static_speech_inputs[key] = static_mel
         self.static_cache_source_inputs[key] = static_source_cache
 
-        self.static_magnitude_outputs[key] = static_magnitude_output
-        self.static_phase_outputs[key] = static_phase_output
-        self.static_cache_source_outputs[key] = static_cache_source_output
+        self.static_magnitude_outputs[key], self.static_phase_outputs[key], self.static_cache_source_outputs[key] = (
+            output_views
+        )
+        static_magnitude_output, static_phase_output = output_views[0], output_views[1]
         # The cached ISTFT still synchronizes the first time it sees a frame
         # count: once for the envelope check, and once inside cuFFT while it
         # builds the plan for that length. Do both here, off the request path,
@@ -437,6 +461,8 @@ def _build_capture_mask(
     # ``offset_cap`` columns of cache follow the query block; the ones past the
     # request's own ``offset`` are ``_capture_offset`` padding and stay False.
     offset_cap = offset if offset_cap is None else int(offset_cap)
+    if offset_cap < offset:
+        raise ValueError("CFM capture cache capacity is smaller than its valid offset")
     mask = torch.zeros(
         2 * int(batch_size),
         query_cap,
@@ -1085,6 +1111,7 @@ class WholeEulerCFMGraphWrapper:
         modulation_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
         att_slots: int = 0,
         row_offsets: bool = False,
+        capture_warmup_iterations: int = 3,
     ) -> None:
         """``ragged_body(estimator, input, t_emb, mask, cnn, att, cnn_out, att_out, lengths)``
         replaces ``estimator.blocks_forward_chunk`` in the captured solve when
@@ -1109,6 +1136,9 @@ class WholeEulerCFMGraphWrapper:
         self.inference_cfg_rate = float(inference_cfg_rate)
         self.att_cache_dtype = att_cache_dtype
         self.max_graphs = int(max_graphs)
+        self.capture_warmup_iterations = int(capture_warmup_iterations)
+        if self.capture_warmup_iterations < 1:
+            raise ValueError("Whole-Euler capture requires at least one warmup iteration")
         # The capture widths, narrowest first (``_capture_query_width``); the widest sizes the arena.
         if isinstance(query_bucket_frames, (tuple, list)):
             self.query_widths = tuple(sorted({int(w) for w in query_bucket_frames if int(w) > 1}))
@@ -1417,7 +1447,7 @@ class WholeEulerCFMGraphWrapper:
         if self.att_slots:
             # Streaming chunks run from the slot pool; the arena only holds
             # what reaches it (the prompt solve or fallback), not a steady batch.
-            capacity, rows = max(capacity, offset + query_cap), max(rows, graph_batch)
+            capacity, rows = offset + query_cap, graph_batch
         if self._cache and not arena.att_cache_fits(max(graph_batch, rows), offset + query_cap):
             # The captured graphs hold views of the current storage: retire
             # them, or they keep it alive beside the larger replacement.
@@ -1474,7 +1504,7 @@ class WholeEulerCFMGraphWrapper:
             warmup_stream = torch.cuda.Stream(device=self.device)
             warmup_stream.wait_stream(current_stream)
             with torch.cuda.stream(warmup_stream), torch.no_grad():
-                for _ in range(3):
+                for _ in range(self.capture_warmup_iterations):
                     static_x.copy_(initial_x)
                     self._run_euler_loop(*loop_args, batch_size=graph_batch)
             current_stream.wait_stream(warmup_stream)

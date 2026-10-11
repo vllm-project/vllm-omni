@@ -34,6 +34,7 @@ from .batched_token2wav import (
     state_shape_signature,
 )
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .reference_audio import decode_reference_audio
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -161,7 +162,7 @@ def _normalize_reference(
     References longer than ``max_seconds`` are truncated with a warning;
     the window is configurable via ``ref_audio_max_seconds``.
     """
-    tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
+    tensor = decode_reference_audio(ref_audio)
     if tensor.dim() > 1:
         # (channels, samples) -> mono; plain reshape(-1) would interleave.
         # Upstream flattens request references to 1-D, so anything else is a
@@ -412,6 +413,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+            "capture_warmup_iterations": int(extra.get("cfm_capture_warmup_iterations", 3)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
             "capture_frames": extra.get("cfm_graph_capture_frames"),
             "offset_bucket_frames": int(extra.get("cfm_graph_offset_bucket_frames", 50)),
@@ -1501,8 +1503,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
         )
-        # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
+        # Capture after weight loading: V1's profile forward or the worker's
+        # auxiliary hook runs before readiness. Capturing during weight load
+        # holds far more memory in the graph pool.
         self._precapture_pending = bool(extra.get("cfm_graph_precapture", True))
+
+    @torch.inference_mode()
+    def capture_auxiliary_graphs(self) -> None:
+        """Warm codec graphs before readiness, including MRv2's no-dummy path."""
+        if not getattr(self, "_precapture_pending", False) or self.backend is None:
+            return
+        # Use forward's precision policy and empty, valid structured input.
+        # This captures the default prompt without creating decoder sessions.
+        device = next(self.backend.flow.parameters()).device
+        self.forward(input_ids=torch.empty(0, dtype=torch.long, device=device), seq_token_counts=[0])
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).

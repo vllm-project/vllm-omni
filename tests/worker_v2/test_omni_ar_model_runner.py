@@ -105,6 +105,8 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
 
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
+    # This CPU orchestration test does not exercise pinned host transfers.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
     input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])

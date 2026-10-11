@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
+    DUPLEX_RUNNER_SERVER_PARAMS,
     SERVER_PARAMS,
     duplex_camera_frames,
     realtime_url,
@@ -31,7 +32,7 @@ def _assert_complete(result, *, require_audio=False):
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.advanced_model
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode,reference", [("basic", False), ("context", False), ("context", True)])
 def test_window_rebuild_and_next_session(omni_server, mode, reference):
     # Two independent sessions exercise admission after final-unit execution.
@@ -74,7 +75,7 @@ def test_window_continuous_input(omni_server, tmp_path, mode, camera):
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.advanced_model
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode", ["off", "basic", "context"])
 def test_window_buffered_flush(omni_server, mode):
     # Burst appends cross processor chunk boundaries and leave a final tail.

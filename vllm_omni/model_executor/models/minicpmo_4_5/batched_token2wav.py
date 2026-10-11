@@ -95,6 +95,20 @@ def relpos_encode_token_budget(
     return max(lookahead + 1, min(int(cap), room))
 
 
+def default_encoder_token_widths(connector: Mapping[str, Any]) -> tuple[int, ...]:
+    """Continuation-chunk token widths the flow-encoder graphs capture by default.
+
+    Every window carries the left context: a response's first window has
+    ``initial_codec_chunk_frames`` new frames when set, every later one
+    ``codec_chunk_frames``. Capturing only the first width leaves every steady
+    window eager (~320 encoder launches each).
+    """
+    left = int(connector.get("codec_left_context_frames", 3) or 0)
+    steady = int(connector.get("codec_chunk_frames", 25) or 25)
+    initial = int(connector.get("initial_codec_chunk_frames", 0) or 0)
+    return tuple(sorted({left + unit for unit in (steady, initial) if unit > 0}))
+
+
 def _supports_ragged_kernel(estimator: nn.Module) -> bool:
     """Whether ``_blocks_forward_chunk_ragged`` can run this estimator's DiT blocks."""
     blocks = getattr(estimator, "blocks", None)
@@ -485,6 +499,7 @@ class BatchedToken2Wav(nn.Module):
                         inference_cfg_rate=getattr(self.flow.decoder, "inference_cfg_rate", 0.7),
                         att_cache_dtype=self._estimator_att_cache_dtype,
                         max_graphs=max_graphs,
+                        capture_warmup_iterations=int(cfm_graph_cfg.get("capture_warmup_iterations", 3)),
                         max_serial_batch=max_serial_batch,
                         max_graph_batch=max_graph_batch,
                         micro_batch_size=micro_batch_size,
@@ -740,16 +755,12 @@ class BatchedToken2Wav(nn.Module):
             for module in (embed, getattr(encoder, "up_embed", None))
             if isinstance(getattr(getattr(module, "pos_enc", None), "pe", None), torch.Tensor)
         ]
-        # Default width: the steady duplex chunk, the left context plus one unit of new frames.
-        unit = int(connector.get("initial_codec_chunk_frames", 0) or 0) or int(connector.get("codec_chunk_frames", 25))
         graphs = self._chunk_encoder_graph or FlowEncoderGraphs(
             functools.partial(self._encode_chunk_eager, last_chunk=False),
             chunk_forward=self._encode_chunk_eager,
         )
         graphs.rows = tuple(sorted(set(config.get("rows") or [1])))
-        graphs.token_widths = tuple(
-            sorted(set(config.get("token_widths") or [int(connector.get("codec_left_context_frames", 3)) + unit]))
-        )
+        graphs.token_widths = tuple(sorted(set(config.get("token_widths") or default_encoder_token_widths(connector))))
         graphs.lookahead = lookahead
         graphs.upsample = self._upsample_stride()
         graphs._held_tensors = lambda: tuple(module.pos_enc.pe for module in tables)

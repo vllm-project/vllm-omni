@@ -9,11 +9,13 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 import websockets
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
+    DUPLEX_RUNNER_SERVER_PARAMS,
     SERVER_PARAMS,
     demo_args,
     duplex_camera_frames,
@@ -174,6 +176,13 @@ async def _run_text_only_response_create(
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
 
 
+class _SeededTextResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
 async def _run_seeded_text_to_audio(
     *,
     url: str,
@@ -183,7 +192,7 @@ async def _run_seeded_text_to_audio(
     modalities: tuple[str, ...] = ("audio", "text"),
     silence_seconds: float = 12.0,
     timeout_s: float = 180.0,
-) -> dict[str, object]:
+) -> _SeededTextResult:
     """Speak a seeded text: the duplex route's text-to-speech shape.
 
     A model-native session takes its text once, in the session context
@@ -280,7 +289,7 @@ async def _run_seeded_text_to_audio(
 
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 def test_duplex_websocket_protocol_smoke(omni_server) -> None:
     ref_audio = resolve_ref_audio()
     events = asyncio.run(
@@ -362,11 +371,13 @@ def test_duplex_single_session_video_input(omni_server, tmp_path: Path) -> None:
 
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize(
     ("locale", "text"),
     [
-        ("en", "Please say exactly: the quick brown fox jumps over the lazy dog."),
+        pytest.param(
+            "en", "Please say exactly: the quick brown fox jumps over the lazy dog.", marks=pytest.mark.core_model
+        ),
         ("zh", "请朗读：今天天气很好，我们一起去公园散步。"),
     ],
 )
@@ -444,6 +455,26 @@ def test_duplex_seeded_text_to_long_audio_output(omni_server) -> None:
     # single Code2Wav frame and well under a 40-word answer.
     assert int(result["audio_bytes"]) > 96_000, f"expected a long answer, got {result['audio_bytes']} bytes"
     assert str(result["transcript"]).strip()
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", DUPLEX_RUNNER_SERVER_PARAMS, indirect=True)
+def test_duplex_seeded_text_to_audio_needs_no_reference_voice(omni_server) -> None:
+    """Default-voice speech uses the codec prompt without client ref_audio."""
+    result = asyncio.run(
+        _run_seeded_text_to_audio(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            ref_audio=None,
+            text="What is the capital of France? Answer in one short sentence.",
+        )
+    )
+
+    assert "response.done" in result["event_types"], result["event_types"]
+    assert int(result["audio_bytes"]) > 0, "default-voice session produced no audio"
+    assert str(result["transcript"]).strip(), "default-voice session produced no transcript"
 
 
 @pytest.mark.advanced_model

@@ -44,6 +44,7 @@ x-qwen3-tts: &qwen3_tts
 x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/config/model.py
   - vllm_omni/model_executor/models/minicpmo_4_5/
   - vllm_omni/model_executor/models/step_audio2/
   - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
@@ -73,6 +74,13 @@ x-minicpmo-4-5-functional-runtime: &minicpmo_4_5_functional_runtime
 
 x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
+  - vllm_omni/deploy/minicpmo_4_5_duplex_h200.yaml
+  - vllm_omni/deploy/minicpmo_4_5_duplex_mrv2_h200.yaml
+  - vllm_omni/worker_v2/
+  - vllm_omni/worker/base.py
+  - tests/worker/test_worker_base.py
+  - tests/worker/test_higgs_forward_metadata_scope.py
+  - vllm_omni/config/omni_config.py
   - vllm_omni/engine/duplex/
   - vllm_omni/engine/duplex_omni_engine.py
   - vllm_omni/engine/duplex_orchestrator.py
@@ -325,7 +333,7 @@ source_file_dependencies:
     - tests/entrypoints/duplex/
     - tests/entrypoints/test_duplex_omni.py
     - tests/entrypoints/openai_api/test_duplex_api_server.py
-    - tests/model_executor/models/minicpmo_4_5/duplex/
+    - tests/model_executor/models/minicpmo_4_5/
     - tests/protocol/
 
   omni_minicpmo_4_5_duplex_perf:

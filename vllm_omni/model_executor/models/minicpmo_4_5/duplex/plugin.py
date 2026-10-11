@@ -35,6 +35,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.intermediate import build_duplex_append_prompt
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
+    DuplexModelSessionState,
     DuplexRuntimeConfigError,
     EncodeAudio,
     reject_changed_runtime_value,
@@ -65,6 +66,8 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 _DUPLEX_CHUNK_SAMPLES = 16000
+# Session-config marker from ``prepare_prompt_config`` to the append plan.
+_CLOSE_TURN_CONFIG_KEY = "_minicpmo45_close_turn"
 _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
 # <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
 # matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
@@ -598,7 +601,42 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                     if isinstance(all_stop_token_ids, set):
                         all_stop_token_ids.update(int(token_id) for token_id in value)
             configured.append(params)
+        if configured and isinstance(configured[0], SamplingParams):
+            stage0 = configured[0]
+            if stage0.logprobs is not None or stage0.logprob_token_ids is not None:
+                # Validate effective policy after runtime overrides, before
+                # submitting a worker request. The two-pass listen/speak draw
+                # cannot expose the standard sampler's output logprobs.
+                raise ValueError("MiniCPM-o duplex sampling does not support output logprobs")
         return tuple(configured)
+
+    def close_model_turn(self, state: DuplexModelSessionState) -> bool:
+        if not isinstance(state, MiniCPMO45ServingSessionState):
+            return False
+        state.close_turn_pending = True
+        return True
+
+    def prepare_prompt_config(
+        self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]
+    ) -> dict[str, object]:
+        if isinstance(state, MiniCPMO45ServingSessionState) and state.close_turn_pending:
+            state.close_turn_pending = False
+            return {**config, _CLOSE_TURN_CONFIG_KEY: True}
+        return config
+
+    async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
+        session_config = kwargs["session_config"]
+        if _CLOSE_TURN_CONFIG_KEY in session_config:
+            session_config = dict(session_config)
+            del session_config[_CLOSE_TURN_CONFIG_KEY]
+            kwargs["session_config"] = session_config
+            payload = kwargs["payload"]
+            # The first append of a request has no unit of the old turn to close.
+            # The closing unit also listens: left to itself the model finishes
+            # the cut-off sentence there, as a new response of its own.
+            if kwargs["seq"] > 1 and isinstance(payload, dict):
+                kwargs["payload"] = {**payload, "close_turn": True, "force_listen": True}
+        return self.plan_append(**kwargs)
 
     def plan_append(
         self,
@@ -726,11 +764,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             ref_audio = extra_tts_ref_audio
 
         if ref_audio is None:
-            if any(str(modality).lower() == "audio" for modality in config.modalities):
-                raise MiniCPMO45ClientRuntimeConfigError(
-                    "MiniCPM-o duplex audio output requires ref_audio",
-                    code="ref_audio_required",
-                )
+            # Voice conditioning is optional, matching MiniCPMODuplex.prepare.
+            # Code2Wav owns its default prompt/cache when codes.ref is absent.
             _apply_first_append_context_tokens(
                 runtime_config,
                 tokenizer=tokenizer,

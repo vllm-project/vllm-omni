@@ -19,6 +19,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     get_ep_all2all_manager,
@@ -27,6 +28,8 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
+from vllm.v1.worker.gpu.input_batch import combine_sampled_and_draft_tokens, prepare_pos_seq_lens
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
@@ -35,6 +38,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
+from vllm_omni.worker_v2.decode_burst import BurstOutputBatch, DecodeBurst, burst_step_batch
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
@@ -218,6 +222,16 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
+        finalize_multimodal = sampling_output.finalize_multimodal
+        output_batch = input_batch
+        burst = self._decode_burst(input_batch, grammar_output, sampling_output, multimodal_outputs)
+        if burst is not None:
+            # Commits every step itself, the scheduled one included.
+            sampler_output, multimodal_outputs, output_batch = self._run_decode_burst(
+                burst, input_batch, sampler_output, multimodal_outputs
+            )
+            num_sampled, num_rejected = sampler_output.num_sampled, sampler_output.num_rejected
+            finalize_multimodal = burst.finalizer(output_batch)
         run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
         if multimodal_outputs and run_eager_mtp is not None:
             run_eager_mtp(
@@ -297,10 +311,10 @@ class OmniARModelRunner(OmniGPUModelRunner):
             copy_stream=self.output_copy_stream,
             text_hidden=text_hidden if need_pooler and sampling_output.include_hidden_states else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
-            input_batch=input_batch if need_pooler else None,
+            input_batch=output_batch if need_pooler else None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
-            finalize_multimodal=sampling_output.finalize_multimodal,
+            finalize_multimodal=finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
@@ -315,15 +329,18 @@ class OmniARModelRunner(OmniGPUModelRunner):
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
         )
 
-        # Postprocess AFTER creating async output (so copy_event is
-        # recorded before postprocess, matching upstream pattern).
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        if burst is not None:
+            burst.finish(async_output.num_sampled_tokens_np, async_output.copy_event)
+        else:
+            # Postprocess AFTER creating async output (so copy_event is
+            # recorded before postprocess, matching upstream pattern).
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
         model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
@@ -331,6 +348,152 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output
+
+    # ------------------------------------------------------------------
+    # Decode burst (see decode_burst)
+    # ------------------------------------------------------------------
+
+    def _decode_burst(
+        self,
+        input_batch: Any,
+        grammar_output: GrammarOutput | None,
+        sampling_output: Any,
+        multimodal_outputs: dict[str, Any] | None,
+    ) -> DecodeBurst | None:
+        """The model's burst plan for this step, if the step can be repeated on the device."""
+        plan = getattr(self.model, "mrv2_decode_burst", None)
+        context = getattr(self, "_decode_burst_context", None)
+        if (
+            not callable(plan)
+            or context is None
+            or context[1].cg_mode != CUDAGraphMode.FULL
+            or self.cudagraph_manager is None
+            or not multimodal_outputs
+            or grammar_output is not None
+            or self.speculator is not None
+            or self.pp_handler is not None
+            or self.batch_sharder is not None
+            or self.lora_config
+            or self.vllm_config.scheduler_config.async_scheduling
+            or getattr(self.model, "logitsprocs_need_output_token_ids", False)
+            or sampling_output.sampler_output.logprobs_tensors is not None
+            or sampling_output.include_hidden_states
+            or input_batch.has_prefill
+            or input_batch.num_draft_tokens
+            or input_batch.num_tokens != input_batch.num_reqs
+        ):
+            return None
+        burst = plan(input_batch, self.req_states)
+        return burst if burst is not None and burst.steps > 1 else None
+
+    def _run_decode_burst(
+        self,
+        burst: DecodeBurst,
+        input_batch: Any,
+        sampler_output: SamplerOutput,
+        multimodal_outputs: dict[str, Any],
+    ) -> tuple[SamplerOutput, dict[str, Any], BurstOutputBatch]:
+        """Commit the scheduled step, then decode ``burst.steps - 1`` more on the device."""
+        assert self._decode_burst_context is not None
+        scheduler_output, batch_desc = self._decode_burst_context
+        self.postprocess_sampled(
+            input_batch.idx_mapping,
+            sampler_output.sampled_token_ids,
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+            input_batch.query_start_loc,
+        )
+        burst.record_step()
+        sampled = [sampler_output.sampled_token_ids]
+        outputs = [multimodal_outputs]
+        live = [sampler_output.num_sampled[: input_batch.num_reqs] > 0]
+        for step in range(1, burst.steps):
+            step_live = live[-1] & burst.continues(sampled[-1])
+            step_batch = burst_step_batch(input_batch, step)
+            step_sampler_output, step_outputs = self._run_decode_burst_step(scheduler_output, batch_desc, step_batch)
+            # Ended rows neither append a token nor advance their computed length.
+            step_sampled = step_live.to(torch.int32)
+            self.postprocess_sampled(
+                step_batch.idx_mapping,
+                step_sampler_output.sampled_token_ids,
+                step_sampled,
+                1 - step_sampled,
+                step_batch.query_start_loc,
+            )
+            burst.record_step()
+            sampled.append(step_sampler_output.sampled_token_ids.to(sampled[0].dtype))
+            outputs.append(step_outputs)
+            live.append(step_live)
+        num_sampled = torch.stack(live, dim=1).sum(dim=1, dtype=torch.int32)
+        merged = SamplerOutput(
+            sampled_token_ids=torch.cat(sampled, dim=1),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=burst.steps - num_sampled,
+        )
+        output_batch = BurstOutputBatch.uniform(input_batch.num_reqs, burst.steps)
+        return merged, burst.merge_outputs(outputs, live), output_batch
+
+    def _run_decode_burst_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_desc: Any,
+        input_batch: Any,
+    ) -> tuple[SamplerOutput, dict[str, Any]]:
+        """One more one-token step of the scheduled batch: ``execute_model`` + ``sample``."""
+        prepare_pos_seq_lens(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            self.req_states.num_computed_tokens.gpu,
+            self.input_buffers.positions,
+            self.input_buffers.seq_lens,
+        )
+        combine_sampled_and_draft_tokens(
+            self.input_buffers.input_ids,
+            input_batch.idx_mapping,
+            self.req_states.last_sampled_tokens,
+            input_batch.query_start_loc,
+            input_batch.seq_lens,
+            self.req_states.prefill_len.gpu,
+            self.req_states.draft_tokens,
+            input_batch.cu_num_logits,
+            input_batch.num_reqs,
+            self.model_state.num_new_sampled_tokens_per_step,
+        )
+        block_tables, slot_mappings = self.prepare_attn(input_batch)
+        self.model_state.preprocess_state(
+            input_batch, block_tables, self.kv_cache_config, self.req_states.num_computed_tokens.gpu
+        )
+        self.model_state.prepare_attn(
+            input_batch,
+            batch_desc.cg_mode,
+            block_tables,
+            slot_mappings,
+            self.attn_groups,
+            self.kv_cache_config,
+            for_capture=False,
+        )
+        input_ids, inputs_embeds, _ = self._prepare_mm_inputs(scheduler_output, input_batch, dummy_run=False)
+        model_inputs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "positions": input_batch.positions,
+            "inputs_embeds": inputs_embeds,
+            "intermediate_tensors": None,
+            **self.model_state.prepare_inputs(input_batch, self.req_states),
+        }
+        self._add_legacy_forward_inputs(model_inputs, input_batch)
+        self.model_state.run_preprocess(input_batch, model_inputs, self.req_states, self._dispatch_mtp_batch_descriptor)
+        hidden_states, aux = self._split_fullgraph_output(self.cudagraph_manager.run_fullgraph(batch_desc))
+        self.model_state.run_postprocess(hidden_states, input_batch)
+        raw_output = self._reconstruct_raw_model_output(hidden_states=hidden_states, multimodal_outputs=None, aux=aux)
+        text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
+            raw_output, input_batch, self.req_states
+        )
+        sampling_output = sample_with_output(self.sampler, self.sample, text_hidden, input_batch, self.req_states, None)
+        if sampling_output.multimodal_outputs is not None:
+            multimodal_outputs = sampling_output.multimodal_outputs
+        return sampling_output.sampler_output, multimodal_outputs
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:
@@ -569,6 +732,8 @@ def _async_copy_mm_value(
                 # One shared per-step host tensor (e.g. every request's sample
                 # rate): one copy serves all entries.
                 return [_async_copy_tensor(first)] * len(value)
+        if type(value) is list and all(type(val) is int for val in value):
+            return value.copy()  # e.g. token-id snapshots: no per-int recursion
         return [
             _async_copy_mm_value(
                 val,
@@ -660,6 +825,8 @@ def _slice_pooler_value(
     if isinstance(value, list):
         if not value:
             return []
+        if request_scoped and type(value) is list and all(type(item) is int for item in value):
+            return value.copy()  # a request's token-id list: no per-int recursion
         # Lists at the batch level contain request-owned payloads. Their
         # tensors use local axes even when a size coincides with batch tokens.
         values = value if request_scoped else [value[req_index] if req_index < len(value) else value[0]]
@@ -682,12 +849,18 @@ def _ensure_tensor_values(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
     """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
 
     Non-tensor scalars (int/float/bool) are wrapped with ``torch.tensor()``;
-    values that cannot be safely converted are dropped. Enforces the tensor-only
-    invariant required by ``OmniEngineCoreOutput.multimodal_output`` (the channel
-    the async_chunk stage-input processor reads). Mirrors the V1 runner helper.
+    ``None`` means the key is absent for this row and is skipped silently; other
+    values that cannot be safely converted are dropped with a warning. Enforces
+    the tensor-only invariant required by ``OmniEngineCoreOutput.multimodal_output``
+    (the channel the async_chunk stage-input processor reads). Mirrors the V1
+    runner helper.
     """
     result: dict[str, torch.Tensor] = {}
     for key, val in payload.items():
+        if val is None:
+            # Per-row producers emit None for "nothing new this step" (e.g. an
+            # unchanged duplex prompt snapshot); that is not a dropped value.
+            continue
         if isinstance(val, torch.Tensor):
             result[key] = val
         elif isinstance(val, (int, float, bool)):
@@ -880,12 +1053,26 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     pin_memory=pin_memory,
                 )
                 total_tokens = text_hidden.shape[0]
+                # A top-level output that *is* the hidden tensor (e.g. a
+                # Thinker "latent") reuses its host copy instead of a second D2H.
+                aliased = (
+                    [key for key, value in multimodal_outputs.items() if value is text_hidden]
+                    if multimodal_outputs is not None and type(multimodal_outputs) is dict
+                    else []
+                )
                 self._mm_cpu = _async_copy_mm(
-                    multimodal_outputs,
+                    {key: value for key, value in multimodal_outputs.items() if value is not text_hidden}
+                    if aliased and multimodal_outputs is not None
+                    else multimodal_outputs,
                     total_tokens,
                     copy_stream=copy_stream,
                     pin_memory=pin_memory,
                 )
+                if aliased and multimodal_outputs is not None:
+                    assert self._mm_cpu is not None
+                    self._mm_cpu = {
+                        key: self._hidden_cpu if key in aliased else self._mm_cpu[key] for key in multimodal_outputs
+                    }
 
             self.copy_event.record(copy_stream)
 
@@ -921,11 +1108,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 f"timed out during dispatch/combine. Mask: {mask.cpu().tolist()}"
             )
 
-        # Pooler output. Populate two channels from the same per-request payloads,
-        # mirroring the V1 runner:
-        #   * pooler_output  -> sync/full-payload path (inline pooling_output bridge)
-        #   * multimodal_outputs -> wire multimodal_output, which the async_chunk
-        #     stage-input processor (talker2code2wav_async_chunk) reads for codes.
+        # Inter-stage payloads feed the bridge; multimodal_outputs feeds the
+        # output processor and client wire. Model-owned snapshots may partition
+        # those payloads separately. Plain full-payload AR output has one wire
+        # representation, so the output processor cannot accumulate it twice.
         if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
             if self._finalize_multimodal is not None:
                 self._mm_snapshot = self._finalize_multimodal(self._mm_snapshot, num_sampled_tokens)
@@ -967,7 +1153,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._padded_total_tokens,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
-            self.model_runner_output.pooler_output = pooler_payload
+            # Full-payload AR output rides in multimodal_outputs, as in V1.
+            # Publishing it in pooling_output too makes the text output
+            # processor append every latent row twice.
+            self.model_runner_output.pooler_output = None
             self.model_runner_output.inter_stage_outputs = pooler_payload
             self.model_runner_output.multimodal_outputs = (
                 [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None

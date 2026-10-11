@@ -82,7 +82,12 @@ def test_auxiliary_capture_finishes_before_worker_readiness(monkeypatch, generat
         if fail:
             raise RuntimeError("auxiliary capture failed")
 
-    monkeypatch.setattr(Worker, "compile_or_warm_up_model", lambda _: events.append("warmup"))
+    def parent_warmup(worker):
+        events.append("warmup")
+        worker._maybe_activate_jit_monitor()
+
+    monkeypatch.setattr(Worker, "compile_or_warm_up_model", parent_warmup)
+    monkeypatch.setattr(Worker, "_maybe_activate_jit_monitor", lambda _: events.append("monitor"))
     worker = object.__new__(GPUGenerationWorker if generation else OmniGPUWorkerBase)
     worker.use_v2_model_runner = generation
     model = SimpleNamespace(capture_auxiliary_graphs=capture) if enabled else SimpleNamespace()
@@ -93,4 +98,5 @@ def test_auxiliary_capture_finishes_before_worker_readiness(monkeypatch, generat
     else:
         worker.compile_or_warm_up_model()
         events.append("ready")
-    assert events == ["warmup"] + (["capture"] if enabled else []) + ([] if fail else ["ready"])
+    monitor = [] if generation or fail else ["monitor"]
+    assert events == ["warmup"] + (["capture"] if enabled else []) + monitor + ([] if fail else ["ready"])

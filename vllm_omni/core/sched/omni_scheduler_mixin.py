@@ -516,7 +516,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
-        timed_out_ids = input_coordinator.collect_timed_out_request_ids(timeout_s=DEFAULT_INPUT_WAIT_TIMEOUT_S)
+        timed_out_ids = self._collect_input_wait_timeouts(input_coordinator)
         if not timed_out_ids:
             return
         present_ids = {req_id for req_id in timed_out_ids if req_id in self.requests}
@@ -529,6 +529,21 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             sorted(present_ids),
         )
         self._finish_input_timeout_requests(present_ids)
+
+    def _collect_input_wait_timeouts(self, receiver: Any) -> set[str]:
+        # A resumable duplex receiver can wait while the user keeps speaking,
+        # or between turns. Session idle/close and producer failure handling
+        # own that lifetime; an absence of output chunks is not a stalled input.
+        config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        if getattr(config, "session_mode", "turn") == "duplex":
+            session_request_ids = {
+                request_id for request_id, request in self.requests.items() if getattr(request, "resumable", False)
+            }
+            if session_request_ids:
+                return receiver.collect_timed_out_request_ids(
+                    timeout_s=DEFAULT_INPUT_WAIT_TIMEOUT_S, session_request_ids=session_request_ids
+                )
+        return receiver.collect_timed_out_request_ids(timeout_s=DEFAULT_INPUT_WAIT_TIMEOUT_S)
 
     def _finish_input_timeout_requests(self, request_ids: set[str]) -> None:
         # Upstream finish_requests frees scheduler state, but does not emit
@@ -616,7 +631,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is None or not getattr(adapter, "receives_chunks", False):
             return
-        timed_out_ids = adapter.collect_timed_out_request_ids(timeout_s=DEFAULT_INPUT_WAIT_TIMEOUT_S)
+        timed_out_ids = self._collect_input_wait_timeouts(adapter)
         if not timed_out_ids:
             return
         present_ids = {req_id for req_id in timed_out_ids if req_id in self.requests}

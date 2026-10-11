@@ -19,6 +19,7 @@ from tests.helpers.stage_config import (
     get_deploy_duplex_max_sessions,
     modify_stage_config,
 )
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "openbmb/MiniCPM-o-4_5"
@@ -53,6 +54,32 @@ SERVER_PARAMS = [
         id="three-stage-single-gpu",
     )
 ]
+
+# Keep the production graph/sampling paths, with KV headroom on 80 GiB CI
+# devices. These scenarios use at most two simultaneous sessions.
+MRV2_PROFILE_CONFIG = get_deploy_config_path("minicpmo_4_5_duplex_mrv2_h200.yaml")
+MRV2_DEPLOY_CONFIG = modify_stage_config(
+    MRV2_PROFILE_CONFIG,
+    updates={
+        # The generated file lives in a temporary directory, so inheritance
+        # must resolve through the absolute production profile path.
+        "base_config": MRV2_PROFILE_CONFIG,
+        "stages": {0: {"kv_cache_memory_bytes": 17179869184}},
+    },
+)
+MRV2_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=MRV2_DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        ),
+        id="three-stage-mrv2-duplex",
+        marks=pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="MRv2 duplex requires CUDA"),
+    )
+]
+DUPLEX_RUNNER_SERVER_PARAMS = SERVER_PARAMS + MRV2_SERVER_PARAMS
 
 CORE_SERVER_PARAMS = [
     pytest.param(

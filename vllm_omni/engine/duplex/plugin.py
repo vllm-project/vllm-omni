@@ -422,6 +422,18 @@ class DuplexModelPlugin(ABC):
         del plan, req_state
         return None
 
+    def close_model_turn(self, state: DuplexModelSessionState) -> bool:
+        """Arrange for the model to end its current turn at its next append.
+
+        ``response.cancel`` otherwise starts a new epoch, and with it new stage
+        requests whose context holds only the session template: the
+        conversation the model had heard and said is gone. A model that decides
+        its own turns can instead close the turn inside its running request;
+        return True once that is arranged. Default: unsupported.
+        """
+        del state
+        return False
+
     def commit_model_context(self, *, session_id: str | None, assistant_text: str) -> None:
         """Persist model-context history at a turn boundary. Default is a no-op.
 

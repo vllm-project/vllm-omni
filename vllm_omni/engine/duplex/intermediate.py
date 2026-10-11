@@ -6,6 +6,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, TypedDict
 
+import torch
+
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.contracts import DuplexFence
 
@@ -114,6 +116,34 @@ def set_ref_audio(buffer: DuplexIntermediateBuffer, waveform: object, sample_rat
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
+# Marks a float32 matrix packed as raw bytes for an untyped request payload.
+_PACKED_TENSOR_KEY = "packed_float32"
+
+
+def pack_tts_hidden(hidden_states: torch.Tensor) -> dict[str, object]:
+    """Pack Thinker rows for the Talker request as float32 bytes.
+
+    ``model_intermediate_buffer`` is untyped, so vLLM's msgpack decoder cannot
+    rebuild a tensor inside it. A nested float list costs milliseconds per
+    handoff (``tolist``, encode, decode, ``as_tensor``) on the first-audio
+    path; raw bytes cross both IPC hops as one copy and decode to the same
+    float32 values.
+    """
+    rows = hidden_states.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return {_PACKED_TENSOR_KEY: rows.numpy().tobytes(), "shape": list(rows.shape)}
+
+
+def _unpack_tts_hidden(value: object) -> object:
+    if not isinstance(value, Mapping) or _PACKED_TENSOR_KEY not in value:
+        return value
+    data = value[_PACKED_TENSOR_KEY]
+    shape = value.get("shape")
+    if not isinstance(data, (bytes, bytearray, memoryview)) or not isinstance(shape, (list, tuple)):
+        raise ValueError("packed TTS hidden states need bytes data and a shape")
+    # bytearray: torch.frombuffer needs a writable buffer to share memory.
+    return torch.frombuffer(bytearray(data), dtype=torch.float32).reshape([int(dim) for dim in shape])
+
+
 def set_tts_handoff(buffer: DuplexIntermediateBuffer, token_ids: object | None, hidden_states: object | None) -> None:
     """Store the AR-to-TTS handoff used by the full-duplex stage bridge."""
     if token_ids is not None:
@@ -130,7 +160,7 @@ def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | No
     hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
     return (
         info.get("tts_token_ids") if token_ids is None else token_ids,
-        info.get("tts_hidden_states") if hidden_states is None else hidden_states,
+        _unpack_tts_hidden(info.get("tts_hidden_states") if hidden_states is None else hidden_states),
     )
 
 
