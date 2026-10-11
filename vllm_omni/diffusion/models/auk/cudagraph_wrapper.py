@@ -66,6 +66,7 @@ class AuKCUDAGraphWrapper:
         self.max_graphs = max(1, int(max_graphs))
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
         self._loop_cache: OrderedDict[tuple, _LoopGraphEntry] = OrderedDict()
+        self._uncapturable_loop_keys: set[tuple] = set()
         self._pool_handle: int | None = None
         # Key whose static context holds the current request, and the context
         # the eager fallback reuses across the steps of one request.
@@ -273,6 +274,29 @@ class AuKCUDAGraphWrapper:
             static_out=static_out,
         )
 
+    def _run_eager_loop(
+        self,
+        *,
+        x: torch.Tensor,
+        text: torch.Tensor,
+        c_mask: torch.Tensor,
+        ref: torch.Tensor,
+        ref_mask: torch.Tensor,
+        timesteps: torch.Tensor,
+        cfg_strength: float,
+    ) -> torch.Tensor:
+        """Run the multi-step Euler denoising loop eagerly without capturing CUDA graphs."""
+        n_steps = int(timesteps.numel()) - 1
+        if n_steps <= 0:
+            return x
+        uses_cfg = cfg_strength >= 1e-5
+        ctx = self._prepare(x, None, text, c_mask, ref, ref_mask, uses_cfg, timesteps[:-1])
+        for i in range(n_steps):
+            vel = self._step(x, timesteps[i], ctx, cfg_strength, i)
+            dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
+            x = x + dt * vel
+        return x
+
     @torch.no_grad()
     def sample_loop(
         self,
@@ -289,22 +313,15 @@ class AuKCUDAGraphWrapper:
         n_steps = int(timesteps.numel()) - 1
         uses_cfg = cfg_strength >= 1e-5
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing() or n_steps <= 0:
-            for i in range(n_steps):
-                vel = self(
-                    x=x,
-                    text=text,
-                    c_mask=c_mask,
-                    ref=ref,
-                    ref_mask=ref_mask,
-                    timestep=timesteps[i],
-                    cfg_strength=cfg_strength,
-                    new_request=i == 0,
-                    timesteps=timesteps[:-1],
-                    step_index=i,
-                )
-                dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
-                x = x + dt * vel
-            return x
+            return self._run_eager_loop(
+                x=x,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timesteps=timesteps,
+                cfg_strength=cfg_strength,
+            )
 
         target_frames = x.shape[1]
         orig_batch = x.shape[0]
@@ -312,23 +329,16 @@ class AuKCUDAGraphWrapper:
             x, text, c_mask, ref, ref_mask
         )
         key = (x_buck.shape[0], x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
-        if getattr(self, "_uncapturable_loop_keys", None) and key in self._uncapturable_loop_keys:
-            for i in range(n_steps):
-                vel = self(
-                    x=x,
-                    text=text,
-                    c_mask=c_mask,
-                    ref=ref,
-                    ref_mask=ref_mask,
-                    timestep=timesteps[i],
-                    cfg_strength=cfg_strength,
-                    new_request=i == 0,
-                    timesteps=timesteps[:-1],
-                    step_index=i,
-                )
-                dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
-                x = x + dt * vel
-            return x
+        if key in self._uncapturable_loop_keys:
+            return self._run_eager_loop(
+                x=x,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timesteps=timesteps,
+                cfg_strength=cfg_strength,
+            )
         entry = self._loop_cache.get(key)
         hit_key = key if entry is not None else None
         if entry is None:
@@ -354,25 +364,16 @@ class AuKCUDAGraphWrapper:
                     key,
                     exc_info=True,
                 )
-                if not hasattr(self, "_uncapturable_loop_keys"):
-                    self._uncapturable_loop_keys = set()
                 self._uncapturable_loop_keys.add(key)
-                for i in range(n_steps):
-                    vel = self(
-                        x=x,
-                        text=text,
-                        c_mask=c_mask,
-                        ref=ref,
-                        ref_mask=ref_mask,
-                        timestep=timesteps[i],
-                        cfg_strength=cfg_strength,
-                        new_request=i == 0,
-                        timesteps=timesteps[:-1],
-                        step_index=i,
-                    )
-                    dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
-                    x = x + dt * vel
-                return x
+                return self._run_eager_loop(
+                    x=x,
+                    text=text,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
+                    timesteps=timesteps,
+                    cfg_strength=cfg_strength,
+                )
         else:
             assert hit_key is not None
             self._loop_cache.move_to_end(hit_key)

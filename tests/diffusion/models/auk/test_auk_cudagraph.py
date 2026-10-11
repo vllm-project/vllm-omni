@@ -185,7 +185,8 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
 def test_graph_capture_failure_falls_back_to_eager(mocker) -> None:
     dit = _make_dit("cuda")
     wrapper = AuKCUDAGraphWrapper(dit)
-    capture = mocker.patch.object(wrapper, "_capture_loop", side_effect=RuntimeError("capture failed"))
+    capture_loop = mocker.patch.object(wrapper, "_capture_loop", side_effect=RuntimeError("loop capture failed"))
+    capture_single = mocker.patch.object(wrapper, "_capture", side_effect=RuntimeError("single step capture failed"))
     inputs = _sample_inputs("cuda")
     common = dict(
         **inputs,
@@ -194,7 +195,8 @@ def test_graph_capture_failure_falls_back_to_eager(mocker) -> None:
         cfg_strength=0.0,
     )
 
-    # First attempt: capture fails, warning logged, falls back to eager execution.
+    # First attempt: capture fails, warning logged, falls back to genuine eager execution
+    # (without attempting single-step capture which would re-raise).
     res1 = sample_latents(
         dit,
         **common,
@@ -213,7 +215,8 @@ def test_graph_capture_failure_falls_back_to_eager(mocker) -> None:
     assert res2 is not None
 
     assert wrapper.enabled
-    assert capture.call_count == 1
+    assert capture_loop.call_count == 1
+    capture_single.assert_not_called()
     assert not wrapper._loop_cache
 
 
