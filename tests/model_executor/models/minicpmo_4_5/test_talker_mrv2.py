@@ -23,6 +23,35 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _EOS = 6561
 
 
+@pytest.mark.parametrize("padded", [False, True])
+def test_native_partition_matches_generic_partition_and_owns_metadata(padded):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _DUPLEX_OUTPUT_META_KEYS,
+        _mrv2_duplex_output_partition,
+    )
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    n = 2 + int(padded)
+    meta = {key: [torch.tensor([1]), torch.tensor([2])] for key in _DUPLEX_OUTPUT_META_KEYS}
+    outputs = {
+        "codes": {"audio": torch.arange(n).view(-1, 1)},
+        "meta": {"codec_frame_valid": torch.ones(n, dtype=torch.bool), "finished": torch.tensor([False, True])},
+    }
+    generic = {"codes": outputs["codes"], "meta": {**outputs["meta"], **meta}}
+    generic["meta"]["finished"] = list(outputs["meta"]["finished"].unbind())
+    expected = OmniARModelRunner._build_async_chunk_outputs_from_mm(generic, np.array([0, 1, 2]), np.ones(2), 2, 2, n)
+    actual = _mrv2_duplex_output_partition(outputs, meta, [(0, 1), (1, 1)], {n})
+    for got_rows, want_rows in zip((actual.inter_stage, actual.client), expected, strict=True):
+        for got, want in zip(got_rows, want_rows, strict=True):
+            assert list(got) == list(want)
+            for key in got:
+                torch.testing.assert_close(got[key], want[key], rtol=0, atol=0)
+    for inter, client in zip(actual.inter_stage, actual.client, strict=True):
+        assert all(client[key] is inter[key] for key in client)
+    meta["llm_output_text_utf8"][0].zero_()
+    assert actual.inter_stage[0]["meta.llm_output_text_utf8"].tolist() == [1]
+
+
 def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     talker._codec_eos_id = _EOS
@@ -30,6 +59,7 @@ def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
     talker._mrv2_empty_speech = torch.zeros(max_reqs, dtype=torch.bool)
     talker._mrv2_forced_eos = None
     talker._mrv2_decode_rows_logged = False
+    talker._deferred_cleanup_ids = set()
     return talker
 
 
@@ -49,6 +79,8 @@ def _batch(rows: list[dict], *, pad_to: int | None = None):
         input_ids=torch.tensor(ids + [0] * (padded - num_tokens), dtype=torch.int32),
         logits_indices=torch.tensor(starts[1:] - 1),
         seq_lens=torch.tensor(seq_lens + [0] * 2, dtype=torch.int32),
+        query_start_loc_np=starts,
+        num_scheduled_tokens=np.diff(starts),
     ), padded
 
 
@@ -57,6 +89,61 @@ def _req_states(prompt_lens: dict[int, int], max_reqs: int = 8):
     for slot, value in prompt_lens.items():
         prompt_len[slot] = value
     return SimpleNamespace(prompt_len=SimpleNamespace(gpu=prompt_len))
+
+
+def test_mrv2_prefill_keeps_interleaved_session_conditions_and_codec_history_separate(mocker):
+    talker = _talker()
+    torch.nn.Module.__init__(talker)
+    talker._request_condition_states = {}
+    talker._request_audio_states = {}
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.zeros(2, 4))
+    # One session advances while another starts. The V2 runner supplies only
+    # req_id; falling back to a shared default key makes seq 3 follow seq 0.
+    for request_id, seq in [("a", 0), ("a", 1), ("a", 2), ("b", 0), ("a", 3)]:
+        _, _, updates = talker.preprocess(
+            torch.zeros(2, dtype=torch.long),
+            None,
+            req_id=request_id,
+            _omni_is_prefill=True,
+            _omni_prompt_len=2,
+            native_duplex=True,
+            ids={"tts": torch.tensor([7])},
+            hidden_states={"tts": torch.zeros(1, 4)},
+            meta={"streaming_condition_seq": seq, "turn_start": seq == 0},
+        )
+        assert talker._request_audio_states[request_id] is updates["audio_state"]
+        updates["audio_state"]["recent_codes"] = [11 if request_id == "a" else 22]
+    assert talker._request_condition_states["a"]["condition_seq"] == 3
+    assert talker._request_condition_states["b"]["condition_seq"] == 0
+    assert talker._request_audio_states["a"]["recent_codes"] == [11]
+    assert talker._request_audio_states["b"]["recent_codes"] == [22]
+
+
+@pytest.mark.parametrize("fallback", ["expanded", "speculative", "ordinary", "unseeded"])
+def test_seeded_codec_unsupported_batches_keep_original_sampler(monkeypatch, mocker, fallback):
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+    from vllm.v1.worker.gpu.states import RequestState
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex import mrv2
+
+    monkeypatch.setattr(mrv2, "LegacySampler", mocker.Mock())
+    original = mocker.Mock(spec=object.__new__(Sampler))
+    original.num_speculative_tokens = 2 if fallback == "speculative" else 1
+    original.req_states = mocker.Mock(spec=RequestState, index_to_req_id={2: "live"})
+    model = mocker.Mock(
+        spec=MiniCPMO45OmniTTSForConditionalGeneration,
+        _mrv2_output_infos=[{"native_duplex": fallback != "ordinary"}],
+    )
+    core = mrv2.MiniCPMO45SeededCodecSampler(original, model)
+    core.add_request(2, SamplingParams(seed=None if fallback == "unseeded" else 42))
+    batch = mocker.Mock(spec=InputBatch, idx_mapping_np=np.array([2]))
+    logits = torch.ones(2 if fallback == "expanded" else 1, 10)
+    output = core(logits, batch)
+    assert output is original.return_value
+    original.assert_called_once_with(logits, batch)
+    assert not core._generators
 
 
 def test_mrv2_output_emits_decode_input_codes_with_validity_and_forced_eos() -> None:
@@ -120,6 +207,62 @@ def test_mrv2_output_empty_condition_and_length_cap() -> None:
         )
         assert out.multimodal_outputs["meta"]["codec_frame_valid"].tolist() == [True]
         assert talker.take_mrv2_forced_eos(batch, None, 1).tolist() == [forced]
+
+
+@pytest.mark.parametrize("speech_tokens", [None, 50])
+@pytest.mark.parametrize("turn_end", [False, True])
+@pytest.mark.parametrize("step", [24, 25, 29, 49, 50, 54])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
+def test_mrv2_native_unit_keeps_codec_budget_and_final_eos(mocker, speech_tokens, turn_end, step, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required for the fused native codec output")
+    talker = _talker()
+    torch.nn.Module.__init__(talker)
+    talker._request_condition_states = {}
+    talker._request_audio_states = {}
+    talker._mrv2_penalties = SimpleNamespace(prefix_history=torch.full((8, 16), -1, dtype=torch.long))
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.zeros(2, 4))
+    meta = {"turn_start": False, "turn_end": turn_end, "gander_context_version": 7}
+    if speech_tokens is not None:
+        meta["gander_speech_tokens"] = speech_tokens
+    info = {"native_duplex": True, "duplex": {"epoch": 3, "turn_id": 5}, "meta": meta}
+    _, _, updates = talker.preprocess(
+        torch.zeros(2, dtype=torch.long),
+        None,
+        req_id="r",
+        _omni_is_prefill=True,
+        _omni_prompt_len=2,
+        ids={"tts": torch.tensor([7])},
+        hidden_states={"tts": torch.zeros(1, 4)},
+        **info,
+    )
+    info.update(updates)
+    batch, _ = _batch([dict(slot=3, prompt_len=2, computed=0, span=[0, 0], prefill=True)])
+    reqs = _req_states({3: 2})
+    talker.make_omni_output_mrv2(
+        torch.zeros(2, 4), input_batch=batch, req_states=reqs, model_intermediate_buffer=[info]
+    )
+    batch, _ = _batch([dict(slot=3, prompt_len=2, computed=2 + step - 1, span=[5], prefill=False)])
+    for name in ("input_ids", "idx_mapping", "seq_lens", "logits_indices"):
+        setattr(batch, name, getattr(batch, name).to(device))
+    reqs.prompt_len.gpu = reqs.prompt_len.gpu.to(device)
+    talker._mrv2_empty_speech = talker._mrv2_empty_speech.to(device)
+    talker._mrv2_codec_controls = talker._mrv2_codec_controls.to(device)
+    out = talker.make_omni_output_mrv2(
+        torch.zeros(1, 4, device=device), input_batch=batch, req_states=reqs, model_intermediate_buffer=[info]
+    )
+    if turn_end:
+        forced = False
+        masked = speech_tokens is None and step in {25, 29, 50, 54}
+    else:
+        budget = 50 if speech_tokens == 50 else 25
+        forced, masked = step >= budget, step < budget
+    assert talker.take_mrv2_forced_eos(batch, reqs, 1).tolist() == [forced]
+    assert talker._mrv2_mask_eos.tolist() == [masked]
+    assert out.multimodal_outputs["meta"]["codec_frame_valid"].tolist() == [True]
+    assert talker._mrv2_output_meta[1]["gander_context_version"][0].item() == 7
+    assert talker._mrv2_output_meta[1]["duplex_epoch"][0].item() == 3
+    assert talker._mrv2_output_meta[1]["duplex_turn_id"][0].item() == 5
 
 
 @pytest.mark.parametrize("forced", [None, [False, True]])
@@ -200,3 +343,82 @@ def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
     assert processed[0, 7].item() == pytest.approx(logits[0, 7].item() * penalty**3)
     # The runner still finds the output bin counts on ``penalties_state``.
     assert sampler.penalties_state.output_bin_counts is not None
+
+
+def test_history_survives_real_intermediate_buffer_merge_and_next_condition(mocker):
+    from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+
+    talker = _talker()
+    torch.nn.Module.__init__(talker)
+    talker._request_condition_states = {}
+    talker._request_audio_states = {}
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.zeros(2, 4))
+    buffer = OmniIntermediateBuffer(1)
+    buffer.add_request(
+        0,
+        SimpleNamespace(
+            req_id="r",
+            mm_features=[],
+            model_intermediate_buffer={
+                "native_duplex": True,
+                "ids": {"tts": torch.tensor([7])},
+                "hidden_states": {"tts": torch.zeros(1, 4)},
+                "meta": {"streaming_condition_seq": 0, "turn_start": True},
+            },
+        ),
+    )
+
+    def prefill():
+        _, _, updates = talker.preprocess(
+            torch.zeros(2, dtype=torch.long),
+            None,
+            **buffer.buffers[0],
+            _omni_is_prefill=True,
+            _omni_prompt_len=2,
+        )
+        buffer.update(0, updates)
+        return updates["audio_state"]
+
+    previous = prefill()
+    # The real buffer copies/merges dictionary fields; its audio_state is
+    # not the model-owned object even immediately after preprocess.
+    assert buffer.buffers[0]["audio_state"] is not previous
+    batch, _ = _batch([dict(slot=0, prompt_len=2, computed=2, span=[8], prefill=False)])
+    finalize = talker.mrv2_codec_history_finalizer(batch, buffer.gather(batch))
+    for code in [8, 9, 8]:
+        payload = {"codes.audio": torch.tensor([[code]]), "meta.codec_frame_valid": torch.tensor([True])}
+        assert finalize(payload, [1]) is payload
+    assert previous["recent_codes"] == [8, 9, 8]
+
+    buffer.update(0, {"meta": {"streaming_condition_seq": 1, "turn_start": False}})
+    current = prefill()
+    assert current is not previous
+    assert current["recent_codes"] == [8, 9, 8]
+    # A delayed copy still belongs to the old condition despite both buffer
+    # dictionaries being copies; it must not pollute the successor's prefix.
+    finalize(payload, [1])
+    assert previous["recent_codes"] == current["recent_codes"] == [8, 9, 8]
+    talker._deferred_cleanup_ids = set()
+    talker.on_requests_finished({"r"})
+    talker._flush_deferred_cleanup()
+    assert not talker._request_audio_states and not talker._request_condition_states
+
+
+@pytest.mark.parametrize("valid_rows", [[True], [False], [True, False, True], [False, False]])
+def test_history_finalizer_batched_read_matches_per_row_masks(valid_rows):
+    talker = _talker()
+    states = {"a": {"recent_codes": list(range(14))}, "b": {"recent_codes": [3]}}
+    talker._request_audio_states = dict(states)
+    n = len(valid_rows)
+    rows = [dict(slot=0, prompt_len=4, computed=6, span=list(range(50, 50 + n)), prefill=False)]
+    rows.append(dict(slot=1, prompt_len=4, computed=6, span=[90], prefill=False))
+    batch, _ = _batch(rows)
+    finalize = talker.mrv2_codec_history_finalizer(batch, [{"req_id": "a"}, {"req_id": "b"}])
+    payload = {
+        "codes": {"audio": torch.tensor([[50 + i] for i in range(n)] + [[90]])},
+        "meta": {"codec_frame_valid": torch.tensor([*valid_rows, True])},
+    }
+    assert finalize(payload, [1, 1]) is payload
+    kept = [50 + i for i, keep in enumerate(valid_rows) if keep]
+    assert states["a"]["recent_codes"] == (list(range(14)) + kept)[-16:]
+    assert states["b"]["recent_codes"] == [3, 90]

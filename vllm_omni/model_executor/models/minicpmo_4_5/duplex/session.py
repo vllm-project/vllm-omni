@@ -20,3 +20,5 @@ class MiniCPMO45ServingSessionState(DefaultDuplexModelSessionState):
     """
 
     audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
+    #: A cancelled response's turn is closed at the next append (``close_turn``).
+    close_turn_pending: bool = False

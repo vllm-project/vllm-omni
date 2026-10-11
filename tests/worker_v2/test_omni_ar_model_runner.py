@@ -105,6 +105,8 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
 
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
+    # This CPU orchestration test does not exercise pinned host transfers.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
     input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])
@@ -225,6 +227,16 @@ def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     expected = hidden[1:3].log_softmax(dim=-1)[:, [2, 0]].cpu()
     assert output.prompt_token_id_logprobs_dict["req"].device.type == "cpu"
     torch.testing.assert_close(output.prompt_token_id_logprobs_dict["req"], expected)
+
+
+def test_ensure_tensor_values_skips_absent_keys_without_warning(mocker) -> None:
+    warning = mocker.patch.object(omni_ar_model_runner.logger, "warning")
+    ids = torch.tensor([1, 2])
+    result = omni_ar_model_runner._ensure_tensor_values({"duplex_prompt_token_ids": None, "ids": ids, "step": 3})
+    assert set(result) == {"ids", "step"}
+    assert result["ids"] is ids
+    assert result["step"].item() == 3
+    warning.assert_not_called()
 
 
 def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
@@ -385,6 +397,11 @@ def test_async_output_slices_request_payloads_with_graph_padding(
         async_chunk=async_chunk,
     ).get_output()
 
+    if not async_chunk:
+        # Text output processing accumulates pooling and multimodal channels
+        # separately. Full payloads must have only one wire representation.
+        assert output.pooler_output is None
+        assert len(output.multimodal_outputs) == len(lengths)
     for i, payload in enumerate(output.inter_stage_outputs):
         torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
         torch.testing.assert_close(payload["codes.ref"], refs[i])
@@ -862,3 +879,41 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
+
+
+def test_full_payload_ledger_survives_runner_and_processor_once(monkeypatch):
+    """A three-row handoff remains three rows on both transport and client."""
+    from tests.engine.test_output_processor_mrv2_text import _Detokenizer, _make_processor, _rehydrated_output
+    from vllm_omni.outputs.output_modality import OutputModality
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    ids = torch.tensor([[11], [12], [13]])
+    positions = torch.arange(3).reshape(-1, 1)
+    hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 3]),
+        num_scheduled_tokens=np.array([3]),
+        num_reqs=1,
+        num_tokens_after_padding=3,
+    )
+    pending = _async_output(
+        req_ids=["r"],
+        text_hidden=hidden,
+        multimodal_outputs={"latent": hidden, "latent_input_ids": ids, "latent_positions": positions},
+        input_batch=batch,
+        async_chunk=False,
+    )
+    assert pending._mm_cpu["latent"] is pending._hidden_cpu
+    output = pending.get_output()
+    stage_payload = output.inter_stage_outputs[0]
+    for name, expected in [("latent", hidden), ("latent_input_ids", ids), ("latent_positions", positions)]:
+        torch.testing.assert_close(stage_payload[name], expected)
+    carrier = _rehydrated_output(pooling_output=output.pooler_output[0] if output.pooler_output else None)
+    carrier.multimodal_output = output.multimodal_outputs[0] if output.multimodal_outputs else None
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    processed = processor.process_outputs([carrier])
+    assert len(processed.request_outputs) == 1
+    completion = processed.request_outputs[0].outputs[0]
+    assert completion.text == "X" and list(completion.token_ids) == [42]
+    for name, expected in [("latent", hidden), ("latent_input_ids", ids), ("latent_positions", positions)]:
+        torch.testing.assert_close(completion.multimodal_output[name], expected)

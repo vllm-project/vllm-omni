@@ -38,7 +38,7 @@ from vllm_omni.engine.duplex import commands as duplex_commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, ResponseCreateOptions
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import DuplexEvent, SessionClosed
+from vllm_omni.engine.duplex.events import DuplexEvent, SessionClosed, SessionUpdated
 from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionError,
@@ -242,6 +242,14 @@ class DuplexSessionHandle:
     def output_guard(self, event: DuplexEvent) -> AbstractContextManager[bool]:
         """Recheck held audio while committing its delivery; never await inside this guard."""
         return self._outbox.guard(event)
+
+    def queued_events(self) -> tuple[DuplexEvent, ...]:
+        """Events accepted by the engine but not yet dequeued for delivery."""
+        return self._outbox.queued_events()
+
+    def observe_session_update(self) -> asyncio.Future[SessionUpdated | None]:
+        """Reserve the engine-owned acceptance/rejection before submitting an update."""
+        return self._outbox.observe_session_update()
 
     async def __aenter__(self) -> DuplexSessionHandle:
         return self

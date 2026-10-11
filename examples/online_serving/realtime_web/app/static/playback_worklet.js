@@ -10,6 +10,7 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
     this.started = false;
     this.activeResponseId = null;
     this.initialBufferFrames = Math.round(sampleRate * 0.2);
+    this.playbackLeadFrames = 0;
     this.bufferWaitFrames = this.initialBufferFrames;
     this.rebuffering = false;
     this.fadeFrames = Math.max(1, Math.round(sampleRate * 0.005));
@@ -25,6 +26,11 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       }
       if (!this.started && Number.isFinite(message.initialBufferMs)) {
         this.initialBufferFrames = Math.max(0, Math.round((sampleRate * message.initialBufferMs) / 1000));
+      }
+      if (!this.started) {
+        this.playbackLeadFrames = Number.isFinite(message.playbackLeadMs)
+          ? Math.max(0, Math.round((sampleRate * message.playbackLeadMs) / 1000))
+          : 0;
       }
       this.queue.push(message.pcm);
       if (!this.started && wasEmpty && !this.rebuffering) {
@@ -109,6 +115,15 @@ class FullDuplexPcmPlayback extends AudioWorkletProcessor {
       if (this.rebuffering && !this.drain) {
         this.underrunFrames += output.length;
         this.reportUnderrun();
+      }
+      // Native duplex supplies one model unit at a time. Existing audio can
+      // cover part of the interval until the next unit, so wait only for the
+      // remaining lead, bounded by the ordinary short-packet wait.
+      if (this.queue.length > 0 && this.playbackLeadFrames > 0) {
+        this.bufferWaitFrames = Math.min(
+          this.bufferWaitFrames,
+          Math.max(0, this.playbackLeadFrames - this.bufferedFrames()),
+        );
       }
       if (this.queue.length > 0 && this.bufferWaitFrames > 0) {
         this.bufferWaitFrames = Math.max(0, this.bufferWaitFrames - output.length);

@@ -46,6 +46,13 @@ class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
         super().__init__(hf_config, hf_text_config)
         self.stage_config_name = stage_config_name
 
+    def get_vocab_size(self) -> int:
+        # Some codec sub-configs (including MiniCPM-o's remote TTS config)
+        # name their single vocabulary num_audio_tokens. Resolve it before
+        # runner buffers are built: a zero-sized V1 InputBatch silently drops
+        # top-k even when the request explicitly sets it.
+        return getattr(self.hf_text_config, "vocab_size", getattr(self.hf_text_config, "num_audio_tokens", 0))
+
     def get_quantization_config(self):
         # When a stage_config_name is set, look for quantization config
         # in that stage's text_config first (has correct relative prefixes).

@@ -587,6 +587,35 @@ async def test_registry_resume_cancelled_mid_delivery_rolls_back_like_a_failure(
 
 
 @pytest.mark.asyncio
+async def test_context_replacement_invalidates_old_replay_but_duplicate_does_not(mocker):
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    created = await registry.create("sid-context", send=mocker.AsyncMock(), close=mocker.AsyncMock())
+    await registry.send_event("sid-context", {"type": "response.output_audio.delta", "delta": "AAAA"})
+    replaced = await registry.send_event(
+        "sid-context",
+        {
+            "type": "duplex.input.context.replaced",
+            "event": {"duplicate": False, "epoch": 1},
+        },
+    )
+    with pytest.raises(DuplexJournalGapError):
+        await registry.authenticate_resume(
+            "sid-context", resume_token=created.resume_token.plaintext, last_received_server_event_seq=0
+        )
+    await registry.send_event("sid-context", {"type": "response.output_audio.delta", "delta": "BBBB"})
+    await registry.send_event(
+        "sid-context",
+        {
+            "type": "duplex.input.context.replaced",
+            "event": {"duplicate": True, "epoch": 1},
+        },
+    )
+    await registry.authenticate_resume(
+        "sid-context", resume_token=created.resume_token.plaintext, last_received_server_event_seq=replaced.sequence
+    )
+
+
+@pytest.mark.asyncio
 async def test_release_hands_back_the_lease_generation_the_dropped_connection_was_serving(mocker) -> None:
     """The lease generation travels with the attachment, so a detach is fenced on the right lease."""
     registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)

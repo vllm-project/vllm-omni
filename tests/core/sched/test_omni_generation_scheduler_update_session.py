@@ -109,17 +109,21 @@ def test_generation_scheduler_records_prefill_stats_for_metrics() -> None:
     assert request.prefill_stats.num_cached_tokens == 0
 
 
-def test_resumable_generation_stop_marks_segment_boundary() -> None:
+@pytest.mark.parametrize("express", [True, False])
+@pytest.mark.parametrize("deferred", [True, False])
+def test_resumable_generation_stop_marks_segment_boundary(express: bool, deferred: bool) -> None:
     session = _make_request(request_id="req-generation-segment")
     session.status = RequestStatus.RUNNING
     session.resumable = True
     session.num_computed_tokens = len(session.prompt_token_ids)
     # schedule() has counted this step's token as in flight; update_from_output()
     # must settle it before handling the segment boundary.
-    session.num_in_flight_tokens = 1
+    session.num_in_flight_tokens = 0 if deferred else 1
 
     sched = MagicMock()
-    sched._first_chunk_express = False
+    sched._first_chunk_express = express
+    sched._chunk_started = {session.request_id}
+    sched._stream_audio = {session.request_id: [1.0, 2.0]}
     sched._express_min_slack_s = 0.0
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
@@ -150,19 +154,19 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched.make_stats.return_value = None
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
-    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.num_scheduled_tokens = {} if deferred else {session.request_id: 1}
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
     model_runner_output = MagicMock(spec=ModelRunnerOutput)
-    model_runner_output.sampled_token_ids = [[]]
+    model_runner_output.sampled_token_ids = [] if deferred else [[]]
     model_runner_output.logprobs = None
     model_runner_output.prompt_logprobs_dict = {}
     model_runner_output.pooler_output = None
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.req_id_to_index = {} if deferred else {session.request_id: 0}
     model_runner_output.routed_experts = None
 
     outputs = OmniGenerationScheduler.update_from_output(
@@ -176,6 +180,9 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     assert output.is_segment_finished is True
     sched._handle_stopped_request.assert_called_once_with(session)
     assert sched._pending_finish_reqs == []
+    assert not sched.chunk_transfer_adapter.segment_finished_requests
+    assert (session.request_id in sched._chunk_started) is (not express)
+    assert (session.request_id in sched._stream_audio) is (not express)
 
 
 @pytest.mark.parametrize("prompt_complete", [False, True])

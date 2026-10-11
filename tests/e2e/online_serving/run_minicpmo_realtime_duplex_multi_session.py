@@ -532,6 +532,7 @@ def _demo_args(
         output_audio_format="pcm16",
         chunk_ms=args.chunk_ms,
         realtime_input=args.realtime_input,
+        continuous_input=getattr(args, "continuous_input", False),
         first_turn_ms=args.first_turn_ms,
         turn_duration_ms=list(args.turn_duration_ms),
         first_turn_transcript=f"session {index} input",
@@ -663,6 +664,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-input-wav", action="append", default=[])
     parser.add_argument("--output-dir", default="/tmp/minicpmo_pr3907_multi_session_e2e")
     parser.add_argument("--realtime-input", action="store_true")
+    parser.add_argument("--continuous-input", action="store_true", help="Let the model own input turn boundaries.")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--turns", type=int, default=1)
     parser.add_argument("--first-turn-ms", type=int, default=1400)

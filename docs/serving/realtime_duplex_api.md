@@ -88,9 +88,9 @@ python examples/online_serving/barge_in_client.py \
     --output-dir ./duplex_out
 ```
 
-Input WAVs must be mono 16 kHz PCM16. `--ref-audio` is required by the
-MiniCPM-o preset (the session is otherwise rejected with
-`ref_audio_required`). `--preset personaplex` switches the session shape to
+Input WAVs must be mono 16 kHz PCM16. `--ref-audio` optionally conditions the
+MiniCPM-o voice; omitting it uses the model's default voice and codec prompt.
+`--preset personaplex` switches the session shape to
 the PersonaPlex preset. The flow is diagrammed in
 `examples/online_serving/barge_in_client_flow.md`.
 
@@ -1015,7 +1015,12 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
 
-After this acknowledgement, `conversation.item.retrieve` returns the truncated
+Check `capabilities.supports_audio_truncate` before sending this command.
+Gander's generated-token journal cannot apply an audio-aligned KV cut, so its
+sessions advertise `false` and reject this command and truncating playback ACKs
+with `audio_truncate_unsupported`. Ordinary playback ACKs remain supported.
+
+After a successful acknowledgement, `conversation.item.retrieve` returns the truncated
 transcript. Without text/audio alignment marks, its prefix is estimated from
 the requested position and audio duration; this is not exact word alignment.
 

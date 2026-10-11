@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.engine.duplex.intermediate import get_tts_handoff
+from vllm_omni.model_executor.models.minicpmo_4_5.reference_audio import decode_reference_audio
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     llm2tts,
@@ -70,7 +72,7 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
 
     info = converted["model_intermediate_buffer"]
     assert info["ids"]["tts"] == output_ids
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[2:4])
+    assert torch.equal(get_tts_handoff(info)[1], latent[2:4])
     assert converted["prompt_token_ids"] == [0, 0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 4
@@ -97,7 +99,7 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     )[0]
 
     info = converted["model_intermediate_buffer"]
-    assert info["codes"]["ref"] == ref_waveform.tolist()
+    assert torch.equal(decode_reference_audio(info["codes"]["ref"]), ref_waveform)
     assert info["meta"]["ref_audio_sr"] == 22050
     assert info["ids"]["tts"] == [11, 12]
 
@@ -178,7 +180,7 @@ def test_native_duplex_uses_forwarded_row_ledger_after_later_audio_prefill() -> 
 
     info = converted["model_intermediate_buffer"]
     assert info["ids"]["tts"] == [21, 22]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+    assert torch.equal(get_tts_handoff(info)[1], latent[3:5])
 
 
 def test_native_duplex_selects_latest_contiguous_forwarded_span() -> None:
@@ -211,7 +213,7 @@ def test_native_duplex_selects_latest_contiguous_forwarded_span() -> None:
     converted = llm2tts([source], prompt=[{}], _streaming_context=context)[0]
 
     info = converted["model_intermediate_buffer"]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[5:7])
+    assert torch.equal(get_tts_handoff(info)[1], latent[5:7])
 
 
 def test_native_duplex_rejects_missing_forwarded_terminal_token() -> None:
@@ -290,7 +292,7 @@ def test_native_duplex_ledger_tolerates_async_lookahead_row_after_terminator() -
     info = _native_handoff(source)
 
     assert info["ids"]["tts"] == [21, 22]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+    assert torch.equal(get_tts_handoff(info)[1], latent[3:5])
 
 
 def test_native_duplex_ledger_without_forwarded_terminator() -> None:
@@ -304,7 +306,7 @@ def test_native_duplex_ledger_without_forwarded_terminator() -> None:
     info = _native_handoff(source)
 
     assert info["ids"]["tts"] == [21, 22]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+    assert torch.equal(get_tts_handoff(info)[1], latent[3:5])
 
 
 def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
@@ -320,7 +322,7 @@ def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
     info = _native_handoff(source)
 
     assert info["ids"]["tts"] == [21, 9310]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+    assert torch.equal(get_tts_handoff(info)[1], latent[3:5])
     assert info["meta"]["turn_end"] is True
 
 
@@ -338,7 +340,7 @@ def test_native_duplex_ledger_anchors_on_unit_after_reinjected_listens() -> None
     info = _native_handoff(source)
 
     assert info["ids"]["tts"] == [21, 22]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[9:11])
+    assert torch.equal(get_tts_handoff(info)[1], latent[9:11])
 
 
 @pytest.mark.parametrize("previous_terminator_forwarded", [False, True])
@@ -359,7 +361,7 @@ def test_native_duplex_ledger_prefers_latest_repeat_of_the_unit(
     info = _native_handoff(source)
 
     assert info["ids"]["tts"] == [21, 22]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[current_start + 1 : current_start + 3])
+    assert torch.equal(get_tts_handoff(info)[1], latent[current_start + 1 : current_start + 3])
 
 
 def test_native_duplex_ledger_rejects_non_contiguous_positions() -> None:
@@ -384,12 +386,13 @@ def test_native_duplex_mid_turn_tts_bos_slices_after_boundary() -> None:
     info = _native_handoff(source)
 
     assert info["ids"]["tts"] == [21, 22]
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+    assert torch.equal(get_tts_handoff(info)[1], latent[3:5])
 
 
 @pytest.mark.parametrize("opening", [9304, 9301])
 @pytest.mark.parametrize("turn_end", [True, False])
-def test_native_duplex_mid_unit_tts_bos_keeps_earlier_text(opening, turn_end) -> None:
+@pytest.mark.parametrize("speech_tokens", [None, 50])
+def test_native_duplex_mid_unit_tts_bos_keeps_earlier_text(opening, turn_end, speech_tokens) -> None:
     # The policy rewrites a mid-turn <|listen|> into <|tts_bos|> anywhere in a
     # unit. It is conditioning like text; it must not restart the slice and
     # drop the words sampled before it.
@@ -399,17 +402,20 @@ def test_native_duplex_mid_unit_tts_bos_keeps_earlier_text(opening, turn_end) ->
         output_ids=[opening, 21, 22, 9301, *tail],
         row_ids=[101, 102, opening, 21, 22, 9301, *tail[:1]],
     )
+    if speech_tokens is not None:
+        source.outputs[0].multimodal_output["meta"]["gander_speech_tokens"] = speech_tokens
 
     info = _native_handoff(source)
 
     expected = [21, 22, 9301, 9310] if turn_end else [21, 22, 9301]
     assert info["ids"]["tts"] == expected
-    torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), latent[3 : 3 + len(expected)])
+    torch.testing.assert_close(get_tts_handoff(info)[1], latent[3 : 3 + len(expected)])
     assert info.get("meta", {}).get("turn_end", False) is turn_end
 
 
 @pytest.mark.parametrize("terminator", [[9308], [9310, 9308]])
-def test_native_duplex_folded_boundary_with_mid_unit_tts_bos(terminator) -> None:
+@pytest.mark.parametrize("speech_tokens", [None, 50])
+def test_native_duplex_folded_boundary_with_mid_unit_tts_bos(terminator, speech_tokens) -> None:
     # A boundary folded as the last prompt token opens the unit even when the
     # policy also rewrites a later listen into <|tts_bos|> inside it.
     source, latent = _native_source(
@@ -417,12 +423,30 @@ def test_native_duplex_folded_boundary_with_mid_unit_tts_bos(terminator) -> None
         output_ids=[21, 22, 9301, *terminator],
         row_ids=[101, 9301, 21, 22, 9301, *terminator[:-1]],
     )
+    if speech_tokens is not None:
+        source.outputs[0].multimodal_output["meta"]["gander_speech_tokens"] = speech_tokens
 
     info = _native_handoff(source)
 
     expected = [21, 22, 9301, *terminator[:-1]]
     assert info["ids"]["tts"] == expected
-    torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), latent[2 : 2 + len(expected)])
+    torch.testing.assert_close(get_tts_handoff(info)[1], latent[2 : 2 + len(expected)])
+
+
+@pytest.mark.parametrize("opening", [9304, 9311])
+def test_native_duplex_gander_decision_after_folded_boundary(opening) -> None:
+    source, latent = _native_source(
+        prompt_ids=[101, 9301],
+        output_ids=[opening, 21, 22, 9301, 9310, 9308],
+        row_ids=[101, 9301, opening, 21, 22, 9301, 9310],
+    )
+    source.outputs[0].multimodal_output["meta"].update(gander_speech_tokens=50, backchannel_token_id=9311)
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22, 9301, 9310]
+    torch.testing.assert_close(get_tts_handoff(info)[1], latent[3:7])
+    assert info["meta"]["turn_end"] is True
 
 
 @pytest.mark.parametrize("folded_decisions", [0, 1, 2])
@@ -458,10 +482,11 @@ def test_native_duplex_tts_bos_aligns_after_window_rebuild(folded_decisions, bos
     converted = llm2tts([source], prompt=[{}], _streaming_context=SimpleNamespace(bridge_states={}))[0]
     info = converted["model_intermediate_buffer"]
     assert info["ids"]["tts"] == [21, 22]
-    torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), latent[-3:-1])
+    torch.testing.assert_close(get_tts_handoff(info)[1], latent[-3:-1])
 
 
-def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
+@pytest.mark.parametrize("runner_version", ["v1", "v2"])
+def test_native_duplex_continuation_appends_only_new_talker_condition(runner_version: str) -> None:
     prompt_ids = [101, 102]
     token_ids = {
         "tts_bos_token_id": 9301,
@@ -548,13 +573,34 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     assert third_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 2
     assert restarted_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 0
     assert first_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
-    assert "replace_streaming_prompt" not in second_input["model_intermediate_buffer"]["meta"]
+    assert second_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is False
     assert third_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_prompt_len"] == 3
     assert first_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert third_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["prompt_token_ids"] == [0, 0, 0]
+
+    # The shared runners merge metadata on resume. An omitted false flag would
+    # leave the first handoff's replacement boundary active on the next chunk.
+    if runner_version == "v1":
+        from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+        runner = SimpleNamespace(
+            model=SimpleNamespace(),
+            model_intermediate_buffer={"req-1": {}},
+            requests={"req-1": SimpleNamespace()},
+        )
+        for handoff, expected_replace in [(first_input, True), (second_input, False), (third_input, True)]:
+            OmniGPUModelRunner._update_streaming_input_additional_info(runner, SimpleNamespace(**handoff), "req-1")
+            assert runner.model_intermediate_buffer["req-1"]["meta"]["replace_streaming_prompt"] is expected_replace
+    else:
+        from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+
+        buffer = OmniIntermediateBuffer(max_num_reqs=1)
+        for handoff, expected_replace in [(first_input, True), (second_input, False), (third_input, True)]:
+            buffer.update(0, handoff["model_intermediate_buffer"])
+            assert buffer.buffers[0]["meta"]["replace_streaming_prompt"] is expected_replace
 
 
 def test_native_duplex_transcript_decodes_the_talker_condition_slice() -> None:

@@ -52,6 +52,9 @@ def _map_with_stage_prefix(
 class OmniINCConfig(INCConfig):
     """INC config with stage-prefix mapping and AutoRound MXFP8/NVFP4 dispatch."""
 
+    block_name_to_quantize: list[str] | str | None
+    extra_config: dict[str, Any] | None
+
     SUPPORTED_DTYPES = {"int", "mx_fp", "nv_fp"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq", "auto_round:llm_compressor"}
 

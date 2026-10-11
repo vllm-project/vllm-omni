@@ -208,8 +208,6 @@ def main(default_profile: str = "minicpm-native") -> None:
     args = parser.parse_args()
     native = args.profile == "minicpm-native"
     aura = args.profile == "aura-ptt"
-    if native and not args.ref_audio:
-        parser.error("--ref-audio is required for the minicpm-native profile")
     if not native and args.ref_audio:
         parser.error("--ref-audio is only supported by minicpm-native")
     args.model = args.model or (

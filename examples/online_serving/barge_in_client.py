@@ -45,9 +45,9 @@ to the model's bundled duplex profile):
 
 Input WAVs must be mono 16 kHz PCM16; when a preset's session takes a
 different capture format (the PersonaPlex preset streams 24 kHz float32),
-the audio is converted before streaming. ``--ref-audio`` is required by the
-MiniCPM-o preset (without it the session is rejected with
-``ref_audio_required``). Outputs land in ``--output-dir`` as one WAV per
+the audio is converted before streaming. ``--ref-audio`` optionally conditions
+the MiniCPM-o voice; omitting it uses the model's default voice and codec
+prompt. Outputs land in ``--output-dir`` as one WAV per
 response — ``response_1_cancelled.wav`` for a barged-in answer,
 ``response_1_completed.wav`` for one that finished — plus ``summary.json``.
 """

@@ -158,14 +158,14 @@ def test_autoround_in_supported_methods():
     assert "inc" in SUPPORTED_QUANTIZATION_METHODS
 
 
-def test_integration_autoround_via_omni_diffusion_config():
+def test_integration_autoround_via_omni_diffusion_config(tmp_path):
     """OmniDiffusionConfig with auto-round quantization dict should resolve."""
     from vllm.model_executor.layers.quantization.inc import INCConfig
 
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     config = OmniDiffusionConfig(
-        model="test",
+        model=str(tmp_path),
         quantization_config={
             "method": "auto-round",
             "bits": 4,
@@ -177,7 +177,7 @@ def test_integration_autoround_via_omni_diffusion_config():
     assert config.quantization_config.weight_bits == 4
 
 
-def test_integration_autodetect_from_transformer_config():
+def test_integration_autodetect_from_transformer_config(tmp_path):
     """When TransformerConfig has quant_config, OmniDiffusionConfig should
     auto-detect it even without explicit quantization_config."""
     from vllm.model_executor.layers.quantization.inc import INCConfig
@@ -201,6 +201,6 @@ def test_integration_autodetect_from_transformer_config():
     assert tf_config.quant_method == "auto-round"
     assert isinstance(tf_config.quant_config, INCConfig)
 
-    od_config = OmniDiffusionConfig(model="test", tf_model_config=tf_config)
+    od_config = OmniDiffusionConfig(model=str(tmp_path), tf_model_config=tf_config)
     assert isinstance(od_config.quantization_config, INCConfig)
     assert od_config.quantization_config.weight_bits == 4

@@ -1395,13 +1395,18 @@ class OrchestratorBase:
 
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
-            if output.finished or segment_finished:
+            session_audio = req_state.session_owned and pool.final_output and pool._has_audio_output([output])
+            # A session may interrupt a response before its persistent stage
+            # request ends. Attribute each audio chunk while that response
+            # still owns it, rather than charging it to the next response.
+            if output.finished or segment_finished or session_audio:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
                     request_timestamp=req_state.request_timestamp,
                     replica_id=replica_id,
                     sampling_params=req_state.sampling_params_list[stage_id],
+                    incremental=req_state.session_owned and pool.final_output,
                 )
                 if self.collect_stage_metrics:
                     stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)

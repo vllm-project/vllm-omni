@@ -121,6 +121,7 @@ class AckPlayback(RealtimeCommand):
     committed_ms: int | None = None
     response_id: str | None = None
     item_id: str | None = None
+    truncate: bool | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

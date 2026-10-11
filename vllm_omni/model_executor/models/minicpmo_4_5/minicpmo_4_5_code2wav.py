@@ -34,6 +34,7 @@ from .batched_token2wav import (
     state_shape_signature,
 )
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+from .reference_audio import decode_reference_audio
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
@@ -161,7 +162,7 @@ def _normalize_reference(
     References longer than ``max_seconds`` are truncated with a warning;
     the window is configurable via ``ref_audio_max_seconds``.
     """
-    tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
+    tensor = decode_reference_audio(ref_audio)
     if tensor.dim() > 1:
         # (channels, samples) -> mono; plain reshape(-1) would interleave.
         # Upstream flattens request references to 1-D, so anything else is a
@@ -292,6 +293,7 @@ class _WorkItem:
     tts_is_last_chunk: bool
     segment_end: bool
     turn_end: bool
+    gander_context_version: int = 0
     has_payload: bool = True
 
 
@@ -412,6 +414,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+            "capture_warmup_iterations": int(extra.get("cfm_capture_warmup_iterations", 3)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
             "capture_frames": extra.get("cfm_graph_capture_frames"),
             "offset_bucket_frames": int(extra.get("cfm_graph_offset_bucket_frames", 50)),
@@ -797,6 +800,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             runtime_prompt_key=runtime_prompt_key,
             duplex_epoch=int(_scalar(meta.get("duplex_epoch"), -1)),
             duplex_turn_id=int(_scalar(meta.get("duplex_turn_id"), -1)),
+            gander_context_version=int(_scalar(meta.get("gander_context_version"), 0)),
             segment_text_utf8=segment_text_utf8,
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
@@ -1224,6 +1228,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # processor before the full-duplex data plane consumes them.
                 "meta.duplex_epoch": [torch.tensor(item.duplex_epoch, dtype=torch.int32) for item in items],
                 "meta.duplex_turn_id": [torch.tensor(item.duplex_turn_id, dtype=torch.int32) for item in items],
+                "meta.duplex_context_version": [
+                    torch.tensor(item.gander_context_version, dtype=torch.int32) for item in items
+                ],
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
@@ -1501,8 +1508,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
         )
-        # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
+        # Capture after weight loading: V1's profile forward or the worker's
+        # auxiliary hook runs before readiness. Capturing during weight load
+        # holds far more memory in the graph pool.
         self._precapture_pending = bool(extra.get("cfm_graph_precapture", True))
+
+    @torch.inference_mode()
+    def capture_auxiliary_graphs(self) -> None:
+        """Warm codec graphs before readiness, including MRv2's no-dummy path."""
+        if not getattr(self, "_precapture_pending", False) or self.backend is None:
+            return
+        # Use forward's precision policy and empty, valid structured input.
+        # This captures the default prompt without creating decoder sessions.
+        device = next(self.backend.flow.parameters()).device
+        self.forward(input_ids=torch.empty(0, dtype=torch.long, device=device), seq_token_counts=[0])
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).

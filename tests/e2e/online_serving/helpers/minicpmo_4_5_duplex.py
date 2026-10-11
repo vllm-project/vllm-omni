@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 import wave
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,14 +20,15 @@ from tests.helpers.stage_config import (
     get_deploy_duplex_max_sessions,
     modify_stage_config,
 )
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "openbmb/MiniCPM-o-4_5"
 DEPLOY_CONFIG_REL = "minicpmo_4_5.yaml"
 DEPLOY_CONFIG = get_deploy_config_path(DEPLOY_CONFIG_REL)
-# Eager-execution variant for fast-startup core-tier probes (e.g. the duplex
-# client live test): skips CUDA-graph capture on the LLM and Talker stages.
-CORE_DEPLOY_CONFIG = modify_stage_config(
+# Eager-execution variant for the real-weight duplex client live test:
+# skips CUDA-graph capture on the LLM and Talker stages.
+EAGER_DEPLOY_CONFIG = modify_stage_config(
     DEPLOY_CONFIG,
     updates={
         "stages": {
@@ -54,17 +56,45 @@ SERVER_PARAMS = [
     )
 ]
 
+# Keep the production graph/sampling paths, with KV headroom on 80 GiB CI
+# devices. These scenarios use at most two simultaneous sessions.
+MRV2_PROFILE_CONFIG = get_deploy_config_path("minicpmo_4_5_duplex_mrv2_h200.yaml")
+MRV2_DEPLOY_CONFIG = modify_stage_config(
+    MRV2_PROFILE_CONFIG,
+    updates={
+        # The generated file lives in a temporary directory, so inheritance
+        # must resolve through the absolute production profile path.
+        "base_config": MRV2_PROFILE_CONFIG,
+        "stages": {0: {"kv_cache_memory_bytes": 17179869184}},
+    },
+)
+MRV2_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=MRV2_DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        ),
+        id="three-stage-mrv2-duplex",
+        marks=pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="MRv2 duplex requires CUDA"),
+    )
+]
+DUPLEX_RUNNER_SERVER_PARAMS = SERVER_PARAMS + MRV2_SERVER_PARAMS
+
 CORE_SERVER_PARAMS = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=CORE_DEPLOY_CONFIG,
+            stage_config_path=EAGER_DEPLOY_CONFIG,
             use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
         id="three-stage-single-gpu",
     )
 ]
+
+EAGER_SERVER_PARAMS = CORE_SERVER_PARAMS
 
 
 def deploy_max_sessions() -> int:
@@ -180,8 +210,8 @@ def multi_session_args(
     ref_audio: Path,
     output_dir: Path,
     response_required: bool,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> Namespace:
+    return Namespace(
         url=realtime_url(omni_server),
         model=omni_server.model,
         sessions=2,

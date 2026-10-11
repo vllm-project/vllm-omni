@@ -421,3 +421,66 @@ def test_a_rejected_value_does_not_outlive_its_test(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("session_mode", ["turn", "duplex"])
+def test_session_owned_wait_keeps_terminal_deadline(chunked, session_mode, monkeypatch, mocker):
+    from vllm.config import VllmConfig
+
+    from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.core.sched import omni_scheduling_coordinator
+    from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
+
+    now = 1000.0
+    monkeypatch.setattr(omni_scheduling_coordinator.time, "monotonic", lambda: now)
+    receiver = OmniSchedulingCoordinator(stage_id=2)
+    receiver._waiting_since = {"session": 0.0, "ordinary": 0.0}
+    if chunked:
+        # Use the real chunk timeout collector without starting connector I/O.
+        receiver = object.__new__(OmniChunkTransferAdapter)
+        receiver._waiting_since = {"session": 0.0, "ordinary": 0.0}
+        receiver.connector = mocker.Mock(stage_id=2)
+        receiver.receives_chunks = True
+        scheduler = _FakeChunkScheduler({}, receiver)
+        sweep = scheduler._process_pending_chunk_timeouts
+    else:
+        scheduler = _FakeScheduler({}, receiver)
+        sweep = scheduler._process_pending_input_timeouts
+    scheduler.vllm_config = mocker.Mock(
+        spec=VllmConfig, model_config=mocker.Mock(spec=OmniModelConfig, session_mode=session_mode)
+    )
+    scheduler.requests = {}
+    for request_id, resumable in [("session", True), ("ordinary", False)]:
+        request = Request(
+            request_id=request_id,
+            prompt_token_ids=[1],
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            client_index=0,
+        )
+        request.resumable = resumable
+        scheduler.requests[request_id] = request
+
+    sweep()
+    expected = {"ordinary"} if session_mode == "duplex" else {"session", "ordinary"}
+    assert scheduler.finish_calls[0][0] == expected
+    if session_mode == "turn":
+        assert not receiver._waiting_since
+        return
+
+    assert receiver._waiting_since == {"session": now}
+    # Another long listening interval must preserve the request and its poll.
+    now += 1000
+    sweep()
+    assert len(scheduler.finish_calls) == 1
+    assert receiver._waiting_since == {"session": now}
+    scheduler.requests["session"].resumable = False
+    now += 599
+    sweep()
+    assert len(scheduler.finish_calls) == 1
+    now += 2
+    sweep()
+    assert scheduler.finish_calls[1][0] == {"session"}
+    assert not receiver._waiting_since

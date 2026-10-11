@@ -390,7 +390,7 @@ class DuplexEngineSession:
     def release_resources_for_request_ids(self, request_ids: Iterable[str]) -> list[str]:
         """Drop bindings for these request ids, whichever fence they sit on.
 
-        ``cancel_fence`` only releases the fence being cancelled. Overlapped
+        ``release_fence`` only releases the fence being cancelled. Overlapped
         draining output stages belong to an older turn fence and would
         otherwise stay until the session closes.
         """
@@ -408,11 +408,6 @@ class DuplexEngineSession:
             if resource.request_id not in wanted
         }
         return released
-
-    def cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
-        stale = self.prepare_cancel_fence(cancelled_fence, next_fence)
-        self.release_fence(cancelled_fence)
-        return stale
 
     def prepare_cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
         """Advance the cancellation fence without dropping cleanup records."""
@@ -1029,7 +1024,7 @@ class DuplexEngineSession:
             "num_tokens_out",
             "stage_gen_time_ms",
             "postprocess_time_ms",
-            "audio_generated_frames",
+            "audio_frames",
             "audio_duration_s",
             "image_pixels",
             "output_unit_count",

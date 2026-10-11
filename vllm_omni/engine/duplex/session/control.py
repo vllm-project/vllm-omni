@@ -172,6 +172,13 @@ class SessionControl:
             )
             return
         if turn_event == "conversation.item.truncate":
+            if not session.capabilities.supports_audio_truncate:
+                self._out.emit_error(
+                    "audio_truncate_unsupported",
+                    "This session cannot truncate model audio history",
+                    event_id=realtime_event_id,
+                )
+                return
             payload = event.get("payload")
             item_id = payload.get("item_id") if isinstance(payload, dict) else None
             audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None
@@ -203,6 +210,7 @@ class SessionControl:
         pending_turn_detection: PendingTurnDetectionUpdate | None = None
 
         def reject_update() -> None:
+            self._ctx.manager.reject_session_update(session.session_id)
             if pending_turn_detection is not None:
                 pending_turn_detection.reject()
 
@@ -212,6 +220,7 @@ class SessionControl:
             )
         except Exception as exc:
             self._out.emit_error("unsupported_turn_detection", str(exc), event_id=realtime_event_id)
+            reject_update()
             return
         if not await self._wait_for_append_tail():
             self._out.emit_error(
@@ -294,6 +303,27 @@ class SessionControl:
         item = payload.get("item") if isinstance(payload, dict) else None
         item_type = item.get("type") if isinstance(item, dict) else None
         if item_type == "function_call_output" and isinstance(item, dict):
+            if self._ctx.history is not None:
+                applied = await self._ctx.history.handle(
+                    "input.context.append",
+                    {
+                        "kind": "tool_result",
+                        "event_id": str(item.get("id") or "result:" + str(item.get("call_id"))),
+                        "epoch": session.epoch,
+                        "call_id": item.get("call_id"),
+                        "output": item.get("output"),
+                    },
+                )
+                if applied:
+                    self._out.emit(
+                        {
+                            "type": "conversation.item.created",
+                            "session_id": session.session_id,
+                            "item": item,
+                            "created": True,
+                        }
+                    )
+                return
             if not await self._wait_for_append_tail():
                 return
             try:

@@ -1,0 +1,38 @@
+# Opt-in single-H200 Gander profile using the shared native-duplex MRv2 path.
+# Keep the four-session capacity, Unit8/50 grammar, sampling and codec math.
+# Compare strict pronunciation, tails, tool lifecycle and latency against V1.
+base_config: gander_hift_h200.yaml
+model_runner: v2
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      initial_codec_chunk_frames: 10
+
+stages:
+  - stage_id: 0
+    # llm2tts needs the complete Thinker hidden-state ledger in MRv2.
+    async_chunk: false
+    enforce_eager: false
+    async_scheduling: true
+    compilation_config:
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+  - stage_id: 1
+    enforce_eager: false
+    async_scheduling: false
+    compilation_config:
+      cudagraph_mode: FULL
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+  - stage_id: 2
+    async_scheduling: false
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

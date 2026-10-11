@@ -20,6 +20,7 @@ import json
 import sys
 import wave
 from pathlib import Path
+from typing import TypedDict
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
@@ -165,12 +166,28 @@ def _compact_sequence(events: list[dict[str, object]]) -> list[str]:
     return sequence
 
 
+class ResponseSummary(TypedDict):
+    response_id: str
+    created_index: int | None
+    done_indices: list[int]
+    created_offset_ms: float | None
+    done_offset_ms: float | None
+    audio_delta_count: int
+    transcript_delta_count: int
+    audio_delta_offsets_ms: list[float | None]
+    audio_duration_ms: list[float | None]
+    transcript: str
+    one_done: bool
+    audio_before_done_ok: bool
+    stale_audio_count: int
+
+
 def _response_summary(
     events: list[dict[str, object]],
     response_id: str,
     *,
     t0: float | None,
-) -> dict[str, object]:
+) -> ResponseSummary:
     created_indices = [
         index
         for index, event in enumerate(events)
@@ -225,6 +242,7 @@ def summarize_artifacts(
     min_responses: int,
     min_audio_deltas_per_response: int,
     expect_followup_response_substring: str | None,
+    require_model_interrupt: bool = False,
 ) -> dict[str, object]:
     if validation_mode not in {"model-policy", "response-required"}:
         raise ValueError(f"unsupported validation mode: {validation_mode}")
@@ -237,7 +255,7 @@ def summarize_artifacts(
     response_summaries = [_response_summary(events, response_id, t0=t0) for response_id in response_ids]
     commit_index = _first_event_index(events, "input_audio_buffer.committed")
     first_created_index = next(
-        (summary["created_index"] for summary in response_summaries if isinstance(summary.get("created_index"), int)),
+        (summary["created_index"] for summary in response_summaries if summary["created_index"] is not None),
         None,
     )
     first_done_index = (
@@ -303,9 +321,7 @@ def summarize_artifacts(
     followup_response_transcripts = [
         str(summary.get("transcript") or "")
         for summary in response_summaries[1:]
-        if commit_index is not None
-        and isinstance(summary.get("created_index"), int)
-        and summary["created_index"] < commit_index
+        if commit_index is not None and summary["created_index"] is not None and summary["created_index"] < commit_index
     ]
     followup_response_transcript_ok = any(
         bool(_normalize_text(transcript)) for transcript in followup_response_transcripts
@@ -325,8 +341,20 @@ def summarize_artifacts(
         1
         for event in events
         if event.get("type") == "response.done"
-        and isinstance(event.get("response"), dict)
-        and event["response"].get("status") == "cancelled"
+        and isinstance(response := event.get("response"), dict)
+        and response.get("status") == "cancelled"
+    )
+    model_interrupt_count = sum(
+        bool(
+            event.get("type") == "response.listen"
+            and isinstance(response := event.get("response"), dict)
+            and isinstance(metadata := response.get("metadata"), dict)
+            and metadata.get("reason") == "model_interrupt"
+        )
+        for event in events
+    )
+    cancellation_ok = (
+        cancelled_count >= 1 and model_interrupt_count >= 1 if require_model_interrupt else cancelled_count == 0
     )
     result_ok = result.get("ok") is True
     # response-required keeps the full listen sandwich around commit. model-policy
@@ -340,7 +368,7 @@ def summarize_artifacts(
     common_contract_ok = bool(
         result_ok
         and not error_events
-        and cancelled_count == 0
+        and cancellation_ok
         and enough_responses
         and response_lifecycle_ok
         and multi_delta_ok
@@ -353,6 +381,7 @@ def summarize_artifacts(
         and listen_before_first_response
         and listen_after_last_done
         and followup_response_transcript_ok
+        and (not require_model_interrupt or followup_response_transcript_expectation_ok)
     )
     ok = common_contract_ok and mode_contract_ok
     return {
@@ -383,6 +412,9 @@ def summarize_artifacts(
         "followup_response_transcript_expectation_ok": followup_response_transcript_expectation_ok,
         "error_count": len(error_events),
         "cancelled_count": cancelled_count,
+        "require_model_interrupt": require_model_interrupt,
+        "model_interrupt_count": model_interrupt_count,
+        "cancellation_ok": cancellation_ok,
         "compact_sequence": _compact_sequence(events),
         "output_dir": str(output_dir),
     }
@@ -451,6 +483,7 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         min_responses=args.min_responses,
         min_audio_deltas_per_response=args.min_audio_deltas_per_response,
         expect_followup_response_substring=args.expect_followup_response_substring,
+        require_model_interrupt=getattr(args, "require_model_interrupt", False),
     )
     summary.update(
         {
@@ -493,6 +526,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
+    parser.add_argument("--require-model-interrupt", action="store_true")
     parser.add_argument("--input-sha256")
     parser.add_argument("--expect-followup-response-substring")
     args = parser.parse_args()

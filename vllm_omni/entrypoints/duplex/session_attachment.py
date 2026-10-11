@@ -317,6 +317,15 @@ class DuplexSessionAttachmentRegistry:
                 with event_guard() if event_guard is not None else nullcontext(True) as valid:
                     if not valid:
                         return None
+                    event = payload.get("event")
+                    if (
+                        payload.get("type") == "duplex.input.context.replaced"
+                        and isinstance(event, dict)
+                        and event.get("duplicate") is False
+                    ):
+                        # A reconnect cursor before physical context replacement
+                        # cannot replay speech/tool events from the retired epoch.
+                        state.journal.acknowledge(state.journal.last_sequence)
                     entry = state.journal.record(payload) if journal else None
                     attachment = state.attachment
                     wire_payload = dict(entry.payload) if entry is not None else dict(payload)

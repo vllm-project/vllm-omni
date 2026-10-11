@@ -31,6 +31,25 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("active_window", [0, 2])
+def test_generation_receives_next_chunk_only_after_output_retires(build_adapter, mocker, active_window):
+    adapter, _ = build_adapter(stage_id=2, model_mode="generation")
+    adapter._active_window = active_window
+    load = mocker.spy(adapter, "load_async")
+    request = _req("inflight", RequestStatus.RUNNING)
+    request.num_in_flight_tokens = 1
+    running = [request]
+    waiting = create_request_queue(SchedulingPolicy.FCFS)
+    adapter.process_pending_chunks(waiting, running, scheduler_requests={request.request_id: request})
+    assert running == [request]
+    assert request.status == RequestStatus.RUNNING
+    load.assert_not_called()
+    request.num_in_flight_tokens = 0
+    adapter.process_pending_chunks(waiting, running, scheduler_requests={request.request_id: request})
+    load.assert_called_once_with(request)
+    assert request.status == RequestStatus.WAITING_FOR_CHUNK
+
+
 @pytest.fixture
 def shm_sender(build_adapter):
     adapter, _ = build_adapter(stage_id=0)
@@ -192,6 +211,9 @@ class DummyWaitingQueue(list):
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
     request = Mock(
+        _all_token_ids=[],
+        _output_token_ids=[],
+        output_token_count=0,
         client_index=0,
         request_id=req_id,
         external_req_id=external_req_id or req_id,
@@ -199,6 +221,7 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         prompt_token_ids=[],
         num_prompt_tokens=0,
         num_computed_tokens=0,
+        num_in_flight_tokens=0,
         num_output_placeholders=0,
         prefill_stats=None,
         additional_information=None,
@@ -1864,6 +1887,22 @@ def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter)
     prompt_token_stats.update_from_output(second_chunk_stats)
     assert prompt_token_stats.total == 5
     assert prompt_token_stats.computed == 5
+
+
+@pytest.mark.parametrize("chunk_ids", [[7, 8, 9], [0], []])
+def test_generation_chunk_replacement_keeps_mrv2_prefill_token_views(chunk_ids):
+    from vllm_omni.core.sched.output import OmniNewRequestData
+
+    request = Request("codec", [0], SamplingParams(max_tokens=1), pooling_params=None)
+    request.append_output_token_ids([11, 12])
+    all_tokens, output_tokens = request.all_token_ids, request.output_token_ids
+    request.prompt_token_ids = chunk_ids
+    OmniChunkTransferAdapter._refresh_generation_chunk_prefill_state(request)
+    assert list(all_tokens) == chunk_ids
+    assert list(output_tokens) == []
+    assert request.num_tokens == request.num_prompt_tokens == len(chunk_ids)
+    scheduled = OmniNewRequestData.from_request(request, (), list(request.all_token_ids))
+    assert scheduled.prefill_token_ids == scheduled.prompt_token_ids == chunk_ids
 
 
 def test_sender_only_adapter_does_not_park_or_clear_requests(build_adapter):

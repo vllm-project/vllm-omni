@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
@@ -150,6 +151,11 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        self._audio_snapshot_frames_by_request: dict[str, int] = {}
+        self._reported_audio_frames_by_request: dict[str, int] = {}
+        self._metrics_end_timestamps_by_request: dict[str, float] = {}
+        self._metrics_prompt_submissions_by_request: dict[str, float] = {}
+        self._reported_token_counts_by_request: dict[str, int] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -533,6 +539,11 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        self._audio_snapshot_frames_by_request.pop(str(request_id), None)
+        self._reported_audio_frames_by_request.pop(str(request_id), None)
+        self._metrics_end_timestamps_by_request.pop(str(request_id), None)
+        self._metrics_prompt_submissions_by_request.pop(str(request_id), None)
+        self._reported_token_counts_by_request.pop(str(request_id), None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -630,17 +641,27 @@ class StagePool:
         request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
+        incremental: bool = False,
     ) -> StageRequestMetrics:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
-        stage_gen_time_ms = (now - submit_ts) * 1000.0
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
+        # A resumable request reports several segment ends under the same
+        # request id. Emit non-overlapping wall intervals so response totals
+        # do not repeatedly include all earlier segments of that request.
+        previous_metrics_ts = (
+            self._metrics_end_timestamps_by_request.get(request_id, submit_ts) if incremental else submit_ts
+        )
+        stage_gen_time_ms = max(now - max(submit_ts, previous_metrics_ts), 0.0) * 1000.0
+        if incremental and request_id:
+            self._metrics_end_timestamps_by_request[request_id] = max(now, previous_metrics_ts)
         native_text_metrics = {}
         if request_id:
             pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
             if callable(pop_native_text_metrics):
                 native_text_metrics = pop_native_text_metrics(request_id)
         native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        output_kind = getattr(sampling_params, "output_kind", None)
         finish_reason = next(
             (
                 str(reason)
@@ -655,12 +676,26 @@ class StagePool:
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
             else count_tokens_from_outputs(request_outputs)
         )
+        if (
+            incremental
+            and request_id
+            and not (isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool))
+            and output_kind in (RequestOutputKind.CUMULATIVE, RequestOutputKind.FINAL_ONLY)
+        ):
+            previous_token_count = self._reported_token_counts_by_request.get(request_id, 0)
+            self._reported_token_counts_by_request[request_id] = max(num_tokens_out, previous_token_count)
+            num_tokens_out = max(num_tokens_out - previous_token_count, 0)
         num_tokens_in = 0
         if self.stage_id == 0:
             for ro in request_outputs:
                 ptids = getattr(ro, "prompt_token_ids", None)
                 if ptids is not None:
                     num_tokens_in += len(ptids)
+            if incremental and request_id:
+                if self._metrics_prompt_submissions_by_request.get(request_id) == submit_ts:
+                    num_tokens_in = 0
+                else:
+                    self._metrics_prompt_submissions_by_request[request_id] = submit_ts
 
         metrics = self._replica_metrics[replica_id]
         metrics.batch_seq += 1
@@ -693,6 +728,9 @@ class StagePool:
             return stage_metrics
 
         output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
+        if incremental and request_id and output_timestamps:
+            # Keep the boundary so the next chunk includes the gap once.
+            self._output_timestamps_by_request[request_id] = output_timestamps[-1:]
         non_empty_first_output_ts = (
             self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
         )
@@ -705,7 +743,20 @@ class StagePool:
         current_audio_frames, current_audio_sample_rate, _ = self._collect_audio_metrics(request_outputs)
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
-        audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        snapshot_audio_frames = self._audio_snapshot_frames_by_request.pop(request_id, 0) if request_id else 0
+        if output_kind in (RequestOutputKind.CUMULATIVE, RequestOutputKind.FINAL_ONLY):
+            # Cumulative PCM survives segment boundaries in the output
+            # processor. Only its newly generated suffix belongs to this
+            # event; adding the full prefix inflates duration and throughput.
+            total_audio_frames = max(snapshot_audio_frames, current_audio_frames)
+            previously_reported_frames = self._reported_audio_frames_by_request.get(request_id, 0)
+            audio_generated_frames = max(total_audio_frames - previously_reported_frames, 0)
+            if request_id:
+                self._reported_audio_frames_by_request[request_id] = max(total_audio_frames, previously_reported_frames)
+        else:
+            audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        if output_unit_type == "audio":
+            output_unit_count = audio_generated_frames
         audio_sample_rate = accumulated_audio_sample_rate or current_audio_sample_rate
         audio_duration_s = (
             float(audio_generated_frames) / float(audio_sample_rate)
@@ -842,7 +893,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -989,6 +1040,9 @@ class StagePool:
             )
             if audio_frames > 0:
                 self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
+                self._audio_snapshot_frames_by_request[rid] = max(
+                    self._audio_snapshot_frames_by_request.get(rid, 0), audio_frames
+                )
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
@@ -1024,8 +1078,8 @@ class StagePool:
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
-            client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            diffusion_client = self._diffusion_client(replica_id)
+            await diffusion_client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
         replica_id = await self._pick_or_select(

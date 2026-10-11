@@ -8,8 +8,19 @@ from dataclasses import replace
 import pytest
 
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
-from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed, TranscriptDelta
-from vllm_omni.engine.duplex.realtime_events import RealtimeProjectionState, project_internal_event
+from vllm_omni.engine.duplex.events import (
+    AudioDelta,
+    ErrorEvent,
+    ResponseDone,
+    SessionClosed,
+    SessionUpdated,
+    TranscriptDelta,
+)
+from vllm_omni.engine.duplex.realtime_events import (
+    RealtimeProjectionState,
+    project_internal_event,
+    retrieve_item_events,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,7 +48,9 @@ async def test_queued_response_creation_keeps_payload_and_byte_count(event_type,
     text = "Growing response. " * 512
     project_internal_event(state, {"type": event_type, "response_id": "r", delta_field: text})
     item = next(iter(state.conversation_items.values()))
-    assert item["content"][0][content_field] == text
+    assert item["content"] == []
+    retrieved = retrieve_item_events(state, {"item_id": "item_r"})[0].to_realtime()
+    assert retrieved["item"]["content"][0][content_field] == text
     assert output.pending_bytes == byte_count
     delivered = [await output.get() for _ in events]
     assert [event.to_realtime() for event in delivered] == payloads
@@ -121,3 +134,41 @@ async def test_cancelled_waiter_can_be_replaced_and_woken_from_another_thread():
     await asyncio.sleep(0)
     await asyncio.to_thread(output.close)
     assert await asyncio.wait_for(closing, timeout=2) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["accepted", "rejected", "closed"])
+async def test_update_result_is_independent_of_output_consumption(outcome):
+    output = DuplexOutputBuffer(max_bytes=64 * 1024, max_events=128)
+    pending = output.observe_session_update()
+    with pytest.raises(RuntimeError, match="already has an observer"):
+        output.observe_session_update()
+    output.put(ErrorEvent(code="unrelated", message="not an update result"))
+    await asyncio.sleep(0)
+    assert not pending.done()
+    accepted = SessionUpdated(session={"input_audio_format": "pcm_f32le"})
+    if outcome == "accepted":
+        await asyncio.to_thread(output.put, accepted)
+    elif outcome == "rejected":
+        await asyncio.to_thread(output.reject_session_update)
+    else:
+        await asyncio.to_thread(output.close)
+    for _ in range(65):
+        output.put(ErrorEvent(code="unrelated", message="later output"))
+    assert await asyncio.wait_for(pending, timeout=2) is (accepted if outcome == "accepted" else None)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_update_observer_cannot_release_its_replacement():
+    output = DuplexOutputBuffer(max_bytes=4096, max_events=8)
+    abandoned = output.observe_session_update()
+    abandoned.cancel()
+    replacement = output.observe_session_update()
+    # The old Future's done callback runs after the new observer was installed.
+    await asyncio.sleep(0)
+    output.reject_session_update()
+    assert await asyncio.wait_for(replacement, timeout=2) is None
+    waiting = output.observe_session_update()
+    output.close()
+    assert await asyncio.wait_for(waiting, timeout=2) is None
+    assert await output.observe_session_update() is None

@@ -987,6 +987,33 @@ def test_minicpmo_stage0_context_window_inserts_previous_before_suffix():
     assert rebuilt["num_input_tokens"] == 7
 
 
+@pytest.mark.parametrize("turn_ended", [False, True])
+@pytest.mark.parametrize("close_turn", [False, True])
+def test_minicpmo_stage0_close_turn_ends_the_unit_on_turn_eos(close_turn, turn_ended):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-close-turn")
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    # The model was speaking: its last unit ended on <|chunk_eos|> (8).
+    state.pending_terminator_token = 8
+    state.current_turn_ended = turn_ended
+    state.pending_speech_context = True
+
+    result = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), seq=2, close_turn=close_turn, is_speech=False
+    )
+
+    closes = close_turn and not turn_ended
+    # <|turn_eos|> (10) replaces the sampled terminator: the same span, so the
+    # scheduler's reserve for this append still matches.
+    assert result["input_token_ids"] == [10 if closes else 8, 2, 1, 11]
+    assert state.current_turn_ended is (turn_ended or closes)
+    assert state.pending_speech_context is not closes
+
+
 @pytest.mark.parametrize("pending_terminator", [None, 3, 99])
 def test_minicpmo_stage0_window_uses_accepted_output_not_async_sampler_history(pending_terminator):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
@@ -1071,6 +1098,42 @@ def _stage0_vision_runtime():
         [torch.full((2, 2), float(index), dtype=torch.float32)] for index in range(len(frames))
     ]
     return runtime
+
+
+def test_gander_seeded_text_is_in_first_input_unit_and_retry_does_not_repeat_it():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    runtime.stage_model.config = SimpleNamespace(gander_unit8=True)
+    convert = runtime.tokenizer.convert_tokens_to_ids
+    from vllm_omni.model_executor.models.minicpmo_4_5.gander import CONTROL_TOKENS
+
+    controls = {token: 30 + index for index, token in enumerate(CONTROL_TOKENS.values())}
+    runtime.tokenizer.convert_tokens_to_ids = lambda token: controls.get(token, convert(token))
+    initial_text = "Please say hello."
+    encoded_texts = []
+
+    def encode(text, add_special_tokens=False):
+        encoded_texts.append(text)
+        return [220, 221] if text == initial_text else [201, 202]
+
+    runtime.tokenizer.encode = encode
+    state = _MiniCPMO45Stage0SessionState(session_id="gander-seed")
+    runtime._prepare_session_context(
+        state, {}, runtime_config={"gander_enabled": True, "initial_user_text": initial_text}
+    )
+    assert all(initial_text not in text and "<|im_start|>assistant" not in text for text in encoded_texts)
+    payload = {"type": "text", "token_ids": runtime.tokenizer.encode(initial_text), "context_version": 0}
+    first = runtime._stage_control_embeddings(state, payload, epoch=0, seq=1)
+    assert first["success"] is True
+    assert first["input_token_ids"] == [201, 202, 201, 202, 1, 220, 221]
+    retry = runtime._stage_control_embeddings(state, payload, epoch=0, seq=1)
+    assert retry["input_token_ids"] == first["input_token_ids"]
+    following = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=0, seq=2)
+    assert following["input_token_ids"] == [2, 1, 11]
+    assert encoded_texts.count(initial_text) == 1
+    assert state.audio_chunk_idx == 1
+    assert state.gander_unit_count == 2
 
 
 def _minicpmo_seeded_silence_sampling_case(initial_user_text: str | None, *, force_listen_count: int = 0):
@@ -1535,6 +1598,71 @@ def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
     assert observed == [1, 1, 2, 2]
     assert processor_a is not processor_b
     assert runtime.processor._streaming_mel_processor.counter == 0
+
+
+def test_minicpmo_stage0_feature_extractor_is_isolated_per_session():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _FeatureExtractor:
+        # Like MiniCPMAAudioProcessor: the log-mel floor mode lives on the extractor.
+        def __init__(self):
+            self.dynamic_log_norm = True
+            self.dynamic_range_db = 8.0
+            self.log_floor_db = -10.0
+
+        def set_spac_log_norm(self, dynamic_range_db=None, log_floor_db=None):
+            if dynamic_range_db is not None:
+                self.dynamic_log_norm, self.dynamic_range_db = True, dynamic_range_db
+            if log_floor_db is not None:
+                self.dynamic_log_norm, self.log_floor_db = False, log_floor_db
+
+    class _Mel:
+        # Like StreamingMelProcessorExact._extract_full below 5 s of buffer.
+        def __init__(self, feature_extractor: _FeatureExtractor):
+            self.feature_extractor = feature_extractor
+
+        def process(self) -> bool:
+            self.feature_extractor.set_spac_log_norm(log_floor_db=-10)
+            return self.feature_extractor.dynamic_log_norm
+
+    class _Processor:
+        # Like the remote MiniCPMOProcessor: set_streaming_mode() rebuilds the streaming
+        # mel processor on self.audio_processor, and process_audio() (the reference
+        # voice) reads whatever floor mode that extractor is in.
+        def __init__(self):
+            self.audio_processor = _FeatureExtractor()
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def set_streaming_mode(self, **_kwargs):
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def reset_streaming(self):
+            return None
+
+        def process_audio_streaming(self, _audio, **_kwargs):
+            return self._streaming_mel_processor.process()
+
+        def process_audio(self, _audios):
+            return self.audio_processor.dynamic_log_norm
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.processor = _Processor()
+    runtime.stage_model = SimpleNamespace()
+    runtime.thinker = runtime.stage_model
+    processor_a = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="a"))
+    processor_b = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="b"))
+
+    assert runtime._process_streaming_audio([], 0, processor=processor_a) is False
+
+    # Session a's stream changed neither the processor that encodes reference voices
+    # nor session b.
+    assert runtime.processor.process_audio([]) is True
+    assert processor_b.audio_processor.dynamic_log_norm is True
+    assert processor_a._streaming_mel_processor.feature_extractor is processor_a.audio_processor
+    assert processor_a.audio_processor is not processor_b.audio_processor
 
 
 def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():

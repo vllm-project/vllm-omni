@@ -22,6 +22,7 @@ class DuplexSamplingRow:
     seq: int | None
     payload: dict[str, object] | None
     max_tokens: int | None
+    sampling_enabled: bool = True
     # Host copies of the row's sampling parameters (None when the runner has none).
     temperature: float | None = None
     top_k: int | None = None
@@ -77,6 +78,7 @@ class DuplexSamplingHelper:
         input_batch = runner.input_batch
         req_ids = [str(req_id) for req_id in getattr(input_batch, "req_ids", [])]
         requests = getattr(runner, "requests", {})
+        discard_mask = getattr(getattr(runner, "discard_request_mask", None), "np", None)
         temperature_cpu = getattr(input_batch, "temperature_cpu", None)
         top_k_cpu = getattr(input_batch, "top_k_cpu", None)
         top_p_cpu = getattr(input_batch, "top_p_cpu", None)
@@ -112,9 +114,25 @@ class DuplexSamplingHelper:
                     seq=seq,
                     payload=payload,
                     max_tokens=max_tokens if max_tokens > 0 else None,
-                    temperature=_host_value(temperature_cpu, row_idx, float),
-                    top_k=_host_value(top_k_cpu, row_idx, int),
-                    top_p=_host_value(top_p_cpu, row_idx, float),
+                    sampling_enabled=(
+                        (discard_mask is None or not bool(discard_mask[row_idx]))
+                        and req_id not in getattr(runner, "_omni_failed_input_requests", {})
+                    ),
+                    temperature=(
+                        _host_value(temperature_cpu, row_idx, float)
+                        if temperature_cpu is not None
+                        else getattr(sampling_params, "temperature", None)
+                    ),
+                    top_k=(
+                        _host_value(top_k_cpu, row_idx, int)
+                        if top_k_cpu is not None
+                        else getattr(sampling_params, "top_k", None)
+                    ),
+                    top_p=(
+                        _host_value(top_p_cpu, row_idx, float)
+                        if top_p_cpu is not None
+                        else getattr(sampling_params, "top_p", None)
+                    ),
                 )
             )
         return tuple(rows)

@@ -71,6 +71,53 @@ from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
 from vllm_omni.metrics.definitions import compute_audio_rtf  # noqa: E402
 
 
+async def _receive_protocol_events(ws, required_types: set[str], *, timeout_s: float) -> list[dict[str, object]]:
+    async def receive() -> list[dict[str, object]]:
+        events: list[dict[str, object]] = []
+        seen: set[str] = set()
+        while not required_types.issubset(seen):
+            raw = await ws.recv()
+            if not isinstance(raw, str):
+                continue
+            event = json.loads(raw)
+            if not isinstance(event, dict):
+                continue
+            events.append(event)
+            event_type = event.get("type")
+            if event_type == "error":
+                raise AssertionError(f"WebSocket protocol smoke received an error: {event}")
+            if isinstance(event_type, str):
+                seen.add(event_type)
+        return events
+
+    return await asyncio.wait_for(receive(), timeout=timeout_s)
+
+
+async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[dict[str, object]]:
+    websocket_url = build_realtime_url(url, model, autostart=False)
+    async with websockets.connect(websocket_url, max_size=64 * 1024 * 1024) as ws:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "model": model,
+                        "modalities": ["audio", "text"],
+                        "ref_audio": _ref_audio_data_url(str(ref_audio)),
+                    },
+                }
+            )
+        )
+        events = await _receive_protocol_events(
+            ws,
+            {"session.created", "session.updated"},
+            timeout_s=60,
+        )
+        await ws.send(json.dumps({"type": "session.close"}))
+        events.extend(await _receive_protocol_events(ws, {"session.closed"}, timeout_s=60))
+    return events
+
+
 def _url_with_model(url, model, *, autostart=None):
     return build_realtime_url(url, model, autostart=autostart)
 
@@ -944,6 +991,7 @@ async def _send_pcm16(
     first_chunk_hints: dict[str, object] | None = None,
     on_model_unit_ready=None,
     frames_b64: Sequence[str] | None = None,
+    repeat_last_video_frame: bool = True,
     stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> None:
     hints = hints or {}
@@ -962,7 +1010,11 @@ async def _send_pcm16(
         chunk_hints = dict(hints)
         if offset == 0:
             chunk_hints.update(first_chunk_hints)
-        if frames and audio_ms >= duplex_unit_boundary_ms(frames_sent):
+        if (
+            frames
+            and (repeat_last_video_frame or frames_sent < len(frames))
+            and audio_ms >= duplex_unit_boundary_ms(frames_sent)
+        ):
             # Omni duplex cadence: one camera frame per model unit, riding the
             # append that closes it, so the frame and the second of audio it was
             # captured during enter the same unit. A video advances one frame per
@@ -1055,6 +1107,7 @@ async def _send_clean_turn(
     model_policy_settle_s: float = 2.0,
     commit_input: bool = True,
     frames_b64: Sequence[str] | None = None,
+    repeat_last_video_frame: bool = True,
     stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> tuple[str | None, str]:
     before_created = state.count("response.created")
@@ -1078,6 +1131,7 @@ async def _send_clean_turn(
         realtime_delay=realtime_input,
         hints={"transcript": transcript} if send_transcript_hint else {},
         frames_b64=frames_b64,
+        repeat_last_video_frame=repeat_last_video_frame,
         stacked_frames_b64=stacked_frames_b64,
     )
     if commit_input:
@@ -1512,6 +1566,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                         commit_input=not continuous_input,
                         frames_b64=demo_frames_b64,
+                        repeat_last_video_frame=getattr(args, "repeat_last_video_frame", True),
                         stacked_frames_b64=demo_stacked_b64,
                     )
                     turn_response_ids.append(response_id)
@@ -1533,6 +1588,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                         commit_input=not continuous_input,
                         frames_b64=demo_frames_b64,
+                        repeat_last_video_frame=getattr(args, "repeat_last_video_frame", True),
                         stacked_frames_b64=demo_stacked_b64,
                     )
                     turn_response_ids.append(response_id)

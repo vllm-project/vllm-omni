@@ -431,6 +431,68 @@ test('interrupted playback reports its cursor before clear resets it', () => {
   assert.equal(messages.filter(m => m.type === 'playback-stopped').length, 1);
 });
 
+function bufferedPlayback() {
+  let Playback;
+  const ctx = vm.createContext({
+    sampleRate: 24000,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage() {} }; } },
+    registerProcessor: (_name, cls) => { Playback = cls; },
+  });
+  vm.runInContext(fs.readFileSync(path.join(root, 'playback_worklet.js'), 'utf8'), ctx);
+  return new Playback();
+}
+
+test('native playback starts immediately once its audio buffering target is available', () => {
+  const player = bufferedPlayback();
+  player.handleMessage({ type: 'audio', responseId: 'native',
+    pcm: new Int16Array(26400).fill(12000), initialBufferMs: 400, playbackLeadMs: 1100 });
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.playedFrames, 128);
+  player.handleMessage({ type: 'clear' });
+  assertSilent(player);
+
+  const ordinary = bufferedPlayback();
+  ordinary.handleMessage({ type: 'audio', responseId: 'turn',
+    pcm: new Int16Array(9600).fill(12000), initialBufferMs: 400 });
+  assert.ok(renderPlayback(ordinary).every(sample => sample === 0));
+  assert.equal(ordinary.playedFrames, 0);
+});
+
+test('native short packets retain the wait bound and drain their complete tail', () => {
+  const player = bufferedPlayback();
+  player.handleMessage({ type: 'audio', responseId: 'short',
+    pcm: new Int16Array(2400).fill(12000), initialBufferMs: 400, playbackLeadMs: 1100 });
+  for (let i = 0; i < 75; i += 1) assert.ok(renderPlayback(player).every(sample => sample === 0));
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.playedFrames, 128);
+  player.handleMessage({ type: 'drain', responseId: 'short' });
+  for (let i = 0; i < 18; i += 1) renderPlayback(player);
+  assert.equal(player.bufferedFrames(), 0);
+  assert.equal(player.activeResponseId, null);
+});
+
+test('native playback resumes on enough queued audio after an underrun', () => {
+  const player = bufferedPlayback();
+  const audio = { type: 'audio', responseId: 'native', initialBufferMs: 400, playbackLeadMs: 1100 };
+  player.handleMessage({ ...audio, pcm: new Int16Array(26400).fill(12000) });
+  for (let i = 0; i < 207; i += 1) renderPlayback(player);
+  assert.equal(player.rebuffering, true);
+  player.handleMessage({ ...audio, pcm: new Int16Array(26400).fill(12000) });
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.rebuffering, false);
+  player.handleMessage({ type: 'clear' });
+  assertSilent(player);
+});
+
+test('native one-second packets wait only for the remaining arrival headroom', () => {
+  const player = bufferedPlayback();
+  player.handleMessage({ type: 'audio', responseId: 'unit',
+    pcm: new Int16Array(24000).fill(12000), initialBufferMs: 400, playbackLeadMs: 1100 });
+  for (let i = 0; i < 19; i += 1) assert.ok(renderPlayback(player).every(sample => sample === 0));
+  assert.ok(renderPlayback(player).some(sample => sample !== 0));
+  assert.equal(player.playedFrames, 128);
+});
+
 test('late interruption cursor acknowledges old response without finishing the new response', async () => {
   const app = shell('qwen3-turn', 'vad');
   await app.ui.startSession();
@@ -639,8 +701,8 @@ function renderPlayback(player) {
   return output;
 }
 
-async function playingQwen(options = {}) {
-  const app = shell('qwen3-turn', 'vad', { realPlayback: true, ...options });
+async function playingRealtime(options = {}, profileName = 'qwen3-turn') {
+  const app = shell(profileName, 'vad', { realPlayback: true, ...options });
   await app.ui.startSession();
   receive(app, { type: 'response.created', response: { id: 'old' } });
   receive(app, audioChunk('old'));
@@ -657,9 +719,42 @@ function assertSilent(player) {
   assert.ok(renderPlayback(player).every(sample => sample === 0), 'speaker must output silence');
 }
 
+for (const event of [
+  { type: 'response.done', response: { id: 'old', status: 'cancelled' } },
+  { type: 'output_audio_buffer.cleared', response_id: 'old' },
+]) {
+  test(`MiniCPM ${event.type} silences playback and rejects late old audio`, async () => {
+    const app = await playingRealtime({}, 'minicpm-native');
+    receive(app, event);
+    receive(app, audioChunk('old'));
+    await app.ui.awaitQueue();
+    assertSilent(app.player);
+    assert.equal(app.ui.microphoneUploadEnabled(), true);
+    receive(app, { type: 'response.created', response: { id: 'new' } });
+    receive(app, audioChunk('new'));
+    await app.ui.awaitQueue();
+    receive(app, event);
+    await app.ui.awaitQueue();
+    assert.equal(app.player.activeResponseId, 'new');
+    assert.equal(app.player.bufferedFrames(), 24000, 'late old cancellation must preserve new audio');
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
+test('MiniCPM completed response drains its buffered audio', async () => {
+  const app = await playingRealtime({}, 'minicpm-native');
+  receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+  await app.ui.awaitQueue();
+  assert.ok(app.player.bufferedFrames() > 0);
+  assert.ok(renderPlayback(app.player).some(sample => sample !== 0));
+  await app.ui.stopSession({ terminal: false });
+});
+
+
+
 for (const terminal of [false, true]) {
   test(`Qwen speech interrupts actual playback after generation completed=${terminal}`, async () => {
-    const app = await playingQwen();
+    const app = await playingRealtime();
     if (terminal) {
       receive(app, { type: 'response.output_audio.done', response_id: 'old' });
       receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
@@ -676,9 +771,9 @@ for (const terminal of [false, true]) {
   });
 }
 
-test('Qwen cancellation preempts pending decode and does not delay the next response', async () => {
+async function cancellationPendingDecode(profileName) {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingRealtime({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) }, profileName);
   receive(app, audioChunk('old', { format: 'wav' }));
   await flushTasks();
   assert.equal(typeof releaseDecode, 'function');
@@ -694,10 +789,13 @@ test('Qwen cancellation preempts pending decode and does not delay the next resp
   await flushTasks();
   assert.equal(app.player.bufferedFrames(), 24000, 'old decoded audio must not enter the new response');
   await app.ui.stopSession({ terminal: false });
-});
+}
+for (const profileName of ['qwen3-turn', 'minicpm-native']) {
+  test(`${profileName} cancellation preempts pending decode`, () => cancellationPendingDecode(profileName));
+}
 
 test('Qwen interruption rejects queued and late audio for the cancelled response', async () => {
-  const app = await playingQwen();
+  const app = await playingRealtime();
   receive(app, audioChunk('old'));
   receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
   receive(app, audioChunk('old'));
@@ -707,7 +805,7 @@ test('Qwen interruption rejects queued and late audio for the cancelled response
 });
 
 test('late cancellation of an old Qwen response does not clear a newer response', async () => {
-  const app = await playingQwen();
+  const app = await playingRealtime();
   receive(app, { type: 'response.done', response: { id: 'old', status: 'cancelled' } });
   await app.ui.awaitQueue();
   receive(app, { type: 'response.created', response: { id: 'new' } });
@@ -742,7 +840,7 @@ test('Qwen speech interruption follows accepted turn detection; MiniCPM mapping 
 
 test('late old-response controls cannot invalidate a newer pending decode', async () => {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingRealtime({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
   receive(app, { type: 'input_audio_buffer.speech_started', item_id: 'next', audio_start_ms: 1000 });
   await app.ui.awaitQueue();
   receive(app, { type: 'response.created', response: { id: 'new' } });
@@ -761,7 +859,7 @@ test('late old-response controls cannot invalidate a newer pending decode', asyn
 
 test('normal completion still waits for decoding before draining playback', async () => {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingRealtime({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
   receive(app, audioChunk('old', { format: 'wav' }));
   await flushTasks();
   receive(app, { type: 'response.output_audio.done', response_id: 'old' });
@@ -777,7 +875,7 @@ test('normal completion still waits for decoding before draining playback', asyn
 
 test('interrupting an old decode preserves a newer response already waiting in the event queue', async () => {
   let releaseDecode;
-  const app = await playingQwen({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
+  const app = await playingRealtime({ decodeAudioData: () => new Promise(resolve => { releaseDecode = resolve; }) });
   receive(app, audioChunk('old', { format: 'wav' }));
   await flushTasks();
   receive(app, { type: 'response.created', response: { id: 'new' } });

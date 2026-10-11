@@ -71,7 +71,7 @@ FLASH_T_GRID = [0.0, 0.07612049579620361, 0.2928932309150696, 0.6173166036605835
 CKPT_DIR = os.environ.get("AUK_OMNI_CKPT_DIR") or os.environ.get("AUK_CKPT_DIR")
 PARITY_REF = os.environ.get("AUK_PARITY_REF")
 # An assembled directory is the only thing this pipeline can load.
-IS_ASSEMBLED = bool(CKPT_DIR) and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
+IS_ASSEMBLED = CKPT_DIR is not None and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
 
 # Measured on the released base checkpoint: mean frame cosine 0.961 to 0.968,
 # relative latent MSE 0.051 to 0.063, log-mel distance 0.34. That spread is
@@ -345,7 +345,12 @@ class TestRequestParsing:
     def test_per_component_config_resolves_the_dit_entry(self, build_pipeline, monkeypatch, quantization, expected):
         swapped = []
         monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
-        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **_: swapped.append(dit) or 160)
+
+        def quantize(dit, **_):
+            swapped.append(dit)
+            return 160
+
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", quantize)
         pipeline, _ = build_pipeline(quantization=quantization)
         assert pipeline.dit_fp8 is expected
         assert swapped == ([pipeline.dit] if expected else [])
@@ -375,7 +380,12 @@ class TestRequestParsing:
     def test_ignored_layers_reach_the_fp8_swap(self, build_pipeline, monkeypatch):
         calls = []
         monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
-        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit, **kwargs: calls.append(kwargs) or 159)
+
+        def quantize(dit, **kwargs):
+            calls.append(kwargs)
+            return 159
+
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", quantize)
         layer = "dit.transformer_blocks.0.attn.to_qkv"
         build_pipeline(quantization={"dit": {"method": "fp8", "ignored_layers": [layer]}, "vae": None})
         assert calls == [{"ignored_layers": [layer], "match_mode": "exact"}]
@@ -663,6 +673,7 @@ def _log_mel_distance(left: torch.Tensor, right: torch.Tensor, sample_rate: int)
 def test_zero_shot_tts_tracks_the_upstream_reference():
     """Replay the saved zero-shot TTS case and report the distances."""
 
+    assert PARITY_REF is not None
     parity_dir = Path(PARITY_REF)
     fusion_dir = Path(os.environ.get("AUK_FUSION_REF") or parity_dir.parent.parent / "fusion_ref")
     reference = torch.load(parity_dir / "zs_tts_en.pt", map_location="cpu", weights_only=False)

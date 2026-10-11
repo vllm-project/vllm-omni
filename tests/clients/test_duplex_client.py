@@ -16,6 +16,7 @@ import json
 import struct
 import wave
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -109,6 +110,110 @@ def make_client(*sockets: FakeSocket, **kwargs) -> tuple[DuplexClient, list[str]
     kwargs.setdefault("handshake_timeout_s", 5.0)
     client = DuplexClient("ws://test-host:8099", model="test-model", connect=connect, **kwargs)
     return client, calls
+
+
+class _ImmediateClosingSocket(FakeSocket):
+    """A peer queues its terminal events and immediately closes the wire."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_ack_sends = 0
+        self.reads_after_terminal = 0
+
+    async def send(self, raw: str) -> None:
+        payload = json.loads(raw)
+        if self.closed and payload.get("type") == "session.event_ack":
+            self.failed_ack_sends += 1
+        await super().send(raw)
+        if payload.get("type") == "session.close":
+            self.close_from_peer()
+
+    def close_from_peer(self) -> None:
+        terminal_events: list[dict[str, object]] = [
+            {"type": "response.output_audio.done", "response_id": "resp-close"},
+            {"type": "response.output_audio_transcript.done", "response_id": "resp-close", "transcript": "hello"},
+            {"type": "response.done", "response": {"id": "resp-close", "status": "cancelled"}},
+            {"type": "session.closed", "session_id": SESSION_ID, "reason": "client_close"},
+        ]
+        for index, event in enumerate(terminal_events, start=2):
+            self.feed({**event, "server_event_seq": index})
+        self.closed = True
+
+    async def recv(self) -> str:
+        if self.closed and self.incoming.empty():
+            self.reads_after_terminal += 1
+            raise ConnectionError("peer closed after terminal")
+        return await super().recv()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_method", ["explicit", "context-exit"])
+async def test_close_drains_terminals_without_sending_acks_to_closed_peer(close_method):
+    socket = _ImmediateClosingSocket()
+    socket.feed(SESSION_CREATED)
+    client, _ = make_client(socket)
+    await client.__aenter__()
+    collector = EventCollector()
+    consume = asyncio.create_task(collector.consume(client))
+    await asyncio.sleep(0)
+    socket.feed({"type": "response.created", "response": {"id": "resp-close"}, "server_event_seq": 1})
+    for _ in range(20):
+        if collector.count("response.created"):
+            break
+        await asyncio.sleep(0)
+    assert collector.count("response.created") == 1
+    if close_method == "explicit":
+        await client.close(timeout_s=1)
+        await client._teardown_quietly()
+    else:
+        await client.__aexit__(None, None, None)
+    await asyncio.wait_for(consume, timeout=1)
+    assert socket.failed_ack_sends == 0
+    assert socket.reads_after_terminal == 0
+    assert collector.count("response.done") == collector.count("session.closed") == 1
+    assert [event["type"] for event in collector.events] == [
+        "response.created",
+        "response.output_audio.done",
+        "response.output_audio_transcript.done",
+        "response.done",
+        "session.closed",
+    ]
+    assert [event["server_event_seq"] for event in socket.sent if event["type"] == "session.event_ack"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_peer_terminal_stops_reader_before_normal_eof():
+    socket = _ImmediateClosingSocket()
+    socket.feed(SESSION_CREATED)
+    client, _ = make_client(socket)
+    await client.__aenter__()
+    collector = EventCollector()
+    consume = asyncio.create_task(collector.consume(client))
+    await asyncio.sleep(0)
+    # Isolate the terminal-reader seam; no response events need ACKs here.
+    socket.feed(SESSION_CLOSED)
+    socket.closed = True
+    await asyncio.wait_for(consume, timeout=1)
+    assert collector.count("session.closed") == 1
+    assert socket.reads_after_terminal == 0
+    assert client._reader_task is not None and client._reader_task.done()
+    await client._teardown_quietly()
+
+
+@pytest.mark.asyncio
+async def test_open_session_keeps_automatic_event_ack():
+    socket = FakeSocket()
+    socket.feed(SESSION_CREATED)
+    client, _ = make_client(socket)
+    await client.__aenter__()
+    socket.feed({"type": "session.updated", "session": {"id": SESSION_ID}, "server_event_seq": 1})
+    for _ in range(20):
+        if "session.event_ack" in socket.sent_types():
+            break
+        await asyncio.sleep(0)
+    assert [event["server_event_seq"] for event in socket.sent if event["type"] == "session.event_ack"] == [1]
+    assert client._reader_task is not None and not client._reader_task.done()
+    await client._teardown_quietly()
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +438,10 @@ async def test_websocket_handshake_sends_session_update_and_acks_sequenced_event
         assert client.resume_token == "tok-1"
         assert calls == ["ws://test-host:8099/v1/realtime?duplex=1&model=test-model&autostart=0"]
         assert sock.sent[0]["type"] == "session.update"
-        assert sock.sent[0]["session"]["model"] == "test-model"
-        assert "session_id" not in sock.sent[0]["session"]
+        session = sock.sent[0]["session"]
+        assert isinstance(session, dict)
+        assert session["model"] == "test-model"
+        assert "session_id" not in session
         # session.created is unjournaled (no seq): nothing to ack yet.
         assert _acks(sock) == []
         sock.feed({"type": "response.listen", "server_event_seq": 1})
@@ -388,7 +495,9 @@ async def test_append_audio_tracks_cumulative_end_ms():
         assert appends[0]["duration_ms"] == 100
         assert "is_speech" not in appends[0]
         assert appends[1]["is_speech"] is True
-        assert base64.b64decode(appends[0]["audio"]) == pcm
+        audio = appends[0]["audio"]
+        assert isinstance(audio, str)
+        assert base64.b64decode(audio) == pcm
         sock.feed(SESSION_CLOSED)
 
 
@@ -417,6 +526,59 @@ async def test_stream_pcm_chunking():
         appends = [event for event in sock.sent if event.get("type") == "input_audio_buffer.append"]
         assert [a["duration_ms"] for a in appends] == [100, 100, 50]
         sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_delay_s", [0.0, 0.01, 0.35])
+async def test_stream_pcm_paces_media_time_without_accumulating_send_delay(monkeypatch, send_delay_s):
+    from vllm_omni.clients import duplex as client_module
+
+    class Clock:
+        now = 100.0
+
+        def time(self):
+            return self.now
+
+        async def sleep(self, delay):
+            assert delay >= 0
+            self.now += delay
+
+    clock = Clock()
+    client, _ = make_client(FakeSocket())
+    monkeypatch.setattr(client_module, "asyncio", SimpleNamespace(sleep=clock.sleep, get_running_loop=lambda: clock))
+    pcm = b"\x01\x00" * (16_000 * 2 + 800)  # 2.05 s, including a partial final chunk.
+    sent = []
+
+    async def append(chunk, **kwargs):
+        sent.append((clock.now - 100, chunk, kwargs["video_frames"]))
+        clock.now += send_delay_s
+
+    monkeypatch.setattr(client, "append_audio", append)
+    frames_sent = await client.stream_pcm(
+        pcm, chunk_ms=200, video_frames=["f0", "f1"], stacked_video_frames=["s0", None]
+    )
+    assert [row[0] for row in sent] == pytest.approx([max(i * 0.2, i * send_delay_s) for i in range(11)])
+    assert clock.now - 100 == pytest.approx(max(2.05, 11 * send_delay_s))
+    assert b"".join(row[1] for row in sent) == pcm
+    assert [row[2] for row in sent if row[2]] == [["f0", "s0"], ["f1"]]
+    assert frames_sent == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_pcm_unpaced_does_not_access_the_clock(monkeypatch):
+    from vllm_omni.clients import duplex as client_module
+
+    client, _ = make_client(FakeSocket())
+    monkeypatch.setattr(client_module, "asyncio", SimpleNamespace())
+    sent = []
+
+    async def append(chunk, **kwargs):
+        sent.append(chunk)
+
+    monkeypatch.setattr(client, "append_audio", append)
+    pcm = b"\x01\x00" * 800
+    assert await client.stream_pcm(pcm, realtime=False) == 0
+    assert sent == [pcm]
 
 
 @pytest.mark.asyncio

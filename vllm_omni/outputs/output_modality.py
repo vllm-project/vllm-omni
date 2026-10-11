@@ -10,6 +10,7 @@ for type-safe multimodal output routing and tensor merging.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Iterable
 from enum import Enum, Flag, auto
 
 
@@ -176,3 +177,31 @@ def get_accumulation_strategy(
     if OutputModality.IMAGE in modality or OutputModality.LATENT in modality:
         return TensorAccumulationStrategy.CONCAT_DIM0
     return TensorAccumulationStrategy.CONCAT_DIM0  # TEXT / TOKEN_IDS default
+
+
+# Append-only row ledgers. A pipeline whose per-step payload carries a marker
+# key (e.g. MiniCPM-o's ``latent_input_ids``) can declare that a group of its
+# CONCAT_DIM0 keys only ever grows by whole rows. While a request's payload
+# carries the marker, those keys are consolidated into a capacity-doubling row
+# buffer: each step copies only its new rows (amortized O(new rows) instead of
+# re-concatenating the whole history), and the consolidated value is a
+# prefix view whose rows are never written again. The values are identical to
+# ``torch.cat``. Keying on a marker keeps generic key names such as
+# ``latent`` unchanged for every other pipeline.
+_ROW_LEDGER_GROUPS: dict[str, frozenset[str]] = {}
+
+
+def register_row_ledger_keys(marker: str, keys: Iterable[str]) -> None:
+    """Declare ``keys`` append-only row ledgers for payloads carrying ``marker``."""
+    _ROW_LEDGER_GROUPS[marker] = frozenset(keys) | {marker}
+
+
+def row_ledger_keys(present_keys: Collection[str]) -> frozenset[str]:
+    """Row-ledger keys that apply to a payload with ``present_keys``."""
+    if not _ROW_LEDGER_GROUPS:
+        return frozenset()
+    result: frozenset[str] = frozenset()
+    for marker, keys in _ROW_LEDGER_GROUPS.items():
+        if marker in present_keys:
+            result |= keys
+    return result

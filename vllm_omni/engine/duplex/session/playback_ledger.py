@@ -21,6 +21,14 @@ from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 
 def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -> list[DuplexEvent]:
     """Apply one ``playback.ack`` and return the events it produces."""
+    if event.get("truncate") is True and not session.capabilities.supports_audio_truncate:
+        return [
+            error_event(
+                "audio_truncate_unsupported",
+                "This session cannot truncate model audio history",
+                event_id=event.get("realtime_event_id"),
+            )
+        ]
     played_ms = event.get("played_ms", event.get("audio_ms", 0))
     committed_ms = event.get("committed_ms")
     if not isinstance(played_ms, int | float):
@@ -69,9 +77,9 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
         playback = session.acknowledge_playback(int(played_ms), committed_cursor, response_id=response_id)
     committed_history = False
     if isinstance(item_id, str) and item_id:
-        expected_item_id = f"item_{response_id}" if response_id is not None else None
+        response_item_id = f"item_{response_id}" if response_id is not None else None
         if (
-            expected_item_id == item_id
+            response_item_id == item_id
             and item_id not in session.history_item_ids
             and item_id not in session.pending_history_item_ids
         ):

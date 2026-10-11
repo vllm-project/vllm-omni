@@ -598,15 +598,15 @@ class TestRequestBatchCapability:
 class TestDiffusionCompileConfig:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-    def test_config_defaults_to_dynamic_regional_compile(self) -> None:
-        config = OmniDiffusionConfig(model="test")
+    def test_config_defaults_to_dynamic_regional_compile(self, tmp_path) -> None:
+        config = OmniDiffusionConfig(model=str(tmp_path))
 
         assert config.diffusion_compile_granularity == "regional"
         assert config.diffusion_compile_dynamic is True
 
-    def test_from_kwargs_preserves_compile_controls(self) -> None:
+    def test_from_kwargs_preserves_compile_controls(self, tmp_path) -> None:
         config = OmniDiffusionConfig.from_kwargs(
-            model="test",
+            model=str(tmp_path),
             diffusion_compile_granularity="full",
             diffusion_compile_dynamic=False,
         )
@@ -714,8 +714,8 @@ class TestRequestBatchAdmission:
         with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
             OmniDiffusionConfig(model="test", request_batch_max_wait_ms=bad_wait)
 
-    def test_config_normalizes_request_batch_max_wait_ms_to_float(self) -> None:
-        config = OmniDiffusionConfig(model="test", request_batch_max_wait_ms=5)
+    def test_config_normalizes_request_batch_max_wait_ms_to_float(self, tmp_path) -> None:
+        config = OmniDiffusionConfig(model=str(tmp_path), request_batch_max_wait_ms=5)
 
         assert config.request_batch_max_wait_ms == 5.0
         assert isinstance(config.request_batch_max_wait_ms, float)
@@ -906,7 +906,8 @@ async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()
     engine._out_streams = {}
-    engine.abort_queue: queue.Queue[str] = queue.Queue()
+    abort_queue: queue.Queue[str] = queue.Queue()
+    engine.abort_queue = abort_queue
     engine._rpc_queue = queue.Queue()
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)

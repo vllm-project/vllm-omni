@@ -152,12 +152,15 @@ assistant template, so it is not an apples-to-apples accuracy run.
 After the server is running, stream one WAV through the Realtime
 WebSocket endpoint:
 
+Reference audio is optional. When `--ref-audio` is omitted, the model uses its
+default voice and Code2Wav initializes the bundled default prompt/cache.
+Pass `--ref-audio` to condition the voice on a specific clip.
+
 ```bash
 python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --url ws://localhost:8099/v1/realtime?duplex=1 \
     --model openbmb/MiniCPM-o-4_5 \
     --input-wav /path/to/input_16k_mono_pcm16.wav \
-    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
 
@@ -320,7 +323,7 @@ them unless `--allow-invalid-clock` is explicit.
 ### Shared realtime UI implementation
 
 The `python -m examples.online_serving.minicpmo.realtime_web` command remains
-available with the same MiniCPM defaults and required `--ref-audio`. Its assets
+available with the same MiniCPM defaults and optional `--ref-audio`. Its assets
 now live in [the shared realtime UI](../realtime_web/README.md), with a dedicated
 `minicpm-native` profile preserving native duplex input, playback ACKs and camera
 frames. Qwen3 uses a separate profile in the same shell, supporting manual STT

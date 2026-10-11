@@ -7,6 +7,8 @@
     description: 'Speak naturally. The model can listen and speak at the same time. Camera frames are sent with your audio.',
     waiting: 'Listening', camera: true, playbackAck: true, clientCommit: false,
     halfDuplex: false, closeSession: true, reconnectEachTurn: false,
+    // One native audio unit plus 100 ms of arrival headroom.
+    playbackLeadMs: 1100,
     readyEvent: 'session.updated', instructions: true, sendIntervalMs: 200,
     presets: {
       omni: 'Streaming Omni Conversation.',
@@ -43,6 +45,10 @@
         played_ms: playedMs, committed_ms: playedMs };
     },
     mapEvent(event) {
+      if (event.type === 'output_audio_buffer.cleared'
+          || (event.type === 'response.done' && event.response?.status === 'cancelled')) {
+        return { kind: 'interrupt', responseId: event.response_id || event.response?.id || null };
+      }
       if (event.type === 'response.listen') return { kind: 'listen' };
       if (event.type === 'response.speak') return { kind: 'begin', responseId: event.response_id || event.response?.id };
       if (event.type === 'playback.acknowledged') {

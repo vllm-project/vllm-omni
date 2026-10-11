@@ -1,0 +1,13 @@
+# Opt-in single-H200 V1 codec graph coverage for Gander.
+# Keep all four sessions and the model's native speech units unchanged.
+# Exact shapes avoid padding first chunks and flushed tails; startup takes
+# longer and reserves more graph memory. Compare against gander.yaml.
+base_config: gander.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      hift_graph_capture_batch_sizes: [1, 2, 4]
+      hift_graph_first_chunk_frames: [1, 32]
+      hift_graph_continuation_frames: [1, 32]
+      hift_graph_exact_batch_sizes: [1, 2, 3, 4]

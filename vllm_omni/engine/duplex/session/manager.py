@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
+from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand, UpdateSession
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -280,6 +280,8 @@ class DuplexSessionManager:
         runner = self.runners.get(message.session_id)
         command = message.command
         if runner is None:
+            if isinstance(command, UpdateSession):
+                self.reject_session_update(message.session_id)
             self._emit_raw(
                 message.session_id,
                 [
@@ -293,6 +295,8 @@ class DuplexSessionManager:
             return
         session = runner.session
         if runner.closing:
+            if isinstance(command, UpdateSession):
+                self.reject_session_update(session.session_id)
             self.emit(
                 session,
                 [
@@ -357,6 +361,12 @@ class DuplexSessionManager:
         output = self._outputs.get(session_id)
         if output is not None and response_id is not None:
             output.invalidate(response_id, through_epoch=through_epoch)
+
+    def reject_session_update(self, session_id: str) -> None:
+        """Settle an update rejected by its engine owner, before error delivery."""
+        output = self._outputs.get(session_id)
+        if output is not None:
+            output.reject_session_update()
 
     def _emit_raw(
         self,

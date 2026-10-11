@@ -21,16 +21,16 @@ This folder provides a unified CLI script for image-to-video generation using vL
 
 ### Supported Models
 
-| Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM Notes |
-| ----- | ------------------ | -------------- | ------------- | -------- | ---------- |
-| `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 480 x 832 | 81 | 50 | 5.0 | Around 60 GiB BF16 for basic single-card usage |
-| `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
-| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
-| `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism |
-| `sand-ai/MAGI-2-preview` | 512 x 896 | 125 | 100 | Model-fixed | Native four-GPU TP/SP; resident SP4 default; DLO available |
-| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480 x 832 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; Wan VAE |
-| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704 x 1280 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; LTX-2 Video VAE |
-| `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers` | 480 x 864 | 125 | 50 | 5.0 | ~75 GiB reserved (H100, CPU offload); public Hub repo |
+| Model                                                        | Default Resolution | Default Frames | Default Steps | Guidance              | VRAM Notes                                                                                                                |
+| ------------------------------------------------------------ | ------------------ | -------------- | ------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `Wan-AI/Wan2.2-I2V-A14B-Diffusers`                           | 480 x 832          | 81             | 50            | 5.0                   | Around 60 GiB BF16 for basic single-card usage                                                                            |
+| `Wan-AI/Wan2.2-TI2V-5B-Diffusers`                            | 480 x 832          | 81             | 50            | 4.0                   | Around 20–25 GiB BF16, smallest I2V model                                                                                 |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832          | 121            | 50            | 6.0                   | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
+| `Lightricks/LTX-2`                                           | 512 x 768          | 121            | 40            | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism                                                                  |
+| `sand-ai/MAGI-2-preview`                                     | 512 x 896          | 125            | 100           | Model-fixed           | Native four-GPU TP/SP; resident SP4 default; DLO available                                                                |
+| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`         | 480 x 832          | 81             | 50            | 6.0                   | Native `SanaImageToVideoPipeline`; Wan VAE                                                                                |
+| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers`         | 704 x 1280         | 81             | 50            | 6.0                   | Native `SanaImageToVideoPipeline`; LTX-2 Video VAE                                                                        |
+| `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`                | 480 x 864          | 125            | 50            | 5.0                   | ~75 GiB reserved (H100, CPU offload); public Hub repo                                                                     |
 
 MAGI-2 native Preview setup, four-GPU topology and DLO choices, I2VA commands,
 and eight-GPU validation status are documented in the
@@ -129,38 +129,38 @@ python image_to_video.py \
 
 ## Key Arguments
 
-| Argument | Type | Default | Description |
-| -------- | ---- | ------- | ----------- |
-| `--model` | str | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Diffusers I2V model ID or local path |
-| `--model-class-name` | str | `None` | Optional pipeline override |
-| `--image` | str | (required) | Path to input image |
-| `--prompt` | str | `""` | Text description of desired motion/animation |
-| `--negative-prompt` | str | `""` | Optional list of artifacts to suppress |
-| `--seed` | int | `42` | Random seed for deterministic sampling |
-| `--guidance-scale` | float | `5.0` | CFG scale |
-| `--guidance-scale-high` | float | `None` | Separate CFG for high-noise stage (MoE only) |
-| `--height` | int | auto | Video height (auto-calculated from image if not set). Multiples of 16 |
-| `--width` | int | auto | Video width (auto-calculated from image if not set). Multiples of 16 |
-| `--num-frames` | int | `81` | Number of frames |
-| `--num-inference-steps` | int | `50` | Number of denoising steps |
-| `--boundary-ratio` | float | `0.875` | Boundary split ratio for two-stage MoE models |
-| `--flow-shift` | float | `5.0` | Scheduler flow shift (5.0 for 720p, 12.0 for 480p) |
-| `--sample-solver` | str | `unipc` | Wan2.2 sampling solver (`unipc` or `euler` for Lightning/Distill) |
-| `--fps` | int | `None` | Frames per second for the saved MP4 |
-| `--frame-rate` | float | `None` | Generation frame rate for pipelines that require it (e.g., LTX2) |
-| `--output` | str | `i2v_output.mp4` | Path to save the generated video |
-| `--vae-use-slicing` | flag | off | Enable VAE slicing for memory optimization |
-| `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
-| `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
-| `--enable-layerwise-offload` | flag | off | Enable layerwise offloading on DiT modules |
-| `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
-| `--tensor-parallel-size` | int | `1` | Tensor parallel size (effective for models that support TP, e.g. LTX2) |
-| `--ulysses-degree` | int | `1` | Ulysses sequence parallel degree |
-| `--ring-degree` | int | `1` | Ring sequence parallel degree |
-| `--cache-backend` | str | `None` | Cache backend: `cache_dit` or `tea_cache` |
-| `--use-hsdp` | flag | off | Enable Hybrid Sharded Data Parallel |
-| `--hsdp-shard-size` | int | `-1` | GPUs per shard group (-1 auto-calculates) |
-| `--hsdp-replicate-size` | int | `1` | Number of replica groups for HSDP |
+| Argument                     | Type  | Default                            | Description                                                            |
+| ---------------------------- | ----- | ---------------------------------- | ---------------------------------------------------------------------- |
+| `--model`                    | str   | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Diffusers I2V model ID or local path                                   |
+| `--model-class-name`         | str   | `None`                             | Optional pipeline override                                             |
+| `--image`                    | str   | (required)                         | Path to input image                                                    |
+| `--prompt`                   | str   | `""`                               | Text description of desired motion/animation                           |
+| `--negative-prompt`          | str   | `""`                               | Optional list of artifacts to suppress                                 |
+| `--seed`                     | int   | `42`                               | Random seed for deterministic sampling                                 |
+| `--guidance-scale`           | float | `5.0`                              | CFG scale                                                              |
+| `--guidance-scale-high`      | float | `None`                             | Separate CFG for high-noise stage (MoE only)                           |
+| `--height`                   | int   | auto                               | Video height (auto-calculated from image if not set). Multiples of 16  |
+| `--width`                    | int   | auto                               | Video width (auto-calculated from image if not set). Multiples of 16   |
+| `--num-frames`               | int   | `81`                               | Number of frames                                                       |
+| `--num-inference-steps`      | int   | `50`                               | Number of denoising steps                                              |
+| `--boundary-ratio`           | float | `0.875`                            | Boundary split ratio for two-stage MoE models                          |
+| `--flow-shift`               | float | `5.0`                              | Scheduler flow shift (5.0 for 720p, 12.0 for 480p)                     |
+| `--sample-solver`            | str   | `unipc`                            | Wan2.2 sampling solver (`unipc` or `euler` for Lightning/Distill)      |
+| `--fps`                      | int   | `None`                             | Frames per second for the saved MP4                                    |
+| `--frame-rate`               | float | `None`                             | Generation frame rate for pipelines that require it (e.g., LTX2)       |
+| `--output`                   | str   | `i2v_output.mp4`                   | Path to save the generated video                                       |
+| `--vae-use-slicing`          | flag  | off                                | Enable VAE slicing for memory optimization                             |
+| `--vae-use-tiling`           | flag  | off                                | Enable VAE tiling for memory optimization                              |
+| `--enable-cpu-offload`       | flag  | off                                | Enable CPU offloading for diffusion models                             |
+| `--enable-layerwise-offload` | flag  | off                                | Enable layerwise offloading on DiT modules                             |
+| `--cfg-parallel-size`        | int   | `1`                                | Set to `2` to enable CFG Parallel                                      |
+| `--tensor-parallel-size`     | int   | `1`                                | Tensor parallel size (effective for models that support TP, e.g. LTX2) |
+| `--ulysses-degree`           | int   | `1`                                | Ulysses sequence parallel degree                                       |
+| `--ring-degree`              | int   | `1`                                | Ring sequence parallel degree                                          |
+| `--cache-backend`            | str   | `None`                             | Cache backend: `cache_dit` or `tea_cache`                              |
+| `--use-hsdp`                 | flag  | off                                | Enable Hybrid Sharded Data Parallel                                    |
+| `--hsdp-shard-size`          | int   | `-1`                               | GPUs per shard group (-1 auto-calculates)                              |
+| `--hsdp-replicate-size`      | int   | `1`                                | Number of replica groups for HSDP                                      |
 
 ## More CLI Examples
 
@@ -344,8 +344,6 @@ Key arguments:
 - `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
 - `--hsdp-shard-size`: Number of GPUs to shard model weights across within each replica group. -1 (default) auto-calculates as world_size / replicate_size.
 - `--hsdp-replicate-size`: Number of replica groups for HSDP. Each replica holds a full sharded copy. Default 1 means pure sharding (no replication).
-
-
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 

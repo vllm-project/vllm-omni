@@ -1377,6 +1377,45 @@ def test_turn_end_drain_masks_only_the_cadence_eos() -> None:
     assert torch.isfinite(logits[0, 7])
 
 
+@pytest.mark.parametrize("speech_tokens", [None, 50])
+@pytest.mark.parametrize("step", [24, 25, 29, 49, 50, 54])
+def test_native_final_unit_preserves_its_codec_eos_policy(speech_tokens, step) -> None:
+    # DetachedTalker allows the final Gander unit to end at any codec frame.
+    # MiniCPM generate_chunk retains its separate cadence-EOS drain policy.
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+    talker.projector_semantic = nn.Identity()
+    talker._normalize = False
+    talker._text_eos_id = 0
+    talker._tts_bos_id = 0
+    meta = {"turn_end": True}
+    if speech_tokens is not None:
+        meta["gander_speech_tokens"] = speech_tokens
+    _, _, updates = talker.preprocess(
+        torch.zeros(2, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        request_id="final-unit",
+        native_duplex=True,
+        meta=meta,
+        tts_token_ids=torch.zeros(1, dtype=torch.long),
+        tts_hidden_states=torch.ones(1, 2),
+    )
+    state = updates["audio_state"]
+    assert state["min_tokens"] == 0
+    state["step"] = step
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "final-unit", "codes": {"audio": torch.empty(0)}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+    masked = speech_tokens is None and step in {25, 29, 50, 54}
+    assert torch.isneginf(logits[0, 7]).item() is masked
+    assert not output.multimodal_outputs["meta"]["finished"][0].item()
+
+
 @pytest.mark.parametrize("aux_penalty", [None, "frequency", "presence"])
 def test_sample_skips_only_neutral_upstream_penalties(mocker, aux_penalty):
     from vllm.sampling_params import SamplingParams

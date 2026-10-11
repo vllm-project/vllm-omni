@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Utilities for handling multimodal outputs / building multimodal output
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """

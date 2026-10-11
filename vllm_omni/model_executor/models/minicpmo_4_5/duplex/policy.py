@@ -137,6 +137,8 @@ class MiniCPMO45DuplexPolicy:
         instructions: object,
         has_ref_audio: bool,
         initial_user_text: object = None,
+        *,
+        user_text_in_unit: bool = False,
     ) -> tuple[str, str]:
         """System-context prefix/suffix, matching MiniCPMODuplex.prepare()."""
         system_prompt = (
@@ -147,7 +149,7 @@ class MiniCPMO45DuplexPolicy:
         if has_ref_audio:
             prefix += "\n<|audio_start|>"
             suffix = "<|audio_end|>" + suffix
-        if isinstance(initial_user_text, str) and initial_user_text:
+        if not user_text_in_unit and isinstance(initial_user_text, str) and initial_user_text:
             suffix += f"\n<|im_start|>user\n{initial_user_text}<|im_end|>\n<|im_start|>assistant\n"
         return prefix, suffix
 

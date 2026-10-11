@@ -811,15 +811,19 @@ def _eager_solve_euler(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("capture_warmup_iterations", [1, 3])
 def test_whole_euler_graph_replay_matches_eager_for_uncached_and_cached_shapes(
     monkeypatch: pytest.MonkeyPatch,
+    capture_warmup_iterations: int,
 ) -> None:
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
 
     torch.manual_seed(0)
     estimator = _WholeEulerDiT().eval().cuda()
-    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=32)
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator, n_timesteps=10, max_graphs=32, capture_warmup_iterations=capture_warmup_iterations
+    )
 
     batch_size = 2
     chunk_size = 10
@@ -2490,3 +2494,48 @@ def test_vocoder_restores_tf32_policy(fail):
     else:
         assert MiniCPMO45Code2Wav.forward(model) == "ok"
     assert torch.backends.cuda.matmul.allow_tf32 == previous
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+@pytest.mark.parametrize("ragged", [False, True])
+def test_whole_euler_cache_bucket_replay_accepts_shorter_history(monkeypatch, ragged):
+    """The same captured graph accepts shrinking offsets and a changed caller mask."""
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    estimator = _tiny_upstream_dit()
+    exact = WholeEulerCFMGraphWrapper(estimator=estimator, ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged)
+    bucketed = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        offset_bucket_frames=16,
+        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
+    )
+    batch_size, width = 3, 8
+    for offset in (14, 7, 3, 16, 31, 18, 17):
+        chunk = _whole_euler_chunk(batch_size, width)
+        att = torch.randn(10, 2, 2 * batch_size, 2, offset, 16, device="cuda")
+        lengths = [8, 5, 3] if ragged else [width] * batch_size
+        mask = _ragged_mask(lengths, width, offset)
+        mask[:, :, width + offset // 2] = False
+        values = {}
+        for name, wrapper in (("exact", exact), ("bucketed", bucketed)):
+            # Per-request inputs may be updated in place; each arm owns its copy.
+            rows = _split_cfg_rows(att.clone(), batch_size)
+            values[name] = wrapper.replay(
+                **chunk,
+                cnn_cache=None,
+                att_cache=rows,
+                attn_mask=mask,
+                valid_lengths=lengths if ragged else None,
+                # Announce the steady history capacity to isolate graph reuse from arena growth.
+                att_keep=(8, 32),
+            )
+            assert values[name] is not None
+        for actual, expected in zip(values["bucketed"][:2], values["exact"][:2], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        for length, actual, expected in zip(lengths, values["bucketed"][2], values["exact"][2], strict=True):
+            assert actual.shape[4] == length + offset
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+    assert {key[3] for key in bucketed._cache} == {8, 24, 40}
+    assert bucketed.stats_snapshot()["flushes"] == 0
+    exact._flush()
+    bucketed._flush()

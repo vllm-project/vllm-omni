@@ -554,6 +554,84 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
 
 
+@pytest.mark.parametrize(
+    "rows,valid",
+    [
+        ([[11]], [True]),
+        ([[11]], [False]),
+        ([[11], [12], [13]], [True, False, True]),
+        ([[11], [12]], [False, False]),
+        ([[11, 21], [12, 22]], [False, True]),
+    ],
+)
+def test_mrv2_frame_validity_selects_codec_rows(rows, valid) -> None:
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
+
+    audio = torch.tensor(rows, dtype=torch.long)
+    flags = torch.tensor(valid)
+    expected = [code for row, keep in zip(rows, valid) if keep for code in row]
+    for payload in (
+        {"codes": {"audio": audio}, "meta": {"codec_frame_valid": flags}},
+        {"codes.audio": audio, "meta.codec_frame_valid": flags},
+    ):
+        assert _extract_codec_delta(payload, "r") == expected
+
+
+def _initial_manager(initial: int):
+    manager = _manager()
+    manager.connector.config["extra"]["initial_codec_chunk_frames"] = initial
+    return manager
+
+
+def test_initial_chunk_releases_first_window_then_steady_windows() -> None:
+    manager = _initial_manager(10)
+    request = _request("req-initial")
+    assert tts2code2wav_async_chunk(manager, _delta(*range(1, 10)), request) is None
+    first = tts2code2wav_async_chunk(manager, _delta(10), request)
+    assert first is not None
+    assert _codes(first) == [4218] * 3 + list(range(1, 11))
+    assert first.meta.codec_chunk_frames == 10
+    assert tts2code2wav_async_chunk(manager, _delta(*range(11, 35)), request) is None
+    second = tts2code2wav_async_chunk(manager, _delta(35), request)
+    assert second is not None
+    assert _codes(second) == [8, 9, 10] + list(range(11, 36))
+    assert second.meta.codec_chunk_frames == 25
+
+
+def test_duplex_initial_chunk_applies_to_each_turn() -> None:
+    manager = _initial_manager(8)
+    request = _request("req-duplex-initial")
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(*range(1, 9), turn_id=7), request)
+    assert first is not None and first.meta.codec_chunk_frames == 8
+    steady = tts2code2wav_async_chunk(manager, _duplex_delta(*range(9, 17), turn_id=7), request)
+    assert steady is None
+    end = tts2code2wav_async_chunk(manager, _duplex_delta(17, turn_id=7, turn_end=True), request, True)
+    assert end is not None and end.meta.last_chunk is True
+    next_first = tts2code2wav_async_chunk(manager, _duplex_delta(*range(30, 38), turn_id=8), request)
+    assert next_first is not None and next_first.meta.codec_chunk_frames == 8 and next_first.meta.chunk_seq == 0
+
+
+@pytest.mark.parametrize("first_window_sent", [False, True])
+def test_duplex_cancelled_turn_state_does_not_open_the_next_turn(first_window_sent: bool) -> None:
+    manager = _initial_manager(8)
+    request = _request("req-duplex-cancel")
+    first = tts2code2wav_async_chunk(
+        manager, _duplex_delta(*(range(1, 9) if first_window_sent else range(1, 5)), turn_id=7, text="old"), request
+    )
+    assert (first is not None) is first_window_sent
+    # The turn is cancelled inside the running request: frames 9 and 10 were
+    # generated but never flushed with a turn end.
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(9, 10, turn_id=7, text="old"), request) is None
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(30, 37), turn_id=8, text="new"), request) is None
+    next_first = tts2code2wav_async_chunk(manager, _duplex_delta(37, turn_id=8, text="new"), request)
+    assert next_first is not None and next_first.meta.codec_chunk_frames == 8
+    # The new turn opens a fresh Code2Wav stream with the silence context.
+    assert _codes(next_first) == [4218] * 3 + list(range(30, 38))
+    assert next_first.meta.chunk_seq == 0
+    assert next_first.meta.cache_epoch == 1
+    assert next_first.meta.llm_output_text_utf8.tolist() == list(b"new")
+
+
 @pytest.mark.parametrize("last_valid", [False, True])
 def test_full_payload_accumulates_codec_validity_per_frame(last_valid):
     """A final invalid/EOS row must not invalidate the whole utterance."""

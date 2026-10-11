@@ -1,0 +1,10 @@
+# Opt-in single-H200 V1 latency profile. Shorter codec windows execute
+# more often; compare latency, gaps, strict pronunciation and full tails
+# against gander_hift_h200.yaml before choosing this profile.
+# Model speech units, capacities, sampling and KV budgets are inherited.
+base_config: gander_hift_h200.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      codec_chunk_frames: 15

@@ -43,6 +43,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -838,6 +839,8 @@ class DuplexClientBase(ABC):
                 frames_sent += 1
                 yield chunk, [frames[index]] if composite is None else [frames[index], composite]
 
+        loop = asyncio.get_running_loop() if realtime else None
+        next_send_at = loop.time() if loop is not None else 0.0
         frames_sent = 0
         for chunk, unit_frames in units():
             if not chunk:
@@ -845,8 +848,11 @@ class DuplexClientBase(ABC):
             await self.append_audio(chunk, is_speech=is_speech, video_frames=unit_frames)
             if unit_frames:
                 frames_sent += 1
-            if realtime:
-                await asyncio.sleep(input_format.duration_ms(len(chunk)) / 1000.0)
+            if loop is not None:
+                # Send/serialization time consumes this chunk's media period;
+                # sleeping the full period after each send accumulates drift.
+                next_send_at += input_format.duration_ms(len(chunk)) / 1000.0
+                await asyncio.sleep(max(0.0, next_send_at - loop.time()))
         return frames_sent
 
     async def commit(self, *, final: bool = True, create_response: bool | None = None) -> None:
@@ -960,7 +966,7 @@ class DuplexClientBase(ABC):
             raise
         except Exception as exc:
             raise DuplexConnectionError(f"send failed: {exc}") from exc
-        return payload["event_id"]
+        return cast(str, payload["event_id"])
 
     # -- internals ---------------------------------------------------------------
 
@@ -1037,13 +1043,13 @@ class DuplexClientBase(ABC):
         elif isinstance(event, ResponseCreated):
             response_id = event.response_id
             if response_id and response_id not in self._responses:
-                handle = ResponseHandle(
+                created_handle = ResponseHandle(
                     response_id=response_id,
                     output_format=self.config.output_audio,
                     max_buffered_events=_MAX_BUFFERED_EVENTS,
                     created_event=event,
                 )
-                self._responses[response_id] = handle
+                self._responses[response_id] = created_handle
                 # Not yielded yet: the handle reaches responses() once its
                 # decision is known — at the first output below, or at its
                 # terminal event — so a turn loop can branch on `decision`
@@ -1110,8 +1116,9 @@ class DuplexClientBase(ABC):
         for handle in self._responses.values():
             handle._finish(None)
         self._responses.clear()
-        for queue in (*self._subscribers, self._response_queue):
+        for queue in self._subscribers:
             _put_drop_oldest(queue, marker)
+        _put_drop_oldest(self._response_queue, marker)
 
 
 class DuplexClient(DuplexClientBase):
@@ -1221,7 +1228,9 @@ class DuplexClient(DuplexClientBase):
             self.resume_token = None
 
         seq = data.get("server_event_seq")
-        if isinstance(seq, int) and not self._closed.is_set() and self._ws is not None:
+        # A local close retires the journal. The peer can close its wire
+        # while the client is still draining queued response terminals.
+        if isinstance(seq, int) and not self._closing and not self._closed.is_set() and self._ws is not None:
             try:
                 await self._ws.send(json.dumps({"type": "session.event_ack", "server_event_seq": seq}))
             except asyncio.CancelledError:
@@ -1233,6 +1242,7 @@ class DuplexClient(DuplexClientBase):
         while True:
             try:
                 while True:
+                    assert self._ws is not None
                     raw = await self._ws.recv()
                     if isinstance(raw, (bytes, bytearray)):
                         continue
@@ -1242,6 +1252,10 @@ class DuplexClient(DuplexClientBase):
                         continue
                     if isinstance(data, dict):
                         await self._dispatch(data)
+                        if self._closed.is_set():
+                            # The terminal event ended the protocol; do not
+                            # read another frame just to observe normal EOF.
+                            return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

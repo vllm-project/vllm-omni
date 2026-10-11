@@ -477,6 +477,7 @@
       pcm,
       responseId: responseId || currentResponseId,
       initialBufferMs: INITIAL_PLAYBACK_BUFFER_MS,
+      playbackLeadMs: profile.playbackLeadMs,
     }, [pcm.buffer]);
   }
 

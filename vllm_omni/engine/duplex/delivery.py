@@ -24,7 +24,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, ErrorEvent, ResponseDone, SessionClosed
+from vllm_omni.engine.duplex.events import (
+    AudioDelta,
+    DuplexEvent,
+    ErrorEvent,
+    ResponseDone,
+    SessionClosed,
+    SessionUpdated,
+)
 
 _MAX_TERMINAL_BYTES = 4096
 
@@ -71,6 +78,9 @@ class DuplexOutputBuffer:
         self._waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[None]] | None = None
         self._closed = False
         self._terminal: SessionClosed | None = None
+        # One reserved result for the serialized session.update. The engine
+        # settles rejection explicitly; unrelated errors cannot answer it.
+        self._update_waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[SessionUpdated | None]] | None = None
 
     @property
     def pending_bytes(self) -> int:
@@ -121,9 +131,14 @@ class DuplexOutputBuffer:
                 self._reserved_events += 1
             else:
                 self._bytes += size
+            update_waiter = None
+            if isinstance(event, SessionUpdated):
+                update_waiter = self._update_waiter
+                self._update_waiter = None
             waiter = self._waiter
             self._waiter = None
         self._notify(waiter)
+        self._notify_update(update_waiter, event if isinstance(event, SessionUpdated) else None)
         return True
 
     @staticmethod
@@ -160,6 +175,64 @@ class DuplexOutputBuffer:
         """Check the current dequeued event; use ``guard`` for an atomic handoff."""
         with self._lock:
             return self._is_valid(event)
+
+    def queued_events(self) -> tuple[DuplexEvent, ...]:
+        """Events still waiting behind the one the consumer is delivering.
+
+        Does not dequeue. The held event is omitted: the consumer already has it.
+        This is not ``pending_events``, which is the queued count.
+        """
+        with self._lock:
+            return tuple(pending.event for pending in self._pending)
+
+    def observe_session_update(self) -> asyncio.Future[SessionUpdated | None]:
+        """Reserve the next update result before submitting its command.
+
+        One update is serialized by the caller. Its result survives a delayed
+        output consumer and is released when accepted, rejected or closed.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[SessionUpdated | None] = loop.create_future()
+        with self._lock:
+            if self._closed:
+                future.set_result(None)
+                return future
+            if self._update_waiter is not None and not self._update_waiter[1].done():
+                raise RuntimeError("session.update already has an observer")
+            self._update_waiter = (loop, future)
+        future.add_done_callback(self._release_update_observer)
+        return future
+
+    def _release_update_observer(self, future: asyncio.Future[SessionUpdated | None]) -> None:
+        with self._lock:
+            if self._update_waiter is not None and self._update_waiter[1] is future:
+                self._update_waiter = None
+
+    def reject_session_update(self) -> None:
+        """Called by the engine's update owner, independently of error delivery."""
+        with self._lock:
+            waiter = self._update_waiter
+            self._update_waiter = None
+        self._notify_update(waiter, None)
+
+    @staticmethod
+    def _notify_update(
+        waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[SessionUpdated | None]] | None,
+        outcome: SessionUpdated | None,
+    ) -> None:
+        if waiter is None:
+            return
+        loop, future = waiter
+
+        def complete() -> None:
+            if not future.done():
+                future.set_result(outcome)
+
+        try:
+            loop.call_soon_threadsafe(complete)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
 
     @contextmanager
     def guard(self, event: DuplexEvent) -> Iterator[bool]:
@@ -223,7 +296,10 @@ class DuplexOutputBuffer:
             self._terminal = event
             waiter = self._waiter
             self._waiter = None
+            update_waiter = self._update_waiter
+            self._update_waiter = None
         self._notify(waiter)
+        self._notify_update(update_waiter, None)
 
     @staticmethod
     def _notify(waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[None]] | None) -> None:

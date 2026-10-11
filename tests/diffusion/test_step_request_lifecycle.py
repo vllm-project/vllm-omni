@@ -51,7 +51,7 @@ class _Pipeline(torch.nn.Module):
 
 
 @pytest.fixture
-def runtime(monkeypatch):
+def runtime(monkeypatch, tmp_path):
     def init_cpu(worker):
         worker.device = torch.device("cpu")
         worker.vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
@@ -66,7 +66,9 @@ def runtime(monkeypatch):
     for method in ("is_available", "max_memory_reserved", "max_memory_allocated"):
         monkeypatch.setattr(current_omni_platform, method, lambda: 0)
     engine = DiffusionEngine(
-        OmniDiffusionConfig(model="test", step_execution=True, distributed_executor_backend="uni", max_num_seqs=2)
+        OmniDiffusionConfig(
+            model=str(tmp_path), step_execution=True, distributed_executor_backend="uni", max_num_seqs=2
+        )
     )
     idle = threading.Event()
     wait = engine._cv.wait

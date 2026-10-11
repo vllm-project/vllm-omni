@@ -20,6 +20,7 @@ from vllm_omni.outputs.output_modality import (
     OutputModality,
     TensorAccumulationStrategy,
     get_accumulation_strategy,
+    row_ledger_keys,
 )
 from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
 
@@ -68,6 +69,72 @@ def _consolidate_tensor_list(
             ) from exc
         logger.warning("CONCAT_LAST failed for key %s; flattening each chunk before concatenating", key)
         return torch.cat([chunk.reshape(-1) for chunk in tensor_list], dim=0)
+
+
+class _RowBuffer:
+    """Capacity-doubling dim-0 buffer behind one append-only ledger key."""
+
+    __slots__ = ("buffer", "rows", "view")
+
+    def __init__(self, buffer: torch.Tensor, rows: int) -> None:
+        self.buffer = buffer
+        self.rows = rows
+        self.view = buffer[:rows]
+
+
+def _same_row_layout(tensor: Any, ref: torch.Tensor) -> bool:
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.ndim == ref.ndim
+        and tensor.shape[1:] == ref.shape[1:]
+        and tensor.dtype == ref.dtype
+        and tensor.device == ref.device
+        and tensor.layout == torch.strided
+        and not tensor.requires_grad
+    )
+
+
+def _consolidate_rows(
+    buffers: dict[str, _RowBuffer],
+    key: str,
+    chunks: list[torch.Tensor],
+) -> torch.Tensor:
+    """``torch.cat(chunks, dim=0)`` that only copies rows it has not seen.
+
+    ``chunks[0]`` is the view this function returned last time for ``key``
+    when the request keeps accumulating (CUMULATIVE consolidates every step);
+    then only ``chunks[1:]`` is copied, into rows past every earlier view.
+    Anything else -- a first consolidation, a replaced/drained key, mixed
+    dtypes, devices or row shapes -- takes the exact ``torch.cat`` path.
+    """
+    state = buffers.get(key)
+    if state is not None and chunks[0] is state.view:
+        new = chunks[1:]
+    else:
+        state = None
+        new = chunks
+    ref = new[0] if state is None else state.buffer
+    if ref.ndim == 0 or not all(_same_row_layout(chunk, ref) for chunk in new):
+        buffers.pop(key, None)
+        return torch.cat(chunks, dim=0)
+    start = 0 if state is None else state.rows
+    total = start + sum(int(chunk.shape[0]) for chunk in new)
+    if state is None or total > state.buffer.shape[0]:
+        capacity = max(2 * total, 8) if state is None else max(2 * state.buffer.shape[0], total)
+        buffer = torch.empty((capacity, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+        if state is not None and start:
+            # Earlier views keep the old buffer alive; it is never written again.
+            buffer[:start].copy_(state.buffer[:start])
+    else:
+        buffer = state.buffer
+    offset = start
+    for chunk in new:
+        rows = int(chunk.shape[0])
+        buffer[offset : offset + rows].copy_(chunk)
+        offset += rows
+    state = _RowBuffer(buffer, total)
+    buffers[key] = state
+    return state.view
 
 
 def _append_entries(store: dict[str, Any], incoming: dict[str, Any]) -> None:
@@ -195,9 +262,17 @@ class MultimodalPayload(Mapping):
                 continue
             self.metadata[key] = value[-1] if isinstance(value, list) else value
 
+        ledger_keys = row_ledger_keys(self.tensors)
         for key, value in list(self.tensors.items()):
             if _is_tensor_list(value):
                 strategy = get_accumulation_strategy(modality, key)
+                if key in ledger_keys and strategy is TensorAccumulationStrategy.CONCAT_DIM0:
+                    buffers = self.__dict__.setdefault("_row_buffers", {})
+                    try:
+                        self.tensors[key] = _consolidate_rows(buffers, key, value)
+                        continue
+                    except RuntimeError:
+                        buffers.pop(key, None)
                 self.tensors[key] = _consolidate_tensor_list(key, value, strategy)
 
     def consolidate_metadata(self) -> None:

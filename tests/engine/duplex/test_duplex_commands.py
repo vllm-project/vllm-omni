@@ -372,6 +372,12 @@ def test_delete_and_truncate_render_as_turn_signal_payloads():
     }
 
 
+def test_playback_truncation_flag_survives_translation():
+    command = command_from_realtime({"type": "playback.ack", "played_ms": 4000, "truncate": True})
+    assert isinstance(command, AckPlayback)
+    assert command.payload()["truncate"] is True
+
+
 def test_playback_ack_close_and_text_append_payloads():
     ack = command_from_realtime(
         {"type": "playback.ack", "played_ms": 1200.0, "committed_ms": 1000, "response_id": "resp_1", "item_id": ""}

@@ -22,13 +22,19 @@ Start your MiniCPM backend using the [existing deployment instructions](../minic
 
 ```bash
 python -m examples.online_serving.minicpmo.realtime_web \
-    --ws-backend ws://127.0.0.1:8099 \
-    --ref-audio /path/to/ref_minicpm_signature.wav
+    --ws-backend ws://127.0.0.1:8099
 ```
 
 The compatibility wrapper serves the shared assets with `minicpm-native`.
 The current native query, `extra_body`, reference voice, continuous microphone
 upload, camera frames and playback acknowledgements are retained.
+Add `--ref-audio /path/to/ref_minicpm_signature.wav` for optional voice
+conditioning; omitting it uses the model's default voice.
+
+For the single-H200 full-duplex MRv2 backend, serve with
+`--deploy-config vllm_omni/deploy/minicpmo_4_5_duplex_mrv2_h200.yaml`.
+It emits a shorter opening codec window while retaining the model's speech
+units. Validate playback buffering and audio quality for your workload.
 
 ## AURA: push-to-talk duplex
 
@@ -216,7 +222,8 @@ This Qwen3 UI profile requires the server-VAD deployment above.
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).
-- `--ref-audio`: required for MiniCPM; rejected for Qwen3 and AURA.
+- `--ref-audio`: optional voice conditioning for MiniCPM; omit to use the
+  model's default voice and codec prompt. Rejected for Qwen3 and AURA.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.
