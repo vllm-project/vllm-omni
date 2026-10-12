@@ -41,6 +41,10 @@ paged cache is sized from the request's `num_frames`. Streaming sessions must
 declare their total video length up front and keep it fixed across ticks.
 Older checkpoints retain their exported finite window and schedule.
 
+For camera-based selection from a full KV archive, see
+[frustum KV retrieval](frustum_retrieval.md). It is enabled per input record
+with an explicit camera-geometry sidecar.
+
 For the preprocessed AgiBot NPZ example:
 
 ```bash

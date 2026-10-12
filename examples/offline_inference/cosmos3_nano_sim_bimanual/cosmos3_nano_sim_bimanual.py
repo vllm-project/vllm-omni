@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import time
@@ -34,6 +35,11 @@ def _load_record(jsonl_path: Path, sample_index: int) -> dict[str, Any]:
                 value = archive[key]
                 payload[key] = value.item() if value.ndim == 0 else value
         record = {**payload, **record}
+    if record.get("kv_cache_frustum_path") is not None:
+        geometry_path = Path(record["kv_cache_frustum_path"])
+        if not geometry_path.is_absolute():
+            geometry_path = jsonl_path.parent / geometry_path
+        record["frustum_geometry"] = json.loads(geometry_path.read_text())
     if record.get("action_path") is not None:
         path = Path(record["action_path"])
         if not path.is_absolute():
@@ -192,6 +198,8 @@ def _reference_request(
         extra["domain_id"] = record["domain_id"]
     if action is not None:
         extra["action"] = action
+    if "frustum_geometry" in record:
+        extra["frustum_geometry"] = record["frustum_geometry"]
     if "action_space" in record:
         extra["action_space"] = record["action_space"]
     params = {
@@ -215,6 +223,44 @@ def _video_metadata(path: Path) -> dict[str, Any]:
             height, width = frame.shape[:2]
             count += 1
     return {"actual_num_frames": count, "actual_fps": fps, "actual_height": height, "actual_width": width}
+
+
+def _resolve_request_frustum(geometry, params, artifact, model, camera_poses=None):
+    """Resolve retrieval-only poses after the request's action and camera preparation."""
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frustum_retrieval import (
+        resolve_frustum_geometry,
+    )
+
+    stats = None
+    if geometry.get("pose_source") == "agibot_unified_v1_chunk16":
+        schema = artifact.require_action_schema()
+        if schema.schema_version != 5:
+            raise ValueError("Action-derived frustum poses require unified action schema 5")
+        source = schema.normalizer["source"]
+        if Path(model).exists():
+            stats_path = Path(model) / source["artifact_path"]
+        else:
+            from huggingface_hub import hf_hub_download
+
+            stats_path = Path(hf_hub_download(model, source["artifact_path"]))
+        content = stats_path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != source["sha256"]:
+            raise ValueError("Frustum normalization statistics hash mismatch")
+        stats = json.loads(content)
+    extra = params["extra_args"]
+    domain_id = extra.get("domain_id")
+    if domain_id is None and extra.get("domain_name") is not None:
+        domain_id = artifact.resolve_domain_name(extra["domain_name"])
+    extra["frustum_geometry"] = resolve_frustum_geometry(
+        geometry,
+        fps=params["frame_rate"],
+        num_frames=params["num_frames"],
+        camera_poses=camera_poses,
+        action=extra.get("action"),
+        action_space=extra.get("action_space"),
+        domain_id=domain_id,
+        normalization_stats=stats,
+    )
 
 
 def main() -> None:
@@ -260,6 +306,7 @@ def main() -> None:
                 else:
                     output = args.output
                 status["output"] = str(output)
+                camera_poses = record.get("gt_c2w", record.get("c2w"))
                 if manifest is not None:
                     from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.cookbook import prepare_cookbook_input
 
@@ -304,6 +351,7 @@ def main() -> None:
                         num_steps=len(manifest.t_list),
                         inference_id=manifest.digest,
                     )
+                    camera_poses = prepared.poses if prepared.poses is not None else camera_poses
                     if prepared.poses is not None:
                         pose_path = output.with_suffix(".camera_trajectory.json")
                         pose_path.write_text(json.dumps(prepared.poses.tolist()) + "\n", encoding="utf-8")
@@ -311,6 +359,8 @@ def main() -> None:
                 else:
                     prompt_data, params, metadata = _reference_request(record, args)
                     status.update(metadata)
+                if "frustum_geometry" in record:
+                    _resolve_request_frustum(record["frustum_geometry"], params, artifact, args.model, camera_poses)
                 params["extra_args"].update(session_id=f"offline-{index}", reset=True, close_session=True)
                 print(
                     json.dumps(
