@@ -900,6 +900,7 @@ def sample_latents(
     ref: torch.Tensor,
     ref_mask: torch.Tensor | None,
     gen_frames: int,
+    x_mask: torch.Tensor | None = None,
     nfe: int = 32,
     cfg_strength: float = 1.0,
     sway_sampling_coef: float | None = None,
@@ -971,6 +972,10 @@ def sample_latents(
             torch.manual_seed(seed)
         x = torch.randn(batch_size, gen_frames, latent_dim, device=device, dtype=dtype)
     else:
+        if batch_size > 1:
+            raise ValueError(
+                "AuK needs one noise generator per request when batch_size > 1, or pass a list of generators."
+            )
         x = torch.randn(
             batch_size, gen_frames, latent_dim, generator=generator, device=generator.device, dtype=dtype
         ).to(device)
@@ -986,6 +991,7 @@ def sample_latents(
             try:
                 return sampler.sample_loop(
                     x=x,
+                    x_mask=x_mask,
                     text=text,
                     c_mask=c_mask,
                     ref=ref,
@@ -999,6 +1005,7 @@ def sample_latents(
             for i in range(t.shape[0] - 1):
                 velocity = sampler(
                     x=x,
+                    x_mask=x_mask,
                     text=text,
                     c_mask=c_mask,
                     ref=ref,
@@ -1016,6 +1023,7 @@ def sample_latents(
     return _sample_latents(
         dit,
         initial_latents=x,
+        x_mask=x_mask,
         text=text,
         c_mask=c_mask,
         ref=ref,
@@ -1029,6 +1037,7 @@ def _sample_latents(
     dit: AuKTransformer,
     *,
     initial_latents: torch.Tensor,
+    x_mask: torch.Tensor | None = None,
     text: torch.Tensor,
     c_mask: torch.Tensor | None,
     ref: torch.Tensor,
@@ -1044,6 +1053,7 @@ def _sample_latents(
         ctx = dit.prepare(
             text,
             target_len=x.shape[1],
+            mask=x_mask,
             c_mask=c_mask,
             ref=ref,
             ref_mask=ref_mask,

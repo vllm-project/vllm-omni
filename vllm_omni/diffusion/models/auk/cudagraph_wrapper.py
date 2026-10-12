@@ -59,6 +59,15 @@ class AuKCUDAGraphWrapper:
     _TARGET_ALIGNMENT = 32
     _TEXT_ALIGNMENT = 32
     _REF_ALIGNMENT = 50
+    _BATCH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
+
+    @classmethod
+    def _batch_bucket(cls, batch_size: int) -> int:
+        """Find the smallest batch ladder step >= batch_size."""
+        for b in cls._BATCH_LADDER:
+            if batch_size <= b:
+                return b
+        return batch_size
 
     def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
         self.dit = dit
@@ -82,11 +91,13 @@ class AuKCUDAGraphWrapper:
         c_mask: torch.Tensor,
         ref: torch.Tensor,
         ref_mask: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_bucket = round_up(x.shape[1], cls._TARGET_ALIGNMENT)
         text_bucket = round_up(text.shape[1], cls._TEXT_ALIGNMENT)
         ref_bucket = round_up(ref.shape[1], cls._REF_ALIGNMENT)
-        x_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+        if x_mask is None:
+            x_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
         return (
             F.pad(x, (0, 0, 0, target_bucket - x.shape[1])),
             F.pad(x_mask, (0, target_bucket - x_mask.shape[1]), value=False),
@@ -155,6 +166,7 @@ class AuKCUDAGraphWrapper:
         self,
         *,
         x: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
         text: torch.Tensor,
         c_mask: torch.Tensor,
         ref: torch.Tensor,
@@ -181,11 +193,11 @@ class AuKCUDAGraphWrapper:
             timesteps, step_index = None, None
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
             if new_request or self._eager_ctx is None:
-                self._eager_ctx = self._prepare(x, None, text, c_mask, ref, ref_mask, uses_cfg, timesteps)
+                self._eager_ctx = self._prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps)
             return self._step(x, timestep, self._eager_ctx, cfg_strength, step_index)
 
         target_frames = x.shape[1]
-        x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask)
+        x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask, x_mask)
         steps = 0 if timesteps is None else int(timesteps.numel())
         key = self._key(x, text, ref, uses_cfg, steps)
         entry = self._cache.get(key)
@@ -278,6 +290,7 @@ class AuKCUDAGraphWrapper:
         self,
         *,
         x: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
         text: torch.Tensor,
         c_mask: torch.Tensor,
         ref: torch.Tensor,
@@ -290,7 +303,7 @@ class AuKCUDAGraphWrapper:
         if n_steps <= 0:
             return x
         uses_cfg = cfg_strength >= 1e-5
-        ctx = self._prepare(x, None, text, c_mask, ref, ref_mask, uses_cfg, timesteps[:-1])
+        ctx = self._prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps[:-1])
         for i in range(n_steps):
             vel = self._step(x, timesteps[i], ctx, cfg_strength, i)
             dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
@@ -302,6 +315,7 @@ class AuKCUDAGraphWrapper:
         self,
         *,
         x: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
         text: torch.Tensor,
         c_mask: torch.Tensor,
         ref: torch.Tensor,
@@ -315,6 +329,7 @@ class AuKCUDAGraphWrapper:
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing() or n_steps <= 0:
             return self._run_eager_loop(
                 x=x,
+                x_mask=x_mask,
                 text=text,
                 c_mask=c_mask,
                 ref=ref,
@@ -326,12 +341,14 @@ class AuKCUDAGraphWrapper:
         target_frames = x.shape[1]
         orig_batch = x.shape[0]
         x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._bucket_inputs(
-            x, text, c_mask, ref, ref_mask
+            x, text, c_mask, ref, ref_mask, x_mask
         )
-        key = (x_buck.shape[0], x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
+        batch_bucket = self._batch_bucket(x_buck.shape[0])
+        key = (batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
         if key in self._uncapturable_loop_keys:
             return self._run_eager_loop(
                 x=x,
+                x_mask=x_mask,
                 text=text,
                 c_mask=c_mask,
                 ref=ref,
@@ -343,10 +360,17 @@ class AuKCUDAGraphWrapper:
         hit_key = key if entry is not None else None
         if entry is None:
             hit_key, entry = self._larger_loop_entry(
-                x_buck.shape[0], x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps
+                batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps
             )
         if entry is None:
             self._retire_graph_generation_if_full()
+            if batch_bucket > x_buck.shape[0]:
+                x_buck = self._pad_batch_time(x_buck, batch_bucket, x_buck.shape[1])
+                x_mask = self._pad_batch_time(x_mask, batch_bucket, x_mask.shape[1], mask=True)
+                text_buck = self._pad_batch_time(text_buck, batch_bucket, text_buck.shape[1])
+                c_mask_buck = self._pad_batch_time(c_mask_buck, batch_bucket, c_mask_buck.shape[1], mask=True)
+                ref_buck = self._pad_batch_time(ref_buck, batch_bucket, ref_buck.shape[1])
+                ref_mask_buck = self._pad_batch_time(ref_mask_buck, batch_bucket, ref_mask_buck.shape[1], mask=True)
             ctx = self._prepare(
                 x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
             )
