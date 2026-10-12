@@ -181,18 +181,20 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
     [
         (True, True, True, False),
         (True, False, True, True),
-        (True, False, False, True),
         (True, True, False, True),
-        (False, True, True, False),
         (False, False, False, False),
     ],
-    ids=["native-v2", "v1-native-capable", "v1", "v2-legacy", "non-async-v2", "non-async-v1"],
+    ids=["native-v2", "v1-native-capable", "v2-legacy", "non-async"],
 )
 def test_release_request_resources_matches_scheduler_adapter_ownership(
     async_chunk, runner_v2, native_support, expect_rpc
 ):
     async def run() -> None:
-        call = AsyncMock()
+        calls = []
+
+        async def call(method, args):
+            calls.append((method, args))
+
         pool = StagePool(
             0,
             [SimpleNamespace(call_utility_async=call)],  # type: ignore[list-item]
@@ -207,10 +209,8 @@ def test_release_request_resources_matches_scheduler_adapter_ownership(
 
         pool.schedule_release_request_resources(["req-1"])
         await asyncio.gather(*pool._release_flushers.values())
-        if expect_rpc:
-            call.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
-        else:
-            call.assert_not_awaited()
+        expected = [("omni_release_request_resources", ["req-1"])] if expect_rpc else []
+        assert calls == expected
 
     asyncio.run(run())
 

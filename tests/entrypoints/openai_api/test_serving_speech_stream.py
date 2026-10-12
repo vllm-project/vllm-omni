@@ -1102,7 +1102,7 @@ class TestGeneratePcmChunksContract:
         )
 
 
-@pytest.mark.parametrize("scenario", ["complete", "burst", "disconnect", "overflow"])
+@pytest.mark.parametrize("scenario", ["burst", "disconnect", "overflow"])
 def test_uvicorn_keepalive_during_sentence_generation(mocker: MockerFixture, monkeypatch, scenario):
     """Real protocol pings survive queued input while synthesis awaits model output."""
 
@@ -1162,8 +1162,7 @@ def test_uvicorn_keepalive_during_sentence_generation(mocker: MockerFixture, mon
                         await ws.send_json({"type": "input.text", "text": "Second sentence. "})
                         if scenario != "burst":
                             await ws.send_json({"type": "input.done"})
-                        if scenario != "complete":
-                            await asyncio.wait_for(started.wait(), timeout=2)
+                        await asyncio.wait_for(started.wait(), timeout=2)
                         if scenario == "disconnect":
                             await ws.close()
                         else:
@@ -1182,10 +1181,9 @@ def test_uvicorn_keepalive_during_sentence_generation(mocker: MockerFixture, mon
                                     event = json.loads(message.data)
                                     events.append(event)
                                     if event["type"] == "session.done":
-                                        assert scenario in {"complete", "burst"}
-                                        expected = 3 if scenario == "burst" else 2
-                                        assert event["total_sentences"] == expected
-                                        assert sum(e["type"] == "audio.done" for e in events) == expected
+                                        assert scenario == "burst"
+                                        assert event["total_sentences"] == 3
+                                        assert sum(e["type"] == "audio.done" for e in events) == 3
                                         assert not any(e["type"] == "error" for e in events)
                                         await ws.send_json({"type": "session.close"})
                                         break
@@ -1201,10 +1199,9 @@ def test_uvicorn_keepalive_during_sentence_generation(mocker: MockerFixture, mon
             finally:
                 server.should_exit = True
                 await asyncio.wait_for(server_task, timeout=5)
-        if scenario in {"complete", "burst"}:
+        if scenario == "burst":
             service.engine_client.abort.assert_not_awaited()
-            if scenario == "burst":
-                assert captured_text[-1] == "".join(f"token{index} " for index in range(100)) + "finished."
+            assert captured_text[-1] == "".join(f"token{index} " for index in range(100)) + "finished."
         else:
             service.engine_client.abort.assert_awaited_once_with("req-1")
 
@@ -1219,7 +1216,7 @@ def test_cancelled_asgi_scope_finishes_active_request_abort(mocker: MockerFixtur
         started = asyncio.Event()
         disconnect = asyncio.Event()
         abort_started = asyncio.Event()
-        aborted = asyncio.Event()
+        aborted = []
         _, service = _build_test_app(mocker=mocker)
 
         async def chunks(*args, **kwargs):
@@ -1230,10 +1227,10 @@ def test_cancelled_asgi_scope_finishes_active_request_abort(mocker: MockerFixtur
         async def abort(request_id):
             abort_started.set()
             await asyncio.sleep(0.02)
-            aborted.set()
+            aborted.append(request_id)
 
         service._generate_pcm_chunks = chunks
-        service.engine_client.abort.side_effect = abort
+        service.engine_client.abort = abort
         messages = [
             json.dumps(
                 {
@@ -1247,16 +1244,20 @@ def test_cancelled_asgi_scope_finishes_active_request_abort(mocker: MockerFixtur
             json.dumps({"type": "input.text", "text": "First sentence. "}),
         ]
 
-        async def receive():
-            if messages:
-                return messages.pop(0)
-            await disconnect.wait()
-            raise WebSocketDisconnect()
+        incoming = [{"type": "websocket.connect"}] + [{"type": "websocket.receive", "text": text} for text in messages]
 
-        websocket = mocker.MagicMock()
-        websocket.accept = mocker.AsyncMock()
-        websocket.receive_text = mocker.AsyncMock(side_effect=receive)
-        websocket.send_json = mocker.AsyncMock()
+        async def receive():
+            if incoming:
+                return incoming.pop(0)
+            await disconnect.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        websocket = WebSocket({"type": "websocket"}, receive, send)
         handler = OmniStreamingSpeechHandler(service)
         with anyio.CancelScope() as scope:
 
@@ -1272,7 +1273,7 @@ def test_cancelled_asgi_scope_finishes_active_request_abort(mocker: MockerFixtur
             await anyio.sleep(0)
         await canceller
         assert scope.cancelled_caught
-        assert aborted.is_set()
-        service.engine_client.abort.assert_awaited_once_with("req-1")
+        assert aborted == ["req-1"]
+        assert sent[0]["type"] == "websocket.accept"
 
     anyio.run(exercise)

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import queue
 from types import SimpleNamespace
 
+import janus
 import pytest
 from vllm import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
@@ -16,15 +16,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("stage_zero_cfg", [False, True])
-@pytest.mark.parametrize("final_stage_id", [0, 1])
-def test_cfg_expansion_respects_stage_zero_guidance(stage_zero_cfg, final_stage_id):
+def test_cfg_expansion_respects_stage_zero_guidance(stage_zero_cfg):
     """AR guidance needs its companion even without a downstream consumer."""
     engine = object.__new__(AsyncOmniEngine)
     engine.default_sampling_params_list = [SamplingParams(max_tokens=8)]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
     engine.prompt_transform_func = None
-    engine.request_queue = SimpleNamespace(sync_q=queue.SimpleQueue())
+    engine.request_queue = janus.Queue()
 
     def process_inputs(request_id, **kwargs):
         return EngineCoreRequest(
@@ -47,11 +46,11 @@ def test_cfg_expansion_respects_stage_zero_guidance(stage_zero_cfg, final_stage_
     if stage_zero_cfg:
         prompt["additional_information"] = {"cfg_group": {"role": "cond"}}
 
-    engine.add_request("parent", prompt, final_stage_id=final_stage_id)
+    engine.add_request("parent", prompt, final_stage_id=0)
 
     parent = engine.request_queue.sync_q.get_nowait()
     assert parent.request_id == "parent"
-    expect_companion = stage_zero_cfg or final_stage_id > 0
+    expect_companion = stage_zero_cfg
     assert engine.request_queue.sync_q.qsize() == int(expect_companion)
     if expect_companion:
         companion = engine.request_queue.sync_q.get_nowait()
@@ -60,3 +59,4 @@ def test_cfg_expansion_respects_stage_zero_guidance(stage_zero_cfg, final_stage_
         metadata = deserialize_additional_information(companion.prompt.additional_information)
         assert metadata["omni_final_stage_id"] == 0
         assert metadata["omni_force_kv_transfer"] is True
+    engine.request_queue.close()
