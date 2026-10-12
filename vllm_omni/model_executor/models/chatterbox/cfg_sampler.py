@@ -33,7 +33,12 @@ class ChatterboxCFGSampler:
         self.pairs = pairs
 
     def prepare_logits(
-        self, logits: torch.Tensor, req_ids: Sequence[str], *, warmup: bool = False
+        self,
+        logits: torch.Tensor,
+        req_ids: Sequence[str],
+        *,
+        warmup: bool = False,
+        pair_metadata: Sequence[tuple[str, str, float]] | None = None,
     ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
         """Resolve current batch rows by request identity and apply guidance."""
         if logits.ndim != 2 or logits.shape[0] != len(req_ids):
@@ -46,9 +51,9 @@ class ChatterboxCFGSampler:
             # under its reserved _warmup_ namespace, with nonzero prefills.
             if warmup or req_id.startswith("_warmup_"):
                 continue
-            if req_id not in self.pairs:
+            if pair_metadata is None and req_id not in self.pairs:
                 raise ValueError(f"Missing Chatterbox CFG registration: {req_id}")
-            key, role, weight = self.pairs[req_id]
+            key, role, weight = self.pairs[req_id] if pair_metadata is None else pair_metadata[row]
             if role not in ("cond", "uncond"):
                 raise ValueError(f"Unsupported Chatterbox CFG role: {role}")
             group = groups.setdefault(key, {})
@@ -79,9 +84,10 @@ class ChatterboxCFGSampler:
         guided[:, SPEECH_STOP_TOKEN + 1 :] = -torch.inf
         return guided, row_pairs
 
-    def sample(self, logits: torch.Tensor, sampling_metadata: Any, input_batch: Any, requests: Any = None) -> Any:
+    def sample(self, logits: torch.Tensor, sampling_metadata: Any, per_req_extra_args: list[dict]) -> Any:
         """V1 model sampler entry point; preserve upstream sampling metadata."""
-        guided, row_pairs = self.prepare_logits(logits, input_batch.req_ids)
+        pairs = [extra["chatterbox_cfg"] for extra in per_req_extra_args]
+        guided, row_pairs = self.prepare_logits(logits, [pair[0] for pair in pairs], pair_metadata=pairs)
         output = self.base_sampler(logits=guided, sampling_metadata=sampling_metadata)
         for cond, uncond in row_pairs:
             output.sampled_token_ids[uncond].copy_(output.sampled_token_ids[cond])

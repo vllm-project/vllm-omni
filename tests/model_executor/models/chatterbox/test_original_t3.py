@@ -5,6 +5,7 @@
 import pytest
 import torch
 from torch import nn
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
@@ -13,7 +14,10 @@ from vllm_omni.model_executor.models.chatterbox.original_heads import (
     original_prefill_embeds,
     original_speech_embeds,
 )
-from vllm_omni.model_executor.stage_input_processors.chatterbox import expand_original_cfg_prompts
+from vllm_omni.model_executor.stage_input_processors.chatterbox import (
+    expand_original_cfg_prompts,
+    prepare_original_prompt,
+)
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -37,7 +41,7 @@ def metadata():
         "_omni_prompt_len": 41,
         "ids": {"prompt": [12, 13, 14], "speech_token": [1, 2, 3, 4]},
         "embed": {"voice": torch.ones(1, 256)},
-        "req_id": "engine-request",
+        "request_id": "engine-request",
         "global_request_id": ["external-request"],
         "chatterbox": {"cfg_weight": 0.5, "exaggeration": 0.7},
     }
@@ -80,12 +84,15 @@ def test_decode_batches_preserve_independent_positions(model):
     assert updates_v2 == updates
 
 
-def test_cfg_registration_uses_external_pair_id_and_cleans_finished_requests(model, metadata):
+@pytest.mark.parametrize("identity_key", ["request_id", "req_id"])
+def test_cfg_registration_uses_external_pair_id_and_cleans_finished_requests(model, metadata, identity_key):
     for role, request_id, external_id in (
         ("cond", "internal-a", "external-request"),
         ("uncond", "internal-b", "external-request__cfg_uncond"),
     ):
-        info = {**metadata, "req_id": request_id, "global_request_id": [external_id], "cfg_group": {"role": role}}
+        info = {**metadata, "global_request_id": [external_id], "cfg_group": {"role": role}}
+        info.pop("request_id")
+        info[identity_key] = request_id
         model.preprocess(torch.tensor([8]), None, _omni_is_prefill=False, _omni_num_computed_tokens=41, **info)
         assert model.cfg_pairs[request_id] == ("external-request", role, 0.5)
     model.on_requests_finished({"internal-a", "already-finished"})
@@ -119,13 +126,19 @@ def test_original_prompt_and_companion_metadata(weight):
     assert prompt["prompt_token_ids"] == [6561] * 41
     info = prompt["additional_information"]
     assert info["chatterbox"] == {"cfg_weight": weight, "exaggeration": 0.7}
-    expanded = expand_original_cfg_prompts(prompt, None)
+    params = SamplingParams(max_tokens=1000)
+    prepare_original_prompt(prompt, [params])
+    expanded = expand_original_cfg_prompts(prompt, params)
     if weight == 0:
         assert "cfg_group" not in info
         assert expanded == []
     else:
         assert info["cfg_group"]["role"] == "cond"
         assert len(expanded) == 1
+        companion_params, _ = expanded[0].apply_overrides(params, [params])
+        pair_key, role, cfg_weight = params.extra_args["chatterbox_cfg"]
+        assert role == "cond" and cfg_weight == weight
+        assert companion_params.extra_args["chatterbox_cfg"] == (pair_key, "uncond", weight)
         assert expanded[0].request_id_suffix == "__cfg_uncond"
         companion = expanded[0].prompt
         assert companion["prompt_token_ids"] == prompt["prompt_token_ids"]

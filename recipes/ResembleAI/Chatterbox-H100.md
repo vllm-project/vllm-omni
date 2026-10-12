@@ -3,7 +3,9 @@
 These measurements used the combined model and runtime implementation. The
 shared runtime changes are now reviewed separately in
 [PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842); the model branch
-requires that prerequisite. Historical profiling and fresh split integration
+includes its required extension hooks. These measurements also include the
+broader runtime fixes from #8842 and do not qualify the standalone branch.
+Historical profiling and fresh split integration
 validation are identified separately below.
 
 Measurements on October 12, 2026 used one H100 SXM 80 GB, PyTorch
@@ -35,7 +37,8 @@ The subsequent `39f251fb0` changes only decoder benchmark OOM reporting.
 
 ## Setup and commands
 
-Install `vllm-omni[chatterbox]` and merge prerequisite [#8842](https://github.com/vllm-project/vllm-omni/pull/8842).
+Install `vllm-omni[chatterbox]`. The model integration includes its required
+extension hooks; #8842 is reviewed independently.
 For built-in-voice and reference requirements, see the
 [shared speech contract](../../docs/serving/speech_api.md#chatterbox-turbo-and-original)
 and [upstream implementation](https://github.com/resemble-ai/chatterbox).
@@ -71,8 +74,8 @@ historical workloads are not interchangeable baselines.
 
 ## Nightly workload and CUDA graph comparison
 
-Fresh integration validation used model revision `0de536675` with prerequisite
-runtime revision `0a47e146a`. Subsequent recipe, baseline and CI marker edits do
+Fresh integration validation used model revision `0de536675` with additional
+runtime fixes at revision `0a47e146a`. Subsequent recipe, baseline and CI marker edits do
 not change inference. The environment was Ubuntu 24.04.3, Python 3.12.3,
 driver 580.159.04, PyTorch 2.13.0+cu130, torchaudio 2.11.0+cu130,
 vLLM 0.31.0 and Transformers 5.14.1. The container had a 233.8 GiB memory

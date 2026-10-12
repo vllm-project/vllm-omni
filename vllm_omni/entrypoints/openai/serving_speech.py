@@ -493,11 +493,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
+        adapter_cls = resolve_adapter(self._tts_model_type) if self._tts_stage is not None else None
 
         # Shared executor for blocking adapter preprocessing. It must exist
         # before adapter construction so adapters can create their make_async
         # wrappers during their own lifecycle initialization.
-        self._tts_executor = ThreadPoolExecutor(max_workers=1)
+        self._tts_executor = ThreadPoolExecutor(
+            max_workers=adapter_cls.preprocessing_workers if adapter_cls is not None else 1
+        )
         # Resolve the per-model serving adapter (RFC #4327), keyed on the
         # detected model-type. Every dedicated TTS model has an adapter; the
         # adapter owns request validation, prompt/param building, capability
@@ -587,6 +590,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def shutdown(self) -> None:
         """Shut down the TTS thread pool executor."""
+        if self._adapter is not None:
+            self._adapter.shutdown()
         if self._tts_executor is not None:
             self._tts_executor.shutdown(wait=False, cancel_futures=True)
             self._tts_executor = None
@@ -2409,6 +2414,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             # Assume that this will follow the same adapter pattern
             # once all RFC is implemented
+            assert self._adapter is not None
             validation_error = self._adapter.validate(request)
             if validation_error is not None:
                 raise ValueError(validation_error)

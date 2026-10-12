@@ -28,7 +28,7 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
     """Keep both guidance branches in step through the atomic CFG scheduler."""
 
     prefer_model_sampler = True
-    model_sampler_wants_input_batch = True
+    model_sampler_wants_extra_args = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
@@ -78,17 +78,22 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
         _omni_num_computed_tokens: int,
         ids: dict,
         embed: dict,
-        req_id: str,
         global_request_id: list[str],
         chatterbox: dict,
         cfg_group: dict | None = None,
+        request_id: str | None = None,
+        req_id: str | None = None,
         **runner_metadata: object,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Reconstruct learned positions from scheduler progress, including recomputation."""
         role = "cond" if cfg_group is None else cfg_group["role"]
         external_id = global_request_id[0]
         pair_id = external_id.removesuffix(CFG_SUFFIX) if role == "uncond" else external_id
-        self.cfg_pairs[req_id] = (pair_id, role, chatterbox["cfg_weight"])
+        # MRv1 supplies request_id; MRv2 supplies req_id.
+        identity = request_id if request_id is not None else req_id
+        if identity is None:
+            raise ValueError("Chatterbox preprocessing requires a request identity")
+        self.cfg_pairs[identity] = (pair_id, role, chatterbox["cfg_weight"])
         device, dtype = input_ids.device, self.heads.text_emb.weight.dtype
         prompt_rows = input_ids.new_empty((0, self.config.hidden_size), dtype=dtype)
         in_prompt = 0
@@ -129,8 +134,8 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
         """Return raw logits; reserved-token masking follows the CFG subtraction."""
         return self.heads.speech_head(hidden_states)
 
-    def sample(self, logits, sampling_metadata, *, input_batch):
-        return self.cfg_sampler.sample(logits, sampling_metadata, input_batch)
+    def sample(self, logits, sampling_metadata, *, per_req_extra_args):
+        return self.cfg_sampler.sample(logits, sampling_metadata, per_req_extra_args)
 
     def mrv2_custom_sampler(self, sampler):
         return ChatterboxMRv2CFGSampler(sampler, self.cfg_pairs), None

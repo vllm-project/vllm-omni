@@ -1,9 +1,9 @@
 # Chatterbox Turbo and Original — RTX A5000
 
-This model integration depends on the shared TTS runtime changes in
-[PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842). Merge that
-prerequisite before using this branch; the model PR intentionally excludes
-shared serving and runner fixes.
+The model integration includes its required adapter extension hooks.
+[PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842) contains independent
+shared runtime fixes. Historical measurements below used the combined implementation
+and do not qualify the standalone branch.
 
 [Chatterbox Turbo](https://huggingface.co/ResembleAI/chatterbox-turbo) generates
 mono 24 kHz English speech. The integration uses vLLM's GPT-2 backbone for

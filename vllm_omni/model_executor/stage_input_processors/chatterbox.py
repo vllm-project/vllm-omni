@@ -11,6 +11,7 @@ contract.
 """
 
 from typing import Any
+from uuid import uuid4
 
 import torch
 
@@ -39,6 +40,12 @@ def prepare_original_prompt(prompt: dict, sampling_params_list: list[Any]) -> di
         raise ValueError(f"Chatterbox Original min_tokens must be at most {ORIGINAL_MAX_NEW_TOKENS}")
     if params.max_tokens is None or params.max_tokens > ORIGINAL_MAX_NEW_TOKENS:
         raise ValueError(f"Chatterbox Original supports at most {ORIGINAL_MAX_NEW_TOKENS} new speech tokens")
+    # InputProcessor clones these parameters immediately after this transform.
+    info = prompt["additional_information"]["chatterbox"]
+    params.extra_args = {
+        **(params.extra_args or {}),
+        "chatterbox_cfg": (uuid4().hex, "cond", info["cfg_weight"]),
+    }
     return prompt
 
 
@@ -54,7 +61,17 @@ def expand_original_cfg_prompts(prompt: dict, sampling_params: Any) -> list[Expa
             "cfg_group": {"role": "uncond", "uncond_suffix": "__cfg_uncond"},
         },
     }
-    return [ExpandedPrompt(prompt=companion, role="uncond", request_id_suffix="__cfg_uncond")]
+    pair_key, _, weight = sampling_params.extra_args["chatterbox_cfg"]
+    return [
+        ExpandedPrompt(
+            prompt=companion,
+            role="uncond",
+            request_id_suffix="__cfg_uncond",
+            sampling_params_override={
+                "extra_args": {**sampling_params.extra_args, "chatterbox_cfg": (pair_key, "uncond", weight)}
+            },
+        )
+    ]
 
 
 def t3_to_s3gen_async_chunk(

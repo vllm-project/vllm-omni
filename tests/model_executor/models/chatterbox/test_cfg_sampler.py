@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.chatterbox.cfg_sampler import (
     ChatterboxCFGSampler,
     ChatterboxMRv2CFGSampler,
 )
+from vllm_omni.worker.sampling_utils import call_model_sampler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -37,7 +38,21 @@ def test_guidance_precedes_delegate_and_tokens_follow_conditional(mrv2):
     logits[0, :2] = torch.tensor([2.0, -4.0])
     logits[1, :2] = torch.tensor([4.0, -2.0])
     metadata = object()
-    output = sampler(logits, batch) if mrv2 else sampler.sample(logits, metadata, batch)
+    output = (
+        sampler(logits, batch)
+        if mrv2
+        else call_model_sampler(
+            SimpleNamespace(model_sampler_wants_extra_args=True),
+            sampler.sample,
+            logits,
+            metadata,
+            input_batch=batch,
+            requests={
+                rid: SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"chatterbox_cfg": registry[rid]}))
+                for rid in batch.req_ids
+            },
+        )
+    )
     torch.testing.assert_close(delegate.logits[:, :2], torch.tensor([[5.0, -1.0], [5.0, -1.0]]))
     assert not torch.isnan(delegate.logits).any()
     assert torch.isneginf(delegate.logits[:, SPEECH_START_TOKEN]).all()
@@ -96,7 +111,7 @@ def test_multiple_pairs_do_not_share_guidance_or_tokens():
     batch = SimpleNamespace(req_ids=["au", "bc", "ac", "bu"])
     logits = torch.zeros(4, SPEECH_STOP_TOKEN + 1)
     logits[:, 0] = torch.tensor([2.0, 10.0, 4.0, 6.0])
-    output = sampler.sample(logits, object(), batch)
+    output = sampler.sample(logits, object(), [{"chatterbox_cfg": registry[rid]} for rid in batch.req_ids])
     torch.testing.assert_close(delegate.logits[:, 0], torch.tensor([5.0, 14.0, 5.0, 14.0]))
     assert output.sampled_token_ids.tolist() == [[2], [1], [2], [1]]
 
@@ -148,7 +163,7 @@ def test_v1_shared_logit_bias_masks_survive_guidance(weight):
     logits[0, 0], logits[1, 0] = 4.0, 2.0
     logits[:, masked_tokens] = -torch.inf
     original = logits.clone()
-    output = sampler.sample(logits, object(), SimpleNamespace(req_ids=["c", "u"]))
+    output = sampler.sample(logits, object(), [{"chatterbox_cfg": registry[rid]} for rid in ["c", "u"]])
     assert not torch.isnan(delegate.logits).any()
     assert torch.isneginf(delegate.logits[:, masked_tokens]).all()
     assert torch.isneginf(delegate.logits[:, SPEECH_START_TOKEN]).all()
