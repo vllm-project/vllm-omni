@@ -37,6 +37,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
+    sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode),
     )
@@ -151,6 +152,7 @@ def _run_resumable_segment_stop(
     inter_stage_output=None,
 ):
     sched = MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -306,6 +308,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise(
     session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
     sched = mocker.MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -399,6 +402,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     num_output_placeholders = session.num_output_placeholders
 
     sched = MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -475,6 +479,7 @@ def test_legacy_stale_async_marker_bypasses_real_placeholder_accounting() -> Non
     request.num_stale_output_tokens = 0
 
     sched = OmniARAsyncScheduler.__new__(OmniARAsyncScheduler)
+    sched._hold_payloadless_outputs = False
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None
@@ -1587,3 +1592,52 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
 
     assert observed_limits == [7 if native else 8]
     assert sched.max_num_active_reqs == 8
+
+
+@pytest.mark.parametrize(
+    ("attention_type", "prompt_len", "recompute"),
+    [("full_attention", 70, True), ("full_attention", 20, False), ("sliding_recompute", 20, True)],
+)
+def test_mrv2_talker_reuses_confirmed_prompt_window(attention_type, prompt_len, recompute) -> None:
+    sched = _make_scheduler(stage_id=1, session_mode="duplex")
+    sched._native_data_plane = True
+    sched.vllm_config.model_config.custom_process_next_stage_input_func = (
+        "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_async_chunk"
+    )
+    sched.max_model_len = 100
+    sched.vllm_config.model_config.hf_config_name = "tts_config"
+    sched.vllm_config.model_config.max_model_len = 100
+    sched.vllm_config.model_config.hf_config = SimpleNamespace(
+        model_type="minicpmtts",
+        max_position_embeddings=100,
+        attention_type=attention_type,
+    )
+    sched.finish_requests = MagicMock()
+    session = _make_request()
+    session.external_req_id = "native-talker"
+    session.prompt_token_ids = [0] * prompt_len
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session.append_output_token_ids([7, 8, 9, 6561])
+    session.num_prompt_tokens = prompt_len
+    session.num_computed_tokens = prompt_len + 3  # EOS was sampled, not fed back into the model.
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    sched.num_waiting_for_streaming_input = 1
+    session.model_intermediate_buffer = {
+        "native_duplex": True,
+        "meta": {
+            "next_stage_prompt_len": 20,
+            "streaming_condition_seq": 0,
+        },
+    }
+    update = _make_talker_update(20, reserve=10, condition_seq=1)
+    sched._update_request_as_session(session, update)
+    assert session.num_computed_tokens == (0 if recompute else prompt_len + 3)
+    assert session.num_prompt_tokens == 43
+    assert update.model_intermediate_buffer["ids"]["streaming_prompt_previous_codes"] == [7, 8, 9]
+    assert update.model_intermediate_buffer["meta"]["streaming_prompt_recompute"] is recompute
+    sched.finish_requests.assert_not_called()
+    if recompute:
+        sched._free_request_blocks.assert_called_once_with(session)
+    else:
+        sched._free_request_blocks.assert_not_called()

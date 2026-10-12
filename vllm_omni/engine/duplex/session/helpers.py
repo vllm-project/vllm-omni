@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexPlaybackCommitPolicy
-from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import ErrorEvent, OverlapDecision, error_event
 from vllm_omni.engine.duplex.plugin import payload_turn_id
 
@@ -63,14 +63,6 @@ def append_fence(session: DuplexEngineSession, payload: object, *, epoch: int | 
         epoch=session.epoch if epoch is None else epoch,
         turn_id=turn_id,
     )
-
-
-def stage0_request_id(session: DuplexEngineSession, epoch: int) -> str:
-    """Stable ``stage0`` or ephemeral ``stage0-turn{T}`` request id for Stage0."""
-    fence = DuplexFence(session.session_id, epoch=epoch, turn_id=session.turn_id)
-    if session.capabilities.supports_core_resumable_request:
-        return duplex_resource_request_id(fence, "stage0")
-    return duplex_resource_request_id(fence, f"stage0-turn{fence.turn_id}")
 
 
 def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks) -> bool:
@@ -195,25 +187,6 @@ def overlap_decision_event(session: DuplexEngineSession, decision: dict[str, obj
         reason=reason if isinstance(reason, str) else None,
         details=details,
     )
-
-
-def input_committed_payload(
-    session: DuplexEngineSession,
-    committed: DuplexCommittedInput,
-    *,
-    realtime_item_id: object | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "type": "input.committed",
-        "session_id": session.session_id,
-        "turn_id": committed.turn_id,
-        "epoch": committed.epoch,
-        "history_len": len(session.history),
-        "message": committed.message,
-    }
-    if isinstance(realtime_item_id, str) and realtime_item_id:
-        payload["realtime_item_id"] = realtime_item_id
-    return payload
 
 
 def audio_committed_payload(

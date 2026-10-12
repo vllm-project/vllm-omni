@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """vLLM-native PersonaPlex Helium temporal transformer.
 
 The module maps the Moshi temporal LM backbone onto vLLM's Llama-style decoder
@@ -9,7 +9,6 @@ embeddings or depformer; PersonaPlex feeds temporal `inputs_embeds` directly.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
 from itertools import islice
 
 import torch
@@ -25,18 +24,12 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
-    maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
@@ -45,7 +38,7 @@ from vllm_omni.model_executor.models.personaplex.configuration_helium import (
     HeliumConfig,
 )
 
-__all__ = ["HeliumForCausalLM", "HeliumModel"]
+__all__ = ["HeliumModel"]
 
 
 class HeliumRMSNorm(RMSNorm):
@@ -375,174 +368,3 @@ class HeliumModel(nn.Module):
             batch, seq_len = unflatten_shape
             hidden_states = hidden_states.reshape(batch, seq_len, -1)
         return hidden_states
-
-
-class HeliumForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-    embedding_modules = {
-        "lm_head": "output_embeddings",
-    }
-
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-        layer_type: type[nn.Module] = HeliumDecoderLayer,
-    ) -> None:
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        self.config = config
-        self.quant_config = vllm_config.quant_config
-        self.model = HeliumModel(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
-            layer_type=layer_type,
-        )
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-        else:
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        return self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-        )
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        if hidden_states.dim() == 3:
-            batch, seq_len, hidden = hidden_states.shape
-            flat_hidden = hidden_states.reshape(batch * seq_len, hidden)
-            logits = self.logits_processor(self.lm_head, flat_hidden)
-            if logits is None:
-                return None
-            return logits.reshape(batch, seq_len, -1)
-        return self.logits_processor(self.lm_head, hidden_states)
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]] | Mapping[str, torch.Tensor],
-    ) -> set[str]:
-        if isinstance(weights, Mapping):
-            weights = weights.items()
-
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            mapped = self._load_moshi_weight(name, loaded_weight, params_dict)
-            loaded_params.update(mapped)
-
-        return loaded_params
-
-    def _load_moshi_weight(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, nn.Parameter],
-    ) -> set[str]:
-        if name == "out_norm.alpha":
-            return self._load_direct(
-                "model.norm.weight",
-                loaded_weight.squeeze(),
-                params_dict,
-            )
-        if name == "text_linear.weight":
-            return self._load_direct("lm_head.weight", loaded_weight, params_dict)
-
-        prefix = "transformer.layers."
-        if not name.startswith(prefix):
-            return set()
-
-        rest = name.removeprefix(prefix)
-        layer_index, _, suffix = rest.partition(".")
-        if not layer_index.isdigit() or not suffix:
-            return set()
-
-        base = f"model.layers.{layer_index}"
-        if suffix == "self_attn.in_proj_weight":
-            q_weight, k_weight, v_weight = loaded_weight.chunk(3, dim=0)
-            param_name = f"{base}.self_attn.qkv_proj.weight"
-            self._load_shard(param_name, q_weight, "q", params_dict)
-            self._load_shard(param_name, k_weight, "k", params_dict)
-            self._load_shard(param_name, v_weight, "v", params_dict)
-            return {param_name}
-        if suffix == "self_attn.out_proj.weight":
-            return self._load_direct(
-                f"{base}.self_attn.o_proj.weight",
-                loaded_weight,
-                params_dict,
-            )
-        if suffix == "gating.linear_in.weight":
-            gate_weight, up_weight = loaded_weight.chunk(2, dim=0)
-            param_name = f"{base}.mlp.gate_up_proj.weight"
-            self._load_shard(param_name, gate_weight, 0, params_dict)
-            self._load_shard(param_name, up_weight, 1, params_dict)
-            return {param_name}
-        if suffix == "gating.linear_out.weight":
-            return self._load_direct(
-                f"{base}.mlp.down_proj.weight",
-                loaded_weight,
-                params_dict,
-            )
-        if suffix == "norm1.alpha":
-            return self._load_direct(
-                f"{base}.input_layernorm.weight",
-                loaded_weight.squeeze(),
-                params_dict,
-            )
-        if suffix == "norm2.alpha":
-            return self._load_direct(
-                f"{base}.post_attention_layernorm.weight",
-                loaded_weight.squeeze(),
-                params_dict,
-            )
-        return set()
-
-    def _load_direct(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, nn.Parameter],
-    ) -> set[str]:
-        if name not in params_dict or is_pp_missing_parameter(name, self):
-            return set()
-        param = params_dict[name]
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight)
-        return {name}
-
-    def _load_shard(
-        self,
-        name: str,
-        loaded_weight: torch.Tensor,
-        shard_id: str | int,
-        params_dict: dict[str, nn.Parameter],
-    ) -> None:
-        if name not in params_dict or is_pp_missing_parameter(name, self):
-            return
-        param = params_dict[name]
-        weight_loader = param.weight_loader
-        weight_loader(param, loaded_weight, shard_id)

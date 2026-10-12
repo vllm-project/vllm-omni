@@ -1926,3 +1926,26 @@ def test_resolve_request_id_requires_internal_or_external_id(fallback, external,
             OmniConnectorModelRunnerMixin._resolve_external_req_id(host, request, fallback)
     else:
         assert OmniConnectorModelRunnerMixin._resolve_external_req_id(host, request, fallback) == expected
+
+
+@pytest.mark.parametrize("legacy_entry", [False, True])
+def test_full_payload_replace_overrides_codec_validity_accumulation(legacy_entry):
+    """Explicit snapshots must replace even keys normally accumulated per row."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    host = _OmniConnectorPayloadTransportMixin()
+    host._pending_full_payload_send = {}
+    host._full_payload_replace_keys_cached = frozenset({"meta.codec_frame_valid"})
+    request = SimpleNamespace(request_id="r")
+    first = {"meta.codec_frame_valid": torch.tensor([True, True])}
+    if legacy_entry:
+        host._pending_full_payload_send["r"] = (first, request)
+    else:
+        host.accumulate_full_payload_output("r", first, request)
+    for valid in ([False], [True, False, True]):
+        host.accumulate_full_payload_output("r", {"meta.codec_frame_valid": torch.tensor(valid)}, request)
+        output, actual_request = host._materialize_full_payload_entry(host._pending_full_payload_send["r"])
+        assert output["meta.codec_frame_valid"].tolist() == valid
+        assert actual_request is request

@@ -138,9 +138,14 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        self.collect_stage_metrics = True
         self._has_chunk_transfer_adapter = bool(
             getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
         )
+        # Per-replica release batching: ids waiting for the replica's next RPC
+        # and the task sending them (also the strong reference keeping it alive).
+        self._pending_releases: dict[int, dict[str, None]] = {}
+        self._release_flushers: dict[int, asyncio.Task[None]] = {}
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
@@ -633,12 +638,7 @@ class StagePool:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
-
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
-        output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
-        non_empty_first_output_ts = (
-            self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
-        )
         native_text_metrics = {}
         if request_id:
             pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
@@ -658,6 +658,47 @@ class StagePool:
             max(int(native_generation_tokens), 0)
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
             else count_tokens_from_outputs(request_outputs)
+        )
+        num_tokens_in = 0
+        if self.stage_id == 0:
+            for ro in request_outputs:
+                ptids = getattr(ro, "prompt_token_ids", None)
+                if ptids is not None:
+                    num_tokens_in += len(ptids)
+
+        metrics = self._replica_metrics[replica_id]
+        metrics.batch_seq += 1
+        batch_id = metrics.batch_seq
+        metrics.agg_total_tokens += num_tokens_out
+        metrics.agg_total_gen_time_ms += stage_gen_time_ms
+
+        # Preserve required fields and completion/usage without optional diagnostics.
+        stage_metrics = StageRequestMetrics(
+            num_tokens_in=num_tokens_in,
+            num_tokens_out=num_tokens_out,
+            finish_reason=finish_reason,
+            replica_id=replica_id,
+            batch_id=batch_id,
+            # This event summarizes one completed request. Execution batching
+            # happens inside the model runner and is not observable here.
+            batch_size=1,
+            stage_gen_time_ms=stage_gen_time_ms,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(
+                total_token=metrics.agg_total_tokens,
+                total_gen_time_ms=metrics.agg_total_gen_time_ms,
+            ),
+        )
+
+        # Lightweight path which skips optional telemetry
+        if not self.collect_stage_metrics:
+            return stage_metrics
+
+        output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
+        non_empty_first_output_ts = (
+            self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
         )
         output_unit_type = self._infer_output_unit_type(request_outputs, token_count=num_tokens_out)
         output_unit_count = self._count_output_units(
@@ -700,53 +741,23 @@ class StagePool:
         inter_output_latency_ms = (
             sum(inter_output_latencies_ms) / float(len(inter_output_latencies_ms)) if inter_output_latencies_ms else 0.0
         )
-        num_tokens_in = 0
-        if self.stage_id == 0:
-            for ro in request_outputs:
-                ptids = getattr(ro, "prompt_token_ids", None)
-                if ptids is not None:
-                    num_tokens_in += len(ptids)
-
-        metrics = self._replica_metrics[replica_id]
-        metrics.batch_seq += 1
-        batch_id = metrics.batch_seq
-        metrics.agg_total_tokens += num_tokens_out
-        metrics.agg_total_gen_time_ms += stage_gen_time_ms
-
-        return StageRequestMetrics(
-            num_tokens_in=num_tokens_in,
-            num_tokens_out=num_tokens_out,
-            stage_gen_time_ms=stage_gen_time_ms,
-            batch_id=batch_id,
-            # This event summarizes one completed request. Execution batching
-            # happens inside the model runner and is not observable here.
-            batch_size=1,
-            replica_id=replica_id,
-            finish_reason=finish_reason,
-            rx_decode_time_ms=0.0,
-            rx_transfer_bytes=0,
-            rx_in_flight_time_ms=0.0,
-            stage_stats=StageStats(
-                total_token=metrics.agg_total_tokens,
-                total_gen_time_ms=metrics.agg_total_gen_time_ms,
-            ),
-            audio_generated_frames=audio_generated_frames,
-            audio_sample_rate=audio_sample_rate,
-            audio_duration_s=audio_duration_s,
-            image_pixels=image_pixels,
-            num_inference_steps=num_inference_steps,
-            output_unit_type=output_unit_type,
-            output_unit_count=output_unit_count,
-            serving_time_to_first_output_ms=serving_time_to_first_output_ms,
-            image_time_to_first_output_ms=image_time_to_first_output_ms,
-            time_per_output_unit_ms=time_per_output_unit_ms,
-            inter_output_latency_ms=inter_output_latency_ms,
-            inter_output_latencies_ms=inter_output_latencies_ms,
-            vllm_ttft_ms=float(native_text_metrics.get("vllm_ttft_ms") or 0.0),
-            vllm_tpot_ms=float(native_text_metrics.get("vllm_tpot_ms") or 0.0),
-            vllm_itl_ms=float(native_text_metrics.get("vllm_itl_ms") or 0.0),
-            vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),
-        )
+        stage_metrics.audio_generated_frames = audio_generated_frames
+        stage_metrics.audio_sample_rate = audio_sample_rate
+        stage_metrics.audio_duration_s = audio_duration_s
+        stage_metrics.image_pixels = image_pixels
+        stage_metrics.num_inference_steps = num_inference_steps
+        stage_metrics.output_unit_type = output_unit_type
+        stage_metrics.output_unit_count = output_unit_count
+        stage_metrics.serving_time_to_first_output_ms = serving_time_to_first_output_ms
+        stage_metrics.image_time_to_first_output_ms = image_time_to_first_output_ms
+        stage_metrics.time_per_output_unit_ms = time_per_output_unit_ms
+        stage_metrics.inter_output_latency_ms = inter_output_latency_ms
+        stage_metrics.inter_output_latencies_ms = inter_output_latencies_ms
+        stage_metrics.vllm_ttft_ms = float(native_text_metrics.get("vllm_ttft_ms") or 0.0)
+        stage_metrics.vllm_tpot_ms = float(native_text_metrics.get("vllm_tpot_ms") or 0.0)
+        stage_metrics.vllm_itl_ms = float(native_text_metrics.get("vllm_itl_ms") or 0.0)
+        stage_metrics.vllm_itls_ms = list(native_text_metrics.get("vllm_itls_ms") or [])
+        return stage_metrics
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
         final_output_type = getattr(self.stage_client, "final_output_type", None)
@@ -965,6 +976,8 @@ class StagePool:
 
     def record_output_timestamps(self, request_outputs: list[Any], *, output_ts: float | None = None) -> None:
         """Record all output timestamps and the first non-empty output timestamp."""
+        if not self.collect_stage_metrics:
+            return
         output_ts = _time.time() if output_ts is None else output_ts
         for request_output in request_outputs:
             request_id = getattr(request_output, "request_id", None)
@@ -1310,27 +1323,64 @@ class StagePool:
 
         return abort_outputs
 
-    async def release_request_resources(self, request_ids: list[str]) -> None:
-        """Ask every live replica to drop transfer resources for *request_ids*.
+    def schedule_release_request_resources(self, request_ids: list[str]) -> None:
+        """Queue a best-effort release of *request_ids* on every live replica.
 
         Broadcast rather than binding-routed: the orchestrator releases route
         bindings as part of the same teardown, so a binding lookup here would
         race it. The engine-core handler is idempotent for unknown ids.
+
+        Each replica batches independently: ids of requests that finish while
+        its release RPC is in flight go out together in its next RPC, and a
+        hung replica delays only its own batches (bounded by
+        ``RELEASE_RPC_TIMEOUT_S`` per RPC).
         """
         if not request_ids or not self._has_chunk_transfer_adapter:
             return
-        ids = list(request_ids)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "[StagePool-%s] no running event loop; skipped reclaim of transfer resources for %s",
+                self.stage_id,
+                request_ids,
+            )
+            return
+        for replica_id in self.live_replica_ids():
+            pending = self._pending_releases.setdefault(replica_id, {})
+            pending.update(dict.fromkeys(request_ids))
+            if replica_id not in self._release_flushers:
+                self._release_flushers[replica_id] = loop.create_task(self._flush_replica_releases(replica_id))
 
-        async def release(replica_id: int, call: Any) -> None:
-            try:
-                await asyncio.wait_for(call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S)
-            except Exception as e:
-                logger.warning(
-                    "[StagePool-%s] release_request_resources on replica %s failed: %r", self.stage_id, replica_id, e
-                )
-
-        calls = [(i, getattr(self.clients[i], "call_utility_async", None)) for i in self.live_replica_ids()]
-        await asyncio.gather(*(release(i, call) for i, call in calls if call is not None))
+    async def _flush_replica_releases(self, replica_id: int) -> None:
+        pending = self._pending_releases[replica_id]
+        try:
+            while pending:
+                # Let completions handled in this loop pass join the batch.
+                await asyncio.sleep(0)
+                ids = list(pending)
+                pending.clear()
+                # Resolve the client per RPC: the replica may have been removed or replaced.
+                client = self.clients[replica_id] if replica_id < len(self.clients) else None
+                call = getattr(client, "call_utility_async", None)
+                if call is None:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[StagePool-%s] release_request_resources on replica %s failed: %r",
+                        self.stage_id,
+                        replica_id,
+                        e,
+                    )
+        finally:
+            # No await from here on, so a concurrent schedule cannot slip in
+            # between: the next one starts a fresh batch and sender.
+            del self._pending_releases[replica_id]
+            del self._release_flushers[replica_id]
 
     async def collective_rpc(
         self,

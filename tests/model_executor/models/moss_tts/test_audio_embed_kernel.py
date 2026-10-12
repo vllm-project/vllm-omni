@@ -31,10 +31,37 @@ def test_fused_embedding_matches_native_padding_clamping_and_reduction(dtype, ro
     gathered = weights[torch.arange(nq, device="cuda")[:, None], safe.t()]
     expected = (gathered * valid.t().unsqueeze(-1)).sum(0)
     actual = audio_embed(codes, weights, vocab)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected)
     saved = actual.clone()
     audio_embed(torch.zeros_like(codes), weights, vocab)
     torch.testing.assert_close(actual, saved, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_embedding_padding_and_clamping_are_bitwise_exact(dtype):
+    nq, vocab, hidden = 4, 4, 4
+    weights = torch.arange(nq * vocab * hidden, device="cuda", dtype=dtype).reshape(nq, vocab, hidden)
+    codes = torch.tensor(
+        [
+            [vocab, vocab, vocab, vocab],
+            [-2, 0, vocab - 1, vocab + 2],
+        ],
+        device="cuda",
+    )
+    expected = torch.tensor(
+        [
+            [0, 0, 0, 0],
+            [120, 124, 128, 132],
+        ],
+        device="cuda",
+        dtype=dtype,
+    )
+
+    actual = audio_embed(codes, weights, vocab)
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_compiled_embedding_has_static_shape_and_owned_outputs():

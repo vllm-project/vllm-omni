@@ -11,6 +11,7 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import signal
 from typing import Any
@@ -118,6 +119,17 @@ def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> b
     return True
 
 
+def _extend_handshake_timeout(timeout_s: float) -> None:
+    """Let this engine core wait at least ``timeout_s`` for the front-end's init message.
+
+    ``EngineCoreProc.startup_handshake`` reads the module global at call time,
+    and a stage process hosts exactly one engine core.
+    """
+    minutes = math.ceil(timeout_s / 60)
+    if minutes > _vllm_engine_core_module.HANDSHAKE_TIMEOUT_MINS:
+        _vllm_engine_core_module.HANDSHAKE_TIMEOUT_MINS = minutes
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -164,6 +176,7 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
         omni_parallel_stage_init: bool = False,
+        omni_handshake_timeout_s: float | None = None,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process.
@@ -180,6 +193,11 @@ class StageEngineCoreProc(EngineCoreProc):
           - ``omni_replica_id``: cluster-unique replica id within the
             stage (assigned by :class:`OmniMasterServer`). Used for
             logging / metrics only.
+          - ``omni_handshake_timeout_s``: how long to wait for the
+            front-end's init message. A launcher that spawns every stage
+            first and then completes their handshakes one by one answers a
+            later stage only after the earlier stages are ready, which can
+            exceed vLLM's fixed 5-minute wait.
         """
         signal_callback: SignalCallback | None = None
         vllm_config: VllmConfig = kwargs["vllm_config"]
@@ -232,6 +250,11 @@ class StageEngineCoreProc(EngineCoreProc):
                 "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
                 _vllm_engine_core_module.EngineCoreRequest,
             )
+
+            # Multi-API launches answer pre-spawned stages in launch order, so
+            # this stage may wait for earlier ones before its handshake reply.
+            if omni_handshake_timeout_s is not None:
+                _extend_handshake_timeout(omni_handshake_timeout_s)
 
             # CFG pairing scheduler patches must land before EngineCore builds
             # its Scheduler; gated on the stage's logits_processors and its
