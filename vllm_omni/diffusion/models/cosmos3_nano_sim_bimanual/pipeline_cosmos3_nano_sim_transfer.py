@@ -318,6 +318,7 @@ def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfi
     cosmos3_pre_process = get_cosmos3_pre_process_func(
         od_config,
         transfer_target_size=transfer_target_size,
+        transfer_direct_resize=True,
     )
 
     def pre_process_func(request):
@@ -875,6 +876,7 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             width=geometry.width,
             max_frames=request.num_pixel_frames,
             input_frames=input_frames,
+            direct_resize=True,
         )
         if control_frames.shape[1] != request.num_pixel_frames:
             raise ValueError(

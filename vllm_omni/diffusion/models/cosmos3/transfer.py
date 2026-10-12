@@ -554,7 +554,15 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
     return torch.stack(stacked, dim=1).contiguous()
 
 
-def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:
+def media_to_uint8_cthw(
+    value: Any,
+    *,
+    height: int,
+    width: int,
+    max_frames: int | None = None,
+    direct_resize_mode: str | None = None,
+    preserve_float: bool = False,
+) -> torch.Tensor:
     if isinstance(value, str | Path):
         frames = _path_media_to_uint8_cthw(value, max_frames=max_frames)
     elif isinstance(value, torch.Tensor):
@@ -571,6 +579,20 @@ def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int 
         raise TypeError(f"Unsupported Cosmos3 transfer control payload type: {type(value)!r}.")
     if max_frames is not None:
         frames = frames[:, : int(max_frames)]
+    if direct_resize_mode is not None:
+        from torchvision.transforms import functional as TF
+
+        if direct_resize_mode not in ("bicubic", "bilinear", "nearest"):
+            raise ValueError(f"Unsupported Transfer resize mode: {direct_resize_mode!r}")
+        # Preserve fractional depth values after resizing.
+        pixels = frames.permute(1, 0, 2, 3)
+        resized = TF.resize(
+            pixels.float() if preserve_float else pixels,
+            [int(height), int(width)],
+            interpolation=TF.InterpolationMode[direct_resize_mode.upper()],
+            antialias=direct_resize_mode != "nearest",
+        )
+        return resized.permute(1, 0, 2, 3).contiguous()
     return resize_center_crop_uint8_cthw(frames, int(height), int(width))
 
 
@@ -645,11 +667,29 @@ def load_or_compute_control_frames(
     width: int,
     max_frames: int,
     input_frames: torch.Tensor | None,
+    direct_resize: bool = False,
 ) -> torch.Tensor:
+    resize_mode = None
+    if direct_resize:
+        resize_mode = {"seg": "nearest", "edge": "nearest", "depth": "bilinear", "blur": "bicubic"}[hint.key]
     if hint.control is not None:
-        return media_to_uint8_cthw(hint.control, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_cthw(
+            hint.control,
+            height=height,
+            width=width,
+            max_frames=max_frames,
+            direct_resize_mode=resize_mode,
+            preserve_float=direct_resize and hint.key == "depth",
+        )
     if hint.control_path is not None:
-        return media_to_uint8_cthw(hint.control_path, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_cthw(
+            hint.control_path,
+            height=height,
+            width=width,
+            max_frames=max_frames,
+            direct_resize_mode=resize_mode,
+            preserve_float=direct_resize and hint.key == "depth",
+        )
     if hint.key == "edge":
         if input_frames is None:
             raise ValueError(

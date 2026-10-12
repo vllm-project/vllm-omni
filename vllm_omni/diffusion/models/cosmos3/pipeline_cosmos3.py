@@ -318,6 +318,7 @@ def get_cosmos3_pre_process_func(
     od_config: OmniDiffusionConfig,
     *,
     transfer_target_size: tuple[int, int] | Callable[[OmniDiffusionRequest], tuple[int, int]] | None = None,
+    transfer_direct_resize: bool = False,
 ):
     """Build the request preprocessor for Cosmos3 image/video inputs.
 
@@ -333,7 +334,8 @@ def get_cosmos3_pre_process_func(
     ``additional_information.preprocessed_transfer_video`` for optional input
     video conditioning. By default Transfer selects an aspect bucket from the
     source media; ``transfer_target_size`` instead fixes the output geometry
-    while retaining aspect-preserving resize and center crop. Cosmos3 sound
+    while retaining aspect-preserving resize and center crop unless
+    ``transfer_direct_resize`` is enabled. Cosmos3 sound
     generation is not driven by ``multi_modal_data["audio"]``; it is enabled
     later from sampling params.
     """
@@ -675,6 +677,7 @@ def get_cosmos3_pre_process_func(
                     height=int(target_h),
                     width=int(target_w),
                     max_frames=transfer_max_frames_from_extra_args(extra),
+                    direct_resize_mode="bicubic" if transfer_direct_resize else None,
                 )
                 prompt["additional_information"]["preprocessed_transfer_video"] = uint8_cthw_to_normalized_5d(
                     transfer_frames,

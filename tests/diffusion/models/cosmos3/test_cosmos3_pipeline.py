@@ -8,6 +8,7 @@ import sys
 import types
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -1548,6 +1549,74 @@ def test_sync_transfer_overlap_allocates_receive_buffer_on_non_output_rank() -> 
 
     assert overlap is not None
     assert torch.equal(overlap, torch.ones_like(overlap))
+
+
+@pytest.mark.parametrize("mode", ["bicubic", "bilinear", "nearest"])
+def test_transfer_direct_resize_preserves_border_and_matching_geometry(mode: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    frames = torch.zeros(3, 2, 4, 8, dtype=torch.uint8)
+    frames[..., :2] = 255
+    resized = transfer.media_to_uint8_cthw(frames, height=4, width=4, max_frames=1, direct_resize_mode=mode)
+    cropped = transfer.media_to_uint8_cthw(frames, height=4, width=4, max_frames=1)
+
+    assert resized.shape == (3, 1, 4, 4)
+    assert resized[..., 0].min() > 200
+    assert cropped.count_nonzero() == 0
+    unchanged = transfer.media_to_uint8_cthw(frames, height=4, width=8, direct_resize_mode=mode)
+    assert torch.equal(unchanged, frames)
+
+
+def test_transfer_direct_segmentation_resize_preserves_labels(tmp_path: Path) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    frame = np.zeros((4, 8, 3), dtype=np.uint8)
+    frame[:, :3] = [31, 127, 241]
+    path = tmp_path / "seg.png"
+    Image.fromarray(frame).save(path)
+    for hint in (
+        transfer.Cosmos3TransferHint(key="seg", control_path=str(path)),
+        transfer.Cosmos3TransferHint(key="seg", control=[Image.fromarray(frame)]),
+    ):
+        resized = transfer.load_or_compute_control_frames(
+            hint, height=2, width=4, max_frames=1, input_frames=None, direct_resize=True
+        )
+        colors = {tuple(pixel) for pixel in resized.permute(1, 2, 3, 0).reshape(-1, 3).tolist()}
+        assert colors == {(0, 0, 0), (31, 127, 241)}
+
+
+def test_transfer_source_direct_resize_precedes_control_generation() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    frame = np.zeros((32, 64, 3), dtype=np.uint8)
+    frame[:, :16] = 255
+    preprocess = get_cosmos3_pre_process_func(
+        SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None),
+        transfer_target_size=(16, 32),
+        transfer_direct_resize=True,
+    )
+    request = SimpleNamespace(
+        prompt={"prompt": "transfer", "multi_modal_data": {"video": [Image.fromarray(frame)]}},
+        sampling_params=SimpleNamespace(height=16, width=32, extra_args={"edge": True, "max_frames": 1}),
+    )
+    additional = preprocess(request).prompt["additional_information"]
+    actual = transfer.normalized_video_to_uint8_cthw(additional["preprocessed_transfer_video"])
+    expected = transfer.media_to_uint8_cthw([frame], height=16, width=32, direct_resize_mode="bicubic")
+    assert torch.equal(actual, expected)
+    assert actual[..., 0].min() == 255
+
+
+def test_transfer_direct_depth_preserves_fractional_values() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    frames = torch.arange(64, dtype=torch.uint8).reshape(1, 1, 8, 8).expand(3, -1, -1, -1)
+    hint = transfer.Cosmos3TransferHint(key="depth", control=frames)
+    resized = transfer.load_or_compute_control_frames(
+        hint, height=3, width=3, max_frames=1, input_frames=None, direct_resize=True
+    )
+    assert resized.dtype == torch.float32
+    assert (resized != resized.round()).any()
 
 
 def test_transfer_control_downsample_suppresses_aliasing() -> None:
