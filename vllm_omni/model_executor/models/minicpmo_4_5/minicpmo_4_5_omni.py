@@ -52,6 +52,49 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 logger = init_logger(__name__)
 
 
+def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
+    """Build the per-row duplex handoff metadata shared by the V1 and MRv2 Thinker outputs."""
+    duplex_rows = []
+    for req_info in request_infos:
+        duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
+        duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
+
+    outputs: dict[str, Any] = {}
+    prompt_rows = []
+    for duplex_info in duplex_rows:
+        prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
+        # This is a complete per-handoff snapshot, not a generated
+        # tensor delta. Keep it as row-local metadata so output
+        # accumulation replaces the previous value instead of
+        # attempting to concatenate variable-length prompts.
+        prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
+    if any(row is not None for row in prompt_rows):
+        outputs["duplex_prompt_token_ids"] = prompt_rows
+
+    special_rows = [
+        info if isinstance(info := duplex_info.get("special_token_ids"), dict) else {} for duplex_info in duplex_rows
+    ]
+    special_values: dict[str, int] = {}
+    for special in special_rows:
+        for key, value in special.items():
+            if isinstance(key, str) and isinstance(value, int) and value >= 0:
+                special_values.setdefault(key, value)
+    if special_values:
+        # These are tokenizer constants. A row whose append built no unit has
+        # none on MRv2, and a None entry would stay in that request's
+        # accumulated metadata over the values later appends publish.
+        # Host tensors: every consumer reads them on the host, and a pageable
+        # host->device copy per row and key would wait for the whole forward.
+        outputs["meta"] = {
+            key: [
+                torch.tensor([value if isinstance(value, int) and value >= 0 else constant], dtype=torch.long)
+                for value in (special.get(key) for special in special_rows)
+            ]
+            for key, constant in sorted(special_values.items())
+        }
+    return outputs
+
+
 @dataclass(slots=True)
 class _MiniCPMO45PendingSamples:
     """A deferred Stage-0 duplex step awaiting its host commit."""
@@ -123,12 +166,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.model_stage = vllm_config.model_config.model_stage
         self.model_sampler_wants_sampling_params = self.model_stage == "tts"
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        if (
-            self.model_stage == "llm"
-            and self._use_v2_model_runner
-            and getattr(vllm_config.model_config, "session_mode", "turn") != "turn"
-        ):
-            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
         if (
             self.model_stage == "llm"
             and self._use_v2_model_runner
@@ -230,13 +267,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # preprocess for duplex audio, while the Talker converts the
         # tts_token_ids/tts_hidden_states handoff into its conditioning
         # embeddings and initializes request-local codec generation state.
-        # Turn-mode Thinker inputs use the native multimodal encoder/cache on
-        # MRv2. Marking it as a custom-preprocess model disables that encoder
-        # path in the runner. Duplex still uses the V1 preprocess hook.
-        self.has_preprocess = self.model_stage == "tts" or not self._use_v2_model_runner
+        is_duplex = getattr(vllm_config.model_config, "session_mode", "turn") == "duplex"
+        self.has_preprocess = (
+            self.model_stage == "tts" or not self._use_v2_model_runner or (self.model_stage == "llm" and is_duplex)
+        )
+        # The duplex Thinker also serves media chat requests, whose image,
+        # audio and video features come from the native MRv2 encoder.
+        self.preprocess_keeps_mm_inputs = self.model_stage == "llm" and is_duplex and self._use_v2_model_runner
         # Neither AR stage has a postprocess, so step outputs can use the
         # runner's async snapshot instead of a blocking per-step D2H.
         self.use_async_omni_output = self.model_stage in {"llm", "tts"}
+
+        if self.model_stage == "llm" and is_duplex and self._use_v2_model_runner:
+            # Only the duplex Thinker exposes the MRv2 batch-preprocess hook.
+            self.preprocess_batch_mrv2 = self._preprocess_batch_mrv2
 
         if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
             # Build the Stage-0 duplex runtime (remote-code processor and
@@ -283,11 +327,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_row_sessions = {
             row.row_idx: row.session_id for row in rows if row.session_id is not None
         }
-        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
-        if not isinstance(request_sessions, dict):
-            request_sessions = {}
-            self._minicpmo45_duplex_request_sessions = request_sessions
-        request_sessions.update({row.request_id: row.session_id for row in rows if row.session_id is not None})
+        self._minicpmo45_duplex_request_session_map().update(
+            {row.request_id: row.session_id for row in rows if row.session_id is not None}
+        )
         self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
         self._minicpmo45_duplex_row_max_tokens = {
             row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
@@ -427,13 +469,24 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {}
 
+        if getattr(self, "_use_v2_model_runner", False) and self.model_stage == "llm":
+            req_id = kwargs.get("req_id")
+            if req_id is not None:
+                if not hasattr(self, "_mrv2_sampling_infos"):
+                    self._mrv2_sampling_infos = {}
+                self._mrv2_sampling_infos[str(req_id)] = kwargs
+
         duplex = kwargs.get("duplex")
         if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {}
 
-        prompt_len_meta = kwargs.get("duplex_prompt_len")
-        token_offset_meta = kwargs.get("duplex_token_offset", 0)
+        prompt_len_meta = kwargs.get("_omni_prompt_len")
+        if prompt_len_meta is None:
+            prompt_len_meta = kwargs.get("duplex_prompt_len")
+        token_offset_meta = kwargs.get("_omni_num_computed_tokens")
+        if token_offset_meta is None:
+            token_offset_meta = kwargs.get("duplex_token_offset", 0)
         if (
             isinstance(prompt_len_meta, int)
             and isinstance(token_offset_meta, int)
@@ -457,6 +510,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # A deferred sample of this session updates the latches its append reads.
         self._commit_minicpmo45_duplex_pending_samples(session_ids={session_id})
         state = self._minicpmo45_duplex_session_state(helper, session_id, duplex)
+        req_id = kwargs.get("req_id")
+        if req_id is not None:
+            # Own the session from its first append: MRv2 samples no partial
+            # prefill row, so a request cancelled mid-prefill never reaches
+            # prepare_duplex_sampling and on_requests_finished must still free it.
+            self._minicpmo45_duplex_request_session_map()[str(req_id)] = session_id
         prefill_kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
         seq = prefill_kwargs["seq"]
         result = helper.take_staged_prefill(state, prefill_kwargs["epoch"], seq)
@@ -488,7 +547,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         )
         full_req_embeds = result["inputs_embeds"].to(device=input_ids.device, dtype=target_dtype)
         full_input_token_ids = list(result.get("input_token_ids") or [])
-        prompt_len = kwargs.get("duplex_prompt_len")
+        prompt_len = kwargs.get("_omni_prompt_len")
+        if prompt_len is None:
+            prompt_len = kwargs.get("duplex_prompt_len")
         try:
             prompt_len = int(prompt_len) if prompt_len is not None else int(full_req_embeds.shape[0])
         except (TypeError, ValueError):
@@ -523,7 +584,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
         span_len = int(input_ids.shape[0])
-        token_offset = kwargs.get("duplex_token_offset", 0)
+        token_offset = kwargs.get("_omni_num_computed_tokens")
+        if token_offset is None:
+            token_offset = kwargs.get("duplex_token_offset", 0)
         try:
             token_offset = max(0, int(token_offset))
         except (TypeError, ValueError):
@@ -608,6 +671,29 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             staged.append((self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs))
         if len(staged) >= 2:
             helper.stage_prefill_batch(staged)
+
+    def _preprocess_batch_mrv2(self, *, req_infos: list[dict[str, Any]], device: torch.device) -> None:
+        """MRv2 ``preprocess_batch_mrv2`` hook (prefill rows only): ``preprocess_batch``'s cross-session batching.
+
+        Without it MRv2 builds every duplex append in ``preprocess`` one session
+        at a time: one batch-1 streaming-encoder pass per unit and no shared
+        vision-tower call for camera frames.
+        """
+        buffers = {
+            str(info["req_id"]): info
+            for info in req_infos
+            if isinstance(info, dict) and info.get("req_id") is not None and isinstance(info.get("duplex"), dict)
+        }
+        if buffers:
+            self.preprocess_batch(req_ids=list(buffers), model_intermediate_buffer=buffers, device=device)
+
+    def _minicpmo45_duplex_request_session_map(self) -> dict[str, str]:
+        """Request id -> Stage-0 session id, read by ``on_requests_finished`` to free the session."""
+        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
+        if not isinstance(request_sessions, dict):
+            request_sessions = {}
+            self._minicpmo45_duplex_request_sessions = request_sessions
+        return request_sessions
 
     def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
         """The Stage-0 state of ``session_id``, created with its session context on first use."""
@@ -763,51 +849,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                duplex_rows = []
-                for req_info in runtime_info:
-                    duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
-                    duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
-
-                prompt_rows = []
-                for duplex_info in duplex_rows:
-                    prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
-                    # This is a complete per-handoff snapshot, not a generated
-                    # tensor delta. Keep it as row-local metadata so output
-                    # accumulation replaces the previous value instead of
-                    # attempting to concatenate variable-length prompts.
-                    prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
-                if any(row is not None for row in prompt_rows):
-                    multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
-
-                special_keys = {
-                    key
-                    for duplex_info in duplex_rows
-                    for key, value in (
-                        duplex_info.get("special_token_ids", {}).items()
-                        if isinstance(duplex_info.get("special_token_ids"), dict)
-                        else ()
-                    )
-                    if isinstance(key, str) and isinstance(value, int) and value >= 0
-                }
-                if special_keys:
-                    # Host tensors: every consumer reads them on the host, and a pageable
-                    # host->device copy per row and key would wait for the whole forward.
-                    multimodal_outputs["meta"] = {
-                        key: [
-                            torch.tensor([int(value)], dtype=torch.long)
-                            if isinstance(value, int) and value >= 0
-                            else None
-                            for duplex_info in duplex_rows
-                            for value in [
-                                (
-                                    duplex_info.get("special_token_ids", {}).get(key)
-                                    if isinstance(duplex_info.get("special_token_ids"), dict)
-                                    else None
-                                )
-                            ]
-                        ]
-                        for key in sorted(special_keys)
-                    }
+                multimodal_outputs.update(_duplex_row_outputs(runtime_info))
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,
@@ -835,17 +877,47 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 req_states=req_states,
                 model_intermediate_buffer=model_intermediate_buffer,
             )
-        if any(isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer):
-            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
         num_tokens = model_outputs.shape[0]
+        multimodal_outputs: dict[str, Any] = {
+            "latent": model_outputs,
+            "latent_input_ids": input_batch.input_ids[:num_tokens].reshape(-1, 1),
+            "latent_positions": input_batch.positions[:num_tokens].reshape(-1, 1),
+        }
+        if model_intermediate_buffer and any(
+            isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer
+        ):
+            # The prompt snapshot and special ids change only with an append,
+            # and the output accumulator keeps the last value of a missing key.
+            # Publish them on steps that complete an append's prefill instead
+            # of copying every row's whole prompt on every decode step.
+            num_reqs = int(input_batch.num_reqs)
+            completes_prefill = input_batch.is_prefilling_np[:num_reqs] & (
+                input_batch.num_computed_prefill_tokens_np[:num_reqs] + input_batch.num_scheduled_tokens[:num_reqs]
+                >= input_batch.prefill_len_np[:num_reqs]
+            )
+            if completes_prefill.any():
+                multimodal_outputs.update(_duplex_row_outputs(model_intermediate_buffer))
+
         return OmniOutput(
             text_hidden_states=model_outputs,
-            multimodal_outputs={
-                "latent": model_outputs,
-                "latent_input_ids": input_batch.input_ids[:num_tokens].reshape(-1, 1),
-                "latent_positions": input_batch.positions[:num_tokens].reshape(-1, 1),
-            },
+            multimodal_outputs=multimodal_outputs,
         )
+
+    @property
+    def mm_outputs_fresh_per_step(self) -> bool:
+        """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
+        return self.model_stage == "tts" and self._use_v2_model_runner
+
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
+        if self.model_stage == "tts":
+            return self.talker.mrv2_custom_sampler(sampler)
+        if self.model_stage == "llm" and getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
+                MiniCPMO45DuplexSampler,
+            )
+
+            return MiniCPMO45DuplexSampler(sampler, self), None
+        return sampler, None
 
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":
@@ -874,6 +946,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             finished = set(finished_req_ids)
             completed_segments = {segment for segment in forced_segments if segment[0] in finished}
             forced_segments.difference_update(completed_segments)
+        mrv2_sampler = getattr(self, "_mrv2_duplex_sampler", None)
+        if mrv2_sampler is not None and hasattr(mrv2_sampler, "forget_requests"):
+            mrv2_sampler.forget_requests(finished_req_ids)
         if hasattr(self.model, "on_requests_finished"):
             self.model.on_requests_finished(finished_req_ids)
 

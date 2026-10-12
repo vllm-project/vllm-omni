@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import time
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
+from vllm import envs
+from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import CompilationTimes
@@ -117,12 +120,36 @@ class OmniGPUWorkerBase(GPUWorker):
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. profiled_usage = weights + peak_activation + non_torch_increase
-               (measured by ``memory_profiling`` around ``profile_run()``;
+            2. Measure weights + peak_activation + non_torch_increase with
+               ``memory_profiling`` around ``profile_run()``.
                ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time)
+               else is resident on the GPU at profiling time.
 
-            3. available_kv_cache = requested_memory - profiled_usage
+            3. Profile the CUDA graphs the runner captures through
+               ``cudagraph_dispatcher`` and the encoder graph manager. This has
+               to stay outside the ``memory_profiling`` window above, because it
+               allocates a minimal KV cache and captures graphs of its own,
+               which would otherwise land in ``non_torch_increase`` and be
+               counted twice. It runs only when
+               VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS is enabled (it is by
+               default), and the estimate is clamped at zero: it comes from
+               device free-memory deltas, so a release elsewhere on the device
+               during capture must not raise the budget above the request.
+               Under ``parallel_stage_init`` this runs inside the profiling
+               ``LOCK_EX`` (``engine/stage_phase_lock``), so co-located stages
+               cannot allocate or capture meanwhile. Graphs captured outside
+               that dispatcher are not in it:
+               ``GPUARModelRunner.capture_model`` captures the talker MTP graphs
+               after ``super().capture_model()``, and model
+               ``capture_auxiliary_graphs`` hooks run after warmup. Under
+               ``parallel_stage_init`` those remain covered by the reserve in
+               ``engine/stage_admission``; on the default path nothing accounts
+               for them.
+
+            4. profiled_usage = the step 2 measurements +
+               cudagraph_memory_estimate
+
+            5. available_kv_cache = requested_memory - profiled_usage
 
         Note:
             Process-scoped NVML estimation was removed in favour of the
@@ -145,7 +172,20 @@ class OmniGPUWorkerBase(GPUWorker):
         ) as profile_result:
             self.model_runner.profile_run()
 
+        cudagraph_memory_estimate = 0
+        if (
+            envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            and current_omni_platform.is_cuda_alike()
+            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            cudagraph_memory_estimate = max(0, self.model_runner.profile_cudagraph_memory())
+
+        self.cudagraph_memory_estimate = cudagraph_memory_estimate
         self.non_torch_memory = profile_result.non_torch_increase
+        # Upstream adds the applied estimate here as well, then adds the actual
+        # graph size again when it suggests --kv-cache-memory in
+        # compile_or_warm_up_model. Keep the activation peak alone so that
+        # suggestion counts the graph pool once.
         self.peak_activation_memory = profile_result.torch_peak_increase
         # Upstream 58b2012aa2 added `total_consumed` to the profiling result
         # and reads it in GPUWorker.compile_or_warm_up_model() (when
@@ -157,6 +197,7 @@ class OmniGPUWorkerBase(GPUWorker):
             int(self.model_runner.model_memory_usage)
             + profile_result.torch_peak_increase
             + profile_result.non_torch_increase
+            + cudagraph_memory_estimate
         )
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(
@@ -172,8 +213,54 @@ class OmniGPUWorkerBase(GPUWorker):
             format_gib(self.available_kv_cache_memory_bytes),
             scope="local",
         )
+        self._log_cudagraph_reserve(cudagraph_memory_estimate)
 
         return int(self.available_kv_cache_memory_bytes)
+
+    def _log_cudagraph_reserve(self, cudagraph_memory_estimate: int) -> None:
+        """Tell the operator how the graph reserve moved their KV budget.
+
+        Same guidance upstream ``GPUWorker.determine_available_memory`` prints:
+        a stage tuned before the reserve existed keeps its effective KV size by
+        raising ``gpu_memory_utilization`` by the graph pool's share. That only
+        works while the raised budget still fits in the memory free at startup.
+        Otherwise ``request_memory_tolerant`` caps it to the free memory, the
+        normal case for co-located Omni stages, and the log says the previous
+        size cannot be restored.
+        """
+        if cudagraph_memory_estimate <= 0:
+            return
+        total = self.init_snapshot.total_memory
+        free = self.init_snapshot.free_memory
+        current_util = self.cache_config.gpu_memory_utilization
+        # Round up so the suggested value restores at least the reserved amount.
+        # (0.8 + 0.1) * 10_000 is 9000.000000000002 in floating point, hence the inner round.
+        scaled = round((current_util + cudagraph_memory_estimate / total) * 10_000, 6)
+        suggested_util = math.ceil(scaled) / 10_000
+        # request_memory_tolerant computes the budget the suggested value would get.
+        suggested_memory = math.ceil(total * suggested_util)
+        uncapped = self.requested_memory >= math.ceil(total * current_util)
+        if uncapped and suggested_memory <= free:
+            logger.info_once(
+                "Reserved %s GiB for CUDA graphs out of this stage's KV budget; raise "
+                "--gpu-memory-utilization from %.4f to %.4f to keep the previous KV size, or set "
+                "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 to leave the graph pool unreserved.",
+                format_gib(cudagraph_memory_estimate),
+                current_util,
+                suggested_util,
+                scope="local",
+            )
+            return
+        logger.info_once(
+            "Reserved %s GiB for CUDA graphs out of this stage's KV budget; no "
+            "--gpu-memory-utilization restores the previous KV size, because the budget it needs "
+            "(%s GiB) exceeds the %s GiB free on the device at startup. Free memory on the device, "
+            "or set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 to leave the graph pool unreserved.",
+            format_gib(cudagraph_memory_estimate),
+            format_gib(suggested_memory if uncapped else self.requested_memory + cudagraph_memory_estimate),
+            format_gib(free),
+            scope="local",
+        )
 
     # Provide memory pool context
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:

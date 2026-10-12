@@ -1037,22 +1037,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             "update_streaming_prompt_for_condition",
             None,
         )
-        if stage_id != 0 and streaming_prompt_payload is not None and callable(update_streaming_prompt):
+        native_prompt = bool(getattr(self, "_native_data_plane", False))
+        if (
+            stage_id != 0
+            and streaming_prompt_payload is not None
+            and (callable(update_streaming_prompt) or native_prompt)
+        ):
             mm_feature_base = session.num_computed_tokens
             try:
-                replaced = update_streaming_prompt(
-                    streaming_prompt_payload,
-                    session,
-                    update_prompt=True,
-                )
+                if callable(update_streaming_prompt):
+                    replaced = update_streaming_prompt(streaming_prompt_payload, session, update_prompt=True)
+                else:
+                    replaced = self._update_native_streaming_prompt(session, streaming_prompt_payload)
             except ValueError as exc:
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
-                # callable(update_streaming_prompt) above implies a live
-                # adapter; the assert narrows it for the type checker.
-                assert chunk_transfer_adapter is not None
-                chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                if chunk_transfer_adapter is not None:
+                    chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                else:
+                    self._streaming_context_overflow[req_id] = (session.client_index, str(exc))
+                    if not session.is_finished():
+                        self.finish_requests((req_id,), RequestStatus.FINISHED_ERROR)
                 return
             if replaced is not None:
                 if replaced:
@@ -1091,6 +1097,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
+        """Delegate streaming prompt policy to the stage's payload processor."""
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        if not hasattr(self, "_native_prompt_hook"):
+            path = getattr(self.vllm_config.model_config, "custom_process_next_stage_input_func", None)
+            processor = resolve_obj_by_qualname(path) if path else None
+            self._native_prompt_hook = getattr(processor, "update_streaming_prompt_for_condition", None)
+        if self._native_prompt_hook is None:
+            return None
+        return self._native_prompt_hook(self.vllm_config.model_config, session, payload)
 
     def _maybe_reanchor_streaming_window(
         self,
