@@ -232,3 +232,14 @@ TODO: add and validate production schema-5 examples for camera, AgiBot, MECKA,
 YAM and Behavior-1K once matching input media are available. Prepared action
 sidecars use `action_space: normalized_unified_v1`, 59D `action` rows and
 `domain_names` (one name or one per row); pass them through `action_path`.
+## Padded conditioning images
+
+For an image already reflection-padded during preprocessing, set
+`extra_args.conditioning_image_size` to `[padded_h, padded_w, content_h, content_w]`.
+The offline JSONL runner in `--input-format reference` mode accepts the same
+`conditioning_image_size` field on a record. For example, `[480, 832, 360, 640]` keeps the complete 832x480 image for
+VAE encoding, crops the encoded latent to 22x40, and generates 640x352 video.
+Omit explicit height/width or supply the cropped output size (352/640), not the
+padded input size. The input image must already match the padded canvas; this
+option does not resize or pad source pixels. Without this field behavior is
+unchanged. This option is specific to Bimanual, not Sim-Transfer.

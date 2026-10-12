@@ -202,6 +202,8 @@ def _reference_request(
         extra["frustum_geometry"] = record["frustum_geometry"]
     if "action_space" in record:
         extra["action_space"] = record["action_space"]
+    if "conditioning_image_size" in record:
+        extra["conditioning_image_size"] = record["conditioning_image_size"]
     params = {
         "height": args.height,
         "width": args.width,

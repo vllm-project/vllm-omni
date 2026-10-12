@@ -49,6 +49,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frustum_retrieval impo
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
+    conditioning_image_size,
     resolve_cosmos3_nano_sim_bimanual_geometry,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
@@ -165,9 +166,23 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
         prompt = request.prompt
         media = _request_media(prompt)
         geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
-        sp.height, sp.width = geometry.height, geometry.width
+        image_size = conditioning_image_size(sp)
+        if image_size is not None:
+            from vllm_omni.diffusion.models.cosmos3.transfer import media_hw
 
-        result = cosmos3_pre_process(request)
+            if media is None or media_hw(media) != image_size[:2]:
+                raise ValueError("conditioning_image_size requires media matching the padded canvas exactly.")
+            # Encode the original padded pixels, but admit/schedule the cropped grid.
+            sp.height, sp.width = image_size[:2]
+        else:
+            sp.height, sp.width = geometry.height, geometry.width
+
+        try:
+            result = cosmos3_pre_process(request)
+        finally:
+            sp.height, sp.width = geometry.height, geometry.width
+        if image_size is not None:
+            result.sampling_params.height, result.sampling_params.width = geometry.height, geometry.width
         # Re-resolving explicit final dimensions catches any downstream
         # alignment, area, aspect, or model-grid violation.
         final_sp = result.sampling_params
@@ -921,6 +936,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if not isinstance(image, torch.Tensor):
             raise TypeError("Cosmos3-Nano-Sim-Bimanual preprocessed image must be a torch.Tensor.")
         latent = self._encode_conditioning_image_latent(image)
+        image_size = conditioning_image_size(sp)
+        if image_size is not None:
+            if tuple(image.shape[-2:]) != image_size[:2]:
+                raise ValueError("Preprocessed conditioning image no longer matches its padded canvas.")
+            latent = self._crop_latent_to_image_size(latent, image_size)
         expected = (
             1,
             self.transformer.latent_channel_size,

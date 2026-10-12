@@ -159,6 +159,22 @@ def _param(params: Any, name: str) -> Any:
     return getattr(params, name, None)
 
 
+def conditioning_image_size(params: Any) -> tuple[int, int, int, int] | None:
+    """Read the padded canvas and pre-padding content size, both in pixels."""
+    extra = _param(params, "extra_args") or {}
+    value = extra.get("conditioning_image_size")
+    if value is None:
+        return None
+    if not isinstance(value, list | tuple) or len(value) != 4:
+        raise ValueError("conditioning_image_size must be [padded_h, padded_w, content_h, content_w].")
+    padded_h, padded_w, content_h, content_w = (
+        _positive_int(item, "conditioning_image_size dimension") for item in value
+    )
+    if content_h > padded_h or content_w > padded_w:
+        raise ValueError("conditioning_image_size content must fit inside its padded canvas.")
+    return padded_h, padded_w, content_h, content_w
+
+
 def _media_hw(media: Any) -> tuple[int, int] | None:
     if media is None:
         return None
@@ -199,6 +215,17 @@ def resolve_cosmos3_nano_sim_bimanual_geometry(
     width = _param(sampling_params, "width")
     if (height is None) != (width is None):
         raise ValueError("Cosmos3-Nano-Sim-Bimanual height and width must be supplied together.")
+    image_size = conditioning_image_size(sampling_params)
+    if image_size is not None:
+        padded_h, padded_w, content_h, content_w = image_size
+        policy.resolve(padded_h, padded_w)
+        factor = policy.vae_spatial_compression_factor
+        if content_h < factor or content_w < factor:
+            raise ValueError("conditioning_image_size content must span at least one VAE spatial cell.")
+        cropped = policy.resolve(content_h // factor * factor, content_w // factor * factor)
+        if height is not None and policy.resolve(height, width).session_key != cropped.session_key:
+            raise ValueError("Explicit height/width must match the conditioning_image_size cropped output.")
+        return cropped
     if height is not None:
         return policy.resolve(height, width)
     source_hw = _media_hw(media)
