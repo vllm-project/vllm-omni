@@ -102,7 +102,7 @@ VOICES: dict[str, tuple[str, str]] = {
 # from the voice index so requests finish at different steps and new requests
 # are admitted into batches that are already running.
 TEXTS = [
-    "Thank you so much for the birthday gift you sent me last week.",
+    "Thank you so much for the nice gift you sent me last week.",
     "The weather is lovely today, with warm sunshine and a gentle breeze, so we decided to walk in the park.",
     "Please remember to bring your notebook and a pen to the meeting tomorrow morning.",
     "After the long winter, the farmers were glad to see the first green shoots appear in the fields, "
