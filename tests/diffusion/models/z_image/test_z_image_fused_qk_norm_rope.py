@@ -53,6 +53,8 @@ def test_packed_table_uses_row_zero_like_rotary_embedding(monkeypatch):
 
     monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
     cos, sin = torch.randn(3, 20, _HEAD_DIM // 2, device="cuda"), torch.randn(3, 20, _HEAD_DIM // 2, device="cuda")
+    assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None  # preserve eager numerics by default
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     table = _packed_qk_norm_rope_table(cos, sin, torch.bfloat16)
     assert table.shape == (60, _HEAD_DIM) and table.dtype == torch.bfloat16
     expected = torch.cat((cos[0], sin[0]), dim=-1).to(torch.bfloat16)
@@ -75,7 +77,7 @@ def test_packed_table_is_built_under_sequence_parallelism(monkeypatch):
     from vllm_omni.diffusion.forward_context import set_forward_context
     from vllm_omni.diffusion.models.z_image.z_image_transformer import _packed_qk_norm_rope_table
 
-    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     shard = 10  # what this rank holds after _sp_plan splits a 20-token sequence over 2 ranks
     cos = torch.randn(3, shard, _HEAD_DIM // 2, device="cuda")
     sin = torch.randn(3, shard, _HEAD_DIM // 2, device="cuda")
@@ -93,9 +95,10 @@ def test_packed_table_is_built_under_sequence_parallelism(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_z_image_attention_fused_matches_eager(_dist_env):
+def test_z_image_attention_fused_matches_eager(_dist_env, monkeypatch):
     from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageAttention, _packed_qk_norm_rope_table
 
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     torch.manual_seed(3)
     with torch.device("cuda"):
         attn = ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)

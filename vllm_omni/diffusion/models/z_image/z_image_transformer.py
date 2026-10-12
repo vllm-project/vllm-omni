@@ -624,11 +624,10 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
-# Token count (B * S) below which a Z-Image attention site keeps its eager
-# RMSNorm -> RoPE chain; fuse by default (the fused path won at every size
-# measured on H200 for this chain, see Flux.2 / Boogu-Image) and keep the
-# gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
-_FUSED_MIN_TOKENS = 0
+# The fused reduction changes Z-Image sampled outputs on the tested model.
+# Keep the eager chain by default until its numerical contract is validated;
+# deployments can opt in with VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS=0.
+_FUSED_MIN_TOKENS = 2**63 - 1
 
 
 def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
