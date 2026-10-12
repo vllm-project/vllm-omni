@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Comprehensive tests of diffusion features that are available in online serving mode.
 
@@ -19,7 +22,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -27,8 +30,8 @@ PROMPT = "Two anthropomorphic cats in comfy boxing gear and bright gloves fight 
 NEGATIVE_PROMPT = "low quality, blurry, distorted face, extra limbs, bad anatomy, watermark, logo, text, ugly, deformed, mutated, jpeg artifacts"
 
 # CUDA marks (original matrix, unchanged)
-CUDA_SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-CUDA_PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+CUDA_SINGLE_CARD_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+CUDA_PARALLEL_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2)
 
 # NPU marks
 NPU_TWO_CARD_MARKS = hardware_marks(res={"npu": "A2"}, num_cards=2)
@@ -124,7 +127,13 @@ def _get_wan22_feature_cases():
         for feat_id, server_args, marks in NPU_PARALLEL_CONFIGS:
             cases.append(
                 pytest.param(
-                    OmniServerParams(model=model_path, server_args=server_args),
+                    OmniServerParams(
+                        model=model_path,
+                        server_args=server_args,
+                        stage_init_timeout=1800,
+                        init_timeout=2100,
+                        startup_timeout=2400,
+                    ),
                     id=f"npu_{model_key}_{feat_id}",
                     marks=marks,
                 )
@@ -140,7 +149,7 @@ def _get_wan22_feature_cases():
 )
 def test_wan22_diffusion_features(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     model_path = omni_server.model
     is_i2v_or_ti2v = any(kw in model_path for kw in ["I2V", "TI2V"])
@@ -176,4 +185,4 @@ def test_wan22_diffusion_features(
     if is_i2v_or_ti2v:
         request_config["image_reference"] = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
-    openai_client.send_video_diffusion_request(request_config)
+    online_client.send_video_diffusion_request(request_config)

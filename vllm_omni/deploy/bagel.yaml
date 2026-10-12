@@ -40,8 +40,6 @@ stages:
 connectors:
   shared_memory_connector:
     name: SharedMemoryConnector
-    extra:
-      shm_threshold_bytes: 65536
 
   rdma_connector:
     name: MooncakeTransferEngineConnector

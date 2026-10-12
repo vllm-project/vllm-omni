@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The Fairseq Authors and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
-from functools import lru_cache
+import inspect
+from collections.abc import Callable
+from functools import cache, lru_cache
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -20,11 +26,42 @@ from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
 
+FlashAttnFn = Callable[..., Any]
+
 logger = init_logger(__name__)
 
-# Flash Attention function detection with fallback chain
-flash_attn_func = None
-flash_attn_varlen_func = None
+
+def _is_blackwell() -> bool:
+    try:
+        capability = current_omni_platform.get_device_capability()
+    except Exception:
+        return False
+    return capability is not None and capability.major >= 10
+
+
+@lru_cache(maxsize=1)
+def is_flash_attn_4_available() -> bool:
+    """Return whether CuTe FlashAttention-4 (``flash_attn.cute``) can be imported.
+
+    FA2/FA3 wheels are often importable on Blackwell but only ship Hopper kernels.
+    Those must not be treated as a runnable FLASH_ATTN implementation here.
+    """
+    try:
+        from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+
+        return True
+    except Exception as exc:
+        logger.debug("CuTe FlashAttention-4 is unavailable: %s", exc)
+        return False
+
+
+# Flash Attention implementation discovery. All candidates implement the same
+# logical FLASH_ATTN backend; this never substitutes SDPA at runtime.
+# Bind via aliases so mypy does not treat each candidate import as a redefinition.
+flash_attn_func: FlashAttnFn | None = None
+flash_attn_varlen_func: FlashAttnFn | None = None
+IS_FLASH_ATTN_4 = False
+IS_AITER = False
 
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
@@ -32,7 +69,12 @@ if current_omni_platform.is_rocm():
         from vllm._aiter_ops import is_aiter_found_and_supported
 
         if is_aiter_found_and_supported():
-            from aiter import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+            from aiter import flash_attn_func as _fa_func
+            from aiter import flash_attn_varlen_func as _fa_varlen
+
+            flash_attn_func = _fa_func
+            flash_attn_varlen_func = _fa_varlen
+            IS_AITER = True
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_xpu():
@@ -44,53 +86,286 @@ elif current_omni_platform.is_xpu():
         pass
 elif current_omni_platform.is_musa():
     try:
-        from flash_attn_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+        from flash_attn_interface import flash_attn_func as _fa_func
+        from flash_attn_interface import flash_attn_varlen_func as _fa_varlen
+
+        flash_attn_func = _fa_func
+        flash_attn_varlen_func = _fa_varlen
     except (ImportError, ModuleNotFoundError):
         pass
 else:
-    # CUDA: try FA3 -> FA2 fallback chain
-    # Try FA3 from fa3-fwd PyPI package
-    try:
-        from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
-    except (ImportError, ModuleNotFoundError):
-        pass
+    # CUDA implementation candidates, ordered by preference.
+    # Candidate 1: CuTe-based FA4. This matters on Blackwell, where an
+    # importable Hopper-only FA3 wheel may otherwise be selected and fail
+    # at launch with "no kernel image is available".
+    if _is_blackwell():
+        if is_flash_attn_4_available():
+            try:
+                from flash_attn.cute import flash_attn_func as _fa_func
+                from flash_attn.cute import flash_attn_varlen_func as _fa_varlen
 
-    # Fallback: Try FA3 from flash-attention source build
-    if flash_attn_func is None:
-        try:
-            from flash_attn_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
-        except (ImportError, ModuleNotFoundError):
-            pass
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+                IS_FLASH_ATTN_4 = True
+                logger.info("Using CuTe FlashAttention-4 on Blackwell")
+            except Exception as exc:
+                # Optional FA4 dependencies may be present but ABI-incompatible
+                # (for example, mismatched CUTLASS DSL and Quack builds). Treat
+                # that as unavailable so backend discovery can continue.
+                logger.debug("CuTe FlashAttention-4 is unavailable: %s", exc)
+    else:
+        # Candidate 2: FA3 from fa3-fwd PyPI package.
+        if flash_attn_func is None:
+            try:
+                from fa3_fwd_interface import flash_attn_func as _fa_func
+                from fa3_fwd_interface import flash_attn_varlen_func as _fa_varlen
 
-    # Fallback: Try FA2 from flash-attn package (try multiple import paths)
-    if flash_attn_func is None:
-        try:
-            from flash_attn import flash_attn_func, flash_attn_varlen_func  # noqa: F401
-        except (ImportError, ModuleNotFoundError):
-            pass
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
 
-    if flash_attn_func is None:
-        try:
-            from flash_attn.flash_attn_interface import (  # noqa: F401
-                flash_attn_func,
-                flash_attn_varlen_func,
-            )
-        except (ImportError, ModuleNotFoundError):
-            pass
+        # Candidate 3: FA3 from a flash-attention source build.
+        if flash_attn_func is None:
+            try:
+                from flash_attn_interface import flash_attn_func as _fa_func
+                from flash_attn_interface import flash_attn_varlen_func as _fa_varlen
 
-    # Fallback: Try vLLM's encapsulated flash attention dispatcher
-    # TODO discuss priority and remove potentially redundant fallbacks
-    if flash_attn_varlen_func is None:
-        try:
-            from vllm.vllm_flash_attn import (  # noqa: F401
-                flash_attn_varlen_func,
-            )
-        except (ImportError, ModuleNotFoundError):
-            pass
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+        # Candidate 4: FA2 from the flash-attn package (multiple import paths).
+        if flash_attn_func is None:
+            try:
+                from flash_attn import flash_attn_func as _fa_func
+                from flash_attn import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+        if flash_attn_func is None:
+            try:
+                from flash_attn.flash_attn_interface import flash_attn_func as _fa_func
+                from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+        # Candidate 5: vLLM's encapsulated Flash Attention dispatcher.
+        if flash_attn_varlen_func is None:
+            try:
+                from vllm.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
 
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+
+
+def validate_fa4_head_dims(head_dim: int, head_dim_v: int, alignment: int) -> bool:
+    """Use the selected FA4 implementation's constraints during path resolution.
+
+    Return False when its validator is unavailable; propagate kernel validation
+    errors for the backend to report. Keep the private FA4 API dependency here,
+    rather than duplicating architecture/version-specific dimension rules.
+    This is a planning-time call, never part of compiled tensor execution.
+    """
+    try:
+        from flash_attn.cute.interface import _get_device_arch, _validate_head_dims
+    except ImportError:
+        return False
+
+    arch = _get_device_arch() // 10
+    # FA4 routes SM80/SM120 through separate kernels and bypasses this validator.
+    if arch not in (9, 10, 11):
+        return False
+    _validate_head_dims(head_dim, head_dim_v, arch, alignment)
+    return True
+
+
+def _choose_vllm_flash_attn_version(
+    device_major: int,
+    requested: str | int | None,
+    supported_versions: frozenset[int],
+) -> int:
+    """Choose a vLLM-bundled FA kernel without model-specific policy."""
+
+    if requested is not None:
+        try:
+            version = int(requested)
+        except (TypeError, ValueError) as error:
+            raise ValueError("FlashAttention version must be 2, 3, or 4") from error
+        if version not in (2, 3, 4):
+            raise ValueError("FlashAttention version must be 2, 3, or 4")
+        if version not in supported_versions:
+            raise RuntimeError(f"FlashAttention {version} is unavailable on this device")
+        return version
+
+    if device_major >= 10 and 4 in supported_versions:
+        return 4
+    if device_major >= 9 and 3 in supported_versions:
+        return 3
+    if 2 in supported_versions:
+        return 2
+    raise RuntimeError("No vLLM-bundled FlashAttention 2/3/4 kernel is available")
+
+
+@cache
+def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
+    """Resolve an available vLLM-bundled FA2/FA3/FA4 implementation."""
+
+    if not current_omni_platform.is_cuda():
+        raise RuntimeError("vLLM-bundled versioned FlashAttention requires CUDA")
+
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    capability = current_omni_platform.get_device_capability()
+    if capability is None:
+        raise RuntimeError("Cannot resolve FlashAttention without a CUDA device capability")
+    supported_versions = frozenset(version for version in (2, 3, 4) if is_fa_version_supported(version))
+    return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
+
+
+_FA3_MISSING = "A standalone FlashAttention-3 varlen interface (flash_attn_interface) is required"
+
+
+@cache
+def _external_fa3_varlen() -> tuple[FlashAttnFn, frozenset[str] | None] | None:
+    """Return the standalone FlashAttention-3 varlen function and its parameter names, if installed.
+
+    The names are ``None`` when the function's signature cannot be inspected.
+    """
+    try:
+        from flash_attn_interface import flash_attn_varlen_func as func
+    except ImportError:
+        return None
+    try:
+        return func, frozenset(inspect.signature(func).parameters)
+    except (TypeError, ValueError):
+        return func, None
+
+
+@cache
+def flash_attn_3_varlen_unsupported(softcap: bool = False, return_softmax_lse: bool = False) -> str | None:
+    """Return why ``flash_attn_3_varlen`` cannot run with these options, or ``None`` when it can."""
+    provider = _external_fa3_varlen()
+    if provider is None:
+        return _FA3_MISSING
+    parameters = provider[1]
+    if parameters is None:
+        return "The FlashAttention-3 provider's signature cannot be inspected"
+    if softcap and "softcap" not in parameters:
+        return "This FlashAttention-3 provider does not support softcap"
+    if return_softmax_lse and not parameters & {"return_attn_probs", "return_softmax_lse"}:
+        return "This FlashAttention-3 provider does not expose an LSE return option"
+    return None
+
+
+def flash_attn_3_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Call standalone FA3 and return the output, or ``(output, LSE)`` with LSE packed as ``[heads, tokens]``.
+
+    Providers name the LSE request either ``return_attn_probs`` or ``return_softmax_lse``.
+    """
+    softcap = max(float(softcap), 0.0)
+    unsupported = flash_attn_3_varlen_unsupported(softcap > 0, return_softmax_lse)
+    if unsupported is not None:
+        raise (ImportError if unsupported == _FA3_MISSING else NotImplementedError)(unsupported)
+    provider = _external_fa3_varlen()
+    assert provider is not None  # flash_attn_3_varlen_unsupported reports a missing provider
+    func, parameters = provider
+    assert parameters is not None  # and an uninspectable signature
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": int(max_seqlen_q),
+        "max_seqlen_k": int(max_seqlen_k),
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+    }
+    if "softcap" in parameters:
+        kwargs["softcap"] = softcap
+    if return_softmax_lse:
+        kwargs["return_attn_probs" if "return_attn_probs" in parameters else "return_softmax_lse"] = True
+    result = func(**kwargs)
+    if not return_softmax_lse:
+        out = result[0] if isinstance(result, tuple) and result else result
+        if not isinstance(out, torch.Tensor):
+            raise RuntimeError("FlashAttention-3 must return an output tensor")
+        return out
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise RuntimeError("FlashAttention-3 must return (output, softmax_lse) when LSE is requested")
+    out, lse = result[:2]
+    if not isinstance(out, torch.Tensor) or not isinstance(lse, torch.Tensor):
+        raise RuntimeError("FlashAttention-3 output and softmax_lse must be tensors")
+    expected_shape = (q.shape[1], q.shape[0])
+    if lse.shape != expected_shape:
+        raise RuntimeError(f"Expected packed softmax_lse shape {expected_shape}, got {tuple(lse.shape)}")
+    return out, lse
+
+
+def vllm_flash_attn_varlen_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    deterministic: bool = False,
+    fa_version: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run packed vLLM FlashAttention and retain LSE for post-processing."""
+
+    from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
+
+    version = resolve_vllm_flash_attn_version(fa_version)
+    out, lse = vllm_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        int(max_seqlen_q),
+        cu_seqlens_q,
+        int(max_seqlen_k),
+        cu_seqlens_k=cu_seqlens_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=None,
+        softcap=max(float(softcap), 0.0),
+        deterministic=deterministic,
+        return_softmax_lse=True,
+        fa_version=version,
+    )
+    return out, lse
 
 
 @lru_cache(maxsize=1)
@@ -100,7 +375,11 @@ def is_flash_attn_installed() -> bool:
     Shared by CUDA/ROCm/MUSA platforms.
     """
     try:
-        # Check for any FA backend: FA3 (fa3_fwd_interface, flash_attn_interface) or FA2 (flash_attn)
+        # Check for any FA backend: FA4 (flash_attn.cute), FA3
+        # (fa3_fwd_interface, flash_attn_interface), or FA2 (flash_attn).
+        if _is_blackwell():
+            return is_flash_attn_4_available()
+
         # Try FA3 from fa3-fwd PyPI package
         try:
             import fa3_fwd_interface  # noqa: F401
@@ -134,7 +413,7 @@ def is_flash_attn_installed() -> bool:
 
         return True
     except (ImportError, ModuleNotFoundError):
-        logger.warning("No Flash Attention backend found, using pytorch SDPA implementation")
+        logger.warning("No Flash Attention implementation found")
         return False
 
 

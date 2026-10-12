@@ -1,0 +1,172 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5",
+    "description": "H100 baseline refreshed 2026-09-29: equal-weight nightly means for 2026-09-22 through 2026-09-28 (7 runs each for C1/P32, C4/P64, C8/P128), rounded to 4 decimals without an added margin. Uses request reference audio after #6628; duplex_seed_tts excluded. A3 unchanged.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"],
+            "npu": "A3"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          32,
+          64,
+          128
+        ],
+        "max_concurrency": [
+          1,
+          4,
+          8
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H100": {
+            "request_throughput": [
+              0.9615,
+              1.4882,
+              1.6245
+            ],
+            "mean_ttft_ms": [
+              156.5006,
+              272.8529,
+              283.2613
+            ],
+            "mean_e2el_ms": [
+              1042.7617,
+              2669.8806,
+              4882.2845
+            ],
+            "mean_audio_ttfp_ms": [
+              585.7387,
+              1396.1575,
+              2508.4384
+            ],
+            "mean_audio_rtf": [
+              0.2504,
+              0.6281,
+              1.1787
+            ]
+          },
+          "A3": {
+            "request_throughput": [
+              0.4813,
+              0.6381,
+              0.8728
+            ],
+            "mean_ttft_ms": [
+              328.182,
+              470.0053,
+              506.3193
+            ],
+            "mean_e2el_ms": [
+              2086.7028,
+              6480.6866,
+              9103.7395
+            ],
+            "mean_audio_ttfp_ms": [
+              1023.3301,
+              2734.1486,
+              3151.4020
+            ],
+            "mean_audio_rtf": [
+              0.4659,
+              1.4737,
+              2.1758
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minicpmo_4_5_a2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A2"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          32,
+          64,
+          128
+        ],
+        "max_concurrency": [
+          1,
+          4,
+          8
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "modalities": [
+            "text",
+            "audio"
+          ],
+          "chat_template_kwargs": {
+            "enable_thinking": false,
+            "use_tts_template": true
+          }
+        },
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]

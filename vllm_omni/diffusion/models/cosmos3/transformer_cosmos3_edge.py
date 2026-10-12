@@ -14,6 +14,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
+from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 
 from .transformer_cosmos3 import (
     Cosmos3VFMTransformer,
@@ -93,7 +94,7 @@ class Cosmos3EdgeCausalAttention(nn.Module):
         num_key_value_heads: int,
         head_dim: int,
         rms_norm_eps: float,
-        use_k_norm_und_for_gen: bool,
+        use_und_k_norm_for_gen: bool,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -144,7 +145,7 @@ class Cosmos3EdgeCausalAttention(nn.Module):
             prefix=f"{prefix}.to_out",
         )
 
-        self.k_norm_und_for_gen = RMSNorm(self.head_dim, eps=rms_norm_eps) if use_k_norm_und_for_gen else None
+        self.k_norm_und_for_gen = RMSNorm(self.head_dim, eps=rms_norm_eps) if use_und_k_norm_for_gen else None
         self.attn = FrameworkAttention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -195,7 +196,7 @@ class Cosmos3EdgeUndDecoderLayer(nn.Module):
         num_key_value_heads: int,
         head_dim: int,
         rms_norm_eps: float,
-        use_k_norm_und_for_gen: bool,
+        use_und_k_norm_for_gen: bool,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -206,7 +207,7 @@ class Cosmos3EdgeUndDecoderLayer(nn.Module):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
-            use_k_norm_und_for_gen=use_k_norm_und_for_gen,
+            use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
@@ -256,8 +257,9 @@ class Cosmos3EdgeLanguageModel(nn.Module):
         rms_norm_eps: float,
         rope_theta: float,
         mrope_section: list[int],
-        use_k_norm_und_for_gen: bool,
+        use_und_k_norm_for_gen: bool,
         quant_config: QuantizationConfig | None = None,
+        release_completed_blocks_to_meta: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -267,22 +269,22 @@ class Cosmos3EdgeLanguageModel(nn.Module):
             rope_theta=rope_theta,
             mrope_section=mrope_section,
         )
-        self.layers = nn.ModuleList(
-            [
-                Cosmos3EdgeUndDecoderLayer(
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                    num_attention_heads=num_attention_heads,
-                    num_key_value_heads=num_key_value_heads,
-                    head_dim=head_dim,
-                    rms_norm_eps=rms_norm_eps,
-                    use_k_norm_und_for_gen=use_k_norm_und_for_gen,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
-                )
-                for i in range(num_hidden_layers)
-            ]
-        )
+        self.layers = nn.ModuleList()
+        for i in range(num_hidden_layers):
+            layer = Cosmos3EdgeUndDecoderLayer(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+                quant_config=quant_config,
+                prefix=f"{prefix}.layers.{i}",
+            )
+            if release_completed_blocks_to_meta:
+                release_module_parameters_to_meta(layer)
+            self.layers.append(layer)
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(
@@ -368,7 +370,7 @@ class Cosmos3EdgeVFMTransformer(Cosmos3VFMTransformer):
         return list(mrope_section)
 
     def _language_model_kwargs(self) -> dict[str, Any]:
-        return {"use_k_norm_und_for_gen": self.use_k_norm_und_for_gen}
+        return {"use_und_k_norm_for_gen": self.use_und_k_norm_for_gen}
 
     def validate_loaded_weights(self, loaded: set[str]) -> None:
         missing: list[str] = []
@@ -379,7 +381,7 @@ class Cosmos3EdgeVFMTransformer(Cosmos3VFMTransformer):
                 f"gen_layers.{layer_idx}.mlp.up_proj.",
                 f"gen_layers.{layer_idx}.mlp.down_proj.",
             )
-            if self.use_k_norm_und_for_gen:
+            if self.use_und_k_norm_for_gen:
                 required_markers = (
                     *required_markers,
                     f"language_model.layers.{layer_idx}.self_attn.k_norm_und_for_gen.",

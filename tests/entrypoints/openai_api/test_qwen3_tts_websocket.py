@@ -33,26 +33,63 @@ tts_ws_server_params = [
 ]
 
 
-async def _run_ws_session(host: str, port: int, model: str) -> dict:
-    uri = f"ws://{host}:{port}/v1/audio/speech/stream"
+def _session_config(model: str) -> str:
+    return json.dumps(
+        {
+            "type": "session.config",
+            "model": model,
+            "voice": "vivian",
+            "language": "English",
+            "response_format": "pcm",
+            "stream_audio": True,
+        }
+    )
+
+
+async def _collect_utterance(ws) -> dict:
+    """Read frames until session.done closes out one flushed utterance."""
     starts: list[dict] = []
     dones: list[dict] = []
     chunk_lengths: dict[int, list[int]] = {}
     session_done: dict | None = None
 
+    while True:
+        message = await asyncio.wait_for(ws.recv(), timeout=180)
+        if isinstance(message, bytes):
+            if not starts:
+                raise AssertionError("Received audio bytes before audio.start")
+            sentence_index = starts[-1]["sentence_index"]
+            chunk_lengths.setdefault(sentence_index, []).append(len(message))
+            continue
+
+        payload = json.loads(message)
+        msg_type = payload.get("type")
+        if msg_type == "audio.start":
+            starts.append(payload)
+            chunk_lengths.setdefault(payload["sentence_index"], [])
+        elif msg_type == "audio.done":
+            dones.append(payload)
+        elif msg_type == "session.done":
+            session_done = payload
+            break
+        elif msg_type == "error":
+            raise AssertionError(f"WebSocket error: {payload['message']}")
+        else:
+            raise AssertionError(f"Unexpected WebSocket message: {payload}")
+
+    return {
+        "starts": starts,
+        "dones": dones,
+        "chunk_lengths": chunk_lengths,
+        "session_done": session_done,
+    }
+
+
+async def _run_ws_session(host: str, port: int, model: str) -> dict:
+    uri = f"ws://{host}:{port}/v1/audio/speech/stream"
+
     async with websockets.connect(uri, max_size=None) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.config",
-                    "model": model,
-                    "voice": "vivian",
-                    "language": "English",
-                    "response_format": "pcm",
-                    "stream_audio": True,
-                }
-            )
-        )
+        await ws.send(_session_config(model))
         await ws.send(
             json.dumps(
                 {
@@ -67,36 +104,23 @@ async def _run_ws_session(host: str, port: int, model: str) -> dict:
         )
         await ws.send(json.dumps({"type": "input.done"}))
 
-        while True:
-            message = await asyncio.wait_for(ws.recv(), timeout=180)
-            if isinstance(message, bytes):
-                if not starts:
-                    raise AssertionError("Received audio bytes before audio.start")
-                sentence_index = starts[-1]["sentence_index"]
-                chunk_lengths.setdefault(sentence_index, []).append(len(message))
-                continue
+        return await _collect_utterance(ws)
 
-            payload = json.loads(message)
-            msg_type = payload.get("type")
-            if msg_type == "audio.start":
-                starts.append(payload)
-                chunk_lengths.setdefault(payload["sentence_index"], [])
-            elif msg_type == "audio.done":
-                dones.append(payload)
-            elif msg_type == "session.done":
-                session_done = payload
-                break
-            elif msg_type == "error":
-                raise AssertionError(f"WebSocket error: {payload['message']}")
-            else:
-                raise AssertionError(f"Unexpected WebSocket message: {payload}")
 
-    return {
-        "starts": starts,
-        "dones": dones,
-        "chunk_lengths": chunk_lengths,
-        "session_done": session_done,
-    }
+async def _run_ws_reused_connection(host: str, port: int, model: str, texts: list[str]) -> list[dict]:
+    """Synthesize several utterances over a single connection."""
+    uri = f"ws://{host}:{port}/v1/audio/speech/stream"
+    results: list[dict] = []
+
+    async with websockets.connect(uri, max_size=None) as ws:
+        await ws.send(_session_config(model))
+        for text in texts:
+            await ws.send(json.dumps({"type": "input.text", "text": text}))
+            await ws.send(json.dumps({"type": "input.done"}))
+            results.append(await _collect_utterance(ws))
+        await ws.send(json.dumps({"type": "session.close"}))
+
+    return results
 
 
 class TestQwen3TTSWebSocket:
@@ -113,6 +137,7 @@ class TestQwen3TTSWebSocket:
         session_done = result["session_done"]
 
         assert session_done is not None
+        assert session_done["utterance_index"] == 0
         assert session_done["total_sentences"] == 1
         assert len(starts) == 1
         assert len(dones) == 1
@@ -131,3 +156,32 @@ class TestQwen3TTSWebSocket:
             assert total_bytes > 0
             assert chunk_lengths[sentence_index], f"Expected binary PCM frames for sentence {sentence_index}"
             assert sum(chunk_lengths[sentence_index]) == total_bytes
+
+    @pytest.mark.advanced_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", tts_ws_server_params, indirect=True)
+    def test_input_done_flushes_without_closing_connection(self, omni_server) -> None:
+        # input.done must flush the buffer and leave the connection usable:
+        # the second utterance is synthesized without a second handshake.
+        texts = [
+            "This is the first utterance sent over the websocket connection.",
+            "This is the second utterance, reusing the very same connection.",
+        ]
+        results = asyncio.run(_run_ws_reused_connection(omni_server.host, omni_server.port, omni_server.model, texts))
+
+        assert len(results) == len(texts)
+        for expected_index, result in enumerate(results):
+            assert result["session_done"] == {
+                "type": "session.done",
+                "utterance_index": expected_index,
+                "total_sentences": 1,
+            }
+            assert len(result["starts"]) == 1
+            assert len(result["dones"]) == 1
+            # utterance_index counts the flushes of the connection, while
+            # sentence_index stays within the flush it belongs to.
+            assert result["starts"][0]["utterance_index"] == expected_index
+            assert result["starts"][0]["sentence_index"] == 0
+            assert result["dones"][0]["error"] is False
+            assert result["dones"][0]["total_bytes"] > 0

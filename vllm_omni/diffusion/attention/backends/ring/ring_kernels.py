@@ -9,9 +9,11 @@ import torch
 from .ring_globals import (
     HAS_AITER,
     HAS_FA3,
+    HAS_FA4,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
     fa3_fwd_func,
+    fa4_attn_func,
 )
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
@@ -57,10 +59,8 @@ def pytorch_attn_forward(
     k shape (bs, seqlen, nhead, hs)
     v shape (bs, seqlen, nhead, hs)
     """
-    # Fallback logic: Flash Attention does not support float32.
-    # If op_type is 'flash' but dtype is float32, force 'efficient'.
     if op_type == "flash" and q.dtype == torch.float32:
-        op_type = "efficient"
+        raise ValueError("The explicitly requested Flash ring kernel does not support float32.")
 
     # Volta (V100, sm70) does not have native bf16 support for the efficient
     # SDPA kernel. When running Ring attention in bf16 on such GPUs, the
@@ -80,6 +80,19 @@ def pytorch_attn_forward(
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
+
+    # GQA/MQA support. Ring attention only ever *communicates* K/V with H_kv
+    # heads -- that is precisely the benefit of GQA -- so expanding here does
+    # not change communication volume. The expansion is needed because the aten
+    # SDPA ops below are required for the LSE output that ring accumulation
+    # consumes, and they do not accept `enable_gqa`.
+    if k.shape[1] != q.shape[1]:
+        num_heads, num_kv_heads = q.shape[1], k.shape[1]
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA/MQA.")
+        n_rep = num_heads // num_kv_heads
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
 
     if op_type == "flash":
         out, lse = _scaled_dot_product_flash_attention(
@@ -108,6 +121,7 @@ def pytorch_attn_forward(
     # Keep LSE in fp32 for numerical stability when accumulating across ring
     # steps (update_out_and_lse uses sigmoid/logsigmoid on LSE diffs).
     # Casting LSE down to fp16/bf16 can introduce NaNs on some GPUs/shapes.
+    # PyTorch SDPA returns LSE as (B, H, S).
     lse = lse.to(torch.float32)
 
     if out.dtype != orig_dtype:
@@ -158,6 +172,7 @@ def flash_attn_forward(
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax,
         )
+    # FA2 softmax_lse is (B, H, S), optionally padded on S.
     return block_out, block_lse
 
 
@@ -183,11 +198,47 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
         softcap=softcap if softcap else 0.0,
     )
 
+    # FA3 softmax_lse is (B, H, S).
     return out, softmax_lse
 
 
 # Legacy alias for backward compatibility
 flash_attn3_func_forward = fa3_forward
+
+
+def flash_attn4_func_forward(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=None,
+    alibi_slopes=None,
+    return_softmax=False,
+):
+    """FA4 forward pass returning the LSE required by Ring Attention."""
+    del dropout_p, alibi_slopes, return_softmax
+    assert HAS_FA4, "FA4 is not available"
+    assert fa4_attn_func is not None, "FA4 high-level API is not available"
+
+    left, right = window_size if window_size else (-1, -1)
+    out, softmax_lse = fa4_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=(
+            None if left == -1 else left,
+            None if right == -1 else right,
+        ),
+        softcap=softcap or 0.0,
+        return_lse=True,
+    )
+    # FA4 CuTe softmax_lse is (B, H, S).
+    return out, softmax_lse
 
 
 def flash_attn_forward_aiter(
@@ -215,6 +266,7 @@ def flash_attn_forward_aiter(
         return_lse=True,
     )
 
+    # Aiter softmax_lse is (B, H, S), matching FA2.
     return block_out, block_lse
 
 
@@ -244,7 +296,7 @@ def flashinfer_attn_forward(
             window_left=window_size[0],
             return_lse=True,
         )
-        lse = lse.transpose(0, 1)
+        # FlashInfer unbatched LSE is (H, S). Canonical ring layout is (B, H, S).
         out, lse = out.unsqueeze(0), lse.unsqueeze(0)
     elif q.ndim == 3:
         out, lse = single_prefill_with_kv_cache(
@@ -257,7 +309,7 @@ def flashinfer_attn_forward(
             window_left=window_size[0],
             return_lse=True,
         )
-        lse = lse.transpose(0, 1)
+        # Unbatched (H, S) matches canonical heads-major layout without a batch dim.
     else:
         raise ValueError(f"Invalid input shape: {q.shape}")
     lse = lse / _LOG2_E

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Offline inference tests: image-to-video.
 See examples/offline_inference/image_to_video/README.md
@@ -17,7 +20,7 @@ pytestmark = [
     pytest.mark.usefixtures("clean_gpu_memory_between_tests"),
     pytest.mark.full_model,
     pytest.mark.example,
-    *hardware_marks(res={"cuda": "H100"}),
+    *hardware_marks(res={"cuda": ["H100", "B200"]}),
 ]
 
 I2V_SCRIPT = EXAMPLES / "offline_inference" / "image_to_video" / "image_to_video.py"

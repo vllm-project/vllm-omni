@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 HunyuanImage-3.0-Instruct reliability integration tests (DiT-only deploy).
 
@@ -35,7 +38,7 @@ from tests.dfx.reliability.helpers import (
     worker_residual_timeout_after_kill_signal,
 )
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OpenAIClientHandler
+from tests.helpers.runtime import OnlineOmniClient
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
     {
@@ -133,8 +136,8 @@ def _image_request_config(omni_server: Any) -> dict[str, Any]:
     }
 
 
-def _submit_image_generation(openai_client: OpenAIClientHandler, omni_server: Any) -> None:
-    responses = openai_client.send_images_generations_http_request(_image_request_config(omni_server))
+def _submit_image_generation(online_client: OnlineOmniClient, omni_server: Any) -> None:
+    responses = online_client.send_images_generations_http_request(_image_request_config(omni_server))
     resp = responses[0]
     if resp.status_code >= 400:
         raise RuntimeError(
@@ -189,7 +192,7 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_image_large_request_failure(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
 ) -> None:
     stage_config_path = getattr(omni_server_function, "stage_config_path", None)
     device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, stage_config_path)
@@ -202,7 +205,7 @@ def test_reliability_fault_gpu_oom_image_large_request_failure(
     )
     try:
         try:
-            _submit_image_generation(openai_client_function, omni_server_function)
+            _submit_image_generation(online_client_function, omni_server_function)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -222,10 +225,10 @@ def test_reliability_fault_gpu_oom_image_large_request_failure(
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_request_failure(
     omni_server_after_fault_function,
-    openai_client_function,
+    online_client_function,
 ) -> None:
     try:
-        _submit_image_generation(openai_client_function, omni_server_after_fault_function)
+        _submit_image_generation(online_client_function, omni_server_after_fault_function)
     except Exception as exc:
         assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
     else:
@@ -244,7 +247,7 @@ def test_reliability_fault_process_kill_request_failure(
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     omni_server_after_fault_function,
-    openai_client_function,
+    online_client_function,
 ) -> None:
     host = omni_server_after_fault_function.host
     port = omni_server_after_fault_function.port
@@ -280,7 +283,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = [
-            executor.submit(_submit_image_generation, openai_client_function, omni_server_after_fault_function)
+            executor.submit(_submit_image_generation, online_client_function, omni_server_after_fault_function)
             for _ in range(3)
         ]
         done, pending = concurrent.futures.wait(
@@ -335,12 +338,12 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_worker_with_load_request_failure(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     fault_injector: FaultInjector,
 ) -> None:
     scenario = "kill_worker_with_load"
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: _submit_image_generation(openai_client_function, omni_server_function),
+        submit_request=lambda: _submit_image_generation(online_client_function, omni_server_function),
         inject_fault=lambda: fault_injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -363,13 +366,13 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     scenario = f"kill_serve_root_with_load_{signal_name.lower()}"
     injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: _submit_image_generation(openai_client_function, omni_server_function),
+        submit_request=lambda: _submit_image_generation(online_client_function, omni_server_function),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -448,7 +451,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     scenario = f"kill_serve_tree_with_load_{signal_name.lower()}"
@@ -458,7 +461,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
         inter_kill_wait_seconds=0.1,
     )
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: _submit_image_generation(openai_client_function, omni_server_function),
+        submit_request=lambda: _submit_image_generation(online_client_function, omni_server_function),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,

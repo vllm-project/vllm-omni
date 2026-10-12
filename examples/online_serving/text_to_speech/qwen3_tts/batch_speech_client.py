@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Batch speech client for Qwen3-TTS via /v1/audio/speech/batch endpoint.
 
 This script demonstrates how to synthesize multiple texts in a single request.
@@ -7,7 +10,7 @@ the reference for each item.
 
 Start the server (with batch-optimized stage settings for best throughput):
 
-    vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
         --omni \
         --trust-remote-code \
         --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},

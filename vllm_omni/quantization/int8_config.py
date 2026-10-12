@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """INT8 quantization config for diffusion transformers.
 
 Supports both online (dynamic) and offline (checkpoint) INT8 quantization
@@ -7,6 +7,8 @@ on CUDA and NPU platforms.
 """
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -26,9 +28,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import CopyNumelCounter, _copy_missing_attrs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
+)
+from vllm.model_executor.model_loader.reload.meta import (
+    CopyCounter as CopyNumelCounter,
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import (
@@ -38,6 +42,9 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization._copy_missing_attrs import (
+    copy_missing_attrs as _copy_missing_attrs,
+)
 
 if current_omni_platform.is_npu():
     import torch_npu
@@ -50,7 +57,87 @@ if TYPE_CHECKING:
 # Dynamic quantization is supported first.
 ACTIVATION_SCHEMES = ["dynamic"]
 
+# Ascend's npu_quant_matmul (QuantBatchMatmulV3) refuses a weight whose last
+# dimension exceeds this, and it fails at the first forward rather than at load
+# time. Layers still wider than the limit after TP sharding stay unquantized.
+NPU_QUANT_MATMUL_MAX_OUT_FEATURES = 65535
+
 logger = init_logger(__name__)
+
+# Set by the diffusion loader while it constructs a model whose weights will be
+# offloaded back to host memory after online quantization (DLO). Over-wide
+# layers that npu_quant_matmul cannot run then load straight into host memory
+# instead of being built on the accelerator and moved off at the end of
+# loading — on MiniMax H3 the 50 fallback adaln layers are ~24 GiB of bf16,
+# which is the dominant startup memory peak.
+_LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU: ContextVar[bool] = ContextVar(
+    "int8_load_unquantizable_fallback_on_cpu", default=False
+)
+
+
+@contextmanager
+def load_unquantizable_fallback_on_cpu():
+    """Create npu_quant_matmul-incompatible fallback weights on meta and load
+    them straight into host memory.
+
+    Only valid when the whole model returns to the host after loading (the
+    loader's offload-after-quant path); otherwise the fallback weights would
+    stay on CPU while the rest of the model runs on the accelerator.
+    """
+    token = _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.set(True)
+    try:
+        yield
+    finally:
+        _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.reset(token)
+
+
+def _fell_back_to_unquantized_npu(
+    layer: torch.nn.Module,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    input_size: int,
+    output_size: int,
+    params_dtype: torch.dtype,
+    **extra_weight_attrs,
+) -> bool:
+    """Swap a layer to unquantized weights when npu_quant_matmul cannot run its shape.
+
+    The check uses the per-partition output size because that is what the kernel
+    actually sees; a layer over the limit on one rank can be within it at a
+    higher TP degree. Returns True when the layer was swapped and its weights
+    created, in which case the caller must not create its own.
+    """
+    output_size_per_partition = sum(output_partition_sizes)
+    if output_size_per_partition <= NPU_QUANT_MATMUL_MAX_OUT_FEATURES:
+        return False
+
+    logger.warning_once(
+        "Keeping a %d-wide linear unquantized: npu_quant_matmul rejects an output dimension past "
+        "%d. Tensor parallelism shrinks this per-rank dimension, so a higher TP degree brings such "
+        "layers back into range.",
+        output_size_per_partition,
+        NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
+    )
+    if _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get():
+        logger.info_once(
+            "Loading over-wide unquantized fallback weights straight into host memory "
+            "(offload-after-quant is active); they only reach the accelerator via "
+            "the offload backend's runtime prefetch."
+        )
+        fallback: LinearMethodBase = UnquantizedHostLinearMethod()
+    else:
+        fallback = UnquantizedLinearMethod()
+    layer.quant_method = fallback
+    fallback.create_weights(
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    )
+    return True
 
 
 def create_weight_parameter(
@@ -231,6 +318,29 @@ class LazyWeightMixin:
 
     uses_meta_device: bool = True
 
+    # This mixin knows when a layer's weight is final, so it can hand the layer
+    # back to the host right there. Loaders that intend to offload the whole
+    # model after loading opt in per layer via ``enable_offload_after_quant``.
+    supports_offload_after_quant: bool = True
+    _offload_after_quant: bool = False
+
+    def enable_offload_after_quant(self) -> None:
+        """Return each layer to host memory as soon as it has been quantized.
+
+        Caps the load-time device footprint at one layer instead of the whole
+        model. A quant method instance belongs to a single layer, so this is not
+        a global switch.
+        """
+        self._offload_after_quant = True
+
+    def _lazy_load_device(self) -> torch.device:
+        """Device the meta weight materializes on at first load.
+
+        Subclasses that never want the accelerator involved (e.g. the
+        over-wide host fallback) override this to return host memory.
+        """
+        return torch.get_default_device()
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -281,11 +391,16 @@ class LazyWeightMixin:
             # process_weights_after_loading
             target_loaded_numel = layer.weight.numel()
             if layer._loaded_numel == target_loaded_numel:
-                self.process_weights_after_loading(layer)
+                self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
 
                 # Prevent the usual `process_weights_after_loading` call from doing
                 # anything
                 layer._already_called_process_weights_after_loading = True
+
+                # This layer's weight is final, so nothing needs it on the
+                # accelerator until inference.
+                if self._offload_after_quant:
+                    layer.to("cpu")
 
                 # Note that we keep `layer._loaded_numel` around just in case
                 # there is logic added to vllm in the future which calls a
@@ -307,8 +422,44 @@ class LazyWeightMixin:
             weight_loader=patched_weight_loader,
         )
         # stash the correct device for `patched_weight_loader`
-        layer._load_device = torch.get_default_device()
+        layer._load_device = self._lazy_load_device()
         layer.register_parameter("weight", weight)
+
+
+class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
+    """Unquantized linear method whose weight loads straight into host memory.
+
+    Layers wider than ``NPU_QUANT_MATMUL_MAX_OUT_FEATURES`` cannot be quantized,
+    so under the ordinary path their bf16 weights materialize on the accelerator
+    at construction time and stay there until the whole model is moved off after
+    loading. When the loader has entered ``load_unquantizable_fallback_on_cpu()``
+    (offload-after-quant, i.e. DLO), that round trip is pure startup peak — the
+    weights end up pinned on the host either way and only visit the accelerator
+    through the offload backend's runtime prefetch.
+
+    This method reuses ``LazyWeightMixin``'s meta + just-in-time materialization
+    wholesale (the weight really is deferred on meta until loading, like the
+    online quant methods, so the loader's meta-aware bookkeeping treats the
+    layer correctly) and only overrides the materialization target to host
+    memory: checkpoint chunks are CPU tensors, so loading stays CPU->CPU with
+    no accelerator round trip.
+    """
+
+    # Offload-after-quant marking is deliberately not advertised even though
+    # the mixin provides the hook: the weight never visits the accelerator,
+    # so there is nothing to return to host.
+    supports_offload_after_quant: bool = False
+
+    def _lazy_load_device(self) -> torch.device:
+        return torch.device("cpu")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Unquantized weights need no post-load transform.
+
+        The mixin calls this when the weight is fully loaded, right before it
+        flags the layer — and the flag is what keeps the loader's post-load
+        sweep from bouncing the host tensor to the accelerator and back.
+        """
 
 
 class Int8LinearMethod(BaseInt8LinearMethod):
@@ -353,6 +504,11 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
 
     def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
+        if _fell_back_to_unquantized_npu(layer, *args, **kwargs):
+            return
+        super().create_weights(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         layer.weight.data = layer.weight.data.t().contiguous()
@@ -423,6 +579,13 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
     NPU Online version of Int8LinearMethod, loads the fp16/bf16 checkpoint
     and quantized the weights during loading.
     """
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
+        # NPUInt8LinearMethod's override is unreachable from here: LazyWeightMixin
+        # comes first in the MRO and does not call super().
+        if _fell_back_to_unquantized_npu(layer, *args, **kwargs):
+            return
+        super().create_weights(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):

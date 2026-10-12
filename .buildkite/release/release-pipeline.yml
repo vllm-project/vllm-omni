@@ -40,9 +40,11 @@ steps:
     commands:
       - "bash .buildkite/release/scripts/publish-release-wheels-pypi.sh"
 
+  # Auto-skip when NIGHTLY=1 (scheduled); otherwise require manual unblock.
   - block: "Unblock to build release Docker images"
     depends_on: ~
     key: block-build-release-images
+    if: build.env("NIGHTLY") != "1"
 
   - group: "Build release Docker images"
     key: "build-release-images"
@@ -63,7 +65,7 @@ steps:
               --progress plain \
               -f docker/Dockerfile.cuda .
           - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m)"
-          # re-tag to default image tag and push, just in case arm64 build fails
+          # Fallback default tag (no arch suffix) if arm64 build fails.
           - "docker tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m) public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
           - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
         env:
@@ -85,6 +87,26 @@ steps:
           - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m)"
         env:
           DOCKER_BUILDKIT: "1"
+
+  # NIGHTLY=1 only: promote ECR images to DockerHub nightly tags, then prune.
+  - label: "Publish nightly multi-arch image to DockerHub"
+    depends_on:
+      - build-release-image-x86
+      - build-release-image-arm64
+    if: build.env("NIGHTLY") == "1"
+    key: publish-nightly-images-dockerhub
+    agents:
+      queue: small_cpu_queue_release
+    commands:
+      - "bash .buildkite/release/scripts/publish-release-images.sh nightly"
+      - "bash .buildkite/release/scripts/cleanup-nightly-builds.sh"
+    plugins:
+      - docker-login#v3.0.0:
+          username: vllmbot
+          password-env: DOCKERHUB_TOKEN
+    env:
+      DOCKER_BUILDKIT: "1"
+      DOCKERHUB_USERNAME: "vllmbot"
 
   - block: "Publish release images to DockerHub"
     key: block-publish-release-images

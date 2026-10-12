@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E online serving tests for IndexTTS2 via /v1/audio/speech endpoint.
 
 Two-stage pipeline: GPT AR → S2Mel + BigVGAN. Output is 22050 Hz mono WAV.
@@ -15,7 +15,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -23,7 +23,7 @@ pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 MODEL = "IndexTeam/IndexTTS-2"
 
-REF_AUDIO_URL = load_test_audio_data_url("indextts2/ref_audio.wav")
+REF_AUDIO_URL = get_asset_path("indextts2/ref_audio.wav", as_data_url=True)
 
 tts_server_params = [
     pytest.param(
@@ -39,7 +39,7 @@ tts_server_params = [
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_basic_english(omni_server, openai_client) -> None:
+def test_basic_english(omni_server, online_client) -> None:
     """
     Basic English TTS: text + ref_audio, no emotion.
     Deploy Setting: default yaml
@@ -55,12 +55,12 @@ def test_basic_english(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": 1024,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_streaming(omni_server, openai_client) -> None:
+def test_streaming(omni_server, online_client) -> None:
     """
     stream=True compatibility: IndexTTS2 itself is non-async-chunking, but the
     OpenAI speech endpoint should still accept the streaming request path and
@@ -80,4 +80,4 @@ def test_streaming(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "min_audio_bytes": 1024,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)

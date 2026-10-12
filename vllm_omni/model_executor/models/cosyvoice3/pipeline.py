@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CosyVoice3 pipeline topology (frozen).
 
 Stage 0: Talker   — text prompt → speech tokens (LLM autoregressive).
@@ -12,11 +12,17 @@ Stage 1: Code2Wav — flow-matching decoder → acoustic features → waveform.
     through the shared-memory connector.
 """
 
+import shutil
+from dataclasses import replace
+
+from transformers import PretrainedConfig
+
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.cosyvoice3"
 
@@ -35,8 +41,9 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             custom_process_next_stage_input_func=f"{_PROC}.text2flow_full_payload",
             sampling_constraints={
-                # merged speech stop token (logsumexp of all 200 stop logits)
-                "stop_token_ids": [6562],
+                # Standard sampling can emit any of the 200 control tokens.
+                # RAS merges their logits into 6562, which is also in this range.
+                "stop_token_ids": list(range(6561, 6761)),
             },
         ),
         StagePipelineConfig(
@@ -48,6 +55,32 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="latent",
             sync_process_input_func=f"{_PROC}.text2flow_token_only",
+            requires_full_payload_input=True,
         ),
     ),
 )
+
+
+def resolve_cosyvoice3_pipeline(hf_config: PretrainedConfig | None = None) -> PipelineConfig | None:
+    """Select a streaming default compatible with the device and runtime.
+
+    Query the platform through NVML without initializing CUDA in the parent.
+    Explicit deploy configs still take precedence over this pipeline default.
+    """
+    from vllm.platforms import current_platform
+
+    if hf_config is not None and not isinstance(hf_config, CosyVoice3Config):
+        return None
+    if current_platform.is_cuda():
+        capability = current_platform.get_device_capability()
+        if (
+            capability is not None
+            and capability.major == 9
+            and current_platform.get_device_total_memory() >= 140 * 1024**3
+            and shutil.which("nvidia-cuda-mps-control") is not None
+        ):
+            return replace(
+                COSYVOICE3_PIPELINE,
+                default_deploy_config_name="cosyvoice3_packed_streaming_optimized_standard.yaml",
+            )
+    return COSYVOICE3_PIPELINE

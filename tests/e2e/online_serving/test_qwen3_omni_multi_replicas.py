@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Core-model CI guard for Qwen3-Omni multi-replica stage-pool routing on 4 GPUs.
 """
@@ -88,9 +91,9 @@ def _assert_audio_outputs(responses: list[OmniResponse], *, expect_text: bool) -
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_only_batch_uses_multi_replica_talker(omni_server, openai_client) -> None:
+def test_text_only_batch_uses_multi_replica_talker(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": _text_messages(),
@@ -98,16 +101,16 @@ def test_text_only_batch_uses_multi_replica_talker(omni_server, openai_client) -
         "modalities": ["text"],
     }
 
-    responses = openai_client.send_omni_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
+    responses = online_client.send_omni_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
     _assert_batch_size(responses, ROUTE_STRESS_REQUESTS)
     _assert_text_outputs(responses)
 
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, openai_client) -> None:
+def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": _text_messages(),
@@ -115,22 +118,22 @@ def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, open
         "modalities": ["audio"],
     }
 
-    responses = openai_client.send_omni_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
+    responses = online_client.send_omni_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
     _assert_batch_size(responses, ROUTE_STRESS_REQUESTS)
     _assert_audio_outputs(responses, expect_text=False)
 
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mixed_modal_stream_batch_generates_text_and_audio(omni_server, openai_client) -> None:
+def test_mixed_modal_stream_batch_generates_text_and_audio(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": _mixed_messages(),
         "stream": True,
     }
 
-    responses = openai_client.send_omni_request(request_config, request_num=MIXED_MODAL_REQUESTS)
+    responses = online_client.send_omni_request(request_config, request_num=MIXED_MODAL_REQUESTS)
     _assert_batch_size(responses, MIXED_MODAL_REQUESTS)
     _assert_audio_outputs(responses, expect_text=True)

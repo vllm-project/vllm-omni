@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Recommended tests of diffusion features that are available in online serving mode
 and are supported by the following model:
@@ -16,7 +19,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
@@ -66,7 +69,7 @@ def _get_diffusion_feature_cases(model: str):
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_longcat_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_longcat_image_edit(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test the recommended feature combinations for LongCat-Image-Edit."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url, content_text=EDIT_PROMPT)
@@ -84,4 +87,4 @@ def test_longcat_image_edit(omni_server: OmniServer, openai_client: OpenAIClient
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

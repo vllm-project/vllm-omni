@@ -43,7 +43,7 @@ if __name__ == "__main__":
             ),
         ],
     )
-    outputs[0].request_output.images[0].save("output.png")
+    outputs[0].images[0].save("output.png")
 ```
 
 ## Image-to-Image (Image Editing)
@@ -72,7 +72,7 @@ if __name__ == "__main__":
             ),
         ],
     )
-    outputs[0].request_output.images[0].save("output.png")
+    outputs[0].images[0].save("output.png")
 ```
 
 ## Generation Parameters

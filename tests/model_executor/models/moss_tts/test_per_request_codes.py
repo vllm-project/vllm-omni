@@ -23,6 +23,9 @@ import functools
 
 import pytest
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 torch = pytest.importorskip("torch")
 
 N_VQ = 4

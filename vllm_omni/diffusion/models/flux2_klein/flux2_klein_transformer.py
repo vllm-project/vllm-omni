@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Black Forest Labs, The HuggingFace Team and The InstantX Team. All rights reserved.
 #
@@ -29,6 +29,7 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
+from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -41,7 +42,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -49,14 +50,39 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.offloader.config import offload_enabled
 
 logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
+_FLUX2_STACKED_PARAMS_MAPPING = (
+    (".to_qkv.", ".to_q.", "q"),
+    (".to_qkv.", ".to_k.", "k"),
+    (".to_qkv.", ".to_v.", "v"),
+    (".add_kv_proj", ".add_q_proj", "q"),
+    (".add_kv_proj", ".add_k_proj", "k"),
+    (".add_kv_proj", ".add_v_proj", "v"),
+)
+
+
 def _join_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
+
+
+def _use_local_single_stream_tp(od_config: OmniDiffusionConfig) -> bool:
+    parallel = od_config.parallel_config
+    return (
+        od_config.dtype == torch.bfloat16
+        and parallel.tensor_parallel_size > 1
+        and parallel.sequence_parallel_size in (None, 1)
+        and not parallel.use_hsdp
+        and od_config.quantization_config is None
+        and od_config.lora_path is None
+        and not offload_enabled(od_config)
+    )
 
 
 class Flux2SwiGLU(nn.Module):
@@ -345,6 +371,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         mlp_mult_factor: int = 2,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        local_tp: bool = False,
     ):
         super().__init__()
         self.parallel_config = parallel_config
@@ -359,14 +386,40 @@ class Flux2ParallelSelfAttention(nn.Module):
         self.mlp_hidden_dim = int(query_dim * self.mlp_ratio)
         self.mlp_mult_factor = mlp_mult_factor
 
-        self.to_qkv_mlp_proj = ColumnParallelLinear(
-            self.query_dim,
-            self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=_join_prefix(prefix, "to_qkv_mlp_proj"),
+        self.local_tp = (
+            local_tp
+            and quant_config is None
+            and parallel_config.sequence_parallel_size in (None, 1)
+            and mlp_mult_factor == 2
         )
+        tp_size = get_tensor_model_parallel_world_size() if self.local_tp else 1
+        self.local_tp = (
+            self.local_tp and tp_size > 1 and self.heads % tp_size == 0 and self.mlp_hidden_dim % tp_size == 0
+        )
+        tp_size = tp_size if self.local_tp else 1
+        self.query_num_heads = self.heads // tp_size
+        self.local_inner_dim = self.inner_dim // tp_size
+        self.local_mlp_hidden_dim = self.mlp_hidden_dim // tp_size
+
+        if self.local_tp:
+            # Split each packed segment independently so Q/K/V heads and
+            # SwiGLU gate/up channels stay paired on each TP rank.
+            self.to_qkv_mlp_proj = MergedColumnParallelLinear(
+                self.query_dim,
+                [self.inner_dim] * 3 + [self.mlp_hidden_dim] * 2,
+                bias=bias,
+                gather_output=False,
+                prefix=_join_prefix(prefix, "to_qkv_mlp_proj"),
+            )
+        else:
+            self.to_qkv_mlp_proj = ColumnParallelLinear(
+                self.query_dim,
+                self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "to_qkv_mlp_proj"),
+            )
         self.mlp_act_fn = Flux2SwiGLU()
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
@@ -382,7 +435,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
-            num_heads=self.heads,
+            num_heads=self.query_num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
@@ -398,14 +451,14 @@ class Flux2ParallelSelfAttention(nn.Module):
         hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
             hidden_states,
-            [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
+            [3 * self.local_inner_dim, self.local_mlp_hidden_dim * self.mlp_mult_factor],
             dim=-1,
         )
 
         query, key, value = qkv.chunk(3, dim=-1)
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.query_num_heads, -1))
+        key = key.unflatten(-1, (self.query_num_heads, -1))
+        value = value.unflatten(-1, (self.query_num_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
@@ -457,6 +510,10 @@ class Flux2ParallelSelfAttention(nn.Module):
             if attention_mask is not None:
                 if attention_mask.dim() == 3:
                     attention_mask = attention_mask.unsqueeze(1)
+                if self.local_tp and attention_mask.dim() == 4 and attention_mask.shape[1] != 1:
+                    attention_mask = attention_mask.narrow(
+                        1, self.to_qkv_mlp_proj.tp_rank * self.query_num_heads, self.query_num_heads
+                    )
                 attn_metadata = AttentionMetadata(attn_mask=attention_mask)
 
             attn_output = self.attn(query, key, value, attn_metadata)
@@ -464,6 +521,9 @@ class Flux2ParallelSelfAttention(nn.Module):
         attn_output = attn_output.flatten(2, 3).to(query.dtype)
 
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
+        if self.local_tp:
+            attn_output = tensor_model_parallel_all_gather(attn_output.contiguous())
+            mlp_hidden_states = tensor_model_parallel_all_gather(mlp_hidden_states.contiguous())
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=-1)
         hidden_states, _ = self.to_out(hidden_states)
         return hidden_states
@@ -481,6 +541,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         bias: bool = False,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        local_tp: bool = False,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -497,6 +558,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             mlp_mult_factor=2,
             quant_config=quant_config,
             prefix=_join_prefix(prefix, "attn"),
+            local_tp=local_tp,
         )
 
     def forward(
@@ -770,6 +832,14 @@ class Flux2Transformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
+    # Constructor state plus complete final-layout parameters and persistent
+    # buffers is sufficient to reconstruct a ready base-model transformer.
+    # Changes to the packed mapping or restore invariants require a version bump.
+    host_weight_restore_contract = FinalLayoutModelContract(
+        implementation_id="flux2-klein-dit",
+        version="1",
+    )
+
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={
             "transformer_blocks": ForwardPattern.Pattern_1,
@@ -815,8 +885,12 @@ class Flux2Transformer2DModel(nn.Module):
         guidance_embeds: bool = True,
         od_config: OmniDiffusionConfig = None,
         quant_config: "QuantizationConfig | None" = None,
+        local_tp: bool = False,
     ):
         super().__init__()
+        # Warm HWR restoration skips load_weights(), so loader consumers such
+        # as LoRA discovery must not depend on that method to create this state.
+        self.stacked_params_mapping = list(_FLUX2_STACKED_PARAMS_MAPPING)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.config = SimpleNamespace(
@@ -889,10 +963,18 @@ class Flux2Transformer2DModel(nn.Module):
                     bias=False,
                     quant_config=quant_config,
                     prefix=f"single_transformer_blocks.{i}",
+                    local_tp=local_tp,
                 )
                 for i in range(num_single_layers)
             ]
         )
+        if any(block.attn.local_tp for block in self.single_transformer_blocks):
+            # Rank-local shapes are unchanged, but packed weight rows belong
+            # to different ranks. Do not restore the old final-layout cache.
+            self.host_weight_restore_contract = FinalLayoutModelContract(
+                implementation_id="flux2-klein-dit",
+                version="2-local-single-stream-tp",
+            )
 
         self.norm_out = AdaLayerNormContinuous(
             self.inner_dim,
@@ -1004,18 +1086,78 @@ class Flux2Transformer2DModel(nn.Module):
             return (output,)
         return Transformer2DModelOutput(sample=output)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".to_qkv.", ".to_q.", "q"),
-            (".to_qkv.", ".to_k.", "k"),
-            (".to_qkv.", ".to_v.", "v"),
-            (".add_kv_proj", ".add_q_proj", "q"),
-            (".add_kv_proj", ".add_k_proj", "k"),
-            (".add_kv_proj", ".add_v_proj", "v"),
-        ]
-        # Expose packed shard mappings for LoRA handling of fused projections.
-        self.stacked_params_mapping = stacked_params_mapping
+    def validate_restored_host_weights(self) -> None:
+        """Validate the tensor-complete BF16 base-model restore contract."""
+        if not isinstance(self.stacked_params_mapping, (list, tuple)) or (
+            tuple(self.stacked_params_mapping) != _FLUX2_STACKED_PARAMS_MAPPING
+        ):
+            raise ValueError("FLUX.2-klein packed QKV mapping is not constructor-stable")
 
+        stack_specs = (
+            ("transformer_blocks", self.config.num_layers, Flux2TransformerBlock),
+            ("single_transformer_blocks", self.config.num_single_layers, Flux2SingleTransformerBlock),
+        )
+        for name, expected_count, block_type in stack_specs:
+            blocks = getattr(self, name, None)
+            if not isinstance(blocks, nn.ModuleList) or len(blocks) != expected_count or expected_count <= 0:
+                raise ValueError(
+                    f"FLUX.2-klein {name} is incomplete: expected {expected_count} blocks, "
+                    f"got {len(blocks) if isinstance(blocks, nn.ModuleList) else 'missing'}"
+                )
+            if any(not isinstance(block, block_type) for block in blocks):
+                raise ValueError(f"FLUX.2-klein {name} contains an unexpected block implementation")
+
+        required_modules = (
+            "pos_embed",
+            "rope_prepare",
+            "time_guidance_embed",
+            "double_stream_modulation_img",
+            "double_stream_modulation_txt",
+            "single_stream_modulation",
+            "x_embedder",
+            "context_embedder",
+            "norm_out",
+            "proj_out",
+        )
+        for name in required_modules:
+            if not isinstance(getattr(self, name, None), nn.Module):
+                raise ValueError(f"FLUX.2-klein required module {name!r} is missing")
+
+        parameter_count = 0
+        stack_parameter_coverage = {name: False for name, _, _ in stack_specs}
+        for name, parameter in self.named_parameters():
+            parameter_count += 1
+            for stack_name in stack_parameter_coverage:
+                if name.startswith(f"{stack_name}."):
+                    stack_parameter_coverage[stack_name] = True
+            if parameter.is_meta or parameter.device.type != "cpu":
+                raise ValueError(f"FLUX.2-klein parameter {name!r} is not materialized on CPU")
+            if parameter.dtype is not torch.bfloat16:
+                raise ValueError(f"FLUX.2-klein parameter {name!r} must stay bf16, got {parameter.dtype}")
+            if parameter.layout is not torch.strided or not parameter.is_contiguous():
+                raise ValueError(f"FLUX.2-klein parameter {name!r} must use contiguous strided layout")
+            if parameter.numel() == 0:
+                raise ValueError(f"FLUX.2-klein parameter {name!r} is empty")
+        if parameter_count == 0 or not all(stack_parameter_coverage.values()):
+            raise ValueError("FLUX.2-klein restore did not materialize both transformer block stacks")
+
+        for name, buffer in self.named_buffers():
+            parent_path, _, leaf_name = name.rpartition(".")
+            owner = self.get_submodule(parent_path)
+            persistent = leaf_name not in owner._non_persistent_buffers_set
+            loader_buffer = name.endswith((".beta", ".eps"))
+            if loader_buffer and not persistent:
+                raise ValueError(f"FLUX.2-klein loader buffer {name!r} must be persistent")
+            if not persistent:
+                continue
+            if buffer.is_meta or buffer.device.type != "cpu":
+                raise ValueError(f"FLUX.2-klein persistent buffer {name!r} is not materialized on CPU")
+            if buffer.layout is not torch.strided or not buffer.is_contiguous():
+                raise ValueError(f"FLUX.2-klein persistent buffer {name!r} must use contiguous strided layout")
+            if loader_buffer and (buffer.dtype is not torch.bfloat16 or buffer.numel() != 1):
+                raise ValueError(f"FLUX.2-klein loader buffer {name!r} must be a scalar bf16 tensor")
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
 
         for name, buffer in self.named_buffers():
@@ -1026,7 +1168,7 @@ class Flux2Transformer2DModel(nn.Module):
         for name, loaded_weight in weights:
             original_name = name
             mapped = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in original_name:
                     continue
                 name = original_name.replace(weight_name, param_name)

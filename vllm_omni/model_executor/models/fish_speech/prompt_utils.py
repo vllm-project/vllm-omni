@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared Fish Speech prompt construction helpers."""
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ FISH_CLONE_SYSTEM_PROMPT_SUFFIX = "\n\nSpeech:\n"
 
 _LEGACY_SPEAKER_TAG_PATTERN = re.compile(r"<speaker:(\d+)>")
 _CANONICAL_SPEAKER_TAG_PATTERN = re.compile(r"<\|speaker:\d+\|>")
+_PHONEME_TAG_PATTERN = re.compile(r"<\|phoneme_(?:start|end)\|>")
 _CONTROL_TOKEN_PATTERN = re.compile(r"<\|[^>]+\|>")
 
 
@@ -21,7 +25,7 @@ def normalize_fish_speech_text(text: str, *, add_default_speaker: bool = False) 
     disallowed_tokens = [
         token
         for token in _CONTROL_TOKEN_PATTERN.findall(normalized)
-        if not _CANONICAL_SPEAKER_TAG_PATTERN.fullmatch(token)
+        if not (_CANONICAL_SPEAKER_TAG_PATTERN.fullmatch(token) or _PHONEME_TAG_PATTERN.fullmatch(token))
     ]
     if disallowed_tokens:
         disallowed_list = ", ".join(sorted(set(disallowed_tokens)))

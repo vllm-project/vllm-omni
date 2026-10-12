@@ -30,4 +30,4 @@ echo "Serving ${MODEL}: num_replicas=${NUM_REPLICAS} devices=${DEVICES} (config 
 vllm serve "$MODEL" --omni \
     --host "$HOST" \
     --port "$PORT" \
-    --stage-configs-path "$CFG"
+    --deploy-config "$CFG"
