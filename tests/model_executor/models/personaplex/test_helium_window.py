@@ -8,6 +8,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_omni.model_executor.models.personaplex.modeling_helium import (
     check_window_bounds_kv_cache,
+    check_window_bounds_kv_caches,
     moshi_attention_window,
 )
 from vllm_omni.model_executor.models.personaplex.personaplex_temporal import _ringkv_positions
@@ -61,3 +62,11 @@ def test_context_within_the_window_accepts_any_kv_cache() -> None:
     # No call can outgrow the window, so a backend without one is harmless.
     check_window_bounds_kv_cache(3000, 3000, _kv_spec(None))
     check_window_bounds_kv_cache(3000, 3000, None)
+
+
+def test_a_rank_whose_layers_expose_no_attention_layer_is_refused() -> None:
+    """Finding nothing to check must not pass for a check that did not run."""
+    with pytest.raises(ValueError, match="none of this rank's 32 layers"):
+        check_window_bounds_kv_caches(46_080, 3000, [], num_layers=32)
+    # An empty pipeline-parallel slice holds no Helium KV, so there is nothing to check.
+    check_window_bounds_kv_caches(46_080, 3000, [], num_layers=0)
