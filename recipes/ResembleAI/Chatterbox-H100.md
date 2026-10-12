@@ -3,7 +3,8 @@
 These measurements used the combined model and runtime implementation. The
 shared runtime changes are now reviewed separately in
 [PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842); the model branch
-requires that prerequisite. Splitting the PRs did not produce new GPU measurements.
+requires that prerequisite. Historical profiling and fresh split integration
+validation are identified separately below.
 
 Measurements on October 12, 2026 used one H100 SXM 80 GB, PyTorch
 2.13.0/CUDA 13.0, vLLM 0.31.0 and Transformers 5.14.1. Serving runtime revision
@@ -30,7 +31,7 @@ The subsequent `39f251fb0` changes only decoder benchmark OOM reporting.
 | Runtime | PyTorch 2.13.0 / CUDA 13.0, vLLM 0.31.0, Transformers 5.14.1 |
 | Precision | BF16 AR; FP32 HiFT; flow precision stated per result |
 | Source revision | `26e4d3910`; benchmark reporting update `39f251fb0` |
-| Qualification | Bounded measurements below; fresh cold-conditioning/WebSocket full-batch runs incomplete |
+| Qualification | Historical profiling environment; fresh integration environment and results below |
 
 ## Setup and commands
 
@@ -56,7 +57,7 @@ for complete synthesis and playback commands.
 | Feature | Status |
 | --- | --- |
 | Built-in / cloned voice, async streaming | Both variants; measured scopes below |
-| Native AR CUDA graphs | Enabled by default; eager comparison job added without claiming measured speedup |
+| Native AR CUDA graphs | Enabled by default; matched graph/eager measurements below |
 | BF16 flow / cuDNN attention / MPS | Opt-in, H100 measurements below; numerical tradeoff |
 | Multilingual / prefix caching | Unsupported |
 | Real-time at 64 clients | Workload-dependent; no general guarantee |
@@ -65,8 +66,53 @@ for complete synthesis and playback commands.
 
 Expect nonempty mono 24 kHz PCM, completed requests, and independent request
 cleanup. Run the commands in [benchmark documentation](../../benchmarks/tts/README.md#chatterbox-concurrency-and-conditioning-checks).
-No latency regression baseline is assigned until the new nightly workload has
-been measured on H100; historical workloads are not interchangeable baselines.
+The nightly JSON records H100 baselines from the matched workload below;
+historical workloads are not interchangeable baselines.
+
+## Nightly workload and CUDA graph comparison
+
+Fresh integration validation used model revision `0de536675` with prerequisite
+runtime revision `0a47e146a`. Subsequent recipe, baseline and CI marker edits do
+not change inference. The environment was Ubuntu 24.04.3, Python 3.12.3,
+driver 580.159.04, PyTorch 2.13.0+cu130, torchaudio 2.11.0+cu130,
+vLLM 0.31.0 and Transformers 5.14.1. The container had a 233.8 GiB memory
+limit and a 23.8-core CPU quota; math threads were bounded to one. One H100
+80 GB was visible. Package imports used local container storage. Checkpoint
+snapshots were Turbo `749d1c1a46eb10492095d68fbcf55691ccf137cd` and Original
+`5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18`.
+
+Both variants passed real-weight MRv2 chunked offline synthesis through the
+shared TTS helper (two batched prompts each), plus MP3 and FLAC speech API
+checks with Whisper transcript validation. All 219 focused model, conditioning,
+adapter, configuration and load-harness tests passed.
+
+The benchmark used the bundled `benchmarks/build_dataset/seed_tts_smoke`
+English text dataset, built-in voice, seed 42 and default deployment settings:
+BF16 AR, FP32 eager decoder, eight stage-0 sequence slots. Original uses two
+CFG slots per guided client. Only stage 0's `enforce_eager` differed in each
+graph/eager pair. Latency used 20 requests at concurrency one and two warmups;
+throughput used 80 requests at concurrency eight and eight warmups; stress
+used 100 requests at two requests/second and two warmups. The shared runner
+originally also emitted redundant 100-request concurrency-eight sweeps; those
+reports are retained but excluded from the final nightly configuration and
+baselines. All eight pytest cases passed, with zero failed benchmark requests.
+
+| Variant / AR mode | Workload | Mean RTF | Mean first audio (ms) | Mean audio duration (s) |
+| --- | --- | --- | --- | --- |
+| Turbo / graph | Latency | 0.148 | 263 | 3.984 |
+| Turbo / eager | Latency | 0.325 | 436 | 3.984 |
+| Original / graph | Latency | 0.427 | 609 | 3.436 |
+| Original / eager | Latency | 0.596 | 934 | 3.482 |
+| Turbo / graph | Throughput, 8 clients | 0.286 | 592 | 4.026 |
+| Original / graph | Throughput, 8 clients | 0.913 | 1603 | 3.494 |
+| Turbo / graph | Stress, 2 requests/s | 0.187 | 371 | 4.063 |
+| Original / graph | Stress, 2 requests/s | 0.976 | 1602 | 3.513 |
+
+These are end-to-end measurements, not isolated graph timings or 64-client
+qualification. Original's generated duration differs slightly between modes.
+The nightly JSON stores measured median first-audio latency and RTF, plus audio
+throughput for the throughput cases, under the H100 hardware bucket. B200
+mirror collection has no measured baseline or qualification claim.
 
 ## Bottlenecks and changes
 
@@ -190,15 +236,65 @@ These checks establish narrow intelligibility evidence, not speaker similarity
 or broad quality parity. BF16 changes numerical audio values. Cold-reference
 variants derived from one recording stress cache misses, not distinct speakers.
 
-The final fresh-server conditioning-inclusive HTTP and sentence-streaming
-WebSocket checks of the committed CUDA profile were interrupted when Runpod
-stopped the H100 for insufficient account balance. They did not produce complete
-reports and are not passing validation. Earlier capacity results in the recipe
-predate the full-batch decoder; the new warm performance runs are separate from
-proof of 64 simultaneously active requests with cold conditioning.
+The earlier fresh-server rerun was interrupted by insufficient Runpod balance.
+Fresh split integration checks now have their own results below; the historical
+warm performance and playback-deficit tables remain separate measurements.
 
-Profiling matrices, traces, quality logs, 64-output quality WAV sets, and the
-Original concurrency reports were saved locally before shutdown. The final hot
+## Fresh conditioning and protocol qualification
+
+The October 12 integration environment and source revisions recorded above also
+ran the opt-in CUDA profiles, including BF16/cuDNN flow, FP32 HiFT and MPS.
+Each transport starts a fresh server. Each workload runs three synchronized
+waves of 64 clients with the default 1000-token allowance: cold distinct
+reference variants, a warm repeated reference and built-in voice. Request seeds
+are their request indices. The current load harness uses the longer narration in the reproduction section. WebSocket
+sessions send two input chunks and validate all five sentence segments, their
+order, PCM and reconstructed text. Input chunk boundaries do not define sentence
+boundaries. The initial harness incorrectly assumed they did; that failed
+report was retained and the corrected harness rerun.
+
+All four runs passed: 576 requests/sessions per run, zero errors and zero exact
+audio replays. Each WebSocket run validated 2880 completed sentence segments.
+The table reports p95 seconds from session submission; later WebSocket sentences
+include time spent behind earlier sentences. These checks do not measure playback
+deficits.
+
+| Variant | Transport | Cold TTFA / completion | Warm TTFA / completion | Built-in TTFA / completion | Every-wave capacity: cold / warm / built-in |
+| --- | --- | --- | --- | --- | --- |
+| Turbo | HTTP | 16.33 / 24.84 | 2.20 / 9.11 | 1.97 / 9.00 | No / Yes / Yes |
+| Turbo | WEBSOCKET | 12.98 / 38.25 | 2.54 / 17.06 | 2.40 / 17.08 | No / No / No |
+| Original | HTTP | 10.84 / 31.51 | 7.15 / 27.56 | 3.82 / 17.03 | Yes / Yes / Yes |
+| Original | WEBSOCKET | 11.99 / 44.30 | 4.00 / 37.07 | 4.04 / 29.01 | No / No / Yes |
+
+Original HTTP reached 128 stage-0 sequences (two CFG branches per request) in
+every wave, including cold conditioning. Turbo HTTP reached 64 in both warm
+and built-in workloads in every wave; its cold wave peaks were 64/64/62.
+WebSocket capacity confirmation was false except for Original built-in voice.
+Sentence segmentation and conditioning stagger admissions; sampled peaks do not
+establish sustained simultaneous occupancy or a universal real-time guarantee.
+
+Browser checks generated built-in-voice speech through the Gradio streaming
+demo for Turbo and Original. Both native players reached the end without a
+media error. This verifies browser delivery and playback; it is not a concurrent
+underrun measurement or a subjective speaker-quality assessment.
+
+To reproduce HTTP qualification after starting the CUDA profile:
+
+```bash
+uv run python benchmarks/tts/chatterbox_load.py \
+  ResembleAI/chatterbox-turbo tests/assets/qwen3_tts/clone_2.wav turbo-http.json \
+  --url http://127.0.0.1:8091/v1/audio/speech \
+  --concurrency 64 --cycles 3 --max-new-tokens 1000 --save-audio
+```
+
+For WebSocket, restart the server and add `--transport websocket`, changing the
+URL to `ws://127.0.0.1:8091/v1/audio/speech/stream`. For Original, use
+`ResembleAI/chatterbox`, its CUDA profile and `--stage0-sequences-per-request 2`.
+The capacity field requires every wave to reach the active-sequence target;
+client completion alone does not establish that target.
+
+Historical profiling matrices, traces, quality logs, 64-output quality WAV sets,
+and Original concurrency reports were saved locally before the earlier shutdown. The final hot
 Qwen JSON was not copied before the shutdown; its table above uses the completed
 report's metrics captured from the pod before it stopped. Do not represent that
 capture as a complete raw report.

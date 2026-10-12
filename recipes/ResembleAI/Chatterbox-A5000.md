@@ -296,7 +296,8 @@ uv run benchmarks/tts/chatterbox_load.py \
 This opens 64 overlapping sessions per wave with `split_granularity="sentence"`
 and `stream_audio=true`. Each sends two text chunks, then `input.done`, and checks
 ordered `audio.start`, binary PCM, `audio.done`, and `session.done` messages.
-Each session has two independently validated sentence segments. The report adds
+The current narration produces five independently validated sentence segments
+from those two input chunks. The report adds
 per-segment results and latency tails measured from session submission, so later
 segments include time behind earlier sentences. Reference workloads, scheduler
 metrics, capacity thresholds, and saved audio use the HTTP harness conventions.
@@ -320,5 +321,6 @@ Exceeding either backlog bound aborts active generation and closes with code 100
 For offline verification, use the [Chatterbox example](../../examples/offline_inference/text_to_speech/README.md#chatterbox-turbo-and-original).
 Expect a finite, nonempty mono waveform at 24 kHz. For browser playback use the
 [streaming demo](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original).
-MP3/FLAC, browser playback, and eager-versus-graph comparisons have runnable
-coverage; unexecuted hardware checks must not be described as qualified.
+MP3/FLAC and eager-versus-graph checks passed on the fresh H100 integration
+run; browser playback is qualified separately in the
+[H100 recipe](Chatterbox-H100.md). These are not new A5000 measurements.

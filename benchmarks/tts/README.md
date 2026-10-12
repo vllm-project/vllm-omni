@@ -18,6 +18,10 @@ HTTP or sentence-segmented WebSocket APIs, with cold distinct references, a warm
 repeated reference, and the built-in voice. `chatterbox_conditioning.py` checks
 real-weight serial/batch parity over 64 references on CPU or an explicit CUDA
 device. These are separate from the universal benchmark registry below.
+The load harness uses the longer parity narration so early completions are
+less likely to hide scheduler occupancy. Its report separately records
+successful clients and sampled active-sequence capacity; neither implies the
+other. Pass `--max-new-tokens 1000` to validate the default output allowance.
 See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-A5000.md#conditioning-load-validation-at-64-clients)
 for commands, measured 64-client results, and capacity and quality limitations.
 
@@ -357,6 +361,8 @@ uv run python -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 ```
 
 Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
-The job records metrics without invented regression thresholds. Its first
-successful H100 run must establish a baseline. It does not replace cold-reference
-or WebSocket validation with `chatterbox_load.py`.
+H100 baselines come from the October 12 integration run documented in the
+[H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-workload-and-cuda-graph-comparison).
+B200 is routed as a CI mirror without an assigned performance baseline.
+The job does not replace cold-reference or WebSocket validation with
+`chatterbox_load.py`.

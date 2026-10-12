@@ -22,7 +22,7 @@ SERVERS = [
 
 @pytest.mark.full_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVERS, indirect=True)
 @pytest.mark.parametrize("response_format", ["mp3", "flac"])
 def test_encoded_audio(omni_server, online_client, response_format):

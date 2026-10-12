@@ -22,7 +22,12 @@ from prometheus_client.parser import text_string_to_metric_families
 from tqdm import tqdm
 
 SAMPLE_RATE = 24000
-TEXT = "Request number {index}. The river moves quietly past the old stone bridge today."
+TEXT = (
+    "Request number {index}. The river moves quietly past the old stone bridge today. "
+    "In the morning, people walk along the bank and listen to the birds in the trees. "
+    "A small boat carries fresh bread to the market across the water. By evening, "
+    "the streets become quiet again, and warm lights shine through the windows of the houses."
+)
 
 
 def main():
@@ -200,9 +205,9 @@ async def websocket_request(session, url, payload, gate, state, reference_hash, 
                         pcm.extend(segment_pcm)
                         segment = None
                     elif kind == "session.done":
-                        if segment is not None or event.get("total_sentences") != len(chunks):
+                        if segment is not None or event.get("total_sentences") != len(result["segments"]):
                             raise ValueError("Incomplete sentence flush")
-                        if len(result["segments"]) != len(chunks):
+                        if " ".join(s["input"].strip() for s in result["segments"]) != payload["input"].strip():
                             raise ValueError("Missing sentence audio")
                         result.update(validate_pcm(pcm, SAMPLE_RATE, 1))
                         result.update(ok=True, sample_rate=SAMPLE_RATE, channels=1)

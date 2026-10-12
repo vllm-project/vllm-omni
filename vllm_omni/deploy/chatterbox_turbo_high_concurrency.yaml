@@ -1,6 +1,6 @@
 # Opt-in admission profile tested with 64 clients on H100 SXM 80 GB through
 # HTTP and sentence-streaming APIs at the default 1000-token allowance.
-# See recipes/ResembleAI/Chatterbox-Turbo.md for measurements and limits.
+# See recipes/ResembleAI/Chatterbox-H100.md for measurements and limits.
 # This is not a 24 GB or simultaneous full-context capacity guarantee.
 # Provision GPU memory for stage-0 KV caches at this admission limit, then
 # validate the intended lengths and voices on the target hardware. Stage 1

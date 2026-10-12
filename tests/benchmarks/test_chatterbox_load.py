@@ -14,6 +14,8 @@ import pytest
 import soundfile as sf
 from aiohttp import ClientSession, ClientTimeout, web
 
+from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
+
 sys.path.insert(0, str(Path(__file__).parents[2] / "benchmarks" / "tts"))
 import chatterbox_load
 
@@ -179,16 +181,25 @@ def test_sentence_websocket_load_through_actual_server(tmp_path):
             active += 1
             peak = max(peak, active)
             sentence = 0
+            splitter = SpeechTextSplitter("sentence")
             try:
                 async for message in websocket:
                     event = json.loads(message.data)
                     if event["type"] == "input.text":
+                        units = splitter.feed(event["text"])
+                    elif event["type"] == "input.done":
+                        units = splitter.flush()
+                    elif event["type"] == "session.close":
+                        break
+                    else:
+                        continue
+                    for unit in units:
                         await asyncio.sleep(0.02)
                         await websocket.send_json(
                             {
                                 "type": "audio.start",
                                 "sentence_index": sentence,
-                                "sentence_text": event["text"],
+                                "sentence_text": unit,
                                 "sample_rate": 24000,
                                 "channels": 1,
                             }
@@ -197,10 +208,8 @@ def test_sentence_websocket_load_through_actual_server(tmp_path):
                         await websocket.send_bytes(pcm)
                         await websocket.send_json({"type": "audio.done", "sentence_index": sentence})
                         sentence += 1
-                    elif event["type"] == "input.done":
+                    if event["type"] == "input.done":
                         await websocket.send_json({"type": "session.done", "total_sentences": sentence})
-                    elif event["type"] == "session.close":
-                        break
             finally:
                 active -= 1
                 await websocket.close()
@@ -235,9 +244,9 @@ def test_sentence_websocket_load_through_actual_server(tmp_path):
         assert peak == 4
         for workload in report["workloads"]:
             assert workload["completed"] == 4
-            assert workload["segments"]["completed"] == 8
+            assert workload["segments"]["completed"] == 20
             for row in workload["requests"]:
-                assert len(row["segments"]) == 2
+                assert len(row["segments"]) == 5
                 assert row["segments"][1]["ttfa_seconds"] >= row["segments"][0]["ttfa_seconds"]
         chatterbox_load.save_representative_audio(report, tmp_path / "websocket.json")
         assert len(list(tmp_path.glob("websocket-*.wav"))) == 3
