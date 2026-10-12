@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
 from collections.abc import Iterable
 from dataclasses import replace
 from functools import cached_property
@@ -49,22 +50,29 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config: Qwen2_5OmniTalkerConfig = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        if isinstance(quant_config, ComponentQuantizationConfig):
-            quant_config = quant_config.resolve("talker")
-            vllm_config = replace(vllm_config, quant_config=quant_config)
-        elif quant_config is not None and quant_config.get_name() not in PRE_QUANTIZED_METHODS:
-            quant_config = None
-            vllm_config = replace(vllm_config, quant_config=None)
-        self.vllm_config = vllm_config
-        self.prefix = prefix
-        self.quant_config = quant_config
-
         if hasattr(config, "talker_config"):
             self.config = config.talker_config
             vllm_config.model_config.hf_text_config = vllm_config.model_config.hf_config.talker_config
         else:
             self.config = config
+
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
+        elif quant_config is not None and quant_config.get_name() not in PRE_QUANTIZED_METHODS:
+            quant_config = None
+        if quant_config is not vllm_config.quant_config:
+            model_config = vllm_config.model_config
+            if quant_config is None:
+                # VllmConfig rebuilds a missing quant_config from
+                # model_config.quantization on every replace(), including the
+                # one inside init_vllm_registered_model, so clear the source too.
+                model_config = copy.copy(model_config)
+                model_config.quantization = None
+            vllm_config = replace(vllm_config, model_config=model_config, quant_config=quant_config)
+        self.vllm_config = vllm_config
+        self.prefix = prefix
+        self.quant_config = quant_config
 
         self.thinker_to_talker_proj = nn.Linear(
             self.config.embedding_size,
