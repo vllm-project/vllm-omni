@@ -444,6 +444,7 @@ def sample_flow_pingpong(
     sigmas: torch.Tensor,
     callback: Callable | None = None,
     disable_tqdm: bool = False,
+    generator: torch.Generator | None = None,
     **extra_args,
 ) -> torch.Tensor:
     """Ping-pong sampler for distilled rectified-flow models.
@@ -485,7 +486,8 @@ def sample_flow_pingpong(
             callback({"x": x, "i": i, "t": t_curr, "sigma": t_curr, "sigma_hat": t_curr, "denoised": denoised})
 
         # Mix denoised with fresh noise at level t_next
-        x = (1 - t_next_broadcast) * denoised + t_next_broadcast * torch.randn_like(x)
+        noise = torch.randn(x.shape, generator=generator, device=x.device, dtype=x.dtype)
+        x = (1 - t_next_broadcast) * denoised + t_next_broadcast * noise
 
     return x
 
@@ -504,9 +506,15 @@ def sample_diffusion(
     x: torch.Tensor,
     sigmas: torch.Tensor,
     sampler_type: str = "dpmpp-3m-sde",
+    generator: torch.Generator | None = None,
     **kwargs,
 ) -> torch.Tensor:
     """Dispatcher. PORT_FROM: sampling.py:356-..."""
     if sampler_type not in SAMPLER_REGISTRY:
         raise ValueError(f"Unknown sampler: {sampler_type}. Options: {list(SAMPLER_REGISTRY)}")
-    return SAMPLER_REGISTRY[sampler_type](model, x, sigmas, **kwargs)
+    sampler = SAMPLER_REGISTRY[sampler_type]
+    # Only pingpong draws noise per step; the other samplers forward extra
+    # kwargs to the model, so the generator must not reach them.
+    if sampler is sample_flow_pingpong:
+        kwargs["generator"] = generator
+    return sampler(model, x, sigmas, **kwargs)

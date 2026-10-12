@@ -429,6 +429,7 @@ class StableAudio3Pipeline(
             noise,
             sigmas,
             sampler_type=sampler_type,
+            generator=generator,
         )
         self._current_timestep = None
 
