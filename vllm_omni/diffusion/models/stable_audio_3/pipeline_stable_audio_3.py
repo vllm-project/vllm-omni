@@ -303,9 +303,15 @@ class StableAudio3Pipeline(
         """
         # --- 1. Extract request params -----------------------------------
         sampling_params = req.sampling_params
-        steps: int = sampling_params.num_inference_steps or 8
-        cfg_scale: float = sampling_params.guidance_scale or 6.0
-        seed = sampling_params.seed
+        steps: int = sampling_params.num_inference_steps or 100
+        # OmniDiffusionRequest rewrites an omitted guidance_scale to 1.0 (CFG off),
+        # so fall back to the SA3 default only when the caller did not set one.
+        cfg_scale: float = sampling_params.guidance_scale if sampling_params.guidance_scale_provided else 7.0
+        generator = sampling_params.generator
+        if isinstance(generator, list):
+            generator = generator[0]
+        if generator is None and sampling_params.seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(sampling_params.seed)
 
         extra = getattr(sampling_params, "extra_args", None) or {}
         audio_start_s: float = extra.get("audio_start_in_s", 0.0)
@@ -370,11 +376,10 @@ class StableAudio3Pipeline(
         latent_sample_size = audio_sample_size // downsampling_ratio
 
         # --- 5. Initial noise -------------------------------------------
-        if seed is not None:
-            torch.manual_seed(seed)
         noise = torch.randn(
             [batch_size, self.diffusion.io_channels, latent_sample_size],
             device=device,
+            generator=generator,
         )
 
         # --- 5b. Inject default inpaint conditioning ---------------------
@@ -466,7 +471,7 @@ class StableAudio3Pipeline(
         AutoWeightsLoader: the upstream key namespace (``model.model.*``,
         ``pretransform.model.*``, ``conditioner.*``) does not align with
         AutoWeightsLoader's attribute-based routing, and T5Gemma is loaded separately in
-        ``__init__`` (hidden from ``named_parameters`` when frozen).
+        ``__init__`` (its params are marked ``is_checkpoint_optional``).
         """
         params = dict(self.named_parameters())
         buffers = dict(self.named_buffers())

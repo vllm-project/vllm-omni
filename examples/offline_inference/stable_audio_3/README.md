@@ -83,7 +83,7 @@ python ../text_to_audio/text_to_audio.py \
 
 ### SAME autoencoder variant
 
-SA3 ships three SAME variants (Small Music / Small SFX / Medium). Selecting one is done via the model checkpoint — the pipeline reads `same_variant` from `od_config.model_config` if you need to override the default `medium`.
+SA3 ships three SAME variants (Small Music / Small SFX / Medium). The checkpoint's `model_config.json` pretransform block selects the variant; there is no separate `same_variant` runtime override.
 
 ## Hardware
 

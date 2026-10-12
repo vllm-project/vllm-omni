@@ -83,7 +83,10 @@ def _generate_short_sa3_clip(
 @hardware_test(res={"cuda": "L4"})
 def test_stable_audio_3_short_clip_smoke() -> None:
     """SA3 short-clip smoke test — checks basic text→audio works end-to-end."""
-    omni = Omni(model=_MODEL_REPO)
+    # ``model_class_name`` must be passed explicitly: the default-stage-cfg
+    # factory reads it from ``kwargs`` when deciding ``final_output_type``
+    # (#2077), before ``model_index.json`` auto-resolution runs.
+    omni = Omni(model=_MODEL_REPO, model_class_name="StableAudio3Pipeline")
     audio = _generate_short_sa3_clip(omni)
 
     # Shape: SA3 outputs stereo at 44.1 kHz.
@@ -94,6 +97,10 @@ def test_stable_audio_3_short_clip_smoke() -> None:
     )
     assert_audio_valid(audio, sample_rate=_SAMPLE_RATE, channels=2, duration_s=_SHORT_CLIP_DURATION_S)
 
+    # The request generator must drive the initial noise: same seed -> same audio.
+    assert np.array_equal(audio, _generate_short_sa3_clip(omni))
+    assert not np.array_equal(audio, _generate_short_sa3_clip(omni, seed=43))
+
 
 @hardware_test(res={"cuda": "L4"})
 def test_stable_audio_3_variable_length() -> None:
@@ -101,7 +108,7 @@ def test_stable_audio_3_variable_length() -> None:
 
     This is SA3-distinctive vs SA Open 1.0 (which has fixed sample_size).
     """
-    omni = Omni(model=_MODEL_REPO)
+    omni = Omni(model=_MODEL_REPO, model_class_name="StableAudio3Pipeline")
 
     short = _generate_short_sa3_clip(omni, audio_end_in_s=5.0, num_inference_steps=4)
     long_ = _generate_short_sa3_clip(omni, audio_end_in_s=_LONG_CLIP_DURATION_S, num_inference_steps=4)

@@ -3,7 +3,7 @@
 """Stable Audio 3 online e2e: text-to-audio via the /v1/audio/generate endpoint.
 
 Mirrors the audio-diffusion serving path used by stable-audio-open
-(see examples/online_serving/stable_audio/). Point ``STABLE_AUDIO_3_TEST_MODEL``
+(see tests/e2e/online_serving/test_stable_audio_online_expansion.py). Point ``STABLE_AUDIO_3_TEST_MODEL``
 at a directory prepared by
 ``examples/offline_inference/stable_audio_3/download_stable_audio_3.py`` (which
 writes the ``model_index.json`` / ``transformer/config.json`` the engine needs).

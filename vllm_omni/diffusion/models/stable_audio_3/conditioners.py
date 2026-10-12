@@ -312,12 +312,12 @@ class T5GemmaConditioner(Conditioner):
                 else:
                     os.environ["TRANSFORMERS_VERBOSITY"] = prev_transformers
 
-        # Hide model from nn.Module's parameter registration when frozen
-        # (upstream trick to avoid optimizer touching it).
-        if self.enable_grad:
-            self.model = model
-        else:
-            self.__dict__["model"] = model
+        # Register the encoder so CPU offload and Module.to() see it. Its weights
+        # come from from_pretrained above, not the SA3 checkpoint, so exempt them
+        # from the loader's strict missing-weight check.
+        self.model = model
+        for param in self.model.parameters():
+            param.is_checkpoint_optional = True
 
         self._device_initialized = False
 

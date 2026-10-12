@@ -98,8 +98,7 @@ except ImportError:
 try:
     from flash_attn import flash_attn_func, flash_attn_kvpacked_func
 except ImportError as e:
-    print(e)
-    print("flash_attn not installed, disabling Flash Attention")
+    logging.debug(f"flash_attn not installed, disabling Flash Attention: {e}")
     flash_attn_kvpacked_func = None
     flash_attn_func = None
 
@@ -107,8 +106,7 @@ try:
     from flash_attn import flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 except ImportError as e:
-    print(e)
-    print("flash_attn varlen/bert_padding not available, disabling varlen attention")
+    logging.debug(f"flash_attn varlen/bert_padding not available, disabling varlen attention: {e}")
     flash_attn_varlen_func = None
     pad_input = None
     unpad_input = None
@@ -148,10 +146,9 @@ def precompute_varlen_metadata(padding_mask: torch.Tensor) -> dict | None:
     }
 
 
-# PORT_FROM: models/utils.py compile helper (inlined to avoid extra file)
-torch._dynamo.config.cache_size_limit = max(64, torch._dynamo.config.cache_size_limit)
-torch._dynamo.config.suppress_errors = True
-
+# PORT_FROM: models/utils.py compile helper (inlined to avoid extra file).
+# Upstream's process-wide torch._dynamo.config writes are dropped: importing a
+# model must not change compile behavior for the rest of the worker.
 _enable_torch_compile = _os.environ.get("ENABLE_TORCH_COMPILE", "0") == "1"
 
 
@@ -181,7 +178,6 @@ def _left_pad_to_match(emb, target_len):
 
 if flex_attention_available:
     try:
-        torch._dynamo.config.cache_size_limit = 5000
         flex_attention_compiled = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
     except Exception as e:
         logging.debug(f"Could not compile flex_attention, using uncompiled version: {e}")
@@ -1067,7 +1063,7 @@ class TransformerBlock(nn.Module):
         self.causal = causal
 
         if layer_scale and zero_init_branch_outputs:
-            print("zero_init_branch_outputs is redundant with layer_scale, setting zero_init_branch_outputs to False")
+            logging.debug("zero_init_branch_outputs is redundant with layer_scale, setting it to False")
             zero_init_branch_outputs = False
 
         if norm_type not in ["layer_norm", "rms_norm", "dyt"]:

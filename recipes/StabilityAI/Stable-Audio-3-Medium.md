@@ -25,7 +25,7 @@ CPU-targeted and lower quality; Large (2.7B) is API-only and out of scope.
 - Model card (gated): <https://huggingface.co/stabilityai/stable-audio-3-medium>
 - Pipeline: `vllm_omni.diffusion.models.stable_audio_3.pipeline_stable_audio_3.StableAudio3Pipeline`
 - Offline example: [`examples/offline_inference/stable_audio_3/`](../../examples/offline_inference/stable_audio_3/) (download helper) plus the shared [`examples/offline_inference/text_to_audio/`](../../examples/offline_inference/text_to_audio/) driver
-- Online example: [`examples/online_serving/stable_audio/`](../../examples/online_serving/stable_audio/)
+- Online example: the `vllm-omni serve` + `curl` steps under [Command](#command) below
 - Related issue: <https://github.com/vllm-project/vllm-omni/issues/3787>
 
 ## Hardware Support
