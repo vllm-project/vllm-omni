@@ -588,7 +588,8 @@ def _moss_adapter_with_stage_configs(stage_configs, mocker):
         model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"),
         stage_configs=stage_configs,
     )
-    return MossTTSAdapter(SpeechServingContext(server=mocker.Mock(), engine_client=engine_client))
+    server = mocker.Mock(api_server_shared_dir=None)  # one API process
+    return MossTTSAdapter(SpeechServingContext(server=server, engine_client=engine_client))
 
 
 def _moss_cuda_available(mocker, device_count=8):

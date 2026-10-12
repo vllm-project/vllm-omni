@@ -6,9 +6,12 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.request import RequestStatus
 
 from vllm_omni.engine.stage_engine_core_proc import (
     StageEngineCoreProc,
@@ -18,6 +21,15 @@ from vllm_omni.engine.stage_engine_core_proc import (
 from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = mocker.Mock(spec=Scheduler)
+
+    engine._handle_client_request(EngineCoreRequestType.ABORT, ["request"])
+
+    engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
 
 
 class WrappedUniProcExecutor(UniProcExecutor):

@@ -372,3 +372,20 @@ def test_float32_pcm_fast_path_matches_soundfile(layout):
         expected = buffer.getvalue()
     assert _float32_to_pcm16_bytes(audio) == expected
     np.testing.assert_array_equal(audio, original)
+
+
+def test_float32_pcm_path_matches_soundfile_across_scales():
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import _float32_to_pcm16_bytes
+
+    def reference(audio):
+        with BytesIO() as buffer:
+            soundfile.write(buffer, audio, 24000, format="RAW", subtype="PCM_16")
+            return buffer.getvalue()
+
+    rng = np.random.default_rng(1)
+    for exponent in range(-40, 39, 3):
+        audio = (rng.standard_normal(4096) * 10.0**exponent).astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            assert _float32_to_pcm16_bytes(audio) == reference(audio)
+    stereo = rng.uniform(-1.1, 1.1, (2, 4096)).astype(np.float32).T  # non-contiguous view
+    assert _float32_to_pcm16_bytes(stereo) == reference(stereo)

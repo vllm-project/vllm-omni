@@ -173,9 +173,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        # Keep rejecting in-flight appends after the error output is drained,
+        # until the engine consumes the owner's abort from its ordered input queue.
+        self._overflowed_streaming_requests: set[str] = set()
         self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
+
+    def add_request(self, request: Request) -> None:
+        if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
+            logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
+            return
+        super().add_request(request)
+
+    def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
+        """Release admission fences after an ordered abort, never an eager one."""
+        overflowed = getattr(self, "_overflowed_streaming_requests", None)
+        if overflowed is not None:
+            overflowed.difference_update(request_ids)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -1429,6 +1444,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if overflow is None:
             overflow = self._streaming_context_overflow = {}
         overflow[session.request_id] = (int(getattr(session, "client_index", 0) or 0), reason)
+        overflowed = getattr(self, "_overflowed_streaming_requests", None)
+        if overflowed is None:
+            overflowed = self._overflowed_streaming_requests = set()
+        overflowed.add(session.request_id)
         if session.is_finished():
             # Reached from ``_handle_stopped_request`` with a queued update.
             # ``update_from_output`` frees every request that call reports as
