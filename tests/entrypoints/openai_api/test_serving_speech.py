@@ -1626,6 +1626,53 @@ class TestTTSMethods:
         assert result is not None
         assert "CustomVoice checkpoint does not support task_type='Base'" in result
 
+    def test_precomputed_voice_is_allowed_on_custom_voice_checkpoint(self, speech_server):
+        """A precomputed profile needs no speaker encoder, so a CustomVoice checkpoint serves it."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            hf_config=SimpleNamespace(
+                tts_model_type="custom_voice",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+        adapter = speech_server._get_tts_adapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            precomputed_speakers={"alice": {"mode": "icl", "ref_text": "reference transcript"}},
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello", voice="alice", task_type="CustomVoice", instructions="Speak calmly"
+        )
+
+        assert speech_server._validate_tts_request(req) is None
+        assert req.task_type == "Base"
+
+    def test_uploaded_voice_shadowing_precomputed_is_still_rejected_on_custom_voice(self, speech_server):
+        """Uploaded voices run the speaker encoder; the exemption covers precomputed profiles only."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            hf_config=SimpleNamespace(
+                tts_model_type="custom_voice",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+        speech_server.uploaded_speakers = {
+            "alice": {"file_path": "/tmp/alice.safetensors", "embedding_source": "audio"}
+        }
+        adapter = speech_server._get_tts_adapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            precomputed_speakers={"alice": {"mode": "xvec"}},
+        )
+
+        result = speech_server._validate_tts_request(OpenAICreateSpeechRequest(input="Hello", voice="alice"))
+
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
     def test_precomputed_voice_infers_base_without_server_attribute(self, speech_server):
         """Cover the non-uploaded side of stored_voice's ``or`` expression."""
         speech_server._tts_model_type = "qwen3_tts"

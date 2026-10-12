@@ -232,6 +232,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             request.task_type = "Base"
 
         # Normalize voice to lowercase for case-insensitive matching
+        precomputed_voice = False
         if request.voice is not None:
             request.voice = request.voice.lower()
             stored_voice = (
@@ -242,10 +243,18 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             # admission gate and builder cannot disagree.
             if stored_voice:
                 request.task_type = "Base"
+            precomputed_voice = (
+                request.voice not in server.uploaded_speakers
+                and request.voice in self.capabilities.precomputed_speakers
+            )
         task_type = request.task_type or "CustomVoice"
 
         model_variant = self._get_model_variant()
-        if model_variant is not None and task_type != model_variant:
+        # A precomputed profile carries its speaker embedding (and ICL reference codes), so its Base
+        # prompt needs no speaker encoder and any Qwen3-TTS checkpoint can serve it, including a
+        # CustomVoice fine-tune whose own speakers stay available as CustomVoice.
+        precomputed_on_custom_voice = precomputed_voice and model_variant == "CustomVoice"
+        if model_variant is not None and task_type != model_variant and not precomputed_on_custom_voice:
             return (
                 f"Qwen3-TTS {model_variant} checkpoint does not support task_type='{task_type}'. "
                 f"Use task_type='{model_variant}' or load the matching {task_type} checkpoint."

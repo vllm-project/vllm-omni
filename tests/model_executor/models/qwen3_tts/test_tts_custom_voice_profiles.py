@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 from types import SimpleNamespace
 
@@ -48,6 +51,7 @@ def test_qwen3_custom_voice_profiles_warm_speaker_cache(tmp_path):
     model.config = SimpleNamespace(
         custom_voice_dir=str(tmp_path),
         speaker_encoder_config=SimpleNamespace(enc_dim=4),
+        talker_config=SimpleNamespace(hidden_size=4),
     )
     model._speaker_cache = SpeakerEmbeddingCache()
 
@@ -60,6 +64,51 @@ def test_qwen3_custom_voice_profiles_warm_speaker_cache(tmp_path):
     assert cached["ref_text"] == "reference transcript"
     torch.testing.assert_close(cached["ref_spk_embedding"], torch.arange(4, dtype=torch.float32))
     torch.testing.assert_close(cached["ref_code"], torch.arange(6, dtype=torch.int32).reshape(3, 2))
+
+
+def test_qwen3_profiles_match_talker_hidden_size_not_encoder_dim(tmp_path):
+    """CustomVoice config.json omits speaker_encoder_config, so enc_dim defaults to 1024.
+
+    Profiles are checked against the talker hidden size, matching the serving adapter, so a
+    hidden-size profile still loads on such a checkpoint instead of being skipped after the API
+    server has accepted requests for it.
+    """
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+        Qwen3TTSTalkerForConditionalGeneration,
+    )
+
+    save_file(
+        {
+            "speaker_embedding": torch.arange(8, dtype=torch.float32),
+            "ref_code": torch.arange(6, dtype=torch.int32).reshape(3, 2),
+        },
+        str(tmp_path / "alice.safetensors"),
+    )
+    _write_manifest(
+        tmp_path,
+        model_type="qwen3_tts",
+        voices={
+            "Alice": {
+                "file": "alice.safetensors",
+                "mode": "icl",
+                "ref_text": "reference transcript",
+                "embedding_dim": 8,
+            }
+        },
+    )
+
+    model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    model.config = SimpleNamespace(
+        custom_voice_dir=str(tmp_path),
+        speaker_encoder_config=SimpleNamespace(enc_dim=4),
+        talker_config=SimpleNamespace(hidden_size=8),
+    )
+    model._speaker_cache = SpeakerEmbeddingCache()
+
+    model._load_custom_voice_profiles()
+
+    key = model._speaker_cache.make_cache_key("alice", model_type="qwen3_tts_icl", created_at=0)
+    assert model._speaker_cache.get(key) is not None
 
 
 def test_qwen3_icl_profile_without_ref_code_is_not_downgraded(tmp_path):
@@ -85,6 +134,7 @@ def test_qwen3_icl_profile_without_ref_code_is_not_downgraded(tmp_path):
     model.config = SimpleNamespace(
         custom_voice_dir=str(tmp_path),
         speaker_encoder_config=SimpleNamespace(enc_dim=4),
+        talker_config=SimpleNamespace(hidden_size=4),
     )
     model._speaker_cache = SpeakerEmbeddingCache()
 

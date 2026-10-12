@@ -435,7 +435,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if not custom_voice_dir:
             return
 
-        expected_dim = int(getattr(self.config.speaker_encoder_config, "enc_dim", 0) or 0)
+        # A profile's speaker embedding is concatenated with the talker codec embeddings, so it must
+        # match the talker hidden size (as the serving adapter checks). speaker_encoder_config.enc_dim
+        # is only the encoder's output width, which a CustomVoice config.json omits (default 1024).
+        expected_dim = int(self.config.talker_config.hidden_size)
         loaded = 0
         for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="qwen3_tts"):
             tensors = load_validated_profile_tensors(
