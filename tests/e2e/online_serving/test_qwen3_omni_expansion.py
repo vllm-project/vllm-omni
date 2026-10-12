@@ -13,7 +13,7 @@ from tests.helpers.media import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
-    load_test_audio_data_url,
+    get_asset_path,
 )
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -517,7 +517,7 @@ def test_qwen3_omni_seed_tts_reads_questions_verbatim(omni_server, online_client
     
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_to_audio(omni_server, openai_client) -> None:
+def test_audio_to_audio(omni_server, online_client) -> None:
     """
     Input Modal: audio
     Output Modal: audio
@@ -525,7 +525,7 @@ def test_audio_to_audio(omni_server, openai_client) -> None:
     Datasets: single request
     """
 
-    audio_data_url = load_test_audio_data_url("audio-prompt.wav")
+    audio_data_url = get_asset_path("audio-prompt.wav", as_data_url=True)
     messages = dummy_messages_from_mix_data(
         audio_data_url=audio_data_url,
         system_prompt=get_system_prompt(),
@@ -537,4 +537,4 @@ def test_audio_to_audio(omni_server, openai_client) -> None:
         "modalities": ["audio"],
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
