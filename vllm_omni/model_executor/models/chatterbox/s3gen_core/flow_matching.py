@@ -16,61 +16,20 @@
 import torch
 
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.configs import CFM_PARAMS
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_flow_matching import BASECFM
 
 
 def cast_all(*args, dtype):
     return [a if (not a.dtype.is_floating_point) or a.dtype == dtype else a.to(dtype) for a in args]
 
 
-class ConditionalCFM(BASECFM):
-    def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
-        super().__init__(
-            n_feats=in_channels,
-            cfm_params=cfm_params,
-            n_spks=n_spks,
-            spk_emb_dim=spk_emb_dim,
-        )
+class ConditionalCFM(torch.nn.Module):
+    """Shared estimator and guided Euler solver for causal inference."""
+
+    def __init__(self, cfm_params, estimator: torch.nn.Module):
+        super().__init__()
         self.t_scheduler = cfm_params.t_scheduler
-        self.training_cfg_rate = cfm_params.training_cfg_rate
         self.inference_cfg_rate = cfm_params.inference_cfg_rate
-        in_channels = in_channels + (spk_emb_dim if n_spks > 0 else 0)
-        # Just change the architecture of the estimator here
         self.estimator = estimator
-
-    @torch.inference_mode()
-    def forward(
-        self,
-        mu,
-        mask,
-        n_timesteps,
-        temperature=1.0,
-        spks=None,
-        cond=None,
-        prompt_len=0,
-        flow_cache=torch.zeros(1, 80, 0, 2),
-    ):
-        """Forward diffusion
-
-        Args:
-            mu (torch.Tensor): output of encoder
-                shape: (batch_size, n_feats, mel_timesteps)
-            mask (torch.Tensor): output_mask
-                shape: (batch_size, 1, mel_timesteps)
-            n_timesteps (int): number of diffusion steps
-            temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
-            spks (torch.Tensor, optional): speaker ids. Defaults to None.
-                shape: (batch_size, spk_emb_dim)
-            cond (torch.Tensor, optional): Not used but kept for future purposes.
-            prompt_len (int, optional): Number of prompt frames kept in the flow cache. Defaults to 0.
-            flow_cache (torch.Tensor, optional): Noise and encoder output cached from the previous call.
-                shape: (1, n_feats, cache_size, 2)
-
-        Raises:
-            NotImplementedError: Always; this path is unused and was not updated for the meanflow model.
-        """
-
-        raise NotImplementedError("unused, needs updating for meanflow model")
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond, meanflow=False):
         """
@@ -146,8 +105,8 @@ class ConditionalCFM(BASECFM):
 
 
 class CausalConditionalCFM(ConditionalCFM):
-    def __init__(self, in_channels=240, cfm_params=CFM_PARAMS, n_spks=1, spk_emb_dim=80, estimator=None):
-        super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
+    def __init__(self, cfm_params=CFM_PARAMS, estimator=None):
+        super().__init__(cfm_params, estimator)
         # TODO: BAD BAD IDEA - IT'LL MESS UP DISTILLATION - SETTING TO NONE
         self.rand_noise = None
 

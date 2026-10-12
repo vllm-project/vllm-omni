@@ -52,8 +52,8 @@ def original_admission_prompt(weight: float) -> dict:
     return build_prompt([12, 13, 14], voice, ChatterboxConfig("original"), cfg_weight=weight)
 
 
-@pytest.mark.parametrize("weight", [0.0, 0.5])
-@pytest.mark.parametrize("final_stage_id", [0, 1])
+# Guided requests finish at the audio stage; stage-0-only requests are unguided.
+@pytest.mark.parametrize("weight,final_stage_id", [(0.0, 0), (0.0, 1), (0.5, 1)])
 @pytest.mark.parametrize("max_tokens", [None, 4096])
 def test_original_offline_admission_preserves_supported_budget(
     original_admission_engine, weight, final_stage_id, max_tokens

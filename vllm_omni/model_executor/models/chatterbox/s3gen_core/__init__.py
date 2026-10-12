@@ -8,12 +8,10 @@ CosyVoice, ESPnet, Matcha-TTS and 3D-Speaker files under Apache-2.0. Import
 paths were rewritten and training-only code removed (plus a demo block, a
 duplicate logger line and a missing `import logging`); the code then follows
 this repository's conventions (absolute imports, lint, Google-style
-docstrings, plain torch operations in place of einops, and the statements
-after the unconditional raise in ``ConditionalCFM.forward`` dropped) without
-changing any computation. Code this checkpoint does not reach was otherwise
-kept as upstream has it: ``BASECFM.forward``, which both subclasses
-override, the raise-only ``ConditionalCFM.forward`` itself, and the
-registry entries in ``class_utils`` the encoder's configuration does not
-select. Numeric parity against the source package, not textual closeness,
-is what is checked.
+docstrings and plain torch operations in place of einops). Unused flow
+configuration fields and overridden base flow methods were removed. The
+reference ``CausalMaskedDiffWithXvec.inference`` path remains for numerical
+comparison tests. Registry entries in ``class_utils`` that this checkpoint
+does not select are retained from upstream. Numeric parity against the source
+package, not textual closeness, is what is checked.
 """

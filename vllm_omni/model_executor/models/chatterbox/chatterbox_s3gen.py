@@ -312,7 +312,7 @@ class S3GenDecoder(nn.Module):
         )
         self.flow = CausalMaskedDiffWithXvec(
             encoder=encoder,
-            decoder=CausalConditionalCFM(spk_emb_dim=80, cfm_params=CFM_PARAMS, estimator=estimator),
+            decoder=CausalConditionalCFM(cfm_params=CFM_PARAMS, estimator=estimator),
             token_mel_ratio=config.token_mel_ratio,
             pre_lookahead_len=config.pre_lookahead_len,
         )

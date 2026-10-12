@@ -65,7 +65,7 @@ def tiny_flow() -> CausalMaskedDiffWithXvec:
         act_fn="gelu",
         meanflow=True,
     )
-    decoder = CausalConditionalCFM(spk_emb_dim=80, cfm_params=CFM_PARAMS, estimator=estimator)
+    decoder = CausalConditionalCFM(cfm_params=CFM_PARAMS, estimator=estimator)
     return CausalMaskedDiffWithXvec(input_size=512, spk_embed_dim=192, encoder=encoder, decoder=decoder).eval()
 
 
