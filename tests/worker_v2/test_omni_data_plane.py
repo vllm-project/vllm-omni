@@ -114,6 +114,28 @@ def test_full_payload_waits_for_terminal_and_last_deferred_frame(plane):
     assert plane.request_terminal({"internal"}) == 0
 
 
+def test_preemption_preserves_sampled_history_and_deferred_outputs(plane):
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(max_tokens=3, stop_token_ids=[2150])
+    plane.register_request(request)
+    state = plane._native_requests["internal"]
+    state.accept_tokens([21, 22])
+    plane.reserve_outputs(["internal"])
+    request.num_computed_tokens = 0
+
+    plane.register_request(request)
+
+    resumed = plane._native_requests["internal"]
+    assert resumed is state
+    assert resumed.snapshot(include_token_history=False).output_token_count == 2
+    assert resumed.num_computed_tokens == 0
+    assert plane._native_outputs_in_flight["internal"] == 1
+    resumed.accept_tokens([23])
+    assert resumed.output_token_ids == [21, 22, 23]
+    assert resumed.output_stopped
+
+
 def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     plane._async_chunk = False
     plane._full_payload_replace_keys_cached = frozenset()
@@ -631,7 +653,8 @@ def test_ar_receiver_accumulates_rows_and_replaces_chunk_metadata():
     assert merged["meta"]["is_segment_finished"].ndim == 0
 
 
-def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane, monkeypatch):
+@pytest.mark.parametrize("final_stage_id", [None, 1])
+def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane, monkeypatch, final_stage_id):
     # Qwen3-Omni's Talker processor returns None on the terminal call when the
     # last frames ended exactly on a chunk boundary; Code2Wav must still learn
     # that the stream finished, as with the V1 chunk adapter.
@@ -648,7 +671,10 @@ def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane,
         return True, None
 
     monkeypatch.setattr(raw_plane, "_enqueue_chunk_payload", enqueue)
-    raw_plane.register_request(_new_request())
+    request = _new_request()
+    if final_stage_id is not None:
+        request.additional_information = {"omni_final_stage_id": final_stage_id}
+    raw_plane.register_request(request)
 
     _complete(raw_plane, [{"codes": {"audio": torch.ones((1, 16))}}])
     assert enqueued == []  # a non-terminal None payload sends nothing
@@ -733,3 +759,47 @@ def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
     assert next_snapshot.last_output_token_id == 2150
     assert next_snapshot.sampled_token_ids == []
     assert first.sampled_token_ids == [2150]
+
+
+@pytest.mark.parametrize("abort", [False, True])
+@pytest.mark.parametrize("serialized", [False, True])
+@pytest.mark.parametrize("force_kv_transfer", [False, True], ids=["stage-zero-final", "cfg-companion"])
+def test_stage_zero_final_never_publishes_but_cleans_up(raw_plane, monkeypatch, abort, serialized, force_kv_transfer):
+    """Final-stage metadata governs chunk publication independently of KV transfer."""
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    raw_plane._omni_connector = object()
+    raw_plane._request_ids_mapping = {}
+    raw_plane._custom_process_func = lambda transfer_manager, multimodal_output, request, is_finished=False: None
+    raw_plane._custom_process_batch_func = None
+    monkeypatch.setattr(raw_plane, "is_data_transfer_rank", lambda: True)
+    enqueued = []
+
+    def enqueue(request, payload, **kwargs):
+        enqueued.append(payload)
+        return True, None
+
+    monkeypatch.setattr(raw_plane, "_enqueue_chunk_payload", enqueue)
+    request = _new_request()
+    # Companions use this same final-stage marker with forced KV transfer;
+    # neither an ID suffix nor CFG-specific role metadata is required.
+    information = {"omni_final_stage_id": 0, "omni_force_kv_transfer": force_kv_transfer}
+    request.additional_information = serialize_additional_information(information) if serialized else information
+    raw_plane.register_request(request)
+    raw_plane.reserve_outputs(["internal"])
+    if abort:
+        assert raw_plane.abort_requests({"internal"}) == 0
+        assert raw_plane.record.cleaned == ["internal"]
+    else:
+        assert raw_plane.request_terminal({"internal"}) == 0
+        assert raw_plane.record.cleaned == []  # Finish still waits for the reserved frame.
+    # A stage-zero-final request cannot publish even with real producer data.
+    assert _complete(raw_plane, [{"codes.audio": torch.ones(1, 16)}]) == 0
+    assert enqueued == []
+    assert raw_plane.record.cleaned == ["internal"]
+    assert raw_plane._native_requests == {}
+    assert not raw_plane._native_outputs_in_flight
+    assert not raw_plane._native_terminal_pending
+    assert raw_plane.request_terminal({"internal"}) == 0
+    assert raw_plane.abort_requests({"internal"}) == 0
+    assert raw_plane.record.cleaned == ["internal", "internal"]

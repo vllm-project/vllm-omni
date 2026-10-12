@@ -1060,6 +1060,7 @@ def test_preprocess_phase_contract_mixed_batch(monkeypatch, batched_decode, orde
     code_index = 0
     for (route, info), (rid, prompt_len, computed, span) in zip(calls, rows, strict=True):
         assert info["request_id"] == rid
+        assert info["req_id"] == rid
         assert type(info["_omni_prompt_len"]) is int
         assert type(info["_omni_num_computed_tokens"]) is int
         assert type(info["_omni_is_prefill"]) is bool

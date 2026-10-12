@@ -16,6 +16,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload, unflatten_payload
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     should_accumulate_full_payload_output,
@@ -44,6 +45,8 @@ class _NativeRequestState:
     # own output (cancel, error or a parked close), so the runner has no
     # finish reason. MiniCPM-o duplex Talkers only end this way.
     aborted: bool = False
+
+    publish_outputs: bool = True
 
     def accept_tokens(self, token_ids: list[int]) -> None:
         """Fence publications past the sampled stop, before scheduler ACK.
@@ -279,8 +282,16 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         req_id = str(request_data.req_id)
         external_req_id = str(getattr(request_data, "external_req_id", None) or req_id)
         with self._native_output_lock:
+            # The scheduler sends preempted requests as new on recomputation.
+            # Their transport state still owns the published token history and
+            # deferred outputs; only KV progress restarts.
+            if req_id in self._native_requests:
+                self._native_requests[req_id].num_computed_tokens = int(request_data.num_computed_tokens)
+                return
             self._native_outputs_in_flight.pop(req_id, None)
             self._native_terminal_pending.discard(req_id)
+            information = getattr(request_data, "additional_information", None)
+            final_stage_id = deserialize_additional_information(information).get("omni_final_stage_id")
             self._native_requests[req_id] = _NativeRequestState(
                 request_id=req_id,
                 external_req_id=external_req_id,
@@ -290,6 +301,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 sampling_params=getattr(request_data, "sampling_params", None),
                 num_computed_tokens=int(getattr(request_data, "num_computed_tokens", 0) or 0),
                 resumable=bool(getattr(request_data, "resumable", False)),
+                publish_outputs=final_stage_id != 0,
             )
 
     def reserve_outputs(self, req_ids: list[str]) -> None:
@@ -543,6 +555,13 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             if state is None:
                 continue
             state.finished = req_id in terminal_req_ids
+            # Match V1's final-stage metadata contract: stage-zero-final
+            # requests (including CFG companions that still transfer KV) have
+            # no downstream chunk consumer, even for terminal markers.
+            if not state.publish_outputs:
+                if state.finished:
+                    finished_req_ids.append(req_id)
+                continue
             # Native transport runs ahead of scheduler consumption. Its
             # terminal notification fences resource cleanup, not the sampled
             # token boundary: a later in-flight frame must not reach the codec.

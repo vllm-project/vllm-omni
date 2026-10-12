@@ -176,18 +176,41 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
 
 
 @pytest.mark.cpu
-def test_release_request_resources_skips_without_async_chunk():
+@pytest.mark.parametrize(
+    ("async_chunk", "runner_v2", "native_support", "expect_rpc"),
+    [
+        (True, True, True, False),
+        (True, False, True, True),
+        (True, False, False, True),
+        (True, True, False, True),
+        (False, True, True, False),
+        (False, False, False, False),
+    ],
+    ids=["native-v2", "v1-native-capable", "v1", "v2-legacy", "non-async-v2", "non-async-v1"],
+)
+def test_release_request_resources_matches_scheduler_adapter_ownership(
+    async_chunk, runner_v2, native_support, expect_rpc
+):
     async def run() -> None:
         call = AsyncMock()
         pool = StagePool(
             0,
             [SimpleNamespace(call_utility_async=call)],  # type: ignore[list-item]
-            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=False)),
+            stage_vllm_config=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    async_chunk=async_chunk,
+                    use_v2_model_runner=runner_v2,
+                    supports_native_mrv2_data_plane=native_support,
+                )
+            ),
         )
 
         pool.schedule_release_request_resources(["req-1"])
-        await asyncio.sleep(0.01)
-        call.assert_not_awaited()
+        await asyncio.gather(*pool._release_flushers.values())
+        if expect_rpc:
+            call.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
+        else:
+            call.assert_not_awaited()
 
     asyncio.run(run())
 

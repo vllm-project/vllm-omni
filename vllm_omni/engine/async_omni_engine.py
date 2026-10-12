@@ -573,7 +573,12 @@ class AsyncOmniEngine(OmniEngineBase):
         # whose companion never arrived.
         companions: list[AddCompanionRequestMessage] = []
         try:
-            if self.prompt_expand_func is not None and final_stage_id > 0:
+            info = msg.original_prompt.get("additional_information") if isinstance(msg.original_prompt, dict) else None
+            # AR guidance groups need their twin even when stage 0 is the
+            # requested final output. Diffusion-only CFG still requires a
+            # downstream stage before expanding its auxiliary prompts.
+            stage0_cfg = isinstance(info, dict) and info.get("cfg_group") is not None
+            if self.prompt_expand_func is not None and (final_stage_id > 0 or stage0_cfg):
                 effective_spl = msg.sampling_params_list
                 stage0_params = effective_spl[0] if effective_spl else None
                 if stage0_params is not None:

@@ -44,6 +44,17 @@ def test_empty_batch():
     assert build_model_sampler_extra_args(SimpleNamespace(req_ids=[]), {}) == []
 
 
+def test_opted_in_sampler_receives_current_batch_identity():
+    batch = SimpleNamespace(req_ids=["b", "a"])
+    model = SimpleNamespace(model_sampler_wants_input_batch=True)
+
+    def sample(logits, metadata, *, input_batch):
+        assert input_batch is batch
+        return input_batch.req_ids
+
+    assert call_model_sampler(model, sample, torch.empty(0), None, input_batch=batch, requests={}) == ["b", "a"]
+
+
 def test_opted_in_sampler_receives_per_request_extra_args(mocker):
     model = SimpleNamespace(model_sampler_wants_extra_args=True)
     model_sample = mocker.Mock(return_value="sampled")

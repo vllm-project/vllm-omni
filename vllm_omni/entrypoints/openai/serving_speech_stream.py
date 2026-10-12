@@ -62,6 +62,7 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 
+import anyio
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from vllm.logger import init_logger
@@ -82,6 +83,8 @@ _PCM_SAMPLE_RATE = 24000
 _BYTES_PER_SAMPLE = 2  # 16-bit PCM, per channel
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
+_MAX_PENDING_MESSAGES = 4096
+_MAX_PENDING_MESSAGE_BYTES = 8 * 1024 * 1024
 
 
 class OmniStreamingSpeechHandler:
@@ -110,14 +113,58 @@ class OmniStreamingSpeechHandler:
         self._config_timeout = config_timeout
 
     async def handle_session(self, websocket: WebSocket) -> None:
-        """Main loop for a single WebSocket connection.
-
-        Serves any number of utterances. input.done always ends a flush;
-        split_granularity controls whether that flush is one TTS request or
-        several sentence/clause requests.
-        """
+        """Drain ASGI input during synthesis so protocol keepalive frames remain readable."""
         await websocket.accept()
+        pending: asyncio.Queue[tuple[int, dict | None]] = asyncio.Queue(maxsize=_MAX_PENDING_MESSAGES)
+        queued_bytes = 0
 
+        async def receive_messages() -> None:
+            nonlocal queued_bytes
+            while True:
+                raw = await websocket.receive_text()
+                # Apply existing per-message limits before retaining queued payloads.
+                message = await self._parse_message(websocket, raw)
+                size = len(raw.encode("utf-8"))
+                if queued_bytes + size > _MAX_PENDING_MESSAGE_BYTES:
+                    raise asyncio.QueueFull
+                pending.put_nowait((size, message))
+                queued_bytes += size
+
+        async def receive_pending() -> dict | None:
+            nonlocal queued_bytes
+            size, message = await pending.get()
+            queued_bytes -= size
+            return message
+
+        reader = asyncio.create_task(receive_messages())
+        processor = asyncio.create_task(self.process_messages(websocket, receive_pending))
+        try:
+            done, _ = await asyncio.wait((reader, processor), return_when=asyncio.FIRST_COMPLETED)
+            if reader in done:
+                with anyio.CancelScope(shield=True):
+                    processor.cancel()
+                    await asyncio.gather(processor, return_exceptions=True)
+                try:
+                    reader.result()
+                except WebSocketDisconnect:
+                    logger.info("Streaming speech: client disconnected")
+                except asyncio.QueueFull:
+                    await self._send_error(websocket, "Too many pending WebSocket messages")
+                    await websocket.close(code=1008, reason="Too many pending WebSocket messages")
+            else:
+                processor.result()
+        finally:
+            reader.cancel()
+            processor.cancel()
+            # ASGI cancellation scopes can cancel every cleanup await again.
+            # Drain both tasks so an in-flight engine abort finishes before exit.
+            with anyio.CancelScope(shield=True):
+                await asyncio.gather(reader, processor, return_exceptions=True)
+
+    async def process_messages(
+        self, websocket: WebSocket, receive_message: Callable[[], Awaitable[dict | None]]
+    ) -> None:
+        """Consume validated messages in order; idle time excludes active synthesis."""
         config: StreamingSpeechSessionConfig | None = None
         splitter = SpeechTextSplitter("none")
         utterance_index = 0
@@ -130,8 +177,8 @@ class OmniStreamingSpeechHandler:
         try:
             while True:
                 try:
-                    raw = await asyncio.wait_for(
-                        websocket.receive_text(),
+                    msg = await asyncio.wait_for(
+                        receive_message(),
                         timeout=self._config_timeout if config is None else self._idle_timeout,
                     )
                 except asyncio.TimeoutError:
@@ -141,7 +188,6 @@ class OmniStreamingSpeechHandler:
                         await self._send_error(websocket, "Idle timeout: no message received")
                     return
 
-                msg = await self._parse_message(websocket, raw)
                 if msg is None:
                     if config is None:
                         return  # Malformed handshake, connection closing
@@ -409,7 +455,7 @@ class OmniStreamingSpeechHandler:
                 )
                 total_bytes = len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
             if request_id is not None:
                 try:
                     await self._speech_service.engine_client.abort(request_id)

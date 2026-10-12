@@ -3,10 +3,15 @@
 
 import asyncio
 import base64
+import json
+import socket
 from types import SimpleNamespace
 
+import aiohttp
+import anyio
 import pytest
 import torch
+import uvicorn
 from fastapi import FastAPI, WebSocket
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
@@ -1095,3 +1100,179 @@ class TestGeneratePcmChunksContract:
         assert asyncio.iscoroutinefunction(OmniOpenAIServingSpeech._generate_pcm_chunks) or callable(
             OmniOpenAIServingSpeech._generate_pcm_chunks
         )
+
+
+@pytest.mark.parametrize("scenario", ["complete", "burst", "disconnect", "overflow"])
+def test_uvicorn_keepalive_during_sentence_generation(mocker: MockerFixture, monkeypatch, scenario):
+    """Real protocol pings survive queued input while synthesis awaits model output."""
+
+    if scenario == "overflow":
+        monkeypatch.setattr(streaming_speech_module, "_MAX_PENDING_MESSAGE_BYTES", 1024)
+
+    async def exercise():
+        started = asyncio.Event()
+        captured_text = []
+        app, service = _build_test_app(mocker=mocker, idle_timeout=0.05)
+
+        async def delayed_chunks(*args, audio_format=None, **kwargs):
+            started.set()
+            await asyncio.sleep(0.3)
+            _fill_audio_format(audio_format)
+            yield b"\x01\x00" * 240
+
+        service._generate_pcm_chunks = delayed_chunks
+
+        async def prepare(request, **kwargs):
+            captured_text.append(request.input)
+            return "req-1", object(), {}
+
+        service._prepare_speech_generation.side_effect = prepare
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=0,
+            ws="auto",
+            ws_ping_interval=0.05,
+            ws_ping_timeout=0.1,
+            lifespan="off",
+            log_level="critical",
+        )
+        server = uvicorn.Server(config)
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            server_task = asyncio.create_task(server.serve(sockets=[listener]))
+            try:
+                while not server.started:
+                    if server_task.done():
+                        server_task.result()
+                    await asyncio.sleep(0.01)
+                async with aiohttp.ClientSession() as client:
+                    async with client.ws_connect(f"http://127.0.0.1:{port}/v1/audio/speech/stream") as ws:
+                        await ws.send_json(
+                            {
+                                "type": "session.config",
+                                "voice": "Vivian",
+                                "response_format": "pcm",
+                                "stream_audio": True,
+                                "split_granularity": "sentence",
+                            }
+                        )
+                        await ws.send_json({"type": "input.text", "text": "First sentence. "})
+                        await ws.send_json({"type": "input.text", "text": "Second sentence. "})
+                        if scenario != "burst":
+                            await ws.send_json({"type": "input.done"})
+                        if scenario != "complete":
+                            await asyncio.wait_for(started.wait(), timeout=2)
+                        if scenario == "disconnect":
+                            await ws.close()
+                        else:
+                            if scenario == "overflow":
+                                for _ in range(3):
+                                    await ws.send_json({"type": "input.text", "text": "x" * 600})
+                            elif scenario == "burst":
+                                for index in range(100):
+                                    await ws.send_json({"type": "input.text", "text": f"token{index} "})
+                                await ws.send_json({"type": "input.text", "text": "finished."})
+                                await ws.send_json({"type": "input.done"})
+                            events = []
+                            while True:
+                                message = await asyncio.wait_for(ws.receive(), timeout=2)
+                                if message.type == aiohttp.WSMsgType.TEXT:
+                                    event = json.loads(message.data)
+                                    events.append(event)
+                                    if event["type"] == "session.done":
+                                        assert scenario in {"complete", "burst"}
+                                        expected = 3 if scenario == "burst" else 2
+                                        assert event["total_sentences"] == expected
+                                        assert sum(e["type"] == "audio.done" for e in events) == expected
+                                        assert not any(e["type"] == "error" for e in events)
+                                        await ws.send_json({"type": "session.close"})
+                                        break
+                                elif message.type == aiohttp.WSMsgType.CLOSE:
+                                    assert scenario == "overflow"
+                                    assert message.data == 1008
+                                    assert any(
+                                        e.get("message") == "Too many pending WebSocket messages" for e in events
+                                    )
+                                    break
+                                else:
+                                    assert message.type == aiohttp.WSMsgType.BINARY
+            finally:
+                server.should_exit = True
+                await asyncio.wait_for(server_task, timeout=5)
+        if scenario in {"complete", "burst"}:
+            service.engine_client.abort.assert_not_awaited()
+            if scenario == "burst":
+                assert captured_text[-1] == "".join(f"token{index} " for index in range(100)) + "finished."
+        else:
+            service.engine_client.abort.assert_awaited_once_with("req-1")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("disconnect_first", [False, True])
+def test_cancelled_asgi_scope_finishes_active_request_abort(mocker: MockerFixture, disconnect_first):
+    """Level cancellation must not interrupt child-task resource finalization."""
+
+    async def exercise():
+        started = asyncio.Event()
+        disconnect = asyncio.Event()
+        abort_started = asyncio.Event()
+        aborted = asyncio.Event()
+        _, service = _build_test_app(mocker=mocker)
+
+        async def chunks(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+            yield b"\x01\x00"
+
+        async def abort(request_id):
+            abort_started.set()
+            await asyncio.sleep(0.02)
+            aborted.set()
+
+        service._generate_pcm_chunks = chunks
+        service.engine_client.abort.side_effect = abort
+        messages = [
+            json.dumps(
+                {
+                    "type": "session.config",
+                    "voice": "Vivian",
+                    "response_format": "pcm",
+                    "stream_audio": True,
+                    "split_granularity": "sentence",
+                }
+            ),
+            json.dumps({"type": "input.text", "text": "First sentence. "}),
+        ]
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await disconnect.wait()
+            raise WebSocketDisconnect()
+
+        websocket = mocker.MagicMock()
+        websocket.accept = mocker.AsyncMock()
+        websocket.receive_text = mocker.AsyncMock(side_effect=receive)
+        websocket.send_json = mocker.AsyncMock()
+        handler = OmniStreamingSpeechHandler(service)
+        with anyio.CancelScope() as scope:
+
+            async def cancel_when_generating():
+                await started.wait()
+                if disconnect_first:
+                    disconnect.set()
+                    await abort_started.wait()
+                scope.cancel()
+
+            canceller = asyncio.create_task(cancel_when_generating())
+            await handler.handle_session(websocket)
+            await anyio.sleep(0)
+        await canceller
+        assert scope.cancelled_caught
+        assert aborted.is_set()
+        service.engine_client.abort.assert_awaited_once_with("req-1")
+
+    anyio.run(exercise)

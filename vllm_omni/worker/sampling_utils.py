@@ -99,9 +99,12 @@ def call_model_sampler(
     """
     wants_extra_args = getattr(model, "model_sampler_wants_extra_args", False)
     wants_sampling_params = getattr(model, "model_sampler_wants_sampling_params", False)
-    if not wants_extra_args and not wants_sampling_params:
+    wants_input_batch = getattr(model, "model_sampler_wants_input_batch", False)
+    if not wants_extra_args and not wants_sampling_params and not wants_input_batch:
         return model_sample(logits, sampling_metadata)
     kwargs: dict[str, Any] = {}
+    if wants_input_batch:
+        kwargs["input_batch"] = input_batch
     if wants_extra_args:
         kwargs["per_req_extra_args"] = build_model_sampler_extra_args(input_batch, requests)
     if wants_sampling_params:

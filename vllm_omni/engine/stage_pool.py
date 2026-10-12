@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -139,8 +140,14 @@ class StagePool:
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self.collect_stage_metrics = True
-        self._has_chunk_transfer_adapter = bool(
-            getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
+        model_config = getattr(stage_vllm_config, "model_config", None)
+        # Match scheduler ownership: native MRv2 has no legacy transfer adapter
+        # to reclaim, so its utility RPC would only queue behind model execution.
+        self._has_chunk_transfer_adapter = bool(getattr(model_config, "async_chunk", False)) and not (
+            uses_native_mrv2_data_plane(
+                model_config,
+                use_v2_model_runner=bool(getattr(model_config, "use_v2_model_runner", False)),
+            )
         )
         # Per-replica release batching: ids waiting for the replica's next RPC
         # and the task sending them (also the strong reference keeping it alive).
