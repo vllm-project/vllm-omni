@@ -337,6 +337,7 @@ class OrchestratorBase:
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     _transfer_release_tasks: set[asyncio.Task] = set()
+    collect_stage_metrics: bool = True
 
     def __init__(
         self,
@@ -353,6 +354,7 @@ class OrchestratorBase:
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
+        collect_stage_metrics: bool = True,
         enable_orch_monitor: bool = False,
         event_driven_orch_default: bool = False,
     ) -> None:
@@ -364,6 +366,11 @@ class OrchestratorBase:
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
         self.log_stats = log_stats
+        if log_stats and not collect_stage_metrics:
+            raise ValueError("log_stats=True requires collect_stage_metrics=True")
+        self.collect_stage_metrics = collect_stage_metrics
+        for pool in self.stage_pools:
+            pool.collect_stage_metrics = collect_stage_metrics
         self._prom_metrics = prom_metrics
         self._stage_replica_waiting: dict[tuple[int, int], int] = {}
         self._orch_monitor = create_orch_monitor(
@@ -1396,7 +1403,8 @@ class OrchestratorBase:
                     replica_id=replica_id,
                     sampling_params=req_state.sampling_params_list[stage_id],
                 )
-                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                if self.collect_stage_metrics:
+                    stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
@@ -1583,7 +1591,10 @@ class OrchestratorBase:
         StageUnavailableError (no live replica / evicted slot) or
         EngineDeadError (replica died mid-submit before the poll loop evicted
         it). Both mean "this request cannot be placed", not "the server is
-        broken": fail the request and keep serving (#4285). An OverflowError
+        broken": fail the request and keep serving (#4285). An OmniClientError
+        raised while building or submitting the request (e.g. by an inter-stage
+        bridge rejecting a user-supplied field) is failed as that client error
+        with its own status code. An OverflowError
         from encoding an out-of-range request value is likewise failed as a
         client error (400) rather than killing the loop. Other unrelated errors
         propagate. Returns False when the request was failed.
@@ -1637,6 +1648,29 @@ class OrchestratorBase:
             await self._fail_request_dead_stage(req_id, stage_id)
             if dead_replica is not None and dead_replica in pool.live_replica_ids():
                 await self._handle_dead_replica(stage_id, dead_replica, e)
+            return False
+        except OmniClientError as e:
+            # A dispatch (including an inter-stage bridge such as a
+            # ``custom_process_input_func``) rejected this request's input: a
+            # documented 4xx client error. Fail just this request, as the LLM
+            # ``process_engine_inputs`` path already does, instead of letting it
+            # escape the orchestration loop and take down every request.
+            logger.warning(
+                "[Orchestrator] %s dispatch for req=%s rejected by stage-%s: %s",
+                operation,
+                req_id,
+                stage_id,
+                e,
+            )
+            req_state = self.request_states.get(req_id)
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                str(e),
+                status_code=e.status_code,
+                error_type=e.error_type,
+                release_owners=bool(getattr(req_state, "session_owned", False)),
+            )
             return False
         except OverflowError as e:
             # Catch overflow errors in the request payload to ensure that msgpack

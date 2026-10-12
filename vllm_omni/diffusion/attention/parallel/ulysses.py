@@ -278,7 +278,18 @@ class UlyssesParallelAttention:
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
+        defer_joint: bool = False,
     ):
+        """Reshard Q/K/V for Ulysses.
+
+        Args:
+            defer_joint: Leave joint q/k/v out of the resharded tensors and
+                only record this rank's head-sliced joint tensors (and any 2D
+                key mask, untouched) in ``attn_metadata``. The composed
+                Ulysses x AllGather-KV strategy re-attaches them after its own
+                K/V gather; attaching them earlier would replicate the joint
+                K/V once per AllGather rank.
+        """
         mode = get_ulysses_mode(default="strict")
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
@@ -406,6 +417,11 @@ class UlyssesParallelAttention:
             if attn_metadata is not None:
                 attn_metadata.joint_key = joint_tensor_key
                 attn_metadata.joint_value = joint_tensor_value
+                # Also expose the head-sliced joint query unconditionally so the
+                # metadata stays q/k/v-consistent; the non-defer paths below
+                # concatenate the joint tensors into Q/K/V and never read this
+                # field back, so writing it is harmless there.
+                attn_metadata.joint_query = joint_tensor_query
 
         ulysses_world_size = self._sp_group.ulysses_world_size
         if mode == "advanced_uaa":
@@ -550,7 +566,7 @@ class UlyssesParallelAttention:
             local_seq_len = 0
             orig_head_cnt = 0
 
-        if is_joint:
+        if is_joint and not defer_joint:
             # Concatenate joint query AFTER AllToAll
             # Image query is now (B, S, H/P, D). Joint query is (B, S_txt, H/P, D).
             # This is dimensionally consistent.
@@ -564,7 +580,7 @@ class UlyssesParallelAttention:
         # Instead, they should remain in attn_metadata and be passed to the Ring kernel.
         use_ring = self._sp_group.ring_world_size > 1
 
-        if is_joint and not use_ring:
+        if is_joint and not use_ring and not defer_joint:
             # Concatenate joint key/value after all-to-all ONLY for pure Ulysses (Local Attention).
             if joint_strategy == "front":
                 key = torch.cat([joint_tensor_key, key], dim=1)
@@ -600,7 +616,7 @@ class UlyssesParallelAttention:
             if attn_metadata.joint_attn_mask is not None and attn_metadata.joint_attn_mask.ndim == 2:
                 use_2d_mask = True
 
-        if attn_metadata is not None and use_2d_mask:
+        if attn_metadata is not None and use_2d_mask and not defer_joint:
             if is_joint:
                 if attn_metadata.joint_attn_mask is None and attn_metadata.attn_mask is None:
                     attn_metadata.attn_mask = None

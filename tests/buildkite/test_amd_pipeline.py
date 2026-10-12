@@ -27,7 +27,6 @@ MODEL_EXECUTOR_CPU_MARKERS = "core_model and cpu and not omni"
 PERSONAPLEX_TEMPORAL_LABEL = "Simple · PersonaPlex Temporal Streaming Test"
 PERSONAPLEX_TEMPORAL_PATH = "tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py"
 PERSONAPLEX_TEMPORAL_STRESS_NODES = [
-    f"{PERSONAPLEX_TEMPORAL_PATH}::test_temporal_streaming_step_matches_legacy_end_to_end",
     f"{PERSONAPLEX_TEMPORAL_PATH}::test_mimi_streaming_step_matches_legacy_end_to_end",
 ]
 PERSONAPLEX_TEMPORAL_ARTIFACTS = "artifacts/personaplex-temporal-streaming/**/*"
@@ -251,7 +250,7 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
         "--collect-only",
         "-q",
     ]
-    assert collect_argv[3:5] == PERSONAPLEX_TEMPORAL_STRESS_NODES
+    assert collect_argv[3:4] == PERSONAPLEX_TEMPORAL_STRESS_NODES
     assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/collection.txt" in collect_commands[0]
 
     run_argv = split(run_commands[0])
@@ -267,7 +266,7 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
         "-v",
         "-ra",
     ]
-    assert run_argv[8:10] == PERSONAPLEX_TEMPORAL_STRESS_NODES
+    assert run_argv[8:9] == PERSONAPLEX_TEMPORAL_STRESS_NODES
     assert "--durations=50" in run_argv
     assert "--junitxml=$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.xml" in run_argv
     assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest.log" in run_commands[0]

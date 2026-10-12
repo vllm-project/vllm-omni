@@ -157,30 +157,22 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - Input field maps to the `ambient_sound` parameter in the upstream processor.
 - Rate: ~12.5 tokens per second; longer descriptions produce longer audio.
 
-## Local 1.5 MRV2 and slot attention
+## Local 1.5 unified deployment and slot attention
 
-`MOSS-TTS-Local-Transformer-v1.5` defaults to the native MRV2 pipeline on
-CUDA, with the original Local projection and sampler. When
-`nvidia-cuda-mps-control` is on `PATH`, it starts private full-quota MPS.
-GPUs with at least 140 GiB total memory use the C128 system profile with
-prefix caching, Triton backbone attention, Stage0 first-frame audio,
-native Torch sampler compilation and dense codec graph buckets through 128. Its Talker KV budget is 32 GiB; smaller GPUs or a failed memory
-query use C64 with utilization-based memory budgets. When the MPS executable
-is unavailable, the automatic default is C64 MRV2 without MPS. NPU, XPU,
-ROCm and MUSA retain V1. Explicit deploy configs override automatic selection.
+`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` uses one single-GPU deploy
+file, `moss_tts_local.yaml`. The CUDA settings use MRV2, 128 stream slots per
+stage, full-quota private MPS, prefix caching and Triton backbone attention.
+These settings replace the former C64, high-concurrency, low-latency and
+optimized presets. Pipeline selection no longer probes GPU memory or MPS.
+Non-CUDA platforms retain V1 through the same file's platform overrides;
+the separate 2/3-NPU files describe different device placements.
 
-```bash
-CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
-vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
-  --stage-init-timeout 1200 --init-timeout 1500
-```
+Both stages share one GPU, with a 32 GiB Talker KV budget. The CUDA settings
+are validated on H200 and require room for codec state and graphs, plus
+`nvidia-cuda-mps-control` on `PATH`. For a smaller GPU or a service without
+MPS, supply a custom deployment override for the stage capacities, graph
+buckets, KV budget and `platforms.cuda.cuda_mps`.
 
-Use `--deploy-config vllm_omni/deploy/moss_tts_local_v1.yaml` to select the
-previous V1 profile explicitly. C128's batch-prefill and direct-token switches
-remain confined to the throughput profile; they are not enabled in C64.
-
-The same `moss_tts_local_mrv2_optimized.yaml` system profile can be selected
-explicitly. It retains the original Local depth projection and sampling algorithm.
 With CUDA MRV2 GPU slot state and asynchronous chunks, Stage0 prepares the first
 MTP frame immediately after prefill, decodes it locally and sends it directly.
 This requires a `UniProcExecutor` (or subclass) with TP=1 and PP=1. Other executors
@@ -191,10 +183,7 @@ with the same codes and sends subsequent audio without duplicating the first
 frame. Its regular dispatch target is 16 with a maximum wait of 6 ms.
 `local_compile_audio_sampler: true` in the Talker HF overrides compiles the native
 Torch sampler; explicit request generators use the original helper. Set the
-override to `false` in a deployment file to disable that compilation. The setting
-is specific to this C128 system profile.
-Both stages share one GPU, with a 32 GiB Talker KV budget; this profile requires H200-class memory and
-`nvidia-cuda-mps-control` on `PATH`.
+override to `false` in a deployment file to disable that compilation. The setting is enabled in the unified CUDA profile.
 The Stage0 decoder adds approximately 2 GiB of parameter weights for this
 checkpoint, plus buffers and CUDA Graph memory, all included in model memory
 profiling. Its T=1 graph buckets follow the Talker's capture sizes up to the
@@ -203,7 +192,7 @@ request capacity.
 ```bash
 CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
-  --deploy-config vllm_omni/deploy/moss_tts_local_mrv2_optimized.yaml \
+  --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
 
@@ -213,95 +202,43 @@ MPS SM quotas: BF16 GEMM outputs were observed incomplete in that configuration
 on the validation environment. MPS uses an owned control socket or an
 explicitly supplied operator socket; only the owned daemon is stopped at shutdown.
 
-The explicit C64 MRV2 and capped-C128 throughput profiles remain available.
-Both profiles below preserve 1-frame initial and 15-frame steady codec chunks
-and the model's sampling defaults.
+The Talker uses mixed FULL CUDA graphs with a 512-token prefill budget and
+capture limit. This keeps new prompt chunks within graph coverage instead
+of letting large prefills monopolize streaming decode. GPU request slots
+retain Local hidden states, audio codes and continuation control. Published
+codes own their storage, so slot reuse cannot overwrite an in-flight output.
+The codec uses `triton_slot` attention, Inductor mode 3 with combo kernels
+disabled, and codec-owned CUDA graphs through batch 128. Cold compilation
+can take several minutes; subsequent starts can reuse the AOT cache.
 
-```bash
-vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
-  --deploy-config vllm_omni/deploy/moss_tts_local_mrv2.yaml
-```
+The codec coalesces ready streams with
+`connectors.shm.extra.generation_min_batch_size: 16` and
+`generation_max_wait_ms: 6`. These are a dispatch target and bounded wait,
+not an execution cap. Pending outputs retire before waiting; cancellation
+and input notifications keep their scheduler bookkeeping. Set the wait to
+`0` in a custom deployment to disable coalescing.
 
-This C64 profile bounds Talker prefill to 512 tokens and retains codec-owned
-CUDA graphs without compiling the codec with Inductor.
-
-For sustained high concurrency on a large-memory CUDA GPU, use:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 \
-vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
-  --deploy-config vllm_omni/deploy/moss_tts_local_mrv2_high_concurrency.yaml \
-  --stage-init-timeout 1200 --init-timeout 1500
-```
-
-The high-concurrency profile places both stages on one GPU, sets each stage's
-capacity to 128 and fixes the Talker KV budget at 32 GiB. The Talker uses
-mixed FULL CUDA graphs with both its token budget and capture limit set to
-512, so new prompt chunks remain within graph coverage. It also enables
-`hf_overrides.mrv2_gpu_slot_state`: Local hidden states, audio codes and
-continuation control stay in GPU request slots, gathered through MRV2's
-batch mapping. Prefill conditioning and explicit per-request sampling seeds
-retain their original behavior. Published audio codes own their storage, so
-slot reuse cannot overwrite an in-flight output. Set the override to `false`
-to compare with the generic Omni model state. The profile selects
-`codec_attention_backend: triton_slot`, Inductor mode 3 with combo kernels
-disabled, and codec CUDA graph buckets through 128. The configuration was
-validated on one H200. The earlier capacity-256 variant used about 110 GiB of
-sampled peak GPU memory, including loading and warmup. Reduce the stage capacities,
-graph buckets and coalescing target together when adapting it to smaller GPUs. Cold codec
-compilation can take several minutes; subsequent starts can reuse the AOT
-cache. Graph capture is still performed at startup.
-
-The high-concurrency profile also coalesces ready codec streams with
-`connectors.shm.extra.generation_min_batch_size: 32` and
-`generation_max_wait_ms: 12`. The target controls when to stop waiting; it
-neither caps execution at 32 nor guarantees every codec group has 32 rows.
-First and final chunks share the bounded window at high concurrency. When
-fewer than 32 requests remain, dispatch is immediate. Pending outputs are
-retired before waiting, with the original deadline preserved, so waiting does
-not prevent the previous batch from releasing its in-flight state. Cancellation
-and input notifications keep their ordinary scheduler bookkeeping. This option
-requires a stateful native MRV2 generation stage with TP1/PP1. Set the wait to
-`0` to disable coalescing; other profiles keep the immediate-dispatch default.
-
-The high-concurrency profile enables two additional Local model-state
-optimizations under the CUDA stage-0 `hf_overrides`, alongside
-`mrv2_gpu_slot_state: true`:
+Two Talker HF overrides reduce CPU and sampler work:
 
 - `mrv2_batch_prefill: true` reuses the batch's text embeddings and combines
-  CPU reference-code slices and their destination positions into one pinned
-  upload. Host staging is reused only after the upload event completes;
-  GPU-resident references keep the original path.
-- `mrv2_direct_tokens: true` returns the already determined text token after
-  the Local audio/stop decision. It avoids constructing and sampling the
-  full text vocabulary. Audio-code and binary-stop sampling are unchanged.
-  Requests requiring distribution metadata or token constraints, and
-  unsupported execution modes, retain the normal sampler.
+  CPU reference-code slices and positions into one pinned upload. Host
+  staging is reused only after the upload event completes.
+- `mrv2_direct_tokens: true` returns the determined text token after the
+  Local audio/stop decision, avoiding a full text-vocabulary sampling pass.
+  Audio-code and binary-stop sampling retain their original algorithm;
+  requests needing distribution metadata or token constraints use the normal
+  sampler.
 
-Other profiles leave both flags disabled. Set both flags explicitly when
-comparing their combined effect. Deployment
-inheritance replaces a stage's `hf_overrides` mapping, so an overlay must also
-retain `mrv2_gpu_slot_state: true`. Measure first-packet latency as well as
-throughput: faster prompt preparation can change competition between the
-Talker and codec sharing the GPU.
-
-For the single-H200 capacity-128 throughput baseline, keep both switches on.
-In complete Seed-TTS EN1088 runs at client concurrency 128, four combined-switch
-rounds pooled 344.11 audio-s/s versus 335.78 for batch prefill alone; direct
-tokens alone had no reliable gain. The combined path had 685 ms mean first
-audio versus 679 ms across six control rounds, with lower mean completion time.
-A fixed-seed 128-row audio sample showed mean Whisper WER of 3.68% versus
-3.78% for the control. This sample does not establish speaker similarity or
-exclude small quality changes. At concurrency 256, the combined path had
-raised mean first-audio latency by about 0.33 s, so other profiles leave the
-switches off until their latency and quality are checked.
+When editing a stage's `hf_overrides`, retain the other required entries:
+deployment inheritance replaces this mapping as a whole. Measure first-packet
+latency and throughput together when changing these settings.
 
 The optional connector setting `generation_coalescing_policy: idle_wait`
 waits for an inbox notification when no stream is runnable, all receivers
 are parked and registered, and no output needs retirement. The first ready
 arrival starts a fresh coalescing window, preserving the batch budget.
 Control messages, including cancellations, can wait up to two windows
-instead of one (24 ms at the 12 ms setting). The default policy remains
+instead of one (12 ms at the 6 ms setting). The default policy remains
 `fixed`; neither policy changes the global orchestration default.
 
 The codec backends differ in state access:
@@ -318,8 +255,8 @@ retaining the final cache-capacity tokens when a chunk exceeds the ring.
 It does not introduce another cache owner or change request-slot lifetime.
 Zero-length padding rows skip the attention computation and emit zeros.
 
-The high-concurrency profile includes intermediate codec batch buckets 6, 12
-and 24. To compare with power-of-two buckets, change the stage-1
+The CUDA profile includes dense codec batch buckets, including 3, 5, 6, 7,
+10, 12, 14 and 24. To compare with power-of-two buckets, change the stage-1
 `cudagraph_capture_sizes` to `[1, 2, 4, 8, 16, 32, 64, 128]`.
 Keep the maximum bucket equal to the state capacity to retain terminal-tail
 coalescing. Smaller buckets reduce padding work but require more graphs;
@@ -383,16 +320,7 @@ CUDA_VISIBLE_DEVICES= PYTHONPATH=. python -m pytest -q \
   -m 'core_model and cpu' --run-level core_model
 ```
 
-### Low-latency and reference-encoding options
-
-`moss_tts_local_mrv2_low_latency.yaml` keeps both stage capacities at 128 and
-uses prefill 2048, GPU slot state, batch prefill and direct tokens. It uses the
-same Stage0 first-frame path and executor requirements described above. Only
-the first MTP frame is prepared immediately after prefill; its codes and audio
-embedding are reused on the next decode step. Eager MTP for subsequent frames
-is not enabled by default. Stage1 uses its regular streaming decoder, with a
-dispatch target of 32 and a maximum wait of 12 ms; these coalescing settings do
-not limit client concurrency or the stage capacities.
+### Reference-encoding options
 
 Reference encoding runs in the API layer, independently of MRV2. Enable
 reference graphs explicitly with `VLLM_OMNI_MOSS_REF_GRAPHS=1`; the default
@@ -423,15 +351,12 @@ VLLM_OMNI_MOSS_REF_HOST_WINDOW_MS=2 \
 VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR=/dev/shm/moss-local-service \
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
   --api-server-count 4 \
-  --deploy-config vllm_omni/deploy/moss_tts_local_mrv2_low_latency.yaml \
+  --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
   --stage-init-timeout 1200 --init-timeout 1500
 ```
 
-This example is a configurable serving profile, not the complete launch
-configuration of a historical benchmark. In particular, the low-latency YAML
-uses synchronous stage-1 scheduling; the retained source46 experiment used
-asynchronous stage-1 scheduling, FP8 backbone, MPS and additional encoder
-environment settings. Do not infer a throughput result from the YAML alone.
+These reference-encoder options are independent of the unified deployment.
+Evaluate cold and hot reference requests separately when enabling them.
 
 ### Cold versus hot reference measurements
 
