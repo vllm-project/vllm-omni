@@ -115,6 +115,32 @@ def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | No
 _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
+# Models with no built-in speakers: an unknown voice name must be uploaded first.
+_NO_BUILTIN_SPEAKER_LABELS = {
+    "cosyvoice3": "CosyVoice3",
+    "fish_tts": "Fish Speech",
+    "audio8_tts": "Audio8 TTS",
+    "omnivoice": "OmniVoice",
+    "moss_tts_nano": "MOSS-TTS-Nano",
+    "higgs_audio_v2": "Higgs-Audio V2",
+    "higgs_audio_v3": "Higgs-Audio V3",
+    "glm_tts": "GLM-TTS",
+}
+
+
+def _check_ref_audio_duration(duration: float) -> None:
+    if duration < _REF_AUDIO_MIN_DURATION:
+        raise ValueError(
+            f"Reference audio too short ({duration:.1f}s). "
+            f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
+        )
+    if duration > _REF_AUDIO_MAX_DURATION:
+        raise ValueError(
+            f"Reference audio too long ({duration:.1f}s). "
+            f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
+        )
+
+
 _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
 _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
@@ -430,8 +456,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance.speech_cache_config = speech_cache_config or SpeechCacheConfig()
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
-        instance._diffusion_model_name = model_name
-        instance._diffusion_stage_configs = stage_configs
         instance._allowed_local_media_path = allowed_local_media_path
         instance._media_connector = MediaConnector(
             allowed_local_media_path=allowed_local_media_path,
@@ -440,7 +464,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._tts_model_type = "omnivoice"
         instance._is_tts = False
         # Diffusion-only instances don't have a TTS stage; set None so any
-        # ``_is_tts_model()`` / ``_tts_stage`` access doesn't raise AttributeError.
+        # ``_tts_stage`` access doesn't raise AttributeError.
         instance._tts_stage = None
         instance._adapter = None
         instance._init_speaker_storage()
@@ -851,26 +875,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         voice_lower = request.voice.lower()
         if voice_lower not in self.uploaded_speakers:
-            if self._tts_model_type in (
-                "cosyvoice3",
-                "fish_tts",
-                "audio8_tts",
-                "omnivoice",
-                "moss_tts_nano",
-                "glm_tts",
-                "higgs_audio_v2",
-                "higgs_audio_v3",
-            ):
-                label = {
-                    "cosyvoice3": "CosyVoice3",
-                    "fish_tts": "Fish Speech",
-                    "audio8_tts": "Audio8 TTS",
-                    "omnivoice": "OmniVoice",
-                    "moss_tts_nano": "MOSS-TTS-Nano",
-                    "higgs_audio_v2": "Higgs-Audio V2",
-                    "higgs_audio_v3": "Higgs-Audio V3",
-                    "glm_tts": "GLM-TTS",
-                }.get(self._tts_model_type, self._tts_model_type)
+            label = _NO_BUILTIN_SPEAKER_LABELS.get(self._tts_model_type or "")
+            if label is not None:
                 return (
                     f"Unknown voice '{request.voice}'. {label} has no "
                     f"built-in speakers. Upload a voice first via "
@@ -1044,16 +1050,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             except Exception as e:
                 raise ValueError(f"Could not decode audio file: {e}")
             duration = len(wav_np) / sr if sr > 0 else 0.0
-            if duration < _REF_AUDIO_MIN_DURATION:
-                raise ValueError(
-                    f"Reference audio too short ({duration:.1f}s). "
-                    f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
-                )
-            if duration > _REF_AUDIO_MAX_DURATION:
-                raise ValueError(
-                    f"Reference audio too long ({duration:.1f}s). "
-                    f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
-                )
+            _check_ref_audio_duration(duration)
 
             speaker_data: dict[str, Any] = {
                 "name": name,
@@ -1223,10 +1220,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         logger.info("Deleted voice '%s'", name)
 
-    def _is_tts_model(self) -> bool:
-        """Check if the current model is a supported TTS model."""
-        return self._find_tts_stage() is not None
-
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
         sample_rate_error = self._validate_speech_sample_rate(request)
@@ -1370,16 +1363,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np = np.mean(wav_np, axis=-1)
         sr = int(sr)
         duration = len(wav_np) / sr if sr > 0 else 0.0
-        if duration < _REF_AUDIO_MIN_DURATION:
-            raise ValueError(
-                f"Reference audio too short ({duration:.1f}s). "
-                f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
-            )
-        if duration > _REF_AUDIO_MAX_DURATION:
-            raise ValueError(
-                f"Reference audio too long ({duration:.1f}s). "
-                f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
-            )
+        _check_ref_audio_duration(duration)
         # Own the buffer: a view could retain a much larger decoded allocation.
         waveform = np.array(wav_np, dtype=np.float32, order="C", copy=True)
         artifact_key = self._make_ref_audio_artifact_cache_key(waveform, sr)
@@ -2022,14 +2006,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         streaming needs per-chunk delta slicing; non-streaming needs full concatenation.
         """
         mm = getattr(res, "multimodal_output", None)
-        ro = None
-        if not mm:
-            ro = res
-            mm = getattr(ro, "multimodal_output", None) if ro else None
         if not mm:
             # MultimodalOutputProcessor attaches mm_accumulated on per-completion outputs.
-            container = res if hasattr(res, "outputs") else ro
-            outputs = getattr(container, "outputs", None) if container is not None else None
+            outputs = getattr(res, "outputs", None)
             if outputs:
                 for completion_output in outputs:
                     completion_mm = getattr(completion_output, "multimodal_output", None)
@@ -2218,7 +2197,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Yield raw PCM byte chunks from the engine generator.
 
         Delegates to ``_generate_audio_chunks`` with ``response_format="pcm"``.
-        Used by the WebSocket streaming handler and ``_iter_pcm_audio_bytes``.
+        Used by the WebSocket streaming handler.
         ``collect`` (when given) receives the forced-aligner stage's pooling
         output under ``"aligner_res"`` for downstream word-timestamp extraction.
         """
@@ -2239,24 +2218,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ) as chunks:
             async for chunk in chunks:
                 yield chunk
-
-    async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
-        """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
-        request_id, generator, tts_params = await self._prepare_speech_generation(request)
-        try:
-            async with aclosing(
-                self._generate_pcm_chunks(
-                    generator,
-                    request_id,
-                    tts_params=tts_params,
-                    target_sample_rate=request.sample_rate,
-                    cumulative_audio=request.word_timestamps,
-                )
-            ) as chunks:
-                async for chunk in chunks:
-                    yield chunk
-        finally:
-            self._discard_ref_audio_artifact_warmup(request_id)
 
     async def _generate_audio_bytes(
         self,
@@ -2982,6 +2943,3 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             succeeded=succeeded,
             failed=len(final_results) - succeeded,
         )
-
-
-ServingSpeech = OmniOpenAIServingSpeech

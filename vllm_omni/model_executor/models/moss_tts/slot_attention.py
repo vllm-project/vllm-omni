@@ -305,11 +305,13 @@ def slot_ring_attention(
     valid_lengths: torch.Tensor,
     context: int = -1,
     skip_empty_tiles: bool = False,
+    advance_offsets: bool = True,
 ) -> torch.Tensor:
     """Fused address/mask path, with three ordered launches and no KV gather.
 
     q/k are already rotary-position encoded. The caller still advances its
-    separate MHA/RoPE offset state; this op advances only end_offset in place.
+    separate MHA/RoPE offset state. ``advance_offsets=False`` leaves the shared
+    resolution group's offsets to its owner; the default advances end_offset.
     context=-1 means unbounded causal attention over available ring entries.
     Outputs beyond each row's valid_lengths are exactly zero.
     skip_empty_tiles skips wholly masked tiles for small (T <= 32) chunks.
@@ -364,7 +366,8 @@ def slot_ring_attention(
         num_warps=8 if c <= 256 else 4,
         num_stages=2,
     )
-    _advance[(1,)](end_offset, slot_ids, valid_lengths, *strides, b, triton.next_power_of_2(b))
+    if advance_offsets:
+        _advance[(1,)](end_offset, slot_ids, valid_lengths, *strides, b, triton.next_power_of_2(b))
     return out
 
 
@@ -379,6 +382,7 @@ def _(
     valid_lengths: torch.Tensor,
     context: int = -1,
     skip_empty_tiles: bool = False,
+    advance_offsets: bool = True,
 ) -> torch.Tensor:
     return torch.empty(q.shape, device=q.device, dtype=q.dtype)
 

@@ -385,11 +385,11 @@ steps:
           - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py -m "full_model and H100 and B200 and (cards_1 or cards_2)" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2v_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
 
-      - label: ":full_moon: Diffusion X2V · MiniMax H3 I2VA/Ref2VA Accuracy Test"
+      - label: ":full_moon: Diffusion X2V · MiniMax H3 I2VA/Ref2VA/Timeline Guide Accuracy Test"
         source_file_dependencies: diffusion_minimax_h3_accuracy
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py -m "full_model and H100 and B200 and cards_4" --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/minimax_h3/ -m "full_model and H100 and B200 and (cards_2 or cards_4)" --run-level full_model
 
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_video_accuracy

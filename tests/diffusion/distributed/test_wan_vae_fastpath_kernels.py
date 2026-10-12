@@ -17,6 +17,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanUpsample,
 )
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
     original_wan_rms_norm,
@@ -434,6 +435,31 @@ def test_cat_time_5d_is_bitwise_and_layout_exact(
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("cache_frames", [0, 1, 2])
+def test_input_assembly_keeps_aten_layout_for_1x1_activations(dtype: torch.dtype, cache_frames: int) -> None:
+    """A contiguous ``(b, c, 1, 1, 1)`` tensor has ``stride(1) == 1`` but ATen lays it out channels-first."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 16, 1, 1, 1, device="cuda", dtype=dtype)
+    cache = torch.randn(1, 16, cache_frames, 1, 1, device="cuda", dtype=dtype) if cache_frames else None
+    padding = (1, 1, 1, 1, 2, 0)
+    reference = _reference_cat_pad(x, cache, padding)
+    pair = dm.cat_pad_5d(x, cache, padding, keep_cache_frames=CACHE_T)
+    assert pair is not None
+    output, next_cache = pair
+    assert output.stride() == reference.stride()
+    assert torch.equal(output, reference)
+    assert next_cache.is_contiguous()
+    assert torch.equal(next_cache, reference[:, :, -CACHE_T:, 1:2, 1:2])
+
+    temporal = _reference_cat_pad(x, cache, (0, 0, 0, 0, 2, 0))
+    assembled = dm.cat_time_5d(x, cache, pad_front=2)
+    assert assembled is not None
+    assert assembled.stride() == temporal.stride()
+    assert torch.equal(assembled, temporal)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("cache_frames", [0, 1, 2])
 def test_cat_time_5d_exceeds_grid_y_limit(monkeypatch: pytest.MonkeyPatch, cache_frames: int) -> None:
     # Smaller blocks reproduce the large-plane launch failure without allocating
@@ -482,6 +508,60 @@ def test_cached_conv_spatial_padding_verdict_is_recorded_and_exact() -> None:
         assert _bits_equal(again, reference)
         assert torch.equal(fast_cache[0], torch.cat([cache, chunk], dim=2)[:, :, -CACHE_T:])
         del reference_cache
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("layout", [torch.contiguous_format, torch.channels_last_3d])
+@pytest.mark.parametrize("history", [0, 1, 2])
+def test_causal_conv_forward_spatial_padding_is_exact(dtype: torch.dtype, layout, history: int) -> None:
+    """Normally called (e.g. hooked) convolutions use the verified cuDNN padding path too."""
+    torch.manual_seed(0)
+    conv = WanCausalConv3d(64, 64, 3, padding=1).to(device="cuda", dtype=dtype)
+    conv.to(memory_format=layout)
+    x = torch.randn(1, 64, 4, 24, 40, device="cuda", dtype=dtype).contiguous(memory_format=layout)
+    cache = (
+        torch.randn(1, 64, history, 24, 40, device="cuda", dtype=dtype).contiguous(memory_format=layout)
+        if history
+        else None
+    )
+    expected = WanCausalConv3d.forward(conv, x, cache)
+    for _ in range(2):  # The verifying call, then the cached verdict.
+        actual = fp.causal_conv_forward(conv, x, cache)
+        assert _same_dense_strides(actual, expected)
+        assert _bits_equal(actual, expected)
+    assert len(fp._SPATIAL_PAD_VERDICTS[conv]) == 1
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", LOW_PRECISION)
+@pytest.mark.parametrize("path", ["spatial_padding", "conv_out_layout"])
+@pytest.mark.parametrize("degenerate", ["input", "weight"])
+def test_conv_verdicts_hold_after_degenerate_first_call(dtype: torch.dtype, path: str, degenerate: str) -> None:
+    """Zero activations or weights on the first call must not validate a kernel for later data.
+
+    Any two kernels agree on them; on GPUs where cuDNN picks a different
+    kernel for the fast formulation (e.g. the RTX 5090), a verdict taken from
+    the first call alone returned different bytes for the second one.
+    """
+    torch.manual_seed(0)
+    conv = WanCausalConv3d(160, 160, 3, padding=1).to(device="cuda", dtype=dtype)
+    x = torch.randn(1, 160, 4, 8, 8, device="cuda", dtype=dtype)
+    trained = conv.weight.clone()
+    if degenerate == "weight":
+        conv.weight.zero_()
+    first = torch.zeros_like(x) if degenerate == "input" else x
+
+    def run(chunk: torch.Tensor) -> torch.Tensor:
+        if path == "conv_out_layout":
+            out = fp._run_conv_out_channels_last(conv, chunk, [None], 0)
+            if out is not None:
+                return out
+        return fp._run_cached_causal_conv(conv, chunk, [None], 0)
+
+    run(first)
+    conv.weight.copy_(trained)  # An in-place update keeps the verdict key.
+    assert _bits_equal(run(x), WanCausalConv3d.forward(conv, x))
 
 
 @torch.no_grad()
@@ -613,6 +693,28 @@ def test_upsample_nearest_2x_declines_unsupported_inputs() -> None:
     assert up.upsample_nearest_2x(x.transpose(2, 3)) is None
     assert up.upsample_nearest_2x(x[..., ::2]) is None
     assert up.upsample_nearest_2x(x.double()) is None
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_upsample_nearest_2x_follows_aten_layout_for_ambiguous_strides(dtype: torch.dtype) -> None:
+    """Channels-last contiguous strides that ATen treats as channels-first must not produce NHWC output."""
+    torch.manual_seed(0)
+    frame = torch.randn(1, 16, 1, 6, 10, device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
+    # Upstream's merge of one channels-last frame: the size-1 batch keeps a
+    # non-canonical stride, and ``F.interpolate`` writes NCHW for it.
+    merged = frame.permute(0, 2, 1, 3, 4).reshape(1, 16, 6, 10)
+    assert merged.is_contiguous(memory_format=torch.channels_last)
+    assert F.interpolate(merged, scale_factor=(2.0, 2.0), mode="nearest-exact").is_contiguous()
+    assert up.upsample_nearest_2x(merged) is None
+
+    single_pixels = torch.randn(3, 16, 1, 1, device="cuda", dtype=dtype)
+    for x in (single_pixels, single_pixels.contiguous(memory_format=torch.channels_last)):
+        reference = F.interpolate(x, scale_factor=(2.0, 2.0), mode="nearest-exact")
+        output = up.upsample_nearest_2x(x)
+        assert output is not None
+        assert output.stride() == reference.stride()
+        assert torch.equal(output, reference)
 
 
 @torch.no_grad()
@@ -961,6 +1063,94 @@ def test_lossless_decoder_is_bitwise_exact_on_cuda(config: dict, dtype: torch.dt
         actual = candidate.decode(latents, return_dict=False)[0]
     assert actual.stride() == expected.stride()
     assert _bits_equal(actual, expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("config", [TINY_RESIDUAL, TINY_WAN21], ids=["residual_patch2", "wan21"])
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("frames", [1, 3])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("latents_kind", ["channels_last_3d", "1x1"])
+def test_lossless_decoder_is_bitwise_exact_for_channels_last_and_1x1_latents(
+    config: dict, dtype: torch.dtype, frames: int, batch: int, latents_kind: str
+) -> None:
+    """Both make activations pass channels-last stride checks where upstream may be channels-first.
+
+    Channels-last latents come e.g. from a channels_last encoder; for a single
+    batch element upstream's upsampler reshapes return to channels-first, for
+    larger batches they stay channels-last. With 1x1 latents every contiguous
+    activation also passes ``is_contiguous(channels_last_3d)``.
+    """
+    reference, candidate = _build_pair(config, dtype)
+    report = install_wan_vae_fastpath(candidate, level="lossless")
+    assert report.installed, report
+    torch.manual_seed(1)
+    height, width = (1, 1) if latents_kind == "1x1" else (6, 10)
+    latents = torch.randn(batch, config["z_dim"], frames, height, width, device="cuda").to(dtype)
+    if latents_kind == "channels_last_3d":
+        latents = latents.contiguous(memory_format=torch.channels_last_3d)
+    autocast = dtype is not torch.float32
+    # For a single spatial position the (unpatched) attention block hands SDPA a
+    # query with sequence stride 1, which the fp32 memory-efficient kernel rejects
+    # for the reference too ("query is not correctly aligned (strideM)").
+    with torch.autocast("cuda", dtype=dtype, enabled=autocast), sdpa_kernel(SDPBackend.MATH):
+        expected = reference.decode(latents, return_dict=False)[0]
+        actual = candidate.decode(latents, return_dict=False)[0]
+    assert actual.stride() == expected.stride()
+    assert _bits_equal(actual, expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("scope", ["global", "module"])
+def test_forward_hooks_registered_after_install_see_every_decoder_module_call(
+    monkeypatch: pytest.MonkeyPatch, scope: str
+) -> None:
+    assembled: list[bool] = []
+    for name in ("cat_time_5d", "cat_pad_5d"):
+
+        def counted(*args, _original=getattr(dm, name), **kwargs):
+            result = _original(*args, **kwargs)
+            assembled.append(result is not None)
+            return result
+
+        monkeypatch.setattr(dm, name, counted)
+    reference, candidate = _build_pair(TINY_RESIDUAL, torch.bfloat16)
+    assert install_wan_vae_fastpath(candidate, level="lossless").installed
+    torch.manual_seed(1)
+    latents = torch.randn(1, TINY_RESIDUAL["z_dim"], 3, 6, 10, device="cuda", dtype=torch.bfloat16)
+    calls: list[str] = []
+
+    def run(vae: AutoencoderKLWan) -> tuple[torch.Tensor, list[str]]:
+        names = {module: name for name, module in vae.named_modules()}
+
+        def record(module: nn.Module, _args, output):
+            calls.append(names[module])
+            # Changing outputs also makes a skipped dispatch visible in the result.
+            return output + 1 if type(module) is WanCausalConv3d else output
+
+        def mutate(_module: nn.Module, args) -> None:
+            args[0].add_(0.125)
+
+        calls.clear()
+        if scope == "global":
+            handles = [nn.modules.module.register_module_forward_hook(record)]
+        else:
+            handles = [module.register_forward_hook(record) for module in vae.modules()]
+            # Upstream's shortcut clone must survive an in-place input mutation.
+            handles.append(vae.decoder.up_blocks[0].resnets[0].register_forward_pre_hook(mutate))
+        try:
+            output = vae.decode(latents, return_dict=False)[0]
+        finally:
+            for handle in handles:
+                handle.remove()
+        return output, list(calls)
+
+    expected, expected_calls = run(reference)
+    actual, actual_calls = run(candidate)
+    assert actual_calls == expected_calls
+    assert _bits_equal(actual, expected)
+    # Hooked convolutions still assemble their inputs in their own optimized forward.
+    assert any(assembled)
 
 
 @torch.no_grad()
