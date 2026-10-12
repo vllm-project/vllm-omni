@@ -13,7 +13,7 @@ from typing import cast
 
 import numpy as np
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
@@ -300,15 +300,22 @@ def test_data_plane_context_is_the_framework_default() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_sampling_params_are_greedy_one_token_on_stage0_only() -> None:
-    defaults = (SamplingParams(temperature=0.8, top_k=10, max_tokens=10), SamplingParams(max_tokens=1024))
+@pytest.mark.parametrize("skip_clone", [False, True])
+def test_sampling_is_greedy_stage0_and_delta_stage1_without_mutating_defaults(skip_clone) -> None:
+    defaults = (
+        SamplingParams(temperature=0.8, top_k=10, max_tokens=10, skip_clone=skip_clone),
+        SamplingParams(max_tokens=1024, skip_clone=skip_clone),
+    )
 
     configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
 
     assert configured[0].temperature == 0.0
     assert configured[0].top_k == 1
     assert configured[0].max_tokens == 1
-    assert configured[1] is defaults[1]
+    assert configured[1] is not defaults[1]
+    assert configured[1].output_kind == RequestOutputKind.DELTA
+    assert defaults[1].output_kind == RequestOutputKind.CUMULATIVE
+    assert defaults[0].temperature == 0.8 and defaults[0].top_k == 10
     assert defaults[0].max_tokens == 10
     assert _plugin().configure_sampling_params(runtime_config={}, defaults=()) == ()
 

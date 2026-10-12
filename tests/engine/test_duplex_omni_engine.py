@@ -7,10 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import threading
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pytest_mock import MockerFixture
 
 from vllm_omni.engine.duplex.commands import Heartbeat
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -42,6 +47,9 @@ class _FakeRpcClient:
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
+
+    async def execute_async(self, key, message, *, timeout=None, timeout_message=None):
+        return self.execute(key, message, timeout=timeout, timeout_message=timeout_message)
 
 
 class _FakeSyncQueue:
@@ -215,3 +223,141 @@ async def test_async_wrappers_run_the_blocking_calls_off_the_event_loop() -> Non
     engine.rpc_client.execute = execute
     await engine.touch_session_async("sid", activity="heartbeat")
     assert seen == [False]
+
+
+@asynccontextmanager
+async def _occupied_default_executor() -> AsyncIterator[None]:
+    """Occupy this isolated loop's worker and always release/join our work."""
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    occupied = asyncio.Event()
+    release = threading.Event()
+
+    def hold_worker() -> None:
+        loop.call_soon_threadsafe(occupied.set)
+        if not release.wait(5):
+            raise AssertionError("test did not release its own executor worker")
+
+    blocker = loop.run_in_executor(None, hold_worker)
+    try:
+        await asyncio.wait_for(occupied.wait(), 2)
+        yield
+    finally:
+        release.set()
+        await asyncio.wait_for(blocker, 2)
+        # A sentinel verifies that any cancelled queued drain was skipped.
+        await loop.run_in_executor(None, lambda: None)
+
+
+def test_drain_does_not_need_a_free_default_executor_worker() -> None:
+    async def exercise() -> None:
+        engine = _engine(_ok("drain_audio"))
+        async with _occupied_default_executor():
+            drain = asyncio.create_task(engine.drain_audio_async("sid", timeout=0.05))
+            try:
+                done, _ = await asyncio.wait({drain}, timeout=0.5)
+                assert drain in done, "drain depended on the occupied executor"
+                assert await drain is engine.rpc_client.result
+            finally:
+                drain.cancel()
+                await asyncio.gather(drain, return_exceptions=True)
+        assert len(engine.rpc_client.calls) == 1
+        assert engine.rpc_client.block_on_submit_flags == [False]
+
+    asyncio.run(exercise())
+
+
+def test_drain_cancelled_before_start_is_never_submitted() -> None:
+    async def exercise() -> None:
+        engine = _engine(_ok("drain_audio"))
+        async with _occupied_default_executor():
+            drain = asyncio.create_task(engine.drain_audio_async("sid", timeout=2))
+            try:
+                drain.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await drain
+            finally:
+                drain.cancel()
+                await asyncio.gather(drain, return_exceptions=True)
+        assert engine.rpc_client.calls == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.asyncio
+async def test_drain_forwards_only_the_remaining_budget_to_rpc_and_backend(mocker: MockerFixture) -> None:
+    # Replace this module's clock reference, not the asyncio loop's real clock.
+    clock = mocker.patch("vllm_omni.engine.duplex_omni_engine.time", autospec=True)
+    clock.monotonic.side_effect = [100.0, 100.75]
+    result = _ok("drain_audio")
+    engine = _engine(result)
+
+    assert await engine.drain_audio_async("sid", timeout=2) is result
+
+    ((_, message, timeout),) = engine.rpc_client.calls
+    assert message.timeout_s == timeout == 1.25
+    assert engine.rpc_client.block_on_submit_flags == [False]
+
+
+@pytest.mark.asyncio
+async def test_expired_drain_budget_cannot_admit_a_control(mocker: MockerFixture) -> None:
+    clock = mocker.patch("vllm_omni.engine.duplex_omni_engine.time", autospec=True)
+    clock.monotonic.side_effect = [100.0, 103.0]
+    engine = _engine(_ok("drain_audio"))
+
+    with pytest.raises(DuplexSessionError) as error:
+        await engine.drain_audio_async("sid", timeout=2)
+
+    assert error.value.code == "timeout" and error.value.retryable
+    assert error.value.session_id == "sid"
+    assert not engine.rpc_client.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [True, False, 0, -1, float("inf"), float("-inf"), float("nan")])
+async def test_drain_rejects_invalid_timeout_before_submission(timeout) -> None:
+    engine = _engine(_ok("drain_audio"))
+    with pytest.raises(ValueError, match="finite positive timeout"):
+        await engine.drain_audio_async("sid", timeout=timeout)
+    assert not engine.rpc_client.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "code", "retryable"),
+    [
+        (queue.Full(), "engine_backpressure", True),
+        (TimeoutError("expired"), "timeout", True),
+        (RuntimeError("router closed"), "engine_error", False),
+        (
+            OpenDuplexSessionMessage(
+                control_id="c",
+                session_id="sid",
+                session_config=DuplexSessionConfig(),
+                output_buffer=DuplexOutputBuffer(max_bytes=1024, max_events=8),
+            ),
+            "internal_error",
+            False,
+        ),
+        (
+            DuplexControlResultMessage(
+                control_id="c",
+                operation="drain_audio",
+                session_id="sid",
+                ok=False,
+                error_code="failed_precondition",
+                error_message="closed",
+                error_retryable=False,
+            ),
+            "failed_precondition",
+            False,
+        ),
+    ],
+)
+async def test_async_drain_retains_typed_control_errors(result, code, retryable) -> None:
+    engine = _engine(result)
+    with pytest.raises(DuplexSessionError) as error:
+        await engine.drain_audio_async("sid", timeout=1)
+    assert error.value.code == code
+    assert error.value.retryable is retryable
+    assert error.value.session_id == "sid"

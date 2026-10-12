@@ -27,15 +27,16 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
+from vllm_omni.engine.duplex.commands import AppendAudio, AudioSendCompleted, Commit, DuplexCommand
 from vllm_omni.engine.duplex.contracts import (
+    AudioDrainTarget,
     DuplexFence,
     DuplexStagePort,
     DuplexStageRequestContext,
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
+from vllm_omni.engine.duplex.delivery import AudioSampleWatermark, DuplexOutputBuffer, DuplexOutputOverflowError
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     ErrorEvent,
@@ -47,6 +48,7 @@ from vllm_omni.engine.duplex.events import (
 )
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
+    DrainDuplexAudioMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionError,
@@ -98,7 +100,7 @@ class DuplexSessionManager:
         ResumeDuplexSessionMessage,
         TouchDuplexSessionMessage,
     )
-    _MESSAGE_TYPES = (*_CONTROL_TYPES, DuplexSessionCommandMessage)
+    _MESSAGE_TYPES = (*_CONTROL_TYPES, DuplexSessionCommandMessage, DrainDuplexAudioMessage)
 
     def __init__(
         self,
@@ -203,6 +205,9 @@ class DuplexSessionManager:
 
     def dispatch(self, message: object) -> None:
         """Route one engine request-queue message without blocking the request handler."""
+        if isinstance(message, DrainDuplexAudioMessage):
+            self._dispatch_audio_drain(message)
+            return
         if isinstance(message, DuplexSessionCommandMessage):
             self._dispatch_command(message)
             return
@@ -214,6 +219,38 @@ class DuplexSessionManager:
             await self.handle(message)
 
         self._run_control(session_id, f"duplex-control-{session_id}-{message.control_id}", handle_message)
+
+    def _dispatch_audio_drain(self, message: DrainDuplexAudioMessage) -> None:
+        # Queue the barrier synchronously at dispatch, in order with input
+        # commands. Waiting on the per-session control tail would block close
+        # and allow commands dispatched later to enter the frozen prefix.
+        runner = self.runners.get(message.session_id)
+        future: asyncio.Future[AudioDrainTarget] | None = None
+        error: BaseException | None = None
+        try:
+            if runner is None:
+                raise KeyError(f"unknown duplex session: {message.session_id}")
+            future = runner.begin_audio_drain(timeout=message.timeout_s)
+        except Exception as exc:
+            error = exc
+
+        async def finish() -> None:
+            failure = error
+            target = None
+            try:
+                if future is not None:
+                    target = await future
+            except Exception as exc:
+                failure = exc
+            await self._put_result(
+                message,
+                operation="drain_audio",
+                ok=failure is None,
+                error=failure,
+                audio_drain_target=target,
+            )
+
+        self._track_task(asyncio.create_task(finish(), name=f"duplex-drain-{message.control_id}"))
 
     def _run_control(
         self,
@@ -254,7 +291,9 @@ class DuplexSessionManager:
         task.add_done_callback(done)
 
     async def handle(self, message: object) -> None:
-        if isinstance(message, OpenDuplexSessionMessage):
+        if isinstance(message, DrainDuplexAudioMessage):
+            self._dispatch_audio_drain(message)
+        elif isinstance(message, OpenDuplexSessionMessage):
             await self.open(message)
         elif isinstance(message, CloseDuplexSessionMessage):
             await self.close(message)
@@ -279,6 +318,10 @@ class DuplexSessionManager:
         """
         runner = self.runners.get(message.session_id)
         command = message.command
+        # A late internal receipt is not a client error and must not resurrect
+        # output or make teardown emit an unrelated public rejection.
+        if isinstance(command, AudioSendCompleted) and (runner is None or runner.closing):
+            return
         if runner is None:
             self._emit_raw(
                 message.session_id,
@@ -349,9 +392,15 @@ class DuplexSessionManager:
     # Emission                                                           #
     # ------------------------------------------------------------------ #
 
-    def emit(self, session: DuplexEngineSession, events: list[DuplexEvent]) -> None:
+    def emit(
+        self,
+        session: DuplexEngineSession,
+        events: list[DuplexEvent],
+        *,
+        audio_watermark: AudioSampleWatermark | None = None,
+    ) -> None:
         """Bind identity and deliver through the session's bounded output."""
-        self._emit_raw(session.session_id, events, epoch=session.epoch)
+        self._emit_raw(session.session_id, events, epoch=session.epoch, audio_watermark=audio_watermark)
 
     def invalidate_output(self, session_id: str, response_id: str | None, *, through_epoch: int) -> None:
         output = self._outputs.get(session_id)
@@ -364,11 +413,12 @@ class DuplexSessionManager:
         events: list[DuplexEvent],
         *,
         epoch: int | None = None,
+        audio_watermark: AudioSampleWatermark | None = None,
     ) -> None:
         ending_delivered = False
         for index, event in enumerate(events):
             try:
-                self._deliver(session_id, event, epoch=epoch)
+                self._deliver(session_id, event, epoch=epoch, audio_watermark=audio_watermark)
             except DuplexOutputOverflowError as exc:
                 if session_id in self._output_failed:
                     return
@@ -392,7 +442,14 @@ class DuplexSessionManager:
                 return
             ending_delivered |= isinstance(event, ResponseDone)
 
-    def _deliver(self, session_id: str, event: DuplexEvent, *, epoch: int | None) -> None:
+    def _deliver(
+        self,
+        session_id: str,
+        event: DuplexEvent,
+        *,
+        epoch: int | None,
+        audio_watermark: AudioSampleWatermark | None = None,
+    ) -> None:
         event = replace(event, session_id=session_id, epoch=epoch)
         output = self._outputs.get(session_id)
         if output is not None and not isinstance(event, SessionClosed):
@@ -404,7 +461,7 @@ class DuplexSessionManager:
                     isinstance(event, ResponseDone) and event.status in {"failed", "cancelled"}
                 ):
                     return
-            output.put(event)
+            output.put(event, audio_watermark=audio_watermark)
             return
         if isinstance(event, SessionClosed):
             self._outputs.pop(session_id, None)
@@ -429,12 +486,14 @@ class DuplexSessionManager:
             | CloseDuplexSessionMessage
             | ResumeDuplexSessionMessage
             | TouchDuplexSessionMessage
+            | DrainDuplexAudioMessage
         ),
         *,
         operation: str,
         ok: bool,
         session: DuplexEngineSession | None = None,
         error: BaseException | None = None,
+        audio_drain_target: AudioDrainTarget | None = None,
     ) -> None:
         error_code, error_message, error_retryable = (
             self._control_error(error) if error is not None else (None, None, False)
@@ -450,6 +509,7 @@ class DuplexSessionManager:
             error_code=error_code,
             error_message=error_message,
             error_retryable=error_retryable,
+            audio_drain_target=audio_drain_target,
         )
         await self._result_sink.put(result)
 

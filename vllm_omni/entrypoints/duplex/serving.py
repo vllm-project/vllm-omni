@@ -538,6 +538,7 @@ class OmniDuplexSessionHandler:
             transport_delivered = True
 
         event_guard = partial(handle.output_guard, event)
+        on_sent = partial(handle.confirm_output_sent, event)
         try:
             try:
                 await self._attachment_registry.send_event(
@@ -546,6 +547,7 @@ class OmniDuplexSessionHandler:
                     journal=journal,
                     on_accepted=mark_transport_delivered if is_handshake else None,
                     event_guard=event_guard,
+                    on_sent=on_sent,
                 )
             except DuplexJournalOverflowError:
                 first_overflow = session_id not in self._resync_required_sessions
@@ -553,7 +555,9 @@ class OmniDuplexSessionHandler:
                 if first_overflow:
                     resync = SessionResyncRequired(session_id=session_id, reason="journal_overflow")
                     await self._attachment_registry.send_event(session_id, resync.to_realtime(), journal=False)
-                await self._attachment_registry.send_event(session_id, payload, journal=False, event_guard=event_guard)
+                await self._attachment_registry.send_event(
+                    session_id, payload, journal=False, event_guard=event_guard, on_sent=on_sent
+                )
         except KeyError:
             # Attachment registry already torn down. A handshake that never left
             # the process still has to release the engine session.

@@ -14,15 +14,17 @@ import asyncio
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from numbers import Integral
 from pathlib import PurePath
 from typing import TYPE_CHECKING
 
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
+    DuplexOutputContext,
     DuplexOutputDecision,
 )
 from vllm_omni.engine.duplex.plugin import (
@@ -119,11 +121,16 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         if isinstance(stage0, SamplingParams):
             # Greedy, one temporal token per frame: the native stepper takes
             # argmax for the text head and the depformer.
-            stage0 = stage0.clone()
+            stage0 = deepcopy(stage0) if stage0.skip_clone else stage0.clone()
             stage0.temperature = 0.0
             stage0.top_k = 1
             stage0.max_tokens = 1
             configured[0] = stage0
+        if len(defaults) > 1 and isinstance(defaults[1], SamplingParams):
+            stage1 = defaults[1]
+            stage1 = deepcopy(stage1) if stage1.skip_clone else stage1.clone()
+            stage1.output_kind = RequestOutputKind.DELTA
+            configured[1] = stage1
         return tuple(configured)
 
     def plan_append(
@@ -186,7 +193,37 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         del stage_id, final_stage_id, segment_finished, segment_token_ids, segment_output_metadata, output
         return None
 
+    def completed_audio_append(self, *, stage_id: int, context: DuplexOutputContext) -> int | None:
+        # One completed Stage 0 sample is one temporal frame. Never infer the
+        # completed sequence from the session's latest accepted input.
+        if stage_id != 0 or not context.segment_finished or len(context.segment_token_ids) != 1:
+            return None
+
+        def scalar(name: str) -> int | None:
+            value = context.segment_output_metadata.get("meta." + name)
+            if value is None:
+                meta = context.segment_output_metadata.get("meta")
+                value = meta.get(name) if isinstance(meta, Mapping) else None
+            item = getattr(value, "item", None)
+            if callable(item):
+                try:
+                    value = item()
+                except (ValueError, RuntimeError):
+                    return None
+            return int(value) if isinstance(value, Integral) and not isinstance(value, bool) else None
+
+        epoch = scalar("duplex_epoch")
+        sequence = scalar("duplex_generated_seq")
+        if epoch != context.identity.fence.epoch or sequence is None or sequence <= 0:
+            return None
+        return sequence
+
     # ---- session policy ----
+
+    def audio_drain_samples(self, accepted_seq: int) -> int:
+        # The last row has no successor for delayed codebooks 1..7. A codec
+        # chunk flush must preserve that row rather than synthesizing EOF.
+        return max(accepted_seq - 1, 0) * FRAME_SIZE
 
     def create_session_state(self) -> PersonaPlexSessionState:
         return PersonaPlexSessionState()

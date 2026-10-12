@@ -95,6 +95,16 @@ class DuplexStageSubmissionResult:
     replica_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class AudioDrainTarget:
+    """Fixed accepted-input prefix; later input cannot increase this drain."""
+
+    request_id: str | None
+    epoch: int
+    accepted_seq: int
+    expected_samples: int
+
+
 @dataclass(frozen=True)
 class DuplexOutputContext:
     identity: DuplexRequestIdentity
@@ -127,6 +137,14 @@ class DuplexStagePort(ABC):
 
     @abstractmethod
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult: ...
+
+    async def flush_audio_prefix(self, request_id: str, *, epoch: int, sequence: int) -> int:
+        """Flush a generated prefix on its existing Stage 0 route, without EOF.
+
+        Completion proves codec submission, not decoded PCM or transport send.
+        Only plugins with a frame-locked acoustic target use this opt-in.
+        """
+        raise NotImplementedError("codec prefix flush is unsupported by this stage port")
 
     @abstractmethod
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None: ...

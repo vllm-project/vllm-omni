@@ -26,6 +26,7 @@ from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConf
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
     DuplexFence,
+    DuplexOutputContext,
     DuplexOutputDecision,
 )
 
@@ -380,6 +381,22 @@ class DuplexModelPlugin(ABC):
         """
         del stage_id, output, context
         return False
+
+    def completed_audio_append(self, *, stage_id: int, context: DuplexOutputContext) -> int | None:
+        """Model-owned proof of one generated append, not accepted input or PCM.
+
+        Default models have no frame-locked generation accounting. The runner
+        records an opt-in sequence through its mailbox without consuming or
+        projecting the intermediate output.
+        """
+        return None
+
+    def audio_drain_samples(self, accepted_seq: int) -> int | None:
+        """Model-owned delay/PCM rule for a fully generated input prefix.
+
+        None means the model has no frame-locked acoustic drain contract.
+        """
+        return None
 
     def user_transcript(
         self,

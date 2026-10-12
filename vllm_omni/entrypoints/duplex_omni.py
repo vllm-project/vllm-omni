@@ -37,6 +37,7 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands as duplex_commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, ResponseCreateOptions
+from vllm_omni.engine.duplex.contracts import AudioDrainTarget
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import DuplexEvent, SessionClosed
 from vllm_omni.engine.duplex.messages import (
@@ -99,6 +100,28 @@ class DuplexSessionHandle:
                 f"duplex session {self.session_id} is closed", code="session_closed", session_id=self.session_id
             )
         await self._omni.engine.submit_command_async(self.session_id, command)
+
+    async def confirm_output_sent(self, event: DuplexEvent) -> None:
+        """Report the held event after a successful send, without ACKing playback."""
+        receipt = self._outbox.send_receipt(event)
+        if receipt is not None and not self._closed:
+            await self._omni.engine.submit_command_async(
+                self.session_id, duplex_commands.AudioSendCompleted(receipt=receipt)
+            )
+
+    async def drain_audio(self, *, timeout: float = _DEFAULT_CONTROL_TIMEOUT_S) -> AudioDrainTarget:
+        """Wait for the currently accepted acoustic prefix, without closing.
+
+        Run an output consumer concurrently: only successful sends reported
+        by confirm_output_sent satisfy this wait. It is not a playback ACK.
+        Partial, unsubmitted input is excluded; unsupported models reject it.
+        """
+        if self._closed:
+            raise DuplexSessionError("session is closed", code="session_closed", session_id=self.session_id)
+        result = await self._omni.engine.drain_audio_async(self.session_id, timeout=timeout)
+        if result.audio_drain_target is None:
+            raise DuplexSessionError("missing audio drain target", code="internal_error", session_id=self.session_id)
+        return result.audio_drain_target
 
     async def append_audio(
         self,

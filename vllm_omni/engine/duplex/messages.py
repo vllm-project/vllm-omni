@@ -19,6 +19,7 @@ from vllm_omni.engine.messages import EngineQueueMessage
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.commands import DuplexCommand
     from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.contracts import AudioDrainTarget
     from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
     from vllm_omni.engine.duplex.events import DuplexEvent
 
@@ -55,6 +56,15 @@ class CloseDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     control_id: str
     session_id: str
     reason: str = "client_close"
+
+
+class DrainDuplexAudioMessage(EngineQueueMessage, kw_only=True):
+    """Server control, not a Realtime wire command or an implicit close."""
+
+    type: Literal["drain_duplex_audio"] = "drain_duplex_audio"
+    control_id: str
+    session_id: str
+    timeout_s: float
 
 
 class ResumeDuplexSessionMessage(EngineQueueMessage, kw_only=True):
@@ -97,6 +107,7 @@ class DuplexControlResultMessage(EngineQueueMessage, kw_only=True):
     error_code: str | None = None
     error_message: str | None = None
     error_retryable: bool = False
+    audio_drain_target: AudioDrainTarget | None = None
 
     @property
     def rpc_correlation_key(self) -> tuple[str, str]:
@@ -113,6 +124,7 @@ class DuplexSessionEventMessage(EngineQueueMessage, kw_only=True):
 
 __all__ = [
     "CloseDuplexSessionMessage",
+    "DrainDuplexAudioMessage",
     "DuplexControlResultMessage",
     "DuplexSessionCommandMessage",
     "DuplexSessionError",
