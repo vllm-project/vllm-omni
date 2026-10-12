@@ -438,7 +438,8 @@ def extract_wan2_2_context(
     post_patch_height = hidden_states.shape[3] // p_h
     post_patch_width = hidden_states.shape[4] // p_w
 
-    rotary_emb = module.rope(hidden_states)
+    freqs_cos, freqs_sin = module.rope(hidden_states)
+    rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
 
     hidden_states = module.patch_embedding(hidden_states)
     hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -460,16 +461,14 @@ def extract_wan2_2_context(
     block = module.blocks[0]
     if timestep_proj.ndim == 4:
         # I2V/TI2V: per-token timestep [B, seq, 6, inner_dim]
-        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(
-            6, dim=2
-        )
+        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table.unsqueeze(0) + timestep_proj).chunk(6, dim=2)
         shift_msa = shift_msa.squeeze(2)
         scale_msa = scale_msa.squeeze(2)
     else:
         # T2V: single timestep per batch [B, 6, inner_dim]
-        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table + timestep_proj.float()).chunk(6, dim=1)
+        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table + timestep_proj).chunk(6, dim=1)
 
-    norm_hidden_states = (block.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+    norm_hidden_states = block.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
     modulated_input = norm_hidden_states
 
     def run_transformer_blocks():
@@ -480,11 +479,13 @@ def extract_wan2_2_context(
 
     def postprocess(h):
         shift, scale = module.output_scale_shift_prepare(temb)
+        shift = shift.to(h.device)
+        scale = scale.to(h.device)
         if shift.ndim == 2:
             shift = shift.unsqueeze(1)
             scale = scale.unsqueeze(1)
 
-        h = (module.norm_out(h.float()) * (1 + scale) + shift).type_as(h)
+        h = module.norm_out(h, scale, shift).type_as(h)
         output = module.proj_out(h)
 
         output = output.reshape(
@@ -507,7 +508,6 @@ def extract_wan2_2_context(
     )
 
 
-def extract_zimage_context(
 
 def extract_zimage_context(
     module: nn.Module,
