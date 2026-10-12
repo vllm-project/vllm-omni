@@ -936,7 +936,9 @@ class Attention(nn.Module):
         """
         op_id = next(_SCHEDULED_ATTENTION_IDS)
         _SCHEDULED_ATTENTION_LAYERS[op_id] = self
-        self._schedule_op_id = torch.tensor(op_id, dtype=torch.int64)
+        # Keep the id on the CPU even under ``with torch.device(...)``: reading a
+        # device tensor here would force a host sync on every attention call.
+        self._schedule_op_id = torch.tensor(op_id, dtype=torch.int64, device="cpu")
 
     def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
         """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
