@@ -27,13 +27,13 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2co
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from tests.helpers.omni_scheduler import (
+from tests.helpers.duplex_scheduler import (
     DUPLEX_MAX_MODEL_LEN,
     append_duplex_frame,
-    bind_omits_transfer_helpers,
     join_duplex_sessions,
     make_engine_duplex_scheduler,
 )
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
 
