@@ -538,6 +538,32 @@ def test_build_diffusion_stage_config_consumes_typed_projection(tmp_path, monkey
     assert config.num_gpus == stage.parallel_config.world_size
 
 
+@pytest.mark.parametrize(
+    "overrides,decode_mode,encode_mode",
+    [
+        ({}, "lossless", "lossless"),
+        ({"vae_fast_path": "off", "vae_encode_fast_path": "channels_last"}, "off", "channels_last"),
+    ],
+)
+def test_vae_encode_fast_path_roundtrip(tmp_path, monkeypatch, overrides, decode_mode, encode_mode):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    model = str(tmp_path)
+    stage = StageConfigFactory.create_typed_default_diffusion(model, overrides).stage_by_id(0)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "device_control_env_var", None)
+
+    config = stage_init_utils.build_diffusion_stage_config(model, stage, stage_init_utils.extract_stage_metadata(stage))
+
+    assert config.vae_fast_path == decode_mode
+    assert config.vae_encode_fast_path == encode_mode
+
+
+def test_invalid_vae_encode_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_encode_fast_path"):
+        OmniDiffusionConfig(model="x", vae_encode_fast_path="fast")
+
+
 def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
     """A stage-level ``diffusion_attention_backend`` shorthand is folded into the structured config."""
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)

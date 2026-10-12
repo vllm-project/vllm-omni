@@ -17,7 +17,7 @@ import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
@@ -42,7 +42,9 @@ from vllm_omni.engine.orchestrator import (
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.stats import StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1596,6 +1598,181 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
 
     assert pool.calls == [[output]]
     assert routed == [built_metrics]
+
+
+@pytest.mark.asyncio
+async def test_disabled_stage_metrics_preserve_completion_routing() -> None:
+    built_metrics = StageRequestStats(
+        batch_id=1,
+        batch_size=1,
+        num_tokens_in=0,
+        num_tokens_out=0,
+        stage_gen_time_ms=0.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+    )
+
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.calls: list[list[Any]] = []
+
+        def build_stage_metrics(self, outputs, **_kwargs):
+            self.calls.append(outputs)
+            return built_metrics
+
+    pool = RecordingPool()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.collect_stage_metrics = False
+    req_state = OrchestratorRequestState(
+        request_id="req-no-metrics",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    req_state.stage_submit_ts[0] = time.time()
+    orchestrator.request_states = {"req-no-metrics": req_state}
+    orchestrator.stage_pools = [pool]
+    routed: list[Any] = []
+
+    async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
+        routed.append(stage_metrics)
+
+    orchestrator._route_output = record_route
+    output = OmniRequestOutput(request_id="req-no-metrics", finished=True)
+
+    await orchestrator._handle_processed_outputs(0, 0, [output])
+
+    assert pool.calls == [[output]]
+    assert routed == [built_metrics]
+    assert built_metrics.pipeline_timings is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_stage_metrics_drain_native_cache_on_completion(mocker) -> None:
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    pool = StagePool(0, [FakeStageClient(stage_type="llm", final_output=True)], output_processor=processor)
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        log_stats=False,
+        collect_stage_metrics=False,
+    )
+    route_output = mocker.patch.object(orchestrator, "_route_output", new_callable=mocker.AsyncMock)
+    params = SamplingParams(max_tokens=10, detokenize=False)
+
+    for count in range(1, 6):
+        request_id = f"req-no-metrics-{count}"
+        processor.add_request(
+            EngineCoreRequest(
+                request_id=request_id,
+                external_req_id=request_id,
+                prompt_token_ids=[1],
+                mm_features=None,
+                sampling_params=params,
+                pooling_params=None,
+                arrival_time=time.time(),
+                lora_request=None,
+                cache_salt=None,
+                data_parallel_rank=None,
+            ),
+            prompt=None,
+        )
+        req_state = OrchestratorRequestState(
+            request_id=request_id,
+            sampling_params_list=[params],
+            final_stage_id=0,
+        )
+        req_state.stage_submit_ts[0] = time.time()
+        orchestrator.request_states[request_id] = req_state
+        outputs = processor.process_outputs(
+            [
+                OmniEngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[42],
+                    num_generation_tokens=count,
+                    finish_reason=FinishReason.STOP,
+                )
+            ]
+        ).request_outputs
+        assert len(outputs) == 1
+        assert outputs[0].finished
+        assert processor._native_text_metrics_by_request[request_id]["num_generation_tokens"] == count
+
+        await orchestrator._handle_processed_outputs(0, 0, outputs)
+
+        assert processor._native_text_metrics_by_request == {}
+        assert route_output.call_args.args[-1].num_tokens_out == count
+
+    assert route_output.await_count == 5
+
+
+def test_disabled_stage_metrics_preserve_native_usage_and_finish_reason(mocker) -> None:
+    processor = mocker.Mock(spec=MultimodalOutputProcessor)
+    processor.pop_native_text_metrics.return_value = {"num_generation_tokens": 191}
+    pool = StagePool(0, [FakeStageClient(stage_type="llm", final_output=True)], output_processor=processor)
+    pool.collect_stage_metrics = False
+    mocker.patch.object(pool, "_collect_audio_metrics", side_effect=AssertionError("audio diagnostics collected"))
+    mocker.patch("vllm_omni.engine.stage_pool._time.time", side_effect=[2.0, 3.0])
+    output = OmniRequestOutput(
+        request_id="req-no-metrics",
+        prompt_token_ids=[1, 2],
+        outputs=[
+            CompletionOutput(
+                index=0, text="", token_ids=[3], cumulative_logprob=None, logprobs=None, finish_reason="length"
+            )
+        ],
+    )
+
+    metrics = pool.build_stage_metrics([output], submit_ts=1.0, request_timestamp=1.0, replica_id=0)
+
+    assert metrics.num_tokens_in == 2
+    assert metrics.num_tokens_out == 191
+    assert metrics.finish_reason == "length"
+    assert metrics.stage_gen_time_ms == 1000.0
+    assert metrics.batch_id == 1
+    assert metrics.batch_size == 1
+    assert metrics.stage_stats.total_token == 191
+    assert metrics.stage_stats.total_gen_time_ms == 1000.0
+    assert metrics.inter_output_latencies_ms is None
+    processor.pop_native_text_metrics.assert_called_once_with("req-no-metrics")
+
+    next_metrics = pool.build_stage_metrics([output], submit_ts=1.0, request_timestamp=1.0, replica_id=0)
+
+    assert next_metrics.batch_id == 2
+    assert next_metrics.stage_gen_time_ms == 2000.0
+    assert next_metrics.stage_stats.total_token == 382
+    assert next_metrics.stage_stats.total_gen_time_ms == 3000.0
+    assert metrics.stage_stats.total_token == 191
+
+
+def test_stage_pool_does_not_track_output_timestamps_when_metrics_disabled() -> None:
+    stage = FakeStageClient(stage_type="llm", final_output=True)
+    pool = StagePool(0, [stage])
+    pool.collect_stage_metrics = False
+
+    pool.record_output_timestamps(
+        [OmniRequestOutput(request_id="req-no-metrics", outputs=[])],
+        output_ts=123.0,
+    )
+
+    assert pool._output_timestamps_by_request == {}
+    assert pool._non_empty_first_output_timestamps_by_request == {}
+    assert pool._audio_frames_by_request == {}
+
+
+def test_orchestrator_rejects_logging_without_stage_metrics() -> None:
+    with pytest.raises(ValueError, match="log_stats=True requires collect_stage_metrics=True"):
+        Orchestrator(
+            request_async_queue=None,
+            output_async_queue=None,
+            rpc_async_queue=None,
+            stage_pools=[],
+            log_stats=True,
+            collect_stage_metrics=False,
+        )
 
 
 def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:

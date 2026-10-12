@@ -19,13 +19,16 @@ For each stage, vLLM-Omni calculates the requested memory as:
 requested_memory = total_gpu_memory × gpu_memory_utilization
 ```
 
-The system checks that:
+When other stages already occupy the same GPU, Omni caps this requested budget:
 
 ```text
-free_memory ≥ requested_memory
+requested_memory = min(requested_memory, free_memory)
 ```
 
-If this condition is not met, the stage will fail to initialize with an error message showing the memory requirements.
+The worker logs a warning when it caps the budget. Model and runtime allocations
+are subtracted from that budget when sizing the KV cache. Initialization can
+still fail if the remaining budget cannot hold the required cache. Raising
+`gpu_memory_utilization` does not increase a budget already capped to free memory.
 
 ### Memory Components
 
@@ -36,6 +39,20 @@ The total memory used by a stage includes:
 3. **Activation Memory**: Temporary memory for intermediate computations
 4. **System Overhead**: Memory used by CUDA, PyTorch, and other system components
 5. **Non-Torch Memory**: Memory allocated outside of PyTorch (e.g., CUDA graphs)
+
+When a stage captures CUDA graphs, the pool the runner captures through its
+CUDA-graph dispatcher is profiled during startup and subtracted from the KV cache
+budget, so `gpu_memory_utilization` covers those graphs as well. Set
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` to skip that profiling pass and leave the pool unreserved. A stage tuned
+before this reserve existed keeps its previous KV cache size by raising
+`gpu_memory_utilization` by the graph pool's share of the device. The startup log
+prints the value to use when the raised budget still fits in the memory free at
+startup, and otherwise says that no value restores the previous size, for example
+when co-located stages already hold part of the device. Graphs a model captures for
+itself after startup profiling — the talker MTP graphs in
+`GPUARModelRunner.capture_model` and model `capture_auxiliary_graphs` hooks — are
+not part of that estimate. Stages using these graphs need those pools free on top
+of their utilization.
 
 ### Example Calculation
 

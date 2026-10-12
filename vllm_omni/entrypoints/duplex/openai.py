@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
-import asyncio
-
 from fastapi import WebSocket
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
-from vllm_omni.entrypoints.duplex.warmup import DUPLEX_WARMUP_CLIENT_WAIT_S
+from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 
 logger = init_logger(__name__)
 
@@ -60,17 +58,7 @@ async def dispatch_realtime_websocket(websocket: WebSocket) -> None:
         await reject_realtime_websocket(websocket, f"Model '{requested_model}' is not available")
         return
 
-    # Hold real clients until the startup duplex warmup finishes (the warmup
-    # connection marks itself with vllm_omni_warmup=1 and passes through).
-    warmup_done = getattr(state, "duplex_warmup_done", None)
-    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
-        try:
-            await asyncio.wait_for(warmup_done.wait(), timeout=DUPLEX_WARMUP_CLIENT_WAIT_S)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning(
-                "Duplex warmup still running after %d s; admitting the client anyway.",
-                DUPLEX_WARMUP_CLIENT_WAIT_S,
-            )
+    await wait_for_duplex_warmup(websocket)
 
     from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
 

@@ -71,7 +71,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    check_interleaved_audio_video,
     merge_interleaved_embeddings,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
@@ -120,6 +119,7 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.torch_utils import async_tensor_h2d
 
 from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerMultiModalDataParser,

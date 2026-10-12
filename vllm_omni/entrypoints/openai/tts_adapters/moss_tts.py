@@ -112,9 +112,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             return await self.ctx.server._resolve_ref_audio(ref_audio)
         return await self.ctx.server._resolve_ref_audio_array(ref_audio)
 
-    def _voice_created_at(self, voice: str) -> int:
-        return self.ctx.server._voice_created_at(voice)
-
     def _get_resolved_ref_audio_artifact_key(self, cache_key: str):
         return self.ctx.server._get_resolved_ref_audio_artifact_key(cache_key)
 

@@ -193,15 +193,10 @@ def _build_codec(codec_path: str) -> tuple[PretrainedConfig, nn.Module]:
     is_v2 = config_dict.get("number_channels", 1) >= 2
 
     if is_v2:
-        try:
-            codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
-            codec = MossAudioTokenizerV2Model(codec_cfg)
-            logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
-            return codec_cfg, codec
-        except Exception:
-            logger.exception(
-                "Failed to instantiate vendored MOSS Audio Tokenizer v2; falling back to legacy vendored codec."
-            )
+        codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
+        codec = MossAudioTokenizerV2Model(codec_cfg)
+        logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
+        return codec_cfg, codec
 
     codec_cfg = MossAudioTokenizerConfig.from_pretrained(codec_path)
     codec = MossAudioTokenizerModel(codec_cfg)
@@ -250,6 +245,8 @@ class _MossCodecStreamSession:
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
         scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
+        if isinstance(codec, MossAudioTokenizerV2Model):
+            scratch_capacity = 1
         self._total_state_capacity = self._state_capacity + scratch_capacity
         self._state_slot_ids = torch.arange(
             self._total_state_capacity,
@@ -269,6 +266,12 @@ class _MossCodecStreamSession:
                 initialize_state_pool(self._state_capacity, scratch_capacity, chunk_frames=self._chunk_frames)
             else:
                 initialize_state_pool(self._state_capacity, scratch_capacity)
+        logger.info(
+            "MOSS codec decoder state pool: live=%d padding=%d shared_metadata=%s",
+            self._state_capacity,
+            scratch_capacity,
+            getattr(codec, "_decoder_null_slot", None) is not None,
+        )
         if batch_sizes and frame_sizes and self._device.type in ("cuda", "npu"):
             if self._device.type == "npu":
                 from vllm_omni.platforms.npu.models.moss_tts_streaming_decode_wrapper import (
@@ -294,8 +297,6 @@ class _MossCodecStreamSession:
                 )
             self._cudagraph_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
-            if not self._cudagraph_wrapper.is_ready:
-                self._cudagraph_wrapper = None
 
     def acquire(self) -> int | None:
         if not self._free_stream_slots:

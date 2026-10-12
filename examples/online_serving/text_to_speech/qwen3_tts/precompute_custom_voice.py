@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Pre-compute Qwen3-TTS custom voice profiles.
 
 The generated directory can be passed to the server via
@@ -64,11 +67,11 @@ def _resample(wav: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
 
 
 def _load_speaker_encoder(model_dir: str, device: torch.device):
+    from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
     from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
-    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSSpeakerEncoder
 
     config = Qwen3TTSConfig.from_pretrained(model_dir)
-    encoder = Qwen3TTSSpeakerEncoder(config.speaker_encoder_config)
+    encoder = ECAPATimeDelayNet(config.speaker_encoder_config)
     index_path = Path(model_dir) / "model.safetensors.index.json"
     state: dict[str, torch.Tensor] = {}
     if index_path.exists():

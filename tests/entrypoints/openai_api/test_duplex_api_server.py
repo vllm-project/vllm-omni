@@ -21,6 +21,7 @@ from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
+from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.utils.tracking_parser import TrackingNamespace
@@ -480,7 +481,7 @@ async def test_warmup_gate_holds_clients_until_the_warmup_session_finishes() -> 
     warmup_done = asyncio.Event()
     websocket = _warmup_websocket(warmup_done, {})
 
-    waiting = asyncio.create_task(api_server._wait_for_duplex_warmup(websocket))
+    waiting = asyncio.create_task(wait_for_duplex_warmup(websocket))
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(asyncio.shield(waiting), timeout=0.05)
 
@@ -500,7 +501,7 @@ async def test_warmup_gate_holds_clients_until_the_warmup_session_finishes() -> 
 async def test_warmup_gate_lets_the_warmup_connection_and_plain_servers_through(warmup_done, query) -> None:
     websocket = _warmup_websocket(warmup_done, query)
 
-    await asyncio.wait_for(api_server._wait_for_duplex_warmup(websocket), timeout=1.0)
+    await asyncio.wait_for(wait_for_duplex_warmup(websocket), timeout=1.0)
 
 
 @pytest.mark.asyncio

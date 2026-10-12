@@ -56,6 +56,14 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
@@ -682,13 +690,57 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
+def _cosmos3_media_output(
+    output: dict[str, Any],
+    od_config: OmniDiffusionConfig,
+    sampling_params: OmniDiffusionSamplingParams,
+    *,
+    stage_durations: dict[str, float] | None = None,
+) -> DiffusionOutput:
+    """Use shared transport only for plain video with NumPy presentation.
+
+    Guardrails and auxiliary outputs retain the existing model postprocessor.
+    Sampling output_type historically did not change Cosmos3 presentation, so
+    non-NumPy requests also stay on that path rather than changing their API.
+    """
+    from .guardrails import is_guardrails_enabled
+
+    video = output.get("video")
+    if (
+        not _is_rank_zero()
+        or set(output) != {"video"}
+        or video is None
+        or video.ndim != 5
+        or is_guardrails_enabled(od_config, sampling_params)
+        or (sampling_params.output_type or "np") != "np"
+        or any(
+            getattr(od_config, flag, False)
+            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
+        )
+    ):
+        return DiffusionOutput(output=output, stage_durations=stage_durations)
+    return DiffusionOutput(
+        media=DiffusionMediaOutput(
+            video=VideoMediaOutput(
+                tensor=video,
+                spec=VideoTensorSpec(
+                    layout=VideoTensorLayout.BCTHW,
+                    encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                    value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                    preserve_input_dtype=True,
+                ),
+            ),
+        ),
+        stage_durations=stage_durations,
+    )
+
+
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
     """Build the postprocessor for Cosmos3 image, video, and video+audio output.
 
-    The pipeline returns image payloads as ``{"image": tensor}`` and video
-    payloads as ``{"video": tensor}``. Sound-enabled video returns the same
-    video payload plus ``audio`` and ``audio_sample_rate``. Image output with
-    audio is rejected because Cosmos3 sound generation is video-only.
+    Guarded video, images, and video with audio/actions or transfer metadata
+    retain the legacy payload and model postprocessing. Plain video uses the
+    shared media finalizer. Image output with audio is rejected.
     """
     from .guardrails import check_video_safety, is_guardrails_enabled
 
@@ -4170,7 +4222,9 @@ class Cosmos3OmniDiffusersPipeline(
                 stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
             )
 
-        return DiffusionOutput(
+        return _cosmos3_media_output(
             output={"image": video} if is_t2i else {"video": video},
+            od_config=self.od_config,
+            sampling_params=sp,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
