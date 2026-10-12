@@ -972,3 +972,126 @@ class TestLockFileLifecycle:
         SharedMemoryConnector({})  # the new process's gated startup sweep
 
         assert not os.path.exists(lock)
+
+    def test_known_interleaving_reader_remove_races_same_key_reuse(self, connector, monkeypatch):
+        """Pin the documented µs-interleaving residual and its self-healing.
+
+        A reader in the failure path removes the lock path while a new-round
+        writer has already opened the *same inode* — ``open()`` needs no
+        flock, and ``O_TRUNC`` reuses the inode, so neither the ``locked``
+        gate nor an inode recheck can see it. The writer then publishes a
+        segment whose lock path is gone; that round's ``get()`` returns
+        ``None`` and the sender's ``close()`` reclaims the segment. Same
+        window exists in the pre-PR success path (``if consumed:``).
+        """
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        seg_path = self._seg_path(key)
+        parked: dict[int, int] = {}
+        real_exists = os.path.exists
+
+        def _park_writer_inside_the_window(path):
+            missing = not real_exists(path)
+            # The connector's finally-block probes the SEGMENT; when it is
+            # gone, a new-round writer's open("wb+") lands right here —
+            # inside the window between the seg_gone check and os.remove().
+            if path == seg_path and missing and not parked:
+                parked["fd"] = os.open(lock, os.O_RDWR | os.O_TRUNC)
+            return real_exists(path)
+
+        monkeypatch.setattr(os.path, "exists", _park_writer_inside_the_window)
+        try:
+            _, _, meta = connector.put("s0", "s1", key, {"data": "w" * 128})
+            self._force_unlink_segment(key)  # old segment gone -> failure path
+
+            result = connector.get("s0", "s1", key, metadata=meta)
+
+            assert result is None
+            assert parked, "the writer's open() should have been injected"
+            assert not real_exists(lock)  # the reader removed the path anyway
+
+            # The parked writer completes its round on the anonymous inode.
+            fcntl.flock(parked["fd"], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            shm_pkg.SharedMemory(create=True, size=16, name=key)
+            # The documented broken state: segment alive, lock path missing.
+            assert real_exists(seg_path) and not real_exists(lock)
+
+            # Self-healing: this round's data is unreadable, no exception is
+            # raised, and the sender's close() reclaims the stranded segment.
+            assert connector.get("s0", "s1", key, metadata=None) is None
+            fcntl.flock(parked["fd"], fcntl.LOCK_UN)
+            os.close(parked.pop("fd"))
+            connector.close()
+            assert not real_exists(seg_path) and not real_exists(lock)
+        finally:
+            if parked:
+                os.close(parked.pop("fd"))
+            if real_exists(seg_path):
+                self._force_unlink_segment(key)
+            if real_exists(lock):
+                os.remove(lock)
+
+    def test_same_key_reuse_storm_keeps_invariants(self, connector):
+        """Concurrent put/get hammering on ONE key must keep hard invariants.
+
+        A background thread re-``put()``s the same key while the main thread
+        keeps destroying the segment and re-reading it (the failure path that
+        removes locks). Any occurrence of the documented µs-interleaving is
+        allowed (that round's read is simply lost); what must NEVER happen:
+        exceptions, or residue left behind after ``close()``.
+        """
+        import threading
+
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        seg_path = self._seg_path(key)
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def _drop_segment() -> bool:
+            # Concurrency-tolerant: the writer thread may consume/recreate the
+            # segment between the existence check and the attach, and may be
+            # mid-creation (a freshly created 0-byte object mmaps as ValueError).
+            try:
+                seg = shm_pkg.SharedMemory(name=key)
+            except (FileNotFoundError, ValueError):
+                return False
+            seg.close()
+            try:
+                seg.unlink()
+            except FileNotFoundError:
+                # The writer thread's FileExistsError recovery may have
+                # unlinked the same segment between our attach and here.
+                pass
+            return True
+
+        def _writer():
+            while not stop.is_set():
+                try:
+                    connector.put("s0", "s1", key, {"round": 1})
+                except BaseException as exc:  # pragma: no cover - invariant
+                    errors.append(exc)
+                    stop.set()
+
+        thread = threading.Thread(target=_writer)
+        thread.start()
+        lost_rounds = 0
+        try:
+            for _ in range(200):
+                _drop_segment()  # force the failure path when one exists
+                result = connector.get("s0", "s1", key, metadata=None)
+                if result is None and os.path.exists(seg_path):
+                    lost_rounds += 1  # a round lost to the interleaving family
+        finally:
+            stop.set()
+            thread.join(timeout=10)
+            connector.close()
+            _drop_segment()
+            if os.path.exists(lock):
+                os.remove(lock)
+
+        assert not errors
+        assert not os.path.exists(seg_path) and not os.path.exists(lock)
+        # The interleaving is rare by construction; losing rounds is allowed,
+        # residue never. Print for visibility, do not assert on timing.
+        print(f"\nsame-key reuse storm: 200 rounds, {lost_rounds} lost rounds")
