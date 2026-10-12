@@ -51,6 +51,23 @@ def test_cpu_mark_is_allowed(monkeypatch):
     assert check_test_marks.get_files_missing_markers([path]) == {}
 
 
+def test_platform_and_sku_mentions_in_comments_and_strings_are_ignored(monkeypatch):
+    path = "tests/test_cpu_mark.py"
+    platform = "pytest.mark." + "cuda"
+    sku = "pytest.mark." + "H100"
+    sources = [
+        f"pytestmark = [pytest.mark.core_model, pytest.mark.cpu]\n# GPU counterpart uses {platform}\n",
+        f'pytestmark = [pytest.mark.core_model, pytest.mark.cpu]\nNOTE = "{platform}"\n',
+        f'"""Document {platform} and {sku} here."""\npytestmark = [pytest.mark.core_model, pytest.mark.cpu]\n',
+        "pytestmark = [pytest.mark.core_model]\n"
+        f"# Do not write {sku} by hand.\n"
+        "@hardware_test(res={'cuda': 'L4'}, num_cards=1)\n",
+    ]
+    for source in sources:
+        monkeypatch.setattr(check_test_marks, "read_test_file", lambda filename, source=source: source)
+        assert check_test_marks.get_files_missing_markers([path]) == {}
+
+
 def test_cuda_sku_helper_is_accepted(monkeypatch):
     path = "tests/test_cuda_sku.py"
     monkeypatch.setattr(

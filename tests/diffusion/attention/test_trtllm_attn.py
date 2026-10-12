@@ -17,7 +17,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionImpl
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "B200"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "RTX5090"}, num_cards=1)]
 
 
 def _has_trtllm_attn() -> bool:

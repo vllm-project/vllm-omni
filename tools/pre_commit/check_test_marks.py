@@ -30,9 +30,11 @@ in ``pyproject.toml``). CI level names come from ``get_level_markers()``
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import re
 import sys
+import tokenize
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -168,11 +170,55 @@ def has_hardware_marker(contents: str) -> bool:
     return bool(_platform_re().search(contents) or HELPER_RE.search(contents))
 
 
+def _blanked_token_types() -> frozenset[int]:
+    """Token types that are not marker applications."""
+    types = {tokenize.COMMENT, tokenize.STRING}
+    for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):
+        token_type = getattr(tokenize, name, None)
+        if token_type is not None:
+            types.add(token_type)
+    return frozenset(types)
+
+
+def _blank_keeping_newlines(text: str) -> str:
+    return "".join("\n" if char == "\n" else " " for char in text)
+
+
+def _source_for_disallowed_mark_scan(contents: str) -> str:
+    """Blank comments and string literals before searching for ``mark.<name>``.
+
+    A mention in a comment or string is not a marker application. Real
+    ``pytest.mark.cuda`` / ``mark.cuda`` expressions stay in the scanned text.
+    """
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(contents).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return contents
+    blanked_token_types = _blanked_token_types()
+    spans = [tok for tok in tokens if tok.type in blanked_token_types and tok.start < tok.end]
+    if not spans:
+        return contents
+    lines = contents.splitlines(keepends=True)
+    for tok in spans:
+        (start_line, start_col), (end_line, end_col) = tok.start, tok.end
+        if start_line == end_line:
+            index = start_line - 1
+            line = lines[index]
+            lines[index] = line[:start_col] + _blank_keeping_newlines(line[start_col:end_col]) + line[end_col:]
+            continue
+        first = lines[start_line - 1]
+        lines[start_line - 1] = first[:start_col] + _blank_keeping_newlines(first[start_col:])
+        for index in range(start_line, end_line - 1):
+            lines[index] = _blank_keeping_newlines(lines[index])
+        lines[end_line - 1] = _blank_keeping_newlines(lines[end_line - 1][:end_col]) + lines[end_line - 1][end_col:]
+    return "".join(lines)
+
+
 def has_direct_sku_marker(path: str, contents: str) -> bool:
     """True when a test applies ``pytest.mark.<SKU>`` instead of the helpers."""
     if _normalize_path(path) in _ALLOWED_DIRECT_SKU_FILES:
         return False
-    return bool(_sku_mark_re().search(contents))
+    return bool(_sku_mark_re().search(_source_for_disallowed_mark_scan(contents)))
 
 
 def has_bare_platform_marker(path: str, contents: str) -> bool:
@@ -180,10 +226,11 @@ def has_bare_platform_marker(path: str, contents: str) -> bool:
 
     ``pytest.mark.cpu`` is allowed. ``gpu`` / ``cuda`` / ``rocm`` / ``xpu`` /
     ``npu`` / ``musa`` must go through ``hardware_test`` / ``hardware_marks``.
+    Comments and string literals that mention those marks are ignored.
     """
     if _normalize_path(path) in _ALLOWED_DIRECT_SKU_FILES:
         return False
-    return bool(_bare_platform_re().search(contents))
+    return bool(_bare_platform_re().search(_source_for_disallowed_mark_scan(contents)))
 
 
 def get_files_missing_markers(
