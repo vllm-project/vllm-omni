@@ -1175,7 +1175,13 @@ def test_omni_wan_vae_decode_is_bitwise_exact_on_cuda(dtype: torch.dtype) -> Non
 @pytest.mark.parametrize(
     ("dtype", "allow_tf32", "tolerance"),
     [
-        pytest.param(torch.bfloat16, True, 3e-2, id="bf16"),
+        pytest.param(
+            torch.bfloat16,
+            True,
+            3e-2,
+            id="bf16",
+            marks=pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/8841"),
+        ),
         # With TF32 disabled the only difference is cuDNN's channels-last algorithm
         # choice and the norm kernel's reduction order.
         pytest.param(torch.float32, False, 2e-4, id="fp32"),
