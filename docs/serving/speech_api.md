@@ -1105,3 +1105,26 @@ weights and working memory. The shared cache itself does not move tensors
 between devices; other adapters determine the device of their cached artifacts.
 Separate model-worker caches are not controlled by this section. The process-wide singleton rejects a
 conflicting explicit budget instead of silently ignoring it.
+
+## Chatterbox Turbo and Original
+
+`ResembleAI/chatterbox-turbo` and `ResembleAI/chatterbox` serve English speech
+at 24 kHz through `/v1/audio/speech` and the shared sentence-segmented WebSocket
+frontend. Use `voice: "default"` for the built-in voice, or one `ref_audio`
+recording (URL or data URL) without `ref_text`. Turbo requires more than five
+seconds of reference audio; Original uses the shared one-second minimum.
+
+Non-streaming formats are WAV, PCM, MP3 and FLAC. Streaming uses
+`stream: true`, `stream_format: "audio"` and `response_format: "pcm"` or `"wav"`.
+PCM is mono signed 16-bit little-endian at 24 kHz. Other output sample rates
+are unsupported by this adapter.
+
+Original accepts nonnegative finite `extra_params.exaggeration` and
+`extra_params.cfg_weight` (both default 0.5). Turbo rejects those fields.
+Both reject VoiceDesign, free-form instructions and multilingual synthesis.
+`max_new_tokens` defaults to 1000 speech tokens and is bounded by context;
+the API ceiling is 4096. Admission capacity does not guarantee real-time playback.
+
+See the [online examples](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original),
+[A5000 recipe](../../recipes/ResembleAI/Chatterbox-A5000.md) and
+[H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md).

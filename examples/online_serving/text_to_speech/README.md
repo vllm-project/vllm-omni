@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✓ (`ref_audio`, no transcript) | ✓ (PCM / WAV + WebSocket) | built-in `default` or uploaded audio | ✓ |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
@@ -30,6 +31,40 @@ For the full list of supported architectures across all modalities, see
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
+
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`. This integration requires the
+shared runtime prerequisite [#8842](https://github.com/vllm-project/vllm-omni/pull/8842).
+
+```bash
+vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091
+# Use ResembleAI/chatterbox for Original.
+```
+
+Use the common curl/SDK and PCM streaming clients above with `voice: default`,
+or supply `ref_audio` as a data URL. Turbo requires more than five seconds;
+Original uses the shared one-second minimum. Both expose WAV/PCM/MP3/FLAC
+non-streaming responses and PCM/WAV streaming. Original additionally accepts
+`extra_params: {exaggeration: 0.5, cfg_weight: 0.5}`; Turbo rejects those controls.
+
+For browser playback, install `vllm-omni[demo]` and run:
+
+```bash
+uv run examples/online_serving/text_to_speech/chatterbox/gradio_demo.py
+```
+
+The demo streams PCM deltas into the browser audio player and accepts an optional
+reference upload. It does not sentence-segment long text; use the shared
+WebSocket speech frontend for long narration. Multilingual is unsupported.
+
+See the [A5000 recipe](../../../recipes/ResembleAI/Chatterbox-A5000.md) and
+[H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for profiles,
+qualification scope and concurrency limitations.
+
+---
 
 ## Common Quick Start
 

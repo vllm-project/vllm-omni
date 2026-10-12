@@ -1,4 +1,4 @@
-# Chatterbox Turbo and Original
+# Chatterbox Turbo and Original — RTX A5000
 
 This model integration depends on the shared TTS runtime changes in
 [PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842). Merge that
@@ -9,6 +9,43 @@ shared serving and runner fixes.
 mono 24 kHz English speech. The integration uses vLLM's GPT-2 backbone for
 speech-token generation and S3Gen meanflow with HiFT for waveform decoding.
 It supports the checkpoint's built-in voice and voice cloning from one recording.
+
+## Summary
+
+| Field | Value |
+| --- | --- |
+| Vendor / checkpoints | ResembleAI: `chatterbox-turbo`, `chatterbox` |
+| Runtime / mode | vLLM-Omni, two-stage offline and streaming speech serving |
+| Hardware | One NVIDIA RTX A5000, 24 GB, PCIe; no inter-GPU communication |
+| Maintainer | PR author; see [#8700](https://github.com/vllm-project/vllm-omni/pull/8700) |
+
+## Supported model contract
+
+| Surface | Contract |
+| --- | --- |
+| Input | English text; optional single reference recording, no transcript |
+| Reference limits | Turbo: more than 5 seconds; Original: shared API minimum 1 second |
+| Output | Mono 24 kHz; non-streaming WAV/PCM/MP3/FLAC; streamed PCM/WAV |
+| Default profiles | `chatterbox_turbo.yaml`, `chatterbox.yaml`: BF16 AR, FP32 decoder, 8 AR slots; Original CFG uses two slots per request |
+| High-concurrency profiles | 64 requests; A5000 qualification below uses a reduced 128-token cap, not the default full-context allowance |
+| Unsupported | Multilingual checkpoint, VoiceDesign, free-form instructions, prefix caching |
+
+## Hardware and software qualification
+
+The A5000 qualification below used one 24 GB device and CPU reference staging.
+Host-memory peak, OS, Python, driver and framework versions were not retained
+with that historical run; do not infer them from the separate H100 environment.
+Revision `223f3c5f6` identifies that run, which predates the full-batch decoder.
+The current head has unit coverage; fresh cold-conditioning and WebSocket load
+qualification of the full-batch decoder is still outstanding.
+
+## References
+
+- [Upstream implementation](https://github.com/resemble-ai/chatterbox)
+- [Offline examples](../../examples/offline_inference/text_to_speech/README.md#chatterbox-turbo-and-original)
+- [Online examples](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original)
+- [Speech API](../../docs/serving/speech_api.md)
+- [Supported models](../../docs/models/supported_models.md)
 
 ## Installation and serving
 
@@ -39,7 +76,7 @@ For the measured H100 throughput settings, use the opt-in
 the 64-request profile and enables BF16 flow, native cuDNN attention, and CUDA
 MPS across the API conditioner and model stages. It requires
 `nvidia-cuda-mps-control` on PATH. HiFT remains FP32. The ordinary profiles retain
-FP32 flow. See the [profiling report](Chatterbox-Profiling.md) for batch-size
+FP32 flow. See the [profiling report](Chatterbox-H100.md) for batch-size
 measurements, warmup requirements, numerical checks, and latency limitations.
 
 ```bash
@@ -172,66 +209,8 @@ establish the default 1000-token capacity or latency parity with Qwen3-TTS.
 The strict per-wave scheduler-capacity check was false: not every sampled wave
 reached 128 simultaneous Original CFG branches.
 
-On H100 SXM 80 GB with vLLM 0.31.0, PyTorch 2.13.0/CUDA 13.0,
-Transformers 5.14.1, and Uvicorn 0.54.0, both variants completed 576 HTTP
-requests and 576 WebSocket sessions (1152 sentence segments) each at 64 clients
-with the default 1000-token allowance. Each transport used a fresh server and
-three waves per workload. All requests passed, with no exact audio replay;
-speech shared-memory entries returned to zero before each server was stopped.
-Original HTTP/WebSocket results use final runtime revision `08352fddf` and
-the 0.40 memory profile; Turbo uses `223f3c5f6`. These measurements precede
-removal of the four-request decoder microbatches; the current full-batch decoder
-has separate [H100 profiling results](Chatterbox-Profiling.md). The following
-historical measurements are p95 seconds,
-including cold conditioner initialization:
-
-| Variant | Transport | Cold TTFA / completion | Warm TTFA / completion | Built-in TTFA / completion |
-| --- | --- | --- | --- | --- |
-| Turbo | HTTP | 27.74 / 34.14 | 3.17 / 7.44 | 3.52 / 7.10 |
-| Turbo | WebSocket | 25.82 / 35.77 | 3.63 / 9.79 | 3.27 / 9.29 |
-| Original | HTTP | 16.91 / 37.01 | 10.53 / 31.75 | 6.94 / 22.19 |
-| Original | WebSocket | 17.63 / 46.48 | 8.24 / 43.27 | 6.41 / 30.99 |
-
-These use the harness's short default text. The per-wave scheduler-capacity
-check remains false for these runs because not every wave reached the target
-stage-0 sequence count. They establish completed client concurrency with the
-default allowance, rather than simultaneous full-context occupancy.
-
-A separate 267-word unsplit HTTP workload completed 192 requests per variant
-(64 per workload) at the 1000-token cap. Every workload reached 64 running Turbo
-sequences or 128 running Original CFG sequences, and 64 decoder requests.
-Original's initial 0.35 stage-0 memory allocation admitted only 57 pairs; the
-final 0.40 profile allocated 264,624 KV tokens and reached all 64 pairs.
-Live speech shared memory returned to zero. Long-workload p95 seconds were:
-
-| Variant | Cold TTFA / completion | Warm TTFA / completion | Built-in TTFA / completion |
-| --- | --- | --- | --- |
-| Turbo | 29.09 / 58.05 | 4.47 / 28.78 | 3.84 / 11.70 |
-| Original | 24.70 / 156.00 | 15.67 / 152.20 | 15.24 / 141.22 |
-
-This establishes active capacity for the tested workload, not successful long
-narration. Original outputs reached the 40-second ceiling; Turbo samples ended
-after 10.2–33.32 seconds with severe repetition or unrelated speech. Separate
-Whisper-small transcription of 18 short samples per variant gave text-cosine
-ranges of 0.952–1.0 for Turbo and 0.848–1.0 for Original. The long samples were
-substantially worse. Text cosine measures overlap, not ordered correctness;
-PCM hashes do not establish semantic voice isolation. Prefer the sentence
-frontend for long text; these results do not claim Qwen3-TTS quality or latency
-parity. Long unsplit narration failed semantic checks in this configuration;
-Both variants also failed the same long input at concurrency one. Pinned upstream
-`chatterbox-tts` 0.1.7 built-in-voice controls likewise skipped/scrambled Original
-content and produced unrelated Turbo speech (40.0 and 8.96 seconds respectively).
-These stochastic controls characterize the limitation; they do not establish
-backbone-logit or quality parity.
-
-Real-weight conditioning separately matched serial execution for 64 reference
-clips of four lengths over three cycles, for both variants on A5000 and H100.
-On H100, eight-reference batches took 2.17–2.44 seconds per 64 Turbo references
-and 1.67–1.92 seconds per 64 Original references, versus 3.21–3.37 and
-2.71–3.04 seconds serially. Token and mel tensors matched exactly; speaker
-embeddings remained within the benchmark's `1e-4` tolerance, with unchanged
-encoder buffers. This measures encoding after initialization, separately from
-the cold public-API timings above.
+H100 results, including historical microbatch measurements, are recorded in the
+[H100 recipe](Chatterbox-H100.md). They do not qualify this A5000 profile.
 
 Start a fresh server before each model run so the first cold wave includes conditioner initialization.
 Supply an actual speech recording of more than five seconds:
@@ -327,3 +306,19 @@ The WebSocket receiver continues draining input during generation so protocol
 keepalive replies remain readable. Each connection permits up to 8 MiB of pending
 messages and 4096 queued messages, in addition to the existing per-message limits.
 Exceeding either backlog bound aborts active generation and closes with code 1008.
+
+## Supported features and verification
+
+| Feature | Status |
+| --- | --- |
+| Built-in voice / reference voice | Both variants; [request contract](../../docs/serving/speech_api.md#chatterbox-turbo-and-original) |
+| Async chunk streaming | Delta audio; [shared streaming guide](../../docs/design/feature/async_chunk.md) |
+| AR CUDA graphs | vLLM runner capture; decoder remains eager |
+| Original CFG / exaggeration | Supported; Turbo rejects these controls |
+| Other accelerator platforms | Configuration-only; no qualification claimed |
+
+For offline verification, use the [Chatterbox example](../../examples/offline_inference/text_to_speech/README.md#chatterbox-turbo-and-original).
+Expect a finite, nonempty mono waveform at 24 kHz. For browser playback use the
+[streaming demo](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original).
+MP3/FLAC, browser playback, and eager-versus-graph comparisons have runnable
+coverage; unexecuted hardware checks must not be described as qualified.

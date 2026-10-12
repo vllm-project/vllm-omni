@@ -3,7 +3,6 @@
 """Offline Chatterbox audio consolidation on both model runners."""
 
 import pytest
-import torch
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer
 
@@ -31,7 +30,7 @@ RUNNERS = [
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", RUNNERS, indirect=True)
-def test_text_to_audio_001(omni_runner):
+def test_text_to_audio_001(omni_runner, offline_client):
     """A batch returns full 24 kHz waveforms, including every streamed chunk."""
     model = omni_runner.model_name
     variant = "turbo" if model.endswith("-turbo") else "original"
@@ -47,13 +46,12 @@ def test_text_to_audio_001(omni_runner):
         ]
     voice = VoiceConditioning.from_builtin(model)
     prompts = [build_prompt(ids, voice, ChatterboxConfig(variant)) for ids in text_ids]
-    outputs = list(omni_runner.generate(prompts))
-    assert len(outputs) == len(prompts)
-    for output in outputs:
-        audio_output = output.outputs[0].multimodal_output
-        audio = audio_output["audio"]
-        if isinstance(audio, list):
-            audio = torch.cat([chunk.flatten() for chunk in audio])
-        assert audio.numel() > 24000
-        assert torch.isfinite(audio).all()
-        assert audio.abs().max() > 0
+    offline_client.send_tokenized_tts_request(
+        {
+            "prompt_token_ids": [prompt["prompt_token_ids"] for prompt in prompts],
+            "additional_information": [prompt["additional_information"] for prompt in prompts],
+            "expected_sample_rate": 24000,
+            "min_duration_s": 1.0,
+            "assert_distinct_outputs": True,
+        }
+    )

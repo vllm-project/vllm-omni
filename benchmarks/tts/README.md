@@ -18,7 +18,7 @@ HTTP or sentence-segmented WebSocket APIs, with cold distinct references, a warm
 repeated reference, and the built-in voice. `chatterbox_conditioning.py` checks
 real-weight serial/batch parity over 64 references on CPU or an explicit CUDA
 device. These are separate from the universal benchmark registry below.
-See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-Turbo.md#conditioning-load-validation-at-64-clients)
+See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-A5000.md#conditioning-load-validation-at-64-clients)
 for commands, measured 64-client results, and capacity and quality limitations.
 
 `chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech
@@ -42,7 +42,7 @@ the same Seed-TTS metadata, references, output cap, and concurrency list after
 restarting the server for each model. The universal benchmark reports audio RTF
 and playback underruns as well as first-audio latency; use these to evaluate
 streaming real-time performance rather than request completion alone.
-See the [H100 profiling report](../../recipes/ResembleAI/Chatterbox-Profiling.md)
+See the [H100 profiling report](../../recipes/ResembleAI/Chatterbox-H100.md)
 for the full-load warmup protocol and measured batch-size tradeoffs.
 
 ```bash
@@ -340,3 +340,23 @@ benchmarks/tts/
 - Upstream seed-tts-eval integration: vllm-project/vllm-omni#2558
 - Pipeline + Deploy schema: vllm-project/vllm-omni#2383
 - Concurrency cliff RFC: vllm-project/vllm-omni#272
+
+### Chatterbox nightly and CUDA graph comparison
+
+`tests/dfx/perf/tests/test_chatterbox.json` is a separate H100 nightly matrix
+for Turbo and Original: default-voice latency, throughput and stress, plus a
+latency-only eager ablation. The paired servers differ only in stage 0's
+`enforce_eager`; stage 1 remains eager and FP32. Use the same dataset, seed,
+request count and hardware when comparing graph and eager results. These are
+end-to-end serving measurements, not isolated AR graph timings.
+
+```bash
+uv run python -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_chatterbox.json \
+  -m "full_model and H100 and cards_1"
+```
+
+Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
+The job records metrics without invented regression thresholds. Its first
+successful H100 run must establish a baseline. It does not replace cold-reference
+or WebSocket validation with `chatterbox_load.py`.

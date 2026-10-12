@@ -1,4 +1,4 @@
-# Chatterbox H100 profiling
+# Chatterbox Turbo and Original — H100
 
 These measurements used the combined model and runtime implementation. The
 shared runtime changes are now reviewed separately in
@@ -9,6 +9,64 @@ Measurements on October 12, 2026 used one H100 SXM 80 GB, PyTorch
 2.13.0/CUDA 13.0, vLLM 0.31.0 and Transformers 5.14.1. Serving runtime revision
 `26e4d3910` removes GPU-to-CPU scalar synchronization from flow-mask repair.
 The subsequent `39f251fb0` changes only decoder benchmark OOM reporting.
+
+## Summary and model contract
+
+| Field | Value |
+| --- | --- |
+| Vendor / checkpoints | ResembleAI: `chatterbox-turbo`, `chatterbox` |
+| Runtime / task | vLLM-Omni two-stage English text-to-speech, built-in or cloned voice |
+| Input / output | Text plus optional single reference; mono 24 kHz audio |
+| Hardware | One NVIDIA H100 SXM, 80 GB; no inter-GPU communication |
+| Recommended profiles | Default FP32 profiles for quality checks; opt-in `*_high_concurrency_cuda.yaml` for the BF16/cuDNN measurements below |
+| Maintainer | PR author; see [#8700](https://github.com/vllm-project/vllm-omni/pull/8700) |
+
+## Hardware and software environment
+
+| Field | Recorded value |
+| --- | --- |
+| Accelerator / topology | 1× H100 SXM 80 GB; TP=1, one AR and one decoder worker |
+| Host memory / OS / Python / driver | Not retained in this report |
+| Runtime | PyTorch 2.13.0 / CUDA 13.0, vLLM 0.31.0, Transformers 5.14.1 |
+| Precision | BF16 AR; FP32 HiFT; flow precision stated per result |
+| Source revision | `26e4d3910`; benchmark reporting update `39f251fb0` |
+| Qualification | Bounded measurements below; fresh cold-conditioning/WebSocket full-batch runs incomplete |
+
+## Setup and commands
+
+Install `vllm-omni[chatterbox]` and merge prerequisite [#8842](https://github.com/vllm-project/vllm-omni/pull/8842).
+For built-in-voice and reference requirements, see the
+[shared speech contract](../../docs/serving/speech_api.md#chatterbox-turbo-and-original)
+and [upstream implementation](https://github.com/resemble-ai/chatterbox).
+
+```bash
+vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/chatterbox_turbo_high_concurrency_cuda.yaml
+```
+
+Use `ResembleAI/chatterbox` and `chatterbox_high_concurrency_cuda.yaml` for Original.
+The acceleration overlays require `nvidia-cuda-mps-control` on PATH. They change
+flow numerics; preserve FP32 HiFT and validate quality before deployment.
+See the [offline guide](../../examples/offline_inference/text_to_speech/README.md#chatterbox-turbo-and-original)
+and [online guide](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original)
+for complete synthesis and playback commands.
+
+## Supported features
+
+| Feature | Status |
+| --- | --- |
+| Built-in / cloned voice, async streaming | Both variants; measured scopes below |
+| Native AR CUDA graphs | Enabled by default; eager comparison job added without claiming measured speedup |
+| BF16 flow / cuDNN attention / MPS | Opt-in, H100 measurements below; numerical tradeoff |
+| Multilingual / prefix caching | Unsupported |
+| Real-time at 64 clients | Workload-dependent; no general guarantee |
+
+## Verification
+
+Expect nonempty mono 24 kHz PCM, completed requests, and independent request
+cleanup. Run the commands in [benchmark documentation](../../benchmarks/tts/README.md#chatterbox-concurrency-and-conditioning-checks).
+No latency regression baseline is assigned until the new nightly workload has
+been measured on H100; historical workloads are not interchangeable baselines.
 
 ## Bottlenecks and changes
 
@@ -185,3 +243,66 @@ quality log and saved WAVs as well as the report: the current wrapper can omit
 WER from its summary JSON. Use the recipe's separate public-API capacity harness
 to measure active scheduler occupancy; client concurrency alone does not prove
 64 simultaneously running model requests.
+
+## Historical API qualification before full-batch decoding
+
+On H100 SXM 80 GB with vLLM 0.31.0, PyTorch 2.13.0/CUDA 13.0,
+Transformers 5.14.1, and Uvicorn 0.54.0, both variants completed 576 HTTP
+requests and 576 WebSocket sessions (1152 sentence segments) each at 64 clients
+with the default 1000-token allowance. Each transport used a fresh server and
+three waves per workload. All requests passed, with no exact audio replay;
+speech shared-memory entries returned to zero before each server was stopped.
+Original HTTP/WebSocket results use final runtime revision `08352fddf` and
+the 0.40 memory profile; Turbo uses `223f3c5f6`. These measurements precede
+removal of the four-request decoder microbatches; the current full-batch decoder
+has separate [H100 profiling results](Chatterbox-H100.md). The following
+historical measurements are p95 seconds,
+including cold conditioner initialization:
+
+| Variant | Transport | Cold TTFA / completion | Warm TTFA / completion | Built-in TTFA / completion |
+| --- | --- | --- | --- | --- |
+| Turbo | HTTP | 27.74 / 34.14 | 3.17 / 7.44 | 3.52 / 7.10 |
+| Turbo | WebSocket | 25.82 / 35.77 | 3.63 / 9.79 | 3.27 / 9.29 |
+| Original | HTTP | 16.91 / 37.01 | 10.53 / 31.75 | 6.94 / 22.19 |
+| Original | WebSocket | 17.63 / 46.48 | 8.24 / 43.27 | 6.41 / 30.99 |
+
+These use the harness's short default text. The per-wave scheduler-capacity
+check remains false for these runs because not every wave reached the target
+stage-0 sequence count. They establish completed client concurrency with the
+default allowance, rather than simultaneous full-context occupancy.
+
+A separate 267-word unsplit HTTP workload completed 192 requests per variant
+(64 per workload) at the 1000-token cap. Every workload reached 64 running Turbo
+sequences or 128 running Original CFG sequences, and 64 decoder requests.
+Original's initial 0.35 stage-0 memory allocation admitted only 57 pairs; the
+final 0.40 profile allocated 264,624 KV tokens and reached all 64 pairs.
+Live speech shared memory returned to zero. Long-workload p95 seconds were:
+
+| Variant | Cold TTFA / completion | Warm TTFA / completion | Built-in TTFA / completion |
+| --- | --- | --- | --- |
+| Turbo | 29.09 / 58.05 | 4.47 / 28.78 | 3.84 / 11.70 |
+| Original | 24.70 / 156.00 | 15.67 / 152.20 | 15.24 / 141.22 |
+
+This establishes active capacity for the tested workload, not successful long
+narration. Original outputs reached the 40-second ceiling; Turbo samples ended
+after 10.2–33.32 seconds with severe repetition or unrelated speech. Separate
+Whisper-small transcription of 18 short samples per variant gave text-cosine
+ranges of 0.952–1.0 for Turbo and 0.848–1.0 for Original. The long samples were
+substantially worse. Text cosine measures overlap, not ordered correctness;
+PCM hashes do not establish semantic voice isolation. Prefer the sentence
+frontend for long text; these results do not claim Qwen3-TTS quality or latency
+parity. Long unsplit narration failed semantic checks in this configuration;
+Both variants also failed the same long input at concurrency one. Pinned upstream
+`chatterbox-tts` 0.1.7 built-in-voice controls likewise skipped/scrambled Original
+content and produced unrelated Turbo speech (40.0 and 8.96 seconds respectively).
+These stochastic controls characterize the limitation; they do not establish
+backbone-logit or quality parity.
+
+Real-weight conditioning separately matched serial execution for 64 reference
+clips of four lengths over three cycles, for both variants on A5000 and H100.
+On H100, eight-reference batches took 2.17–2.44 seconds per 64 Turbo references
+and 1.67–1.92 seconds per 64 Original references, versus 3.21–3.37 and
+2.71–3.04 seconds serially. Token and mel tensors matched exactly; speaker
+embeddings remained within the benchmark's `1e-4` tolerance, with unchanged
+encoder buffers. This measures encoding after initialization, separately from
+the cold public-API timings above.
