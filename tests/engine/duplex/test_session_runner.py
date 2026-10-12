@@ -697,6 +697,34 @@ async def test_cleared_in_flight_append_cannot_release_later_audio(monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_append_chained_behind_a_cleared_append_still_submits() -> None:
+    h = await open_harness()
+    h.port.submit_gate = asyncio.Event()
+    try:
+        before = len(h.port.submissions)
+        h.submit(append_audio(event_id="in-flight"))
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        h.submit(append_audio(event_id="cleared"))
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(event_id="after-clear"))
+        for _ in range(200):
+            if h.runner._mailbox.empty() and len(h.runner.tasks.append_tasks) == 3:
+                break
+            await asyncio.sleep(0.005)
+        assert len(h.runner.tasks.append_tasks) == 3
+
+        h.port.submit_gate.set()
+        await h.settle()
+        # The cleared append is called off; the one behind it is not rolled back.
+        assert len(h.port.submissions) == before + 2
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert h.session.pending_input_bytes == 0
+    finally:
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commit_without_audio_is_rejected() -> None:
     h = await open_harness()
     try:
@@ -1978,7 +2006,7 @@ async def test_input_clear_racing_a_queued_append_drops_it_as_the_clients_doing(
 
         h.port.submit_gate.set()
         events = await h.settle()
-        assert queued.done() and queued.result() is False, "the cleared append never ran"
+        assert queued.done() and queued.result() is True, "called off, not failed: later appends still run"
         assert len(h.port.submissions) == 1, "only the append that was already in flight reached the stage"
         assert [event.type for event in events if event.type in {"error", "response.done", "session.closed"}] == []
         assert h.session.pending_input_bytes == 0

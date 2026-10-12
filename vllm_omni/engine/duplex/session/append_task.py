@@ -178,7 +178,8 @@ class AppendAttempt:
             # answer, and that is the client's doing, not a runtime failure.
             # The reservation rollback itself is already a no-op.
             self.abandon(reason="input_cleared")
-            return False
+            # Called off, not failed: audio appended after the clear still runs.
+            return True
         return await self._submit()
 
     async def _submit(self) -> bool:
