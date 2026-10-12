@@ -47,6 +47,19 @@ def _should_emit_engine_output(
     )
 
 
+def _holds_payloadless_outputs(model_config: object) -> bool:
+    """Whether a final audio stage may fold token-only steps into its next output.
+
+    Such a stage streams audio through ``multimodal_output``; its codec tokens
+    are not client-visible. Steps that sampled a token but produced no audio
+    then only cost serialization, IPC and per-output API work.
+    """
+    # OmniModelConfig fields; a plain vLLM ModelConfig has neither.
+    return bool(getattr(model_config, "final_output", False)) and (
+        getattr(model_config, "engine_output_type", None) == "audio"
+    )
+
+
 class SampledLogprobContractError(RuntimeError):
     """The model runner returned unusable sampled-token logprobs."""
 
@@ -160,6 +173,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        # Keep rejecting in-flight appends after the error output is drained,
+        # until the engine consumes the owner's abort from its ordered input queue.
+        self._overflowed_streaming_requests: set[str] = set()
+        self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
+        # External finishes release Request before their terminal output is assembled.
+        self._held_token_ids: dict[str, list[int]] = {}
+
+    def add_request(self, request: Request) -> None:
+        if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
+            logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
+            return
+        super().add_request(request)
+
+    def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
+        """Release admission fences after an ordered abort, never an eager one."""
+        overflowed = getattr(self, "_overflowed_streaming_requests", None)
+        if overflowed is not None:
+            overflowed.difference_update(request_ids)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -789,6 +820,26 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or kv_transfer_params
                 or stopped
             )
+            if (
+                has_stage_output
+                and not stopped
+                and not mm_output
+                and pooler_output is None
+                and prefill_stats is None
+                and new_logprobs is None
+                and prompt_logprobs_tensors is None
+                and prompt_token_id_logprobs is None
+                and kv_transfer_params is None
+                and request.num_nans_in_logits == 0
+                and self._hold_payloadless_outputs
+                and request.sampling_params is not None
+                and not request.sampling_params.detokenize
+            ):
+                # Token-only step of a final audio stage: the client sees
+                # nothing new, so carry the tokens on the next emitted output
+                # instead of sending one output per decode step.
+                self._held_token_ids.setdefault(req_id, []).extend(new_token_ids)
+                has_stage_output = False
             if has_stage_output and _should_emit_engine_output(
                 self.vllm_config.model_config,
                 stopped=stopped,
@@ -887,6 +938,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             engine_core_outputs,
             synthesize_abort_outputs=True,
         )
+
+        # Include external errors, control messages and synthetic aborts in the
+        # same flush, after every output path has finished assembling its batch.
+        if self._hold_payloadless_outputs:
+            for client_output in engine_core_outputs.values():
+                for output in client_output.outputs:
+                    held = self._held_token_ids.pop(output.request_id, None)
+                    if held:
+                        output.new_token_ids = held + output.new_token_ids
+                        output.is_coalesced = True
 
         self._attach_scheduler_stats(
             engine_core_outputs,
@@ -1383,6 +1444,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if overflow is None:
             overflow = self._streaming_context_overflow = {}
         overflow[session.request_id] = (int(getattr(session, "client_index", 0) or 0), reason)
+        overflowed = getattr(self, "_overflowed_streaming_requests", None)
+        if overflowed is None:
+            overflowed = self._overflowed_streaming_requests = set()
+        overflowed.add(session.request_id)
         if session.is_finished():
             # Reached from ``_handle_stopped_request`` with a queued update.
             # ``update_from_output`` frees every request that call reports as
@@ -1518,6 +1583,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        elif status == RequestStatus.FINISHED_ABORTED:
+            # Without finished-request notifications no synthetic abort output
+            # will flush these tokens; the cancelled consumer no longer needs them.
+            getattr(self, "_held_token_ids", {}).pop(request_id, None)
 
         # Mirror the generation scheduler's try/finally pattern so the
         # input_coordinator entry is always pruned along every return path,

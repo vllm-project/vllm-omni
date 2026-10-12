@@ -4,6 +4,7 @@
 single-flight, and micro-batched encoding."""
 
 import asyncio
+import os
 import threading
 import time
 from tempfile import TemporaryDirectory
@@ -733,7 +734,7 @@ async def test_prepare_captures_graphs_or_starts_the_shared_host(make_encoder, m
 
     enc = make_encoder(_FakeProcessor())
     enc._shares_encoder, enc._shared_codes_dir = True, str(tmp_path)
-    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda: role)
+    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda shared_dir: role)
     captured, hosts, ready = [], [], []
     monkeypatch.setattr(enc, "_reference_graphs", lambda: captured.append(True))
     monkeypatch.setattr(enc, "_host_workers", lambda: [])
@@ -835,3 +836,106 @@ async def test_device_prep_resamples_on_the_tokenizer_device(make_encoder, monke
     enc._encode_prepared([clip])
     assert calls == [24000]
     assert re_mod._REF_ENCODE_GPU_PREP_ENV == "VLLM_OMNI_MOSS_REF_GPU_PREP"
+
+
+async def test_shared_code_directory_is_bounded_and_keeps_recent_entries(make_encoder, monkeypatch, tmp_path):
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    monkeypatch.setattr(re_mod, "_SHARED_CODES_MAX_ENTRIES", 8)
+    monkeypatch.setattr(re_mod, "_SHARED_CODES_PRUNE_EVERY", 2)
+    enc = make_encoder(_FakeProcessor())
+    enc._shared_codes_dir = str(tmp_path)
+    stale_tmp = tmp_path / "old.npy.123.tmp"
+    stale_tmp.write_bytes(b"partial")
+    os.utime(stale_tmp, (1, 1))
+    codes = torch.zeros((3, _N_VQ), dtype=torch.long)
+    for index in range(40):
+        enc._store_shared_codes(f"k{index}", codes + index)
+        os.utime(tmp_path / f"k{index}.npy", (1000 + index, 1000 + index))
+        if index == 5:
+            # A reused entry is refreshed and survives later pruning.
+            assert enc._load_shared_codes("k0") is not None
+            os.utime(tmp_path / "k0.npy", (2000, 2000))
+    names = {path.name for path in tmp_path.iterdir()}
+    assert not stale_tmp.exists()
+    assert len(names) <= 8 + 2
+    assert {"k0.npy", "k39.npy"} <= names and "k1.npy" not in names
+
+
+async def test_in_memory_hits_keep_the_shared_entry_recent(make_encoder, monkeypatch, tmp_path):
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    ref = "data:audio/wav;base64,R0hJ"
+    audio = _DigestAudio()
+    audio.register(ref, 9)
+    enc = make_encoder(_FakeProcessor())
+    enc._shared_codes_dir = str(tmp_path)
+    await enc.encode(ref, resolve_ref_audio=audio.resolve, get_artifact_key=audio.artifact_key)
+    (entry,) = tmp_path.iterdir()
+
+    async def hit_refreshes() -> bool:
+        os.utime(entry, (1, 1))
+        await enc.encode(ref, resolve_ref_audio=audio.resolve, get_artifact_key=audio.artifact_key)
+        return entry.stat().st_mtime > 1
+
+    assert audio.resolve_calls == [ref]
+    assert await hit_refreshes()  # served from memory, still marked used for other processes
+    assert not await hit_refreshes()  # at most once per interval
+    monkeypatch.setattr(re_mod, "_SHARED_CODES_TOUCH_S", 0.0)
+    assert await hit_refreshes() and audio.resolve_calls == [ref]
+
+
+async def test_failed_shared_code_write_leaves_no_temporary_file(make_encoder, monkeypatch, tmp_path):
+    enc = make_encoder(_FakeProcessor())
+    enc._shared_codes_dir = str(tmp_path)
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail)
+    enc._store_shared_codes("k", torch.zeros((3, _N_VQ), dtype=torch.long))
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_too_long_a_shared_directory_keeps_one_local_batch_in_flight(make_encoder, monkeypatch):
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    monkeypatch.setenv(re_mod._REF_ENCODE_INFLIGHT_ENV, "2")
+    monkeypatch.setenv(re_mod._SHARED_CODES_DIR_ENV, "/tmp/" + "d" * 120)
+    enc = make_encoder(_FakeProcessor())
+    assert not enc._shares_encoder and enc._batcher._max_inflight == 1
+
+
+@pytest.mark.parametrize("role", ["", "client"])
+async def test_local_encodes_never_overlap(make_encoder, monkeypatch, role):
+    import threading
+    import time
+
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    enc = make_encoder(_FakeProcessor())
+    enc._shares_encoder = True  # as with a shared directory and several batches in flight
+    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda shared_dir: role)
+
+    class _Unreachable:
+        def encode(self, wavs):
+            raise ConnectionRefusedError("host gone")
+
+    enc._shared_client = _Unreachable()
+    monkeypatch.setattr(enc, "_place_tokenizer_for_local_encode", lambda: None)
+    active, peak = [0], [0]
+
+    def encode_local(prepared, graphs=None):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        time.sleep(0.05)  # a graph replay reusing one set of buffers
+        active[0] -= 1
+        return [torch.zeros((1, _N_VQ), dtype=torch.long) for _ in prepared]
+
+    monkeypatch.setattr(enc, "_encode_local", encode_local)
+    threads = [threading.Thread(target=enc._encode_shared_or_local, args=([torch.ones(1, 10)],)) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert peak[0] == 1

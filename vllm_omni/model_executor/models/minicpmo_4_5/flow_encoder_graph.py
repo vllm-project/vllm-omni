@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Unified Code2Wav encoder graphs: shared CUDA arena and CUDA/NPU fallback.
+"""Unified Code2Wav encoder graphs: shared CUDA/NPU arena and exact-shape fallback.
 
 The CosyVoice2 upsample-conformer encoder (embedding, ``forward_chunk``,
 ``encoder_proj``) is ~320 small kernels whose launches, not their GPU time, set
@@ -26,6 +26,7 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from .cuda_graph_wrapper import _graph_api, _graph_execution_context
 from .encoder_graph import NPUEncoderGraphRunners
 
 logger = init_logger(__name__)
@@ -171,27 +172,35 @@ class FlowEncoderGraphs:
             target.copy_(value)
 
     def _record(self, views: dict[str, torch.Tensor]) -> Any:
-        """Warm up on a side stream, then capture ``_body`` into the shared private pool."""
+        """Warm up on a side stream, then capture into the shared private pool."""
         device = views["att"].device
-        current = torch.cuda.current_stream(device)
+        api = _graph_api(device)
+        current = api.current_stream(device)
         if self._capture_stream is None:
             self._capture_stream = (
-                torch.cuda.Stream(device=device) if torch.version.hip is not None else _new_capture_stream(device)
+                api.Stream(device=device)
+                if device.type == "npu" or torch.version.hip is not None
+                else _new_capture_stream(device)
             )
         side = self._capture_stream
         side.wait_stream(current)
-        amp, dtype = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
-        with torch.cuda.stream(side), torch.autocast("cuda", enabled=amp, dtype=dtype, cache_enabled=False):
+        amp, dtype = torch.is_autocast_enabled(device.type), torch.get_autocast_dtype(device.type)
+        with (
+            api.stream(side),
+            _graph_execution_context(device),
+            torch.autocast(device.type, enabled=amp, dtype=dtype, cache_enabled=False),
+        ):
             for _ in range(2):
                 self._body(views)
         current.wait_stream(side)
-        torch.accelerator.synchronize(device)
+        api.synchronize(device)
         if self._pool is None:
-            self._pool = torch.cuda.graph_pool_handle()
-        graph = torch.cuda.CUDAGraph()
+            self._pool = api.graph_pool_handle()
+        graph = api.NPUGraph() if device.type == "npu" else api.CUDAGraph()
         with (
-            torch.autocast("cuda", enabled=amp, dtype=dtype, cache_enabled=False),
-            torch.cuda.graph(graph, pool=self._pool, stream=side),
+            _graph_execution_context(device),
+            torch.autocast(device.type, enabled=amp, dtype=dtype, cache_enabled=False),
+            api.graph(graph, pool=self._pool, stream=side),
         ):
             self._body(views)
         current.wait_stream(side)
@@ -238,7 +247,7 @@ class FlowEncoderGraphs:
         # while attention state and projected hidden states are FP16.
         # Probe output metadata eagerly before recording any graph.
         dtypes = {"tokens": torch.long, "cnn": cnn_dtype or dtype, "att": dtype}
-        with torch.no_grad():
+        with torch.no_grad(), _graph_execution_context(device):
             probe = {name: torch.zeros(layouts[0][name], dtype=value, device=device) for name, value in dtypes.items()}
             outputs = self.encode_fn(probe["tokens"], cnn_cache=probe["cnn"], att_cache=probe["att"])
             dtypes.update(
@@ -251,9 +260,9 @@ class FlowEncoderGraphs:
                 numel = max(math.prod(layout[name]) for layout in layouts)
                 self._storage[name] = torch.zeros(numel, dtype=dtypes[name], device=device)
         self._precision = _precision_state()
-        if device.type == "cuda":
-            self._caller_stream = torch.cuda.current_stream(device)
-            self._amp = (torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"))
+        if device.type in {"cuda", "npu"}:
+            self._caller_stream = _graph_api(device).current_stream(device)
+            self._amp = (torch.is_autocast_enabled(device.type), torch.get_autocast_dtype(device.type))
         try:
             for key, layout in zip(keys, layouts, strict=True):
                 with torch.inference_mode(False):
@@ -286,10 +295,15 @@ class FlowEncoderGraphs:
         """
         if self._failed:
             raise RuntimeError("Code2Wav encoder graph capture failed; restart the stage before retrying")
-        if tokens.device.type == "cuda" and self._caller_stream is not None:
-            if torch.cuda.current_stream(tokens.device).cuda_stream != self._caller_stream.cuda_stream:
+        if tokens.device.type in {"cuda", "npu"} and self._caller_stream is not None:
+            stream = _graph_api(tokens.device).current_stream(tokens.device)
+            stream_attr = "npu_stream" if tokens.device.type == "npu" else "cuda_stream"
+            if getattr(stream, stream_attr) != getattr(self._caller_stream, stream_attr):
                 return None
-            if (torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")) != self._amp:
+            if (
+                torch.is_autocast_enabled(tokens.device.type),
+                torch.get_autocast_dtype(tokens.device.type),
+            ) != self._amp:
                 return None
         rows = len(att_rows)
         # The batch cutoff applies to opportunistic exact-shape captures.
@@ -309,7 +323,7 @@ class FlowEncoderGraphs:
             for att, cnn in zip(att_rows, cnn_rows, strict=True)
         ):
             return None
-        if _precision_state() != self._precision or torch.cuda.is_current_stream_capturing():
+        if _precision_state() != self._precision or _graph_api(tokens.device).is_current_stream_capturing():
             return None
         if [id(t) for t in self._held_tensors()] != [id(t) for t in self._held]:  # ``_held`` keeps them alive
             self.enabled = False
@@ -455,7 +469,7 @@ class FlowEncoderGraphs:
             tuple((id(value), value.data_ptr(), value.shape, value.dtype, value.device) for value in position_tables),
         )
         if shape_key not in self._npu_pe:
-            if self._npu_runners.captures >= self.max_graphs:
+            if not self.capture_on_request or self._npu_runners.captures >= self.max_graphs:
                 return eager("capacity")
             count = self.seen.pop(shape_key, 0) + 1
             self.seen[shape_key] = count
