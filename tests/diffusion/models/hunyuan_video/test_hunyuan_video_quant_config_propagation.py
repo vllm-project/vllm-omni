@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for HunyuanVideo-1.5 quant_config propagation through transformer creation.
 
 Tests cover:
@@ -16,8 +16,35 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 as t2v_module
 import vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5_i2v as i2v_module
+from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+    _gather_valid_encoder_hidden_states,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("has_image", [False, True])
+@pytest.mark.parametrize("negative_prompt", [False, True])
+def test_single_request_conditioning_indices_match_mask_order(has_image, negative_prompt):
+    """Both pipelines must preserve the legacy image, ByT5, text token order."""
+    image = torch.arange(20, 40, dtype=torch.float32).reshape(1, 5, 4)
+    text_2 = torch.arange(40, 64, dtype=torch.float32).reshape(1, 6, 4)
+    text = torch.arange(64, 92, dtype=torch.float32).reshape(1, 7, 4)
+    image_mask = torch.tensor([[has_image, False, has_image, False, False]])
+    text_2_mask = torch.tensor([[True, not negative_prompt, False, True, False, False]])
+    text_mask = torch.tensor([[True, False, True, not negative_prompt, False, False, False]])
+
+    indices = t2v_module._get_encoder_hidden_states_indices(image_mask, text_2_mask, text_mask)
+    assert indices is not None
+    actual = _gather_valid_encoder_hidden_states(image, text_2, text, indices)
+    expected = torch.cat((image[:, image_mask[0]], text_2[:, text_2_mask[0]], text[:, text_mask[0]]), dim=1)
+    assert torch.equal(actual, expected)
+    assert actual.is_contiguous()
+
+
+def test_batched_conditioning_indices_keep_legacy_fallback():
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    assert t2v_module._get_encoder_hidden_states_indices(mask, mask, mask) is None
 
 
 def test_i2v_pre_process_uses_single_request_prompt():
