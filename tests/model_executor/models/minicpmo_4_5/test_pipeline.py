@@ -157,8 +157,8 @@ class TestDeployTopology:
         assert not stages[0].load_config.skip_mm_profiling
         assert stages[1].load_config.skip_mm_profiling is True
         assert stages[2].load_config.skip_mm_profiling is True
-        assert stages[1].yaml_extras["output_connectors"]["to_stage_2"] == "connector_of_shared_memory"
-        assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
+        assert stages[1].connector_config.output_connectors["to_stage_2"] == "connector_of_shared_memory"
+        assert stages[2].connector_config.input_connectors["from_stage_1"] == "connector_of_shared_memory"
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["name"] == "SharedMemoryConnector"
         assert connector["extra"]["codec_chunk_frames"] == 25
@@ -170,7 +170,7 @@ class TestDeployTopology:
         assert stages[1].custom_process_next_stage_input_func.endswith(expected_processor)
         assert not stages[1].model_config.hf_overrides
         if filename == "minicpmo_4_5.yaml":
-            assert [stage.scheduler_config.max_num_seqs for stage in stages] == [4, 4, 4]
+            assert [stage.scheduler_config.max_num_seqs for stage in stages] == [16, 16, 16]
             memory_utilizations = [stage.cache_config.gpu_memory_utilization for stage in stages]
             assert memory_utilizations == [
                 0.55,

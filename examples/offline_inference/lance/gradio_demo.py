@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unified Gradio demo for Lance × vllm-omni — all 7 tasks.
 
 Style mirrors upstream Lance's lance_gradio.py:

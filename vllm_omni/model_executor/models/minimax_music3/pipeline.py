@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax Music 3 pipeline topology: AR talker -> acoustic decoder.
 
 Stage 0 ``minimax_music3_ar``: a Qwen3 backbone (the repo's ``language_model/``

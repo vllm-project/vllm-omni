@@ -16,10 +16,13 @@ from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.omni_config import (
+    BaseVllmOmniStageConfig,
+    VllmOmniARStageConfig,
     VllmOmniDiffusionStageConfig,
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
 from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.config.stage_config import StageExecutionType, StagePipelineConfig
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_runtime import StageEngineLaunch
 from vllm_omni.entrypoints.cli.serve import (
@@ -44,18 +47,6 @@ class _FakeProcess:
 @dataclass
 class _FakeProcessOwner:
     processes: list[_FakeProcess]
-
-
-@dataclass
-class _FakeStageEngineArgs:
-    async_chunk: bool
-    enable_sleep_mode: bool
-
-
-@dataclass
-class _FakeStageConfig:
-    stage_id: int
-    engine_args: _FakeStageEngineArgs
 
 
 def _resolved(*stages: SimpleNamespace) -> OmniConfigResolution:
@@ -325,10 +316,9 @@ def test_serve_validate_rejects_sleep_mode_with_multiple_api_servers(mocker: Moc
         cmd.validate(args)
 
 
-@pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize("downstream_async_chunk", [False, True])
 def test_build_multi_api_stage_runtime_matches_current_constructor(
-    mocker: MockerFixture, typed: bool, downstream_async_chunk: bool
+    mocker: MockerFixture, downstream_async_chunk: bool
 ) -> None:
     from vllm_omni.entrypoints.cli import serve as serve_module
 
@@ -342,25 +332,10 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
         ),
         frozenset({"model"}),
     )
-    if typed:
-        from vllm_omni.config.omni_config import VllmOmniARStageConfig
-        from vllm_omni.config.stage_config import StagePipelineConfig
-
-        stages = [
-            VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=i, model_stage="ar"))
-            for i in range(2)
-        ]
-        stages[1].connector_config.async_chunk = downstream_async_chunk
-    else:
-        stages = [
-            _FakeStageConfig(
-                stage_id=i,
-                engine_args=_FakeStageEngineArgs(
-                    async_chunk=bool(i and downstream_async_chunk), enable_sleep_mode=False
-                ),
-            )
-            for i in range(2)
-        ]
+    stages = [
+        VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=i, model_stage="ar")) for i in range(2)
+    ]
+    stages[1].connector_config.async_chunk = downstream_async_chunk
     mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
     mocker.patch(
         "vllm_omni.config.config_factory.with_trust_remote_code_override",
@@ -379,9 +354,8 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
     assert runtime._async_chunk is downstream_async_chunk
 
 
-@pytest.mark.parametrize("typed", [False, True])
 def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
-    mocker: MockerFixture, typed: bool
+    mocker: MockerFixture,
 ) -> None:
     from vllm_omni.entrypoints.cli import serve as serve_module
 
@@ -395,17 +369,8 @@ def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
         ),
         frozenset({"model"}),
     )
-    stage_config = _FakeStageConfig(
-        stage_id=3,
-        engine_args=_FakeStageEngineArgs(async_chunk=False, enable_sleep_mode=True),
-    )
-    if typed:
-        from vllm_omni.config.omni_config import VllmOmniARStageConfig
-        from vllm_omni.config.stage_config import StagePipelineConfig
-
-        typed_stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=3, model_stage="ar"))
-        typed_stage.model_config.enable_sleep_mode = True
-        stage_config = typed_stage
+    stage_config = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=3, model_stage="ar"))
+    stage_config.model_config.enable_sleep_mode = True
     mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
     mocker.patch(
         "vllm_omni.config.config_factory.with_trust_remote_code_override",
@@ -835,21 +800,18 @@ def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture)
 # ---------------------------------------------------------------------------
 
 
-def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
-    """Build a stage config that satisfies every attribute run_headless reads.
-
-    Notably ``engine_args`` is a real dict (not a Mock) so
-    ``get_stage_devices_per_replica`` can call ``.get("tensor_parallel_size")``
-    and feed the result through ``int()`` without TypeError.
-    """
-    return SimpleNamespace(
-        stage_id=stage_id,
-        stage_type=stage_type,
-        # No "devices" key -> split_devices_for_replicas skipped, each replica
-        # inherits the launcher's CUDA_VISIBLE_DEVICES.
-        runtime=None,
-        engine_args={},
-        connector_config=SimpleNamespace(async_chunk=False),
+def _make_stage_cfg(stage_id: int, stage_type: str) -> BaseVllmOmniStageConfig:
+    """Build a typed stage that inherits the launcher's visible devices."""
+    if stage_type == "diffusion":
+        return VllmOmniDiffusionStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+            ),
+        )
+    return VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=stage_id, model_stage="ar"),
     )
 
 

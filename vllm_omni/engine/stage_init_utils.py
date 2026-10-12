@@ -527,6 +527,7 @@ class StageMetadata:
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    async_chunk_prewarm_payload_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -607,6 +608,7 @@ def extract_stage_metadata(
         runtime_cfg=stage_config.runtime_config,
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
+        async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
     )
 
 
@@ -720,7 +722,7 @@ def get_stage_tp_size(stage_cfg: BaseVllmOmniStageConfig) -> int:
 
 
 def _get_local_llm_parallel_sizes(
-    stage_cfg: Any,
+    stage_cfg: BaseVllmOmniStageConfig,
     engine_args: Any | None = None,
 ) -> tuple[int, int, int]:
     """Return ``(tp, local_dp, pp)`` for one local LLM replica.
@@ -740,28 +742,10 @@ def _get_local_llm_parallel_sizes(
     return tp_size, int(local_dp_size if local_dp_size is not None else 1), pp_size
 
 
-def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None) -> int:
+def get_stage_devices_per_replica(stage_cfg: BaseVllmOmniStageConfig, engine_args: Any | None = None) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
-    if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
-        typed_parallel_config = getattr(stage_cfg, "parallel_config", None)
-        if typed_parallel_config is not None:
-            return max(1, int(typed_parallel_config.world_size))
-        if engine_args is None:
-            engine_args = getattr(stage_cfg, "engine_args", {})
-        parallel_config = _get_attr_or_item(engine_args, "parallel_config")
-        if parallel_config is None:
-            return 1
-
-        world_size = _get_attr_or_item(parallel_config, "world_size")
-        if world_size is not None:
-            return max(1, int(world_size))
-
-        try:
-            from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-            return max(1, int(DiffusionParallelConfig.from_dict(_to_dict(parallel_config)).world_size))
-        except Exception:
-            return 1
+    if isinstance(stage_cfg, VllmOmniDiffusionStageConfig):
+        return max(1, int(stage_cfg.parallel_config.world_size))
 
     tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_cfg, engine_args)
     return tp_size * max(1, local_dp_size) * pp_size
@@ -874,14 +858,17 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
             return
 
     previous_env: dict[str, str | None] = {}
-    for key, value in runtime_env.items():
-        env_key = str(key)
-        previous_env[env_key] = os.environ.get(env_key)
-        os.environ[env_key] = str(value)
-
-    if previous_env:
-        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
     try:
+        for key, value in runtime_env.items():
+            env_key = str(key)
+            old_value = os.environ.get(env_key)
+            os.environ[env_key] = str(value)
+            # Track only successful writes, preserving the original value
+            # if distinct keys normalize to the same environment name.
+            previous_env.setdefault(env_key, old_value)
+
+        if previous_env:
+            logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
         yield
     finally:
         for key, old_value in previous_env.items():
@@ -940,7 +927,7 @@ def _project_omni_stage_engine_args(
         "default_sampling_params",
         "has_sampling_extra_args",
     }
-    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus"}
+    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps"}
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.
@@ -1200,7 +1187,7 @@ def _count_stage_devices(devices: Any) -> int | None:
     return len(values) or None
 
 
-def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
+def _check_stage_device_layout(stage_config: BaseVllmOmniStageConfig, engine_args_dict: dict[str, Any]) -> None:
     """Fail early when a stage's world size cannot fit its assigned ``devices``.
 
     Re-runs :func:`check_device_layout` (normally only reached on the
@@ -1211,14 +1198,14 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
     """
     from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
 
-    runtime = getattr(stage_config, "runtime_config", getattr(stage_config, "runtime", None))
-    devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
+    runtime = stage_config.runtime_config
+    devices = runtime.devices
     if devices is None:
         # No explicit placement -> vLLM assigns devices itself; nothing to check.
         return
 
-    num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
-    stage_id = getattr(stage_config, "stage_id", "?")
+    num_replicas = runtime.num_replicas
+    stage_id = stage_config.stage_id
     tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_config, engine_args_dict)
     if local_dp_size == 0:
         # This process hosts no local DP engines, so its local device list does
@@ -1759,7 +1746,17 @@ def build_diffusion_stage_config(
     """Build the diffusion backend config for a typed stage."""
 
     engine_args_dict = project_engine_args(stage_cfg, model)
-    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+    # Stage metadata and LLM settings in the mixed projection do not belong
+    # to the terminal diffusion config. Validate ownership before extracting
+    # its fields so unknown inputs still fail at this boundary.
+    from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
+
+    diffusion_kwargs = extract_diffusion_stage_config_kwargs(
+        engine_args_dict,
+        stage_id=stage_cfg.stage_id,
+        include_engine_adapter_metadata=True,
+    )
+    od_config = OmniDiffusionConfig.from_kwargs(**diffusion_kwargs)
 
     # Diffusion KV profiling needs the request dimensions available during
     # stage construction. Preserve explicit dimensions supplied by the stage
@@ -1770,6 +1767,10 @@ def build_diffusion_stage_config(
         if isinstance(value, int) and value > 0:
             od_config.additional_config.setdefault(f"diffusion_kv_profile_{dimension}", value)
 
+    if od_config.distributed_executor_backend == "ray":
+        runtime_env = _to_dict(_get_attr_or_item(metadata.runtime_cfg, "env", {}) or {})
+        od_config.ray_worker_env = {str(key): str(value) for key, value in runtime_env.items()}
+
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
@@ -1779,7 +1780,10 @@ def build_diffusion_stage_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    if len(physical_devices) < num_devices_per_stage:
+    # Ray validates cluster-wide GPU availability through its placement
+    # group. The stage driver only sees the GPUs on its own node, so a local
+    # device-count check would reject every valid multi-node configuration.
+    if od_config.distributed_executor_backend != "ray" and len(physical_devices) < num_devices_per_stage:
         raise ValueError(
             f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"

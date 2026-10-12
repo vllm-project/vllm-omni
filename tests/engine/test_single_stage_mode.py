@@ -16,7 +16,12 @@ from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.omni_config import VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.omni_config import (
+    BaseVllmOmniStageConfig,
+    OmniStageRuntimeConfig,
+    VllmOmniARStageConfig,
+    VllmOmniDiffusionStageConfig,
+)
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     PipelineConfig,
@@ -41,17 +46,23 @@ from vllm_omni.engine.stage_runtime import DistStageRuntime, StageRuntime
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
-    """Return a lightweight stage config mock."""
-    return SimpleNamespace(
-        stage_id=stage_id,
-        stage_type=stage_type,
-        runtime=SimpleNamespace(devices="0"),
-        engine_args=SimpleNamespace(
-            async_chunk=False,
-            model_stage=None,
-            engine_output_type=None,
-        ),
+def _make_stage_cfg(stage_id: int, stage_type: str = "llm") -> BaseVllmOmniStageConfig:
+    """Build a typed stage with explicit local device placement."""
+    runtime_config = OmniStageRuntimeConfig(devices="0")
+    if stage_type == "diffusion":
+        return VllmOmniDiffusionStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+                final_output_type="image",
+            ),
+            runtime_config=runtime_config,
+        )
+    return VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=stage_id, model_stage="thinker"),
+        runtime_config=runtime_config,
     )
 
 
@@ -718,24 +729,20 @@ class TestSingleStageInitialization:
 
     def test_validate_single_stage_mode_allows_diffusion_replicas(self):
         stage_cfg = _make_stage_cfg(0, stage_type="diffusion")
-        stage_cfg.runtime.num_replicas = 2
+        stage_cfg.runtime_config.num_replicas = 2
         runtime = self._build_runtime([stage_cfg], stage_id_filter=0)
 
         runtime._validate_single_stage_mode_replica_constraints()
 
-    def test_validate_single_stage_mode_does_not_swallow_num_replica_validation_errors(self):
-        class RuntimeConfig:
-            @property
-            def num_replicas(self):
-                return 1
-
-            @num_replicas.setter
-            def num_replicas(self, value):
+    def test_validate_single_stage_mode_does_not_swallow_num_replica_validation_errors(self, monkeypatch):
+        def reject_num_replicas(self, name, value):
+            if name == "num_replicas":
                 raise ValueError("invalid num_replicas")
+            object.__setattr__(self, name, value)
 
         stage_cfg = _make_stage_cfg(0, stage_type="llm")
-        stage_cfg.runtime = RuntimeConfig()
         runtime = self._build_runtime([stage_cfg], stage_id_filter=0)
+        monkeypatch.setattr(OmniStageRuntimeConfig, "__setattr__", reject_num_replicas)
 
         with pytest.raises(ValueError, match="invalid num_replicas"):
             runtime._validate_single_stage_mode_replica_constraints()
@@ -1097,7 +1104,9 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        od_config = SimpleNamespace(max_num_seqs=4, parallel_config=SimpleNamespace(world_size=1))
+        od_config = SimpleNamespace(
+            max_num_seqs=4, parallel_config=SimpleNamespace(world_size=1), distributed_executor_backend="mp"
+        )
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_stage_config", return_value=od_config)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
@@ -1179,9 +1188,7 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._coordinator_runtime = None
         plan = _make_diffusion_plan(0, stage_id=0, launch_mode="local").replicas[0]
-        plan.stage_cfg.diffusion_config = SimpleNamespace(
-            custom_pipeline_args={"pipeline_class": "test.CustomPipeline"}
-        )
+        plan.stage_cfg.diffusion_config.custom_pipeline_args = {"pipeline_class": "test.CustomPipeline"}
         sentinel_client = SimpleNamespace()
         mock_launch = mocker.patch.object(
             runtime_mod,
@@ -1232,7 +1239,9 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
+        od_config = SimpleNamespace(
+            max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1), distributed_executor_backend="mp"
+        )
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_stage_config", return_value=od_config)
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",

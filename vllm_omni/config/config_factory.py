@@ -399,7 +399,7 @@ class StageConfigFactory:
         cls,
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
-        """Normalize inputs shared by typed and compatibility diffusion builders."""
+        """Normalize inputs for the typed default diffusion builder."""
         # Preserve the default builder's explicit top-level override of model
         # extras before the strict same-source alias validator runs.
         if kwargs.get("auxiliary_text_encoder") is not None:

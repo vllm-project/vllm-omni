@@ -55,42 +55,40 @@ def test_single_stage_streaming_capability_uses_central_async_resolver():
 )
 def test_qwen3_tts_deployment_selection_preserves_output_and_transport_contract(pipeline_key, profile, stage_count):
     from tests.helpers.stage_config import get_deploy_config_path
+    from vllm_omni.config.omni_config import VllmOmniConfig
     from vllm_omni.config.pipeline_registry import resolve_pipeline_config
-    from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+    from vllm_omni.config.stage_config import load_deploy_config
 
     pipeline = resolve_pipeline_config(pipeline_key)
     assert pipeline is not None
     deploy = load_deploy_config(get_deploy_config_path(profile))
-    stages = merge_pipeline_deploy(pipeline, deploy)
+    stages = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs
     assert len(stages) == stage_count
     talker = stages[0]
     if stage_count == 1:
         assert talker.final_output and talker.final_output_type == "audio"
-        assert talker.yaml_engine_args["engine_output_type"] == "audio"
-        assert "custom_process_next_stage_input_func" not in talker.yaml_engine_args
-        assert not talker.yaml_extras.get("output_connectors")
-        assert talker.yaml_engine_args["supports_running_prefix_cache_reset"] is False
-        assert talker.yaml_engine_args["additional_config"]["ref_code_context_frames"] == 72
+        assert talker.engine_output_type == "audio"
+        assert talker.custom_process_next_stage_input_func is None
+        assert not talker.connector_config.output_connectors
+        assert talker.model_config.supports_running_prefix_cache_reset is False
+        assert talker.runtime_config.additional_config["ref_code_context_frames"] == 72
     else:
         assert not talker.final_output
-        assert talker.yaml_engine_args["engine_output_type"] == "latent"
-        assert talker.yaml_engine_args["custom_process_next_stage_input_func"].endswith("talker2code2wav_async_chunk")
-        assert talker.yaml_extras["output_connectors"]
-        assert stages[1].input_sources == [0] and stages[1].final_output_type == "audio"
-        assert talker.yaml_engine_args.get("supports_running_prefix_cache_reset", True)
+        assert talker.engine_output_type == "latent"
+        assert talker.custom_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
+        assert talker.connector_config.output_connectors
+        assert stages[1].stage_pipeline_config.input_sources == (0,) and stages[1].final_output_type == "audio"
+        assert talker.model_config.supports_running_prefix_cache_reset
 
 
 def test_single_stage_running_reset_capability_cannot_be_overridden():
     from vllm_omni.config.omni_config import VllmOmniConfig
-    from vllm_omni.config.stage_config import DeployConfig, StageDeployConfig, merge_pipeline_deploy
+    from vllm_omni.config.stage_config import DeployConfig, StageDeployConfig
     from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE
 
     deploy = DeployConfig(
         stages=[StageDeployConfig(stage_id=0, engine_extras={"supports_running_prefix_cache_reset": True})]
     )
-    legacy = merge_pipeline_deploy(QWEN3_TTS_FUSED_PIPELINE, deploy)[0]
-    legacy.runtime_overrides["supports_running_prefix_cache_reset"] = True
-    assert legacy.to_omegaconf().engine_args.supports_running_prefix_cache_reset is False
     with pytest.raises(ValueError, match="no structured config owner: supports_running_prefix_cache_reset"):
         VllmOmniConfig.from_pipeline_config(QWEN3_TTS_FUSED_PIPELINE, user_deploy_config=deploy)
     structured = VllmOmniConfig.from_pipeline_config(QWEN3_TTS_FUSED_PIPELINE)

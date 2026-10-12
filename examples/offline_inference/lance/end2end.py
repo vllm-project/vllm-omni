@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Lance-3B offline inference (single-stage).
 
 Lance is BAGEL-lineage; this example covers the single-stage paths wired in

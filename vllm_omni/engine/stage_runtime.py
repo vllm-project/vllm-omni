@@ -30,6 +30,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.engine.cuda_mps import CudaMPSServer, physical_gpu_uuid
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
@@ -203,6 +204,7 @@ class StageRuntime:
         # device groups can initialize concurrently.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
+        self._mps_servers: dict[str, CudaMPSServer] = {}
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -421,6 +423,8 @@ class StageRuntime:
                             )
                         )
 
+                    with self._replica_launch_lock:
+                        mps_env = self._mps_environment(physical_devices, replica.metadata.runtime_cfg)
                     launch_context = launch_stage_replica(
                         vllm_config=replica.stage_vllm_config,
                         executor_class=replica.executor_class,
@@ -430,7 +434,7 @@ class StageRuntime:
                         stage_config=replica.stage_cfg,
                         omni_master_server=self._get_omni_master_server(),
                         omni_coordinator_address=self._get_coordinator_address(),
-                        stage_visible_devices=physical_devices,
+                        stage_visible_devices=mps_env.get("CUDA_VISIBLE_DEVICES", physical_devices),
                         spawn_device_lock=self._spawn_device_lock,
                         omni_parallel_stage_init=self._parallel_stage_init,
                         num_api_servers=num_api_servers,
@@ -439,7 +443,10 @@ class StageRuntime:
                     # Environment overlays are process-global. Serialize spawn;
                     # parallel initialization waits for READY outside this lock.
                     with self._replica_launch_lock:
-                        with stage_runtime_env(replica.metadata.stage_id, replica.metadata.runtime_cfg):
+                        with (
+                            stage_runtime_env(replica.metadata.stage_id, replica.metadata.runtime_cfg),
+                            stage_runtime_env(replica.metadata.stage_id, {"env": mps_env}),
+                        ):
                             stage_resources = launch_context.__enter__()
                         entered_contexts.append(launch_context)
                         if stage_resources is None:
@@ -512,6 +519,55 @@ class StageRuntime:
             if lock_fds:
                 release_device_locks(lock_fds)
 
+    @staticmethod
+    def _mps_enabled(runtime_cfg: Any) -> bool:
+        return bool(
+            runtime_cfg.get("cuda_mps", False)
+            if isinstance(runtime_cfg, Mapping)
+            else getattr(runtime_cfg, "cuda_mps", False)
+        )
+
+    def _validate_mps_topology(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        for plan in stage_plans:
+            for replica in plan.replicas:
+                runtime_cfg = replica.stage_cfg.runtime_config
+                if not self._mps_enabled(runtime_cfg):
+                    continue
+                if replica.launch_mode != "local" or replica.metadata.stage_type == "diffusion":
+                    raise ValueError("cuda_mps currently supports local EngineCore stages only")
+                if self._parallel_stage_init:
+                    raise ValueError(
+                        "cuda_mps requires parallel_stage_init=false for physical GPU initialization locks"
+                    )
+
+    def _mps_environment(self, devices: str | None, runtime_cfg: Any) -> dict[str, str]:
+        if not self._mps_enabled(runtime_cfg):
+            return {}
+        if not current_omni_platform.is_cuda() or devices is None or len(devices.split(",")) != 1:
+            raise ValueError("cuda_mps currently requires a local CUDA stage on exactly one explicit GPU")
+        runtime_env = runtime_cfg.get("env") if isinstance(runtime_cfg, Mapping) else getattr(runtime_cfg, "env", None)
+        pipe_directory = (
+            str(runtime_env["CUDA_MPS_PIPE_DIRECTORY"])
+            if isinstance(runtime_env, Mapping) and "CUDA_MPS_PIPE_DIRECTORY" in runtime_env
+            else None
+        )
+        uuid = physical_gpu_uuid(devices.strip())
+        if uuid not in self._mps_servers:
+            self._mps_servers[uuid] = CudaMPSServer(uuid, pipe_directory=pipe_directory)
+        server = self._mps_servers[uuid]
+        if pipe_directory is not None and (pipe_directory or None) != server.operator_pipe_directory:
+            raise ValueError(f"Conflicting CUDA_MPS_PIPE_DIRECTORY settings for stages sharing GPU {uuid}")
+        return server.env
+
+    def _close_mps_servers(self) -> None:
+        for uuid, server in list(self._mps_servers.items()):
+            try:
+                server.close()
+            except Exception:
+                logger.exception("Failed to close private MPS server for %s; retaining its control directory", uuid)
+            else:
+                del self._mps_servers[uuid]
+
     def shutdown(self) -> None:
         for pool in self.stage_pools:
             for client in pool.clients:
@@ -523,6 +579,7 @@ class StageRuntime:
         if self._stage_init_executor is not None:
             self._stage_init_executor.shutdown(wait=True, cancel_futures=True)
             self._stage_init_executor = None
+        self._close_mps_servers()
 
     def create_membership_controller(self) -> Any | None:
         """Return a distributed membership controller, if this runtime needs one."""
@@ -538,6 +595,7 @@ class StageRuntime:
             replicas_per_stage,
             replica_devices_map,
         )
+        self._validate_mps_topology(stage_plans)
         self._validate_native_kv_topology(stage_plans)
         return stage_plans
 
@@ -555,17 +613,20 @@ class StageRuntime:
 
     def _cleanup_after_initialize_failure(self) -> None:
         """Hook for runtimes that own extra infrastructure during init."""
-        return None
+        self._close_mps_servers()
 
     def _resolve_replica_physical_devices(self, stage_id: int, runtime_cfg: Any) -> str | None:
         if runtime_cfg is None:
             runtime_cfg = {}
         devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        return resolve_stage_physical_devices(
+        physical = resolve_stage_physical_devices(
             stage_id,
             devices,
             visible_baseline=self._init_visible_devices_baseline,
         )
+        if self._mps_enabled(runtime_cfg) and (physical is None or not physical.isdigit()):
+            raise ValueError("cuda_mps requires one numeric physical GPU for initialization locking")
+        return physical
 
     # ---- Internal methods ----
 
@@ -726,7 +787,7 @@ class StageRuntime:
                 )
                 if stage_idx in replica_devices_map:
                     devices = replica_devices_map[stage_idx][replica_id]
-                    runtime_cfg = getattr(replica_cfg, "runtime_config", getattr(replica_cfg, "runtime", None))
+                    runtime_cfg = replica_cfg.runtime_config
                     if runtime_cfg is not None:
                         runtime_cfg.devices = devices
 
@@ -1136,19 +1197,8 @@ class StageRuntime:
                         raise RuntimeError("Omni KV connector requires source and destination stages")
                     inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
                 inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
-                # Typed configs expose the topology through
-                # ``stage_pipeline_config``.  Keep the runtime tolerant of
-                # lightweight test/dynamic configs that omit that optional
-                # topology wrapper; those stages simply use the normal
-                # subprocess path.
-                inline_diffusion = bool(
-                    getattr(getattr(plan.stage_cfg, "stage_pipeline_config", None), "inline_diffusion", False)
-                )
-                custom_pipeline_args = getattr(
-                    getattr(plan.stage_cfg, "diffusion_config", None),
-                    "custom_pipeline_args",
-                    None,
-                )
+                inline_diffusion = plan.stage_cfg.stage_pipeline_config.inline_diffusion
+                custom_pipeline_args = plan.stage_cfg.diffusion_config.custom_pipeline_args
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
                     stage_config=plan.stage_cfg,
@@ -1302,34 +1352,21 @@ class DistStageRuntime(StageRuntime):
         return super()._prepare_stage_plans()
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
-        """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
+        """Apply --omni-dp-size-local to the local typed stage runtime config."""
         target_stage_id = self._single_stage_id_filter
         if target_stage_id is None:
             return
 
-        for idx, stage_cfg in enumerate(self._stage_configs):
-            stage_id = int(getattr(stage_cfg, "stage_id", idx))
-            runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", None))
-            if runtime_cfg is None:
-                continue
-            if stage_id == target_stage_id:
-                try:
-                    runtime_cfg.num_replicas = self._omni_dp_size_local
-                except (AttributeError, TypeError):
-                    if hasattr(runtime_cfg, "__setitem__"):
-                        runtime_cfg["num_replicas"] = self._omni_dp_size_local
-                        continue
-                    logger.warning(
-                        "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
-                        self._omni_dp_size_local,
-                        stage_id,
-                    )
+        for stage_cfg in self._stage_configs:
+            if stage_cfg.stage_id == target_stage_id:
+                stage_cfg.runtime_config.num_replicas = self._omni_dp_size_local
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         self._start_omni_master_server(stage_plans)
         self._stage_remote_factory_contexts = self._capture_stage_factory_contexts(stage_plans)
 
     def _cleanup_after_initialize_failure(self) -> None:
+        super()._cleanup_after_initialize_failure()
         self._cleanup_distributed_infra()
 
     def shutdown(self) -> None:

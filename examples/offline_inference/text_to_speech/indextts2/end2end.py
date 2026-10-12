@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline inference example for IndexTTS 2.0 and 2.5 via vLLM-Omni.
 
 Two-stage pipeline: GPT AR (Stage 0) → semantic codec + S2Mel + BigVGAN

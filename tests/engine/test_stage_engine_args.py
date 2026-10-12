@@ -18,6 +18,7 @@ from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.models.utils import extract_layer_index
 
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
@@ -65,7 +66,6 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "env",
         "final_output",
         "has_sampling_extra_args",
-        "log_level",
         "log_stats",
         "model_arch",
         "model_subdir",
@@ -192,7 +192,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 execution_type=StageExecutionType.LLM_AR,
                 requires_multimodal_data=True,
                 hf_config_name="thinker_config",
-                engine_output_type="hidden_states",
+                engine_output_type="latent",
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
                 model_subdir="ar-model",
                 tokenizer_subdir="ar-tokenizer",
@@ -204,7 +204,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 model_stage="talker",
                 execution_type=StageExecutionType.LLM_GENERATION,
                 input_sources=(0,),
-                engine_output_type="audio_tokens",
+                engine_output_type="latent",
             ),
             StagePipelineConfig(
                 stage_id=2,
@@ -360,7 +360,9 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     )
 
     assert deploy.stages[0].engine_extras["kv_cache_dtype"] == "fp8_e4m3"
+    assert deploy.stages[0].engine_extras["kv_cache_dtype_skip_layers"] == ["0"]
     assert "kv_cache_dtype" not in deploy.stages[1].engine_extras
+    assert "kv_cache_dtype_skip_layers" not in deploy.stages[1].engine_extras
 
     typed_args = [
         project_engine_args(
@@ -375,12 +377,18 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
 
     assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
     assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
+    assert ar_stage.cache_config.kv_cache_dtype_skip_layers == ["0"]
     assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
     assert typed_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert typed_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
+    # vLLM matches the list against the index it parses from each attention prefix.
+    assert str(extract_layer_index("ar.language_model.layers.0.self_attn.attn")) == "0"
 
     assert dit_stage.cache_config.cache_dtype == "auto"
+    assert dit_stage.cache_config.kv_cache_dtype_skip_layers == []
     assert "cache_dtype" not in dit_stage.cache_config._omni_explicit_fields
     assert "kv_cache_dtype" not in typed_args[1]
+    assert "kv_cache_dtype_skip_layers" not in typed_args[1]
 
 
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
@@ -499,6 +507,35 @@ def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
     assert isinstance(typed_args["diffusion_attention_config"], AttentionConfig)
     assert typed_args["diffusion_attention_config"].default.backend == "FLASH_ATTN"
     assert typed_args["diffusion_attention_config"].per_role["cross"].backend == "TORCH_SDPA"
+
+
+@pytest.mark.parametrize("generic", [False, True], ids=["multistage", "generic-fallback"])
+def test_build_diffusion_stage_config_consumes_typed_projection(tmp_path, monkeypatch, generic):
+    """Exercise the terminal constructor, not just the intermediate engine dict."""
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    if generic:
+        model = str(tmp_path)
+        stage = StageConfigFactory.create_typed_default_diffusion(
+            model, {"model_class_name": "ZImagePipeline", "tensor_parallel_size": 2}
+        ).stage_by_id(0)
+    else:
+        pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+        stage = _typed_stages(pipeline, deploy, model).stage_by_id(2)
+    # Only placement is mocked; projection, ownership validation, and the
+    # OmniDiffusionConfig constructor all run as they do during startup.
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 8)
+    monkeypatch.setattr(stage_init_utils.current_omni_platform, "device_control_env_var", None)
+    metadata = stage_init_utils.extract_stage_metadata(stage)
+
+    config = stage_init_utils.build_diffusion_stage_config(model, stage, metadata)
+
+    assert isinstance(config, OmniDiffusionConfig)
+    assert config.model == stage.model_config.model
+    assert config.stage_id == stage.stage_id
+    assert config.model_class_name == stage.diffusion_config.model_class_name
+    assert config.parallel_config.tensor_parallel_size == 2
+    assert config.num_gpus == stage.parallel_config.world_size
 
 
 def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):

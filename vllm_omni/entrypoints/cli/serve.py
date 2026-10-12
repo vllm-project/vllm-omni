@@ -1154,15 +1154,7 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
     stage_configs = list(resolved.stage_configs)
 
     sleep_stages = [
-        int(getattr(stage_config, "stage_id", stage_index))
-        for stage_index, stage_config in enumerate(stage_configs)
-        if bool(
-            getattr(
-                getattr(stage_config, "model_config", getattr(stage_config, "engine_args", None)),
-                "enable_sleep_mode",
-                False,
-            )
-        )
+        stage_config.stage_id for stage_config in stage_configs if stage_config.model_config.enable_sleep_mode
     ]
     if sleep_stages:
         raise ValueError(
@@ -1170,16 +1162,7 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
             f"disable enable_sleep_mode for stage(s) {sleep_stages}"
         )
 
-    async_chunk = any(
-        bool(
-            getattr(
-                getattr(stage, "connector_config", None),
-                "async_chunk",
-                getattr(getattr(stage, "engine_args", None), "async_chunk", False),
-            )
-        )
-        for stage in stage_configs
-    )
+    async_chunk = any(stage.connector_config.async_chunk for stage in stage_configs)
     return StageRuntime(
         stage_configs=stage_configs,
         model=model,

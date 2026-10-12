@@ -25,6 +25,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
+from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.platforms import current_omni_platform
@@ -328,7 +329,10 @@ def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, m
     baseline_config = Mock()
     warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
 
-    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    patch_hf_snapshot_download(monkeypatch, lambda *args, **kwargs: str(tmp_path), hf_home=tmp_path)
+    # Keep a remote model ID even when the test environment enables HF offline
+    # mode, so this exercises Omni's tokenizer-subfolder download branch.
+    monkeypatch.setattr("vllm.engine.arg_utils.get_model_path", lambda model, revision: model)
     monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
     monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
     monkeypatch.setattr(
@@ -565,4 +569,30 @@ def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
     assert omni_config.get_inputs_embeds_size() == omni_config.hf_text_config.hidden_size
 
 
-# For https://github.com/vllm-project/vllm-omni/issues/3293
+# For https://github.com/vllm-project/vllm-omni/issues/7564
+def test_from_cli_args_preserves_text_encoder_tp_size():
+    """`--text-encoder-tp-size` must survive from_cli_args field filtering.
+
+    Library callers build engine args via ``OmniEngineArgs.from_cli_args``;
+    the dataclass field filter drops any namespace attribute the dataclass
+    does not declare, silently resetting the diffusion text-encoder TP to 1.
+    """
+    engine_args = OmniEngineArgs.from_cli_args(
+        SimpleNamespace(text_encoder_tp_size=2),
+    )
+    assert engine_args.text_encoder_tp_size == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/7564
+def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
+    """The preserved explicit CLI override must reach the typed diffusion stage."""
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    engine_args = OmniEngineArgs.from_cli_args(
+        SimpleNamespace(text_encoder_tp_size=2),
+    )
+    config = StageConfigFactory.create_typed_default_diffusion(
+        "test-model", {"text_encoder_tp_size": engine_args.text_encoder_tp_size}
+    )
+
+    assert config.stage_configs[0].parallel_config.text_encoder_tp_size == 2

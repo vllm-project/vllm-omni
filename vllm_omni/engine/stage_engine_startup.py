@@ -34,6 +34,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.distributed.omni_connectors.utils import initialization
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.stage_init_utils import (
@@ -1414,17 +1415,12 @@ def replica_device_env(stage_id: int, devices: str | None):
 
 
 def get_headless_replica_devices(
-    stage_cfg: Any,
+    stage_cfg: BaseVllmOmniStageConfig,
     stage_id: int,
     omni_dp_size_local: int,
 ) -> list[str | None]:
     """Return per-replica device slices for a headless stage."""
-    runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", None))
-    devices_str: str | None = None
-    if runtime_cfg is not None:
-        devices_str = (
-            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        )
+    devices_str = stage_cfg.runtime_config.devices
     if not devices_str:
         return [None] * omni_dp_size_local
 
@@ -1527,6 +1523,7 @@ def launch_headless_diffusion_replicas(
 
     metadata = stage_init_utils.extract_stage_metadata(stage_cfg)
     if omni_conn_cfg:
+        assert omni_from is not None and omni_to is not None
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
     # from the loaded deploy config so heterogeneous KV routing keys match the

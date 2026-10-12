@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import copy
 import operator
+from dataclasses import replace
 
 import pytest
 from vllm.sampling_params import SamplingParams
@@ -30,7 +34,7 @@ def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
                 execution_type=StageExecutionType.LLM_AR,
                 owns_tokenizer=True,
                 requires_multimodal_data=True,
-                engine_output_type="token_ids",
+                engine_output_type="text",
                 custom_process_input_func="operator.add",
                 prompt_expand_func="operator.mul",
             ),
@@ -39,7 +43,7 @@ def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
                 model_stage="talker",
                 execution_type=StageExecutionType.LLM_GENERATION,
                 input_sources=(0,),
-                engine_output_type="audio_tokens",
+                engine_output_type="latent",
                 custom_process_input_func="operator.sub",
                 sync_process_input_func="operator.floordiv",
             ),
@@ -113,3 +117,16 @@ def test_extract_stage_metadata_projects_runtime_fields():
     assert diffusion.default_sampling_params.seed == 7
     assert diffusion.custom_process_input_func is operator.neg
     assert diffusion.cfg_kv_collect_func is operator.concat
+
+
+@pytest.mark.parametrize("engine_output_type", [None, "", "latent", "token_ids", "text+token_ids", "text+audio"])
+def test_extract_stage_metadata_preserves_declared_engine_output_type(engine_output_type):
+    pipeline, deploy = _metadata_inputs()
+    pipeline = replace(
+        pipeline,
+        stages=(replace(pipeline.stages[0], engine_output_type=engine_output_type), *pipeline.stages[1:]),
+    )
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    # Preserve explicit empty values so the output processor can reject them
+    # during startup instead of silently substituting its None default.
+    assert extract_stage_metadata(config.stage_by_id(0)).engine_output_type == engine_output_type
