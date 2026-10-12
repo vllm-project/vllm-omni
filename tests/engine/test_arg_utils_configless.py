@@ -35,11 +35,7 @@ def test_a_hub_repo_without_config_gets_one_written_001(monkeypatch) -> None:
         }
 
 
-def test_a_local_chatterbox_directory_without_config_gets_one_written_001(monkeypatch, tmp_path) -> None:
-    def no_config(*args, **kwargs):
-        raise OSError("no config.json")
-
-    monkeypatch.setattr(PretrainedConfig, "get_config_dict", no_config)
+def test_a_local_chatterbox_directory_without_config_gets_one_written_001(tmp_path) -> None:
     args = OmniEngineArgs(model=str(tmp_path), model_arch="ChatterboxForConditionalGeneration")
     args.hf_config_path = None
 
@@ -53,25 +49,20 @@ def test_a_local_chatterbox_directory_without_config_gets_one_written_001(monkey
         }
 
 
-def test_a_local_chatterbox_directory_with_a_config_is_left_alone_001(monkeypatch, tmp_path) -> None:
-    def no_config(*args, **kwargs):
-        raise OSError("config.json cannot be loaded")
-
-    (tmp_path / "config.json").write_text("{}")
-    monkeypatch.setattr(PretrainedConfig, "get_config_dict", no_config)
+def test_a_local_chatterbox_directory_with_an_invalid_config_is_left_alone_001(tmp_path) -> None:
+    # Exercise Transformers' real parse failure and preserve the user's file.
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{")
     args = OmniEngineArgs(model=str(tmp_path), model_arch="ChatterboxForConditionalGeneration")
     args.hf_config_path = None
 
     args._patch_empty_hf_config("chatterbox")
 
     assert args.hf_config_path is None
+    assert config_path.read_text() == "{"
 
 
-def test_an_unlisted_model_type_is_left_alone_001(monkeypatch, tmp_path) -> None:
-    def no_config(*args, **kwargs):
-        raise OSError("no config.json")
-
-    monkeypatch.setattr(PretrainedConfig, "get_config_dict", no_config)
+def test_an_unlisted_model_type_is_left_alone_001(tmp_path) -> None:
     args = OmniEngineArgs(model=str(tmp_path), model_arch="CosyVoice3Model")
     args.hf_config_path = None
 

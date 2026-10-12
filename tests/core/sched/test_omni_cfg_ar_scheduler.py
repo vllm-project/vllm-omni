@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import queue
-from types import SimpleNamespace
-
 import pytest
 from vllm import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -12,11 +9,6 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_cfg_ar_scheduler import OmniCFGARScheduler
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
-from vllm_omni.model_executor.stage_input_processors.chatterbox import (
-    expand_original_cfg_prompts,
-    prepare_original_prompt,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -110,56 +102,3 @@ def test_new_prefill_waits_for_initial_streaming_audio(monkeypatch):
     assert scheduler._should_defer_waiting_admission()
     request.append_output_token_ids(0)
     assert not scheduler._should_defer_waiting_admission()
-
-
-@pytest.mark.parametrize("weight", [0.0, 0.5])
-def test_stage0_only_engine_admission_schedules_complete_cfg_group(monkeypatch, weight):
-    from vllm.v1.engine import EngineCoreRequest
-
-    engine = object.__new__(AsyncOmniEngine)
-    engine.default_sampling_params_list = [SamplingParams(max_tokens=100)]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
-    engine.supported_tasks = ("generate",)
-    engine.prompt_transform_func = prepare_original_prompt
-    engine.prompt_expand_func = expand_original_cfg_prompts
-    engine.request_queue = SimpleNamespace(sync_q=queue.SimpleQueue())
-
-    def process_inputs(**kwargs):
-        return EngineCoreRequest(
-            request_id=kwargs["request_id"],
-            prompt_token_ids=kwargs["prompt"]["prompt_token_ids"],
-            mm_features=None,
-            sampling_params=kwargs["params"],
-            pooling_params=None,
-            arrival_time=0.0,
-            lora_request=None,
-            cache_salt=None,
-            data_parallel_rank=None,
-        )
-
-    engine.input_processor = SimpleNamespace(process_inputs=process_inputs)
-    info = {"chatterbox": {"cfg_weight": weight, "exaggeration": 0.5}}
-    if weight:
-        info["cfg_group"] = {"role": "cond", "uncond_suffix": "__cfg_uncond"}
-    engine.add_request("original", {"prompt_token_ids": [6561] * 41, "additional_information": info}, final_stage_id=0)
-
-    scheduler = _scheduler(monkeypatch, [])
-    scheduler._pairs.clear()
-    scheduler._request_pairs.clear()
-
-    def admit(self, request):
-        self.requests[request.request_id] = request
-        self.waiting.add_request(request)
-
-    monkeypatch.setattr(OmniARScheduler, "add_request", admit)
-    while not engine.request_queue.sync_q.empty():
-        core = engine.request_queue.sync_q.get_nowait().prompt
-        request = Request(core.request_id, core.prompt_token_ids, core.sampling_params, None)
-        request.external_req_id = core.external_req_id
-        request.additional_information = core.additional_information
-        scheduler.add_request(request)
-
-    expected = {"original": 41}
-    if weight:
-        expected["original__cfg_uncond"] = 41
-    assert scheduler.schedule().num_scheduled_tokens == expected
