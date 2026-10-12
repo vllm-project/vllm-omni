@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for MOSS-TTS-Realtime (MossTTSRealtime, 1.7B).
 
 Uses the standard omni_runner + pytestmark pattern (one module-scoped engine
@@ -95,10 +95,13 @@ def _get_test_config() -> str:
 # ---------------------------------------------------------------------------
 
 pytestmark = [
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.tts,
-    pytest.mark.parametrize("omni_runner", [(MODEL, _get_test_config())], indirect=True),
+    pytest.mark.parametrize(
+        "omni_runner",
+        [(MODEL, _get_test_config(), {"trust_remote_code": True})],
+        indirect=True,
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -156,12 +159,13 @@ def _build_request(ref_audio_path: str, text: str) -> dict:
     Frees the codec model before returning to avoid competing with the
     running vllm engine for GPU/CPU memory.
     """
-    from huggingface_hub import snapshot_download
     from transformers import AutoModel, AutoTokenizer
+
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     # Step 1: locate the realtime processor module in the snapshot.
     try:
-        snap_dir = Path(snapshot_download(repo_id=MODEL))
+        snap_dir = Path(hf_api().snapshot_download(repo_id=MODEL))
     except Exception as exc:
         msg = f"Cannot locate snapshot for {MODEL}: {exc}"
         if os.environ.get("MOSS_TTS_SKIP_ON_NET_FAIL"):
@@ -267,8 +271,7 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: English voice_clone produces non-empty 24 kHz audio."""
     req = _build_request(ref_audio_path, "This is a real-time TTS streaming test.")
@@ -279,8 +282,7 @@ def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str)
     assert not torch.all(audio == 0), "Audio is silence"
 
 
-@pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_realtime_chinese(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: Chinese input produces non-empty audio."""
     req = _build_request(ref_audio_path, "你好，这是语音合成测试。")

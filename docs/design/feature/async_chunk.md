@@ -209,40 +209,68 @@ In sequential mode, each stage must wait for the previous stage to complete enti
 
 7. **Request status**: `RequestStatus.WAITING_FOR_CHUNK` is added via patch (e.g. in `vllm_omni/patch.py`) so requests waiting for a chunk are not scheduled by the base vLLM scheduler until the chunk is ready.
 
+### Placeholder prewarm
+
+When a request arrives, `Orchestrator._prewarm_async_chunk_stages` submits every downstream stage that receives chunks right away, before any chunk exists. An LLM stage gets a placeholder request:
+
+- its `prompt_token_ids` are zeros of the expected prompt length (`compute_talker_prompt_ids_length`, or `hf_overrides.async_chunk_prewarm_prompt_len` if the stage sets it);
+- it carries no multimodal data;
+- it waits in `WAITING_FOR_CHUNK` until chunk 0 arrives.
+
+As a result, the downstream request already exists when the first chunk lands. Stages that only send chunks are not prewarmed, because their first real input comes from the orchestrator.
+
+#### Prewarm payload
+
+A stage can also receive data derived from the original request together with its placeholder, and use its idle steps to prepare for chunk 0. MiniCPM-o's Code2Wav uses this to prepare the reference audio (see the MiniCPM-o recipe). The contract spans four layers:
+
+| Layer | Touchpoint | Behavior |
+| --- | --- | --- |
+| Pipeline config | `StagePipelineConfig.async_chunk_prewarm_payload_func` | Dotted path to `fn(prompt) -> dict[str, Tensor \| scalar] \| None`. It is resolved in `stage_init_utils` and exposed on the stage client. |
+| Orchestrator | `_attach_async_chunk_prewarm_payload` | Runs on the initial add only. It is skipped on a streaming re-prewarm and for session-owned or resumable requests. It calls the function with the original prompt and adds the result to the placeholder's `additional_information` under flat keys `f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`. If the function fails or returns nothing, the placeholder is submitted unchanged. |
+| Scheduler | `OmniSchedulerMixin._take_async_chunk_prewarm` | In `add_request`, it pops those keys off a new request, so they never reach the runner's per-request buffer. The payload is delivered once, as an `OmniRequestPrewarm` in `OmniSchedulerOutput.pending_request_prewarms`. Finish and abort drop payloads that were never delivered. |
+| Runner and model | `on_requests_added(prewarms)`, `run_idle_prefetch()` | Optional model hooks in the GPU and NPU generation runners. `on_requests_added` runs right after `on_requests_finished`. `run_idle_prefetch` runs only on a zero-token step that follows another zero-token step, and the runner ignores its return value. A hook exception is logged and never reaches the EngineCore. |
+
+Constraints for a new integration:
+
+- Return a flat `{name: Tensor | scalar}` dict. The orchestrator turns each name into its own dotted key so that tensor values cross the wire as top-level values in `additional_information`, and the scheduler rebuilds the dict. Do not nest tensors inside containers.
+- Treat the payload as a hint. Chunk 0 must still carry everything the stage needs, because the payload is absent after a re-prewarm, for session-owned and resumable requests, and whenever the payload function fails.
+- Keep hook work bounded. The hooks run on the forward thread, so a chunk that becomes ready during a hook call waits for it to return.
+
 ## Configuration
 
-Enable async_chunk in stage configuration YAML:
+Enable async chunk mode in the deploy YAML:
 
 ```yaml
 async_chunk: true
-stage_args:
-  - stage_id: 0
-    engine_args:
-      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk
-  - stage_id: 1
-    engine_args:
-      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk
 ```
 
-### Stage Configuration
+The registered `PipelineConfig` owns the async handoff processor functions.
+For Qwen3-Omni these are `thinker2talker_async_chunk` and
+`talker2code2wav_async_chunk`; deploy YAML only selects the mode and runtime
+sizing.
+
+### Configuration ownership
 
 - `async_chunk: bool`: Enable/disable async chunk mode
-- `custom_process_next_stage_input_func: str`: Path to custom chunk processing function; receives `(transfer_manager, pooling_output, request)`. For qwen3-omni: `thinker2talker_async_chunk`, `talker2code2wav_async_chunk`
-- `stage_connector_config: dict`: Connector configuration
-- `worker_type: str`: Model type, e.g. `"ar"` or `"generation"` (used by OmniChunkTransferAdapter for mode-specific payload handling)
+- `async_chunk_process_next_stage_input_func: str`: Pipeline-owned chunk processor path
+- `execution_type: StageExecutionType`: Pipeline-owned runtime family
+- `connectors: dict`: Deploy-owned connector definitions
 - `max_num_seqs: int`: Maximum number of sequences for concurrent processing in the stage
-
 
 ### Connector Configuration
 
 ```yaml
 connectors:
-  - from_stage: 0
-    to_stage: 1
-    spec:
-      name: SharedMemoryConnector
-      extra:
-        stage_id: 0
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+  - stage_id: 1
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
 ```
 
 ### Code2Wav Batch Configuration
@@ -250,13 +278,10 @@ connectors:
 For optimal performance with async_chunk, the code2wav stage should be configured with batching:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 2  # code2wav stage
-    runtime:
-      devices: "1"
-    engine_args:
-      model_stage: code2wav
-      max_num_seqs: 64  # Enables batched audio generation
+    devices: "1"
+    max_num_seqs: 64  # Enables batched audio generation
 ```
 
 ## Related Files

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,12 +15,7 @@ from torch.distributed.fsdp import (
 )
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_fs_group,
-    get_fully_shard_rank,
-    get_fully_shard_world_size,
-    get_world_group,
-)
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -51,39 +46,47 @@ class HSDPInferenceConfig:
     reshard_after_forward: bool = True
 
 
+@dataclass
+class HSDPShardContext:
+    """Reusable state for incrementally sharding one HSDP model."""
+
+    hsdp_kwargs: dict[str, Any]
+    ignored_params: set[nn.Parameter] | None = None
+
+
 def _create_hsdp_mesh(
     device_type: str,
     replicate_size: int,
-    shard_pg: torch.distributed.ProcessGroup,
+    shard_size: int,
 ) -> DeviceMesh:
-    """Create a 2D DeviceMesh for HSDP using an existing ProcessGroup for the shard dimension.
+    """Create the FSDP2 DeviceMesh; it owns the HSDP process groups.
 
     Args:
         device_type: The device type (e.g., "cuda", "npu")
         replicate_size: Number of replica groups
-        shard_pg: The ProcessGroup for the shard dimension (from FS GroupCoordinator)
+        shard_size: Number of ranks in each FSDP shard group
 
     Returns:
         A 2D DeviceMesh with dimensions ("replicate", "shard")
     """
-    shard_size = torch.distributed.get_world_size(shard_pg)
     world_size = replicate_size * shard_size
+    actual_world_size = torch.distributed.get_world_size()
+    if world_size != actual_world_size:
+        raise ValueError(
+            f"HSDP mesh dimensions ({replicate_size} x {shard_size} = {world_size}) "
+            f"must equal WORLD size ({actual_world_size})"
+        )
 
     # Build 2D mesh tensor: shape (replicate_size, shard_size)
     # Ranks are arranged so that each row is a shard group
     mesh_tensor = torch.arange(world_size).reshape(replicate_size, shard_size)
 
-    # Create DeviceMesh with the shard ProcessGroup
-    # For the shard dimension, we reuse the existing FS ProcessGroup
     device_mesh = init_device_mesh(
         device_type,
         mesh_shape=(replicate_size, shard_size),
         mesh_dim_names=("replicate", "shard"),
     )
 
-    # Note: init_device_mesh creates new ProcessGroups internally.
-    # For consistency, we verify the mesh structure matches our FS group.
-    # In a future optimization, we could pass the existing ProcessGroups directly.
     logger.debug(
         "Created HSDP mesh: replicate_size=%d, shard_size=%d, mesh=%s",
         replicate_size,
@@ -116,37 +119,59 @@ def apply_hsdp_to_model(
     Returns:
         HSDP-wrapped model ready for inference
     """
+    context = prepare_hsdp_shard_context(
+        model,
+        hsdp_config,
+        target_device=target_device,
+    )
+
+    hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
+    if not hsdp_shard_conditions:
+        raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
+
+    # Apply HSDP sharding, this will automatically handle weight distribution
+    shard_model(
+        model,
+        hsdp_shard_conditions=hsdp_shard_conditions,
+        context=context,
+    )
+
+    logger.info("HSDP applied to model: %s", type(model).__name__)
+    return model
+
+
+def prepare_hsdp_shard_context(
+    model: nn.Module,
+    hsdp_config: HSDPInferenceConfig,
+    target_device: torch.device | None = None,
+) -> HSDPShardContext:
+    """Prepare mesh, precision, and ignored-parameter state for HSDP.
+
+    The returned context can be reused to shard completed child modules while
+    checkpoint weights are still streaming, then to shard the root once all
+    children have been loaded.
+    """
     if not hsdp_config.enabled:
         raise ValueError("HSDP is not enabled in config")
 
-    # Use GroupCoordinator for distributed info
     world_group = get_world_group()
-    fs_group = get_fs_group()
-
     world_size = world_group.world_size
     rank = world_group.rank_in_group
-    fs_world_size = get_fully_shard_world_size()
-    fs_rank = get_fully_shard_rank()
 
     hsdp_replicate_size = hsdp_config.hsdp_replicate_size
     hsdp_shard_size = hsdp_config.hsdp_shard_size
 
-    # Validate that the FS group matches the HSDP shard size
-    if fs_world_size != hsdp_shard_size:
+    if hsdp_replicate_size * hsdp_shard_size != world_size:
         raise ValueError(
-            f"FS group world_size ({fs_world_size}) does not match "
-            f"HSDP shard_size ({hsdp_shard_size}). "
-            "Ensure fully_shard_degree is set correctly in initialize_model_parallel."
+            f"HSDP mesh dimensions ({hsdp_replicate_size} x {hsdp_shard_size}) must equal WORLD size ({world_size})"
         )
 
     logger.info(
-        "HSDP Inference: replicate_size=%d, shard_size=%d, world_size=%d, rank=%d, fs_world_size=%d, fs_rank=%d",
+        "HSDP Inference (FSDP2): replicate_size=%d, shard_size=%d, world_size=%d, rank=%d",
         hsdp_replicate_size,
         hsdp_shard_size,
         world_size,
         rank,
-        fs_world_size,
-        fs_rank,
     )
 
     # When the model contains FP8 parameters (online quantization), let FSDP
@@ -154,8 +179,9 @@ def apply_hsdp_to_model(
     # hsdp_config.param_dtype (typically bfloat16). FP8 GEMM kernels expect
     # FP8 inputs; an implicit FP8 -> bf16 cast would silently break them.
     has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
+    preserve_parameter_dtypes = bool(getattr(model, "_hsdp_preserve_parameter_dtypes", False))
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=None if has_fp8_params else hsdp_config.param_dtype,
+        param_dtype=None if has_fp8_params or preserve_parameter_dtypes else hsdp_config.param_dtype,
         reduce_dtype=hsdp_config.reduce_dtype,
         output_dtype=hsdp_config.output_dtype,
         cast_forward_inputs=False,
@@ -163,18 +189,18 @@ def apply_hsdp_to_model(
 
     device_type = current_omni_platform.device_type
 
-    # Create 2D DeviceMesh for HSDP using the FS group's ProcessGroup for shard dimension
+    # DeviceMesh is the single source of truth for FSDP2 shard/replicate groups
     # The mesh shape is (replicate, shard) where:
     # - replicate: groups of ranks that hold the same shard (for gradient all-reduce in training)
     # - shard: groups of ranks that each hold different shards (for parameter all-gather)
     device_mesh = _create_hsdp_mesh(
         device_type=device_type,
         replicate_size=hsdp_replicate_size,
-        shard_pg=fs_group.device_group,
+        shard_size=hsdp_shard_size,
     )
 
     hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
-    if not hsdp_shard_conditions or len(hsdp_shard_conditions) == 0:
+    if not hsdp_shard_conditions:
         raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
 
     # Collect parameters of any modules the model wants excluded from FSDP sharding.
@@ -197,11 +223,16 @@ def apply_hsdp_to_model(
             "the ignored modules can be placed on the worker's execution device."
         )
     for mod_name in ignored_module_names:
-        sub_mod = getattr(model, mod_name, None)
-        if sub_mod is None:
+        try:
+            sub_mod = model.get_submodule(mod_name)
+        except AttributeError:
             logger.warning("_hsdp_ignored_modules entry %r not found on model", mod_name)
             continue
-        sub_mod.to(target_device)
+        has_meta_tensor = any(tensor.device.type == "meta" for tensor in (*sub_mod.parameters(), *sub_mod.buffers()))
+        if has_meta_tensor:
+            sub_mod.to_empty(device=target_device)
+        else:
+            sub_mod.to(target_device)
         ignored_params.update(sub_mod.parameters())
     if ignored_params:
         logger.info(
@@ -237,21 +268,36 @@ def apply_hsdp_to_model(
             target_device,
         )
 
-    # Apply HSDP sharding, this will automatically handle weight distribution
-    shard_model(
-        model,
-        reshard_after_forward=hsdp_config.reshard_after_forward,
-        mp_policy=mp_policy,
-        mesh=device_mesh,
-        hsdp_shard_conditions=hsdp_shard_conditions,
-        ignored_params=ignored_params if ignored_params else None,
+    return HSDPShardContext(
+        hsdp_kwargs={
+            "reshard_after_forward": hsdp_config.reshard_after_forward,
+            "mesh": device_mesh,
+            "mp_policy": mp_policy,
+        },
+        ignored_params=ignored_params or None,
     )
 
-    for param in model.parameters():
+
+def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
+    """Shard one completed child module with a prepared HSDP context."""
+    module_kwargs = dict(context.hsdp_kwargs)
+    if context.ignored_params:
+        module_ignored_params = context.ignored_params.intersection(module.parameters())
+        if module_ignored_params:
+            module_kwargs["ignored_params"] = module_ignored_params
+    fully_shard(module, **module_kwargs)
+    for param in module.parameters():
         param.requires_grad = False
 
-    logger.info("HSDP applied to model: %s", type(model).__name__)
-    return model
+
+def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
+    """Shard the model root after all selected child modules are sharded."""
+    root_kwargs = dict(context.hsdp_kwargs)
+    if context.ignored_params:
+        root_kwargs["ignored_params"] = context.ignored_params
+    fully_shard(model, **root_kwargs)
+    for param in model.parameters():
+        param.requires_grad = False
 
 
 def shard_model(
@@ -262,6 +308,7 @@ def shard_model(
     mesh: DeviceMesh | None = None,
     hsdp_shard_conditions: list[Callable[[str, nn.Module], bool]],
     ignored_params: set[nn.Parameter] | None = None,
+    context: HSDPShardContext | None = None,
 ) -> None:
     """Apply HSDP sharding to model modules based on shard conditions.
 
@@ -272,32 +319,30 @@ def shard_model(
     This is required for packed integer parameters inside sharded transformer
     blocks; the root wrap receives the full set for all remaining parameters.
     """
-    hsdp_kwargs: dict[str, Any] = {
-        "reshard_after_forward": reshard_after_forward,
-        "mesh": mesh,
-        "mp_policy": mp_policy,
-    }
+    if context is None:
+        context = HSDPShardContext(
+            hsdp_kwargs={
+                "reshard_after_forward": reshard_after_forward,
+                "mesh": mesh,
+                "mp_policy": mp_policy,
+            },
+            ignored_params=ignored_params,
+        )
+    elif any(value is not None for value in (mp_policy, mesh, ignored_params)) or not reshard_after_forward:
+        raise ValueError("Pass either context or individual HSDP shard options, not both")
 
     num_sharded = 0
     for name, module in reversed(list(model.named_modules())):
         if any(cond(name, module) for cond in hsdp_shard_conditions):
-            module_kwargs = dict(hsdp_kwargs)
-            if ignored_params:
-                module_ignored_params = ignored_params.intersection(module.parameters())
-                if module_ignored_params:
-                    module_kwargs["ignored_params"] = module_ignored_params
-            fully_shard(module, **module_kwargs)
+            shard_hsdp_module(module, context)
             num_sharded += 1
 
     if num_sharded == 0:
         raise ValueError("No modules were sharded")
 
-    root_kwargs = dict(hsdp_kwargs)
-    if ignored_params:
-        root_kwargs["ignored_params"] = ignored_params
-    fully_shard(model, **root_kwargs)
+    finalize_hsdp_root(model, context)
     logger.info(
         "Sharded %d modules + root (ignored_params=%d)",
         num_sharded,
-        len(ignored_params) if ignored_params else 0,
+        len(context.ignored_params) if context.ignored_params else 0,
     )

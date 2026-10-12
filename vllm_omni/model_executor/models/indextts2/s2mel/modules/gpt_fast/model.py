@@ -116,6 +116,7 @@ class Transformer(nn.Module):
         context: Tensor | None = None,
         context_input_pos: Tensor | None = None,
         cross_attention_mask: Tensor | None = None,
+        unpad_data: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         if mask is None:  # in case of non-causal model
@@ -135,7 +136,18 @@ class Transformer(nn.Module):
                 skip_in_x = skip_in_x_list.pop(-1)
             else:
                 skip_in_x = None
-            x = layer(x, c, input_pos, freqs_cis, mask, context, context_freqs_cis, cross_attention_mask, skip_in_x)
+            x = layer(
+                x,
+                c,
+                input_pos,
+                freqs_cis,
+                mask,
+                context,
+                context_freqs_cis,
+                cross_attention_mask,
+                skip_in_x,
+                unpad_data=unpad_data,
+            )
             if self.uvit_skip_connection and i in self.layers_emit_skip:
                 skip_in_x_list.append(x)
         x = self.norm(x, c)
@@ -169,11 +181,18 @@ class TransformerBlock(nn.Module):
         context_freqs_cis: Tensor | None = None,
         cross_attention_mask: Tensor | None = None,
         skip_in_x: Tensor | None = None,
+        unpad_data: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         c = None if self.time_as_token else c
         if self.uvit_skip_connection and skip_in_x is not None:
             x = self.skip_in_linear(torch.cat([x, skip_in_x], dim=-1))
-        h = x + self.attention(self.attention_norm(x, c), freqs_cis, mask, input_pos)
+        h = x + self.attention(
+            self.attention_norm(x, c),
+            freqs_cis,
+            mask,
+            input_pos,
+            unpad_data=unpad_data,
+        )
         out = h + self.feed_forward(self.ffn_norm(h, c))
         return out
 
@@ -218,6 +237,7 @@ class Attention(nn.Module):
         input_pos: Tensor | None = None,
         context: Tensor | None = None,
         context_freqs_cis: Tensor | None = None,
+        unpad_data: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -252,7 +272,37 @@ class Attention(nn.Module):
         # building AttentionMetadata entirely — this avoids the backend's
         # `torch.any(~mask)` D2H sync per ODE step and keeps the forward
         # CUDA-graph capturable.
-        if getattr(self, "_assume_full_mask", False):
+        full_mask_state = getattr(self, "_assume_full_mask", None)
+        packed_varlen = (
+            unpad_data is not None
+            and context is None
+            and q.device.type == "cuda"
+            and q.dtype != torch.float32
+            and hasattr(getattr(self.diff_attn, "attention", None), "_forward_varlen_packed")
+        )
+        if packed_varlen:
+            indices, cu_seqlens = unpad_data
+            packed_q = q.flatten(0, 1).index_select(0, indices).unsqueeze(0)
+            packed_k = k.flatten(0, 1).index_select(0, indices).unsqueeze(0)
+            packed_v = v.flatten(0, 1).index_select(0, indices).unsqueeze(0)
+            packed_metadata = AttentionMetadata(
+                extra={
+                    "cu_seqlens_q": cu_seqlens,
+                    "cu_seqlens_k": cu_seqlens,
+                    "max_seqlen_q": seqlen,
+                    "max_seqlen_k": seqlen,
+                }
+            )
+            packed_y = self.diff_attn(
+                packed_q,
+                packed_k,
+                packed_v,
+                attn_metadata=packed_metadata,
+            )
+            flat_y = torch.zeros_like(q.flatten(0, 1))
+            flat_y.index_copy_(0, indices, packed_y.squeeze(0))
+            y = flat_y.view_as(q)
+        elif full_mask_state is True:
             attn_metadata = None
         else:
             attn_mask = mask
@@ -260,8 +310,15 @@ class Attention(nn.Module):
                 # (B, 1, T, T) → (B, T) — take the first query row;
                 # all query positions share the same padding pattern.
                 attn_mask = attn_mask[:, 0, 0, :]
-            attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
-        y = self.diff_attn(q, k, v, attn_metadata=attn_metadata)
+            attn_metadata = (
+                AttentionMetadata(
+                    attn_mask=attn_mask,
+                )
+                if attn_mask is not None
+                else None
+            )
+        if not packed_varlen:
+            y = self.diff_attn(q, k, v, attn_metadata=attn_metadata)
         y = y.flatten(2, 3)
 
         y = self.wo(y)

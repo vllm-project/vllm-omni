@@ -18,6 +18,7 @@ from vllm_omni.config.stage_config import (
 
 MOSS_TTS_NANO_PIPELINE = PipelineConfig(
     model_type="moss_tts_nano",
+    default_deploy_config_name="moss_tts_nano.yaml",
     model_arch="MossTTSNanoForCausalLM",
     stages=(
         StagePipelineConfig(

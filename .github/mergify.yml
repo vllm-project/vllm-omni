@@ -45,7 +45,7 @@ pull_request_rules:
         > # For mypy (substitute "3.10" with the failing version if needed)
         > pre-commit run --hook-stage manual mypy-3.10
         > # For markdownlint
-        > pre-commit run --hook-stage manual markdownlint
+        > pre-commit run markdownlint-cli2
         > ```
         > </details>
 

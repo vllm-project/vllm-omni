@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
 import inspect
@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
@@ -48,7 +50,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, spli
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -264,7 +266,11 @@ def apply_rotary_emb_qwen(
 
 
 class QwenImagePipeline(
-    nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
+    QwenImageLoraLoaderMixin,
 ):
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -309,9 +315,8 @@ class QwenImagePipeline(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
-        # half-written cache (missing-shard ``OSError`` *and* the default
-        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
-        # could not recover) instead of crashing the worker.
+        # half-written cache (missing-shard ``OSError`` and the default
+        # -config size-mismatch ``RuntimeError``) instead of crashing the worker.
         self.text_encoder = from_pretrained_with_prefetch(
             Qwen2_5_VLForConditionalGeneration.from_pretrained,
             model,
@@ -333,14 +338,20 @@ class QwenImagePipeline(
             del visual_owner.visual
         else:
             logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
-        self.text_encoder = self.text_encoder.to(self.device)
+        # Under model-level CPU offload, keep the BF16 encoder/VAE on CPU so they
+        # do not share VRAM with DiT construction (#7555). The DiT follows the
+        # loader's default-device context (CUDA for online / AutoRound INT under
+        # offload, CPU for layerwise / unquantized HSDP defer).
+        cpu_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+        enc_vae_device = torch.device("cpu") if cpu_offload else self.device
+        self.text_encoder = self.text_encoder.to(enc_vae_device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=qwen_subfolders,
             local_files_only=local_files_only,
-        ).to(self.device)
+        ).to(enc_vae_device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         self.transformer = QwenImageTransformer2DModel(
             od_config=od_config,
@@ -771,9 +782,9 @@ class QwenImagePipeline(
 
     def prepare_encode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
-    ) -> "DiffusionRequestState":
+    ) -> "StepRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
         sampling = state.sampling
         prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
@@ -960,7 +971,7 @@ class QwenImagePipeline(
 
     def step_scheduler(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -981,7 +992,7 @@ class QwenImagePipeline(
 
     def post_decode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
         """Decode final latents from *state*."""

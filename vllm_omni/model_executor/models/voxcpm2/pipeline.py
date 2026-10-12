@@ -15,6 +15,7 @@ from vllm_omni.config.stage_config import (
 
 VOXCPM2_PIPELINE = PipelineConfig(
     model_type="voxcpm2",
+    default_deploy_config_name="voxcpm2.yaml",
     model_arch="VoxCPM2TalkerForConditionalGeneration",
     stages=(
         StagePipelineConfig(

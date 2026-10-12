@@ -1,0 +1,4 @@
+interface:
+  display_name: "Music Video Direction"
+  short_description: "Plan music-driven scenes and optional lyric text"
+  default_prompt: "Use $music-video-subtitle-generator to prepare the requested H3 prompts or video with the available tools."

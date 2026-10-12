@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     ModelOptFp8CheckpointAdapter,
+    ModelOptNvFp4CheckpointAdapter,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -87,6 +88,23 @@ class _QuantizedRemappedModelOptModel(nn.Module):
         if name.startswith(prefix):
             return "runtime.proj." + name[len(prefix) :]
         return name
+
+
+class _RemappedNvFp4Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime = nn.Module()
+        self.runtime.proj = nn.Module()
+        self.runtime.proj.register_parameter(
+            "weight",
+            nn.Parameter(torch.empty(1, 1, dtype=torch.uint8), requires_grad=False),
+        )
+        for name in ("input_scale", "weight_scale", "weight_scale_2"):
+            self.runtime.proj.register_parameter(name, nn.Parameter(torch.empty(1), requires_grad=False))
+
+    @staticmethod
+    def remap_checkpoint_key(name: str) -> str:
+        return name.replace("transformer.orig.proj.", "runtime.proj.")
 
 
 def _make_source() -> SimpleNamespace:
@@ -188,13 +206,36 @@ def test_modelopt_adapter_remaps_and_keeps_scales_for_quantized_target():
     emitted = dict(adapted)
     assert len(adapted) == len(emitted) == 3
 
-    # Both scales are retained (the dropped-scale regression). They keep their
-    # source-checkpoint names; the model's load_weights remaps them downstream.
-    assert torch.equal(emitted["transformer.orig.proj.weight_scale"], weight_scale)
-    assert torch.equal(emitted["transformer.orig.proj.input_scale"], input_scale)
+    # Both scales are retained and emitted under the remapped runtime names.
+    assert torch.equal(emitted["runtime.proj.weight_scale"], weight_scale)
+    assert torch.equal(emitted["runtime.proj.input_scale"], input_scale)
 
     # The FP8 weight is passed through unchanged under the remapped target name
     # (the quantized param is FP8, so it must NOT be dequantized). Compare via
     # float32 since torch.equal has no FP8 CPU kernel.
     assert emitted["runtime.proj.weight"].dtype == torch.float8_e4m3fn
     assert torch.equal(emitted["runtime.proj.weight"].to(torch.float32), fp8_weight.to(torch.float32))
+
+
+def test_modelopt_nvfp4_adapter_remaps_quantized_weights_and_scales():
+    adapter = ModelOptNvFp4CheckpointAdapter(_RemappedNvFp4Model(), _make_source())
+    prefix = "transformer.orig.proj"
+    checkpoint_tensors = [
+        (f"{prefix}.input_scale", torch.tensor([1.0])),
+        (f"{prefix}.weight_scale", torch.tensor([0.5])),
+        (f"{prefix}.weight_scale_2", torch.tensor([0.25])),
+        (f"{prefix}.weight", torch.tensor([[1]], dtype=torch.uint8)),
+    ]
+
+    adapted = list(adapter.adapt(iter(checkpoint_tensors)))
+
+    assert [name for name, _ in adapted] == [
+        name.replace(f"{prefix}.", "runtime.proj.") for name, _ in checkpoint_tensors
+    ]
+
+
+def test_modelopt_nvfp4_adapter_rejects_unconsumed_pre_quant_scale():
+    adapter = ModelOptNvFp4CheckpointAdapter(nn.Module(), _make_source())
+
+    with pytest.raises(ValueError, match="does not consume pre_quant_scale"):
+        list(adapter.adapt(iter([("transformer.proj.pre_quant_scale", torch.tensor([1.0]))])))

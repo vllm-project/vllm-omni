@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import pytest
+import torch
+from torch import nn
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _TinyModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.kept = nn.Linear(1, 1, bias=False)
+        self.skipped = nn.Linear(1, 1, bias=False)
+        self.rotary_embed = nn.Module()
+        self.rotary_embed.register_parameter("inv_freq", nn.Parameter(torch.zeros(1)))
+
+
+def test_upstream_mapper_preserves_stage_exclusions_after_renaming() -> None:
+    model = _TinyModel()
+    model.skipped.weight.data.zero_()
+
+    loaded = AutoWeightsLoader(model).load_weights(
+        [
+            ("checkpoint.kept.weight", torch.ones(1, 1)),
+            ("checkpoint.skipped.weight", torch.full((1, 1), 2.0)),
+            ("rotary_embed.inv_freq", torch.ones(1)),
+        ],
+        mapper=WeightsMapper(orig_to_new_prefix={"checkpoint.": ""})
+        | WeightsMapper(orig_to_new_prefix={"skipped.": None}, orig_to_new_substr={"rotary_embed.inv_freq": None}),
+    )
+
+    assert loaded == {"kept.weight"}
+    torch.testing.assert_close(model.kept.weight, torch.ones(1, 1))
+    torch.testing.assert_close(model.skipped.weight, torch.zeros(1, 1))
+    torch.testing.assert_close(model.rotary_embed.inv_freq, torch.zeros(1))

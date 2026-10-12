@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for TrackingArgumentParser and related utilities."""
 
 import argparse
@@ -23,6 +26,9 @@ from vllm_omni.utils.tracking_parser import (
     build_shadow_kwargs,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 ### Fake pipeline/deploy config for integration tests
 
 _TEST_MODEL = "_test_tracking"
@@ -32,7 +38,7 @@ _TEST_PIPELINE = PipelineConfig(
     stages=(
         StagePipelineConfig(stage_id=0, model_stage="stage0"),
         StagePipelineConfig(stage_id=1, model_stage="stage1"),
-        StagePipelineConfig(stage_id=2, model_stage="stage2"),
+        StagePipelineConfig(stage_id=2, model_stage="stage2", final_output=True),
     ),
 )
 
@@ -49,6 +55,11 @@ _TEST_DEPLOY = DeployConfig(
 @pytest.fixture()
 def mock_stages(monkeypatch):
     """Register a fake pipeline and mock deploy YAML loading."""
+    from vllm_omni import platforms
+
+    platform = platforms.current_omni_platform
+    monkeypatch.setattr(platform, "device_name", "cpu", raising=False)
+    monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
     monkeypatch.setitem(OMNI_PIPELINES, _TEST_MODEL, _TEST_PIPELINE)
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.load_deploy_config",
@@ -209,6 +220,46 @@ def test_store_true_explicit():
     assert ns.explicit_keys == {"verbose"}
     assert isinstance(ns, TrackingNamespace)
     assert ns.verbose is True
+
+
+def test_unset_trust_remote_code_falls_back_to_engine_default_none():
+    """Regression guard for issue #5495 (the CLI-plumbing half).
+
+    The CI test ``test_completions_rejected_for_thinker_talker`` does NOT pass
+    ``--trust-remote-code``. Because it is a ``store_true`` flag, an omitted
+    value is dropped from ``get_explicit_kwargs_dict()`` (it is not user-typed),
+    so it is never forwarded to ``AsyncOmni(**kwargs)`` and the engine falls back
+    to ``AsyncOmniEngine.__init__``'s default of ``None`` — NOT argparse's
+    ``False``. That ``None`` is what used to break endpoint-restriction
+    resolution (see ``TestQwen3OmniPipeline.
+    test_endpoint_restrictions_survive_unset_trust_remote_code``).
+
+    This test locks in the "CI does not pass the flag => effective value is
+    None" premise so a future refactor cannot silently change it.
+    """
+    import inspect
+
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    p = TrackingArgumentParser()
+    # Mirror how --trust-remote-code is registered upstream (store_true).
+    p.add_argument("--trust-remote-code", action="store_true")
+
+    # Scenario A: CI — flag omitted.
+    ns = p.parse_args([])
+    assert "trust_remote_code" not in ns.explicit_keys
+    kwargs = ns.get_explicit_kwargs_dict()
+    assert "trust_remote_code" not in kwargs
+    engine_default = inspect.signature(AsyncOmniEngine.__init__).parameters["trust_remote_code"].default
+    assert engine_default is None
+    effective = kwargs.get("trust_remote_code", engine_default)
+    assert effective is None  # <- the value that reached the buggy restriction path
+
+    # Scenario B: flag passed (what earlier repros used) => True, restrictions fine.
+    ns2 = p.parse_args(["--trust-remote-code"])
+    assert "trust_remote_code" in ns2.explicit_keys
+    kwargs2 = ns2.get_explicit_kwargs_dict()
+    assert kwargs2.get("trust_remote_code", engine_default) is True
 
 
 def test_store_false_default():
@@ -584,6 +635,12 @@ def test_cli_overrides_config(tmp_path):
 
 
 ### Integration tests for arg resolution through StageConfigFactory
+#
+# These tests still target the transitional legacy StageConfig path because the
+# current runtime reads explicit CLI values from ``stage.runtime_overrides``.
+# After RFC #4021 migrates engine startup to consume ``VllmOmniConfig`` directly,
+# these assertions should move to the structured config/runtime boundary and the
+# ``_create_legacy_from_registry`` calls should be removed.
 def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
     """Explicitly passed CLI values reach runtime_overrides on all stages."""
     p = TrackingArgumentParser()
@@ -591,8 +648,7 @@ def test_explicit_cli_arg_reaches_runtime_overrides(mock_stages):
     ns = p.parse_args(["--max-num-seqs", "999"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -608,8 +664,7 @@ def test_omitted_default_not_in_runtime_overrides(mock_stages):
     ns = p.parse_args([])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -630,8 +685,7 @@ def test_config_file_args_reach_runtime_overrides(mock_stages):
         ns = p.parse_args(["--config", "fake.yaml"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -648,8 +702,7 @@ def test_per_stage_override_routes_correctly(mock_stages):
     ns = p.parse_args(["--stage-0-gpu-memory-utilization", "0.42"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,
@@ -670,8 +723,7 @@ def test_explicit_args_omitted_from_yaml(mock_stages):
     ns = p.parse_args(["--enforce-eager"])
 
     explicit_kwargs = ns.get_explicit_kwargs_dict()
-    stages, _ = StageConfigFactory._create_from_registry(
-        _TEST_MODEL,
+    stages, _ = StageConfigFactory._create_legacy_from_registry(
         _TEST_PIPELINE,
         explicit_kwargs,
         deploy_config_path=mock_stages,

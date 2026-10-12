@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Offline inference demo for Qwen3 TTS via vLLM Omni.
 
 Provides single and batch sample inputs for CustomVoice, VoiceDesign, and Base
@@ -166,6 +169,9 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
                 "language": [language],
                 "speaker": [speaker],
                 "max_new_tokens": [2048],
+                # Optional Code2Wav emit opt-in under deploy.async_chunk.
+                # Independent of prompt-mode non_streaming_mode (#4198 / #6898).
+                "full_utterance_decode": [True],
             }
             inputs.append(
                 {
@@ -185,6 +191,7 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
             "speaker": [speaker],
             "instruct": [instruct],
             "max_new_tokens": [2048],
+            "full_utterance_decode": [True],
         }
         inputs = {
             "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
@@ -226,6 +233,7 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
                 "instruct": [instruct],
                 "max_new_tokens": [2048],
                 "non_streaming_mode": [True],
+                "full_utterance_decode": [True],
             }
             inputs.append(
                 {
@@ -244,6 +252,7 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
             "instruct": [instruct],
             "max_new_tokens": [2048],
             "non_streaming_mode": [True],
+            "full_utterance_decode": [True],
         }
         inputs = {
             "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
@@ -291,6 +300,7 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
                 "language": [language],
                 "x_vector_only_mode": [x_vector_only_mode],
                 "max_new_tokens": [2048],
+                "full_utterance_decode": [True],
             }
             inputs.append(
                 {
@@ -307,6 +317,7 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
             "language": [syn_lang_single],
             "x_vector_only_mode": [x_vector_only_mode],
             "max_new_tokens": [2048],
+            "full_utterance_decode": [True],
         }
         inputs = {
             "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
@@ -391,7 +402,7 @@ def main(args):
     for batch_start in range(0, len(inputs), batch_size):
         batch = inputs[batch_start : batch_start + batch_size]
         for stage_outputs in omni.generate(batch):
-            output = stage_outputs.request_output
+            output = stage_outputs
             _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
 
 
@@ -412,7 +423,7 @@ async def main_streaming(args):
         t_prev = t_start
         chunk_idx = 0
         async for stage_output in omni.generate(prompt, request_id=request_id):
-            mm = stage_output.request_output.outputs[0].multimodal_output
+            mm = stage_output.outputs[0].multimodal_output
             if not stage_output.finished:
                 t_now = time.perf_counter()
                 audio = mm.get("audio")
@@ -490,10 +501,10 @@ def parse_args():
         help="Path to a .txt file with one prompt per line (preferred).",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to a stage configs file.",
+        help="Path to a deploy config YAML.",
     )
     parser.add_argument(
         "--audio-path",

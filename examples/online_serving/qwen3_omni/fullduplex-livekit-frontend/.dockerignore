@@ -1,0 +1,6 @@
+agent-starter-react/
+.git/
+.claude/
+__pycache__/
+*.py[cod]
+*.log

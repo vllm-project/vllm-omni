@@ -14,6 +14,7 @@ from vllm_omni.config.stage_config import (
 
 OMNIVOICE_PIPELINE = PipelineConfig(
     model_type="omnivoice",
+    default_deploy_config_name="omnivoice.yaml",
     model_arch="OmniVoicePipeline",
     stages=(
         StagePipelineConfig(

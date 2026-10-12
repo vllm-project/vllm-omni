@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Integration tests for MooncakeTransferEngineConnector.
@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_open_port
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
     ManagedBuffer,
     MooncakeTransferEngineConnector,
@@ -164,14 +165,6 @@ RDMA_HOST = get_rdma_host()
 RDMA_DEVICE = _detect_rdma_device()
 
 
-def _free_port() -> int:
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((RDMA_HOST, 0))
-        return s.getsockname()[1]
-
-
 def _connector_config(
     zmq_port: int,
     pool_size: int = 16 * 1024 * 1024,
@@ -204,7 +197,7 @@ class TestBasicConnector:
     """Verify connector initialization, put, cleanup, and health check."""
 
     def test_initialization(self):
-        port = _free_port()
+        port = get_open_port(RDMA_HOST)
         with MooncakeTransferEngineConnector(_connector_config(port, pool_size=1024 * 1024)) as c:
             assert c.rpc_port != 0
             assert c.pool_size == 1024 * 1024
@@ -214,7 +207,7 @@ class TestBasicConnector:
 
     def test_put_tensor_bytes_object(self):
         """Put tensor / bytes / dict and verify metadata."""
-        port = _free_port()
+        port = get_open_port(RDMA_HOST)
         with MooncakeTransferEngineConnector(_connector_config(port)) as c:
             ok, sz, meta = c.put("s0", "s1", "t", torch.randn(100))
             assert ok
@@ -229,7 +222,7 @@ class TestBasicConnector:
             assert not meta["is_fast_path"]
 
     def test_cleanup_releases_buffer(self):
-        port = _free_port()
+        port = get_open_port(RDMA_HOST)
         with MooncakeTransferEngineConnector(_connector_config(port)) as c:
             c.put("s0", "s1", "r1", torch.randn(100))
             key = MooncakeTransferEngineConnector._make_key("r1", "s0", "s1")
@@ -239,7 +232,7 @@ class TestBasicConnector:
 
     def test_pool_exhaustion_and_recovery(self):
         """Fill pool, verify failure, free, verify recovery."""
-        port = _free_port()
+        port = get_open_port(RDMA_HOST)
         with MooncakeTransferEngineConnector(_connector_config(port, pool_size=64 * 1024)) as c:
             ids = []
             for i in range(10):
@@ -264,8 +257,8 @@ class TestEndToEnd:
     """E2E RDMA transfer: tensor, bytes, object, zero-copy, large payload, mixed types."""
 
     def _pair(self, pool_size=16 * 1024 * 1024):
-        p = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
-        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
+        p = MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST), pool_size))
+        c = MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST), pool_size))
         return p, c
 
     def test_tensor_e2e(self):
@@ -401,7 +394,7 @@ class TestEndToEnd:
 
     def test_concurrent_put(self):
         """10 concurrent puts should all succeed."""
-        port = _free_port()
+        port = get_open_port(RDMA_HOST)
         conn = MooncakeTransferEngineConnector(_connector_config(port, pool_size=64 * 1024 * 1024))
         errors: list[str] = []
         lock = threading.Lock()
@@ -457,20 +450,20 @@ class TestLifecycle:
     """Close, context manager, double-close safety."""
 
     def test_close_releases_resources(self):
-        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size=1024 * 1024))
+        c = MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST), pool_size=1024 * 1024))
         c.put("s0", "s1", "x", torch.randn(100))
         c.close()
         assert c._stop_event.is_set()
         assert len(c._local_buffers) == 0
 
     def test_context_manager(self):
-        with MooncakeTransferEngineConnector(_connector_config(_free_port())) as c:
+        with MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST))) as c:
             ok, _, _ = c.put("s0", "s1", "ctx", torch.randn(50))
             assert ok
         assert c._stop_event.is_set()
 
     def test_double_close_safe(self):
-        c = MooncakeTransferEngineConnector(_connector_config(_free_port()))
+        c = MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST)))
         c.close()
         c.close()
 
@@ -489,12 +482,12 @@ class TestGPUPool:
         return _connector_config(port, pool_size, pool_device="cuda:0")
 
     def test_gpu_pool_init(self):
-        with MooncakeTransferEngineConnector(self._gpu_cfg(_free_port())) as c:
+        with MooncakeTransferEngineConnector(self._gpu_cfg(get_open_port(RDMA_HOST))) as c:
             assert c.pool_device == "cuda:0"
             assert c.pool.is_cuda
 
     def test_gpu_pool_put_cpu_and_gpu_tensor(self):
-        with MooncakeTransferEngineConnector(self._gpu_cfg(_free_port())) as c:
+        with MooncakeTransferEngineConnector(self._gpu_cfg(get_open_port(RDMA_HOST))) as c:
             ok, _, meta = c.put("s0", "s1", "h2d", torch.randn(256, 256))
             assert ok
             assert meta["is_fast_path"]
@@ -504,8 +497,8 @@ class TestGPUPool:
             assert meta["is_fast_path"]
 
     def test_gpu_e2e_transfer(self):
-        p = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
-        c = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
+        p = MooncakeTransferEngineConnector(self._gpu_cfg(get_open_port(RDMA_HOST)))
+        c = MooncakeTransferEngineConnector(self._gpu_cfg(get_open_port(RDMA_HOST)))
         try:
             orig = torch.randn(512, 512, dtype=torch.float32, device="cuda:0")
             ok, _, meta = p.put("s0", "s1", "ge", orig)
@@ -536,8 +529,8 @@ class TestStressCorrectness:
     """
 
     def _pair(self, pool_size=64 * 1024 * 1024):
-        p = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
-        c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size))
+        p = MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST), pool_size))
+        c = MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST), pool_size))
         return p, c
 
     # -- Concurrent put + get with data integrity --
@@ -712,7 +705,7 @@ class TestStressCorrectness:
 
     def test_empty_bytes_rejected(self):
         """Connector should gracefully reject empty bytes payload."""
-        port = _free_port()
+        port = get_open_port(RDMA_HOST)
         with MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024)) as c:
             ok, sz, meta = c.put("s0", "s1", "empty_b", b"")
             assert not ok, "Empty bytes should be rejected by connector"
@@ -744,7 +737,7 @@ class TestStressCorrectness:
 
     def test_rapid_alloc_free_cycle(self):
         """Put + cleanup in tight loop to stress allocator under real connector."""
-        port = _free_port()
+        port = get_open_port(RDMA_HOST)
         with MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024)) as c:
             for i in range(50):
                 rid = f"cycle_{i}"

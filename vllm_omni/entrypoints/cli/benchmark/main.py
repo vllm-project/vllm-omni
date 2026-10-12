@@ -1,3 +1,11 @@
+"""Top-level ``vllm bench`` command integration for vLLM-Omni.
+
+``OmniBenchmarkSubcommand`` creates the benchmark command group, discovers
+``OmniBenchmarkSubcommandBase`` implementations, builds their nested parsers,
+and dispatches parsed commands to the selected implementation. ``cmd_init``
+exposes the command to the surrounding vLLM-Omni CLI registration mechanism.
+"""
+
 from __future__ import annotations
 
 import argparse

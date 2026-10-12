@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for MOSS-VoiceGenerator (MossTTSDelayModel, 1.7B).
 
 Weekly expansion coverage (``pytest.mark.slow``) for the delay-model path.
@@ -74,9 +74,12 @@ def _get_test_config() -> str:
 
 pytestmark = [
     pytest.mark.slow,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
     pytest.mark.tts,
-    pytest.mark.parametrize("omni_runner", [(MODEL, _get_test_config())], indirect=True),
+    pytest.mark.parametrize(
+        "omni_runner",
+        [(MODEL, _get_test_config(), {"trust_remote_code": True})],
+        indirect=True,
+    ),
 ]
 
 
@@ -133,7 +136,7 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
     return torch.cat(chunks, dim=0), sr_final
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_delay_english(omni_runner: OmniRunner) -> None:
     """VoiceGenerator: English instruction produces non-empty 24 kHz audio."""
     req = _build_request(
@@ -147,7 +150,7 @@ def test_moss_tts_delay_english(omni_runner: OmniRunner) -> None:
     assert not torch.all(audio == 0), "Audio is silence"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_delay_chinese(omni_runner: OmniRunner) -> None:
     """VoiceGenerator: Chinese input produces non-empty audio."""
     req = _build_request(
@@ -161,7 +164,7 @@ def test_moss_tts_delay_chinese(omni_runner: OmniRunner) -> None:
     assert not torch.all(audio == 0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_delay_batch(omni_runner: OmniRunner) -> None:
     """VoiceGenerator: batch of two requests each returns non-empty audio."""
     requests = [

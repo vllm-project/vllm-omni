@@ -3,7 +3,7 @@
 
 Thin glue over vLLM's paged KV stack (``KVCacheManager`` / ``BlockPool`` /
 ``SlidingWindowManager``), used by the AR-Diffusion Engine to manage KV for
-AR-diffusion models. See ``BDE_doc/dreamzero_kv_phase1_plan.md``.
+AR-diffusion models.
 
 Layout: ``config`` (public knob) · ``paged`` (engine-generic paging mechanics +
 chunk-window eviction spec) · ``manager`` (the ARDiffusionKVCache orchestrator + its
@@ -32,7 +32,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedLayerInputs,
     ar_diffusion_paged_attention,
     paged_write_attn,
-    set_current_paged_kv_cache,
 )
 
 __all__ = [
@@ -53,5 +52,4 @@ __all__ = [
     "paged_write_attn",
     "pool_write_chunk",
     "resident_block_ids",
-    "set_current_paged_kv_cache",
 ]

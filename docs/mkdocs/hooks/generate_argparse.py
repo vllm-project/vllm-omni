@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import ast
+import json
 import logging
 import re
 import sys
@@ -123,6 +124,9 @@ def extract_omni_serve_subparser_init():
                         "TrackingNamespace": None,  # type annotation only
                         "make_arg_parser": lambda parser: parser,  # no-op for doc
                         "_ensure_vllm_platform": lambda: None,  # no-op for doc
+                        "_nonneg_finite_float": float,
+                        "_json_object": json.loads,
+                        "_parse_stage_overrides": __import__("json").loads,
                         "VLLM_SUBCMD_PARSER_EPILOG": "",
                         "logger": logger,
                         "DummySubparsers": DummySubparsers,
