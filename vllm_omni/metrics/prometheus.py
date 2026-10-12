@@ -55,7 +55,7 @@ _request_queue_wait_family = Histogram(
 )
 _stage_waiting_requests_family = Gauge(
     defs.STAGE_WAITING_REQUESTS,
-    "Sum of the latest scheduler waiting snapshots across a stage's replicas; "
+    "Central admission waiters plus the latest scheduler waiting snapshots across a stage's replicas; "
     "diffusion snapshots update when outputs arrive.",
     labelnames=list(defs.DIFFUSION_LABELS),
 )
