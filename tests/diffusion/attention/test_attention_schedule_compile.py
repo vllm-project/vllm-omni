@@ -619,3 +619,12 @@ def test_op_metadata_with_video_spans_keeps_the_boundary():
     span = VideoTokenSpan(start=0, latent_grid=(1, 2, 2), role="target")
     metadata = AttentionMetadata(video_layout=VideoTokenLayout(used_len=4, video_spans=(span,)))
     assert layer_mod._encode_scheduled_op_metadata(metadata) is None
+
+
+def test_scheduled_op_id_stays_on_cpu_when_built_under_a_default_device(compile_env):
+    # In-tree pipelines are built inside ``with torch.device(<load device>)``.
+    with torch.device("meta"):
+        pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), compiled=False)
+    assert pipeline.model.blocks[0].to_out.weight.device.type == "meta"
+    for block in pipeline.model.blocks:
+        assert block.attn._schedule_op_id.device.type == "cpu"
