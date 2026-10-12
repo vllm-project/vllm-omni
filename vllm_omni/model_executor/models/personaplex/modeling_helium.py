@@ -33,6 +33,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 
 from vllm_omni.model_executor.models.personaplex.configuration_helium import (
     HeliumConfig,
@@ -130,6 +131,30 @@ def check_rope_covers_context(max_model_len: int, max_position_embeddings: int) 
             "positions; raise max_position_embeddings with it (PersonaPlex Stage 0: "
             "hf_overrides.temporal_config.max_position_embeddings)."
         )
+
+
+def check_window_bounds_kv_cache(max_model_len: int, context: int, kv_cache_spec: KVCacheSpec | None) -> None:
+    """Refuse a context past Helium's window unless the layer's KV cache is windowed.
+
+    A call longer than the window relies on the attention layer resolving to
+    a ``SlidingWindowSpec``: only then does the KV manager free the pages
+    behind the window. With any other spec a long call keeps every page until
+    the pool runs out, so fail at startup instead.
+    """
+    if max_model_len <= context:
+        return
+    window = moshi_attention_window(context)
+    if isinstance(kv_cache_spec, SlidingWindowSpec) and kv_cache_spec.sliding_window == window:
+        return
+    resolved = type(kv_cache_spec).__name__
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        resolved += f"(sliding_window={kv_cache_spec.sliding_window})"
+    raise ValueError(
+        f"max_model_len {max_model_len} runs past Helium's {context}-frame window, which needs a "
+        f"SlidingWindowSpec of {window} keys so the KV behind the window is freed, but the attention "
+        f"backend resolved {resolved}. Use a backend with sliding-window support, or keep "
+        f"max_model_len within {context}."
+    )
 
 
 def _get_helium_rope(config: HeliumConfig):
@@ -344,6 +369,13 @@ class HeliumModel(nn.Module):
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix, config=config),
             prefix=f"{prefix}.layers",
         )
+        max_model_len = vllm_config.model_config.max_model_len
+        if max_model_len > config.sliding_window:
+            for module in self.modules():
+                if isinstance(module, Attention):
+                    check_window_bounds_kv_cache(
+                        max_model_len, config.sliding_window, module.get_kv_cache_spec(vllm_config)
+                    )
         if get_pp_group().is_last_rank:
             self.norm = HeliumRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
