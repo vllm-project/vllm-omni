@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate,
     indexed_scale_shift_,
@@ -28,12 +28,13 @@ def _make_modulation_case(
     hidden_size: int,
     has_history_condition: bool,
     dtype: torch.dtype,
+    device: str | torch.device = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return the production compact rows and indices plus a per-token reference."""
-    current = torch.randn(batch_size, 6, hidden_size, dtype=dtype)
+    current = torch.randn(batch_size, 6, hidden_size, dtype=dtype, device=device)
     history = None
     if has_history_condition:
-        history = torch.randn(1, 6, hidden_size, dtype=dtype).expand(batch_size, -1, -1)
+        history = torch.randn(1, 6, hidden_size, dtype=dtype, device=device).expand(batch_size, -1, -1)
     compact, indices = _make_compact_modulation(current, history, sequence_length, history_context_length)
 
     if history is None:
@@ -129,39 +130,39 @@ def test_helios_width_modulation_kernels_match_reference(device: str, has_histor
         hidden_size,
         has_history_condition,
         torch.bfloat16,
+        device,
     )
 
-    shift, scale, gate, *_ = compact.float().chunk(6, dim=1)
-    shift, scale, gate = shift.squeeze(1), scale.squeeze(1), gate.squeeze(1)
-    x = torch.randn(batch_size * sequence_length, hidden_size)
-    bf16_branch = torch.randn(batch_size * sequence_length, hidden_size, dtype=torch.bfloat16)
+    modulation = compact.float()
+    shift, scale, gate, *_ = modulation.unbind(1)
+    assert shift.stride() == scale.stride() == gate.stride() == (6 * hidden_size, 1)
+
+    x = torch.randn(batch_size * sequence_length, hidden_size, device=device)
+    bf16_branch = torch.randn(
+        batch_size * sequence_length,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     fp32_branch = torch.randn_like(x)
 
-    npu_x = x.to(device)
-    npu_shift = shift.to(device)
-    npu_scale = scale.to(device)
-    npu_gate = gate.to(device)
-    npu_indices = indices.to(device)
-    npu_bf16_branch = bf16_branch.to(device)
-    npu_fp32_branch = fp32_branch.to(device)
+    indexed_shift = shift.index_select(0, indices)
+    indexed_scale = scale.index_select(0, indices)
+    indexed_gate_values = gate.index_select(0, indices)
+    expected_affine = x * (1.0 + indexed_scale) + indexed_shift
+    expected_bf16_gate = x + indexed_gate_values * bf16_branch
+    expected_fp32_gate = x + indexed_gate_values * fp32_branch
 
-    indexed_shift = npu_shift.index_select(0, npu_indices)
-    indexed_scale = npu_scale.index_select(0, npu_indices)
-    indexed_gate_values = npu_gate.index_select(0, npu_indices)
-    expected_affine = npu_x * (1.0 + indexed_scale) + indexed_shift
-    expected_bf16_gate = npu_x + indexed_gate_values * npu_bf16_branch
-    expected_fp32_gate = npu_x + indexed_gate_values * npu_fp32_branch
-
-    actual_affine = indexed_scale_shift_(npu_x.clone(), npu_shift, npu_scale, npu_indices)
-    actual_bf16_gate = indexed_gate(npu_x, npu_gate, npu_bf16_branch, npu_indices)
-    actual_fp32_gate = indexed_gate(npu_x, npu_gate, npu_fp32_branch, npu_indices)
+    actual_affine = indexed_scale_shift_(x.clone(), shift, scale, indices)
+    actual_bf16_gate = indexed_gate(x, gate, bf16_branch, indices)
+    actual_fp32_gate = indexed_gate(x, gate, fp32_branch, indices)
 
     assert torch.equal(actual_affine, expected_affine)
     assert torch.equal(actual_bf16_gate, expected_bf16_gate)
     assert torch.equal(actual_fp32_gate, expected_fp32_gate)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("has_history_condition", [False, True])
