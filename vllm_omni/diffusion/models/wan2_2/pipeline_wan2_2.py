@@ -327,6 +327,19 @@ def get_wan22_pre_process_func(
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
         has_image = raw_image is not None and (not isinstance(raw_image, list) or bool(raw_image))
+        metadata = DiffusionRequestBatch.get_prompt_field(prompt, "wan_request_metadata")
+        if metadata is not None:
+            if not isinstance(metadata, dict) or metadata.get("version") != 1:
+                raise ValueError("Invalid wan_request_metadata version.")
+            if type(metadata.get("has_image")) is not bool:
+                raise ValueError("wan_request_metadata.has_image must be a bool.")
+            for dimension in ("height", "width"):
+                value = metadata.get(dimension)
+                if type(value) is not int or value <= 0:
+                    raise ValueError(f"Invalid wan_request_metadata.{dimension}.")
+                if getattr(request.sampling_params, dimension) is None:
+                    setattr(request.sampling_params, dimension, value)
+            has_image = metadata["has_image"]
         request.batch_compatibility_key = ("wan22_image_condition", has_image)
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
@@ -1019,7 +1032,15 @@ class Wan22Pipeline(
             self.vae_scale_factor_temporal,
             image is not None,
         )
-        payload: dict[str, Any] = {"wan_conditioning_metadata": metadata}
+        payload: dict[str, Any] = {
+            "wan_conditioning_metadata": metadata,
+            "wan_request_metadata": {
+                "version": 1,
+                "height": height,
+                "width": width,
+                "has_image": image is not None,
+            },
+        }
         if image is not None:
             image_tensor = prepare_wan_image_tensor([image], height, width, self.vae_scale_factor_spatial)
             latent_condition = encode_wan_image_condition(self.vae, image_tensor, self.device)

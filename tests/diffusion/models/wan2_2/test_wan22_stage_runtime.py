@@ -169,6 +169,69 @@ def test_g_rejects_bad_handoff_before_rng_or_encoder_fallback(damage, match):
     torch.testing.assert_close(batch.requests[0].sampling_params.generator.get_state(), state)
 
 
+@pytest.mark.parametrize("height,width", [(None, None), (16, None), (None, 32)])
+@pytest.mark.parametrize("connector", [False, True])
+def test_handoff_preserves_dimensions_and_image_batch_identity(height, width, connector):
+    from tests.diffusion.test_diffusion_stage_payload import _FakeConnector, _make_sender
+    from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_EG_PIPELINE
+    from vllm_omni.model_executor.stage_input_processors.diffusion_disagg import diffusion_stage_handoff
+
+    encode = _image_pipeline(DiffusionStageRole.ENCODE)
+    source = _requests(1, outputs=1)
+    output = encode.encode_batch(source)[0]
+    custom_output = output.custom_output
+    if connector:
+        transport = _FakeConnector()
+        sender = _make_sender(transport, payload_keys=WAN2_2_EG_PIPELINE.stages[0].stage_output_payload_keys)
+        sender._maybe_send_stage_payload(source.requests, [output])
+        transferred = transport.put_calls[0][3]
+        assert "wan_conditioning_metadata" not in custom_output
+        assert "wan_request_metadata" in custom_output
+    prompt = diffusion_stage_handoff([SimpleNamespace(custom_output=custom_output)], source.requests[0].prompt)[0]
+    target = _requests(1, outputs=1, image=False).requests[0]
+    target.prompt = prompt
+    target.sampling_params.height = height
+    target.sampling_params.width = width
+    pre_process = wan_module.get_wan22_pre_process_func(SimpleNamespace())
+    pre_process(target)
+
+    assert (target.sampling_params.height, target.sampling_params.width) == (16, 32)
+    assert target.batch_compatibility_key == ("wan22_image_condition", True)
+    text_request = _requests(1, outputs=1, image=False).requests[0]
+    pre_process(text_request)
+    assert text_request.batch_compatibility_key != target.batch_compatibility_key
+    for request in (target, text_request):
+        sampling = OmniDiffusionSamplingParams()
+        for name, value in vars(request.sampling_params).items():
+            setattr(sampling, name, value)
+        request.sampling_params = sampling
+    assert build_request_batch_sampling_params_key(target) != build_request_batch_sampling_params_key(text_request)
+    assert "multi_modal_data" not in target.prompt
+    if connector:
+        target.prompt["additional_information"].update(transferred)
+    generate = _image_pipeline(DiffusionStageRole.DENOISE)
+    assert len(generate.forward(DiffusionRequestBatch(requests=[target]))) == 1
+
+
+@pytest.mark.parametrize("field,value", [("version", 2), ("has_image", 1), ("height", 0), ("width", "32")])
+def test_preprocess_rejects_invalid_wan_request_metadata(field, value):
+    request = _requests(1, image=False).requests[0]
+    metadata = dict(version=1, height=16, width=32, has_image=True)
+    metadata[field] = value
+    request.prompt["wan_request_metadata"] = metadata
+    with pytest.raises(ValueError, match="wan_request_metadata"):
+        wan_module.get_wan22_pre_process_func(SimpleNamespace())(request)
+
+
+def test_preprocess_preserves_explicit_dimensions_for_conditioning_validation():
+    request = _requests(1, image=False).requests[0]
+    request.prompt["wan_request_metadata"] = dict(version=1, height=32, width=64, has_image=True)
+    wan_module.get_wan22_pre_process_func(SimpleNamespace())(request)
+    assert (request.sampling_params.height, request.sampling_params.width) == (16, 32)
+
+
 def test_encode_cfg_uses_same_defaults_and_high_stage_guidance_as_full():
     pipeline = _image_pipeline(DiffusionStageRole.ENCODE)
     batch = _requests(1, image=False, cfg=1.0)
