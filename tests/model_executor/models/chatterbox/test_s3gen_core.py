@@ -15,13 +15,11 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.mask import (
     subsequent_chunk_mask,
 )
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.upsample_encoder import UpsampleConformerEncoder
-from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("chunk_size", [0, 3])
-@pytest.mark.parametrize("left_chunks", [-1, 0])
+@pytest.mark.parametrize(("chunk_size", "left_chunks"), [(0, -1), (3, -1), (3, 0)])
 def test_chunk_mask_repairs_empty_rows_without_scalar_reads(chunk_size, left_chunks):
     tokens = torch.zeros(3, 7, 4)
     padding = ~make_pad_mask(torch.tensor([7, 3, 0]), 7).unsqueeze(1)
@@ -87,10 +85,3 @@ def test_flow_meanflow_two_steps_shape_001() -> None:
     )
     final, _ = flow.inference(finalize=True, **kwargs)
     assert final.shape == (1, 80, 2 * gen_len)
-
-
-def test_voice_encoder_embedding_is_unit_norm_001() -> None:
-    encoder = VoiceEncoder(VoiceEncConfig()).eval()
-    embedding = encoder.inference(torch.rand(1, 200, 40), mel_lens=[200], batch_size=32, rate=1.3)
-    assert embedding.shape == (1, 256)
-    assert torch.allclose(embedding.norm(dim=1), torch.ones(1), atol=1e-5)

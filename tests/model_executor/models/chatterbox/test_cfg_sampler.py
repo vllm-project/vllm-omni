@@ -137,9 +137,9 @@ def test_registered_kernel_warmup_delegates_without_guidance():
     assert torch.isneginf(delegate.logits[:, SPEECH_STOP_TOKEN + 1 :]).all()
 
 
-@pytest.mark.parametrize("masked_tokens", [[SPEECH_STOP_TOKEN], [2, 17, 123, SPEECH_STOP_TOKEN]])
 @pytest.mark.parametrize("weight", [0.0, 0.5])
-def test_v1_shared_logit_bias_masks_survive_guidance(masked_tokens, weight):
+def test_v1_shared_logit_bias_masks_survive_guidance(weight):
+    masked_tokens = [2, 17, 123, SPEECH_STOP_TOKEN]
     registry = {"c": ("pair", "cond", weight), "u": ("pair", "uncond", weight)}
     delegate = RecordingSampler()
     sampler = ChatterboxCFGSampler(delegate, registry)

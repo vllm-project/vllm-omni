@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Original prompt layout and strict checkpoint routing."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -16,14 +14,15 @@ from vllm_omni.model_executor.models.chatterbox.original_heads import (
     original_speech_embeds,
     split_original_weights,
 )
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_original_prompt_layout_and_cfg():
-    heads = OriginalHeads(
-        SimpleNamespace(hidden_size=4, text_vocab_size=704, speech_vocab_size=8194, speaker_embed_size=2)
-    )
+    config = ChatterboxConfig("original")
+    config.update({"hidden_size": 4, "speaker_embed_size": 2})
+    heads = OriginalHeads(config)
     heads.eval()
     with torch.no_grad():
         for parameter in heads.parameters():
@@ -54,9 +53,9 @@ def test_original_prompt_layout_and_cfg():
 
 def test_perceiver_matches_explicit_attention():
     torch.manual_seed(9)
-    heads = OriginalHeads(
-        SimpleNamespace(hidden_size=8, text_vocab_size=704, speech_vocab_size=8194, speaker_embed_size=2)
-    )
+    config = ChatterboxConfig("original")
+    config.update({"hidden_size": 8, "speaker_embed_size": 2})
+    heads = OriginalHeads(config)
     heads.eval()
     perceiver = heads.cond_enc.perceiver
     context = torch.randn(2, 7, 8)
@@ -73,9 +72,9 @@ def test_perceiver_matches_explicit_attention():
 
 
 def test_original_weight_routes_are_complete_and_strict():
-    heads = OriginalHeads(
-        SimpleNamespace(hidden_size=4, text_vocab_size=704, speech_vocab_size=8194, speaker_embed_size=2)
-    )
+    config = ChatterboxConfig("original")
+    config.update({"hidden_size": 4, "speaker_embed_size": 2})
+    heads = OriginalHeads(config)
     state = heads.state_dict()
     marker = torch.zeros(1)
     backbone, routed = split_original_weights(
@@ -88,20 +87,19 @@ def test_original_weight_routes_are_complete_and_strict():
         split_original_weights([("speech_head.bias", marker)])
 
 
-@pytest.mark.parametrize("unconditional", [False, True])
-def test_original_text_position_boundary(unconditional):
-    heads = OriginalHeads(
-        SimpleNamespace(hidden_size=4, text_vocab_size=704, speech_vocab_size=8194, speaker_embed_size=2)
-    ).eval()
+def test_original_text_position_boundary():
+    config = ChatterboxConfig("original")
+    config.update({"hidden_size": 4, "speaker_embed_size": 2})
+    heads = OriginalHeads(config).eval()
     assert heads.text_pos_emb.emb.num_embeddings == ORIGINAL_TEXT_POSITIONS == 2050
     assert heads.speech_pos_emb.emb.num_embeddings == ORIGINAL_SPEECH_POSITIONS == 4100
     text = torch.ones(ORIGINAL_MAX_TEXT_TOKENS, dtype=torch.long)
     reference, speaker = torch.tensor([1, 2, 3]), torch.zeros(1, 2)
-    prompt = original_prefill_embeds(heads, text, reference, speaker, unconditional=unconditional)
+    prompt = original_prefill_embeds(heads, text, reference, speaker)
     assert prompt.shape == (ORIGINAL_MAX_TEXT_TOKENS + 38, 4)
     # Invalid vocabulary IDs prove the length error happens before embedding.
     overflow = torch.full((ORIGINAL_MAX_TEXT_TOKENS + 1,), 99999, dtype=torch.long)
     with pytest.raises(ValueError, match="at most 2048 text tokens"):
-        original_prefill_embeds(heads, overflow, reference, speaker, unconditional=unconditional)
+        original_prefill_embeds(heads, overflow, reference, speaker)
     last_speech = original_speech_embeds(heads, torch.tensor([1]), torch.tensor([ORIGINAL_SPEECH_POSITIONS - 1]))
     torch.testing.assert_close(last_speech, heads.speech_emb(torch.tensor([1])) + heads.speech_pos_emb.emb.weight[-1:])

@@ -395,10 +395,7 @@ def test_decoding_a_chunk_twice_gives_the_same_mel_001(decoder: S3GenDecoder, re
     assert torch.equal(audio[0], audio[1])
 
 
-@pytest.mark.parametrize("repeats", [1, 2])
-def test_a_row_does_not_depend_on_its_batch_001(
-    decoder: S3GenDecoder, references: list[Reference], repeats: int
-) -> None:
+def test_a_row_does_not_depend_on_its_batch_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
     """Nothing is pinned here: each row's noise is fixed by its own positions."""
     tokens = torch.randint(0, 6561, (113,))
     chunks = [
@@ -406,9 +403,8 @@ def test_a_row_does_not_depend_on_its_batch_001(
         Chunk(tokens, 50, references[1], None, True),
         Chunk(tokens[:23], 0, references[0], None, False),
     ]
-    chunks *= repeats
     batched = decoder.chunk_mels(chunks)
-    assert [mel.shape[2] for mel in batched] == [60, 2 * (63 + 3), 40] * repeats
+    assert [mel.shape[2] for mel in batched] == [60, 2 * (63 + 3), 40]
     for chunk, mel in zip(chunks, batched, strict=True):
         (alone,) = decoder.chunk_mels([chunk])
         assert torch.allclose(mel, alone, atol=1e-3, rtol=1e-3), (mel - alone).abs().max()

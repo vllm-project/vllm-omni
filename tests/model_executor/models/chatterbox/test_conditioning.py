@@ -107,6 +107,8 @@ def test_voice_encoder_padded_batch_matches_individual_references() -> None:
             batch_size=32,
             rate=1.3,
         )
+    assert batched.shape == (3, 256)
+    torch.testing.assert_close(batched.norm(dim=1), torch.ones(3), atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(batched, individual, atol=1e-6, rtol=1e-5)
 
 
