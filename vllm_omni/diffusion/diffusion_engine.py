@@ -1255,12 +1255,6 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
-            has_paced_request = bool(getattr(self, "_streaming_playback", None))
-            has_active_request = self.scheduler.has_requests()
-            if buffer_seconds is not None and has_active_request:
-                raise ValueError("playback feedback requires an otherwise idle diffusion engine")
-            if buffer_seconds is None and has_paced_request:
-                raise ValueError("diffusion engine is serving a paced playback request")
             queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
             if self._request_cancellations is not None:
                 request.cancellation_signal = self._request_cancellations.create(request.request_id)
