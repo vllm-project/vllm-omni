@@ -13,6 +13,9 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.config.quantization import resolve_quantization_config
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 
 from vllm_omni.model_executor.models.qwen2_5_omni import qwen2_5_omni_thinker as thinker_mod
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
@@ -83,14 +86,15 @@ def test_language_model_only_component_config_leaves_vision_unquantized(monkeypa
     assert captured["language_model"] is router
 
 
-def test_dynamic_method_is_scoped_to_language_model(monkeypatch):
-    fp8 = _quant("fp8")
-    model, captured = _build(monkeypatch, fp8)
+def test_online_method_is_scoped_to_language_model(monkeypatch):
+    # What vLLM builds for --quantization fp8 on a BF16 checkpoint.
+    online = OnlineQuantizationConfig(resolve_quantization_config("fp8_per_tensor", None))
+    model, captured = _build(monkeypatch, online)
 
     assert captured["visual"] is None
     routed = captured["language_model"]
     assert isinstance(routed, ComponentQuantizationConfig)
-    assert routed.resolve("thinker.language_model.model.layers.0.mlp.gate_up_proj") is fp8
+    assert routed.resolve("thinker.language_model.model.layers.0.mlp.gate_up_proj") is online
     assert routed.resolve("thinker.visual.blocks.0.attn.qkv") is None
     assert model.quant_config is routed
 
@@ -101,3 +105,14 @@ def test_pre_quantized_method_stays_on_language_model(monkeypatch):
 
     assert captured["visual"] is None
     assert captured["language_model"] is modelopt
+
+
+def test_serialized_fp8_checkpoint_config_is_passed_through(monkeypatch):
+    # Serialized checkpoints name their own unquantized layers, so the config
+    # reaches every component unchanged, as before online routing existed.
+    fp8 = Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="dynamic")
+    model, captured = _build(monkeypatch, fp8)
+
+    assert captured["visual"] is fp8
+    assert captured["language_model"] is fp8
+    assert model.quant_config is fp8

@@ -24,6 +24,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.inputs import MultiModalHashes
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -90,8 +91,8 @@ from vllm.utils.collection_utils import is_list_of
 
 from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.quantization.component_config import (
-    PRE_QUANTIZED_METHODS,
     ComponentQuantizationConfig,
+    resolve_encoder_quant_config,
 )
 
 try:
@@ -1063,27 +1064,23 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 "in the audio tower part."
             )
 
-        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
-        # the Thinker LM (language model). Vision and audio encoder weights
-        # remain in BF16 and have no corresponding scale tensors in the
-        # checkpoint. Dynamic quantization methods (e.g. --quantization fp8)
-        # should also only target the language model.
+        # Online quantization (e.g. --quantization fp8 on a BF16 checkpoint)
+        # only targets the Thinker LM. Serialized checkpoint configs are kept
+        # as they are: pre-quantized ones (modelopt NVFP4/FP8/MXFP8) leave the
+        # vision encoder in BF16 without scale tensors, so it gets None there.
         visual_prefix = maybe_prefix(prefix, "visual")
         language_prefix = maybe_prefix(prefix, "language_model")
         if isinstance(quant_config, ComponentQuantizationConfig):
             visual_quant_config = quant_config.resolve(visual_prefix)
-        elif quant_config is not None:
-            if quant_config.get_name() in PRE_QUANTIZED_METHODS:
-                visual_quant_config = None
-            else:
-                quant_config = ComponentQuantizationConfig(
-                    component_configs={language_prefix: quant_config},
-                    default_config=None,
-                )
-                vllm_config = replace(vllm_config, quant_config=quant_config)
-                visual_quant_config = None
-        else:
+        elif isinstance(quant_config, OnlineQuantizationConfig):
+            quant_config = ComponentQuantizationConfig(
+                component_configs={language_prefix: quant_config},
+                default_config=None,
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
             visual_quant_config = None
+        else:
+            visual_quant_config = resolve_encoder_quant_config(quant_config)
 
         self.vllm_config = vllm_config
         self.quant_config = quant_config

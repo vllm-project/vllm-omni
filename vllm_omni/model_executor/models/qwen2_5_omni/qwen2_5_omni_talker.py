@@ -11,6 +11,7 @@ import torch.nn as nn
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniTalkerConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -23,10 +24,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.quantization.component_config import (
-    PRE_QUANTIZED_METHODS,
-    ComponentQuantizationConfig,
-)
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 
 class Qwen2_5OmniTalkerForConditionalGeneration(
@@ -59,14 +57,16 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         quant_config = vllm_config.quant_config
         if isinstance(quant_config, ComponentQuantizationConfig):
             quant_config = quant_config.resolve("talker")
-        elif quant_config is not None and quant_config.get_name() not in PRE_QUANTIZED_METHODS:
+        elif isinstance(quant_config, OnlineQuantizationConfig):
+            # Online quantization targets the thinker LM only. Serialized
+            # checkpoint configs are kept so the talker's scales still load.
             quant_config = None
         if quant_config is not vllm_config.quant_config:
             model_config = vllm_config.model_config
             if quant_config is None:
+                # Unless this is a with_hf_config() view (the staged pipeline),
                 # VllmConfig rebuilds a missing quant_config from
-                # model_config.quantization on every replace(), including the
-                # one inside init_vllm_registered_model, so clear the source too.
+                # model_config.quantization on replace(), so clear it too.
                 model_config = copy.copy(model_config)
                 model_config.quantization = None
             vllm_config = replace(vllm_config, model_config=model_config, quant_config=quant_config)
