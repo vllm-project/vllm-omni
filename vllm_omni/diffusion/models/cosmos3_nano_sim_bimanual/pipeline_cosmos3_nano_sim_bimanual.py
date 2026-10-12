@@ -44,9 +44,12 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frustum_cache import FrustumKVArchive
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frustum_retrieval import FrustumHistorySelector
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
+    conditioning_image_size,
     resolve_cosmos3_nano_sim_bimanual_geometry,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
@@ -156,9 +159,23 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
         prompt = request.prompt
         media = _request_media(prompt)
         geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
-        sp.height, sp.width = geometry.height, geometry.width
+        image_size = conditioning_image_size(sp)
+        if image_size is not None:
+            from vllm_omni.diffusion.models.cosmos3.transfer import media_hw
 
-        result = cosmos3_pre_process(request)
+            if media is None or media_hw(media) != image_size[:2]:
+                raise ValueError("conditioning_image_size requires media matching the padded canvas exactly.")
+            # Encode the original padded pixels, but admit/schedule the cropped grid.
+            sp.height, sp.width = image_size[:2]
+        else:
+            sp.height, sp.width = geometry.height, geometry.width
+
+        try:
+            result = cosmos3_pre_process(request)
+        finally:
+            sp.height, sp.width = geometry.height, geometry.width
+        if image_size is not None:
+            result.sampling_params.height, result.sampling_params.width = geometry.height, geometry.width
         # Re-resolving explicit final dimensions catches any downstream
         # alignment, area, aspect, or model-grid violation.
         final_sp = result.sampling_params
@@ -502,6 +519,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if getattr(self.transformer, "_inductor_cudagraphs", False):
             torch._dynamo.reset()
         self._dense_attention_cache = None
+        self._frustum_attention_cache = None
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self._drop_session(session_id)
@@ -852,7 +870,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         paged_kv = None
         dense_history = None
         dense_cache = getattr(state, "dense_attention", None) if paged_state is None else None
-        if paged_state is not None:
+        retrieval = getattr(state, "frustum_archive", None)
+        if retrieval is not None:
+            retrieval.prepare(frame_start)
+            dense_cache = retrieval.attention
+        elif paged_state is not None:
             paged_kv = paged_state.get_kv_caches(
                 self._MAIN_BRANCH,
                 seq_len=seq_len,
@@ -879,7 +901,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             history_window=(self.manifest.sink_frames, self.manifest.window_frames),
             **conditioning_kwargs,
         )
-        if paged_state is not None:
+        if retrieval is not None:
+            if commit_current:
+                retrieval.commit(hidden_states.shape[2])
+        elif paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
         elif commit_current and dense_cache is not None:
             state.dense_kv_by_branch[self._MAIN_BRANCH] = dense_cache.commit(seq_len)
@@ -1031,6 +1056,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if not isinstance(image, torch.Tensor):
             raise TypeError("Cosmos3-Nano-Sim-Bimanual preprocessed image must be a torch.Tensor.")
         latent = self._encode_conditioning_image_latent(image)
+        image_size = conditioning_image_size(sp)
+        if image_size is not None:
+            if tuple(image.shape[-2:]) != image_size[:2]:
+                raise ValueError("Preprocessed conditioning image no longer matches its padded canvas.")
+            latent = self._crop_latent_to_image_size(latent, image_size)
         expected = (
             1,
             self.transformer.latent_channel_size,
@@ -1681,6 +1711,23 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
 
+        selector = None
+        if extra.get("frustum_geometry") is not None:
+            if tick or not state_was_new or start_frame != 0:
+                raise ARDiffusionRequestRejectedError("Frustum retrieval requires a fresh complete offline rollout")
+            if self.manifest.window_frames is not None or self.manifest.sink_frames != 0:
+                raise ARDiffusionRequestRejectedError(
+                    "Frustum retrieval requires a full archive: window_frames=null, sink_frames=0"
+                )
+            if initial_latent is None:
+                raise ARDiffusionRequestRejectedError("Frustum retrieval requires an initial conditioning image")
+            try:
+                selector = FrustumHistorySelector(
+                    extra["frustum_geometry"], target_frame, self.manifest.temporal_compression_factor, fps
+                )
+            except (TypeError, ValueError, RuntimeError) as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
+
         # ---- Side effects begin ---------------------------------------------
         tick_durations: dict[str, float] = {}
         self._sync_for_tick_timing(measure_tick_latency)
@@ -1693,7 +1740,30 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if tick and state.tick_output_type is None:
             state.tick_output_type = tick_output_type
         text_kv = self._ensure_text_kv(state, text_ids, text_mask, max_length=prompt_token_limit)
-        self._prepare_dense_attention(state, text_kv, real_text_kv_len, geometry, target_frame)
+        if selector is None:
+            self._prepare_dense_attention(state, text_kv, real_text_kv_len, geometry, target_frame)
+        else:
+            attention = getattr(self, "_frustum_attention_cache", None)
+            if attention is None:
+                attention = CosmosSimDenseAttentionCache()
+            capacity = real_text_kv_len + (sum(selector.sizes) + self.manifest.chunk_size) * geometry.tokens_per_frame(
+                self.manifest.conditioning_tokens_per_frame
+            )
+            if attention.kv and not attention.fits(text_kv, capacity):
+                self.release_captured_graphs()
+            self._frustum_attention_cache = attention
+            state.frustum_archive = FrustumKVArchive(
+                state,
+                text_kv,
+                real_text_kv_len,
+                geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame),
+                target_frame,
+                sum(selector.sizes),
+                self.manifest.chunk_size,
+                attention,
+                self._ar_diffusion_kv_state,
+                self._MAIN_BRANCH,
+            )
 
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)
@@ -1745,6 +1815,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             target_frame,
             self.manifest.chunk_size,
         ):
+            if selector is not None:
+                selected = selector.select(chunk_start, chunk_end)
+                state.frustum_archive.select(chunk_start, selected)
+                logger.info("Frustum KV chunk [%d,%d): %s", chunk_start, chunk_end, selected)
             clean_chunk = self._run_chunk(
                 state,
                 geometry=geometry,

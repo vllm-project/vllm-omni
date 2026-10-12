@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import io
 import json
-import time
 import warnings
+import wave
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -21,12 +22,13 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionToolsParam,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams, StructuredOutputsParams
 from vllm.tool_parsers import ToolParserManager
 
 if TYPE_CHECKING:
-    from vllm.inputs import TokensPrompt
+    from vllm.inputs import EngineInput
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.realtime.session import (
@@ -37,29 +39,26 @@ from vllm_omni.entrypoints.openai.realtime.session import (
     _gen_id,
     merge_session_config,
 )
+from vllm_omni.utils.audio import audio_chunk_sample_rate
+from vllm_omni.utils.audio_resample import StreamingAudioResampler
 
 logger = init_logger(__name__)
 
 _CLIENT_EVENT_ADAPTER = TypeAdapter(types.RealtimeClientEvent)
 
-# Qwen3-Omni's Realtime contract is mono signed PCM16 at 24 kHz. PCM16 is the
-# sample width; 24 kHz is the sample rate.
+# The Realtime PCM contract is mono signed PCM16 at 24 kHz.
 SAMPLE_RATE_HZ = 24000
 BYTES_PER_SAMPLE_PCM16 = 2
 # Application safety caps for one append and the complete pending input turn.
 MAX_AUDIO_APPEND_BYTES = 15 * 1024 * 1024
 MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
 
-# The Qwen3-Omni chat template uses these literal special tokens for audio.
-# The generic chat-template interface does not expose that placeholder as
-# metadata, so it cannot be inferred reliably from the Realtime event schema.
-AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
-
-# Empirically calibrated for Qwen3-Omni from 8,808 ms / 23 thinker tokens.
-QWEN3_OMNI_MS_PER_TOKEN = 383.0
-
 AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
+
+
+def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
+    return exc.parameter in {"input_text", "input_tokens"}
 
 
 class _UnsupportedAudioFormatError(ValueError):
@@ -68,7 +67,7 @@ class _UnsupportedAudioFormatError(ValueError):
 
 @dataclass(slots=True)
 class _ResolvedResponse:
-    input: list[Any] | None
+    input: list[types.ConversationItem] | None
     instructions: str | None
     modalities: list[str]
     max_output_tokens: int | str
@@ -85,13 +84,15 @@ class OpenAIFullDuplexConnection:
         websocket: WebSocket,
         engine: AsyncOmni,
         model_name: str,
-        tokenizer: Any,
+        chat_handler: Any,
         tool_call_parser: str | None = None,
         enable_auto_tool_choice: bool = False,
     ):
         self.ws = websocket
         self.engine = engine
         self.model_name = model_name
+        self.chat_handler = chat_handler
+        self._tokenizer = chat_handler.renderer.get_tokenizer()
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
 
         self.session = AudioFullDuplexSessionState()
@@ -101,8 +102,6 @@ class OpenAIFullDuplexConnection:
         self._response_task: asyncio.Task | None = None
         self._response_cancel_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
-
-        self._tokenizer = self._resolve_tokenizer(tokenizer)
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                          #
@@ -139,23 +138,6 @@ class OpenAIFullDuplexConnection:
         self._connected = False
         await self._cancel_active_response()
         logger.info("[realtime] connection closed, session_id=%s", self.session.session_id)
-
-    def _resolve_tokenizer(self, tokenizer: Any) -> Any:
-        if getattr(tokenizer, "chat_template", None):
-            return tokenizer
-
-        input_processor = getattr(self.engine, "input_processor", None)
-        if input_processor is None:
-            return tokenizer
-        try:
-            from vllm.transformers_utils.processor import cached_processor_from_config
-
-            processor = cached_processor_from_config(input_processor.model_config)
-            if getattr(processor, "apply_chat_template", None):
-                return processor
-        except Exception:
-            logger.warning("Could not load processor for chat templating")
-        return tokenizer
 
     # ------------------------------------------------------------------ #
     #  Event dispatch                                                     #
@@ -332,6 +314,16 @@ class OpenAIFullDuplexConnection:
             raise ValueError("PCM audio data must contain complete 16-bit samples")
         return decoded
 
+    @staticmethod
+    def _pcm16_wav_b64(audio: bytes) -> str:
+        with io.BytesIO() as buffer:
+            with wave.open(buffer, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(BYTES_PER_SAMPLE_PCM16)
+                wav.setframerate(SAMPLE_RATE_HZ)
+                wav.writeframes(audio)
+            return base64.b64encode(buffer.getvalue()).decode("ascii")
+
     async def _commit_audio_buffer(
         self,
         event_id: str | None = None,
@@ -340,13 +332,12 @@ class OpenAIFullDuplexConnection:
         s = self.session
         if len(s.input_audio_buffer) == 0:
             return None
-        pcm16 = np.frombuffer(bytes(s.input_audio_buffer), dtype=np.int16)
-        audio_f32 = pcm16.astype(np.float32) / 32768.0
+        audio = base64.b64encode(s.input_audio_buffer).decode("ascii")
         item = types.RealtimeConversationItemUserMessage(
             type="message",
             role="user",
             status="completed",
-            content=[{"type": "input_audio", "audio": self._pcm16_b64(audio_f32)}],
+            content=[{"type": "input_audio", "audio": audio}],
         )
         try:
             s.insert_item(item)
@@ -447,37 +438,31 @@ class OpenAIFullDuplexConnection:
             metadata=metadata,
         )
 
-    async def _estimate_total_tokens(
-        self,
-        tools: list | None,
-        *,
-        instructions: str | None = None,
-        items: list[Any] | None = None,
-    ) -> int:
-        t0 = time.monotonic()
-        prompt = await self._build_full_prompt(tools=tools, instructions=instructions, items=items)
-        total = len(prompt["prompt_token_ids"])
-        audio_arrays = prompt.get("multi_modal_data", {}).get("audio", [])
-        if audio_arrays:
-            raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
-            placeholder_len = len(raw_tok.encode(AUDIO_PLACEHOLDER, add_special_tokens=False))
-            for arr, sr in audio_arrays:
-                total += self._qwen3_omni_audio_token_count(arr.shape[0], sr) - placeholder_len
-        elapsed = time.monotonic() - t0
-        if elapsed > 0.05:
-            logger.warning(
-                "[realtime] _estimate_total_tokens took %.3fs (history=%d items, %d audio segments)",
-                elapsed,
-                len(items if items is not None else self.session.items),
-                len(audio_arrays),
-            )
-        return total
-
-    async def _maybe_truncate_history(self, response: _ResolvedResponse) -> bool:
+    async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
         s = self.session
-        max_model_len = getattr(self.engine.model_config, "max_model_len", None)
-        if not max_model_len:
-            return True
+        max_model_len = self.engine.model_config.max_model_len
+        if response.input is None:
+            items = s.model_context_items()
+        else:
+            items = response.input
+
+        async def probe_prompt(
+            current_items: list[types.ConversationItem],
+        ) -> tuple[EngineInput | None, int]:
+            # Budget checks are speculative and may render repeatedly while
+            # truncating, so keep them off the shared sender cache.
+            try:
+                prompt = await self._build_full_prompt(
+                    tools=response.tools,
+                    instructions=response.instructions,
+                    items=current_items,
+                    skip_mm_cache=True,
+                )
+            except VLLMValidationError as exc:
+                if not _is_prompt_limit_error(exc):
+                    raise
+                return None, max_model_len + 1
+            return prompt, len(prompt["prompt_token_ids"])
 
         truncation = s.config.truncation or "auto"
         ratio = 1.0
@@ -503,67 +488,41 @@ class OpenAIFullDuplexConnection:
             trigger = limit
             target = limit
 
-        persistent = response.input is None
-        items: list[Any] = s.items if response.input is None else response.input
-        total = await self._estimate_total_tokens(
-            response.tools,
-            instructions=response.instructions,
-            items=items,
-        )
+        engine_input, total = await probe_prompt(items)
         if total <= trigger:
-            return True
+            return items
         if mode == "disabled":
             logger.warning(
                 "[realtime] token budget exceeded (%d/%d) and truncation is disabled -- rejecting response.create",
                 total,
                 limit,
             )
-            return False
+            return None
 
-        idx = 0
-        while total > target and idx < len(items):
-            item = items[idx]
-            if getattr(item, "role", None) == "system":
-                idx += 1
-                continue
-            if persistent and item.id is not None and s.item_in_progress.get(item.id, False):
-                idx += 1
-                continue
+        all_items = items
+        if not all_items:
+            return None if total > limit else all_items
 
-            remove_indexes = [idx]
-            if item.type in ("function_call", "function_call_output"):
-                call_id = getattr(item, "call_id", None)
-                pair_idx = next(
-                    (
-                        other_idx
-                        for other_idx, other in enumerate(items)
-                        if other_idx != idx and getattr(other, "call_id", None) == call_id
-                    ),
-                    None,
-                )
-                if pair_idx is not None:
-                    remove_indexes.append(pair_idx)
+        low = 1
+        high = len(all_items)
+        feasible_index: int | None = None
+        while low < high:
+            middle = (low + high) // 2
+            items = all_items[middle:]
+            engine_input, total = await probe_prompt(items)
+            if total <= target:
+                high = middle
+                feasible_index = middle
+            else:
+                low = middle + 1
 
-            for remove_idx in sorted(remove_indexes, reverse=True):
-                removed = items[remove_idx]
-                if persistent:
-                    s.remove_item(removed.id)
-                    await self._send_event(
-                        types.ConversationItemDeletedEvent(
-                            event_id=_gen_id("evt"),
-                            type="conversation.item.deleted",
-                            item_id=removed.id,
-                        )
-                    )
-                else:
-                    del items[remove_idx]
-            total = await self._estimate_total_tokens(
-                response.tools,
-                instructions=response.instructions,
-                items=items,
-            )
+        if feasible_index != low:
+            items = all_items[low:]
+            engine_input, total = await probe_prompt(items)
 
-        return total <= limit
+        if total > limit:
+            return None
+        return items
 
     async def _handle_response_create(self, event: types.ResponseCreateEvent):
         s = self.session
@@ -582,13 +541,47 @@ class OpenAIFullDuplexConnection:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
 
-        if not await self._maybe_truncate_history(response):
+        had_active_response = s.active_response is not None
+        try:
+            preflight_items = await self._truncate_prompt_items(response)
+        except VLLMValidationError as exc:
+            await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
+            return
+        if preflight_items is None:
             await self._send_error(
                 "The response input exceeds the model's input token limit",
                 "invalid_request_error",
                 event_id=event.event_id,
             )
             return
+
+        if had_active_response:
+            if s.active_response is not None:
+                await self._cancel_active_response()
+            try:
+                preflight_items = await self._truncate_prompt_items(response)
+            except VLLMValidationError as exc:
+                await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
+                return
+            if preflight_items is None:
+                await self._send_error(
+                    "The response input exceeds the model's input token limit",
+                    "invalid_request_error",
+                    event_id=event.event_id,
+                )
+                return
+
+        try:
+            engine_input = await self._build_full_prompt(
+                tools=response.tools,
+                instructions=response.instructions,
+                items=preflight_items,
+            )
+        except VLLMValidationError as exc:
+            await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
+            return
+        if response.input is None:
+            s.commit_model_context_items(preflight_items)
 
         response_id = _gen_id("resp")
         await self._send_event(
@@ -599,13 +592,10 @@ class OpenAIFullDuplexConnection:
             )
         )
 
-        if s.active_response is not None:
-            await self._cancel_active_response()
-
         s.active_response = ActiveResponse(response_id=response_id, request_id=f"rt-{response_id}")
 
         self._response_cancel_event.clear()
-        self._response_task = asyncio.create_task(self._run_response(response_id, response))
+        self._response_task = asyncio.create_task(self._run_response(response_id, response, engine_input))
 
     def _response_object(
         self,
@@ -630,7 +620,12 @@ class OpenAIFullDuplexConnection:
             usage=usage,
         )
 
-    async def _run_response(self, response_id: str, response: _ResolvedResponse):
+    async def _run_response(
+        self,
+        response_id: str,
+        response: _ResolvedResponse,
+        engine_input: EngineInput,
+    ):
         s = self.session
         active = s.active_response
         if active is None:
@@ -638,7 +633,7 @@ class OpenAIFullDuplexConnection:
 
         completed = False
         try:
-            await self._run_response_inner(response_id, response, s, active)
+            await self._run_response_inner(response_id, response, s, active, engine_input)
             completed = True
         except asyncio.CancelledError:
             if self._response_cancel_event.is_set():
@@ -716,17 +711,11 @@ class OpenAIFullDuplexConnection:
         except Exception:
             logger.debug("Failed to send failure response.done for %s", response_id, exc_info=True)
 
-    async def _run_response_inner(self, response_id, response, s, active):
+    async def _run_response_inner(self, response_id, response, s, active, engine_input: EngineInput):
         previous_item_id = s.items[-1].id if s.items else None
         modalities = response.modalities
         is_audio = "audio" in modalities
         tools, tool_choice = response.tools, response.tool_choice
-        prompt = await self._build_full_prompt(
-            tools=tools,
-            instructions=response.instructions,
-            items=response.input,
-        )
-
         item_id = _gen_id("item")
         active.item_id = item_id
         output_index = 0
@@ -804,12 +793,13 @@ class OpenAIFullDuplexConnection:
         limit_reached = False
         usage = ResponseUsage()
         total_audio_samples = 0
+        audio_resampler: StreamingAudioResampler | None = None
 
         previous_text = ""
         previous_token_ids: list[int] = []
         pending_tool_calls: dict[int, dict[str, Any]] = {}
         next_output_index = 1  # 0 is the message item, reserved above
-        # Qwen's talker speaks tool markup, so stop audio after detecting a call.
+        # Tool-call markup is control output, so suppress its audio after detection.
         tool_call_seen = False
 
         async def emit_content_delta(piece: str) -> None:
@@ -842,6 +832,26 @@ class OpenAIFullDuplexConnection:
                         delta=piece,
                     )
                 )
+
+        async def emit_audio_delta(chunk: np.ndarray) -> None:
+            nonlocal total_audio_samples
+            if not chunk.size:
+                return
+            # Honor the requested modality and suppress audio after a tool call.
+            if not is_audio or tool_call_seen:
+                return
+            total_audio_samples += chunk.shape[0]
+            await self._send_event(
+                types.ResponseAudioDeltaEvent(
+                    event_id=_gen_id("evt"),
+                    type="response.output_audio.delta",
+                    response_id=response_id,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    delta=self._pcm16_b64(chunk),
+                )
+            )
 
         async def handle_tool_parser_delta(delta_msg) -> None:
             nonlocal next_output_index, tool_call_seen
@@ -911,8 +921,11 @@ class OpenAIFullDuplexConnection:
                         sp.structured_outputs = StructuredOutputsParams(structural_tag=structural_tag_json)
                     thinker_params_configured = True
 
+        sampling_params_list = self.chat_handler._fix_minicpmo45_audio_stream_output_kinds(
+            sampling_params_list, modalities
+        )
         gen = self.engine.generate(
-            prompt=prompt,
+            prompt=engine_input,
             request_id=active.request_id,
             sampling_params_list=sampling_params_list,
             output_modalities=modalities,
@@ -927,31 +940,14 @@ class OpenAIFullDuplexConnection:
                 output_type = getattr(output, "final_output_type", "text")
                 if output_type == "audio":
                     audio_chunks = self._extract_audio_deltas(output)
-                    for chunk in audio_chunks:
-                        total_audio_samples += chunk.shape[0]
-                        # is_audio guard is defense-in-depth: generate() is
-                        # now given output_modalities=modalities above, so
-                        # the engine shouldn't produce audio-typed output
-                        # for a text-only response -- but don't rely on
-                        # that alone to honor the client's explicit
-                        # request; never flip session state or forward
-                        # audio it didn't ask for.
-                        if not is_audio:
-                            continue
-                        if tool_call_seen:
-                            continue
-                        b64 = self._pcm16_b64(chunk)
-                        await self._send_event(
-                            types.ResponseAudioDeltaEvent(
-                                event_id=_gen_id("evt"),
-                                type="response.output_audio.delta",
-                                response_id=response_id,
-                                item_id=item_id,
-                                output_index=output_index,
-                                content_index=content_index,
-                                delta=b64,
+                    if audio_chunks:
+                        if audio_resampler is None:
+                            audio_resampler = StreamingAudioResampler(
+                                audio_chunk_sample_rate(output),
+                                SAMPLE_RATE_HZ,
                             )
-                        )
+                        for chunk in audio_chunks:
+                            await emit_audio_delta(audio_resampler.process(chunk))
                     continue
 
                 if output.outputs:
@@ -966,11 +962,8 @@ class OpenAIFullDuplexConnection:
                     delta_text = first_out.text or ""
                     delta_token_ids = list(first_out.token_ids)
                     usage.output_tokens += len(delta_token_ids)
-                    # Raw thinker token stream, in talker-consumption order --
-                    # this is what _qwen3_omni_truncate_transcript correlates
-                    # against codec frames, independent of any tool-parser
-                    # stripping applied to full_text/full_transcript below
-                    # (the talker speaks the raw stream, tool tags included).
+                    # Keep the raw token stream for approximate transcript
+                    # truncation, independent of any tool-parser stripping.
                     full_token_ids.extend(delta_token_ids)
 
                     if output.prompt_token_ids:
@@ -1020,6 +1013,10 @@ class OpenAIFullDuplexConnection:
 
         if self._response_cancel_event.is_set():
             cancelled = True
+
+        if audio_resampler is not None and not cancelled:
+            tail = audio_resampler.process(np.empty(0, dtype=np.float32), final=True)
+            await emit_audio_delta(tail)
 
         status = "cancelled" if cancelled else "incomplete" if limit_reached else "completed"
 
@@ -1170,11 +1167,9 @@ class OpenAIFullDuplexConnection:
                     s.item_duration_ms[item_obj.id] = total_audio_samples / SAMPLE_RATE_HZ * 1000
                     # Skip storing for tool-call responses: full_token_ids is
                     # the raw thinker stream (tool-call tags included), but
-                    # this item's transcript/text is the tool-parser-stripped
-                    # content -- the two no longer line up token-for-token,
-                    # so _qwen3_omni_truncate_transcript falls back to
-                    # blanking (today's behavior) rather than risk splicing
-                    # raw <tool_call> text into a truncated transcript.
+                    # this item's transcript/text is tool-parser-stripped,
+                    # so truncation falls back to a blank transcript rather
+                    # than splice raw tool markup into it.
                     if not pending_tool_calls:
                         s.item_token_ids[item_obj.id] = full_token_ids
                 await self._send_conversation_item_added_and_done(history_item, previous_item_id)
@@ -1488,16 +1483,10 @@ class OpenAIFullDuplexConnection:
             )
             return
 
-        # Per spec, truncating audio must not leave text in context the user
-        # never heard -- but rather than blanking the transcript entirely
-        # (the previous, spec-minimum behavior), reconstruct the prefix that
-        # *was* actually heard using Qwen3-Omni's fixed talker text/frame
-        # correlation (see _qwen3_omni_truncate_transcript). This keeps the
-        # model's own memory of what it said in sync with what the user
-        # actually heard, instead of wiping it and confusing later turns.
-        # Falls back to "" (today's behavior) when we don't have a captured
-        # token stream for this item (e.g. it included a tool call).
-        truncated_text = self._qwen3_omni_truncate_transcript(item_id, audio_end_ms)
+        # Preserve only the transcript prefix proportional to the audio heard.
+        # Exact token/audio alignment is model-specific, so fall back to an
+        # empty transcript when token IDs or duration are unavailable.
+        truncated_text = self._truncate_transcript(item_id, audio_end_ms)
         part = new_content[content_index]
         if hasattr(part, "transcript"):
             new_content[content_index] = {
@@ -1587,8 +1576,8 @@ class OpenAIFullDuplexConnection:
                 return text
         return ""
 
-    def _resolve_response_input(self, items: list[Any]) -> list[Any]:
-        resolved = []
+    def _resolve_response_input(self, items: list[Any]) -> list[types.ConversationItem]:
+        resolved: list[types.ConversationItem] = []
         for item in items:
             if getattr(item, "type", None) != "item_reference":
                 self._validate_input_item(item)
@@ -1602,45 +1591,33 @@ class OpenAIFullDuplexConnection:
             resolved.append(referenced)
         return resolved
 
-    def _qwen3_omni_truncate_transcript(self, item_id: str, audio_end_ms: float) -> str:
-        """Approximate the transcript heard before ``audio_end_ms``."""
+    def _truncate_transcript(self, item_id: str, audio_end_ms: float) -> str:
+        """Estimate the transcript prefix heard before ``audio_end_ms``."""
         token_ids = self.session.item_token_ids.get(item_id)
-        if not token_ids:
+        duration_ms = self.session.item_duration_ms.get(item_id)
+        if not token_ids or duration_ms is None or duration_ms <= 0:
             return ""
-        tokens_heard = round(audio_end_ms / QWEN3_OMNI_MS_PER_TOKEN)
-        tokens_heard = min(tokens_heard, len(token_ids))
+        tokens_heard = int(len(token_ids) * audio_end_ms / duration_ms)
         if tokens_heard <= 0:
             return ""
         raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
         return raw_tok.decode(token_ids[:tokens_heard], skip_special_tokens=True)
-
-    @staticmethod
-    def _qwen3_omni_audio_token_count(num_samples: int, sample_rate: int) -> int:
-        """Return Qwen3-Omni's expanded token count for an audio segment."""
-        from vllm.model_executor.models.qwen3_omni_moe_thinker import (
-            _get_feat_extract_output_lengths,
-        )
-
-        num_samples_16k = round(num_samples * 16000 / sample_rate)
-        input_lengths = num_samples_16k // 160
-        output_lengths = _get_feat_extract_output_lengths(input_lengths)
-        return int(output_lengths) + 2  # + <|audio_start|> + <|audio_end|>
 
     async def _build_full_prompt(
         self,
         tools: list | None = None,
         *,
         instructions: str | None = None,
-        items: list | None = None,
-    ) -> TokensPrompt:
-        """Render the effective instructions and items into an engine prompt."""
-        from vllm.inputs import TokensPrompt
+        items: list[types.ConversationItem] | None = None,
+        skip_mm_cache: bool = False,
+    ) -> EngineInput:
+        """Render the effective conversation through normal chat preprocessing."""
+        chat_handler = self.chat_handler
 
         s = self.session
         effective_instructions = instructions if instructions is not None else s.config.instructions
         effective_items = items if items is not None else s.items
         messages: list[dict[str, Any]] = []
-        audio_arrays: list[tuple[np.ndarray, int]] = []
         converted_tools = self._convert_tools(tools) if tools else None
 
         if effective_instructions:
@@ -1648,11 +1625,7 @@ class OpenAIFullDuplexConnection:
 
         for item in effective_items:
             if item.type == "function_call":
-                # "" not None: this model's chat template only handles
-                # message.content as a string or a list (line 55/59 of its
-                # Jinja template unconditionally iterates non-string content
-                # assuming it's a list) -- None crashes with "'NoneType'
-                # object is not iterable" (confirmed in production logs).
+                # Some chat templates iterate message content unconditionally.
                 messages.append(
                     {
                         "role": "assistant",
@@ -1673,17 +1646,23 @@ class OpenAIFullDuplexConnection:
 
             role = getattr(item, "role", None)
             if role == "user":
-                parts_text = []
+                content = []
                 for part in item.content:
                     if part.type == "input_audio" and part.audio:
-                        parts_text.append(AUDIO_PLACEHOLDER)
                         audio_bytes = self._decode_pcm16(part.audio, MAX_INPUT_AUDIO_BUFFER_BYTES)
-                        pcm16 = np.frombuffer(audio_bytes, dtype=np.int16)
-                        audio_arrays.append((pcm16.astype(np.float32) / 32768.0, SAMPLE_RATE_HZ))
+                        content.append(
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": self._pcm16_wav_b64(audio_bytes),
+                                    "format": "wav",
+                                },
+                            }
+                        )
                     elif part.type == "input_text" and part.text:
-                        parts_text.append(part.text)
-                if parts_text:
-                    messages.append({"role": "user", "content": "".join(parts_text)})
+                        content.append({"type": "text", "text": part.text})
+                if content:
+                    messages.append({"role": "user", "content": content})
             elif role == "assistant":
                 text = self._assistant_item_text(item)
                 if text:
@@ -1693,21 +1672,19 @@ class OpenAIFullDuplexConnection:
                 if text:
                     messages.append({"role": "system", "content": text})
 
-        chat_template_kwargs: dict[str, Any] = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-            "add_special_tokens": False,
-        }
-        if converted_tools:
-            chat_template_kwargs["tools"] = converted_tools
-        text = self._tokenizer.apply_chat_template(messages, **chat_template_kwargs)
-        raw_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
-        token_ids = raw_tok.encode(text, add_special_tokens=False)
-
-        prompt_data = TokensPrompt(prompt_token_ids=token_ids)
-        if audio_arrays:
-            prompt_data["multi_modal_data"] = {"audio": audio_arrays}
-        return prompt_data
+        request = ChatCompletionRequest(model=self.model_name, messages=messages)
+        _, (engine_input,) = await chat_handler._preprocess_chat(
+            request,
+            messages,
+            default_template=request.chat_template or chat_handler.chat_template,
+            default_template_content_format=chat_handler.chat_template_content_format,
+            default_template_kwargs=chat_handler._effective_chat_template_kwargs(request),
+            tool_dicts=converted_tools,
+            skip_mm_cache=skip_mm_cache,
+        )
+        if engine_input.get("prompt_token_ids") is None:
+            raise RuntimeError("Realtime renderer did not return prompt token IDs")
+        return engine_input
 
     # ------------------------------------------------------------------ #
     #  Audio output processing                                            #

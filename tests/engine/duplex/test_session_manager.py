@@ -827,6 +827,23 @@ async def test_close_retains_the_admission_slot_until_stage_cleanup_succeeds() -
         assert (await harness.open("sid-replacement")).ok is True
 
 
+async def test_undeliverable_handshake_close_releases_admission_after_detach() -> None:
+    """``session.created`` never delivered: detach still holds the slot; close frees it.
+
+    Serving calls this close for both a raised send and a detach-before-send.
+    The two triggers share this manager cleanup.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        assert (await harness.open("sid-handshake")).ok is True
+        assert (await harness.touch("sid-handshake", DuplexLeaseActivity.DETACH.value)).ok is True
+        blocked = await harness.open("sid-blocked")
+        assert blocked.error_code == "resource_exhausted"
+
+        closed = await harness.close("sid-handshake", reason="session_created_undelivered")
+        assert closed.ok is True
+        assert (await harness.open("sid-next")).ok is True
+
+
 async def test_resume_requires_the_expected_lease_generation() -> None:
     async with Harness.create() as harness:
         await harness.open("sid-resume")

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Tests for AsyncOmniEngine.try_get_output and try_get_output_async.
+"""Tests for AsyncOmniEngine.try_get_output.
 
 Focuses on the critical behavior: when the orchestrator thread dies,
 subsequent attempts to collect output raise RuntimeError.
@@ -92,29 +92,6 @@ def test_try_get_output_raises_after_orchestrator_dies(mocker: MockerFixture):
         engine.try_get_output()
 
 
-@pytest.mark.asyncio
-async def test_try_get_output_async_raises_after_orchestrator_dies(mocker: MockerFixture):
-    """Same scenario as above but for the async variant."""
-    raw_queue = queue.Queue()
-    raw_queue.put_nowait(
-        OutputMessage(
-            request_id="r1",
-            stage_id=0,
-            engine_outputs=OmniRequestOutput(request_id="r1"),
-            finished=False,
-        )
-    )
-
-    engine = _make_engine(SimpleNamespace(sync_q=raw_queue), mocker, thread_alive=True)
-
-    assert (await engine.try_get_output_async()).request_id == "r1"
-
-    engine.orchestrator_thread.is_alive.return_value = False
-
-    with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
-        await engine.try_get_output_async()
-
-
 def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixture):
     """When the orchestrator thread crashes, it enqueues a fatal error message.
 
@@ -133,22 +110,6 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
     assert msg.type == "error"
     assert msg.fatal is True
     assert "crashed" in msg.error
-
-
-@pytest.mark.asyncio
-async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker: MockerFixture):
-    """Async variant of the fatal error message test."""
-    fatal_msg = ErrorMessage(error="Orchestrator thread crashed", fatal=True)
-
-    raw_queue = queue.Queue()
-    raw_queue.put_nowait(fatal_msg)
-
-    engine = _make_engine(SimpleNamespace(sync_q=raw_queue), mocker, thread_alive=False)
-
-    msg = await engine.try_get_output_async()
-    assert msg is not None
-    assert msg.type == "error"
-    assert msg.fatal is True
 
 
 def test_output_remains_on_shared_output_path(mocker: MockerFixture):

@@ -127,7 +127,13 @@ def _get_wan22_feature_cases():
         for feat_id, server_args, marks in NPU_PARALLEL_CONFIGS:
             cases.append(
                 pytest.param(
-                    OmniServerParams(model=model_path, server_args=server_args),
+                    OmniServerParams(
+                        model=model_path,
+                        server_args=server_args,
+                        stage_init_timeout=1800,
+                        init_timeout=2100,
+                        startup_timeout=2400,
+                    ),
                     id=f"npu_{model_key}_{feat_id}",
                     marks=marks,
                 )

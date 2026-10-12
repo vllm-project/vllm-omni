@@ -472,7 +472,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             nested = getattr(request, "extra_body", None)
         explicit = getattr(request, "model_fields_set", None)
         if explicit is None:
-            explicit = getattr(request, "__fields_set__", ())
+            explicit = getattr(request, "__fields_set__", None) or ()
         explicit_root_args = {
             key: getattr(request, key) for key in explicit if key != "extra_body" and hasattr(request, key)
         }
@@ -539,7 +539,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     def _truthy_extra_body_flag(request: Any, key: str) -> bool:
         if isinstance(request, dict):
             extra_body = request
-            model_extra = {}
+            model_extra: dict[str, Any] = {}
         else:
             extra_body = getattr(request, "extra_body", None) or {}
             model_extra = getattr(request, "model_extra", None) or {}
@@ -777,7 +777,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 # Override the prompts produced by chat-template preprocessing.
                 is_img2img = engine_prompt_image is not None
-                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
+                tprompt: OmniTextPrompt = OmniTextPrompt(prompt=extracted_prompt)
                 if is_img2img:
                     tprompt["modalities"] = ["img2img"]
                 else:
@@ -832,19 +832,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if not extracted_prompt:
                     return self.create_error_response("No text prompt found in messages")
 
-                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
-                tprompt["modalities"] = ["text"]
+                text_prompt: OmniTextPrompt = OmniTextPrompt(prompt=extracted_prompt, modalities=["text"])
 
                 if reference_images:
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
                         img = Image.open(BytesIO(img_bytes))
-                        tprompt["multi_modal_data"] = {"image": img}
-                        tprompt["multi_modal_uuids"] = {"image": [f"{request_id}-image-0"]}
+                        text_prompt["multi_modal_data"] = {"image": img}
+                        text_prompt["multi_modal_uuids"] = {"image": [f"{request_id}-image-0"]}
                     except Exception:
                         pass
 
-                engine_prompts = [tprompt]
+                engine_prompts = [text_prompt]
             except Exception as e:
                 logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
             _image_gen_height = None
@@ -977,6 +976,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         continue_final_message: bool = False,
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
+        skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
         if renderer is None:
             renderer = self.renderer
@@ -1020,6 +1020,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_extras={
                 k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
             },
+            skip_mm_cache=skip_mm_cache,
         )
 
         tokenizer = renderer.get_tokenizer()
@@ -1417,7 +1418,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Pydantic v2 uses `model_fields_set`; keep v1 fallback for compatibility.
         explicit_fields = getattr(request, "model_fields_set", None)
         if explicit_fields is None:
-            explicit_fields = getattr(request, "__fields_set__", set())
+            explicit_fields = getattr(request, "__fields_set__", None) or set()
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
             if field_name not in explicit_fields:
@@ -2170,6 +2171,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             # finish_reason is:
                             # "tool_calls" for "auto" or "required" tool calls,
                             # and "stop" for named tool calls.
+                            finish_reason_: str | None
                             if (
                                 auto_tools_called
                                 or (tools_streamed[i] and not tool_choice_function_name)
@@ -2621,7 +2623,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if output_text:
                     # Get the corresponding output token IDs
                     output_token_ids = None
-                    if choice.index < len(final_res.outputs):
+                    if final_res is not None and choice.index < len(final_res.outputs):
                         output_token_ids = final_res.outputs[choice.index].token_ids
 
                     self.request_logger.log_outputs(
@@ -3229,7 +3231,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 resolve_stop_token_ids,
             )
 
-            build_kwargs: dict[str, Any] = {
+            build_kwargs = {
                 "task": "it2i" if reference_images else "t2i",
                 "sys_type": use_system_prompt,
                 "custom_system_prompt": custom_system_prompt,
@@ -3277,7 +3279,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 **ar_stop_kwargs,
             )
 
-        engine_prompt: OmniTextPrompt = {"prompt": prompt}
+        engine_prompt: OmniTextPrompt = OmniTextPrompt(prompt=prompt)
         if prompt_token_ids is not None:
             engine_prompt["prompt_token_ids"] = prompt_token_ids
         if system_prompt_type is not None:
@@ -3322,7 +3324,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # AR stop tokens: use stage_type=="llm" instead of comprehension_idx
             # (None for DictConfig where is_comprehension is nested in engine_args).
             if stage_type == "llm" and ar_stop_token_ids is not None:
-                default_stage_params.stop_token_ids = ar_stop_token_ids
+                setattr(default_stage_params, "stop_token_ids", ar_stop_token_ids)
 
             if stage_type == "llm" and idx == 0 and ar_prompt_info is not None:
                 if should_init_extra_args_for_non_diffusion_stages(model_class_name):
@@ -3463,6 +3465,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             layers=extra_body.get("layers"),
             resolution=extra_body.get("resolution"),
             strength=extra_body.get("strength"),
+            sigmas=extra_body.get("sigmas"),
         )
 
         if lora_body and isinstance(lora_body, dict):
@@ -3475,11 +3478,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             except Exception as e:  # pragma: no cover - safeguard
                 logger.warning("Failed to parse LoRA request: %s", e)
 
-        gen_prompt: OmniTextPrompt = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "modalities": ["image"],
-        }
+        gen_prompt: OmniTextPrompt = OmniTextPrompt(
+            prompt=prompt,
+            modalities=["image"],
+        )
+        if negative_prompt is not None:
+            gen_prompt["negative_prompt"] = negative_prompt
         if pil_images:
             if len(pil_images) == 1:
                 gen_prompt["multi_modal_data"] = {"image": pil_images[0]}
@@ -3607,20 +3611,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # ``images`` field, so fall back to the shared extractor used by the
         # offline example path before giving up.
         images = getattr(result, "images", None) or extract_images_from_outputs(result)
-        stage_durations = result.stage_durations
-        peak_memory_mb = result.peak_memory_mb
+        stage_durations = getattr(result, "stage_durations", None)
+        peak_memory_mb = getattr(result, "peak_memory_mb", None)
         response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
         cot_output = None
-
-        req_out = result
-        if req_out:
-            prompt_obj = getattr(req_out, "prompt", None)
-            if isinstance(prompt_obj, dict):
-                extra = prompt_obj.get("extra", {})
-                if isinstance(extra, dict):
-                    ar_text = extra.get("ar_generated_text")
-                    if isinstance(ar_text, str) and ar_text.strip():
-                        cot_output = ar_text
+        prompt_obj = getattr(result, "prompt", None)
+        if isinstance(prompt_obj, dict):
+            extra = prompt_obj.get("extra", {})
+            if isinstance(extra, dict):
+                ar_text = extra.get("ar_generated_text")
+                if isinstance(ar_text, str) and ar_text.strip():
+                    cot_output = ar_text
 
         return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output, response_metrics
 
@@ -3648,14 +3649,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         text = completion.text or ""
                         if not text:
                             continue
-                        chunk = ImageEditARDeltaChunk(
+                        delta_chunk = ImageEditARDeltaChunk(
                             delta=text,
                             index=completion.index,
                             created=created,
                             model=model,
                             metrics=metrics,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield f"data: {delta_chunk.model_dump_json()}\n\n"
                 elif final_output_type == "image":
                     images = self._flatten_diffusion_images(getattr(output, "images", []))
                     if not images:
@@ -3671,15 +3672,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                         for img in images
                     ]
-                    chunk = ImageEditImageChunk(
+                    actual_size = f"{images[0].width}x{images[0].height}"
+                    # Echo the request size only when it already matches the
+                    # decoded pixels. Use actual WxH for size=auto/None or when
+                    # the pipeline diverged (e.g. Qwen-Image-2.1 aspect-derived
+                    # outputs). Edit models that honor an explicit WxH keep the
+                    # same wire string because size == actual_size.
+                    if size in (None, "auto") or size != actual_size:
+                        chunk_size = actual_size
+                    else:
+                        chunk_size = size
+                    img_chunk = ImageEditImageChunk(
                         data=image_data,
                         output_format=output_format,
-                        size=size,
+                        size=chunk_size,
                         created=created,
                         model=model,
                         metrics=metrics,
                     )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    yield f"data: {img_chunk.model_dump_json()}\n\n"
                     emitted_image = True
             if not emitted_image:
                 raise RuntimeError("Streaming image edit completed without a final image output.")
@@ -3699,7 +3710,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
         except OmniClientError as exc:
             logger.info("Client error during streaming image edit: %s", exc)
-            chunk = ImageEditStreamError(
+            client_error_chunk = ImageEditStreamError(
                 created=created,
                 model=model,
                 error={
@@ -3708,10 +3719,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "code": exc.status_code,
                 },
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {client_error_chunk.model_dump_json()}\n\n"
         except Exception as exc:
             logger.exception("Streaming image edit failed: %s", exc)
-            chunk = ImageEditStreamError(
+            server_error_chunk = ImageEditStreamError(
                 created=created,
                 model=model,
                 error={
@@ -3720,7 +3731,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "code": 500,
                 },
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {server_error_chunk.model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
 
     @staticmethod
@@ -3827,11 +3838,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning("Failed to decode reference image: %s", e)
 
             # Build generation kwargs
-            gen_prompt: OmniTextPrompt = {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "modalities": ["image"],
-            }
+            gen_prompt: OmniTextPrompt = OmniTextPrompt(
+                prompt=prompt,
+                modalities=["image"],
+            )
+            if negative_prompt is not None:
+                gen_prompt["negative_prompt"] = negative_prompt
             gen_params = OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
@@ -4057,6 +4069,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
 
                 # Build response
+                content: str | list[dict[str, Any]]
                 if not image_contents:
                     content = "Image generation completed but no images were produced."
                 else:

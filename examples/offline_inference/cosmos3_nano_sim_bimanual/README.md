@@ -41,6 +41,10 @@ paged cache is sized from the request's `num_frames`. Streaming sessions must
 declare their total video length up front and keep it fixed across ticks.
 Older checkpoints retain their exported finite window and schedule.
 
+For camera-based selection from a full KV archive, see
+[frustum KV retrieval](frustum_retrieval.md). It is enabled per input record
+with an explicit camera-geometry sidecar.
+
 For the preprocessed AgiBot NPZ example:
 
 ```bash
@@ -296,3 +300,15 @@ The exporter detects `conditioning.mode="control_video"` and writes
 `Cosmos3NanoSimTransferPipeline` into the model indexes. Shared manifests and
 metadata retain the `cosmos3_nano_sim_bimanual` prefix. The deployment is
 [`cosmos3_nano_sim_transfer.yaml`](../../../vllm_omni/deploy/cosmos3_nano_sim_transfer.yaml).
+
+## Padded conditioning images
+
+For an image already reflection-padded during preprocessing, set
+`extra_args.conditioning_image_size` to `[padded_h, padded_w, content_h, content_w]`.
+The offline JSONL runner in `--input-format reference` mode accepts the same
+`conditioning_image_size` field on a record. For example, `[480, 832, 360, 640]` keeps the complete 832x480 image for
+VAE encoding, crops the encoded latent to 22x40, and generates 640x352 video.
+Omit explicit height/width or supply the cropped output size (352/640), not the
+padded input size. The input image must already match the padded canvas; this
+option does not resize or pad source pixels. Without this field behavior is
+unchanged. This option is specific to Bimanual, not Sim-Transfer.

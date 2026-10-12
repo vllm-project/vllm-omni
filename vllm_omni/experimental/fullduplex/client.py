@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import math
 import time
 import wave
 from collections.abc import Callable, Iterator, Sequence
@@ -16,8 +15,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-from vllm_omni.metrics.definitions import compute_audio_rtf
 
 try:
     import websockets
@@ -43,74 +40,6 @@ def duplex_unit_boundary_ms(unit_index: int) -> int:
     return DUPLEX_FIRST_UNIT_MS + max(0, int(unit_index)) * DUPLEX_UNIT_MS
 
 
-def _rounded_ms(value: float) -> float:
-    return round(float(value), 3)
-
-
-def _finite_number(value: object, *, nonnegative: bool = False) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    parsed = float(value)
-    return parsed if math.isfinite(parsed) and (not nonnegative or parsed >= 0) else None
-
-
-def _interval_summary(values: list[float]) -> dict[str, float | int]:
-    clean = sorted(_rounded_ms(value) for value in values if math.isfinite(value) and value >= 0)
-    if not clean:
-        return {"count": 0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
-
-    def nearest_rank(percentile: float) -> float:
-        index = max(0, math.ceil(percentile * len(clean)) - 1)
-        return clean[min(index, len(clean) - 1)]
-
-    return {
-        "count": len(clean),
-        "mean": _rounded_ms(sum(clean) / len(clean)),
-        "p50": nearest_rank(0.50),
-        "p95": nearest_rank(0.95),
-        "max": clean[-1],
-    }
-
-
-def summarize_session_request_metrics(
-    request_metrics: list[dict[str, object]],
-    *,
-    session_id: str | None,
-) -> dict[str, object]:
-    """Average client-observed metrics across turns that emitted audio."""
-
-    def mean(metric: str, *, digits: int = 3) -> float | None:
-        values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
-        return round(sum(values) / len(values), digits) if values else None
-
-    return {
-        "session_id": session_id,
-        "audio_turn_count": len(request_metrics),
-        "mean_ttft_ms": mean("ttft_ms"),
-        "mean_ttfp_ms": mean("ttfp_ms"),
-        "mean_rtf": mean("rtf", digits=6),
-    }
-
-
-def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
-    candidates: list[object] = [event.get("vllm_omni")]
-    metadata = event.get("metadata")
-    if isinstance(metadata, dict):
-        candidates.extend((metadata, metadata.get("vllm_omni")))
-    response = event.get("response")
-    if isinstance(response, dict):
-        response_metadata = response.get("metadata")
-        if isinstance(response_metadata, dict):
-            candidates.extend((response_metadata, response_metadata.get("vllm_omni")))
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        stage_metrics = candidate.get("stage_metrics")
-        if isinstance(stage_metrics, dict):
-            return stage_metrics
-    return None
-
-
 def build_realtime_url(
     url: str,
     model: str | None,
@@ -134,32 +63,6 @@ def build_realtime_url(
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
-def reference_audio_data_url(path: str | None) -> str | None:
-    """Encode a local reference WAV for a Realtime session update."""
-    if path is None:
-        return None
-    audio = Path(path).expanduser().resolve()
-    if not audio.is_file():
-        raise FileNotFoundError(f"Reference audio does not exist: {audio}")
-    return "data:audio/wav;base64," + base64.b64encode(audio.read_bytes()).decode("ascii")
-
-
-def chunk_period_ms(events: list[dict[str, object]], *, default: int = 1000) -> int:
-    """Read the negotiated native-duplex model-unit duration."""
-    for event in reversed(events):
-        session = event.get("session")
-        capabilities = session.get("capabilities") if isinstance(session, dict) else None
-        value = capabilities.get("chunk_period_ms") if isinstance(capabilities, dict) else None
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-    return default
-
-
-def has_residual_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bool:
-    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
-    return bool(unit_bytes and len(pcm16) % unit_bytes)
-
-
 def read_pcm16_wav(path: Path) -> bytes:
     """Read a mono, uncompressed, 16 kHz PCM16 WAV file."""
     with wave.open(str(path), "rb") as wav_file:
@@ -172,15 +75,6 @@ def read_pcm16_wav(path: Path) -> bytes:
         if wav_file.getcomptype() != "NONE":
             raise ValueError("input WAV must be uncompressed PCM")
         return wav_file.readframes(wav_file.getnframes())
-
-
-def write_pcm16_wav(path: Path, pcm16: bytes, *, sample_rate_hz: int) -> None:
-    """Write mono PCM16 bytes as a WAV artifact."""
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(PCM16_BYTES_PER_SAMPLE)
-        wav_file.setframerate(sample_rate_hz)
-        wav_file.writeframes(pcm16)
 
 
 async def wait_for(
@@ -292,146 +186,6 @@ class RealtimeEventCollector:
             if event.get("type") == event_type:
                 return received_at_s
         return None
-
-    def timing_summary(
-        self,
-        *,
-        after_s: float,
-        input_committed_at_s: float | None = None,
-        response_id: str | None = None,
-        measurement_origin: dict[str, str] | None = None,
-    ) -> dict[str, object]:
-        """Summarize engine token metrics and client-observed audio cadence."""
-        stage0_metrics: dict[str, object] | None = None
-        response_created_at_s: float | None = None
-        first_text_received_at_s: float | None = None
-        audio_received_at_s: list[float] = []
-        cumulative_audio_ms: list[float] = []
-        for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
-            if received_at_s < after_s:
-                continue
-            event_response_id = self.response_id(event)
-            if response_id is not None and event_response_id != response_id:
-                continue
-            if event.get("type") == "response.created" and response_created_at_s is None:
-                response_created_at_s = received_at_s
-            if (
-                event.get("type")
-                in {
-                    "response.output_audio_transcript.delta",
-                    "response.output_text.delta",
-                    "response.text.delta",
-                }
-                and isinstance(event.get("delta"), str)
-                and bool(event["delta"])
-                and first_text_received_at_s is None
-            ):
-                first_text_received_at_s = received_at_s
-
-            stage_metrics = _event_stage_metrics(event)
-            stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
-            if isinstance(stage0, dict):
-                stage0_metrics = stage0
-
-            if event.get("type") != "response.output_audio.delta" or (
-                response_id is not None and event_response_id != response_id
-            ):
-                continue
-            delta = event.get("delta") or event.get("audio")
-            if not isinstance(delta, str) or not delta:
-                continue
-            audio_received_at_s.append(received_at_s)
-            metadata = event.get("metadata")
-            duration_ms = metadata.get("audio_duration_ms") if isinstance(metadata, dict) else None
-            if isinstance(duration_ms, int | float) and math.isfinite(float(duration_ms)):
-                cumulative_audio_ms.append(max(0.0, float(duration_ms)))
-
-        result: dict[str, object] = {}
-        if stage0_metrics is not None:
-            raw_itls = stage0_metrics.get("vllm_itls_ms")
-            itls = (
-                [parsed for value in raw_itls if (parsed := _finite_number(value, nonnegative=True)) is not None]
-                if isinstance(raw_itls, list)
-                else []
-            )
-            result["stage0_tokens"] = {
-                "source": "engine_stage_metrics",
-                "output_token_count": int(_finite_number(stage0_metrics.get("num_tokens_out"), nonnegative=True) or 0),
-                "ttft_ms": _finite_number(stage0_metrics.get("vllm_ttft_ms"), nonnegative=True) or 0.0,
-                "tpot_ms": _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True),
-                "itls_ms": itls,
-                "inter_token_interval_ms": _interval_summary(itls),
-            }
-
-        if audio_received_at_s:
-            intervals_ms = [
-                (current - previous) * 1000.0 for previous, current in zip(audio_received_at_s, audio_received_at_s[1:])
-            ]
-            chunk_durations_ms: list[float] = []
-            previous_duration_ms = 0.0
-            for duration_ms in cumulative_audio_ms:
-                chunk_durations_ms.append(
-                    duration_ms - previous_duration_ms if duration_ms >= previous_duration_ms else duration_ms
-                )
-                previous_duration_ms = duration_ms
-            interval_summary = _interval_summary(intervals_ms)
-            result["audio_output"] = {
-                "source": "client_monotonic_receive",
-                "chunk_count": len(audio_received_at_s),
-                "response_created_to_first_audio_ms": (
-                    _rounded_ms((audio_received_at_s[0] - response_created_at_s) * 1000.0)
-                    if response_created_at_s is not None
-                    else None
-                ),
-                "commit_to_first_audio_ms": (
-                    _rounded_ms((audio_received_at_s[0] - input_committed_at_s) * 1000.0)
-                    if input_committed_at_s is not None
-                    else None
-                ),
-                "inter_chunk_interval_ms": interval_summary,
-                "chunk_duration_ms": _interval_summary(chunk_durations_ms),
-                "max_chunk_gap_ms": interval_summary["max"],
-            }
-            request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
-            if request_started_at_s is not None:
-                audio_duration_ms = (
-                    max(cumulative_audio_ms)
-                    if cumulative_audio_ms
-                    else len(self.audio_bytes(response_id))
-                    * 1000.0
-                    / (self.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
-                )
-                audio_generation_ms = max(
-                    0.0,
-                    (audio_received_at_s[-1] - request_started_at_s) * 1000.0,
-                )
-                result["request_metrics"] = {
-                    "source": "client_monotonic_receive",
-                    "measurement_origin": measurement_origin
-                    or {
-                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
-                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
-                        "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
-                    },
-                    "ttft_ms": (
-                        _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
-                        if first_text_received_at_s is not None
-                        else None
-                    ),
-                    "ttfp_ms": _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0),
-                    "rtf": round(
-                        compute_audio_rtf(
-                            audio_generation_ms / 1000.0,
-                            audio_duration_ms / 1000.0,
-                        ),
-                        6,
-                    )
-                    if audio_duration_ms > 0
-                    else None,
-                    "audio_generation_ms": _rounded_ms(audio_generation_ms),
-                    "audio_duration_ms": _rounded_ms(audio_duration_ms),
-                }
-        return result
 
 
 class RealtimeDuplexClient:

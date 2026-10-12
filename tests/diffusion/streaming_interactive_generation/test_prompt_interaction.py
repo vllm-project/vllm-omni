@@ -714,6 +714,7 @@ class TestPromptUpdateIntegration:
         omni = object.__new__(AsyncOmni)
         omni.engine = engine  # pyright: ignore[reportAttributeAccessIssue]
         omni.log_stats = False
+        omni.collect_stage_metrics = True
         omni._pause_cond = asyncio.Condition()
         omni._paused = False
         omni.request_states = {}
@@ -814,11 +815,16 @@ class TestPromptUpdateIntegration:
                 )
             )
 
-        async def try_get_output_async(self) -> Any | None:
-            try:
-                return self._fixture.output_sync_q.get_nowait()
-            except queue.Empty:
-                return None
+        async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+            msgs: list[Any] = []
+            while len(msgs) < max_messages:
+                try:
+                    msgs.append(self._fixture.output_sync_q.get_nowait())
+                except queue.Empty:
+                    break
+            if not msgs:
+                await asyncio.sleep(0.001)
+            return msgs
 
         def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
             return self.stage_metadata[stage_id]

@@ -40,7 +40,7 @@ SERVER_ARGS = [
     "Cosmos3OmniDiffusersPipeline",
     "--no-guardrails",
 ]
-SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
 
 
 def _get_diffusion_feature_cases(model: str):

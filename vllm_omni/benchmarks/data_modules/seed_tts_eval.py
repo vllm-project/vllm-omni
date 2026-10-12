@@ -42,8 +42,10 @@ Env: ``SEED_TTS_EVAL_DEVICE`` (e.g. ``cuda:0``, ``cpu``); ``SEED_TTS_HF_WHISPER_
 defaults to ``openai/whisper-large-v3`` (override for debugging only). Set
 ``SEED_TTS_WER_SAVE_AUDIO_DIR`` to save the captured 24 kHz mono WAV used by
 WER evaluation for each synthesized utterance.
-Streaming PCM is decoded using ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
-``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` (default: 24 kHz mono).
+Streaming PCM is decoded using the server's ``X-Audio-Sample-Rate`` /
+``X-Audio-Channels`` response headers; ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
+``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` (default: 24 kHz mono) apply when a server
+does not send them.
 """
 
 from __future__ import annotations

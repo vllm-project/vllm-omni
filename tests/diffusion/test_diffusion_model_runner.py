@@ -24,7 +24,9 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -413,7 +415,16 @@ def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypa
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestDiffusionOutputPipeline()
     runner.state_cache = {"aborted-step-request": object()}
-    old_step_batch = object()
+    old_step_batch = InputBatch.make_batch(
+        [
+            StepRequestState(
+                request_id="aborted-step-request",
+                sampling=OmniDiffusionSamplingParams(),
+                latents=torch.zeros(1, 1),
+                timesteps=torch.ones(1),
+            )
+        ]
+    )
     runner.input_batch = old_step_batch
     runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
     runner.remove_diffusion_kv_requests = Mock()
@@ -518,6 +529,35 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
             (),
             {"dynamic": True},
         )
+    ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_scopes_inductor_cudagraphs_to_decode_graph(monkeypatch):
+    model = SimpleNamespace(enable_cuda_graph_decode=True)
+    runner = _make_compile_runner(model)
+    compile_calls = []
+
+    def _regionally_compile(target, *args, **kwargs):
+        compile_calls.append(kwargs)
+        return target
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+    import torch._inductor.config as inductor_config
+
+    before = inductor_config.triton.cudagraphs
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert inductor_config.triton.cudagraphs == before
+    assert compile_calls == [
+        {
+            "dynamic": True,
+            "options": {
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            },
+        }
     ]
 
 
@@ -1452,3 +1492,27 @@ def test_execute_model_batch_cancellation_preserves_live_peer(monkeypatch, cance
             assert pipeline.last_batch is None
     finally:
         registry.close()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_non_step_fallback_keeps_client_error_status():
+    """Step mode's full-forward fallback must not drop a request error's 4xx status."""
+    from vllm_omni.errors import OmniClientError
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.execute_model = Mock(side_effect=OmniClientError("bad request option", status_code=400))
+    request = _make_request()
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        kv_prefetch_job=None,
+    )
+
+    result = DiffusionModelRunner._execute_non_step_requests(runner, scheduler_output)
+
+    output = result.get_request_output(request.request_id)
+    assert output.finished is True
+    assert output.result.error == "bad request option"
+    assert output.result.error_status_code == 400
+    assert output.result.error_type == "BadRequestError"

@@ -7,13 +7,15 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from functools import lru_cache
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import lru_cache, partial
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import soundfile as sf
 import torch
@@ -27,8 +29,14 @@ from vllm_omni.utils.device_copy import to_device_nonblocking
 from .batched_token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
+    PromptFeatures,
+    row_offset_signature,
     state_shape_signature,
 )
+from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
+
+if TYPE_CHECKING:
+    from vllm_omni.core.sched.output import OmniRequestPrewarm
 
 logger = init_logger(__name__)
 
@@ -45,6 +53,47 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     from vllm_omni.transformers_utils.repo_utils import hf_api
 
     return hf_api().snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+
+
+def _tf32_mode(extra: Mapping[str, Any]) -> str:
+    """Ordinary TF32 for CFM DiT GEMMs (``"off"`` / ``"tf32"``).
+
+    Enables ``allow_tf32`` on dense QKV/MLP and Triton ``input_precision="tf32"``
+    dots. Not compensated TF32x3. ``token2wav_allow_tf32`` is the shipped YAML
+    key; ``code2wav_allow_tf32`` and legacy env ``tf32x3`` / ``3xtf32`` alias it.
+    Defaults to ``"tf32"`` unless explicitly disabled.
+    """
+    raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
+    value = raw if raw not in (None, "") else extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", True))
+    if isinstance(value, str):
+        return {
+            "tf32": "tf32",
+            "tf32x3": "tf32",
+            "3xtf32": "tf32",
+            "flow": "tf32",
+            "1": "tf32",
+            "true": "tf32",
+            "yes": "tf32",
+        }.get(value.strip().lower(), "off")
+    return "tf32" if value else "off"
+
+
+@contextmanager
+def _stage_matmul_policy(extra: Mapping[str, Any]) -> Iterator[None]:
+    """Apply this stage's TF32 matmul policy for the enclosed work.
+
+    This stage owns the vocoder process. Restore its previous matmul
+    policy after eager execution/capture; cuDNN's policy is independent.
+    The idle prefetch runs the same preparation calls as chunk 0, so it
+    runs under the same policy.
+    """
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        if _tf32_mode(extra) != "off":
+            torch.backends.cuda.matmul.allow_tf32 = True
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -200,7 +249,28 @@ class _RequestState:
 class _RuntimePrompt:
     cache_id: str
     path: str
+    # Request ids whose committed chunk-0 reference is this entry.
     owners: set[str]
+    # Request ids whose idle-step prefetch pins this entry until their chunk 0
+    # or finish. Kept apart from ``owners``: chunk 0 commits and releases
+    # ownership only through ``_request_prompt_keys``, so a chunk-0 reference
+    # that differs from the prefetched one must not leave the prefetched entry
+    # owned by the request forever, and no request id can collide with a pin.
+    pins: set[str] = field(default_factory=set)
+
+
+# Placeholders queued for an idle-step prefetch at once; beyond this a request
+# prepares its reference inline at chunk 0.
+_MAX_QUEUED_PREFETCHES = 32
+
+
+@dataclass
+class _RefPrefetch:
+    ref_audio: torch.Tensor
+    sample_rate: int
+    # Set once phase A (materialize + prepare_prompt) has run; the record then
+    # stays queued only for phase B (``token2wav_ref_prefetch_setup``).
+    entry: _RuntimePrompt | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +295,12 @@ class _WorkItem:
     has_payload: bool = True
 
 
+def _slot_resident(item: _WorkItem) -> bool:
+    if item.previous is None:
+        return False
+    return isinstance(item.previous.token2wav.flow_cache.get("estimator_att_cache"), ResidentAttCache)
+
+
 class MiniCPMO45Code2Wav(nn.Module):
     """LLM_GENERATION model with request-owned state and compatible batching."""
 
@@ -237,6 +313,11 @@ class MiniCPMO45Code2Wav(nn.Module):
     requires_exact_input_shape = True
     has_preprocess = False
     has_postprocess = False
+
+    # Returned CUDA payloads own their storage (including HiFT graph results).
+    # Subsequent forwards/state updates never mutate it; the runner can retain
+    # the tensors and copy to host without taking another device snapshot.
+    owns_generation_output_storage = True
 
     def __init__(
         self,
@@ -256,6 +337,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
             prefix="minicpmo45-runtime-prompts-",
         )
+        from vllm_omni.platforms import current_omni_platform
+
         extra = self._extra_config()
         self._runtime_prompt_cache_size = int(extra.get("token2wav_runtime_prompt_cache_size", 4))
         if self._runtime_prompt_cache_size < 0:
@@ -263,14 +346,38 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._setup_cache_size = int(extra.get("token2wav_setup_cache_size", 1))
         if self._setup_cache_size < 0:
             raise ValueError("MiniCPM-o Code2Wav setup cache capacity must be >= 0")
+        # Reference prefetch: the async-chunk placeholder reaches this stage
+        # well before chunk 0, so idle steps can warm the same content-addressed
+        # prompt caches that chunk 0 would otherwise fill inline. By default
+        # only the prompt is warmed (phase A: materialize + prepare_prompt) and
+        # chunk 0 still runs setup_batch inline. ``token2wav_ref_prefetch_setup``
+        # also warms the batch-1 setup (phase B), a ~100 ms CFM pass that
+        # competes with the thinker's decode on a shared GPU.
+        self._ref_prefetch_enabled = bool(extra.get("token2wav_ref_prefetch", True))
+        self._ref_prefetch_setup = bool(extra.get("token2wav_ref_prefetch_setup", False))
+        self._prefetch_queue: OrderedDict[str, _RefPrefetch] = OrderedDict()
+        self._prefetch_pins: dict[str, str] = {}
+        self._prefetch_setup_holder: str | None = None
+        # The holder's prompt features, to check its setup is still cached.
+        self._prefetch_setup_features: PromptFeatures | None = None
         self._connector_config = {
             "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
+            "initial_codec_chunk_frames": int(extra.get("initial_codec_chunk_frames", 0)),
             "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
+            "hift_max_lazy_graphs": int(extra.get("hift_max_lazy_graphs", 8)),
+            "hift_graph_codec_chunk_frames": list(extra.get("hift_graph_codec_chunk_frames") or ()),
+            "hift_graph_first_chunk_frames": list(extra.get("hift_graph_first_chunk_frames") or ()),
+            "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames") or ()),
+            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes") or (1,)),
         }
         if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
+        max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
-        capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
+        # Default: powers of two below the scheduler's batch (capped at 32) and the cap itself.
+        batch_cap = min(int(max_num_seqs), 32) if max_num_seqs else 32
+        pow2 = [1 << i for i in range(batch_cap.bit_length()) if 1 << i < batch_cap] + [batch_cap]
+        capture_batch_sizes = pow2 if raw_capture_batch_sizes is None else raw_capture_batch_sizes
         max_serial_batch = extra.get("max_serial_batch")
         max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
         self._hift_graph_config = {
@@ -281,24 +388,56 @@ class MiniCPMO45Code2Wav(nn.Module):
         enable_whole_euler = extra.get("enable_whole_euler")
         max_graph_batch_raw = extra.get("max_graph_batch")
         max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
+        max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
         micro_batch_size_raw = extra.get("micro_batch_size")
         if micro_batch_size_raw is not None:
             micro_batch_size = int(micro_batch_size_raw)
         else:
             # The Whole-Euler arena reserves one attention cache per micro-batch
             # row, so size it for the most requests this stage ever batches.
-            max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
             micro_batch_size = min(int(max_num_seqs), max_graph_batch or 16) if max_num_seqs else None
+        encoder_rows = extra.get("code2wav_encoder_graph_rows", 1)
+        if isinstance(encoder_rows, (list, tuple)):
+            encoder_rows = sorted({int(row) for row in encoder_rows})
+        else:
+            encoder_rows = list(range(1, int(encoder_rows) + 1))
+        if not encoder_rows or any(row < 1 for row in encoder_rows):
+            raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
+        self._chunk_encoder_graph_config = {
+            "enabled": bool(extra.get("enable_code2wav_encoder_graph", False)),
+            "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
+            "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
+            "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
+        }
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
             "capture_frames": extra.get("cfm_graph_capture_frames"),
+            "offset_bucket_frames": int(extra.get("cfm_graph_offset_bucket_frames", 50)),
             "enable_whole_euler": enable_whole_euler is None or bool(enable_whole_euler),
             "max_serial_batch": max_serial_batch,
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
+            # The fused body uses tiled TF32 attention on NVIDIA SM80+;
+            # older CUDA devices retain its SDPA fallback. Respect TF32 opt-out.
+            "fused_body": bool(
+                extra.get("cfm_fused_body", current_omni_platform.is_cuda() and _tf32_mode(extra) != "off")
+            ),
+            "slot_pool": bool(extra.get("cfm_slot_pool", False)),
+            "row_offset_merge": extra.get("cfm_row_offset_merge", False) is True,
+        }
+        # Exact-shape flow-encoder graphs (``FlowEncoderGraphs``, default off).
+        # ``cfm_encoder_graph_rows`` is the largest row count or a list of counts.
+        rows = extra.get("cfm_encoder_graph_rows", 8)
+        rows = sorted({int(r) for r in rows}) if isinstance(rows, (list, tuple)) else list(range(1, int(rows) + 1))
+        if any(r < 1 for r in rows):
+            raise ValueError("MiniCPM-o cfm_encoder_graph_rows must be positive")
+        self._encoder_graph_config = {
+            "enabled": extra.get("cfm_encoder_cuda_graph", False) is True,
+            "rows": [r for r in rows if not max_num_seqs or r <= int(max_num_seqs)],
+            "token_widths": [int(w) for w in extra.get("cfm_encoder_graph_token_widths") or ()],
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:
@@ -314,6 +453,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
         self._default_prompt_normalized: tuple[str, str] | None = None
+        self._onset_merge = bool(extra.get("cfm_onset_merge", False))
+        self._cross_turn_buckets = extra.get("cfm_cross_turn_buckets", False) is True
+        self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
+        self._precapture_empty_cache = extra.get("cfm_precapture_empty_cache", False) is True
 
     @property
     def _default_prompt_wav(self) -> str:
@@ -496,9 +639,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._trim_runtime_prompts()
 
     def _trim_runtime_prompts(self) -> None:
-        """Evict least-recent unowned references, never request-owned state."""
+        """Evict least-recent unowned references, never request-owned or prefetch-pinned state."""
         while len(self._runtime_prompts) > self._runtime_prompt_cache_size:
-            victim = next(((key, entry) for key, entry in self._runtime_prompts.items() if not entry.owners), None)
+            victim = next(
+                ((key, entry) for key, entry in self._runtime_prompts.items() if not entry.owners and not entry.pins),
+                None,
+            )
             if victim is None:
                 return
             self._evict_runtime_prompt(*victim)
@@ -658,18 +804,69 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
 
     @staticmethod
-    def _bucket_key(item: _WorkItem) -> tuple[Any, ...]:
+    def _bucket_key(item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
             cache_signature = ("uninitialized",)
+        elif row_offsets and _slot_resident(item):
+            # A slot-pool row keeps its cache lengths per row (``cfm_row_offset_merge``).
+            cache_signature = ("row_offsets", row_offset_signature(item.previous.token2wav))
         else:
             cache_signature = state_shape_signature(item.previous.token2wav)
+        if cross_turn:
+            return (item.prompt_cache_id, item.prompt_wav, cache_signature)
         return (
             item.prompt_cache_id,
             item.prompt_wav,
             cache_signature,
             item.cache_epoch,
         )
+
+    def _signature_groups(
+        self, bucket: list[_WorkItem], states: list[BatchedToken2WavState], *, row_offsets: bool
+    ) -> list[list[int]]:
+        """A bucket's rows grouped by cache signature, for a bucket that cannot decode as one.
+
+        With ``row_offsets``, slot-pool groups differing only in cache length stay one if the backend can solve it.
+        """
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for row, state in enumerate(states):
+            groups.setdefault(state_shape_signature(state), []).append(row)
+        if not row_offsets:
+            return list(groups.values())
+        clusters: dict[tuple[Any, ...], list[list[int]]] = {}
+        for signature, rows in groups.items():
+            if _slot_resident(bucket[rows[0]]):
+                signature = ("row_offsets", row_offset_signature(states[rows[0]]))
+            clusters.setdefault(signature, []).append(rows)
+        result: list[list[int]] = []
+        for parts in clusters.values():
+            rows = sorted(row for part in parts for row in part)
+            if len(parts) > 1 and self.backend.can_merge_row_offsets(
+                [states[row] for row in rows], [int(bucket[row].tokens.numel()) for row in rows]
+            ):
+                result.append(rows)
+            else:
+                result.extend(parts)
+        return result
+
+    def _decode_rows(
+        self, items: list[_WorkItem], states: list[BatchedToken2WavState], features: Any, *, ragged: bool
+    ) -> tuple[list[Any], list[Any]]:
+        """Decode ``items`` together: ragged when asked to, or when their token counts or last-chunk flags differ."""
+        tokens = [item.tokens for item in items]
+        last_chunks = [item.last_chunk for item in items]
+        if ragged or len({int(t.numel()) for t in tokens}) > 1 or len(set(last_chunks)) > 1:
+            return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
+        return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
+
+    @staticmethod
+    def _onset_group_key(key: tuple[Any, ...], *, cross_turn: bool = False) -> tuple[Any, ...]:
+        """The onset-merge group of a bucket key: its prompt, plus its cache epoch unless rows merge across turns."""
+        if cross_turn:
+            return key[:2]
+        prompt_cache_id, prompt_wav, _, cache_epoch = key
+        return (prompt_cache_id, prompt_wav, cache_epoch)
 
     def _iter_limited_batches(
         self,
@@ -734,12 +931,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        # This stage owns the vocoder process. Restore its previous matmul
-        # policy after eager execution/capture; cuDNN's policy is independent.
-        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-        try:
-            if self._extra_config().get("token2wav_allow_tf32", False):
-                torch.backends.cuda.matmul.allow_tf32 = True
+        with _stage_matmul_policy(self._extra_config()):
             return self._forward_impl(
                 input_ids,
                 positions,
@@ -748,8 +940,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 runtime_additional_information,
                 **kwargs,
             )
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
     @torch.inference_mode()
     def _forward_impl(
@@ -762,6 +952,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds
+        if getattr(self, "_precapture_pending", False) and self.backend is not None:
+            try:
+                self._precapture_default_prompt()
+            finally:
+                if getattr(self, "_precapture_empty_cache", False):
+                    self._release_precapture_cache()
         ids = input_ids if isinstance(input_ids, torch.Tensor) else torch.empty(0, dtype=torch.long)
         segments = self._split_segments(ids, kwargs.get("seq_token_counts"))
         empty = torch.empty(0, dtype=torch.float32, device=ids.device)
@@ -845,9 +1041,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._trim_runtime_prompts()
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
+        cross_turn = getattr(self, "_cross_turn_buckets", False) is True
+        row_offsets = getattr(self, "_row_offset_merge", False) is True
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
-            buckets.setdefault(self._bucket_key(item), []).append(item)
+            buckets.setdefault(self._bucket_key(item, cross_turn=cross_turn, row_offsets=row_offsets), []).append(item)
         undersized = [
             {
                 "size": len(bucket),
@@ -921,34 +1119,57 @@ class MiniCPMO45Code2Wav(nn.Module):
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
                 )
-        for bucket in self._iter_decode_batches(buckets.values()):
+        decode_buckets: Iterable[list[_WorkItem]]
+        if self._onset_merge and self.backend is not None and self.backend._whole_euler_ragged_active():
+            # Offer a fresh onset and a continuation of one prompt/epoch, ready together, to ragged
+            # Whole-Euler; other exact-shape buckets stay as they are.
+            grouped: dict[tuple[Any, ...], list[list[_WorkItem]]] = {}
+            for key, bucket in buckets.items():
+                grouped.setdefault(self._onset_group_key(key, cross_turn=cross_turn), []).append(bucket)
+            merged: list[list[_WorkItem]] = []
+            for entries in grouped.values():
+                combined = [item for bucket in entries for item in bucket]
+                mixed = len({item.previous is None for item in combined}) > 1
+                merged.extend([combined] if mixed else entries)
+            decode_buckets = merged
+        else:
+            decode_buckets = buckets.values()
+        for bucket in self._iter_decode_batches(decode_buckets):
             batch_size = len(bucket)
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
                 )
-                if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
+                fresh = [item for item in bucket if item.previous is None]
+                setup = iter(self.backend.setup_batch(features, len(fresh)) if fresh else [])
+                states = [next(setup) if item.previous is None else item.previous.token2wav for item in bucket]
+                onset_mix = self._onset_merge and 0 < len(fresh) < batch_size
+                onset_ready = onset_mix and self.backend.can_merge_state_shapes(
+                    states, [int(item.tokens.numel()) for item in bucket]
+                )
+                row_groups: list[list[int]] | None = None
+                offset_mix = False
+                if onset_mix and not onset_ready:
+                    # Cache layouts ragged Whole-Euler cannot take split back into signature buckets.
+                    row_groups = self._signature_groups(bucket, states, row_offsets=row_offsets)
+                elif row_offsets and not onset_ready and batch_size > 1:
+                    groups = self._signature_groups(bucket, states, row_offsets=True)
+                    if len(groups) > 1:
+                        row_groups = groups
+                    else:
+                        # One decode, ragged when it holds rows of different cache lengths.
+                        offset_mix = len({state_shape_signature(state) for state in states}) > 1
+                if row_groups is None:
+                    audios, next_states = self._decode_rows(bucket, states, features, ragged=onset_ready or offset_mix)
                 else:
-                    states = [item.previous.token2wav for item in bucket if item.previous is not None]
-                token_lengths = {int(item.tokens.numel()) for item in bucket}
-                last_chunk_values = {item.last_chunk for item in bucket}
-                if len(token_lengths) > 1 or len(last_chunk_values) > 1:
-                    audios, next_states = self.backend.decode_ragged_batch(
-                        [item.tokens for item in bucket],
-                        features,
-                        states,
-                        last_chunks=[item.last_chunk for item in bucket],
-                    )
-                else:
-                    tokens = torch.stack([item.tokens for item in bucket], dim=0)
-                    audios, next_states = self.backend.decode_batch(
-                        tokens,
-                        features,
-                        states,
-                        last_chunk=bucket[0].last_chunk,
-                    )
+                    audios, next_states = [None] * batch_size, [None] * batch_size
+                    for rows in row_groups:
+                        group_states = [states[row] for row in rows]
+                        mixed = row_offsets and len({state_shape_signature(state) for state in group_states}) > 1
+                        decoded = self._decode_rows([bucket[row] for row in rows], group_states, features, ragged=mixed)
+                        for row, audio, next_state in zip(rows, *decoded, strict=True):
+                            audios[row], next_states[row] = audio, next_state
             except Exception as exc:
                 self._trim_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -982,6 +1203,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
 
         self._commit_runtime_prompt_owners(items)
+        # Only after the request committed its own reference can the prefetch
+        # pin go; placeholder steps carry no reference and keep it.
+        for item in items:
+            if item.has_payload:
+                self._drop_prefetch(item.state_id)
         for request_id, state in pending.items():
             if state is None:
                 self._states.pop(request_id, None)
@@ -1010,6 +1236,169 @@ class MiniCPMO45Code2Wav(nn.Module):
             state_id = str(request_id)
             self._states.pop(state_id, None)
             self._release_request_prompt(state_id)
+            self._drop_prefetch(state_id)
+
+    def on_requests_added(self, prewarms: list[OmniRequestPrewarm]) -> None:
+        """Queue reference prefetches for new async-chunk placeholders.
+
+        Only validates and enqueues; :meth:`run_idle_prefetch` does the work
+        (the prompt, plus the setup with ``token2wav_ref_prefetch_setup``).
+        A bad payload is logged and skipped, never raised. Only the V1 GPU and
+        NPU generation runners call this hook and :meth:`run_idle_prefetch`;
+        under any other runner (e.g. the MRv2 generation runner) nothing is
+        queued and chunk 0 prepares its reference inline.
+        """
+        if not self._ref_prefetch_enabled or self.backend is None:
+            return
+        for prewarm in prewarms:
+            state_id = str(prewarm.request_id)
+            if (
+                state_id in self._states
+                or state_id in self._request_prompt_keys
+                or state_id in self._prefetch_queue
+                or state_id in self._prefetch_pins
+            ):
+                continue
+            payload = prewarm.payload if isinstance(prewarm.payload, Mapping) else {}
+            ref_audio = payload.get("ref_audio")
+            sample_rate = payload.get("ref_audio_sr")
+            if ref_audio is None:
+                continue
+            valid_ref = (
+                isinstance(ref_audio, torch.Tensor)
+                and ref_audio.dim() == 1
+                and ref_audio.is_floating_point()
+                and ref_audio.numel() > 0
+            )
+            valid_sr = isinstance(sample_rate, int) and not isinstance(sample_rate, bool) and sample_rate > 0
+            if not (valid_ref and valid_sr):
+                logger.warning(
+                    "MiniCPM-o Code2Wav ignoring invalid reference prefetch payload for request %s",
+                    state_id,
+                )
+                continue
+            if len(self._prefetch_queue) >= _MAX_QUEUED_PREFETCHES:
+                logger.debug(
+                    "MiniCPM-o Code2Wav prefetch queue is full (%d); request %s prepares its reference at chunk 0",
+                    _MAX_QUEUED_PREFETCHES,
+                    state_id,
+                )
+                continue
+            self._prefetch_queue[state_id] = _RefPrefetch(ref_audio=ref_audio, sample_rate=sample_rate)
+
+    @torch.inference_mode()
+    def run_idle_prefetch(self) -> bool:
+        """Run one phase of the lone queued prefetch.
+
+        Returns whether a phase ran. The runner ignores the result; callers
+        such as the unit tests use it to see which phase ran.
+
+        Called by the runner only on a zero-token step that follows another,
+        on the same thread as ``forward``: the cold reference work runs through
+        the same calls chunk 0 makes, so chunk 0 runs its normal inline path
+        and simply hits the warm caches. Phase A (materialize + prepare_prompt)
+        runs only while no stream is live here, no other reference is queued
+        and a pin is free; by default it then retires the record and chunk 0
+        runs setup_batch inline. Only with ``token2wav_ref_prefetch_setup``
+        does a later call run phase B (setup_batch).
+        """
+        if not self._ref_prefetch_enabled or self.backend is None or not self._prefetch_queue:
+            return False
+        # Busy gate: start no phase while another request's stream is live
+        # here, since a phase would delay that request's next chunk if it
+        # became ready meanwhile. This only protects Stage 2's own streams, not
+        # other stages sharing the GPU. It also defers prefetch for as long as
+        # a long-lived (e.g. duplex) session keeps state here. Records stay
+        # queued; their own chunk 0 or finish still drops them as usual.
+        if self._states:
+            return False
+        # Lone-waiter gate: start no phase while more than one reference is
+        # queued. Several waiting placeholders (e.g. the initial burst at
+        # C > 1) mean their thinker and talker work is starting on the stages
+        # that share this GPU, and a phase would compete with it. This keeps
+        # the prefetch to a lone request at low concurrency; the queued
+        # records are dropped by their own chunk 0 or finish as usual.
+        if len(self._prefetch_queue) > 1:
+            return False
+        state_id, record = next(iter(self._prefetch_queue.items()))
+        with _stage_matmul_policy(self._extra_config()):
+            return self._run_prefetch_phase(state_id, record)
+
+    def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
+        """Run the next phase of ``record``; see ``run_idle_prefetch``."""
+        entry = record.entry
+        try:
+            if entry is None:
+                # Cap outstanding pins at the runtime-prompt capacity, since
+                # pinned entries are never trimmed. The record waits at the
+                # head until a pin is released; its own chunk 0 or finish
+                # still drops it as usual.
+                if len(self._prefetch_pins) >= max(1, self._runtime_prompt_cache_size):
+                    return False
+                # Phase A. The pin keeps the entry (and with it the backend's
+                # prompt features) alive until chunk 0 or finish releases it.
+                cache_key, entry = self._materialize_runtime_prompt(record.ref_audio, record.sample_rate)
+                entry.pins.add(state_id)
+                self._prefetch_pins[state_id] = cache_key
+                self._trim_runtime_prompts()
+                self.backend.prepare_prompt(entry.cache_id, entry.path)
+                record.entry = entry
+                if not self._ref_prefetch_setup:
+                    # Prompt only: the record is done, and chunk 0 runs setup_batch inline.
+                    del self._prefetch_queue[state_id]
+                logger.debug("MiniCPM-o Code2Wav prefetched reference prompt %s for %s", entry.cache_id, state_id)
+                return True
+            # Phase B (``token2wav_ref_prefetch_setup`` only).
+            self._prefetch_queue.pop(state_id)
+            # Slot rule: the prefetched setup lives in the existing setup-cache
+            # slot, so warm at most one setup that is still waiting for its
+            # chunk 0; later placeholders keep only the prompt features.
+            self._release_evicted_setup_holder()
+            if self._setup_cache_size <= 0 or self._prefetch_setup_holder is not None:
+                return False
+            features = self.backend.prepare_prompt(entry.cache_id, entry.path)
+            self.backend.setup_batch(features, 1)
+            self._prefetch_setup_holder = state_id
+            self._prefetch_setup_features = features
+            logger.debug("MiniCPM-o Code2Wav prefetched setup for %s", state_id)
+            return True
+        except Exception:
+            logger.warning(
+                "MiniCPM-o Code2Wav reference prefetch failed for request %s; chunk 0 will prepare it inline",
+                state_id,
+                exc_info=True,
+            )
+            self._drop_prefetch(state_id)
+            return True
+
+    def _release_evicted_setup_holder(self) -> None:
+        """Free the setup slot once the holder's prefetched setup is gone.
+
+        Another request's chunk 0 builds its setup inline in the same LRU
+        cache and can evict the holder's; the holder's chunk 0 then rebuilds
+        it inline anyway, so keeping the slot would only block later
+        placeholders until then.
+        """
+        features = self._prefetch_setup_features
+        if self._prefetch_setup_holder is None or features is None or self.backend is None:
+            return
+        if not self.backend.has_cached_setup(features):
+            self._prefetch_setup_holder = None
+            self._prefetch_setup_features = None
+
+    def _drop_prefetch(self, state_id: str) -> None:
+        """Forget a request's prefetch and release its runtime-prompt pin."""
+        queued = self._prefetch_queue.pop(state_id, None)
+        cache_key = self._prefetch_pins.pop(state_id, None)
+        if self._prefetch_setup_holder == state_id:
+            self._prefetch_setup_holder = None
+            self._prefetch_setup_features = None
+        if queued is None and cache_key is None:
+            return
+        entry = self._runtime_prompts.get(cache_key) if cache_key is not None else None
+        if entry is not None:
+            entry.pins.discard(state_id)
+        self._trim_runtime_prompts()
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -1055,6 +1444,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = Path(self.model_path) / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
+        # Token2wav runs in fp32, so without TF32 every flow-DiT GEMM runs on
+        # SIMT cores. Ordinary TF32 uses SM80+ Tensor Cores for dense GEMMs and
+        # Triton CFM attention dots. HiFT stays IEEE FP32.
+        tf32_mode = _tf32_mode(extra) if current_omni_platform.is_cuda() else "off"
+        if tf32_mode != "off":
+            logger.info("MiniCPM-o Code2Wav: ordinary TF32 enabled for CFM DiT GEMMs")
         use_float16 = bool(extra.get("token2wav_float16", False))
         previous_dtype = torch.get_default_dtype()
         try:
@@ -1066,6 +1461,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 str(token2wav_path),
                 float16=use_float16,
                 n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
+                # The batched backend builds its estimator caches itself and
+                # never runs the upstream chunk path that owns these buffers.
+                drop_upstream_chunk_att_buffers=extra.get("cfm_drop_upstream_att_buffer", False) is True,
             )
         finally:
             torch.set_default_dtype(previous_dtype)
@@ -1097,6 +1495,65 @@ class MiniCPMO45Code2Wav(nn.Module):
             connector_config=self._connector_config,
             hift_graph_config=self._hift_graph_config,
             cfm_graph_config=self._cfm_graph_config,
+            chunk_encoder_graph_config=self._chunk_encoder_graph_config,
             bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
             setup_cache_size=self._setup_cache_size,
+            cfm_tf32=tf32_mode != "off",
+            encoder_graph_config=self._encoder_graph_config,
         )
+        # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
+        self._precapture_pending = bool(extra.get("cfm_graph_precapture", True))
+
+    def _release_precapture_cache(self) -> None:
+        """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).
+
+        Live tensors, the slot pool and graph pools stay, so no later solve changes.
+        """
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+            torch.accelerator.synchronize(device)
+            before = _memory_snapshot(device)
+            torch.accelerator.empty_cache()
+            delta = _format_memory_delta(before, _memory_snapshot(device))
+            logger.info("MiniCPM-o Code2Wav: emptied the allocator cache after precapture%s", delta)
+
+    def _precapture_default_prompt(self) -> None:
+        """Capture the HiFT, default-voice Whole-Euler and flow-encoder graphs before serving.
+
+        Otherwise each graph is captured by the first chunk that needs it,
+        stalling every stream for 1-2 s per graph.
+        """
+        self._precapture_pending = False
+        backend = self.backend
+        assert backend is not None
+        started = time.perf_counter()
+
+        def precapture(name: str, capture: Callable[[], int]) -> bool:
+            try:
+                captured = capture()
+            except Exception:
+                # Encoder capture failures poison their CUDA/NPU wrapper.
+                # Fail startup rather than promise lazy capture and fail the
+                # first user request with a restart-required error.
+                if any(
+                    getattr(getattr(backend, attr, None), "_failed", False)
+                    for attr in ("_encoder_graphs", "_chunk_encoder_graph")
+                ):
+                    raise
+                logger.warning("MiniCPM-o Code2Wav: %s precapture failed; graphs capture lazily", name, exc_info=True)
+                return False
+            if captured:
+                elapsed = time.perf_counter() - started
+                logger.info("MiniCPM-o Code2Wav: precaptured %d %s CUDA Graphs in %.1f s", captured, name, elapsed)
+            return True
+
+        precapture("HiFT", backend.precapture_hift)
+        prompt_wav, prompt_cache_id = self._normalized_default_prompt()
+        try:
+            features = backend.prepare_prompt(prompt_cache_id, prompt_wav)
+        except Exception:
+            logger.warning("MiniCPM-o Code2Wav: default prompt failed; graphs capture lazily", exc_info=True)
+            return
+        if precapture("Whole-Euler", partial(backend.precapture_whole_euler, features)):
+            precapture("flow encoder", partial(backend.precapture_flow_encoder, features))
+        precapture("chunk encoder", partial(backend.precapture_chunk_encoder, features))

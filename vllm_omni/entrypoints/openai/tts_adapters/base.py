@@ -172,9 +172,6 @@ class PreparedRequest:
     tts_params: dict[str, Any] = field(default_factory=dict)
     model_type: str = "generic"
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
-    #: Cross-cutting per-request state the orchestrator still owns (e.g. the
-    #: Qwen3-TTS ref-audio warmup artifact key tracked after ``generate()``).
-    warmup_artifact_key: str | None = None
 
 
 @dataclass
@@ -283,6 +280,15 @@ class TTSModelAdapter(ABC):
         """
         return None
 
+    def _validate_max_new_tokens(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Range-check ``request.max_new_tokens`` against the adapter bounds."""
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < self.max_new_tokens_min:
+                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
+            if request.max_new_tokens > self.max_new_tokens_max:
+                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
+        return None
+
     @abstractmethod
     async def build(
         self,
@@ -330,6 +336,9 @@ class TTSModelAdapter(ABC):
         terminal metrics needed by the validation without charging that cost
         to unrelated TTS models.
         """
+
+    def validate_stream_audio(self, *, has_audio: bool) -> None:
+        """Validate audio availability before recording streaming success."""
 
     def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
         """Fold engine-side metadata from the mm payload into ``collect``.

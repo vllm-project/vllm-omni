@@ -75,6 +75,9 @@ class MockScheduler:
     def has_requests(self):
         return len(self._waiting_queue) > 0
 
+    def pending_finished_request_ids(self):
+        return set()
+
     def num_waiting_requests(self) -> int:
         return len(self._waiting_queue)
 

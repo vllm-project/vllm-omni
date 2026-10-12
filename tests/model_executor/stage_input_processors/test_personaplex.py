@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -100,16 +100,18 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
         received["audio_tokens"] = audio_tokens
         received["audio_provided"] = audio_provided
         received["num_steps"] = num_steps
-        return torch.arange(num_steps or 16, dtype=torch.long).reshape(1, -1)
+        return 100 + torch.arange(num_steps or 16, dtype=torch.long).reshape(1, -1)
 
     model = SimpleNamespace(
         _dtype=torch.float32,
         num_active_codebooks=8,
         depformer=depformer,
+        _depformer_teacher_forcing=PersonaPlexTalkerForConditionalGeneration._depformer_teacher_forcing,
         _duplex_stage0_runtime=lambda: SimpleNamespace(
-            record_sample=lambda *, request_id, text_token, agent_codes: recorded.append(
-                (request_id, text_token.clone(), agent_codes.clone())
-            )
+            prepared_depformer_state=lambda _request_id: None,
+            record_sample=lambda *, request_id, text_token, effective_codes: recorded.append(
+                (request_id, text_token.clone(), effective_codes.clone())
+            ),
         ),
     )
     method = getattr(PersonaPlexTalkerForConditionalGeneration, "post_sample_talker_mtp", None)
@@ -137,4 +139,6 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
     assert torch.equal(received["audio_tokens"], torch.arange(16).reshape(1, 16))
     assert torch.equal(received["audio_provided"], (torch.arange(16) > 0).reshape(1, 16))
     assert [(row[0], row[1].item()) for row in recorded] == [("r1", 101)]
-    assert torch.equal(recorded[0][2], codes[0])
+    # Teacher-forced agent codebooks (1..7 here) replace the sampled ones.
+    assert codes[0].tolist() == list(range(100, 108))
+    assert recorded[0][2].tolist() == [100, 1, 2, 3, 4, 5, 6, 7]

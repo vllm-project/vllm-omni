@@ -223,6 +223,12 @@ Please refer to the [test instructions](./ci/test_execution_guide.md) for detail
 
 ### Using repository skills with coding agents
 
+Before implementing a contribution, complete the human
+[contributor intent gate](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md#contributor-intent-gate).
+Reuse explicit human answers already provided; ask for missing answers and wait.
+The gate also checks whether the outcome needs a PR and requires actual failure
+evidence for bug fixes. It does not gate independent PR reviews.
+
 vLLM-Omni maintains [repository-scale skills](https://github.com/vllm-project/vllm-omni/tree/main/.claude/skills) for common coding, testing, performance, and review workflows. These skills capture repository-specific structure, validation requirements, and evidence standards that a general coding agent may not know.
 
 If your coding agent discovers repository skills automatically, ask it to use the relevant skill by name. Otherwise, point it to the linked `SKILL.md` and ask it to read the file before changing code. Skills can be combined: use a domain skill for the implementation, `vllm-omni-test` for test and CI decisions, and `precheck-pr` before opening the pull request.

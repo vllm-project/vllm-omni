@@ -569,15 +569,15 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 
 ## MOSS-TTS Local Transformer v1.5
 
-For a single H200, the optional
-[`moss_tts_local_h200.yaml`](../../../vllm_omni/deploy/moss_tts_local_h200.yaml)
+For a single H200, the default
+[`moss_tts_local.yaml`](../../../vllm_omni/deploy/moss_tts_local.yaml)
 deployment places both the talker and codec on logical GPU 0:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 VLLM_OMNI_EVENT_DRIVEN_ORCH=1 \
     vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
     --omni --trust-remote-code \
-    --deploy-config vllm_omni/deploy/moss_tts_local_h200.yaml \
+    --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
     --disable-log-stats
 ```
 
@@ -586,18 +586,18 @@ Run from the repository root and select an available physical GPU with
 disables detailed per-request statistics logging to reduce CPU overhead at
 high concurrency. Remove `--disable-log-stats` when those statistics are needed;
 keep these settings identical when comparing performance.
-This preset configures 256 request slots per stage,
+This preset configures 128 request slots per stage,
 a 32 GiB talker KV cache, talker CUDA Graph buckets through 512 scheduled tokens,
-and codec batch buckets through 256. It requires more than 80 GiB of GPU memory;
-request capacity also depends on input and generated lengths. The default
-[`moss_tts_local.yaml`](../../../vllm_omni/deploy/moss_tts_local.yaml) remains
-available for smaller deployments.
+and codec batch buckets through 128. It requires room for both stages and
+their graph/state pools, plus `nvidia-cuda-mps-control` on `PATH`.
+For smaller deployments, override the capacities, graph buckets, KV budget
+and MPS setting in a custom deploy file.
 
-The preset enables the optional codec backend with
-`hf_overrides.codec_attention_backend: triton` on stage 1. It preserves the
-streaming ring-cache mask and uses BF16 attention with 64-dimensional heads;
-other attention shapes use PyTorch SDPA. Set the backend to `sdpa` to use the
-default attention implementation. Codec terminal tails share execution only
+The preset enables the codec backend with
+`hf_overrides.codec_attention_backend: triton_slot` on stage 1, accessing
+request-slot ring state directly with BF16 attention. Set the backend to
+`sdpa` in a custom deploy to compare with the PyTorch attention path.
+Codec terminal tails share execution only
 when they already map to the same padded CUDA Graph; returned audio retains
 each request's actual length.
 
