@@ -21,6 +21,7 @@ orchestrator loop (the session is never touched from another thread):
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -965,20 +966,24 @@ class DuplexSessionRunner:
             self._maybe_schedule_vad_commit(vad_result)
             return
         session.mark_user_input_activity()
-        model_state.input_since_commit = True
-        model_state.speech_since_commit = model_state.speech_since_commit or overlap_policy.input_looks_like_speech(
+        speech_since_commit = model_state.speech_since_commit or overlap_policy.input_looks_like_speech(
             self.session, event, payload
         )
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
         pending_before = model_state.audio_buffer.pending_byte_count
+        limit = int(self.manager.runtime_config.max_pending_input_bytes_per_session)
         # No await between releasing admission bytes and reserving PCM bytes.
         if release_queued_input is not None:
             release_queued_input()
+            # Admission already applied backpressure; the handoff only converts
+            # the wire charge into decoded PCM bytes, which can be larger
+            # (pcm16 -> f32, resampling), so it must not drop admitted audio.
+            # This is a soft limit: pending PCM can overshoot by the decode
+            # expansion of the queued backlog (up to 8x for 8 kHz G.711) until
+            # admission sees it; charge admission in PCM units if that matters.
+            limit = sys.maxsize
         try:
-            if not session.reserve_input_bytes(
-                raw_audio_bytes,
-                limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
-            ):
+            if not session.reserve_input_bytes(raw_audio_bytes, limit=limit):
                 self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
                 return
             # Full-duplex: emit each ~chunk_period of audio so the model runs
@@ -994,16 +999,16 @@ class DuplexSessionRunner:
             session.release_input_bytes(raw_audio_bytes)
             self._emit_error("bad_event", str(exc))
             return
+        # Only audio the buffer actually took counts as input for the next commit.
+        model_state.input_since_commit = True
+        model_state.speech_since_commit = speech_since_commit
         if pcm_reservation is None:
             # Commit-only buffers (AURA) accumulate in place and return None.
             # Undo the speculative audio reserve and re-apply the exact pending
             # delta so retained video frames are counted (and later released).
             session.release_input_bytes(raw_audio_bytes)
             pending_delta = model_state.audio_buffer.pending_byte_count - pending_before
-            if pending_delta > 0 and not session.reserve_input_bytes(
-                pending_delta,
-                limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
-            ):
+            if pending_delta > 0 and not session.reserve_input_bytes(pending_delta, limit=limit):
                 self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
                 return
             if pending_delta < 0:
