@@ -43,12 +43,15 @@ _sweep_gate_lock = threading.Lock()
 
 
 def _reclaim_orphan_lock_file(key: str, grace: float | None = None) -> bool:
-    """Remove *key*'s lock file when its segment is already gone (single key).
+    """Try to remove *key*'s lock file when its segment is already gone.
 
-    A lock file has no lifecycle of its own — it exists exactly while its
-    segment does.  Uses the same check–lock–recheck protocol as
-    ``_sweep_stale_lock_files`` so a concurrent creator or consumer never
-    loses its lock; see that function for the protocol description.
+    Best-effort: skips silently when the lock is younger than *grace* (age is
+    the lock file's mtime against the wall clock — not time since the segment
+    died), the segment (re)appears, the lock is held, the file identity or
+    owner check fails, or any syscall raises.  Uses the same
+    check–lock–recheck protocol as ``_sweep_stale_lock_files`` so a
+    concurrent creator or consumer never loses its lock; see that function
+    for the protocol description.
     """
     if grace is None:
         grace = _STALE_LOCK_GRACE_SECONDS
@@ -124,11 +127,14 @@ def _sweep_stale_lock_files(grace: float | None = None) -> int:
 
 
 def _maybe_sweep_stale_lock_files() -> None:
-    """Run :func:`_sweep_stale_lock_files` at most once per grace period.
+    """Run :func:`_sweep_stale_lock_files` at most once per grace interval.
 
-    Called from ``__init__`` / ``put()`` / ``get()``; the hot path pays one
-    monotonic-clock comparison under a tiny lock, and a full sweep runs at
-    most once per ``_STALE_LOCK_GRACE_SECONDS``.
+    Lazy and per-process — not a background timer: it only fires when
+    ``__init__`` / ``put()`` / ``get()`` is called.  The gate compares
+    ``time.monotonic()`` trigger times (a rate limit distinct from the
+    mtime-based orphan-age test) and re-arms, so calls arriving after the
+    grace interval retry young orphans that an earlier sweep skipped; with
+    no further calls there is no further sweeping.
     """
     global _last_stale_sweep
     with _sweep_gate_lock:
@@ -155,18 +161,44 @@ class SharedMemoryConnector(OmniConnectorBase):
     deployment layout, or ``VLLM_OMNI_SHM_WAKEUP=0``) keeps the timed poll.
 
     Lock-file lifecycle contract: the zero-byte lock file
-    ``/dev/shm/shm_{key}_lockfile.lock`` has no lifecycle of its own — it
-    exists exactly while its segment does.  It is removed on the successful
-    receiving read, on a lock-acquired read whose segment is already gone, on
-    a key-based poll whose segment no longer exists
-    (``_reclaim_orphan_lock_file``), on a failed ``put()`` (the segment never
-    came to life), and by ``cleanup()`` / ``close()``.  Abnormally
-    terminated processes leave lock files behind once their segments are
-    reaped by ``resource_tracker``; a time-gated sweep
-    (``_maybe_sweep_stale_lock_files``, called from ``__init__`` / ``put()`` /
-    ``get()``) reaps such orphans, retrying after the grace window so a
-    restart inside the window is not left with young orphans forever.
-    ``_pending_keys`` is bookkeeping for ``cleanup()`` / ``close()`` only.
+    ``/dev/shm/shm_{key}_lockfile.lock`` has no purpose of its own — it only
+    serializes one transfer, and its reclamation is tied to the segment's,
+    best-effort rather than strict co-presence: a lock may briefly exist
+    before its segment is created, and may outlive a reaped segment until a
+    removal path runs.  Removal is *attempted*, never guaranteed — every
+    path swallows OSError:
+
+    - a receiving **byte read** that returned successfully (``consumed`` is
+      set before deserialization, so a later deserialize failure still
+      removes the lock; the byte read itself unlinks the segment on
+      success, best-effort, before returning);
+    - a read that acquired the lock and then found the segment already
+      gone — a read that never acquired the lock never touches it, and a
+      failed read with the segment still alive keeps it for retry;
+    - a key-based poll whose segment is missing, reclaiming an aged orphan
+      via ``_reclaim_orphan_lock_file`` (best-effort like every path);
+    - a ``put()`` whose ``shm_write_bytes`` raised before the segment
+      existed (removed while still holding the lock);
+    - ``cleanup()`` / ``close()`` for a given key.
+
+    Orphan sweeping is lazy and per-process — not a background timer.
+    ``_maybe_sweep_stale_lock_files()`` fires from ``__init__`` / ``put()``
+    / ``get()`` at most once per grace interval, on two different clocks:
+    the gate compares ``time.monotonic()`` trigger times, while an orphan's
+    age is its lock file's mtime against the wall clock — not "seconds
+    since the segment died".  The gate re-arms, so a restart inside the
+    grace window retries young orphans on later calls; with no further
+    calls, or if removals keep failing, no reclamation time is guaranteed.
+    A lock whose segment was reaped externally (e.g. by
+    ``resource_tracker`` at owner shutdown — itself best-effort) is an
+    orphan candidate for the sweep.
+
+    ``_pending_keys`` is a process-local record of keys this connector has
+    put and not yet observed consumed: ``put()`` registers them, successful
+    reads pop them, ``reap_consumed()`` bounds the backlog, and
+    ``cleanup()`` / ``close()`` drain them (``cleanup(key)`` unlinks
+    unconditionally, tracked or not).  It is bookkeeping — not an authority
+    on segment existence, and not a crash-recovery log.
     """
 
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
@@ -339,8 +371,11 @@ class SharedMemoryConnector(OmniConnectorBase):
                 try:
                     meta = shm_write_bytes(payload, name=put_key)
                 except BaseException:
-                    # The segment never came to life, so the lock file guarding
-                    # it must not either — remove it while we still hold it.
+                    # The transfer did not complete — drop the lock while we
+                    # still hold it.  Best-effort: shm_write_bytes may also
+                    # raise *after* creating the segment and does not roll
+                    # back, which leaves an orphan segment behind (see the
+                    # lifecycle contract; the remove itself may fail too).
                     try:
                         os.remove(lock_file)
                     except OSError:
@@ -382,9 +417,9 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            # The lock file has no lifecycle of its own: once the segment is
-            # gone (consumed by this read, or already reaped elsewhere) the
-            # lock guarding it must go too — but only when this call actually
+            # Attempted, not guaranteed (OSError swallowed): with the byte
+            # read consumed — or the lock acquired and the segment already
+            # gone — the lock is dropped; but only when this call actually
             # acquired the lock.  During a same-key replacement the writer
             # holds it while the old segment is already unlinked and the new
             # one not yet created, and that gap must not steal the writer's
@@ -412,10 +447,11 @@ class SharedMemoryConnector(OmniConnectorBase):
                     self._pending_keys.pop(get_key, None)
             return result
         except FileNotFoundError:
-            # No segment: either the sender has not created it yet, or the
-            # owner died and resource_tracker reaped it. In the latter case an
-            # orphan lock file may be left behind — reclaim it once it is old
-            # enough (the grace window protects an in-flight put()).
+            # No segment: either the sender has not created it yet, or it was
+            # reaped (e.g. by resource_tracker after an abnormal owner exit —
+            # itself best-effort). In the latter case an orphan lock file may
+            # be left behind — try to reclaim it once it is old enough (the
+            # grace window protects an in-flight put()).
             _reclaim_orphan_lock_file(get_key)
             return None
         except ValueError as e:
