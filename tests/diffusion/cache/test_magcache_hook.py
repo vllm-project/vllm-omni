@@ -78,32 +78,21 @@ def _make_config(num_inference_steps: int = 2) -> MagCacheConfig:
 
 @pytest.mark.parametrize("as_tuple", [False, True])
 @pytest.mark.parametrize("debug_enabled", [False, True])
-def test_residual_debug_norms_run_only_at_debug(monkeypatch, as_tuple, debug_enabled):
-    """INFO logging must not synchronize residual tensors to format DEBUG lines."""
-    from vllm_omni.diffusion.cache.magcache import hook as hook_module
-
+def test_residual_debug_norms_run_only_at_debug(caplog, mocker, as_tuple, debug_enabled):
+    caplog.set_level(logging.DEBUG if debug_enabled else logging.INFO, logger="vllm_omni.diffusion.cache.magcache.hook")
+    norm = mocker.spy(torch, "norm")
     state = MagCacheState()
     residual = torch.ones(1, 2, 3)
     if as_tuple:
-        residual = (residual, residual.clone())
+        residual = (residual, residual)
     state.previous_residual = residual
     output = torch.zeros(1, 2, 3)
     head = MagCacheHeadHook(StateManager(MagCacheState), _make_config())
     tail = MagCacheBlockHook(StateManager(MagCacheState))
 
-    monkeypatch.setattr(hook_module.logger, "isEnabledFor", lambda level: debug_enabled and level == logging.DEBUG)
-    monkeypatch.setattr(hook_module.logger, "debug", lambda *_args, **_kwargs: None)
-    original_norm = torch.norm
-    norm_calls = []
-
-    def counting_norm(tensor):
-        norm_calls.append(tensor)
-        return original_norm(tensor)
-
-    monkeypatch.setattr(torch, "norm", counting_norm)
     assert head.log_cache_miss(state, output) is output
     assert tail.log_residual_computed(state, residual) is None
-    assert len(norm_calls) == (2 * (2 if as_tuple else 1) if debug_enabled else 0)
+    assert norm.call_count == (2 * (2 if as_tuple else 1) if debug_enabled else 0)
     assert state.previous_residual is residual
     assert state.step_index == 0
 
