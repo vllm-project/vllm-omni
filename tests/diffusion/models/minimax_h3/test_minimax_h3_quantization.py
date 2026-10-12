@@ -800,9 +800,7 @@ def test_adaln_curve_model_interpolates_without_dense_time_embedder(monkeypatch)
 
 @pytest.mark.parametrize("adaln_dtype", [torch.float32, torch.bfloat16])
 def test_final_layer_matches_comfy_adaln_precision(adaln_dtype):
-    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
-        indexed_scale_shift_,
-    )
+    from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3FinalLayer,
     )

@@ -1663,9 +1663,7 @@ class MiniMaxH3DiTModel(nn.Module):
         return loaded
 
     def _embed_timesteps(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
-        if self.arch.adaln_curve_grid is None:
-            if self.time_embedder is None:
-                raise RuntimeError("MiniMax-H3 dense AdaLN model is missing its time embedder.")
+        if self.time_embedder is not None:
             return self.time_embedder(unique_timesteps)
 
         table = self.adaln_t_table

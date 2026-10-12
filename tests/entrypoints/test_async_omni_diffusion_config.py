@@ -157,10 +157,10 @@ def test_default_diffusion_fallback_preserves_model_loading_overrides(mocker, pe
         trust_remote_code=False,
     )
 
-    engine_args = stage_configs[0]["engine_args"]
-    assert engine_args["model_paths"] == model_paths
-    assert engine_args["model_loaded"] == model_loaded
-    assert engine_args["quantization_config"] == quantization_config
+    diffusion_config = stage_configs[0].diffusion_config
+    assert diffusion_config.model_paths == model_paths
+    assert diffusion_config.model_loaded == model_loaded
+    assert diffusion_config.quantization_config == quantization_config
 
 
 def test_default_stage_rejects_unknown_nested_parallel_config_key():
