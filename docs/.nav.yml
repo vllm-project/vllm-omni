@@ -48,6 +48,7 @@ nav:
   - Models:
     - models/supported_models.md
     - SeedVR2: models/seedvr2.md
+    - Lychee-FD: models/lychee_fd.md
   - Features:
     - Overview: features/README.md
     - Runtime and Stage Execution:

@@ -27,6 +27,7 @@ from vllm_omni.config.omni_config import (
     _LLM_STAGE_ENGINE_FIELDS,
     OmniStageCacheConfig,
     OmniStageLoadConfig,
+    OmniStageModelConfig,
     OmniStageParallelConfig,
     OmniStageSchedulerConfig,
     VllmOmniARStageConfig,
@@ -88,6 +89,8 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "final_output",
         "use_v2_model_runner",
         "supports_native_mrv2_data_plane",
+        "supports_native_preemption",
+        "supports_running_prefix_cache_reset",
         "active_stream_window",
         "codec_frame_rate_hz",
         "custom_voice_dir",
@@ -327,6 +330,16 @@ def test_llm_stage_engine_field_schema_tracks_upstream_engine_args():
     upstream_engine_fields = frozenset(field.name for field in fields(EngineArgs))
 
     assert _LLM_STAGE_ENGINE_FIELDS - upstream_engine_fields == _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS
+
+
+@pytest.mark.parametrize("capability", ["supports_native_preemption", "supports_running_prefix_cache_reset"])
+def test_typed_llm_projection_preserves_explicit_disabled_model_capability(capability):
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+        model_config=OmniStageModelConfig(**{capability: False}),
+    )
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+    assert engine_args[capability] is False
 
 
 def test_typed_llm_projection_discovers_explicit_upstream_config_fields():

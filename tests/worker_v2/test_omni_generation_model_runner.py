@@ -139,6 +139,7 @@ def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
         num_output_tokens=[0],
         prompt_token_ids={"req": [1]},
         additional_information={"req": None},
+        model_intermediate_buffer={"req": {"duplex": {"seq": 2}}},
     )
     scheduler_output = SchedulerOutput(
         scheduled_new_reqs=[],

@@ -59,6 +59,10 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
             IndexTTS25Config,
         )
+        from vllm_omni.model_executor.models.lychee_fd.configuration_lychee import (
+            LycheeAudioEncoderConfig,
+            LycheeFDConfig,
+        )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
             MingMoeConfig,
@@ -98,6 +102,8 @@ def _register_omni_hf_configs() -> None:
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
+        ("step_audio_2_full_duplex", LycheeFDConfig),
+        ("step_audio_2_encoder", LycheeAudioEncoderConfig),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
@@ -199,6 +205,7 @@ class OmniEngineArgs(EngineArgs):
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
     supports_running_prefix_cache_reset: bool = True
+    supports_native_preemption: bool = True
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
@@ -436,6 +443,7 @@ class OmniEngineArgs(EngineArgs):
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
             supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
+            supports_native_preemption=self.supports_native_preemption,
             use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,

@@ -40,7 +40,7 @@ def encode_audio(
             CreateAudio(
                 audio_tensor=audio_tensor,
                 sample_rate=sample_rate_hz,
-                response_format=response_format,
+                response_format="pcm" if response_format.lower() == "pcm16" else response_format,
                 speed=float(speed) if isinstance(speed, int | float) and speed > 0 else 1.0,
                 stream_format="audio",
                 base64_encode=True,

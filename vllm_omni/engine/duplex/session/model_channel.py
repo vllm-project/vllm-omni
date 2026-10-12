@@ -50,7 +50,11 @@ from vllm_omni.engine.duplex.plugin import (
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageOutput
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
-from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.session.engine_session import (
+    DuplexEngineSession,
+    DuplexFenceMismatchError,
+    DuplexRequestResource,
+)
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
@@ -99,6 +103,8 @@ class ModelChannel:
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
+        # One recovery epoch is sufficient: appends execute in wire order.
+        self._append_recovery_epoch: int | None = None
 
     def _draining_stage_ids(self) -> frozenset[int]:
         """Stages the plugin keeps across a concurrent turn. Empty if undeclared."""
@@ -170,6 +176,10 @@ class ModelChannel:
         if not session.capabilities.supports_input_append:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
+            if expected_epoch == self._append_recovery_epoch:
+                # This queued PCM never reached a worker. Recovery retained
+                # accepted evidence; its unsubmitted tail must be rolled back.
+                return False, False
             return True, False
         # Anchor the submission time before the RPC; the acceptance callback
         # commits timing state only if the append actually submitted.
@@ -189,6 +199,11 @@ class ModelChannel:
             return False, False
         if result is None:
             return True, False
+        if result.get("accepted_append_recovered") is True:
+            # The worker accepted this PCM and the plugin retained its rebuild
+            # evidence. Consume its reservation even though recovery advanced
+            # the epoch; rolling it back would register the same window twice.
+            return True, True
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
         self._mark_accepted_append_request_start(payload)
@@ -319,6 +334,10 @@ class ModelChannel:
                 raise DuplexFenceMismatchError(session.fence, fence)
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
+            if append_plan.sampling_params is not None:
+                append_params = list(request_context.sampling_params)
+                append_params[stage_id] = append_plan.sampling_params
+                request_context = replace(request_context, sampling_params=tuple(append_params))
             submission = DuplexStageSubmission(
                 context=request_context,
                 prompt=append_plan.prompt,
@@ -326,23 +345,39 @@ class ModelChannel:
                 resumable=resumable,
             )
             submission_result = await self._ctx.stage_port.submit(submission)
+            # A returned result establishes accepted/ambiguous worker work for
+            # the trusted submitted owner. Persist abort ownership before any
+            # result/fence/sequence validation can enter compensation. A cancel
+            # may have released its reservation while submit was awaiting.
+            resource_key = (stage_id, request_id)
+            accepted_resource = session.request_resources.get(resource_key)
+            if accepted_resource is None:
+                accepted_resource = DuplexRequestResource(stage_id=stage_id, request_id=request_id, fence=fence)
+                session.request_resources[resource_key] = accepted_resource
+            accepted_resource.submitted = True
             try:
+                # Accepted input facts survive cancellation or an invalid
+                # adapter result, even when the session cannot commit a bind.
+                self._ctx.plugin.record_accepted_append_plan(request_id=request_id, fence=fence, plan=append_plan)
                 if submission_result.request_id != request_id or submission_result.stage_id != stage_id:
                     raise RuntimeError("duplex stage adapter returned a mismatched submission result")
                 if expected_epoch is not None and session.epoch != expected_epoch:
                     raise DuplexFenceMismatchError(session.fence, fence)
+                if session.state != DuplexSessionState.OPEN:
+                    raise RuntimeError("duplex session closed during append submission")
+                # Check all session sequencing before either commit mutates it.
+                if session.prepare_append(fence) != reservation:
+                    raise RuntimeError("duplex append reservation is stale")
+            except Exception as exc:
+                # A returned result means the worker may have accepted work,
+                # even if that result violates the adapter identity contract.
+                return await self._recover_accepted_append(request_id, fence, exc)
+            try:
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
-            except BaseException:
-                try:
-                    await self._ctx.stage_port.cleanup([request_id])
-                except Exception as cleanup_exc:
-                    logger.warning(
-                        "duplex append compensation remains pending for session %s: %s",
-                        session.session_id,
-                        cleanup_exc,
-                    )
-                raise
+                self._ctx.plugin.commit_append_plan(request_id=request_id, fence=fence, plan=append_plan)
+            except Exception as exc:
+                return await self._recover_accepted_append(request_id, fence, exc)
             session.touch_lease(DuplexLeaseActivity.APPEND)
             session.bind_request(request_id)
             # Consuming a Stage0 bind closes the concurrent-turn gate even when
@@ -377,6 +412,35 @@ class ModelChannel:
                 except Exception:
                     session.lease.active_operations.discard(lease_operation_id)
 
+    async def _recover_accepted_append(self, request_id: str, fence: DuplexFence, exc: Exception) -> dict[str, object]:
+        """Retire accepted worker work while keeping its PCM rebuild evidence."""
+        session = self._ctx.session
+        try:
+            if session.epoch == fence.epoch and session.state == DuplexSessionState.OPEN:
+                self._fail_response_from_model_error(
+                    {
+                        "error_code": "runtime_append_failed",
+                        "error": str(exc),
+                        "retryable": True,
+                    }
+                )
+                await self._recover_failed_binding(request_id)
+            else:
+                # Cancel/close already advanced the fence. Compensate only the
+                # submitted owner; never abort a returned, untrusted identity
+                # or advance the newer session's epoch again.
+                await self._ctx.stage_port.cleanup([request_id], abort=True)
+                session.release_resources_for_request_ids([request_id])
+                self._ctx.plugin.data_plane.close_stream(request_id)
+                self._ctx.plugin.data_plane.mark_terminal(request_id)
+        except Exception as cleanup_exc:
+            # Recovery keeps stage resource records until abort succeeds, so
+            # closing can retry cleanup instead of losing an accepted worker.
+            logger.exception("Duplex accepted append recovery failed for %s", request_id)
+            self.send_runtime_error("runtime_append_compensation_failed", cleanup_exc)
+            await self._close_from_runtime("runtime_append_compensation_failed")
+        return {"accepted_append_recovered": True}
+
     def _start_data_plane_stream(self, result: object) -> bool:
         """Bind the resumable stage request as the session's active data-plane stream."""
         request_id, _ = duplex_data_plane_request_info(result) if isinstance(result, dict) else (None, None)
@@ -400,11 +464,30 @@ class ModelChannel:
         try:
             next_fence = session.sync_fence()
             if next_fence.epoch > cancelled_fence.epoch:
-                stale_request_ids = session.cancel_fence(cancelled_fence, next_fence)
+                stale_request_ids = session.prepare_cancel_fence(cancelled_fence, next_fence)
+                # A cancel can interrupt recovery's abort after it advanced
+                # the epoch. Include those older retained cleanup records too,
+                # while preserving any resource owned by the newer epoch.
+                stale_request_ids = list(
+                    dict.fromkeys(
+                        [
+                            *stale_request_ids,
+                            *(
+                                resource.request_id
+                                for resource in session.request_resources.values()
+                                if (resource.fence.epoch, resource.fence.turn_id)
+                                <= (cancelled_fence.epoch, cancelled_fence.turn_id)
+                            ),
+                        ]
+                    )
+                )
             else:
                 stale_request_ids = []
             if stale_request_ids:
-                await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                await self._ctx.stage_port.cleanup(stale_request_ids, abort=True)
+                session.release_resources_for_request_ids(stale_request_ids)
+                for request_id in stale_request_ids:
+                    self._ctx.plugin.data_plane.close_stream(request_id)
             session.touch_lease(DuplexLeaseActivity.SIGNAL)
         except asyncio.CancelledError:
             raise
@@ -637,6 +720,7 @@ class ModelChannel:
         self._out.emit_error(
             str(model_result.get("error_code")),
             str(model_result.get("error") or "Duplex native data-plane error"),
+            retryable=model_result.get("retryable") is True,
         )
         if self._ctx.run.closing or response_id is None:
             return
@@ -653,6 +737,34 @@ class ModelChannel:
                 "playback": session.playback.as_dict(),
             }
         )
+
+    async def _recover_failed_binding(self, request_id: str) -> None:
+        """Replace a failed native binding while retaining model-owned evidence."""
+        session = self._ctx.session
+        if self._ctx.run.closing or session.state != DuplexSessionState.OPEN:
+            return
+        failed_fence = session.fence
+        # Recovery replaces the whole binding, including older draining stages.
+        # Collect known session owners before barge_in clears response mappings.
+        stale_ids = session.resource_request_ids()
+        session.barge_in()
+        self._append_recovery_epoch = failed_fence.epoch
+        next_fence = session.sync_fence()
+        # Retain cleanup records until the abort is acknowledged. A failed
+        # abort must remain visible to a later session-close cleanup attempt.
+        stale_ids = list(dict.fromkeys([*stale_ids, *session.prepare_cancel_fence(failed_fence, next_fence)]))
+        if request_id not in stale_ids:
+            stale_ids.append(request_id)
+        # Both stages share the resident engine owner. Advance the fence
+        # before awaiting cleanup so late codec/PCM cannot publish meanwhile.
+        await self._ctx.stage_port.cleanup(stale_ids, abort=True)
+        session.release_resources_for_request_ids(stale_ids)
+        for stale_id in stale_ids:
+            self._ctx.plugin.data_plane.close_stream(stale_id)
+            self._ctx.plugin.data_plane.mark_terminal(stale_id)
+        self._ctx.model_state.clear_continuation()
+        self._ctx.run.stream_request_id = None
+        self._out.emit({"type": "session.updated", "session": session.as_public_dict()})
 
     def _complete_model_turn_without_output(
         self,
@@ -753,6 +865,7 @@ class ModelChannel:
             and active_response_id is not None
             and session.active_request_id is not None
             and model_result.get("end_of_turn") is not True
+            and model_result.get("await_waveform_final") is not True
             and auto_continuations_remaining
         )
         if non_terminal_auto_listen:
@@ -781,6 +894,14 @@ class ModelChannel:
         self._attach_runtime_metadata(payload, model_result)
         self._out.emit(payload)
         if self._ctx.run.closing:
+            return close_reason, emitted_response
+        if model_result.get("await_waveform_final") is True:
+            return close_reason, emitted_response
+        if auto_response and response_id is None and model_result.get("preserve_request") is True:
+            # Persistent native-listening models finish an input segment while
+            # keeping the Stage0 request/KV parked for the next append. A
+            # public listen event must not turn that segment boundary into a
+            # request terminal.
             return close_reason, emitted_response
         if model_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
             # stage_port.abort_requests expects a list of ids; a bare str is
@@ -846,6 +967,8 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
+            if model_result.get("recover_binding") is True and isinstance(data_plane_request_id, str):
+                await self._recover_failed_binding(data_plane_request_id)
             return close_reason, True
         if model_result.get("function_call") is True:
             self._out.emit(
@@ -891,6 +1014,23 @@ class ModelChannel:
                 data_plane_request_id=data_plane_request_id,
                 expected_epoch=expected_epoch,
             )
+
+        if model_result.get("model_speak") is True:
+            response_id = session.active_response_id
+            if response_id is None:
+                response_id = session.begin_response(turn_id=model_turn_id)
+                self._out.emit(self.response_created_payload(response_id, epoch=session.epoch))
+            speak_payload = {
+                "type": "response.speak",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "reason": model_result.get("reason") or "model_speak",
+                "backchannel": model_result.get("model_backchannel") is True,
+            }
+            self._attach_runtime_metadata(speak_payload, model_result)
+            self._out.emit(speak_payload)
+            return close_reason, True
 
         text = model_result.get("text")
         audio = model_result.get("audio_data", model_result.get("audio"))
@@ -1194,6 +1334,9 @@ class ModelChannel:
         response_request_metrics: Mapping[str, object] | None = None,
     ) -> None:
         metadata: dict[str, object] = {}
+        model_metadata = model_result.get("model_metadata")
+        if isinstance(model_metadata, Mapping):
+            metadata["model_metadata"] = dict(model_metadata)
         runtime_impl = model_result.get("runtime_impl")
         if isinstance(runtime_impl, str) and runtime_impl:
             metadata["runtime_impl"] = runtime_impl

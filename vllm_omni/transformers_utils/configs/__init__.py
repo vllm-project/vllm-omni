@@ -37,6 +37,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
     "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
+    "LycheeAudioEncoderConfig": "vllm_omni.transformers_utils.configs.lychee_fd",
+    "LycheeFDConfig": "vllm_omni.transformers_utils.configs.lychee_fd",
 }
 
 __all__ = [
@@ -67,6 +69,8 @@ __all__ = [
     "WhisperEncoderConfig",
     "SenseNovaU1Config",
     "SenseNovaU1MoELLMConfig",
+    "LycheeAudioEncoderConfig",
+    "LycheeFDConfig",
 ]
 
 
@@ -91,6 +95,7 @@ from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # no
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import lychee_fd as _lychee_fd  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402

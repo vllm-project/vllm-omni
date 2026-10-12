@@ -84,6 +84,28 @@ _OMNI_MODELS = {
         "step_audio2_token2wav",
         "StepAudio2Token2WavForConditionalGeneration",
     ),
+    "LycheeToken2WavForConditionalGeneration": (
+        "lychee_fd",
+        "token2wav",
+        "LycheeToken2WavForConditionalGeneration",
+    ),
+    # Lychee-FD keeps the historical StepAudio2FullDuplex architecture name
+    # in released checkpoints. Both aliases resolve to the same native graph.
+    "StepAudio2FullDuplex": (
+        "lychee_fd",
+        "modeling_lychee",
+        "LycheeFullDuplexForConditionalGeneration",
+    ),
+    "LycheeFullDuplex": (
+        "lychee_fd",
+        "modeling_lychee",
+        "LycheeFullDuplexForConditionalGeneration",
+    ),
+    "LycheeFullDuplexForConditionalGeneration": (
+        "lychee_fd",
+        "modeling_lychee",
+        "LycheeFullDuplexForConditionalGeneration",
+    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",

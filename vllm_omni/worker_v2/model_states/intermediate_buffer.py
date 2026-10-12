@@ -83,7 +83,9 @@ class OmniIntermediateBuffer:
         # request's runner payload over directly, like the V1 runner's
         # ``_update_intermediate_buffer``: nested sections merge key by key.
         mib = getattr(new_req_data, "model_intermediate_buffer", None)
-        if isinstance(mib, dict) and mib:
+        if mib is not None and not isinstance(mib, dict):
+            raise TypeError(f"model_intermediate_buffer must be a dict, got {type(mib).__name__}")
+        if mib:
             for key, value in mib.items():
                 if isinstance(value, dict):
                     section = info.get(key)

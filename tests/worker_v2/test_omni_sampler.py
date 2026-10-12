@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,7 +8,7 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput, sample_with_output
+from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingContext, OmniSamplingOutput, sample_with_output
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -65,3 +66,14 @@ def test_adapter_preserves_stock_sampler_staged_write_fast_path():
     assert OmniSampler(object.__new__(Sampler)).omni_static_staged_writes
     assert not OmniSampler(SimpleNamespace()).omni_static_staged_writes
     assert OmniSampler(SimpleNamespace(omni_static_staged_writes=True)).omni_static_staged_writes
+
+
+def test_stock_adapter_sampling_context_preserves_standard_behavior():
+    sampler = OmniSampler(SimpleNamespace())
+    expected = _output()
+    standard = Mock(return_value=expected)
+    batch = object()
+    with sampler.set_sampling_context(OmniSamplingContext(batch, nullcontext)):
+        result = sample_with_output(sampler, standard, torch.zeros(2, 4), batch, object(), None)
+    assert result.sampler_output is expected[0]
+    assert result.multimodal_outputs is None

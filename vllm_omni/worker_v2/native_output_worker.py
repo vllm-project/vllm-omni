@@ -9,6 +9,50 @@ from typing import Any
 from vllm.v1.outputs import AsyncModelRunnerOutput
 
 
+class NativeOutputMaterializationError(RuntimeError):
+    """Defer recoverable host output failure to the owner's consumption step."""
+
+    def __init__(self, req_ids: tuple[str, ...], exception: Exception, recover: Any) -> None:
+        super().__init__(str(exception))
+        self.req_ids = req_ids
+        self.exception = exception
+        self.recover = recover
+
+    def resolve_on_owner(self) -> Any:
+        output = self.recover(list(self.req_ids), self.exception)
+        if output is None:
+            raise self.exception
+        return output
+
+
+class OwnerAsyncOutput(AsyncModelRunnerOutput):
+    """Resolve optional host-materialization failures on direct owner consumption.
+
+    This keeps the ordinary pooler transport. It is selected only when a
+    single-rank model explicitly supplies request transaction recovery.
+    """
+
+    def __init__(self, output: AsyncModelRunnerOutput) -> None:
+        self._output: AsyncModelRunnerOutput | None = output
+        self.copy_event = output.copy_event
+        self._resolved: Future = Future()
+
+    def get_output(self) -> Any:
+        if not self._resolved.done():
+            try:
+                assert self._output is not None
+                try:
+                    result = self._output.get_output()
+                except NativeOutputMaterializationError as failure:
+                    result = failure.resolve_on_owner()
+                self._resolved.set_result(result)
+            except Exception as error:
+                self._resolved.set_exception(error)
+            finally:
+                self._output = None
+        return self._resolved.result()
+
+
 class NativeAsyncOutput(AsyncModelRunnerOutput):
     """Consume an ordered publication on the engine's owner thread."""
 
@@ -25,6 +69,8 @@ class NativeAsyncOutput(AsyncModelRunnerOutput):
             try:
                 assert self._future is not None
                 output = self._future.result()
+                if isinstance(output, NativeOutputMaterializationError):
+                    output = output.resolve_on_owner()
                 output.omni_connector_output = self._plane.get_omni_connector_output()
                 self._resolved.set_result(output)
             except Exception as error:
@@ -67,7 +113,12 @@ class NativeOutputWorker:
 
     @staticmethod
     def _materialize(output: AsyncModelRunnerOutput, plane: Any) -> Any:
-        result = output.get_output()
+        try:
+            result = output.get_output()
+        except NativeOutputMaterializationError as failure:
+            # No publication has begun. Resolve the optional failure hook on
+            # the owner thread; this worker never mutates model/scheduler state.
+            return failure
         plane.enqueue_outputs(
             req_ids=list(result.req_ids),
             inter_stage_outputs=getattr(result, "inter_stage_outputs", None),

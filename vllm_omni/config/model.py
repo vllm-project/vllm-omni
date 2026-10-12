@@ -131,6 +131,7 @@ class OmniModelConfig(ModelConfig):
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
     supports_running_prefix_cache_reset: bool = True
+    supports_native_preemption: bool = True
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.

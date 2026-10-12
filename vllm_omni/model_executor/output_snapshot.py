@@ -25,6 +25,14 @@ class RequestOutputSnapshot:
     client: list[dict[str, Any] | None] | None = None
 
 
+class OutputCopyLifetimeError(RuntimeError):
+    """A device output's copy lifetime could not be safely established.
+
+    This is an engine fault. Request-local recovery must not recycle a device
+    slab whose producer or copy completion could not be fenced.
+    """
+
+
 class PackedOutputSnapshot(dict):
     """A normal payload mapping with an internal batched-copy plan.
 
@@ -39,6 +47,48 @@ class PackedOutputSnapshot(dict):
         self._spec = spec
         self._groups = groups
         self.producer_event: torch.cuda.Event | None = None
+        self._copy_completion_callback: Callable[[torch.cuda.Event], None] | None = None
+        self._copy_callback_registered = False
+        self._copy_started = False
+        self._copy_event_bound = False
+
+    @property
+    def copy_started(self) -> bool:
+        """Whether a consumer has begun establishing the copy dependencies."""
+        return self._copy_started
+
+    def set_copy_completion_callback(self, callback: Callable[[torch.cuda.Event], None]) -> None:
+        """Register a model-owned slab's one-time, nonblocking release hook.
+
+        The callback must only publish the completion event; it must not wait
+        for the device or depend on request state that can be canceled/reused.
+        """
+        if self._copy_callback_registered or self._copy_started or self._copy_event_bound:
+            raise RuntimeError("Output snapshot copy callback is already registered or consumed")
+        if not callable(callback):
+            raise TypeError("Output snapshot copy callback must be callable")
+        self._copy_completion_callback = callback
+        self._copy_callback_registered = True
+
+    def mark_copy_started(self) -> None:
+        """Keep an owned lease unavailable if a dependency or event fails."""
+        if not self._copy_callback_registered:
+            return
+        if self._copy_started or self._copy_event_bound:
+            raise RuntimeError("Output snapshot copy has already started")
+        self._copy_started = True
+
+    def bind_copy_event(self, event: torch.cuda.Event) -> None:
+        """Return an owned slab only after all queued D2H reads are fenced."""
+        callback = self._copy_completion_callback
+        if not self._copy_callback_registered:
+            return
+        if self._copy_event_bound:
+            raise RuntimeError("Output snapshot copy event is already bound")
+        self._copy_event_bound = True
+        self._copy_completion_callback = None
+        assert callback is not None
+        callback(event)
 
     def record_producer_event(self, stream: torch.cuda.Stream) -> None:
         """Publish readiness when a model produces on a separate CUDA stream."""

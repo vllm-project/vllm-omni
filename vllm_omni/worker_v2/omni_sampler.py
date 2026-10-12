@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,20 @@ from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
 StandardSample = Callable[
     [torch.Tensor, InputBatch, GrammarOutput | None], tuple[SamplerOutput, torch.Tensor, torch.Tensor]
 ]
+
+
+@dataclass
+class OmniSamplingContext:
+    """Forward payload and a fresh eager context for post-sampling model work.
+
+    The runner refreshes the payload after model output postprocessing. The
+    registered sampler owns its sampling transaction and may enter the original
+    attention context when it needs a same-step model continuation.
+    """
+
+    input_batch: InputBatch
+    forward_context: Callable[[], AbstractContextManager[Any]]
+    multimodal_outputs: dict[str, Any] | None = None
 
 
 @dataclass
@@ -60,6 +75,10 @@ class OmniSampler:
 
     def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         return self.base_sampler(logits, input_batch)
+
+    def set_sampling_context(self, context: OmniSamplingContext) -> AbstractContextManager[Any]:
+        """Bind one post-forward sampling transaction; stock adapters need none."""
+        return nullcontext()
 
     def sample_step(
         self,

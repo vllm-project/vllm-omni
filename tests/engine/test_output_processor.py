@@ -102,6 +102,28 @@ def test_modality_type_string_handles_reloaded_token_id_enum(name, expected):
     assert output_processor._modality_to_type_string(value) == expected
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (OutputModality(0), "text"),
+        (OutputModality.TEXT, "text"),
+        (OutputModality.TEXT | OutputModality.TOKEN_IDS, "token_ids"),
+        (OutputModality.LATENT | OutputModality.TOKEN_IDS, "latent"),
+        (OutputModality.IMAGE | OutputModality.LATENT, "image"),
+        (OutputModality.AUDIO | OutputModality.IMAGE | OutputModality.TOKEN_IDS, "audio"),
+    ],
+)
+def test_modality_type_string_preserves_native_flag_priority(value, expected):
+    assert output_processor._modality_to_type_string(value) == expected
+
+
+def test_modality_type_string_foreign_flag_uses_exact_names():
+    ForeignOutputModality = Flag("ForeignOutputModality", ["NOT_AUDIO", "NOT_TOKEN_IDS", "TEXT"])
+    assert output_processor._modality_to_type_string(ForeignOutputModality.NOT_AUDIO) == "text"
+    assert output_processor._modality_to_type_string(ForeignOutputModality.NOT_TOKEN_IDS) == "text"
+    assert output_processor._modality_to_type_string(ForeignOutputModality(0)) == "text"
+
+
 def test_init_empty_dict():
     """Ensure mm_accumulated is initially empty."""
     assert _make_state(RequestOutputKind.CUMULATIVE).mm_accumulated == {}

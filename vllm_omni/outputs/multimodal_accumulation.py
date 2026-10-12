@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 import torch
@@ -41,6 +44,13 @@ def drain_delta_payload(payload: MultimodalPayload) -> None:
         key = str(modality_key)
         payload.tensors.pop(key, None)
         payload.metadata.pop(key, None)
+
+    # Model-owned column tensors under chunk.* accompany the drained
+    # modality rows. They accumulate until publication, then leave together.
+    for values in (payload.tensors, payload.metadata):
+        for key in list(values):
+            if key == "chunk" or key.startswith("chunk."):
+                values.pop(key)
 
     for metadata_key in CHUNK_METADATA_KEYS:
         flat_key = f"meta.{metadata_key}"

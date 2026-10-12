@@ -83,6 +83,7 @@ def test_qwen3_tts_deployment_selection_preserves_output_and_transport_contract(
 def test_single_stage_running_reset_capability_cannot_be_overridden():
     from vllm_omni.config.omni_config import VllmOmniConfig
     from vllm_omni.config.stage_config import DeployConfig, StageDeployConfig, merge_pipeline_deploy
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE
 
     deploy = DeployConfig(
@@ -91,8 +92,13 @@ def test_single_stage_running_reset_capability_cannot_be_overridden():
     legacy = merge_pipeline_deploy(QWEN3_TTS_FUSED_PIPELINE, deploy)[0]
     legacy.runtime_overrides["supports_running_prefix_cache_reset"] = True
     assert legacy.to_omegaconf().engine_args.supports_running_prefix_cache_reset is False
-    with pytest.raises(ValueError, match="no structured config owner: supports_running_prefix_cache_reset"):
-        VllmOmniConfig.from_pipeline_config(QWEN3_TTS_FUSED_PIPELINE, user_deploy_config=deploy)
+    # This capability now has a structured model-config owner. A deploy
+    # override is accepted, but cannot enable an unsupported pipeline feature.
+    overridden = VllmOmniConfig.from_pipeline_config(QWEN3_TTS_FUSED_PIPELINE, user_deploy_config=deploy)
+    assert overridden.stage_by_id(0).model_config.supports_running_prefix_cache_reset is False
+
+    projected = build_engine_args_dict_from_omni_stage_config(overridden.stage_by_id(0), model="/models/qwen3-tts")
+    assert projected["supports_running_prefix_cache_reset"] is False
     structured = VllmOmniConfig.from_pipeline_config(QWEN3_TTS_FUSED_PIPELINE)
     assert structured.stage_by_id(0).model_config.supports_running_prefix_cache_reset is False
 
