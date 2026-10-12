@@ -116,6 +116,8 @@ async def request(session, url, payload, gate, state, reference_hash, retain_aud
     state["peak"] = max(state["peak"], state["active"])
     result = {"input": payload["input"], "seed": payload["seed"], "reference_sha256": reference_hash, "ok": False}
     data = bytearray()
+    arrivals = []
+    playback_deficit = 0.0
     try:
         async with session.post(url, json=payload) as response:
             result["status"] = response.status
@@ -125,16 +127,26 @@ async def request(session, url, payload, gate, state, reference_hash, retain_aud
             result["channels"] = int(response.headers.get("X-Audio-Channels", "0"))
             async for chunk in response.content.iter_any():
                 if chunk:
+                    arrived = time.perf_counter() - started
                     if not data:
-                        result["ttfa_seconds"] = time.perf_counter() - started
+                        result["ttfa_seconds"] = arrived
+                    # Mono 24 kHz int16 PCM, verified below before reporting.
+                    playback_deficit = max(
+                        playback_deficit, arrived - result["ttfa_seconds"] - len(data) / (SAMPLE_RATE * 2)
+                    )
+                    arrivals.append({"seconds": arrived, "pcm_bytes": len(chunk)})
                     data.extend(chunk)
             result.update(validate_pcm(data, result["sample_rate"], result["channels"]))
+            result["playback_deficit_seconds"] = playback_deficit
+            result["chunk_arrivals"] = arrivals
             result["ok"] = True
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
         result["error"] = str(error) or type(error).__name__
     finally:
         result["e2e_seconds"] = time.perf_counter() - started
         state["active"] -= 1
+    if result["ok"]:
+        result["rtf"] = result["e2e_seconds"] / result["audio_seconds"]
     if retain_audio and result["ok"]:
         result["_audio_pcm"] = bytes(data)
     return result
@@ -443,8 +455,9 @@ def summarize(rows, elapsed):
         "audio_throughput_seconds_per_second": sum(row["audio_seconds"] for row in good) / elapsed,
         "duplicate_audio_hashes": len(good) - len({row["audio_sha256"] for row in good}),
     }
-    for metric in ("ttfa_seconds", "e2e_seconds"):
-        values = [row[metric] for row in good]
+    for metric in ("ttfa_seconds", "e2e_seconds", "rtf", "playback_deficit_seconds"):
+        # Playback timing is currently captured only for HTTP PCM responses.
+        values = [row[metric] for row in good if metric in row]
         result[metric] = (
             dict(zip(("p50", "p95", "p99", "max"), map(float, np.percentile(values, [50, 95, 99, 100]))))
             if values

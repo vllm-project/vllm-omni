@@ -21,7 +21,10 @@ device. These are separate from the universal benchmark registry below.
 The load harness uses the longer parity narration so early completions are
 less likely to hide scheduler occupancy. Its report separately records
 successful clients and sampled active-sequence capacity; neither implies the
-other. Pass `--max-new-tokens 1000` to validate the default output allowance.
+other. HTTP reports also include per-request RTF, raw PCM arrival timing, and
+playback deficit: the additional initial buffer needed to avoid underruns when
+playback otherwise begins at the first received audio byte. These timings include
+conditioning and client transport; no sentence-level gap is silently excluded. Pass `--max-new-tokens 1000` to validate the default output allowance.
 See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-A5000.md#conditioning-load-validation-at-64-clients)
 for commands, measured 64-client results, and capacity and quality limitations.
 

@@ -89,6 +89,12 @@ def test_streaming_waves_measure_overlap_and_keep_failures(tmp_path, metrics_ava
             assert workload["completed"] == 6
             assert workload["ttfa_seconds"]["max"] > 0
             assert workload["e2e_seconds"]["p50"] > workload["ttfa_seconds"]["p50"]
+            assert workload["rtf"]["p50"] > 10
+            assert workload["playback_deficit_seconds"]["p50"] > 0.2
+            for row in workload["requests"]:
+                if row["ok"]:
+                    assert row["rtf"] == pytest.approx(row["e2e_seconds"] / row["audio_seconds"])
+                    assert sum(chunk["pcm_bytes"] for chunk in row["chunk_arrivals"]) == 960
             assert len(workload["requests"]) == 8
             observed = workload["server_metrics"]
             assert observed["available"] == metrics_available
