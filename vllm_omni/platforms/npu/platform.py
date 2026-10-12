@@ -3,10 +3,12 @@
 
 from contextlib import nullcontext
 from functools import cache
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import torch
 import torch.nn as nn
+from packaging.version import InvalidVersion, Version
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
 
@@ -296,6 +298,15 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from importlib.util import find_spec
 
         return find_spec("mindiesd") is not None
+
+    @classmethod
+    @cache
+    def supports_sdpa_native_gqa(cls) -> bool:
+        # Older torch-npu SDPA bindings require explicit K/V expansion.
+        try:
+            return Version(version("torch-npu")) >= Version("2.10.0")
+        except (PackageNotFoundError, InvalidVersion):
+            return False
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:

@@ -157,6 +157,11 @@ class OmniPlatform(Platform):
         return True
 
     @classmethod
+    def supports_sdpa_native_gqa(cls) -> bool:
+        """Whether this platform's SDPA supports compressed K/V heads."""
+        return False
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
