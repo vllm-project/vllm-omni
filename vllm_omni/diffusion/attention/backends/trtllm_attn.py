@@ -294,6 +294,7 @@ def _normalize_trtllm_metadata(
 
 class TrtllmAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_allgather_kv: bool = False
 
     @classmethod
     def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
