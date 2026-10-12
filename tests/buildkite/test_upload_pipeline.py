@@ -27,6 +27,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
@@ -172,7 +173,11 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     env_names = {item["name"] for item in container["env"]}
     assert "VLLM_CI_HF_TOKEN" in env_names
     assert "HF_TOKEN" not in env_names
-    assert step["commands"] == [CUDA_HF_TOKEN_EXPORT, "pytest -sv tests/example"]
+    assert step["commands"] == [
+        CUDA_HF_TOKEN_EXPORT,
+        "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+        "pytest -sv tests/example",
+    ]
 
 
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
@@ -239,6 +244,10 @@ def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
         assert "VLLM_CI_HF_TOKEN" in env_names
         assert "HF_TOKEN" not in env_names
         assert step["commands"][0] == CUDA_HF_TOKEN_EXPORT
+        assert step["commands"][1:] == [
+            "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+            "pytest -sv tests/example",
+        ]
 
 
 def _gpu_limit(step: dict) -> int:
@@ -365,7 +374,7 @@ def test_mirror_hardwares_inferred_missing_preset_is_rejected(monkeypatch: pytes
 
 
 def test_cpu_step_without_mirror_hardwares_is_unchanged() -> None:
-    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "cpu_queue_premerge"}}
+    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "medium_cpu_queue_premerge"}}
     assert _expand_mirror_hardwares(step) is step
 
 
@@ -471,6 +480,28 @@ def _iter_steps(doc: dict):
             yield from walk(step.get("steps"))
 
     yield from walk(doc.get("steps"))
+
+
+def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:
+    doc = yaml.safe_load(AMD_MERGE_YAML.read_text(encoding="utf-8"))
+    jobs = {
+        step["label"]: "\n".join(step.get("commands", []))
+        for step in _iter_steps(doc)
+        if step.get("label", "").startswith("Diffusion · Wan22")
+    }
+
+    assert set(jobs) == {
+        "Diffusion · Wan22 Offline Test",
+        "Diffusion · Wan22 Online Test",
+    }
+    offline = jobs["Diffusion · Wan22 Offline Test"]
+    online = jobs["Diffusion · Wan22 Online Test"]
+    assert "timeout 40m" in offline
+    assert "timeout 40m" in online
+    assert "tests/e2e/offline_inference/test_wan22_t2v.py" in offline
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" not in offline
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" in online
+    assert "tests/e2e/offline_inference/test_wan22_t2v.py" not in online
 
 
 # Synthetic coverage-style job: shared inputs that change what the split measures.

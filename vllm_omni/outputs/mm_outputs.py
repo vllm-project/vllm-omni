@@ -16,16 +16,20 @@ import torch
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput
 
-from vllm_omni.outputs.output_modality import TensorAccumulationStrategy
+from vllm_omni.outputs.output_modality import (
+    OutputModality,
+    TensorAccumulationStrategy,
+    get_accumulation_strategy,
+)
 from vllm_omni.outputs.utils import _is_tensor_list, _to_cpu
 
 logger = init_logger(__name__)
 
-# Keys whose values are metadata scalars (e.g. audio sample rate) but may
-# arrive as 0-d torch.Tensors — from_dict routes all tensors into .tensors,
-# so we relocate them to .metadata before consolidation to avoid a bogus
-# torch.cat attempt and its warn-and-keep-last fallback.
-_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate"})
+# Keys whose values are metadata scalars (e.g. audio sample rate or the
+# latest completion flag) may arrive as 0-d torch.Tensors. from_dict routes
+# all tensors into .tensors, so relocate these keys to .metadata before
+# consolidation to preserve the latest value without attempting torch.cat.
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate", "meta.finished"})
 
 
 def _cat_tensors(
@@ -46,21 +50,24 @@ def _consolidate_tensor_list(
     tensor_list: list[torch.Tensor],
     strategy: TensorAccumulationStrategy,
 ) -> torch.Tensor:
-    """Concatenate a deferred tensor list, with fallbacks on shape mismatch."""
+    """Concatenate a deferred tensor list, with a fallback for CONCAT_LAST only.
+
+    A shape mismatch under CONCAT_LAST is expected for genuine audio waveform
+    chunks (their non-last dims can vary between async-chunk steps), so that
+    case falls back to flattening each chunk before concatenating. Any other
+    strategy failing to concatenate means the tensors are not shaped the way
+    that strategy assumes (e.g. a key was assigned the wrong strategy), so it
+    is surfaced instead of silently keeping only the last chunk.
+    """
     try:
         return _cat_tensors(tensor_list, strategy)
-    except RuntimeError:
-        # [TODO: this part is for async chunk, not for audio only. can we come up with a design
-        # that identify this by whether using async chunk instead of modality?]
-        if key != "audio":
-            logger.warning("Error concatenating tensor for key %s; keeping last tensor", key)
-            return tensor_list[-1]
-        # Audio chunks may have mismatched shapes; retry along the last dim,
-        # then fall back to flattening each chunk.
-        try:
-            return torch.cat(tensor_list, dim=-1)
-        except RuntimeError:
-            return torch.cat([chunk.reshape(-1) for chunk in tensor_list], dim=0)
+    except RuntimeError as exc:
+        if strategy is not TensorAccumulationStrategy.CONCAT_LAST:
+            raise RuntimeError(
+                f"Error concatenating tensor list for key {key!r} under strategy {strategy}: {exc}"
+            ) from exc
+        logger.warning("CONCAT_LAST failed for key %s; flattening each chunk before concatenating", key)
+        return torch.cat([chunk.reshape(-1) for chunk in tensor_list], dim=0)
 
 
 def _append_entries(store: dict[str, Any], incoming: dict[str, Any]) -> None:
@@ -148,7 +155,7 @@ class MultimodalPayload(Mapping):
         """Merge *incoming* onto this payload and return the result.
 
         Content tensors accumulate into lists for deferred concatenation;
-        known sample-rate keys are snapshots replaced immediately, including
+        known scalar metadata keys are snapshots replaced immediately, including
         in DELTA streams that do not consolidate each emission. Missing keys
         retain their previous value. Other values keep the existing merge
         behavior. When this payload
@@ -167,12 +174,17 @@ class MultimodalPayload(Mapping):
             self.metadata[key] = value
         return self
 
-    def consolidate_tensors(self, strategy: TensorAccumulationStrategy) -> None:
+    def consolidate_tensors(self, modality: OutputModality) -> None:
         """Concatenate deferred tensor lists into single tensors.
 
-        Tensors are generated content accumulated as chunks, so lists are
-        concatenated according to *strategy* (e.g. audio chunks along the
-        time dimension, latent frames along the batch dimension).
+        Tensors are generated content accumulated as chunks, so each key's
+        list is concatenated according to the strategy
+        ``get_accumulation_strategy(modality, key)`` resolves for it (e.g.
+        audio waveform chunks along the time dimension, latent frames along
+        the batch dimension). Most keys share *modality*'s default, but a
+        key can be registered for a different strategy -- e.g. a codec-frame
+        matrix that grows along dim 0 rather than the waveform-tuned default
+        for its modality -- via ``register_key_accumulation_strategy``.
         """
         # Relocate scalar metadata tensors (e.g. sample rate) that from_dict
         # routed into .tensors, so they take the REPLACE path via .metadata
@@ -185,6 +197,7 @@ class MultimodalPayload(Mapping):
 
         for key, value in list(self.tensors.items()):
             if _is_tensor_list(value):
+                strategy = get_accumulation_strategy(modality, key)
                 self.tensors[key] = _consolidate_tensor_list(key, value, strategy)
 
     def consolidate_metadata(self) -> None:

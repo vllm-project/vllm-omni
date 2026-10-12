@@ -5,6 +5,9 @@
 Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
+- [vllm_omni.entrypoints.async_omni_base.AsyncOmniBase][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexOmni][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexSessionHandle][]
 - [vllm_omni.engine.cfg_companion_tracker.CfgCompanionTracker][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
@@ -17,12 +20,13 @@ Main entry points for vLLM-Omni inference and serving.
 
 ## Clients
 
-Client libraries that talk to a running vLLM-Omni server (the full-duplex Realtime client and its per-model session presets).
+Client libraries for full-duplex sessions: the Realtime WebSocket client, the in-process client over `DuplexOmni`, and the per-model session presets.
 
 - [vllm_omni.clients.duplex.AudioDelta][]
 - [vllm_omni.clients.duplex.AudioFormat][]
 - [vllm_omni.clients.duplex.ConnectionResumed][]
 - [vllm_omni.clients.duplex.DuplexClient][]
+- [vllm_omni.clients.duplex.DuplexClientBase][]
 - [vllm_omni.clients.duplex.DuplexClientError][]
 - [vllm_omni.clients.duplex.DuplexConnectionError][]
 - [vllm_omni.clients.duplex.DuplexEvent][]
@@ -44,6 +48,7 @@ Client libraries that talk to a running vLLM-Omni server (the full-duplex Realti
 - [vllm_omni.clients.duplex.TextDelta][]
 - [vllm_omni.clients.duplex.TranscriptDelta][]
 - [vllm_omni.clients.duplex.WebSocketTransport][]
+- [vllm_omni.clients.inline_duplex.InlineDuplexClient][]
 
 ## Inputs
 
@@ -110,11 +115,6 @@ Core scheduling and caching components.
 - [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.SineGen2][]
 - [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.Snake][]
 - [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.SourceModuleHnNSF][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedGroupResidualVectorQuantization][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedResidualVectorQuantization][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.EuclideanCodebook][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.VectorQuantization][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.preprocess][]
 
 ## Configuration
 
@@ -138,11 +138,6 @@ Configuration classes.
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSTalkerConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2Config][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2DecoderConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1Config][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderBigVGANConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
 - [vllm_omni.transformers_utils.configs.cosyvoice3.CosyVoice3Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]

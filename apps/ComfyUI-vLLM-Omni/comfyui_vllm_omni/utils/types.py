@@ -30,7 +30,17 @@ class MiniMaxH3ModelSpecificParams(dict):
     pass
 
 
+MAX_REFERENCE_IMAGES = 9
+MAX_REFERENCE_VIDEOS = 3
+MAX_REFERENCE_AUDIOS = 3
+MAX_TOTAL_REFERENCES = 12
+
+
 class VideoReferences(dict):
+    pass
+
+
+class LatentMaskEditing(dict):
     pass
 
 

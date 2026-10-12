@@ -12,6 +12,8 @@ steps:
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1"
     timeout_in_minutes: 60
+    artifact_paths:
+      - coverage-core-model-cpu-*.xml.gz
     commands:
       - |
         set +e
@@ -19,7 +21,6 @@ steps:
         pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
         EXIT=$$?
         gzip -9 -f "$${REPORT}"
-        buildkite-agent artifact upload "$${REPORT}.gz"
         exit $$EXIT
     mirror_hardwares: l4_1
 
@@ -79,41 +80,32 @@ steps:
         source_file_dependencies: omni_qwen3_omni_perf
         key: weekly-omni-performance-vllm-text
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · Perf Test · Async Chunk · Random"
         key: weekly-omni-performance-async-chunk-random
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and slow"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and slow"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · Perf Test · Multi-Replica"
         source_file_dependencies: omni_qwen3_omni_perf
         key: weekly-omni-performance-multi-replicas
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
         mirror_hardwares: h100_3
 
   - group: ":card_index_dividers: E2E Tests"
@@ -160,15 +152,122 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_4
 
-      - label: "TTS · L4"
-        timeout_in_minutes: 120
+      - label: "TTS · Moss · L4"
+        timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
           - export VLLM_MOE_USE_DEEP_GEMM="0"
           - |
             failed=0
-            for f in $(pytest --collect-only -q tests/e2e/ -m "slow and L4 and tts" --run-level "full_model" | grep '\.py::' | sed -E 's|::.*||' | sort -u); do
+            for f in \
+              tests/e2e/offline_inference/test_moss_tts_expansion.py \
+              tests/e2e/offline_inference/test_moss_tts_nano_expansion.py \
+              tests/e2e/offline_inference/test_moss_tts_realtime.py \
+              tests/e2e/offline_inference/test_moss_tts_realtime_expansion.py \
+              tests/e2e/online_serving/test_moss_tts_expansion.py \
+              tests/e2e/online_serving/test_moss_tts_nano_expansion.py
+            do
+              pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
+            done
+            exit $$failed
+        mirror_hardwares: l4_1
+
+      - label: "TTS · VoxCPM2 · Voxtral · L4"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - |
+            failed=0
+            for f in \
+              tests/e2e/offline_inference/test_voxcpm2_tts.py \
+              tests/e2e/online_serving/test_voxcpm2_tts.py \
+              tests/e2e/online_serving/test_voxcpm2_tts_expansion.py \
+              tests/e2e/online_serving/test_voxcpm2_tts_lora.py \
+              tests/e2e/offline_inference/test_voxtral_tts_expansion.py \
+              tests/e2e/online_serving/test_voxtral_tts_expansion.py
+            do
+              pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
+            done
+            exit $$failed
+        mirror_hardwares: l4_1
+
+      - label: "TTS · Higgs · L4"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - |
+            failed=0
+            for f in \
+              tests/e2e/offline_inference/test_higgs_audio_v2_expansion.py \
+              tests/e2e/online_serving/test_higgs_audio_v2_expansion.py \
+              tests/e2e/online_serving/test_higgs_audio_v3.py
+            do
+              pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
+            done
+            exit $$failed
+        mirror_hardwares: l4_1
+
+      - label: "TTS · OmniVoice · Step-Audio · L4"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - |
+            failed=0
+            for f in \
+              tests/e2e/offline_inference/test_omnivoice_expansion.py \
+              tests/e2e/online_serving/test_omnivoice_expansion.py \
+              tests/e2e/online_serving/test_omnivoice_parity.py \
+              tests/e2e/offline_inference/test_step_audio2_expansion.py
+            do
+              pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
+            done
+            exit $$failed
+        mirror_hardwares: l4_1
+
+      - label: "TTS · Ming · GLM · IndexTTS · Breeze · L4"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - |
+            failed=0
+            for f in \
+              tests/e2e/offline_inference/test_ming_tts_expansion.py \
+              tests/e2e/online_serving/test_ming_tts_expansion.py \
+              tests/e2e/offline_inference/test_glm_tts_expansion.py \
+              tests/e2e/online_serving/test_glm_tts_expansion.py \
+              tests/e2e/offline_inference/test_indextts2_expansion.py \
+              tests/e2e/online_serving/test_indextts2_expansion.py \
+              tests/e2e/online_serving/test_breeze_tts_2.py
+            do
+              pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
+            done
+            exit $$failed
+        mirror_hardwares: l4_1
+
+      - label: "TTS · Audex · CosyVoice · Qwen3-TTS · L4"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export VLLM_USE_DEEP_GEMM="0"
+          - export VLLM_MOE_USE_DEEP_GEMM="0"
+          - |
+            failed=0
+            for f in \
+              tests/e2e/offline_inference/test_audex_tts.py \
+              tests/e2e/offline_inference/test_audex_s2t.py \
+              tests/e2e/offline_inference/test_audex_tta.py \
+              tests/e2e/offline_inference/test_cosyvoice3_expansion.py \
+              tests/e2e/online_serving/test_qwen3_tts_word_timestamps.py
+            do
               pytest -s -v "$$f" -m "slow and L4 and tts" --run-level "full_model" || failed=1
             done
             exit $$failed
@@ -232,6 +331,17 @@ steps:
 
       # Split the old shared H100 Single-GPU sweep: one pytest process collected
       # every slow+cards_1 diffusion file and exceeded 150 minutes.
+      - label: ":robot_face: Robot Policy OpenPI · π0.5 · H100 · Single-GPU"
+        timeout_in_minutes: 120
+        commands:
+          - pip install --no-deps "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git@215abfb217dbac7d5f1273282331b9b1866c0479#subdirectory=packages/openpi-client"
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_pi05_expansion.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · Qwen-Image · H100 · Single-GPU"
         timeout_in_minutes: 120
         commands:
@@ -424,6 +534,7 @@ steps:
           - >-
             pytest -sv
             tests/e2e/online_serving/test_bagel_expansion.py
+            tests/e2e/offline_inference/test_bagel_expansion.py
             -m "slow and diffusion and H100 and cards_2"
             --run-level "full_model"
         mirror_hardwares: h100_2

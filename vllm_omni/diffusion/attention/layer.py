@@ -7,7 +7,9 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+from collections.abc import Mapping
 from dataclasses import replace
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -16,8 +18,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
+from vllm_omni.diffusion.attention.capabilities import (
+    ExecutionContext,
+    ExecutionPathResult,
+    OuterBoundary,
+    ParallelStrategy,
+)
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
@@ -83,6 +91,10 @@ class Attention(nn.Module):
         custom_attention: nn.Module | None = None,
         # Preserve dense FP32 inference for models opting into CUDA auto fallback.
         allow_fp32_fallback: bool = False,
+        # Model-owned implementation subclasses, keyed by backend name.
+        # Keep the platform-selected backend and its capabilities unchanged.
+        # Each override must preserve the selected implementation's contract.
+        impl_overrides: Mapping[str, type[AttentionImpl]] | None = None,
     ):
         super().__init__()
 
@@ -113,6 +125,8 @@ class Attention(nn.Module):
 
         config = get_current_diffusion_config_or_none()
         attention_config = config.diffusion_attention_config if config is not None else None
+        parallel_config = getattr(config, "parallel_config", None)
+        self._hsdp_compile_boundary_enabled = bool(getattr(parallel_config, "use_hsdp", False))
 
         from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
@@ -125,6 +139,9 @@ class Attention(nn.Module):
             is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
         self._scheduler_paged_kv = scheduler_paged_kv
+        self.attn_backend: type[AttentionBackend] | None
+        self.attention: AttentionImpl | nn.Module
+        self.sdpa_fallback: SDPAImpl | None
         if custom_attention is None:
             attn_backend_cls, spec = get_attn_backend_for_role(
                 role=role,
@@ -160,7 +177,6 @@ class Attention(nn.Module):
                     attn_backend_cls.get_name(),
                     dense_backend_name,
                 )
-            parallel_config = getattr(config, "parallel_config", None)
             allgather_degree = getattr(parallel_config, "allgather_degree", 1)
             # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
             # so validation does not depend on backend names.
@@ -183,6 +199,16 @@ class Attention(nn.Module):
 
             self.attn_backend = attn_backend_cls
             self.attn_impl_cls = self.attn_backend.get_impl_cls()
+            if impl_overrides is not None:
+                override = impl_overrides.get(attn_backend_cls.get_name())
+                if override is not None:
+                    if not issubclass(override, self.attn_impl_cls):
+                        raise TypeError(
+                            f"Attention implementation override {override.__qualname__} must subclass "
+                            f"the selected implementation {self.attn_impl_cls.__qualname__} "
+                            f"for backend {attn_backend_cls.__qualname__}"
+                        )
+                    self.attn_impl_cls = override
             self.attention = self.attn_impl_cls(
                 num_heads=num_heads,
                 head_size=head_size,
@@ -263,6 +289,7 @@ class Attention(nn.Module):
 
         if self.paged_kv_cache_role is None:
             return None
+        assert self.attn_backend is not None  # Custom attention cannot opt into paged KV.
         dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
         # Keep backend layout discovery under the same config context used by
         # upstream vLLM's attention-spec collector.  vLLM 0.29 moved the
@@ -299,12 +326,13 @@ class Attention(nn.Module):
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None or self._has_custom_attention:
             return
+        assert self.attn_backend is not None
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         if dtype == "auto":
             dtype = None
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if dtype:
+        if dtype and dtype != "float":
             if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
@@ -321,13 +349,15 @@ class Attention(nn.Module):
         self._kv_cache_dtype = dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
+        if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
+            raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
         skip_layers = self._kv_cache_skip_layers
         if skip_steps is not None:
             step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-            if step_idx is not None and step_idx in skip_steps:
+            if skip_steps and (step_idx is None or step_idx in skip_steps):
                 return False
         if skip_layers is not None:
             if self.layer_idx is not None and self.layer_idx in skip_layers:
@@ -335,18 +365,21 @@ class Attention(nn.Module):
         return True
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        kv_cache_dtype = self._kv_cache_dtype
-        if kv_cache_dtype is None or self._disable_kv_quant or not self._should_apply_kv_cache_quant():
-            if attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra:
-                return attn_metadata
-            extra = dict(attn_metadata.extra)
-            extra.pop("kv_cache_dtype", None)
-            return replace(attn_metadata, extra=extra)
-
+        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
+        dtype = self._kv_cache_dtype
+        if dtype in (None, "float"):
+            dtype = None
+        elif disabled:
+            dtype = "float"
+        if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
+            return attn_metadata
+        extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
+        # Recompute per forward so shared metadata cannot retain another step's policy.
+        extra.pop("kv_cache_dtype", None)
+        if dtype is not None:
+            extra["kv_cache_dtype"] = dtype
         if attn_metadata is None:
-            return AttentionMetadata(extra={"kv_cache_dtype": kv_cache_dtype})
-        extra = dict(attn_metadata.extra)
-        extra["kv_cache_dtype"] = kv_cache_dtype
+            return AttentionMetadata(extra=extra) if extra else None
         return replace(attn_metadata, extra=extra)
 
     def forward(
@@ -356,16 +389,67 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if torch.compiler.is_compiling() and is_forward_context_available():
-            od_config = get_forward_context().omni_diffusion_config
-            parallel_config = getattr(od_config, "parallel_config", None)
-            if getattr(parallel_config, "use_hsdp", False):
-                # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
-                # attention graph; otherwise scheduler dependency analysis can
-                # fail on the fused attention region.
-                return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
+        if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
+            # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
+            # attention graph; otherwise scheduler dependency analysis can
+            # fail on the fused attention region.
+            return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
+
+    def _uses_hsdp_compile_boundary(self) -> bool:
+        if self._hsdp_compile_boundary_enabled:
+            return True
+        if not is_forward_context_available():
+            return False
+        od_config = get_forward_context().omni_diffusion_config
+        parallel_config = getattr(od_config, "parallel_config", None)
+        return bool(getattr(parallel_config, "use_hsdp", False))
+
+    def resolve_execution_path(
+        self,
+        context: ExecutionContext,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> ExecutionPathResult:
+        """Compose backend capabilities with outer Attention boundaries."""
+        boundaries = set(context.outer_boundaries)
+        if self._uses_hsdp_compile_boundary():
+            boundaries.add(OuterBoundary.HSDP)
+        active_strategy = self._get_active_parallel_strategy()
+        strategy_name = active_strategy.name
+        if self.use_ring and active_strategy.enabled and strategy_name == "ulysses":
+            parallel_strategy = ParallelStrategy.HYBRID_ULYSSES_RING
+        elif self.use_ring and active_strategy.enabled:
+            parallel_strategy = ParallelStrategy.RING
+        else:
+            parallel_strategy = {
+                "allgather_kv": ParallelStrategy.ALLGATHER_KV,
+                "ulysses": ParallelStrategy.ULYSSES,
+            }.get(strategy_name, ParallelStrategy.NONE)
+        resolved_context = replace(
+            context,
+            outer_boundaries=frozenset(boundaries),
+            paged_kv=self.is_paged_kv_active(),
+            parallel_strategy=parallel_strategy,
+        )
+        resolver = getattr(self.attention, "resolve_execution_path", None)
+        if not callable(resolver):
+            return ExecutionPathResult.unmigrated(
+                type(self.attention).__name__,
+                resolved_context,
+            )
+        if not resolved_context.paged_kv:
+            attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        return resolver(
+            resolved_context,
+            query,
+            key,
+            value,
+            attn_metadata,
+        )
 
     @torch.compiler.disable
     def _forward_hsdp_compile_boundary(
@@ -400,9 +484,11 @@ class Attention(nn.Module):
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
+            backend_name = (
+                self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
+            )
             raise NotImplementedError(
-                f"Diffusion paged KV requires an Omni backend with paged support; "
-                f"selected {self.attn_backend.get_name()}"
+                f"Diffusion paged KV requires an Omni backend with paged support; selected {backend_name}"
             )
         if use_paged_attention and strategy is not self._no_parallel_strategy:
             strategy_name = strategy.name
@@ -410,8 +496,10 @@ class Attention(nn.Module):
                 raise NotImplementedError(
                     "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
                 )
-            if strategy_name == "allgather_kv":
-                raise NotImplementedError("paged Scheduler KV is not supported with AllGather-KV sequence parallelism")
+            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
+                raise NotImplementedError(
+                    f"paged Scheduler KV is not supported with the {strategy_name!r} sequence-parallel strategy"
+                )
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
@@ -496,7 +584,7 @@ class Attention(nn.Module):
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:
-            return self.attention(query, key, value, attn_metadata)
+            return cast(nn.Module, self.attention)(query, key, value, attn_metadata)
 
         self._assert_metadata_compatible(attn_metadata)
 
@@ -506,7 +594,7 @@ class Attention(nn.Module):
             and query.dtype == torch.float32
             and query.ndim == 4
             and not self.backend_explicit
-            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and cast(type[AttentionBackend], self.attn_backend).get_name() == "FLASH_ATTN"
             and (
                 attn_metadata is None
                 or (
@@ -519,7 +607,7 @@ class Attention(nn.Module):
             )
         ):
             logger.warning_once("Using SDPA for this layer's FP32 input with automatic CUDA FlashAttention selection.")
-            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
         # The startup KV-capacity profile needs tensor shapes, not a paged
@@ -531,14 +619,16 @@ class Attention(nn.Module):
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None
             and in_kv_memory_profile
+            and self.attn_backend is not None
             and self.attn_backend.get_name() == "FLASH_ATTN"
             and not current_omni_platform.supports_diffusion_dense_flash_attention()
         ):
+            assert self.sdpa_fallback is not None
             logger.warning_once(
                 "The startup KV memory profile is using SDPA because dense FLASH_ATTN is unavailable. "
                 "Formal paged requests still use the platform-native paged attention backend."
             )
-            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         return self.attention.forward(query, key, value, attn_metadata)
 

@@ -102,6 +102,7 @@ CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_depe
 SOURCE_FILTER_FALLBACK_KEY = "source_filter_fallback"
 CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
 CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
+CUDA_RUNTIME_CHECK = "python3 .buildkite/cuda/scripts/check_vllm_runtime.py"
 
 # Bootstrap Buildkite ``if`` expressions.
 # ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
@@ -620,11 +621,11 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
     if any(preset_name == chip or preset_name.startswith(f"{chip}_") for chip in _cuda_mirror_chips()):
         commands = merged.get("commands")
         if isinstance(commands, list):
-            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, *commands]
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, *commands]
         elif commands is None:
-            merged["commands"] = [CUDA_HF_TOKEN_EXPORT]
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK]
         else:
-            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, commands]
+            merged["commands"] = [CUDA_HF_TOKEN_EXPORT, CUDA_RUNTIME_CHECK, commands]
     # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
     if "retry" in step:
         merged["retry"] = step["retry"]

@@ -1,31 +1,40 @@
-# Experimental Full-Duplex (JoyVL)
+# Experimental Full-Duplex (JoyVL, Mage-VL)
 
-This package now contains the JoyVL framework and its example integration,
-plus two client-side helpers kept for the benchmark and e2e drivers:
+This package now contains the JoyVL framework, the JoyVL and Mage-VL example
+integrations, and two client-side helpers kept for the benchmark and e2e
+drivers:
 
 ```text
 core/              generic duplex scaffold used by the JoyVL adapter
 joyvl/             JoyVL model-specific integration
+mage_vl/           Mage-VL model-specific integration
 client.py          legacy Realtime probe client (RealtimeDuplexClient) used by
-                   the omniinteract / omni-duplex-eval benchmarks and the
-                   server-VAD and Nemotron e2e drivers; applications should use
+                   the omni-duplex-eval benchmark and the MiniCPM-o server-VAD
+                   e2e driver; applications should use
                    vllm_omni.clients.duplex.DuplexClient instead
 video_stacking.py  camera-frame tiling for omni duplex video input
 ```
 
 To run JoyVL, see
 [`recipes/JD/JoyAI-VL-Interaction.md`](../../../recipes/JD/JoyAI-VL-Interaction.md).
+To run Mage-VL, see [`recipes/Microsoft/Mage-VL.md`](../../../recipes/Microsoft/Mage-VL.md).
 
-The MiniCPM-o 4.5 and PersonaPlex native full-duplex runtimes graduated out
-of this package. They now live in the stable tree:
+The native full-duplex runtimes graduated out of this package. They now live
+in the stable tree, where sessions are engine-resident (RFC
+[vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)):
 
 ```text
-vllm_omni/engine/duplex/                       engine control plane, sessions, leases
-vllm_omni/entrypoints/duplex/           WebSocket serving and Realtime projection
-vllm_omni/entrypoints/duplex_request_client.py request/output lifecycle
-vllm_omni/model_executor/models/minicpmo_4_5/duplex/  MiniCPM adapter
-vllm_omni/model_executor/models/personaplex/duplex/   PersonaPlex adapter
-vllm_omni/model_executor/models/nemotron_voicechat/duplex/  Nemotron VoiceChat adapter
+vllm_omni/engine/duplex/                       sessions, manager, runner, leases, typed contract
+vllm_omni/engine/duplex_omni_engine.py         DuplexOmniEngine (session message surface)
+vllm_omni/engine/duplex_orchestrator.py        DuplexOrchestrator (hosts the session manager)
+vllm_omni/entrypoints/duplex_omni.py           DuplexOmni + DuplexSessionHandle (Python API)
+vllm_omni/entrypoints/duplex/                  WebSocket transport (attachments, resume, replay)
+vllm_omni/clients/duplex.py                    DuplexClient / DuplexClientBase
+vllm_omni/model_executor/models/minicpmo_4_5/duplex/  MiniCPM-o 4.5 DuplexModelPlugin
+vllm_omni/model_executor/models/personaplex/duplex/   PersonaPlex DuplexModelPlugin
+vllm_omni/model_executor/models/nemotron_voicechat/duplex/  Nemotron VoiceChat DuplexModelPlugin
+vllm_omni/model_executor/models/qwen3_omni/duplex/    Qwen3-Omni DuplexModelPlugin
+vllm_omni/model_executor/models/aura_omni/duplex/     AURA DuplexModelPlugin
 vllm_omni/model_executor/duplex_sampling.py    AR-runner sampling hook helper
 vllm_omni/outputs/duplex.py                    typed output decision envelope
 ```
@@ -51,6 +60,8 @@ only model policy.
 3. Promote a helper from a model package up into `core/` only once a second
    model actually needs it.
 
-For production serving, prefer the stable plugin seams instead
-(`duplex_serving_adapter` / `duplex_runtime_extension` dotted strings in the
-model's `pipeline.py`), as MiniCPM-o 4.5 and PersonaPlex do.
+For production serving, prefer the stable plugin seam instead: implement one
+`vllm_omni.engine.duplex.plugin.DuplexModelPlugin` and name it in the model's
+`pipeline.py` as `duplex_plugin`, as MiniCPM-o 4.5, PersonaPlex, Nemotron
+VoiceChat, Qwen3-Omni and AURA do. The contract is documented in
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md).

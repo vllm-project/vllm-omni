@@ -31,6 +31,12 @@ stages:
     engine_extras:
       hf_overrides:
         voxcpm2_runtime_config:
+          # LocDiT generation settings affect synthesis quality. Keep the defaults
+          # unless alternative values have been validated for your workload.
+          inference_timesteps: 10
+          cfg_value: 2.0
+          cfg_cutoff_ratio: 1.0
+
           audio_emit_every: 1
           vae_decode_every: 3
           enable_batched_cfm: true

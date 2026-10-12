@@ -346,3 +346,25 @@ def test_chat_audio_metadata_survives_response_serialization(stream, fmt):
             assert audio_file.samplerate == 22050
     else:
         assert len(raw) == frame_count * 2
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+def test_float32_pcm_fast_path_matches_soundfile(channels):
+    from vllm_omni.entrypoints.openai.audio_utils_mixin import _float32_to_pcm16_bytes
+
+    rng = np.random.default_rng(0)
+    audio = np.concatenate(
+        [
+            rng.uniform(-1.2, 1.2, 4096),
+            np.array([-1.0, 1.0, 0.0, -0.0, 32767 / 32768, -1 / 32768, 0.5 / 32768, -0.5 / 32768]),
+            np.array([np.nan, np.inf, -np.inf, np.nextafter(np.float32(1 / 32768), np.float32(0))]),
+        ]
+    ).astype(np.float32)
+    if channels == 2:
+        audio = np.stack((audio, audio[::-1])).T  # Non-contiguous, channels-last stereo.
+    original = audio.copy()
+    with BytesIO() as buffer:
+        soundfile.write(buffer, audio, 24000, format="RAW", subtype="PCM_16")
+        expected = buffer.getvalue()
+    assert _float32_to_pcm16_bytes(audio) == expected
+    np.testing.assert_array_equal(audio, original)

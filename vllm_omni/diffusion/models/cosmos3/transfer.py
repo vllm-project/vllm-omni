@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 transfer inference helpers.
 
 The reference Cosmos Framework transfer path accepts one or more control hints
@@ -24,6 +24,8 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
+
+from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
 
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 _TRANSFER_HINT_COMMON_FIELDS = frozenset({"control_path", "control", "control_weight"})
@@ -538,23 +540,9 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
         array = _pil_to_uint8_rgb(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
-    try:
-        import imageio.v3 as iio
-    except ImportError as exc:
-        raise ImportError(
-            "Cosmos3 transfer video control_path loading requires imageio. "
-            "Install imageio[ffmpeg] or provide decoded control frames."
-        ) from exc
-
-    frames: list[torch.Tensor] = []
-    limit = max_frames if max_frames is not None else None
-    for frame in iio.imiter(media_path):
-        frames.append(torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1))
-        if limit is not None and len(frames) >= int(limit):
-            break
-    if not frames:
-        raise ValueError(f"Cosmos3 transfer control_path produced no frames: {media_path}")
-    return torch.stack(frames, dim=1).contiguous()
+    rgb_frames = decode_path_video_frames(media_path, max_frames=max_frames, keep="first")
+    stacked = [torch.from_numpy(frame).permute(2, 0, 1) for frame in rgb_frames]
+    return torch.stack(stacked, dim=1).contiguous()
 
 
 def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:

@@ -51,6 +51,7 @@ This extension offers the following nodes based on the output modalities:
 - **Generate Video** for text-to-video and image-to-video tasks
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for text-to-music tasks
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
 
@@ -80,6 +81,18 @@ To build a simple workflow yourself,
     - For multi-stage models, you can connect multiple **AR Sampling Params** and **Diffusion Sampling Params** nodes to a **Multi-Stage Sampling Params List** node, and connect this node to the generation node.
     - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
     - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
+
+## MiniMax H3 text-to-video workflow
+
+The **MiniMax H3 Text to Video** template uses the existing remote Generate Video,
+H3 Params, sampling, and Remote LoRA nodes. It includes Base settings and an
+optional Turbo preset, with native resolution, 24 FPS, and `17k+5` frame counts.
+ComfyUI receives the generated video and audio from the server; it does not load
+H3 weights locally. Configure the server-side LoRA path before enabling Turbo.
+
+See the [H3 workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/minimax-h3-t2v.md)
+for server setup, template import, Turbo configuration, recorded validation,
+and saved-video/audio checks.
 
 ## Examples & Screenshots
 

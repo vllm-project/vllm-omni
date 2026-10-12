@@ -29,7 +29,12 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import Dis
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 if TYPE_CHECKING:
@@ -620,17 +625,23 @@ def _load_ltx25_native_diffusion_decoder(
 
 def _place_aux_components(pipeline: Any) -> None:
     parallel_config = getattr(pipeline.od_config, "parallel_config", None)
-    use_managed_placement = bool(
-        getattr(pipeline.od_config, "enable_cpu_offload", False)
-        or getattr(pipeline.od_config, "enable_layerwise_offload", False)
-        or getattr(parallel_config, "use_hsdp", False)
-    )
+    use_managed_placement = resolve_offload_strategy(pipeline.od_config) in (
+        OffloadStrategy.MODEL_LEVEL,
+        OffloadStrategy.LAYER_WISE,
+    ) or bool(getattr(parallel_config, "use_hsdp", False))
     if use_managed_placement:
         return
 
     modules = ModuleDiscovery.discover(pipeline)
     for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):
         module.to(pipeline.device)
+
+
+def _declare_text_encoder_offload_plan(pipeline: Any) -> None:
+    """Make the text encoder streamable; offloading the DiT alone leaves it resident."""
+    language_model = getattr(getattr(pipeline.text_encoder, "model", None), "language_model", None)
+    if language_model is not None and hasattr(language_model, "layers"):
+        pipeline._offload_plan = OffloadPlan(encoder_block_attrs={"text_encoder": ("model.language_model.layers",)})
 
 
 def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
@@ -680,6 +691,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
+    _declare_text_encoder_offload_plan(pipeline)
     _install_connector_attention(
         pipeline.connectors,
         preserve_learned_register_mask=profile.preserve_connector_attention_mask,

@@ -84,6 +84,7 @@ class StepRequestState:
     # Opaque model-owned preprocessing result. Scheduler-owned Diffusion KV
     # request state is removed before this Worker state is built.
     prepared_layout: Any | None = None
+    external_req_id: str | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None

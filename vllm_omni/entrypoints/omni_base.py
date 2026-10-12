@@ -19,13 +19,13 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     OutputMessage,
     StageMetricsMessage,
 )
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
@@ -66,7 +66,7 @@ class OmniEngineDeadError(EngineDeadError):
         self.error_stage_id = error_stage_id
 
 
-def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
+def _weak_shutdown_engine(engine: OmniEngineBase) -> None:
     """Best-effort engine cleanup for GC finalization."""
     try:
         engine.shutdown()
@@ -181,6 +181,7 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        collect_stage_metrics = kwargs.pop("collect_stage_metrics", True)
         self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
         # before it reaches ``StageConfigFactory._create_legacy_from_registry``, so
@@ -198,6 +199,7 @@ class OmniBase(PDDisaggregationMixin):
         self.__dict__["_name"] = self.__class__.__name__
         self.model = model
         self.log_stats = log_stats
+        self.collect_stage_metrics = collect_stage_metrics
         # Provisional value (mirrors the CLI/caller kwarg); the engine resolves
         # pipeline + deploy YAML + CLI precedence below and the final value is
         # re-assigned from ``self.engine.async_chunk`` after init.
@@ -206,26 +208,27 @@ class OmniBase(PDDisaggregationMixin):
         self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
         logger.info("[%s] Initializing with model %s", self.__class__.__name__, model)
-        # Construct transfer_metrics first so we can hand it to AsyncOmniEngine
+        # Construct transfer_metrics first so we can hand it to the engine
         # (which forwards it to the Orchestrator background thread for
-        # TX-side emit; see Orchestrator._forward_to_next_stage).
+        # TX-side emit; see OrchestratorBase._forward_to_next_stage).
         self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         st = time.time()
-        self.engine = AsyncOmniEngine(
+        self.engine = self._create_engine(
             model=model,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             transfer_emitter=self.transfer_metrics,
             prom_metrics=self.prom_metrics,
             log_stats=log_stats,
+            collect_stage_metrics=collect_stage_metrics,
             **kwargs,
         )
         self._shutdown_called = False
         self._weak_finalizer = weakref.finalize(self, _weak_shutdown_engine, self.engine)
         et = time.time()
-        logger.info("[%s] AsyncOmniEngine initialized in %.2f seconds", self.__class__.__name__, et - st)
-        # Authoritative: ``AsyncOmniEngine`` resolves (pipeline + deploy YAML +
+        logger.info("[%s] %s initialized in %.2f seconds", self.__class__.__name__, type(self.engine).__name__, et - st)
+        # Authoritative: the engine resolves (pipeline + deploy YAML +
         # CLI overrides) through ``StageConfigFactory`` and stores the final
         # value on ``engine.async_chunk``; mirror it here so ``--no-async-chunk``
         # (explicit ``False``) is not fallen-back-through by ``or``.
@@ -252,6 +255,10 @@ class OmniBase(PDDisaggregationMixin):
 
         # PD disaggregation state (detects if a prefill/decode stage pair is configured)
         self._init_pd_state()
+
+    def _create_engine(self, **engine_kwargs: Any) -> OmniEngineBase:
+        """Construct this entrypoint's engine (``AsyncOmniEngine`` for turn-based use)."""
+        raise NotImplementedError
 
     @property
     def num_stages(self) -> int:
@@ -437,7 +444,7 @@ class OmniBase(PDDisaggregationMixin):
             if self.log_stats:
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
-                req_state.metrics.build_and_log_summary()
+                req_state.metrics.log_timing_summary()
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
@@ -737,7 +744,9 @@ class OmniBase(PDDisaggregationMixin):
                 evt_output_type = evt_stage_meta.final_output_type
             stage_name = evt_stage_meta.model_stage
             sid_key = str(sid)
-            stage_metrics[sid_key] = OrchestratorAggregator._merge_stage_metric_event(stage_metrics.get(sid_key), evt)
+            stage_metrics[sid_key] = OrchestratorAggregator._merge_stage_metric_event(
+                stage_metrics.get(sid_key), evt, collect_stage_metrics=self.collect_stage_metrics
+            )
             stage_metrics[sid_key]["stage_name"] = stage_name or f"stage_{sid}"
             stage_metrics[sid_key]["final_output_type"] = evt_output_type
         if stage_metrics:

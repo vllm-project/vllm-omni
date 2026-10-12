@@ -71,15 +71,8 @@ from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
 from vllm_omni.metrics.definitions import compute_audio_rtf  # noqa: E402
 
 
-def _url_with_model(url, model, *, autostart=None, session_id=None):
-    # This driver speaks the MiniCPM-o native duplex wire contract.
-    return build_realtime_url(
-        url,
-        model,
-        autostart=autostart,
-        session_id=session_id,
-        extra_query={"native_duplex": "1"},
-    )
+def _url_with_model(url, model, *, autostart=None):
+    return build_realtime_url(url, model, autostart=autostart)
 
 
 _read_wav_pcm16 = read_pcm16_wav
@@ -630,7 +623,6 @@ def _session_update_event(args: DemoArgs) -> dict[str, object]:
         "playback_commit_policy": "ack_only",
         "extra_body": {
             "auto_response": True,
-            "native_duplex": True,
             "force_listen_count": 0,
         },
     }
@@ -646,9 +638,6 @@ def _session_update_event(args: DemoArgs) -> dict[str, object]:
         "type": "session.update",
         "session": session_payload,
     }
-    session_id = getattr(args, "session_id", None)
-    if session_id:
-        session_payload["session_id"] = session_id
     return event
 
 
@@ -1462,7 +1451,6 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         args.url,
         args.model,
         autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=getattr(args, "session_id", None),
     )
     state = DemoState()
     stop = asyncio.Event()
@@ -1674,6 +1662,10 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
     )
     unexpected_error_events = _unexpected_error_events(state)
     continuous_input_ok = not continuous_input or state.count("input_audio_buffer.committed") == 0
+    # The server allocates every session id; label metrics with the one it announced.
+    created = state.events[0] if state.events else {}
+    created_session = created.get("session") if isinstance(created, dict) else None
+    server_session_id = created_session.get("id") if isinstance(created_session, dict) else None
     result = {
         "ok": terminal_activity_ok
         and state.count("session.closed") > 0
@@ -1711,8 +1703,8 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         "input_transcription_ok": input_transcription_ok,
         "completed_response_ids": completed_response_ids,
         "response_timings": state.response_timing_summaries(),
-        "request_metrics": state.session_request_metrics(session_id=args.session_id),
-        "session_metrics": state.session_metric_summary(session_id=args.session_id),
+        "request_metrics": state.session_request_metrics(session_id=server_session_id),
+        "session_metrics": state.session_metric_summary(session_id=server_session_id),
         "lifecycle_counts_ok": lifecycle_counts_ok,
         "validation_mode": validation_mode,
         "scenario": scenario,
@@ -1773,7 +1765,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
-    parser.add_argument("--session-id", help="Use an explicit public session ID, including for close/reopen tests.")
     parser.add_argument("--input-wav", required=True)
     parser.add_argument("--ref-audio", help="Optional WAV used as the MiniCPM-o voice prompt.")
     parser.add_argument(

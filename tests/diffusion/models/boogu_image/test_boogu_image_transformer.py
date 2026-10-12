@@ -440,29 +440,86 @@ def test_transformer_rejects_prompt_tuning():
         BooguImageTransformer2DModel(od_config=_tiny_od_config(prompt_tuning_configs={"use_prompt_tuning": True}))
 
 
-def _native_to_checkpoint_name(name: str) -> str:
-    """Inverse of ``load_weights`` remapping: native param name -> diffusers name.
+_QKV_FANOUT = {
+    "to_qkv": ("to_q", "to_k", "to_v"),
+    "img_to_qkv": ("img_to_q", "img_to_k", "img_to_v"),
+    "instruct_to_qkv": ("instruct_to_q", "instruct_to_k", "instruct_to_v"),
+}
+
+
+def _native_to_checkpoint_weights(name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    """Inverse of ``load_weights`` remapping: native param -> diffusers weights.
+
+    The diffusers checkpoint stores fused projections as separate matrices, so a
+    single merged native param (QKV or FFN gate/up) fans out into several
+    checkpoint weights. Returns ``(diffusers_name, value)`` pairs whose values,
+    when fed through ``load_weights``, reassemble into the original ``param``.
 
     - ``.to_out.<suffix>`` -> ``.to_out.0.<suffix>`` (diffusers ModuleList wrap).
     - promoted joint-attention projections move back under ``.processor.``.
     """
+    q_size = NUM_HEADS * HEAD_DIM
+    kv_size = NUM_KV_HEADS * HEAD_DIM
+
+    # Fused QKV projections split back into per-matrix q/k/v weights.
+    for token, (q_name, k_name, v_name) in _QKV_FANOUT.items():
+        marker = f".{token}."
+        if marker in name:
+            q, k, v = param[:q_size], param[q_size : q_size + kv_size], param[q_size + kv_size :]
+            results = []
+            for sub_name, value in ((q_name, q), (k_name, k), (v_name, v)):
+                ckpt_name = name.replace(marker, f".{sub_name}.")
+                if token != "to_qkv":
+                    # Joint-attention projections live under `.processor.` upstream.
+                    ckpt_name = ckpt_name.replace(".img_instruct_attn.", ".img_instruct_attn.processor.")
+                results.append((ckpt_name, value))
+            return results
+
+    # Fused FFN gate/up splits into linear_1 (gate) / linear_3 (input).
+    if ".gate_up_proj." in name:
+        inner = param.shape[0] // 2
+        return [
+            (name.replace(".gate_up_proj.", ".linear_1."), param[:inner]),
+            (name.replace(".gate_up_proj.", ".linear_3."), param[inner:]),
+        ]
+
+    # Default: 1:1 with the existing diffusers name promotions.
     if ".to_out." in name:
         name = name.replace(".to_out.", ".to_out.0.")
-    for proj in (
-        "img_to_q",
-        "img_to_k",
-        "img_to_v",
-        "instruct_to_q",
-        "instruct_to_k",
-        "instruct_to_v",
-        "instruct_out",
-        "img_out",
-    ):
+    for proj in ("instruct_out", "img_out"):
         token = f".img_instruct_attn.{proj}."
         if token in name:
             name = name.replace(token, f".img_instruct_attn.processor.{proj}.")
             break
-    return name
+    return [(name, param)]
+
+
+def test_transformer_exposes_stacked_params_mapping():
+    """The packed -> sub-layer mapping must be discoverable from the module tree.
+
+    ``diffusion/lora/loader.py`` and the quantized weight loaders read
+    ``stacked_params_mapping`` off the model, so it has to exist before (and
+    independently of) ``load_weights``.
+    """
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _BOOGU_STACKED_PARAMS_MAPPING,
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+
+    assert tuple(model.stacked_params_mapping) == _BOOGU_STACKED_PARAMS_MAPPING
+    # A per-instance copy, so consumers cannot mutate the module constant.
+    assert model.stacked_params_mapping is not _BOOGU_STACKED_PARAMS_MAPPING
+
+    # Every entry is a (param, shard, shard_id) triple.
+    for param_name, shard_name, shard_id in model.stacked_params_mapping:
+        assert param_name.startswith(".") and shard_name.startswith(".")
+        assert shard_id in {"q", "k", "v", 0, 1}
+
+    # The mapping targets exactly the fused projections this port creates.
+    mapped_leaves = {param.strip(".").split(".")[-1] for param, _, _ in model.stacked_params_mapping}
+    assert mapped_leaves == {"to_qkv", "img_to_qkv", "instruct_to_qkv", "gate_up_proj"}
 
 
 def test_transformer_load_weights_round_trip():
@@ -473,24 +530,59 @@ def test_transformer_load_weights_round_trip():
     model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
     native_params = dict(model.named_parameters())
 
-    # Build synthetic diffusers-named weights (one per native parameter).
-    checkpoint_weights = {}
+    # Build synthetic diffusers-named weights. Fused native projections fan out
+    # into the separate matrices the diffusers checkpoint stores.
+    expected: dict[str, torch.Tensor] = {}
+    checkpoint_weights: dict[str, torch.Tensor] = {}
     for native_name, param in native_params.items():
-        checkpoint_weights[_native_to_checkpoint_name(native_name)] = torch.randn_like(param)
+        full = torch.randn_like(param)
+        expected[native_name] = full
+        for ckpt_name, value in _native_to_checkpoint_weights(native_name, full):
+            checkpoint_weights[ckpt_name] = value
 
-    # The remapping must be a bijection over the parameter set.
-    assert len(checkpoint_weights) == len(native_params)
+    # Every checkpoint name is unique; merged params fan out to >=1 weight.
+    assert len(checkpoint_weights) >= len(native_params)
 
     loaded = model.load_weights(list(checkpoint_weights.items()))
 
     # No missing / unexpected parameters.
     assert loaded == set(native_params.keys())
 
-    # Values landed on the right parameters (TP=1: weight_loader copies verbatim).
+    # Values landed on the right parameters (TP=1: weight_loader copies verbatim;
+    # fused shards are placed at their q/k/v / gate/up offsets).
     reloaded = dict(model.named_parameters())
     for native_name in native_params:
-        expected = checkpoint_weights[_native_to_checkpoint_name(native_name)]
-        assert torch.allclose(reloaded[native_name], expected)
+        assert torch.allclose(reloaded[native_name], expected[native_name])
+
+
+def test_transformer_load_weights_rejects_partial_fused_params():
+    """A fused parameter must not count as loaded until all its shards arrive.
+
+    The loader compares parameter *names*, so reporting ``to_qkv`` complete
+    after a single ``to_q`` would let a checkpoint carrying only ``to_q`` start
+    up with the ``k``/``v`` slices left uninitialized.
+    """
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    native_params = dict(model.named_parameters())
+
+    complete_name = "noise_refiner.0.attn.to_qkv.weight"
+    partial_name = "noise_refiner.0.feed_forward.gate_up_proj.weight"
+    assert complete_name in native_params
+    assert partial_name in native_params
+
+    weights = list(_native_to_checkpoint_weights(complete_name, native_params[complete_name]))
+    # Only the gate half of the FFN, so its fused parameter stays incomplete.
+    gate_ckpt, gate_value = _native_to_checkpoint_weights(partial_name, native_params[partial_name])[0]
+    weights.append((gate_ckpt, gate_value))
+
+    loaded = model.load_weights(weights)
+
+    assert complete_name in loaded
+    assert partial_name not in loaded
 
 
 def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
@@ -513,12 +605,15 @@ def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
     try:
         model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
         native_params = dict(model.named_parameters())
-        loaded_name = next(iter(native_params))
-        checkpoint_name = _native_to_checkpoint_name(loaded_name)
+        # A non-fused parameter, so one checkpoint entry loads it completely.
+        loaded_name = "x_embedder.weight"
+        assert loaded_name in native_params
+        (checkpoint_name, checkpoint_value), *_ = _native_to_checkpoint_weights(loaded_name, native_params[loaded_name])
+        checkpoint_value = torch.randn_like(checkpoint_value)
 
         loaded = model.load_weights(
             [
-                (checkpoint_name, torch.randn_like(native_params[loaded_name])),
+                (checkpoint_name, checkpoint_value),
                 ("unexpected.weight", torch.ones(1)),
             ]
         )
@@ -602,6 +697,116 @@ def test_transformer_forward_ti2i_shape():
 
     assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
     assert torch.isfinite(out).all()
+
+
+def test_transformer_forward_batch_invariant_to_partner_padding():
+    """Row A must not change when only row B's padded length changes.
+
+    Both rows carry a non-empty reference image (the TI2I/editing path), so
+    this exercises the reference-image refiner and the joint
+    instruction/reference/noise sequence concatenation and position
+    offsets -- not just the T2I path, which skips the reference refiner
+    entirely and would leave that concatenation logic uncovered. Real
+    attention masking, RoPE, and sequence concatenation are exercised
+    end-to-end through the actual (tiny) weights -- the mechanism the CPU
+    pipeline-level fakes in ``test_pipeline_boogu_image.py`` cannot reach,
+    since those stop at a fake encoder/transformer boundary. A's instruction
+    content, reference latent, and attention mask are held byte-identical
+    across runs; only B's padded region grows.
+    """
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+        BooguImageTransformer2DModel,
+    )
+
+    torch.manual_seed(0)
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    _randomize_parameters(model)
+    # _randomize_parameters' uniform(-0.02, 0.02) scale (tuned for the other
+    # shape/finite-value tests in this file) makes the instruction stream's
+    # contribution to the final output smaller than float32 rounding noise
+    # after 4 layers of untrained mixing with the image latents -- both the
+    # invariance check and the negative control below were passing/failing
+    # vacuously at that scale (diffs ~1e-6) until confirmed via a scaled-up
+    # diagnostic that masking is in fact respected; amplify locally so a real
+    # masking regression is distinguishable from noise.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.mul_(20.0)
+    model.eval()
+
+    batch_size = 2
+    in_channels = 4
+    latent_h = latent_w = 8
+    instruction_feat_dim = 32
+    a_len = 5
+
+    torch.manual_seed(0)
+    latents = torch.randn(batch_size, in_channels, latent_h, latent_w)
+    timestep = torch.full((batch_size,), 0.5)
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(model.axes_dim_rope, model.axes_lens, theta=10000)
+    a_content = torch.randn(a_len, instruction_feat_dim)
+    # Non-empty, fixed per-row reference latents route both rows through the
+    # TI2I reference-image refiner and the joint instruction/reference/noise
+    # concatenation, rather than the T2I path (which skips both entirely).
+    a_ref = torch.randn(in_channels, 6, 10)
+    b_ref = torch.randn(in_channels, 6, 10)
+    ref_image_hidden_states = [[a_ref], [b_ref]]
+
+    def run(b_len, a_mask_len=a_len, a_tail_value=0.0):
+        """``a_mask_len`` marks how many of row A's leading positions are valid.
+
+        Real usage always leaves it at ``a_len``; the negative control below
+        widens it to include A's own padding tail so that tail's content
+        starts to matter, proving the invariance check exercises real
+        masking rather than an architecture that ignores trailing positions
+        regardless of the mask.
+        """
+        width = max(a_len, b_len)
+        instruction_hidden_states = torch.zeros(batch_size, width, instruction_feat_dim)
+        instruction_hidden_states[0, :a_len] = a_content
+        if width > a_len:
+            instruction_hidden_states[0, a_len:] = a_tail_value
+        torch.manual_seed(100 + b_len)
+        instruction_hidden_states[1, :b_len] = torch.randn(b_len, instruction_feat_dim)
+
+        instruction_attention_mask = torch.zeros(batch_size, width, dtype=torch.bool)
+        instruction_attention_mask[0, :a_mask_len] = True
+        instruction_attention_mask[1, :b_len] = True
+
+        with torch.no_grad():
+            return model(
+                latents,
+                timestep,
+                instruction_hidden_states,
+                freqs_real,
+                instruction_attention_mask,
+                ref_image_hidden_states=ref_image_hidden_states,
+            )
+
+    out_short_b = run(b_len=3)
+    out_long_b = run(b_len=8)  # B now sits in a much wider padded batch than A.
+
+    torch.testing.assert_close(
+        out_short_b[0],
+        out_long_b[0],
+        rtol=1e-4,
+        atol=1e-4,
+        msg="row A changed when only B's padded length grew",
+    )
+
+    # Negative control: mark A's own padding tail "valid" (mask length ==
+    # full width) and show that what sits there now measurably changes A's
+    # output -- a magnitude-based outlier there did not (SDPA masking makes
+    # softmax weight on a correctly-excluded position exactly zero regardless
+    # of its magnitude), so this instead varies the tail's *content* under a
+    # broken mask and checks the two runs diverge.
+    width = max(a_len, 8)
+    tail_x = torch.randn(width - a_len, instruction_feat_dim)
+    tail_y = torch.randn(width - a_len, instruction_feat_dim)
+    out_broken_x = run(b_len=8, a_mask_len=width, a_tail_value=tail_x)
+    out_broken_y = run(b_len=8, a_mask_len=width, a_tail_value=tail_y)
+    assert not torch.allclose(out_broken_x[0], out_broken_y[0], rtol=1e-4, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------

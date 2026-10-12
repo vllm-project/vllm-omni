@@ -90,6 +90,21 @@ def test_hsdp_policy_shards_individual_preview_layers():
     assert not condition("pre_adapter", model.pre_adapter)
 
 
+def test_layerwise_offload_contract() -> None:
+    from vllm_omni.diffusion.offloader import get_blocks_from_dit
+
+    model = Magi2PreviewTransformer(_tiny_config(num_layers=2))
+
+    assert model._layerwise_offload_blocks_attrs == ["block"]
+    assert "block" in dict(model.named_children())
+    assert list(model.block) == list(model.block.layers)
+    assert model.layers is model.block.layers
+
+    attr_names, blocks = get_blocks_from_dit(model)
+    assert attr_names == ["block"]
+    assert blocks == list(model.block.layers)
+
+
 def test_data_proxy_keeps_output_layout_request_scoped() -> None:
     proxy = Magi2DataProxy(Magi2PreviewDataProxyConfig(time_channel_dim=0))
 

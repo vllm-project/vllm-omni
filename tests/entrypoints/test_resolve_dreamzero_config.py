@@ -32,15 +32,18 @@ def test_dreamzero_resolves_through_registry_with_model_defaults(monkeypatch):
         stage_overrides=None,
         strategy_config_path=None,
     )
-    engine_args = resolved.stage_configs[0].engine_args
+    stage = resolved.stage_configs[0]
 
     assert resolved.config_path is not None
     assert resolved.config_path.endswith("vllm_omni/deploy/dreamzero.yaml")
-    assert engine_args.model_class_name == "DreamZeroPipeline"
-    assert engine_args.model_config.policy_server_config.action_space == "joint_position"
+    assert stage.diffusion_config.model_class_name == "DreamZeroPipeline"
+    assert stage.diffusion_config.model_config["policy_server_config"]["action_space"] == "joint_position"
 
 
 def test_dreamzero_enrich_config_preserves_explicit_model_class_name(monkeypatch):
+    def _get_hf_config(path, _model):
+        return None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]}
+
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_hf_file_to_dict",
         lambda path, _model, **_kwargs: (

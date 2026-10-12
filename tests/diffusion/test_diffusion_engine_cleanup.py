@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -15,6 +15,7 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecu
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -31,6 +32,7 @@ def _make_request(request_id: str) -> OmniDiffusionRequest:
 
 def _make_engine() -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
     engine.scheduler.initialize(SimpleNamespace())
     engine.executor = SimpleNamespace(shutdown=Mock())
@@ -38,6 +40,7 @@ def _make_engine() -> DiffusionEngine:
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
     engine._closed = False
+    engine._shutting_down = False
     engine._shutdown_complete = False
     engine.abort_queue = queue.Queue()
     engine._loop_started = False
@@ -89,8 +92,35 @@ def test_emit_step_outputs_finalizes_finished_request_without_stream() -> None:
     assert engine.scheduler.get_request_state(request_id) is None
 
 
+@pytest.mark.parametrize("path", ["request", "step", "unscheduled_step"])
+def test_terminal_output_keeps_original_queue_when_request_id_is_reused(monkeypatch, path) -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    engine.execution_mode = (
+        DiffusionExecutionMode.REQUEST_BATCH if path == "request" else DiffusionExecutionMode.STEP_BATCH
+    )
+    request_id = engine._add_prepared_request(_make_request("reused"))
+    original_queue = engine._out_streams[request_id]
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+    finalize = engine._finalize_finished_request
+
+    def admit_after_finalization(*args, **kwargs):
+        output = finalize(*args, **kwargs)
+        engine._add_prepared_request(_make_request(request_id))
+        return output
+
+    monkeypatch.setattr(engine, "_finalize_finished_request", admit_after_finalization)
+    runner_output = RunnerOutput(request_id=request_id, step_index=None, finished=True, result=None)
+    engine._emit_outputs({request_id}, [] if path == "unscheduled_step" else [request_id], runner_output)
+
+    assert original_queue.qsize() == 1, "the old terminal output must not be sent to the new lifecycle"
+    assert original_queue.get_nowait().aborted
+    assert engine._out_streams[request_id].empty()
+    assert engine.scheduler.get_request_state(request_id).status == DiffusionRequestStatus.WAITING
+
+
 def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine, Mock]:
-    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine = _make_engine()
     engine.od_config = SimpleNamespace(diffusion_kv_mode=mode)
     cleanup = Mock()
     engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup)
@@ -99,8 +129,9 @@ def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine
 
 def test_paged_terminal_output_clears_worker_rows() -> None:
     engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
-    engine._finalize_finished_request = lambda request_id, *_args: request_id
-    engine._put_output = lambda *_args: None
+    for request_id in ("req-0", "req-1"):
+        engine.scheduler.add_request(_make_request(request_id))
+    engine.scheduler.finish_requests(["req-0", "req-1"], DiffusionRequestStatus.FINISHED_COMPLETED)
 
     engine._emit_finished_outputs({"req-0", "req-1"})
 
@@ -123,9 +154,8 @@ def test_paged_abort_clears_worker_rows_before_scheduler_free() -> None:
 
 def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
     engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.DENSE_LEGACY)
-    engine._finalize_finished_request = lambda request_id, *_args: request_id
-    engine._put_output = lambda *_args: None
-    engine.scheduler = SimpleNamespace(get_request_state=lambda _request_id: None)
+    engine.scheduler.add_request(_make_request("req-0"))
+    engine.scheduler.finish_requests("req-0", DiffusionRequestStatus.FINISHED_COMPLETED)
 
     engine._emit_finished_outputs({"req-0"})
     engine._abort_requests(["req-idle"])
@@ -379,3 +409,120 @@ def test_close_defers_resource_shutdown_until_worker_thread_stops() -> None:
     engine.executor.shutdown.assert_called_once()
     assert engine._shutdown_complete is True
     assert engine._loop_started is False
+
+
+def test_fail_engine_does_not_reenter_when_executor_shutdown_fails() -> None:
+    engine = _make_engine()
+    shutdown_error = RuntimeError("worker shutdown failed")
+    engine.executor.shutdown.side_effect = shutdown_error
+    engine.scheduler.close = Mock()
+    engine._fail_pending_rpcs = Mock()
+
+    with pytest.raises(RuntimeError, match="worker shutdown failed"):
+        engine._fail_engine(RuntimeError("engine failed"))
+
+    engine._fail_engine(RuntimeError("follow-up failure"))
+
+    engine.executor.shutdown.assert_called_once_with()
+    engine.scheduler.close.assert_not_called()
+    assert engine._closed is True
+    assert engine._shutting_down is True
+    assert engine._shutdown_complete is False
+
+
+def test_finalize_aborted_request_drops_pending_async_output() -> None:
+    """An aborted request with a pending async output must be drained (#6413).
+
+    The aborted branch of _finalize_finished_request returns before the
+    async_output_id branch, so without draining, the worker's late OUTPUT_READY
+    is cached in the executor's _completed_outputs forever. The engine must tell
+    the executor to drop that output id.
+    """
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-async"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    runner_output = SimpleNamespace(result=None, async_output_id="aid-async-1")
+    output = engine._finalize_finished_request(request_id, runner_output)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_called_once_with("aid-async-1")
+
+
+def test_finalize_aborted_request_without_async_output_skips_drop() -> None:
+    """No async output pending -> nothing to drop; drop_output not called."""
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-plain"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    output = engine._finalize_finished_request(request_id)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_not_called()
+
+
+@pytest.mark.parametrize("scheduler_fails", [False, True])
+def test_fail_engine_releases_cancellation_signals_after_workers_stop(scheduler_fails):
+    from multiprocessing.shared_memory import SharedMemory
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
+
+    engine = _make_engine()
+    engine._fail_pending_rpcs = Mock()
+    registry = RequestCancellationRegistry()
+    engine._request_cancellations = registry
+    name = registry.create("running")
+
+    def shutdown():
+        # Cancellation is visible before shutdown, and late readers can attach.
+        reader = SharedMemory(name=name)
+        try:
+            assert reader.buf[0] == 1
+        finally:
+            reader.close()
+
+    engine.executor.shutdown.side_effect = shutdown
+    engine.scheduler.close = Mock(side_effect=RuntimeError("scheduler cleanup failed") if scheduler_fails else None)
+    try:
+        if scheduler_fails:
+            with pytest.raises(RuntimeError, match="scheduler cleanup failed"):
+                engine._fail_engine(RuntimeError("engine failed"))
+        else:
+            engine._fail_engine(RuntimeError("engine failed"))
+            engine.close()
+            engine.executor.shutdown.assert_called_once_with()
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+        assert not registry._signals
+    finally:
+        registry.close()
+
+
+def test_close_retains_cancellation_signal_until_stuck_worker_stops():
+    from multiprocessing.shared_memory import SharedMemory
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
+
+    engine = _make_engine()
+    registry = RequestCancellationRegistry()
+    engine._request_cancellations = registry
+    name = registry.create("running")
+    engine.worker_thread = Mock()
+    engine.worker_thread.is_alive.side_effect = [True, True, False, False]
+    try:
+        engine.close()
+        engine.executor.shutdown.assert_not_called()
+        reader = SharedMemory(name=name)
+        try:
+            assert reader.buf[0] == 1
+        finally:
+            reader.close()
+        engine.close()
+        engine.executor.shutdown.assert_called_once_with()
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+        assert not registry._signals
+    finally:
+        registry.close()

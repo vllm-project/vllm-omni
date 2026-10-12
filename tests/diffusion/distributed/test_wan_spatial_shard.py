@@ -356,6 +356,94 @@ def test_attention_wrapper_rejects_spatial_extent_change(monkeypatch: pytest.Mon
         wan_spatial_shard._SPATIAL_SHARD_CONTEXT.reset(token)
 
 
+def _reference_conv_input(conv, x, cache_x):
+    """The conv input the previous implementation built: cat, F.pad, then halo_exchange."""
+    padding = list(conv._padding)
+    if cache_x is not None and padding[4] > 0:
+        x = torch.cat([cache_x, x], dim=2)
+        padding[4] -= cache_x.shape[2]
+    x = torch.nn.functional.pad(x, padding)
+    x_padded, _, _ = wan_spatial_shard.halo_exchange(
+        x, group=object(), halo_size=conv.halo_size, split_dim=conv.split_dim
+    )
+    return x_padded, x.shape[conv.split_tensor_dim]
+
+
+def _dist_conv(split_dim, kernel=(3, 3, 3), padding=(1, 1, 1)):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    torch.manual_seed(0)
+    source = WanCausalConv3d(3, 4, kernel, padding=padding)
+    return source, wan_spatial_shard.WanDistCausalConv3d(source, object(), split_dim=split_dim)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("split_dim", ["width", "height"])
+@pytest.mark.parametrize("with_cache", [False, True])
+def test_single_pass_conv_input_matches_cat_pad_halo_on_one_rank(monkeypatch, split_dim, with_cache):
+    """One rank, halo-bearing kernel: same bytes as the previous cat -> F.pad -> halo_exchange path."""
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 1))
+    _, conv = _dist_conv(split_dim)
+    x = torch.randn(1, 3, 2, 6, 8)
+    cache_x = torch.randn(1, 3, 2, 6, 8) if with_cache else None
+
+    expected, expected_extent = _reference_conv_input(conv, x, cache_x)
+    got, got_extent = conv._assemble_input(x, cache_x)
+
+    assert got.shape == expected.shape and got_extent == expected_extent
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_single_pass_conv_rejects_cache_longer_than_causal_padding():
+    _, conv = _dist_conv("width")
+    with pytest.raises(AssertionError, match="temporal cache exceeds"):
+        conv._assemble_input(torch.randn(1, 3, 2, 6, 8), torch.randn(1, 3, 3, 6, 8))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("split_dim", ["width", "height"])
+def test_single_pass_conv_without_a_halo_matches_the_stock_causal_conv(monkeypatch, split_dim):
+    """A kernel with no spatial extent along the split (the temporal conv) needs no halo and equals the stock conv."""
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 1))
+    source, conv = _dist_conv(split_dim, kernel=(3, 1, 1), padding=(1, 0, 0))
+    x = torch.randn(1, 3, 2, 6, 8)
+    cache_x = torch.randn(1, 3, 2, 6, 8)
+
+    assert torch.equal(conv(x, cache_x), source(x, cache_x))
+    assert torch.equal(conv(x, None), source(x, None))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("split_dim", ["width", "height"])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("kernel,padding", [((3, 3, 3), (1, 1, 1)), ((3, 1, 1), (0, 0, 0))])
+def test_single_pass_conv_input_matches_cat_pad_halo_on_two_ranks(monkeypatch, split_dim, rank, kernel, padding):
+    """Same bytes as cat -> F.pad -> halo_exchange, halos included, on either rank of a pair."""
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (rank, 2))
+
+    def fake_p2p(*, rank, world_size, group, top_row_ref, bottom_row_ref, recv_top_buf, recv_bottom_buf):
+        # A neighbour's halo is whatever it sent; stand in with a marker derived from our own edge so
+        # both the reference and the single-pass path see the same exchange. Global edges stay zero.
+        recv_top_buf.copy_(top_row_ref * 0 + 7.0) if rank > 0 else recv_top_buf.zero_()
+        recv_bottom_buf.copy_(bottom_row_ref * 0 + 9.0) if rank < world_size - 1 else recv_bottom_buf.zero_()
+
+    monkeypatch.setattr(wan_spatial_shard, "_halo_exchange_p2p", fake_p2p)
+    _, conv = _dist_conv(split_dim, kernel=kernel, padding=padding)
+    x = torch.randn(1, 3, 1, 6, 8)
+    cache_x = torch.randn(1, 3, 2, 6, 8)
+
+    expected, expected_extent = _reference_conv_input(conv, x, cache_x)
+    got, got_extent = conv._assemble_input(x, cache_x)
+
+    assert got.shape == expected.shape and got_extent == expected_extent
+    assert torch.equal(got, expected)
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_halo_exchange_single_rank_noop(monkeypatch: pytest.MonkeyPatch):
@@ -403,6 +491,84 @@ def test_dist_zero_pad_only_applies_global_width_edges(monkeypatch: pytest.Monke
     last_rank_pad = wan_spatial_shard.WanDistZeroPad2d((1, 1, 0, 0), group=object(), split_dim="width")
     last = last_rank_pad(x)
     assert last.shape == (1, 1, 2, 3)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+class _PlainDecoder(torch.nn.Module):
+    """A decoder with nothing to patch, so the install only wraps ``forward``."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
+        self.calls.append({"feat_cache": feat_cache, "feat_idx": feat_idx, "first_chunk": first_chunk})
+        return x
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size, dst", [(4, -1), (4, 4), (4, 5), (1, 1), (4, 1.5)])
+def test_install_rejects_invalid_destination_before_mutating_decoder(monkeypatch, world_size, dst):
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, world_size))
+    vae = SimpleNamespace(decoder=torch.nn.Identity())
+    original_forward = vae.decoder.forward
+
+    def unexpected_patch(*args, **kwargs):
+        pytest.fail("invalid destination must fail before patching modules")
+
+    monkeypatch.setattr(wan_spatial_shard, "_patch_decoder_modules", unexpected_patch)
+    with pytest.raises(ValueError, match="dst must be None or an integer"):
+        wan_spatial_shard.install_wan_spatial_shard_decode(vae, object(), dst=dst)
+    assert vae.decoder.forward == original_forward
+    assert not getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False)
+
+
+def _install_on_plain_decoder(monkeypatch: pytest.MonkeyPatch, *, dst):
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (1, 2))
+    monkeypatch.setattr(
+        wan_spatial_shard,
+        "split_for_parallel_decode",
+        lambda x, *, upsample_count, split_dim, group: (x, x.shape[wan_spatial_shard._spatial_dim(split_dim)]),
+    )
+    gathers: list[dict] = []
+
+    def gather(x, *, expected_extent, split_dim, group, dst=None):
+        gathers.append({"expected_extent": expected_extent, "split_dim": split_dim, "dst": dst})
+        return x
+
+    monkeypatch.setattr(wan_spatial_shard, "gather_and_trim_extent", gather)
+    vae = SimpleNamespace(decoder=_PlainDecoder())
+    wan_spatial_shard.install_wan_spatial_shard_decode(vae, object(), split_dim="width", dst=dst)
+    return vae, gathers
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("dst", [0, 1, None])
+def test_install_passes_the_assembling_rank_through_to_the_gather(monkeypatch: pytest.MonkeyPatch, dst):
+    vae, gathers = _install_on_plain_decoder(monkeypatch, dst=dst)
+    cache = [None]
+
+    out = vae.decoder(torch.zeros(1, 3, 1, 4, 6), feat_cache=cache, feat_idx=[0], first_chunk=True)
+
+    assert out.shape == (1, 3, 1, 4, 6)
+    assert gathers == [{"expected_extent": 6, "split_dim": "width", "dst": dst}]
+    # The streaming arguments reach the wrapped decoder untouched.
+    assert vae.decoder.calls == [{"feat_cache": cache, "feat_idx": [0], "first_chunk": True}]
+    assert vae._vllm_omni_wan_spatial_shard_dst == dst
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_install_refuses_to_change_the_assembling_rank(monkeypatch: pytest.MonkeyPatch):
+    vae, _ = _install_on_plain_decoder(monkeypatch, dst=None)
+
+    # Same settings again: a no-op, as before.
+    wan_spatial_shard.install_wan_spatial_shard_decode(vae, object(), split_dim="width", dst=None)
+    with pytest.raises(ValueError, match="already patched to assemble on None"):
+        wan_spatial_shard.install_wan_spatial_shard_decode(vae, object(), split_dim="width", dst=0)
 
 
 @pytest.mark.core_model
@@ -536,6 +702,105 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
         destroy_model_parallel()
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+_STREAMING_SHARD_CHUNKS = 3
+
+
+def _streaming_shard_worker(rank: int, return_dict, master_port: str) -> None:
+    """Sharded streaming decode with every rank keeping the frame, against an unsharded streaming reference.
+
+    Two sessions are interleaved chunk by chunk, so the per-session temporal cache
+    and the halo exchange are exercised across successive calls, then one session
+    is reset and must reproduce its opening chunk. Every rank checks every chunk.
+    """
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        destroy_model_parallel,
+        get_sp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = master_port
+    device = current_omni_platform.get_torch_device(rank)
+    current_omni_platform.set_device(device)
+    dtype = torch.float32
+    backend = current_omni_platform.dist_backend
+    init_distributed_environment(world_size=_SPATIAL_SHARD_WORLD_SIZE, rank=rank, local_rank=rank, backend=backend)
+    initialize_model_parallel(
+        sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend
+    )
+    # VLLM_OMNI_TEST_WAN_VAE may point at a local diffusers checkpoint (with or
+    # without a ``vae`` subfolder) for machines without hub access.
+    model = os.environ.get("VLLM_OMNI_TEST_WAN_VAE", _SPATIAL_SHARD_MODEL)
+    local_vae_only = os.path.isdir(model) and not os.path.isdir(os.path.join(model, "vae"))
+    load = {"torch_dtype": dtype} if local_vae_only else {"subfolder": _SPATIAL_SHARD_SUBFOLDER, "torch_dtype": dtype}
+    try:
+        reference_vae = DistributedAutoencoderKLWan.from_pretrained(model, **load).to(device=device, dtype=dtype).eval()
+        sharded_vae = DistributedAutoencoderKLWan.from_pretrained(model, **load).to(device=device, dtype=dtype).eval()
+        wan_spatial_shard.install_wan_spatial_shard_decode(
+            sharded_vae, get_sp_group().device_group, split_dim="width", dst=None
+        )
+        reference = WanStreamingDecoder(reference_vae, bytes_per_pixel_fp32=1.0)
+        sharded = WanStreamingDecoder(sharded_vae, bytes_per_pixel_fp32=1.0)
+
+        generator = torch.Generator(device=device).manual_seed(0)
+        # Width 104 latents = 832 px: not divisible by two ranks' halo-padded shards without padding.
+        shape = (1, reference_vae.config.z_dim, 1, _SPATIAL_SHARD_LATENT_HEIGHT, _SPATIAL_SHARD_LATENT_WIDTH)
+        chunks = {
+            name: [
+                torch.randn(shape, generator=generator, device=device, dtype=dtype)
+                for _ in range(_STREAMING_SHARD_CHUNKS)
+            ]
+            for name in ("a", "b")
+        }
+        max_diff = 0.0
+        with torch.inference_mode():
+            ref_states = {name: reference.new_decode_state(name) for name in chunks}
+            shard_states = {name: sharded.new_decode_state(name) for name in chunks}
+            for index in range(_STREAMING_SHARD_CHUNKS):
+                for name in ("a", "b"):
+                    expected = reference.decode_chunk(chunks[name][index], ref_states[name]).float()
+                    got = sharded.decode_chunk(chunks[name][index], shard_states[name]).float()
+                    if got.shape != expected.shape:
+                        raise AssertionError(
+                            f"rank {rank} {name}[{index}]: {tuple(got.shape)} != {tuple(expected.shape)}"
+                        )
+                    max_diff = max(max_diff, (got - expected).abs().max().item())
+            # Reset session a: a fresh state must reproduce its opening chunk, on this rank too.
+            shard_states["a"].release()
+            ref_states["a"].release()
+            shard_states["a"] = sharded.new_decode_state("a")
+            ref_states["a"] = reference.new_decode_state("a")
+            expected = reference.decode_chunk(chunks["a"][0], ref_states["a"]).float()
+            got = sharded.decode_chunk(chunks["a"][0], shard_states["a"]).float()
+            max_diff = max(max_diff, (got - expected).abs().max().item())
+        return_dict[f"max_abs_diff_rank{rank}"] = max_diff
+        return_dict[f"shape_rank{rank}"] = tuple(got.shape)
+    finally:
+        destroy_model_parallel()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=_SPATIAL_SHARD_WORLD_SIZE)
+def test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank():
+    manager = mp.get_context("spawn").Manager()
+    return_dict = manager.dict()
+    mp.spawn(_streaming_shard_worker, args=(return_dict, "29510"), nprocs=_SPATIAL_SHARD_WORLD_SIZE, join=True)
+
+    for rank in range(_SPATIAL_SHARD_WORLD_SIZE):
+        assert f"max_abs_diff_rank{rank}" in return_dict, f"rank {rank} did not report"
+        diff = return_dict[f"max_abs_diff_rank{rank}"]
+        shape = return_dict[f"shape_rank{rank}"]
+        print(f"streaming shard rank {rank}: max_abs_diff={diff:.6e} shape={shape}")
+        assert shape[-1] == _SPATIAL_SHARD_LATENT_WIDTH * 8 and shape[-2] == _SPATIAL_SHARD_LATENT_HEIGHT * 8
+        assert diff <= _SPATIAL_SHARD_TOLERANCE, f"rank {rank}: {diff} exceeds {_SPATIAL_SHARD_TOLERANCE}"
 
 
 @pytest.mark.full_model

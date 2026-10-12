@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
     OmniCoordClientForHub,
@@ -22,6 +23,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -97,14 +99,21 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # A replica that dies mid-release never answers; without a bound its background release never finishes.
+    RELEASE_RPC_TIMEOUT_S: float = 5.0
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
     _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
         {
             "pause_scheduler",
             "resume_scheduler",
             "sleep",
+            "release_kv_cache_memory",
             "wake_up",
+            "reset_prefix_cache",
+            "reset_encoder_cache",
+            "reset_mm_cache",
         }
     )
 
@@ -129,6 +138,10 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        self.collect_stage_metrics = True
+        self._has_chunk_transfer_adapter = bool(
+            getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
+        )
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
@@ -621,12 +634,7 @@ class StagePool:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
-
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
-        output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
-        non_empty_first_output_ts = (
-            self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
-        )
         native_text_metrics = {}
         if request_id:
             pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
@@ -646,6 +654,47 @@ class StagePool:
             max(int(native_generation_tokens), 0)
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
             else count_tokens_from_outputs(request_outputs)
+        )
+        num_tokens_in = 0
+        if self.stage_id == 0:
+            for ro in request_outputs:
+                ptids = getattr(ro, "prompt_token_ids", None)
+                if ptids is not None:
+                    num_tokens_in += len(ptids)
+
+        metrics = self._replica_metrics[replica_id]
+        metrics.batch_seq += 1
+        batch_id = metrics.batch_seq
+        metrics.agg_total_tokens += num_tokens_out
+        metrics.agg_total_gen_time_ms += stage_gen_time_ms
+
+        # Preserve required fields and completion/usage without optional diagnostics.
+        stage_metrics = StageRequestMetrics(
+            num_tokens_in=num_tokens_in,
+            num_tokens_out=num_tokens_out,
+            finish_reason=finish_reason,
+            replica_id=replica_id,
+            batch_id=batch_id,
+            # This event summarizes one completed request. Execution batching
+            # happens inside the model runner and is not observable here.
+            batch_size=1,
+            stage_gen_time_ms=stage_gen_time_ms,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(
+                total_token=metrics.agg_total_tokens,
+                total_gen_time_ms=metrics.agg_total_gen_time_ms,
+            ),
+        )
+
+        # Lightweight path which skips optional telemetry
+        if not self.collect_stage_metrics:
+            return stage_metrics
+
+        output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
+        non_empty_first_output_ts = (
+            self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
         )
         output_unit_type = self._infer_output_unit_type(request_outputs, token_count=num_tokens_out)
         output_unit_count = self._count_output_units(
@@ -688,53 +737,23 @@ class StagePool:
         inter_output_latency_ms = (
             sum(inter_output_latencies_ms) / float(len(inter_output_latencies_ms)) if inter_output_latencies_ms else 0.0
         )
-        num_tokens_in = 0
-        if self.stage_id == 0:
-            for ro in request_outputs:
-                ptids = getattr(ro, "prompt_token_ids", None)
-                if ptids is not None:
-                    num_tokens_in += len(ptids)
-
-        metrics = self._replica_metrics[replica_id]
-        metrics.batch_seq += 1
-        batch_id = metrics.batch_seq
-        metrics.agg_total_tokens += num_tokens_out
-        metrics.agg_total_gen_time_ms += stage_gen_time_ms
-
-        return StageRequestMetrics(
-            num_tokens_in=num_tokens_in,
-            num_tokens_out=num_tokens_out,
-            stage_gen_time_ms=stage_gen_time_ms,
-            batch_id=batch_id,
-            # This event summarizes one completed request. Execution batching
-            # happens inside the model runner and is not observable here.
-            batch_size=1,
-            replica_id=replica_id,
-            finish_reason=finish_reason,
-            rx_decode_time_ms=0.0,
-            rx_transfer_bytes=0,
-            rx_in_flight_time_ms=0.0,
-            stage_stats=StageStats(
-                total_token=metrics.agg_total_tokens,
-                total_gen_time_ms=metrics.agg_total_gen_time_ms,
-            ),
-            audio_generated_frames=audio_generated_frames,
-            audio_sample_rate=audio_sample_rate,
-            audio_duration_s=audio_duration_s,
-            image_pixels=image_pixels,
-            num_inference_steps=num_inference_steps,
-            output_unit_type=output_unit_type,
-            output_unit_count=output_unit_count,
-            serving_time_to_first_output_ms=serving_time_to_first_output_ms,
-            image_time_to_first_output_ms=image_time_to_first_output_ms,
-            time_per_output_unit_ms=time_per_output_unit_ms,
-            inter_output_latency_ms=inter_output_latency_ms,
-            inter_output_latencies_ms=inter_output_latencies_ms,
-            vllm_ttft_ms=float(native_text_metrics.get("vllm_ttft_ms") or 0.0),
-            vllm_tpot_ms=float(native_text_metrics.get("vllm_tpot_ms") or 0.0),
-            vllm_itl_ms=float(native_text_metrics.get("vllm_itl_ms") or 0.0),
-            vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),
-        )
+        stage_metrics.audio_generated_frames = audio_generated_frames
+        stage_metrics.audio_sample_rate = audio_sample_rate
+        stage_metrics.audio_duration_s = audio_duration_s
+        stage_metrics.image_pixels = image_pixels
+        stage_metrics.num_inference_steps = num_inference_steps
+        stage_metrics.output_unit_type = output_unit_type
+        stage_metrics.output_unit_count = output_unit_count
+        stage_metrics.serving_time_to_first_output_ms = serving_time_to_first_output_ms
+        stage_metrics.image_time_to_first_output_ms = image_time_to_first_output_ms
+        stage_metrics.time_per_output_unit_ms = time_per_output_unit_ms
+        stage_metrics.inter_output_latency_ms = inter_output_latency_ms
+        stage_metrics.inter_output_latencies_ms = inter_output_latencies_ms
+        stage_metrics.vllm_ttft_ms = float(native_text_metrics.get("vllm_ttft_ms") or 0.0)
+        stage_metrics.vllm_tpot_ms = float(native_text_metrics.get("vllm_tpot_ms") or 0.0)
+        stage_metrics.vllm_itl_ms = float(native_text_metrics.get("vllm_itl_ms") or 0.0)
+        stage_metrics.vllm_itls_ms = list(native_text_metrics.get("vllm_itls_ms") or [])
+        return stage_metrics
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
         final_output_type = getattr(self.stage_client, "final_output_type", None)
@@ -953,6 +972,8 @@ class StagePool:
 
     def record_output_timestamps(self, request_outputs: list[Any], *, output_ts: float | None = None) -> None:
         """Record all output timestamps and the first non-empty output timestamp."""
+        if not self.collect_stage_metrics:
+            return
         output_ts = _time.time() if output_ts is None else output_ts
         for request_output in request_outputs:
             request_id = getattr(request_output, "request_id", None)
@@ -996,6 +1017,9 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
+            payload_sender_info = getattr(request, "payload_sender_info", None)
+            if payload_sender_info is not None:
+                submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
@@ -1048,8 +1072,10 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
+        submit_kwargs = submit_kwargs or {}
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
@@ -1067,7 +1093,7 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
@@ -1080,7 +1106,7 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request)
+                await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
@@ -1136,7 +1162,29 @@ class StagePool:
         # gauges for that interval.
         if not outputs.outputs and outputs.scheduler_stats is None and not outputs.finished_requests:
             return None
+        self._rehydrate_pooling_output_payloads(outputs)
         return outputs
+
+    @staticmethod
+    def _rehydrate_pooling_output_payloads(outputs: EngineCoreOutputs) -> None:
+        """Restore dict-shaped pooling_output from its bytes carrier (MR V2).
+
+        vLLM decodes EngineCoreOutput.pooling_output as a torch.Tensor, so MR
+        V2 runners ship the per-request dict handoff via ``pooling_output_payload``
+        with ``pooling_output=None``. Decode it back here so downstream stage-input
+        processors see the same ``pooling_output`` shape as the legacy runner.
+        """
+        for eco in outputs.outputs:
+            payload = getattr(eco, "pooling_output_payload", None)
+            if payload is None:
+                continue
+            if getattr(eco, "pooling_output", None) is None:
+                # deserialize_* returns the nested OmniPayload form; the producer
+                # serialized a flat (dotted-key) pooler dict, and downstream
+                # consumers (e.g. talker2code2wav_full_payload) read flat keys like
+                # "codes.audio". Re-flatten to restore the exact on-wire shape.
+                eco.pooling_output = flatten_payload(deserialize_additional_information(payload))
+            eco.pooling_output_payload = None
 
     async def process_llm_raw_outputs(
         self,
@@ -1271,6 +1319,28 @@ class StagePool:
 
         return abort_outputs
 
+    async def release_request_resources(self, request_ids: list[str]) -> None:
+        """Ask every live replica to drop transfer resources for *request_ids*.
+
+        Broadcast rather than binding-routed: the orchestrator releases route
+        bindings as part of the same teardown, so a binding lookup here would
+        race it. The engine-core handler is idempotent for unknown ids.
+        """
+        if not request_ids or not self._has_chunk_transfer_adapter:
+            return
+        ids = list(request_ids)
+
+        async def release(replica_id: int, call: Any) -> None:
+            try:
+                await asyncio.wait_for(call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S)
+            except Exception as e:
+                logger.warning(
+                    "[StagePool-%s] release_request_resources on replica %s failed: %r", self.stage_id, replica_id, e
+                )
+
+        calls = [(i, getattr(self.clients[i], "call_utility_async", None)) for i in self.live_replica_ids()]
+        await asyncio.gather(*(release(i, call) for i, call in calls if call is not None))
+
     async def collective_rpc(
         self,
         replica_id: int,
@@ -1301,6 +1371,8 @@ class StagePool:
                     if timeout is not None:
                         return await asyncio.wait_for(result, timeout=timeout)
                     return await result
+                if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory":
+                    return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
 
             return await client.collective_rpc_async(
                 method=method,
@@ -1315,7 +1387,7 @@ class StagePool:
                 replica_id,
                 method,
             )
-            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS and method not in self._CACHE_RESET_METHODS:
                 raise
             if isinstance(exc, TimeoutError):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
