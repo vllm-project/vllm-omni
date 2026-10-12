@@ -36,6 +36,11 @@ metadata query per scheduler poll (10ms by default), which prevents an unavailab
 producer from blocking unrelated requests. The regular transfer-completion handshake
 keeps the configured transfer timeout.
 
+Numeric payload keys of one request/stage prefix share a private producer agent
+while pending. CUDA preparation is synchronized before publication because native
+READs do not inherit PyTorch stream dependencies. A connector may retain one
+unregistered agent after normal completion; cancelled agents are retired.
+
 ## Installation
 
 CUDA hosts can install the published wheel:
@@ -102,11 +107,10 @@ Parameters:
   nobody has claimed. An internal reaper releases only unclaimed registrations.
   `VLLM_OMNI_NIXL_LEASE_S` overrides it.
 - `transfer_timeout_s`: how long a `get()` waits for its `READ` to complete
-  (default 300). NIXL 1.3 has no transfer cancellation API, so a timed-out transfer's
-  buffers and registrations remain owned by the connector until NIXL reports a
-  terminal state. `close()` polls remaining transfers once and returns without
-  releasing active DMA resources. A serialized background closer automatically
-  finishes cleanup after completion; no second call is required.
+  (default 300). A timeout does not prove DMA has stopped. Buffers and registrations
+  remain owned until native handles can be released. `close()` polls remaining
+  transfers once and returns without releasing active DMA resources. A serialized
+  background closer retries cleanup; no second call is required.
   `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
 
 ### Diffusion worker integration
@@ -147,6 +151,9 @@ The nonzero-subgroup regression covers both sender and receiver behavior.
 Claims and expiry use the same lock. Completion identifies both a payload
 generation and a unique READ claim; duplicate or stale ACKs cannot release a
 different reader or replacement payload. Replacing a claimed key is rejected.
+The final ACK retains its claim and source ownership until deregistration succeeds.
+Failed release unpublishes metadata; replaying the same ACK retries remaining
+registrations without accepting another READ or releasing a replacement generation.
 Terminal errors also release claims; timeout, unknown status, and active sibling
 transfers retain the complete destination bundle and source claim until terminal.
 Zero-element tensors retain their shape/dtype/skeleton positions but never create
@@ -159,21 +166,49 @@ distinct claims. Callers retry on the same thread and call `abandon_get()` when
 giving up. Synchronous stage payload receive does this automatically. Background
 recovery reacquires the same claim solely to acknowledge it, without issuing a
 READ. Lost completion ACKs are retried against the exact payload generation.
-A permanently unreachable or dead consumer can still retain a claim indefinitely.
-NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
-`cleanup()` frees those allocations. Producer `close()` rejects new work and
-retains its agent, listener and claimed allocations; the background closer finishes
-teardown after claims drain. Permanently abandoned claims remain until process
-exit. A consumer with unfinished local transfers likewise retains a strong reference
-to its connector, agent, tensors and registrations after `close()` returns. Its
-background closer polls and releases resources only after a terminal state;
-permanently stuck transfers retain resources until process exit. Closing connectors
-reject new work and report unhealthy. This avoids an unbounded transfer-polling loop
-in shutdown without freeing DMA-owned memory. Only trusted
+Neither TTL nor ordinary `cleanup(key)` frees a claimed source allocation.
+After publication has stopped, `cleanup_prefix()` removes that prefix's metadata
+and destroys its private native contexts before releasing source tensors. This
+also handles a lost remote READ owner without resetting another request's agent.
+Retirement detaches the contexts under the state lock, destroys them outside that
+lock while retaining source storage, then finalizes ownership under the lock.
+Concurrent cleanup waits for the existing operation; key reuse is rejected until
+retirement finishes. Independent publication, GET and ACK can continue.
+Producer `close()` applies the same ordering to all pending contexts.
+`wait_for_cleanup()` additionally waits for matching local READs and deferred
+claims; a deadline reports failure while retaining resources still owned locally.
+Native context destruction is synchronous and has no universal hard deadline.
+
+The lease reaper owns expiry cleanup. A failed expired release retains its source
+ownership, keeps metadata unpublished and retries after a 100 ms backoff. Failure
+of one payload does not stop the reaper or reject another request's publication.
+
+Receive cleanup releases handles, descriptor lists, remote agents and registrations
+in that order before acknowledging the source. Failed releases retain the remaining
+bundle for retry. A consumer with unfinished local transfers retains a strong
+reference to its connector and resources after `close()` returns. Permanently
+stuck local transfers can retain resources until process exit. Closing connectors
+reject new work and report unhealthy. Only trusted
 peers may access this unauthenticated control plane. Both endpoints must use the
 claim-aware protocol; rolling compatibility with older GET_META clients is not
 provided. Legacy externally-owned metadata without a generation is accepted only
 under the caller's lifetime guarantee, not managed as a leased allocation here.
+
+Private contexts trade resource isolation for agent creation and backend thread
+cost. Device synchronization can reduce overlap with other streams. The
+[routing RFC's transport section](https://github.com/vllm-project/vllm-omni/issues/8740)
+records measured costs and their limits; it does not establish general performance
+parity. Native ownership validation covers NIXL 1.5 with UCX TCP/cuda_copy. Other
+backend and SDK combinations require validation.
+
+An [independent H100 review](https://github.com/vllm-project/vllm-omni/pull/8744#pullrequestreview-5483707044)
+of commit `7ec25991` measured publication of ready 32 KiB tensors with 64 retained
+prefixes: put P95 increased from 0.238 ms on the base to 1554.224 ms, with 315
+additional threads. This fixture performs no payload READ or model inference.
+The lifecycle fixes retain the per-prefix context policy and device-wide CUDA
+readiness fence; they do not establish that this publication overhead is resolved.
+Payloads can be written on non-current streams, so narrowing that fence requires
+an explicit producer-readiness contract rather than assuming the current stream.
 
 ## Validation
 
@@ -190,5 +225,17 @@ checks mixed CPU/GPU tensor leaves from an `OmniPayloadStruct`, sends `XFER_DONE
 and verifies that producer registrations are released. This validates same-host,
 cross-GPU operation. Inter-node UCX transport is supported by the design but was not
 validated by this test.
+
+One-GPU regressions inject transient/persistent deregistration failures into the
+real SDK and gate native-owner destruction to check independent request progress.
+The two-GPU live-READ test requires an actual `PROC` observation immediately before
+prefix cleanup, then verifies survivor delivery, key reuse and resource release.
+If the READ already completed, the test skips rather than claiming active-READ
+cancellation coverage. These tests validate the selected local transport; cross-node
+RDMA cancellation needs a separate run with the revised source.
+
+Active READ retirement with NIXL 1.5 / UCX 1.23 over TCP has emitted UCX
+`ucp_requests` pool warnings. Released connector records and successful survivor
+READs do not establish complete native backend cleanup; this remains a validation gap.
 
 For more details, refer to the [NIXL repository](https://github.com/ai-dynamo/nixl).
