@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.helpers.omni_scheduler import (
+from tests.helpers.duplex_scheduler import (
     DUPLEX_BLOCK_SIZE,
     append_duplex_frame,
     join_duplex_sessions,
