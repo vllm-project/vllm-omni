@@ -48,6 +48,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSNanoAdapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
+    QWEN3_TTS_AUTO_BUDGET_KEY,
     QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY,
     Qwen3TTSAdapter,
     Qwen3TTSCodecLimitError,
@@ -815,19 +816,27 @@ def test_voxtral_prompt_builder_is_sync():
 
 
 @pytest.mark.parametrize(
-    ("task_type", "text_tokens", "request_cap", "expected_cap"),
+    ("task_type", "text_tokens", "request_cap", "expected_cap", "auto"),
     [
-        ("Base", 0, None, 4096),
-        ("Base", 10, None, 192),
-        ("Base", 23, None, 276),
-        ("Base", 23, 128, 128),
-        ("Base", 23, 512, 512),
-        ("Base", 400, None, 4096),
-        ("CustomVoice", 10, None, 4096),
-        ("CustomVoice", 10, 256, 256),
+        ("Base", 0, None, 4096, False),
+        ("Base", 10, None, 192, True),
+        ("Base", 23, None, 276, True),
+        ("Base", 23, 128, 128, False),
+        ("Base", 23, 512, 512, False),
+        ("Base", 400, None, 4096, True),
+        ("CustomVoice", 0, None, 4096, False),
+        ("CustomVoice", 6, None, 400, True),
+        ("CustomVoice", 23, None, 920, True),
+        ("CustomVoice", 200, None, 4096, True),
+        ("CustomVoice", 10, 256, 256, False),
+        ("CustomVoice", 10, 4096, 4096, False),
+        ("VoiceDesign", 23, None, 920, True),
+        ("VoiceDesign", 23, 1000, 1000, False),
     ],
 )
-def test_qwen3_tts_applies_text_scaled_codec_safety_limit(task_type, text_tokens, request_cap, expected_cap, mocker):
+def test_qwen3_tts_applies_text_scaled_codec_safety_limit(
+    task_type, text_tokens, request_cap, expected_cap, auto, mocker
+):
     server = mocker.Mock()
     server._count_usage_text_tokens.return_value = text_tokens
     adapter = Qwen3TTSAdapter(SpeechServingContext(server=server))
@@ -843,7 +852,124 @@ def test_qwen3_tts_applies_text_scaled_codec_safety_limit(task_type, text_tokens
 
     assert overridden[0].max_tokens == expected_cap
     assert prompt["additional_information"][QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [expected_cap]
+    assert (QWEN3_TTS_AUTO_BUDGET_KEY in prompt["additional_information"]) is auto
     assert stage_defaults[0].max_tokens == 4096
+    if request_cap is not None:
+        # The explicit caller budget bypasses text-token counting entirely.
+        server._count_usage_text_tokens.assert_not_called()
+
+
+def _qwen3_server_with_stage_config(mocker, additional_config, *, legacy=False):
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = 23
+    if legacy:
+        server._tts_stage = SimpleNamespace(engine_args=SimpleNamespace(additional_config=additional_config))
+    else:
+        server._tts_stage = SimpleNamespace(runtime_config=SimpleNamespace(additional_config=additional_config))
+    return server
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    ("additional_config", "expected_cap"),
+    [
+        # 20 * 23 = 460 frames.
+        ({"codec_budget_frames_per_text_token": 20, "codec_budget_min_frames": 100}, 460),
+        # The floor wins for short inputs.
+        ({"codec_budget_frames_per_text_token": 2.5, "codec_budget_min_frames": 300}, 300),
+        # The task's default floor still applies (CustomVoice: 400 frames).
+        ({"codec_budget_frames_per_text_token": 7.01}, 400),
+        ({"codec_budget_frames_per_text_token": 9.5, "codec_budget_min_frames": 1}, 219),
+        # Unrelated stage options keep the defaults (CustomVoice: 40 * 23).
+        ({"talker_stream_decode": True}, 920),
+        # Per-task mappings override only the named task.
+        ({"codec_budget_frames_per_text_token": {"CustomVoice": 20}}, 460),
+        ({"codec_budget_frames_per_text_token": {"Base": 20}}, 920),
+        ({"codec_budget_min_frames": {"CustomVoice": 1000}}, 1000),
+        # 0 disables the text budget and keeps the configured stage limit.
+        ({"codec_budget_frames_per_text_token": 0}, 4096),
+    ],
+)
+def test_qwen3_tts_codec_budget_reads_talker_additional_config(legacy, additional_config, expected_cap, mocker):
+    server = _qwen3_server_with_stage_config(mocker, additional_config, legacy=legacy)
+    adapter = Qwen3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="test text", task_type="CustomVoice")
+    prompt: dict[str, Any] = {"additional_information": {}}
+
+    overridden = adapter.apply_sampling_overrides([SamplingParams(max_tokens=4096, min_tokens=2)], request, prompt)
+
+    assert overridden[0].max_tokens == expected_cap
+    assert (QWEN3_TTS_AUTO_BUDGET_KEY in prompt["additional_information"]) is (expected_cap != 4096)
+
+    # An explicit request budget still wins over the configured coefficients.
+    explicit = OpenAICreateSpeechRequest(input="test text", task_type="CustomVoice", max_new_tokens=64)
+    assert adapter.apply_sampling_overrides([SamplingParams(max_tokens=4096)], explicit)[0].max_tokens == 64
+
+
+@pytest.mark.parametrize(
+    "additional_config",
+    [
+        {"codec_budget_frames_per_text_token": -1},
+        {"codec_budget_frames_per_text_token": "fast"},
+        {"codec_budget_frames_per_text_token": float("inf")},
+        {"codec_budget_min_frames": 0},
+        {"codec_budget_min_frames": 12.5},
+        {"codec_budget_min_frames": True},
+        {"codec_budget_frames_per_text_token": {"Custom": 20}},
+    ],
+)
+def test_qwen3_tts_codec_budget_rejects_invalid_config(additional_config, mocker):
+    server = _qwen3_server_with_stage_config(mocker, additional_config)
+    with pytest.raises(ValueError, match="codec_budget"):
+        Qwen3TTSAdapter(SpeechServingContext(server=server))
+
+
+def test_qwen3_tts_codec_budget_follows_prompt_task_type(mocker):
+    """Stored voices dispatch as Base in the built prompt; the Base budget applies."""
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = 23
+    adapter = Qwen3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="test text", voice="stored")
+    prompt: dict[str, Any] = {"additional_information": {"task_type": ["Base"]}}
+
+    overridden = adapter.apply_sampling_overrides([SamplingParams(max_tokens=4096)], request, prompt)
+
+    assert overridden[0].max_tokens == 276
+
+
+def test_qwen3_tts_rejects_length_finish_under_auto_budget_for_all_tasks(mocker):
+    adapter = Qwen3TTSAdapter(SpeechServingContext(server=mocker.Mock()))
+    for task_type in ("CustomVoice", "VoiceDesign"):
+        auto = {
+            "task_type": [task_type],
+            QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY: [276],
+            QWEN3_TTS_AUTO_BUDGET_KEY: [True],
+        }
+        adapter.validate_generation(auto, stage0_finish_reason="stop", output_tokens=276)
+        with pytest.raises(Qwen3TTSCodecLimitError, match=f"{task_type} .*275/276"):
+            adapter.validate_generation(auto, stage0_finish_reason="length", output_tokens=275)
+
+        # An explicit caller budget (or the configured stage limit) keeps the
+        # pre-existing behavior for non-Base tasks: the audio is returned.
+        explicit = {"task_type": [task_type], QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY: [256]}
+        adapter.validate_generation(explicit, stage0_finish_reason="length", output_tokens=256)
+
+
+def test_qwen3_tts_reports_length_finish_when_derived_budget_hits_stage_limit(mocker):
+    """A long input clamps the derived budget to the stage limit; reaching it without EOS is still reported."""
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = 200
+    adapter = Qwen3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="test text", task_type="CustomVoice")
+    prompt: dict[str, Any] = {"additional_information": {"task_type": ["CustomVoice"]}}
+
+    overridden = adapter.apply_sampling_overrides([SamplingParams(max_tokens=4096)], request, prompt)
+
+    assert overridden[0].max_tokens == 4096
+    tts_params = prompt["additional_information"]
+    adapter.validate_generation(tts_params, stage0_finish_reason="stop", output_tokens=3000)
+    with pytest.raises(Qwen3TTSCodecLimitError, match="CustomVoice .*4096/4096"):
+        adapter.validate_generation(tts_params, stage0_finish_reason="length", output_tokens=4096)
 
 
 def test_qwen3_tts_rejects_only_length_finished_base_audio(mocker):

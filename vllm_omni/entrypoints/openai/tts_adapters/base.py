@@ -172,9 +172,6 @@ class PreparedRequest:
     tts_params: dict[str, Any] = field(default_factory=dict)
     model_type: str = "generic"
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
-    #: Cross-cutting per-request state the orchestrator still owns (e.g. the
-    #: Qwen3-TTS ref-audio warmup artifact key tracked after ``generate()``).
-    warmup_artifact_key: str | None = None
 
 
 @dataclass
