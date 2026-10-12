@@ -17,9 +17,9 @@ import logging
 
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig
 from torch.nn import functional as F
 
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.configs import CFM_PARAMS
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.mask import make_pad_mask
 
 logger = logging.getLogger(__name__)
@@ -57,16 +57,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             "out_channel": 80,
             "spk_emb_dim": 80,
             "n_spks": 1,
-            "cfm_params": DictConfig(
-                {
-                    "sigma_min": 1e-06,
-                    "solver": "euler",
-                    "t_scheduler": "cosine",
-                    "training_cfg_rate": 0.2,
-                    "inference_cfg_rate": 0.7,
-                    "reg_loss_type": "l1",
-                }
-            ),
+            "cfm_params": CFM_PARAMS,
             "decoder_params": {
                 "channels": [256, 256],
                 "dropout": 0.0,
