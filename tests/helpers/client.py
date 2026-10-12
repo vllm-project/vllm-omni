@@ -370,6 +370,9 @@ def _ws_error_code(jb: Mapping[str, Any]) -> Any:
 
     Speech and video frames put ``code`` on the envelope. OpenAI Realtime nests
     it under ``error`` (``{"type": "error", "error": {"code": "invalid_event"}}``).
+    The envelope wins when both differ; Realtime frames are expected to omit
+    top-level ``code`` (as in the Buildkite failure) so a stale envelope field
+    does not mask the nested code.
     """
     code = jb.get("code")
     if code is not None:
