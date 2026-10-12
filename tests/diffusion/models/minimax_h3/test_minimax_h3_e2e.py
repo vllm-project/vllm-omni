@@ -6,11 +6,10 @@ import os
 import numpy as np
 import pytest
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_test
 
 pytestmark = [
     pytest.mark.local_model,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.parallel,
 ]
@@ -29,6 +28,7 @@ def _assert_joint_output(outputs):
     assert multimodal["fps"] == 24
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=8)
 @pytest.mark.skipif(
     not os.environ.get(MODEL_ENV),
     reason=f"set {MODEL_ENV} to an authorized FL2VA checkpoint path",
@@ -84,6 +84,7 @@ def test_minimax_h3_t2va_ulysses8_smoke():
     assert multimodal["fps"] == 24
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(
     not os.environ.get(MODEL_ENV),
     reason=f"set {MODEL_ENV} to an authorized FL2VA checkpoint path",
@@ -138,6 +139,7 @@ def test_minimax_h3_t2va_fp8_single_gpu_smoke():
     _assert_joint_output(outputs)
 
 
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(
     not os.environ.get(MODEL_ENV),
     reason=f"set {MODEL_ENV} to an authorized FL2VA checkpoint path",
