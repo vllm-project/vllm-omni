@@ -1,0 +1,107 @@
+# Chatterbox Turbo deploy: T3 (GPT-2 backbone) -> S3Gen (meanflow + HiFT).
+#
+# Default mode is async-chunk streaming through SharedMemoryConnector. Pass
+# ``--no-async-chunk`` to the serve CLI to have stage 1 decode each finished
+# utterance once instead.
+#
+# Runner: both stages run on Model Runner V2 with its native data plane on
+# CUDA, where it was measured: streaming is within a few percent of the
+# default runner at 1 and at 8 concurrent streams. Set ``model_runner: v1``
+# to use the default runner; both are supported. Without streaming
+# (``--no-async-chunk``) V2 is slower, about 0.2 against 0.15 real-time
+# factor on a 24 GB card, because it copies stage 0's hidden states to the
+# host on every step. The ``platforms:`` section at the end keeps V1 where
+# V2 is rejected (NPU, XPU) or has not been run (ROCm, MUSA).
+#
+# Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 runs in float32 (the
+# vocoder is not half-precision safe) and eagerly (its convolutions see a
+# different length every step).
+#
+# Prefix caching is off for correctness, not speed: stage 0's prompt is
+# placeholder ids, and the real prefix arrives as embeddings, so two requests
+# of equal length would share a cache entry whatever their voice or text.
+#
+# No stage loads a tokenizer: prompts are placeholder ids and nothing is
+# detokenized. Loading one would also have vLLM look in the repo for the
+# config.json it does not ship and log the miss as an error in every process.
+#
+# Chunking: the first chunk is 15 tokens plus the padding that aligns the
+# reference prompt to 15 (20 for a ten-second reference), then 30, then 60;
+# every chunk waits for the flow's 3-token lookahead, which is the model's
+# and not a setting. Smaller chunks start audio sooner and cost more flow
+# work. Stage 1 decodes each chunk from a fixed 50-token left context of its
+# own, so no left-context key is set here.
+#
+# Sized on one 24 GB card (see the recipe for the measurements). TUNE PER
+# GPU: on a slower card lower max_num_seqs before raising the chunk size.
+pipeline: chatterbox_turbo
+model_runner: v2
+async_chunk: true
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_chunk_frames: 15
+      codec_max_chunk_frames: 60
+      codec_stream_scale_factor: 2
+
+stages:
+  - stage_id: 0
+    # Halves the backbone's weights. Its logits are only sampled from, and
+    # the end-to-end transcripts pass with it.
+    dtype: bfloat16
+    max_num_seqs: 8
+    # 1 speaker slot + up to 375 prompt tokens + text + 1 start token + 1000
+    # output tokens: a text of up to 671 tokens has the full 1000-token
+    # output. A longer text is accepted and ends at whatever the 2048 leave
+    # for output; the engine refuses a prompt of 2048 tokens or more.
+    max_model_len: 2048
+    # One step can prefill a whole prompt. A smaller budget splits the
+    # prefill over steps, which stage 0 handles: later first token, steadier
+    # decode steps for the requests already speaking.
+    max_num_batched_tokens: 2048
+    gpu_memory_utilization: 0.35
+    enforce_eager: false
+    enable_prefix_caching: false
+    skip_tokenizer_init: true
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.8
+      top_k: 1000
+      top_p: 0.95
+      repetition_penalty: 1.2
+      max_tokens: 1000
+
+  - stage_id: 1
+    dtype: float32
+    max_num_seqs: 8
+    # The longest utterance this stage is built for: its noise buffer and
+    # the budget below are sized from it. It must not be smaller than stage
+    # 0's max_model_len, which is what bounds an utterance whatever
+    # max_tokens a request asks for; the engine does not compare a streamed
+    # chunk with this value, so a smaller one would let an utterance outgrow
+    # both with no error.
+    max_model_len: 2048
+    # At least max_num_seqs * max_model_len (8 * 2048); the stage refuses to
+    # start with less. A new request the step's budget cannot cover is
+    # scheduled with part of its tokens, and the decoder would take that
+    # part for the utterance.
+    max_num_batched_tokens: 16384
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    skip_tokenizer_init: true
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

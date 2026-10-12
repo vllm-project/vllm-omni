@@ -3,13 +3,54 @@
 A model-agnostic serving benchmark for TTS models in vllm-omni. One CLI
 (`bench_tts.py`) + one YAML registry (`model_configs.yaml`) drive perf and
 quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice / VoiceDesign)
-and **VoxCPM2** today, more to come.
+**VoxCPM2**, and **Chatterbox Turbo / Original** today, more to come.
 
 The same three task types — `voice_clone`, `default_voice`, `voice_design` —
 are wired into both the manual CLI and the DFX nightly CI matrix
 (`tests/dfx/perf/tests/test_tts.json`).
 
 ## Quick start
+
+### Chatterbox concurrency and conditioning checks
+
+`chatterbox_load.py` validates Chatterbox Turbo and Original through their public
+HTTP or sentence-segmented WebSocket APIs, with cold distinct references, a warm
+repeated reference, and the built-in voice. `chatterbox_conditioning.py` checks
+real-weight serial/batch parity over 64 references on CPU or an explicit CUDA
+device. These are separate from the universal benchmark registry below.
+See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-Turbo.md#conditioning-load-validation-at-64-clients)
+for commands, measured 64-client results, and capacity and quality limitations.
+
+`chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech
+codes replayed from the checkpoint's built-in voice. It measures first,
+continuing, and final chunks, separates flow and vocoder costs, and exports a
+CPU/CUDA trace of the largest successful steady-state batch. Its 64-stream
+real-time-factor estimate assumes sequential
+decoder batches; it excludes T3, conditioning, transport, and GPU contention.
+It is not an end-to-end serving result.
+
+Use `--tf32` or `--bf16-flow` to compare flow precision. Each precision run
+also saves paired `.fp32.wav` and `.selected.wav` replay chunks beside the
+JSON report for listening. Numerical similarity and these short clips do not
+replace end-to-end intelligibility and speaker-quality evaluation.
+Add `--cudnn-attention` to a BF16 run for a separate native SDPA backend ablation;
+unsupported attention shapes fail rather than silently selecting another kernel.
+
+Both Chatterbox variants are also registered in `bench_tts.py`. For a Qwen3-TTS
+comparison, run its `voice_clone` task and Chatterbox's `voice_clone` task against
+the same Seed-TTS metadata, references, output cap, and concurrency list after
+restarting the server for each model. The universal benchmark reports audio RTF
+and playback underruns as well as first-audio latency; use these to evaluate
+streaming real-time performance rather than request completion alone.
+See the [H100 profiling report](../../recipes/ResembleAI/Chatterbox-Profiling.md)
+for the full-load warmup protocol and measured batch-size tradeoffs.
+
+```bash
+uv run benchmarks/tts/chatterbox_decoder.py /path/to/snapshot turbo /path/to/results.json
+# Compare native HiFT optimizations independently:
+uv run benchmarks/tts/chatterbox_decoder.py /path/to/snapshot turbo /path/to/folded.json --fold-weight-norm
+uv run benchmarks/tts/chatterbox_decoder.py /path/to/snapshot turbo /path/to/istft.json --cached-istft
+```
 
 ### 1. Start the server
 

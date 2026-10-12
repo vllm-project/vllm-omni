@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib
+import queue
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -12,9 +16,90 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
+from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def original_admission_engine():
+    """Use real admission and pipeline hooks without starting GPU workers."""
+    engine = object.__new__(AsyncOmniEngine)
+    engine.default_sampling_params_list = [SamplingParams(max_tokens=1000)]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = SimpleNamespace(
+        process_inputs=lambda **kwargs: _make_engine_core_request(kwargs["request_id"])
+    )
+    engine.request_queue = SimpleNamespace(sync_q=queue.SimpleQueue())
+    for name in ("prompt_transform_func", "prompt_expand_func"):
+        module, function = getattr(CHATTERBOX_ORIGINAL_PIPELINE.stages[0], name).rsplit(".", 1)
+        setattr(engine, name, getattr(importlib.import_module(module), function))
+    return engine
+
+
+def original_admission_prompt(weight: float) -> dict:
+    voice = VoiceConditioning(
+        cond_tokens=torch.tensor([[1, 2]]),
+        speaker_emb=torch.ones(1, 256),
+        prompt_token=torch.tensor([[3, 4]]),
+        prompt_feat=torch.zeros(1, 4, 80),
+        embedding=torch.ones(1, 192),
+    )
+    return build_prompt([12, 13, 14], voice, ChatterboxConfig("original"), cfg_weight=weight)
+
+
+@pytest.mark.parametrize("weight", [0.0, 0.5])
+@pytest.mark.parametrize("final_stage_id", [0, 1])
+@pytest.mark.parametrize("max_tokens", [None, 4096])
+def test_original_offline_admission_preserves_supported_budget(
+    original_admission_engine, weight, final_stage_id, max_tokens
+):
+    engine = original_admission_engine
+    params = None if max_tokens is None else [SamplingParams(max_tokens=max_tokens, min_tokens=max_tokens)]
+    engine.add_request(
+        "original", original_admission_prompt(weight), sampling_params_list=params, final_stage_id=final_stage_id
+    )
+    message = engine.request_queue.sync_q.get_nowait()
+    assert message.sampling_params_list[0].max_tokens == (1000 if params is None else 4096)
+    assert message.sampling_params_list[0].min_tokens == (0 if params is None else 4096)
+    assert engine.request_queue.sync_q.qsize() == int(weight != 0)
+    parent_info = deserialize_additional_information(message.prompt.additional_information)
+    assert parent_info["omni_final_stage_id"] == final_stage_id
+    if weight != 0:
+        companion = engine.request_queue.sync_q.get_nowait()
+        companion_info = deserialize_additional_information(companion.prompt.additional_information)
+        assert parent_info["cfg_group"]["role"] == "cond"
+        assert companion_info["cfg_group"]["role"] == "uncond"
+        assert companion_info["omni_final_stage_id"] == 0
+        assert companion.parent_id == "original"
+        assert companion.companion_id == "original__cfg_uncond"
+
+
+def test_stage0_only_does_not_expand_downstream_cfg(mocker: MockerFixture, original_admission_engine):
+    engine = original_admission_engine
+    engine.prompt_expand_func = mocker.Mock(side_effect=AssertionError("downstream CFG must stay idle"))
+    engine.add_request("plain", original_admission_prompt(0.0), final_stage_id=0)
+    engine.prompt_expand_func.assert_not_called()
+    assert engine.request_queue.sync_q.qsize() == 1
+
+
+@pytest.mark.parametrize("weight", [0.0, 0.5])
+@pytest.mark.parametrize("final_stage_id", [0, 1])
+@pytest.mark.parametrize("max_tokens,min_tokens", [(4200, 0), (4200, 4101), (None, 0)])
+def test_original_offline_admission_rejects_unsupported_budget(
+    original_admission_engine, weight, final_stage_id, max_tokens, min_tokens
+):
+    engine = original_admission_engine
+    params = SamplingParams(max_tokens=max_tokens, min_tokens=min_tokens)
+    with pytest.raises(ValueError, match="Chatterbox Original.*4096"):
+        engine.add_request(
+            "original", original_admission_prompt(weight), sampling_params_list=[params], final_stage_id=final_stage_id
+        )
+    assert engine.request_queue.sync_q.empty()
 
 
 class _SyntheticSyncQueueShutDownError(Exception):
