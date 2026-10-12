@@ -11,6 +11,7 @@ import inspect
 import pytest
 
 from vllm_omni.engine.duplex import events as events_module
+from vllm_omni.engine.duplex.commands import ClearOutputAudio, TruncateItem
 from vllm_omni.engine.duplex.events import (
     REALTIME_ERROR_TYPES_BY_CODE,
     AudioDelta,
@@ -32,7 +33,9 @@ from vllm_omni.engine.duplex.events import (
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    Speak,
     TextDelta,
+    TranscriptDelta,
     TranscriptDone,
     TurnEvent,
     error_event,
@@ -40,6 +43,9 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     project_internal_event,
+    resolve_clear_output_audio,
+    resolve_truncate_item,
+    retrieve_item_events,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -114,6 +120,18 @@ def test_optional_wire_fields_are_omitted_when_none():
     assert delta["format"] == "pcm16"
     assert delta["output_index"] == 0
     assert delta["content_index"] == 0
+
+    transcript = TranscriptDelta(response_id="resp_1", item_id="item_resp_1", delta="hi").to_realtime()
+    assert "metadata" not in transcript
+    assert (
+        TranscriptDelta(
+            response_id="resp_1",
+            item_id="item_resp_1",
+            delta="hi",
+            metadata={"vllm_omni": {"response_request_metrics": {"ttft_ms": 200.0}}},
+        ).to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"]
+        == 200.0
+    )
 
     anonymous_listen = Listen(session_id="sid", epoch=0, details={"reason": "silence"}).to_realtime()
     assert "response_id" not in anonymous_listen
@@ -373,6 +391,96 @@ def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals(
     assert state.item_truncation_cursors["item_resp_1"] == (0, 250)
 
 
+@pytest.mark.parametrize("reason", ["turn_detected", "barge_in", "output_audio_buffer_clear"])
+@pytest.mark.parametrize("committed_ms", [1000, 10000])
+def test_completed_response_cancellation_only_clears_pending_playback(reason, committed_ms):
+    state = RealtimeProjectionState(session_id="duplex-playback")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+
+    cancelled = project_internal_event(
+        state,
+        {
+            "type": "audio.cancelled",
+            "response_id": "resp_1",
+            "reason": reason,
+            "committed_ms": committed_ms,
+            "playback": {"sent_ms": 10000, "committed_ms": committed_ms},
+        },
+    )
+
+    if reason == "output_audio_buffer_clear" or committed_ms < 10000:
+        assert _types(cancelled) == ["output_audio_buffer.cleared"]
+        assert cancelled[0].response_id == "resp_1"
+    else:
+        assert cancelled == []
+
+
+@pytest.mark.parametrize("explicit_response_id", [False, True])
+def test_clear_latest_completed_response_reaches_playback_owner(explicit_response_id):
+    state = RealtimeProjectionState(session_id="duplex-clear")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+
+    control = resolve_clear_output_audio(
+        state, ClearOutputAudio(response_id="resp_1" if explicit_response_id else None, event_id="clear_1")
+    )
+
+    # Generation completion does not prove the client has drained its audio.
+    # A cleared event must follow the engine clearing its playback cursor.
+    assert control.events == []
+    assert control.payloads == [
+        {
+            "type": "output_audio_buffer.clear",
+            "reason": "output_audio_buffer.clear",
+            "response_id": "resp_1",
+            "realtime_event_id": "clear_1",
+        }
+    ]
+
+
+@pytest.mark.parametrize("new_response_finished", [False, True])
+def test_late_clear_of_completed_response_does_not_touch_new_response(new_response_finished):
+    state = RealtimeProjectionState(session_id="duplex-clear")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_2"})
+    if new_response_finished:
+        project_internal_event(state, {"type": "response.done", "response_id": "resp_2"})
+
+    control = resolve_clear_output_audio(state, ClearOutputAudio(response_id="resp_1"))
+
+    assert control.payloads == []
+    assert _types(control.events) == ["output_audio_buffer.cleared"]
+    assert control.events[0].response_id == "resp_1"
+    assert state.active_response_id == (None if new_response_finished else "resp_2")
+    assert state.last_response_id == "resp_2"
+
+
+def test_one_truncate_command_truncates_retrieved_transcript_once():
+    state = RealtimeProjectionState(session_id="duplex-truncate")
+    state.conversation_items["item_resp_1"] = {
+        "id": "item_resp_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_audio", "transcript": "abcdefghij", "audio_duration_ms": 10_000}],
+    }
+
+    control = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000))
+    # The runner executes this signal and projects its acknowledgement.
+    signal = control.payloads[0]
+    payload = signal["payload"]
+    assert isinstance(payload, dict)
+    assert signal["event"] == "conversation.item.truncate"
+    project_internal_event(state, {"type": "conversation.item.truncated", **payload})
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "abcd"
+    # Keep the cursor: later output must not restore the untruncated item.
+    assert state.item_truncation_cursors["item_resp_1"] == (0, 4_000)
+
+
 def test_projection_leaves_error_to_typed_emit_sites():
     # Errors are constructed typed (``error_event``) at the emit site; the projector
     # has no ``error`` branch and falls back to the raw wrapper for such a dict.
@@ -384,3 +492,87 @@ def test_projection_leaves_error_to_typed_emit_sites():
     assert isinstance(projected[0], DuplexRawEvent)
     assert projected[0].type == "duplex.error"
     assert projected[0].to_realtime()["event"]["code"] == "bad_event"
+
+
+def test_response_speak_projection_keeps_vllm_omni_request_metrics():
+    state = RealtimeProjectionState(session_id="duplex-proj", model="test-model")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    metrics = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+
+    events = project_internal_event(
+        state,
+        {
+            "type": "response.speak",
+            "response_id": "resp_1",
+            "session_id": "duplex-proj",
+            "epoch": 0,
+            "model_speak": True,
+            "vllm_omni": {"response_request_metrics": metrics},
+        },
+    )
+
+    assert _types(events) == ["response.speak"]
+    assert isinstance(events[0], Speak)
+    assert events[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"] == 200.0
+
+
+def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
+    state = RealtimeProjectionState(session_id="duplex-proj", model="test-model")
+    project_internal_event(
+        state, {"type": "response.created", "response_id": "resp_1", "modalities": ["audio", "text"]}
+    )
+    ttft = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+
+    text_only = project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": "",
+            "text": "hi",
+            "session_id": "duplex-proj",
+            "epoch": 0,
+            "model_speak": True,
+            "vllm_omni": {"response_request_metrics": ttft},
+        },
+    )
+
+    assert _types(text_only) == ["response.output_audio_transcript.delta"]
+    assert isinstance(text_only[0], TranscriptDelta)
+    text_metrics = text_only[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    assert text_metrics["ttft_ms"] == 200.0
+    assert "ttfp_ms" not in text_metrics
+
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    ttfp = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "ttfp_ms": 400.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+    audio = project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "",
+            "format": "pcm16",
+            "vllm_omni": {"response_request_metrics": ttfp},
+        },
+    )
+
+    assert "response.output_audio.delta" in _types(audio)
+    audio_delta = next(event for event in audio if event.type == "response.output_audio.delta")
+    assert isinstance(audio_delta, AudioDelta)
+    audio_metrics = audio_delta.to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    assert audio_metrics["ttft_ms"] == 200.0
+    assert audio_metrics["ttfp_ms"] == 400.0

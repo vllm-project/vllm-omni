@@ -1,5 +1,8 @@
 # NixlConnector
 
+For the reusable model-runner API, illustrated control flow, deadline semantics,
+and failure/ownership contracts, see [Cross-Stage Payload Transport](stage_payload.md).
+
 ## When to Use
 
 Multi-node or intra-node stage transfer over NIXL, which brokers RDMA/shared-memory
@@ -45,6 +48,15 @@ For Intel XPU, use `docker/Dockerfile.xpu`. Its upstream vLLM XPU base image
 provides a matching torch-xpu, UCX with Level Zero support, and NIXL runtime.
 
 ## Configuration
+
+MiniMax-H3's default disaggregated and Turbo deploy configs use shared memory
+for same-host transfer. To opt into NIXL, select
+`vllm_omni/deploy/minimax_h3_disaggregated_nixl.yaml` or
+`vllm_omni/deploy/minimax_h3_disaggregated_turbo_nixl.yaml` with
+`--deploy-config`. These overlays inherit the corresponding model and
+parallel settings and switch both ends of the stage edge. They require NIXL
+and a working UCX backend; initialization failures do not automatically fall
+back to shared memory.
 
 ```yaml
 connectors:
@@ -92,8 +104,43 @@ Parameters:
 - `transfer_timeout_s`: how long a `get()` waits for its `READ` to complete
   (default 300). NIXL 1.3 has no transfer cancellation API, so a timed-out transfer's
   buffers and registrations remain owned by the connector until NIXL reports a
-  terminal state; `close()` waits for that state before releasing them.
+  terminal state. `close()` polls remaining transfers once and returns without
+  releasing active DMA resources. A serialized background closer automatically
+  finishes cleanup after completion; no second call is required.
   `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
+
+### Diffusion worker integration
+
+Diffusion initializes `OmniConnectorModelRunnerMixin` in synchronous mode,
+borrowing its KV transfer manager's lazy connector. This mode creates no second
+connector, starts no receive/save threads, and leaves KV key builders and
+sharding callbacks unchanged. Connector lifetime remains with the manager.
+
+The shared `recv_stage_payload` entry point and asynchronous `_poll_single_request`
+use the same key and endpoint metadata builder. Diffusion passes its actual
+incoming edge and external request ID; explicit transfer handles take precedence.
+Sender endpoints are passed per request, without mutating KV sender state.
+Diffusion-specific prompt merging, output handles and device placement live in
+`diffusion/worker/stage_payload.py`.
+
+Diffusion supplies ordered TP and SP groups to the shared payload fanout.
+Only the rank leading both groups reads the connector. Each subsequent broadcast
+uses its own group-local rank zero, including ranks that received the payload
+from the preceding group. Tensor payloads use tensor-dictionary broadcasts rather
+than serializing the full payload as a Python object. Receive misses still reach
+the same collectives. Inline fallback is allowed only when all required payload
+keys remain present; otherwise each rank raises an explicit payload error.
+
+The synchronous path passes one monotonic deadline to `get_with_deadline()` for
+discovery and DMA completion waits, rather than calling the ordinary `get()`
+with its potentially much longer transfer timeout. Native calls, serialization,
+and distributed collectives are not preemptible by this deadline.
+
+`GroupCoordinator.broadcast_tensor_dict` preserves the group-local source for
+`broadcast_object` while passing the mapped global source to PyTorch tensor
+collectives. For subgroup `[1, 3]`, local source `0` maps to global source `1`;
+passing `1` back to `broadcast_object` would incorrectly select global rank `3`.
+The nonzero-subgroup regression covers both sender and receiver behavior.
 
 ### Source ownership and failure limits
 
@@ -105,12 +152,24 @@ transfers retain the complete destination bundle and source claim until terminal
 Zero-element tensors retain their shape/dtype/skeleton positions but never create
 DMA descriptors or registrations.
 
-A lost metadata response, lost completion ACK, or abandoned consumer can retain a
-claim indefinitely. NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
+After a lost metadata response, retries on the same consumer thread reuse the
+claim ID for that endpoint, key and requested generation until a reply arrives.
+This makes claim acquisition idempotent; subsequent independent reads still get
+distinct claims. Callers retry on the same thread and call `abandon_get()` when
+giving up. Synchronous stage payload receive does this automatically. Background
+recovery reacquires the same claim solely to acknowledge it, without issuing a
+READ. Lost completion ACKs are retried against the exact payload generation.
+A permanently unreachable or dead consumer can still retain a claim indefinitely.
+NIXL 1.3 cannot prove remote cancellation, so neither TTL nor
 `cleanup()` frees those allocations. Producer `close()` rejects new work and
-retains its agent, listener and claimed allocations; a later `close()` finishes
+retains its agent, listener and claimed allocations; the background closer finishes
 teardown after claims drain. Permanently abandoned claims remain until process
-exit. This favors memory safety over bounded shutdown/memory usage. Only trusted
+exit. A consumer with unfinished local transfers likewise retains a strong reference
+to its connector, agent, tensors and registrations after `close()` returns. Its
+background closer polls and releases resources only after a terminal state;
+permanently stuck transfers retain resources until process exit. Closing connectors
+reject new work and report unhealthy. This avoids an unbounded transfer-polling loop
+in shutdown without freeing DMA-owned memory. Only trusted
 peers may access this unauthenticated control plane. Both endpoints must use the
 claim-aware protocol; rolling compatibility with older GET_META clients is not
 provided. Legacy externally-owned metadata without a generation is accepted only

@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.kv_hints import KvHintsEnvelope
 
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -51,13 +52,49 @@ class AsyncOmniEngine(OmniEngineBase):
             return value
         return [value]
 
+    _DEFAULT_MM_HASHER_ALGORITHM = "blake3"
+
+    def _resolve_mm_hasher_algorithm(self) -> str:
+        """Return the MM hash algorithm configured for stage 0.
+
+        Upstream vLLM 0.29 removed ``MultiModalHasher``'s ``_get_mm_hasher_algorithm``
+        helper and the ``VLLM_MM_HASHER_ALGORITHM`` env var; the algorithm now lives
+        only on ``MultiModalConfig.mm_hasher_algorithm`` (``--mm-hasher-algorithm``,
+        default ``"blake3"``). Resolve it from stage-0's config so the pre-computed
+        replica-scoped uuid uses the same algorithm as the stage-0 renderer built by
+        ``build_stage0_input_processor``. Falls back to the upstream default when the
+        engine has no stage config (unit tests built via ``object.__new__``) or the
+        model has no multimodal config.
+        """
+
+        stage_vllm_configs = getattr(self, "stage_vllm_configs", None) or []
+        if not stage_vllm_configs:
+            return self._DEFAULT_MM_HASHER_ALGORITHM
+
+        model_config = getattr(stage_vllm_configs[0], "model_config", None)
+        if model_config is None:
+            return self._DEFAULT_MM_HASHER_ALGORITHM
+
+        mm_config = None
+        get_multimodal_config = getattr(model_config, "get_multimodal_config", None)
+        if callable(get_multimodal_config):
+            try:
+                mm_config = get_multimodal_config()
+            except ValueError:
+                # Model is not multimodal.
+                mm_config = None
+        if mm_config is None:
+            mm_config = getattr(model_config, "multimodal_config", None)
+
+        return getattr(mm_config, "mm_hasher_algorithm", None) or self._DEFAULT_MM_HASHER_ALGORITHM
+
     def _ensure_stage_replica_mm_uuids(
         self,
         prompt: Any,
         *,
         stage_id: int,
         replica_id: int,
-    ) -> None:
+    ) -> Any:
         """Make multimodal processor-cache keys local to a stage replica.
 
         vLLM's frontend multimodal sender cache is process-global, while each
@@ -66,17 +103,23 @@ class AsyncOmniEngine(OmniEngineBase):
         replicas, a plain content hash can make the sender omit the tensor for
         a replica that has never received it. Prefixing user/content UUIDs with
         the selected replica keeps cache reuse within the receiver that owns it.
+
+        Returns a shallow copy carrying the scoped UUIDs; the caller's prompt is
+        left untouched. Writing the scoped UUIDs back would make the next
+        request built from that dict reuse them as user UUIDs and key its new
+        media under the old media's hash.
         """
 
         if not isinstance(prompt, dict):
-            return
+            return prompt
 
         mm_data = prompt.get("multi_modal_data")
         if not isinstance(mm_data, dict) or not mm_data:
-            return
+            return prompt
 
-        from vllm.config.multimodal import _get_mm_hasher_algorithm
         from vllm.multimodal.hasher import MultiModalHasher
+
+        mm_hasher_algorithm = self._resolve_mm_hasher_algorithm()
 
         existing_uuids = prompt.get("multi_modal_uuids")
         if not isinstance(existing_uuids, dict):
@@ -102,7 +145,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     base_uuid = None
                 else:
                     base_uuid = MultiModalHasher.hash_kwargs(
-                        _get_mm_hasher_algorithm(),
+                        mm_hasher_algorithm,
                         model_id=model_id,
                         **{modality: item},
                     )
@@ -114,8 +157,11 @@ class AsyncOmniEngine(OmniEngineBase):
 
             scoped_uuids[modality] = modality_uuids
 
-        if scoped_uuids:
-            prompt["multi_modal_uuids"] = scoped_uuids
+        if not scoped_uuids:
+            return prompt
+        scoped_prompt = dict(prompt)
+        scoped_prompt["multi_modal_uuids"] = scoped_uuids
+        return scoped_prompt
 
     @staticmethod
     def _stage_pool_replica_count(stage_pool: Any) -> int:
@@ -157,20 +203,25 @@ class AsyncOmniEngine(OmniEngineBase):
         self,
         request_id: str,
         prompt: Any,
-    ) -> int | None:
+    ) -> tuple[int | None, Any]:
+        """Return the preselected stage-0 replica and the prompt to process.
+
+        The returned prompt is a scoped copy when scoping applies, else
+        ``prompt`` itself.
+        """
         stage_pools = getattr(self, "stage_pools", None)
         if isinstance(prompt, EngineCoreRequest) or not stage_pools:
-            return None
+            return None, prompt
 
         stage0_pool = stage_pools[0]
         # TODO: Currently only supports the ar -> dit process.
         # Future scenarios (e.g., dit -> ar) need to be added, which will require modifications here.
         if stage0_pool.stage_type == "diffusion" or self._stage_pool_replica_count(stage0_pool) <= 1:
-            return None
+            return None, prompt
 
         prompts = prompt if isinstance(prompt, list) else [prompt]
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
-            return None
+            return None, prompt
 
         if self._stage_pool_is_distributed(stage0_pool):
             preselect_replica_id = getattr(stage0_pool, "preselect_replica_id", None)
@@ -180,7 +231,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     "without preselect support req=%s",
                     request_id,
                 )
-                return None
+                return None, prompt
             replica_id = preselect_replica_id(request_id)
             if replica_id is None:
                 logger.debug(
@@ -188,23 +239,18 @@ class AsyncOmniEngine(OmniEngineBase):
                     "because no serviceable replica is available yet req=%s",
                     request_id,
                 )
-                return None
+                return None, prompt
         else:
             replica_id = stage0_pool.select_replica_id(request_id)
 
-        for p in prompts:
-            self._ensure_stage_replica_mm_uuids(
-                p,
-                stage_id=0,
-                replica_id=replica_id,
-            )
+        scoped = [self._ensure_stage_replica_mm_uuids(p, stage_id=0, replica_id=replica_id) for p in prompts]
 
         logger.debug(
             "[AsyncOmniEngine] Scoped multimodal cache keys to stage-0 replica-%s for req=%s",
             replica_id,
             request_id,
         )
-        return replica_id
+        return replica_id, (scoped if isinstance(prompt, list) else scoped[0])
 
     def _build_add_request_message(
         self,
@@ -222,6 +268,7 @@ class AsyncOmniEngine(OmniEngineBase):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
@@ -252,6 +299,8 @@ class AsyncOmniEngine(OmniEngineBase):
         request_artifact_dirs: list[str] = []
 
         stage_type = self.stage_metadata[0].stage_type
+        if stage_type == "diffusion" and kv_hints is not None:
+            raise ValueError("kv_hints require an AR/LLM stage with a KV cache")
         output_prompt_text: Any = None
         _preprocess_ms = 0.0
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
@@ -285,7 +334,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 for item in prompt:
                     inject_global_id(item, request_id)
 
-            preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
+            preselected_stage0_replica, prompt = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
                 prompt,
             )
@@ -306,6 +355,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,
                     resumable=resumable,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             except Exception:
                 if preselected_stage0_replica is not None and self.stage_pools:
@@ -481,6 +531,7 @@ class AsyncOmniEngine(OmniEngineBase):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
@@ -506,6 +557,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 data_parallel_rank=data_parallel_rank,
                 reasoning_ended=reasoning_ended,
                 resumable=resumable,
+                **({"kv_hints": kv_hints} if kv_hints is not None else {}),
             )
         except BaseException:
             if isinstance(prompt, dict):
@@ -562,6 +614,7 @@ class AsyncOmniEngine(OmniEngineBase):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
     ) -> None:
         """Async add_request API."""
@@ -580,6 +633,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
 
     def add_streaming_update(

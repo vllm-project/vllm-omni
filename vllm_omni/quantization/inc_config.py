@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Extended INC/AutoRound config for multi-stage omni models."""
 
 from __future__ import annotations
@@ -50,28 +50,35 @@ def _map_with_stage_prefix(
 
 
 class OmniINCConfig(INCConfig):
-    """INCConfig extended with multi-stage prefix remapping and MXFP8 support.
+    """INC config with stage-prefix mapping and AutoRound MXFP8/NVFP4 dispatch."""
 
-    AutoRound MXFP8 checkpoints declare quant_method="auto-round" with data_type="mx_fp".
-    This config detects that case and dispatches to IncMxfp8OfflineLinearMethod instead
-    of the standard INT quantization path.
-
-    Architecture:
-      - AutoRound INT4/INT8 → standard INCConfig path (xpu_w4a16_quant_layer, etc.)
-      - AutoRound MXFP8 (data_type="mx_fp") → IncMxfp8OfflineLinearMethod
-      - Native MXFP8 (quant_method="mxfp8") → DiffusionMXFP8Config → NPUMxfp8LinearMethod (NPU only)
-    """
-
-    # Extend supported data types and formats to include MXFP8
-    SUPPORTED_DTYPES = {"int", "mx_fp"}
+    SUPPORTED_DTYPES = {"int", "mx_fp", "nv_fp"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq", "auto_round:llm_compressor"}
 
     # ------------------------------------------------------------------
-    # Core integration: called by vLLM's configure_quant_config()
+    # Quantization method selection and checkpoint name mapping
     # ------------------------------------------------------------------
 
     def get_quant_method(self, layer, prefix: str):
-        """Get quantization method, handling AutoRound MXFP8 as a special case."""
+        """Get quantization methods for AutoRound checkpoints."""
+        if self.data_type == "nv_fp":
+            from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsW4A4Fp4,
+            )
+
+            layer_config = self.config_parser.resolve(layer, prefix)
+            if isinstance(layer, LinearBase):
+                if not layer_config.quantized:
+                    return UnquantizedLinearMethod()
+                scheme = CompressedTensorsW4A4Fp4()
+                layer.scheme = scheme
+                return CompressedTensorsLinearMethod(self)
+            return None
+
         # Check if this is an AutoRound MXFP8 checkpoint (data_type="mx_fp")
         if hasattr(self, "data_type") and self.data_type == "mx_fp" and self.weight_bits == 8:
             from vllm.model_executor.layers.linear import LinearBase

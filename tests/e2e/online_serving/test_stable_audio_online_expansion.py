@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E online serving test for Stable Audio Open text-to-audio diffusion.
 
@@ -11,7 +11,6 @@ import os
 
 import pytest
 
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
@@ -32,17 +31,10 @@ def _stable_audio_server_cases(model: str):
     ]
 
 
-@pytest.fixture
-def _require_stable_audio_access() -> None:
-    """Skip cleanly (before the server boots) if the gated checkpoint is inaccessible."""
-    skip_if_gated_repo_inaccessible(STABLE_AUDIO_TEST_MODEL)
-
-
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _stable_audio_server_cases(STABLE_AUDIO_TEST_MODEL), indirect=True)
 def test_stable_audio_t2a_online(
-    _require_stable_audio_access: None,
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
 ) -> None:

@@ -97,6 +97,7 @@ def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[
 class OmniResponse:
     """Decoded multimodal / chat output from the OpenAI SDK or offline runner (not raw ``requests``)."""
 
+    request_id: str | None = None
     text_content: str | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
@@ -421,6 +422,8 @@ class OnlineOmniClient:
             text_content = ""
             audio_data = []
             for chunk in chat_completion:
+                if result.request_id is None:
+                    result.request_id = getattr(chunk, "id", None)
                 for choice in chunk.choices:
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     modality = getattr(chunk, "modality", None)
@@ -453,6 +456,7 @@ class OnlineOmniClient:
         """Wall clock from *before* ``chat.completions.create`` through response parse + local decode."""
         result = OmniResponse()
         try:
+            result.request_id = getattr(chat_completion, "id", None)
             audio_data = None
             text_content = None
             for choice in chat_completion.choices:
@@ -1444,6 +1448,9 @@ class OnlineOmniClient:
           - task_type, ref_text, ref_audio: TTS-specific extras (optional, passed via extra_body)
           - min_audio_bytes: optional minimum ``len(audio_bytes)`` checked in ``assert_audio_speech_response``
           - transcript_expected_text: local expected spoken text; defaults to ``input``
+          - transcript_model: primary Whisper model for content checks; defaults to ``small``
+          - transcript_pcm_sample_rate: local-only opt-in to transcribe mono int16 PCM;
+            must be the actual output sample rate, also used for HNR
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
 
@@ -1467,10 +1474,12 @@ class OnlineOmniClient:
             "task_type",
             "ref_text",
             "ref_audio",
+            "extra_params",
             "language",
             "max_new_tokens",
             "seed",
             "instructions",
+            "duration_seconds",
             "speed",
             "sample_rate",
             "extra_params",

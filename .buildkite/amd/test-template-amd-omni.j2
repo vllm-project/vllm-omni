@@ -3,7 +3,8 @@
    Last synced: 2026-08-04
    Modifications: Use the shared MI300 queues and Omni command-passing contract
 #}
-{% set docker_image_amd = "rocm/vllm-omni:$BUILDKITE_COMMIT" %}
+{% set docker_registry_amd = "rocm/vllm-omni" %}
+{% set docker_image_amd = docker_registry_amd ~ ":$BUILDKITE_COMMIT" %}
 {% set default_working_dir = "/app/vllm-omni" %}
 
 {# MI300 runs tests natively in Kubernetes; Docker-in-Docker is unavailable. #}
@@ -74,11 +75,12 @@ steps:
         depends_on: ~
         soft_fail: false
         commands:
-          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --target test --build-arg ARG_PYTORCH_ROCM_ARCH=gfx942 --progress plain ."
-          - "docker push {{ docker_image_amd }}"
+          - "bash .buildkite/amd/scripts/build-ci-image.sh"
         key: "amd-build"
         env:
           DOCKER_BUILDKIT: "1"
+          PYTORCH_ROCM_ARCH: "gfx942"
+          ROCM_CI_IMAGE_REGISTRY: "{{ docker_registry_amd }}"
         retry:
           automatic:
             - exit_status: -1  # Agent was lost

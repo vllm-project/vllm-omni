@@ -27,7 +27,6 @@ For the full list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
-| dots.tts | `dots-studio/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
@@ -142,42 +141,6 @@ python examples/online_serving/text_to_speech/gepard/speech_client.py \
 - Unsupported: `speed`, `extra_params` (including `temperature`/`top_p`/`top_k`), `ref_audio`, `ref_text`, `speaker_embedding`, `task_type`, `instructions`, `language`, and `word_timestamps`.
 - Concurrent requests at `max_num_seqs: 4` are supported. Native-AR recompute preemption is a known limitation of this architecture (a request that is preempted mid-generation can resume incorrectly); keep concurrency at or below `max_num_seqs` and treat preemption as out of scope until the platform fix lands.
 - Optional comparison against the upstream Gepard reference server needs Blackwell/Hopper + CUDA 13 + Postgres and is not part of CI.
-
-## dots.tts
-
-Single-stage, text-only TTS at 48 kHz. The current integration supports
-no-reference synthesis; voice cloning, reference audio, named voices, and
-precomputed speaker embeddings are not supported yet.
-
-### Launch
-
-```bash
-vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
-```
-
-### Sending requests
-
-```bash
-# Non-streaming WAV
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "Hello, this is a dots TTS online-serving test.",
-        "voice": "default",
-        "response_format": "wav"
-    }' --output output.wav
-
-# Streaming 48 kHz mono PCM
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "Hello, this is a streaming dots TTS test.",
-        "voice": "default",
-        "stream": true,
-        "stream_format": "audio",
-        "response_format": "pcm"
-    }' --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
-```
 
 ---
 
@@ -606,15 +569,15 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 
 ## MOSS-TTS Local Transformer v1.5
 
-For a single H200, the optional
-[`moss_tts_local_h200.yaml`](../../../vllm_omni/deploy/moss_tts_local_h200.yaml)
+For a single H200, the default
+[`moss_tts_local.yaml`](../../../vllm_omni/deploy/moss_tts_local.yaml)
 deployment places both the talker and codec on logical GPU 0:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 VLLM_OMNI_EVENT_DRIVEN_ORCH=1 \
     vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
     --omni --trust-remote-code \
-    --deploy-config vllm_omni/deploy/moss_tts_local_h200.yaml \
+    --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
     --disable-log-stats
 ```
 
@@ -623,18 +586,18 @@ Run from the repository root and select an available physical GPU with
 disables detailed per-request statistics logging to reduce CPU overhead at
 high concurrency. Remove `--disable-log-stats` when those statistics are needed;
 keep these settings identical when comparing performance.
-This preset configures 256 request slots per stage,
+This preset configures 128 request slots per stage,
 a 32 GiB talker KV cache, talker CUDA Graph buckets through 512 scheduled tokens,
-and codec batch buckets through 256. It requires more than 80 GiB of GPU memory;
-request capacity also depends on input and generated lengths. The default
-[`moss_tts_local.yaml`](../../../vllm_omni/deploy/moss_tts_local.yaml) remains
-available for smaller deployments.
+and codec batch buckets through 128. It requires room for both stages and
+their graph/state pools, plus `nvidia-cuda-mps-control` on `PATH`.
+For smaller deployments, override the capacities, graph buckets, KV budget
+and MPS setting in a custom deploy file.
 
-The preset enables the optional codec backend with
-`hf_overrides.codec_attention_backend: triton` on stage 1. It preserves the
-streaming ring-cache mask and uses BF16 attention with 64-dimensional heads;
-other attention shapes use PyTorch SDPA. Set the backend to `sdpa` to use the
-default attention implementation. Codec terminal tails share execution only
+The preset enables the codec backend with
+`hf_overrides.codec_attention_backend: triton_slot` on stage 1, accessing
+request-slot ring state directly with BF16 attention. Set the backend to
+`sdpa` in a custom deploy to compare with the PyTorch attention path.
+Codec terminal tails share execution only
 when they already map to the same padded CUDA Graph; returned audio retains
 each request's actual length.
 
@@ -1098,7 +1061,7 @@ vllm serve BreezeBlue/Breeze-TTS-2 --omni --port 8091
 ./breeze_tts_2/run_server.sh
 ```
 
-The deploy config at `vllm_omni/deploy/breeze_tts_2.yaml` auto-loads (async-chunk streaming, 8-frame inter-stage chunks).
+The deploy config at `vllm_omni/deploy/breeze_tts_2.yaml` auto-loads (async-chunk streaming with 1, 2, 4, then 5-frame inter-stage chunks).
 
 ### Sending requests
 

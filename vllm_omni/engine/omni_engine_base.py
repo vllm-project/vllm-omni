@@ -55,7 +55,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     OutputMessage,
 )
-from vllm_omni.engine.orchestrator import OrchestratorBase
+from vllm_omni.engine.orchestrator import OrchestratorBase, _event_driven_orch_default_for_pipeline
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
@@ -119,6 +119,7 @@ class OmniEngineBase:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when stage-init / forward paths touch these attrs.
     _log_stats: bool = False
+    _collect_stage_metrics: bool = True
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
@@ -136,6 +137,7 @@ class OmniEngineBase:
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
+        collect_stage_metrics: bool = True,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
@@ -157,6 +159,7 @@ class OmniEngineBase:
         # replica) vllm:* wrap stays registered but reads zero. Respects the
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
+        self._collect_stage_metrics = collect_stage_metrics
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
         self._client_config = client_config
 
@@ -356,6 +359,9 @@ class OmniEngineBase:
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
             model_class_name = resolve_model_class_name(self.model)
+            if model_class_name is None:
+                # use registered diffusers cls name as fallback
+                model_class_name = getattr(self.pipeline_config, "diffusers_class_name", None)
             metadata = get_diffusion_model_metadata(model_class_name)
             self._diffusion_od_config_view = SimpleNamespace(
                 model_class_name=model_class_name,
@@ -422,7 +428,7 @@ class OmniEngineBase:
             for client in self.stage_clients
         ]
         supported_tasks: set[str] = set()
-        if any(getattr(client, "is_comprehension", False) for client in self.stage_clients):
+        if any(getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs):
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
@@ -458,7 +464,9 @@ class OmniEngineBase:
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
+                collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
+                event_driven_orch_default=self._event_driven_orch_default,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -879,6 +887,9 @@ class OmniEngineBase:
     ) -> None:
         """Initialize engine-wide settings resolved from pipeline metadata."""
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
+        self._event_driven_orch_default = _event_driven_orch_default_for_pipeline(
+            pipeline_config.model_type if pipeline_config is not None else None
+        )
         # No duplex_runtime_extension / duplex_serving_adapter / duplex_control
         # here: the pre-framework wiring they named is gone, and design rule 3
         # in docs/design/fullduplex.md keeps duplex vocabulary out of the base.

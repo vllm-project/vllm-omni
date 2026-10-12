@@ -303,6 +303,70 @@ class TestFilterDataclassKwargs:
 
 
 class TestResolveOmniConfig:
+    @pytest.mark.parametrize("model_class_name", ["AnimaPipeline", "AnimaModularPipeline"])
+    def test_native_anima_checkpoint_uses_default_diffusion_stage_without_model_config(
+        self, tmp_path, mocker: MockerFixture, model_class_name: str
+    ):
+        checkpoint = tmp_path / "anima.safetensors"
+        checkpoint.write_text("dummy")
+        custom_args = {"components_path": "/tmp/anima-components"}
+        mocker.patch(
+            "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
+            side_effect=AssertionError("native Anima checkpoints should not require model config discovery"),
+        )
+
+        resolved = resolve_omni_config(
+            str(checkpoint),
+            trust_remote_code=False,
+            deploy_config_path=None,
+            cli_overrides={"model_class_name": model_class_name, "custom_pipeline_args": custom_args},
+            stage_overrides=None,
+            strategy_config_path=None,
+        )
+
+        assert resolved.config_path is None
+        assert len(resolved.stage_configs) == 1
+        stage_config = resolved.stage_configs[0]
+        assert stage_config.model_stage == "diffusion"
+        assert stage_config.diffusion_config.model_class_name == "AnimaPipeline"
+        assert stage_config.diffusion_config.custom_pipeline_args == custom_args
+
+    @pytest.mark.parametrize(
+        ("model_class_name", "checkpoint_exists", "deploy_config_path"),
+        [
+            ("AnimaPipeline", True, "deploy.yaml"),
+            ("AnimaPipeline", False, None),
+            ("FluxPipeline", True, None),
+        ],
+    )
+    def test_native_single_file_fallback_preserves_config_discovery(
+        self, tmp_path, mocker: MockerFixture, model_class_name, checkpoint_exists, deploy_config_path
+    ):
+        checkpoint = tmp_path / "model.safetensors"
+        if checkpoint_exists:
+            checkpoint.write_text("dummy")
+        create_from_model = mocker.patch(
+            "vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None
+        )
+
+        resolved = resolve_omni_config(
+            str(checkpoint),
+            trust_remote_code=False,
+            deploy_config_path=deploy_config_path,
+            cli_overrides={"model_class_name": model_class_name},
+            stage_overrides=None,
+            strategy_config_path=None,
+        )
+
+        create_from_model.assert_called_once_with(
+            str(checkpoint),
+            trust_remote_code=False,
+            cli_overrides={"model_class_name": model_class_name, "trust_remote_code": False},
+            deploy_config_path=deploy_config_path,
+            strategy_specs=None,
+        )
+        assert resolved.config_path == deploy_config_path
+
     def test_bare_deploy_name_returns_packaged_resolved_path(self, tmp_path, mocker: MockerFixture):
         deploy_name = "qwen3_omni_moe.yaml"
         deploy_path = tmp_path / deploy_name

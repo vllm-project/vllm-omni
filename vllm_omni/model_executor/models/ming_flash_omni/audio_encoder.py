@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright 2024 ANT Group and the HuggingFace Inc. team.
 # Copyright (c) 2022 OpenAI
@@ -126,7 +127,6 @@ class ResidualAttentionBlock(nn.Module):
 
     Adapted from
     https://github.com/openai/whisper/blob/v20250625/whisper/model.py
-    vllm_omni/model_executor/models/qwen3_tts/tokenizer_25hz/vq/whisper_encoder.py
     """
 
     def __init__(self, n_state: int, n_head: int, use_flash_attn: bool = True):
@@ -153,7 +153,6 @@ class WhisperAudioEncoder(nn.Module):
 
     Adapted from
     https://github.com/openai/whisper/blob/v20250625/whisper/model.py
-    vllm_omni/model_executor/models/qwen3_tts/tokenizer_25hz/vq/whisper_encoder.py
     """
 
     def __init__(

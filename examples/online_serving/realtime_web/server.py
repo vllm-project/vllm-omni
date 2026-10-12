@@ -74,17 +74,22 @@ def build_app(
     public_realtime_url: str | None = None,
     ref_audio: str | None = None,
     profile: str = "minicpm-native",
-    adapter: str = "stt",
+    turn_mode: str = "manual",
 ) -> FastAPI:
-    if profile not in {"minicpm-native", "qwen3-turn"}:
+    if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt"}:
         raise ValueError(f"Unknown profile: {profile}")
-    if adapter not in {"stt", "vad"}:
-        raise ValueError(f"Unknown adapter: {adapter}")
+    if turn_mode not in {"manual", "vad"}:
+        raise ValueError(f"Unknown turn mode: {turn_mode}")
     if profile == "qwen3-turn" and ref_audio:
         raise ValueError("Qwen3 profile does not accept --ref-audio")
+    if profile == "aura-ptt" and ref_audio:
+        raise ValueError("AURA profile does not accept --ref-audio")
     native = profile == "minicpm-native"
-    ws_backend = ws_backend or ("ws://127.0.0.1:8099" if native else "ws://127.0.0.1:8091")
-    model = model or ("openbmb/MiniCPM-o-4_5" if native else "Qwen/Qwen3-Omni-30B-A3B-Instruct")
+    aura = profile == "aura-ptt"
+    ws_backend = ws_backend or ("ws://127.0.0.1:8099" if native or aura else "ws://127.0.0.1:8091")
+    model = model or (
+        "openbmb/MiniCPM-o-4_5" if native else "aurateam/AURA" if aura else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    )
     app = FastAPI(title="Omni Realtime Web UI")
     index_path = APP_DIR / "index.html"
     app_version_hash = hashlib.sha256()
@@ -111,7 +116,7 @@ def build_app(
             {
                 "model": model,
                 "profile": profile,
-                "adapter": adapter,
+                "turnMode": turn_mode,
                 "realtimePath": public_realtime_url or "v1/realtime",
                 "refAudio": ref_audio_uri,
                 "appVersion": app_version,
@@ -182,12 +187,12 @@ def main(default_profile: str = "minicpm-native") -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
-    parser.add_argument("--profile", choices=("minicpm-native", "qwen3-turn"), default=default_profile)
+    parser.add_argument("--profile", choices=("minicpm-native", "qwen3-turn", "aura-ptt"), default=default_profile)
     parser.add_argument("--ws-backend", "--backend", dest="ws_backend")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--stt", dest="adapter", action="store_const", const="stt")
-    mode.add_argument("--vad", dest="adapter", action="store_const", const="vad")
-    parser.set_defaults(adapter="stt")
+    mode.add_argument("--manual", dest="turn_mode", action="store_const", const="manual")
+    mode.add_argument("--vad", dest="turn_mode", action="store_const", const="vad")
+    parser.set_defaults(turn_mode="manual")
     parser.add_argument(
         "--public-realtime-url",
         help="Browser-visible ws:// or wss:// Realtime URL; defaults to the same-origin proxy.",
@@ -202,12 +207,15 @@ def main(default_profile: str = "minicpm-native") -> None:
     )
     args = parser.parse_args()
     native = args.profile == "minicpm-native"
+    aura = args.profile == "aura-ptt"
     if native and not args.ref_audio:
         parser.error("--ref-audio is required for the minicpm-native profile")
     if not native and args.ref_audio:
         parser.error("--ref-audio is only supported by minicpm-native")
-    args.model = args.model or ("openbmb/MiniCPM-o-4_5" if native else "Qwen/Qwen3-Omni-30B-A3B-Instruct")
-    args.ws_backend = args.ws_backend or ("ws://127.0.0.1:8099" if native else "ws://127.0.0.1:8091")
+    args.model = args.model or (
+        "openbmb/MiniCPM-o-4_5" if native else "aurateam/AURA" if aura else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    )
+    args.ws_backend = args.ws_backend or ("ws://127.0.0.1:8099" if native or aura else "ws://127.0.0.1:8091")
 
     logging.basicConfig(level=logging.INFO)
     uvicorn.run(
@@ -217,7 +225,7 @@ def main(default_profile: str = "minicpm-native") -> None:
             public_realtime_url=args.public_realtime_url,
             ref_audio=args.ref_audio,
             profile=args.profile,
-            adapter=args.adapter,
+            turn_mode=args.turn_mode,
         ),
         host=args.host,
         port=args.port,

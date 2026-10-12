@@ -10,6 +10,10 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from vllm_omni.engine.duplex.pcm_reservation import (
+    commit_ordered_reservation,
+    rollback_ordered_reservation,
+)
 from vllm_omni.engine.duplex.plugin import PcmAppendBuffer, PcmAppendReservation
 
 
@@ -389,33 +393,23 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         return reservation.payload
 
     def _commit_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
-        if not reservation._active:
-            return
-        if not self._reservations or self._reservations[0] is not reservation:
-            raise RuntimeError("PCM append reservations must commit in wire order")
-        self._reservations.pop(0)
-        reservation._active = False
+        commit_ordered_reservation(self._reservations, reservation, head_only=True)
 
     def _rollback_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
-        if not reservation._active:
+        rolled_back = rollback_ordered_reservation(
+            self._reservations,
+            reservation,
+            self._buffer,
+            active_only=False,
+        )
+        if not rolled_back:
             return
-        try:
-            index = self._reservations.index(reservation)
-        except ValueError:
-            reservation._active = False
-            return
-        rolled_back = self._reservations[index:]
-        restored = b"".join(item._raw for item in rolled_back)
-        self._buffer[:0] = restored
         self._prepend_spans([span for item in rolled_back for span in item._spans])
         restored_groups = [list(item._video_frames) for item in rolled_back if item._video_frames]
         if restored_groups:
             self._frame_queue[:0] = restored_groups
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
-        for item in rolled_back:
-            item._active = False
-        del self._reservations[index:]
 
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
         if not self._buffer:

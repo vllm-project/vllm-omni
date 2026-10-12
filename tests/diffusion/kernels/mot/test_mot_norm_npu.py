@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
 import vllm_omni.diffusion.layers.custom_op as custom_op
-from vllm_omni.diffusion.layers.mot.mot_layernorm import MoTRMSNorm
+from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

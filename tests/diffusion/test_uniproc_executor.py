@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Single-GPU (uniproc) diffusion executor: selection and RPC behaviour."""
 
@@ -260,3 +260,52 @@ def test_shutdown_is_idempotent_and_closes_executor(executor, monkeypatch):
     empty_cache.assert_called_once_with()
     with pytest.raises(RuntimeError, match="closed"):
         exec_.collective_rpc("some_method", unique_reply_rank=0)
+
+
+def _single_request_wave(request_id: str = "req-1"):
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=request_id,
+                req=SimpleNamespace(request_id=request_id),
+                diffusion_kv_metadata=None,
+            )
+        ],
+        kv_prefetch_job=None,
+    )
+
+
+def test_execute_request_keeps_client_error_status(executor, monkeypatch):
+    """A pipeline's OmniClientError must keep its 4xx status on a single GPU.
+
+    The worker runs inline, so the exception reaches execute_request directly.
+    Flattening it to DiffusionOutput(error=str(exc)) made the engine rebuild a
+    RuntimeError and the API answer HTTP 500 for a request validation error.
+    """
+    from vllm_omni.errors import OmniClientError
+
+    exec_, worker = executor
+    worker.execute_method.side_effect = OmniClientError("clip exceeds the frame budget", status_code=422)
+    monkeypatch.setattr(exec_, "_device_is_usable", lambda: True)
+
+    batch = exec_.execute_request(_single_request_wave())
+
+    (runner_output,) = batch.runner_outputs
+    assert runner_output.finished is True
+    assert runner_output.result.error == "clip exceeds the frame budget"
+    assert runner_output.result.error_status_code == 422
+    assert runner_output.result.error_type == "BadRequestError"
+    assert exec_.is_dead is False
+
+
+def test_execute_request_server_error_has_no_client_status(executor, monkeypatch):
+    exec_, worker = executor
+    worker.execute_method.side_effect = RuntimeError("CUDA out of memory")
+    monkeypatch.setattr(exec_, "_device_is_usable", lambda: True)
+
+    batch = exec_.execute_request(_single_request_wave())
+
+    (runner_output,) = batch.runner_outputs
+    assert runner_output.result.error == "CUDA out of memory"
+    assert runner_output.result.error_status_code is None
+    assert runner_output.result.error_type is None

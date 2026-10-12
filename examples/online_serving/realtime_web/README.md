@@ -7,13 +7,14 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | Profile | Turn control | Camera | Playback acknowledgement |
 | --- | --- | --- | --- |
 | `minicpm-native` | Model-controlled listen/speak, continuous audio input | Frames accompany audio | Yes |
-| `qwen3-turn --stt` (default) | User presses **Send turn** | No | No |
+| `qwen3-turn --manual` | Press **Send turn**; mic pauses while the reply plays | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
+| `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
 checkpoint still generates committed turns; this is not native streaming-input
-KV decoding. STT remains explicit-turn and audio-only.
+KV decoding.
 
 ## MiniCPM: existing command stays valid
 
@@ -29,44 +30,68 @@ The compatibility wrapper serves the shared assets with `minicpm-native`.
 The current native query, `extra_body`, reference voice, continuous microphone
 upload, camera frames and playback acknowledgements are retained.
 
-## Qwen3: explicit-turn STT adapter
+## AURA: push-to-talk duplex
 
-Start the backend, then the UI in a second terminal:
+AURA has no client VAD. Start the duplex serve, then the thin wrapper:
+
+```bash
+bash examples/online_serving/aura_omni/run_duplex_smoke_serve.sh
+
+python -m examples.online_serving.aura_omni.realtime_web \
+    --ws-backend ws://127.0.0.1:8099 --model aurateam/AURA --port 7862
+```
+
+Or select the profile on the shared host:
+
+```bash
+python -m examples.online_serving.realtime_web --profile aura-ptt \
+    --ws-backend ws://127.0.0.1:8099 --model aurateam/AURA --port 7862
+```
+
+Open the UI, start a session, optionally enable **Camera**, then **hold**
+**Hold to talk** to stream `is_speech=true` PCM (with sticky camera frames).
+**Release** to `input_audio_buffer.commit`. Holding the button stops playback
+in the browser only; the in-flight response is not cancelled on the server.
+With the camera on, frames are still captured at 2 fps. While the button is
+up they are committed once per two frames (`is_speech=false` + silent PCM).
+Both frames of that commit are sent and packed as one video (`<|video_pad|>`).
+Turns still open from this client commit, not from a server-side auto trigger.
+but only after the prior spoken turn unlocks (text-final or `response.listen`).
+Release itself locks vision immediately so a follow-up frame cannot abort the
+just-committed speech turn on Stage0/1 (`max_num_seqs=1`). Audio still playing
+does not hold the next vision turn once text is done.
+MiniCPM / Qwen profiles do not set `pushToTalk`, so the PTT control stays hidden.
+
+## Qwen3: explicit-turn Realtime
+
+The shared UI sends OpenAI Realtime events to `/v1/realtime?duplex=0` and keeps
+conversation history on the same connection:
+
+Start the turn-based backend:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
-
-python -m examples.online_serving.qwen3_omni.realtime_web \
-    --backend ws://127.0.0.1:8091 --stt --port 7863
 ```
 
-Open `http://localhost:7863`, start a session, speak, and press **Send turn**.
-Wait for the answer to finish playing before speaking again. The UI opens a
-fresh STT connection for each turn; the displayed conversation is a local log,
-and **previous turns are not provided as model history**. The STT endpoint
-accepts only model selection, so system-prompt controls are hidden in this mode.
+In another terminal, check readiness and start the UI:
 
-The adapter follows the shipped `qwen3_omni/openai_realtime_client.py` and
-`vllm_omni/entrypoints/openai/realtime_connection.py`:
+```bash
+curl --fail http://127.0.0.1:8091/health
+python -m examples.online_serving.realtime_web --profile qwen3-turn \
+    --backend ws://127.0.0.1:8091 --manual --port 7863
+```
 
-1. Explicit `duplex=0` selects the legacy STT handler on a turn deployment.
-   It does not enable STT on a duplex deployment.
-2. Send `{type: "session.update", model: ...}` and `commit(final=false)`.
-3. Stream mono PCM16 at 16 kHz; **Send turn** flushes buffered audio, then sends `commit(final=true)`.
-4. `response.output_audio.delta.audio` contains PCM; `response.output_audio.done`
-   terminates this adapter, including a response with no audio.
-5. The local implementation emits **model output** on `transcription.*`, so the
-   UI displays it as assistant text. This differs from the early RFC's suggested
-   user-transcript mapping. The VAD adapter also supports `response.output_text.*`
-   and audio-transcript events without duplicating the answer.
+Speak, then press **Send turn**. The client commits the audio and requests a
+response; recording pauses while the reply plays.
 
 ## Qwen3 with Server VAD (automatic turns)
 
 Run commands from the repository root with the vLLM-Omni environment activated.
-Prepare the pinned Silero v6.2 ONNX artifact as described in the
-[Qwen3 Server VAD instructions](../qwen3_omni/README.md#realtime-websocket-client-openai_realtime_clientpy).
-The backend requires ONNX Runtime and a compatible local artifact; setting
-`--vad` on the UI alone does not enable VAD on the backend.
+The plugin uses the pinned Silero v6.2 ONNX artifact from
+`istupakov/silero-vad-onnx` and does not download it while serving. Make it
+available in the Hugging Face cache or set `server_vad_model_path` to a local
+copy in the overlay below. The backend requires ONNX Runtime; setting `--vad`
+on the UI alone does not enable VAD.
 
 Create an overlay named `qwen3_vad.yaml`, replacing both paths with absolute paths
 on the backend host:
@@ -90,7 +115,7 @@ In a second terminal, wait until the health check succeeds, then start the UI:
 
 ```bash
 curl --fail http://127.0.0.1:8091/health
-python -m examples.online_serving.qwen3_omni.realtime_web \
+python -m examples.online_serving.realtime_web --profile qwen3-turn \
     --backend ws://127.0.0.1:8091 --vad --port 7863
 ```
 
@@ -114,21 +139,17 @@ The bundled duplex deploy allows four audio inputs and eight images per prompt.
 Use headphones to avoid speaker audio triggering VAD interruption. Reference
 voices and tool calls are not supported by this plugin.
 
-### Switching between VAD and manual turns
+### Using the Qwen3 web UI
 
-| Mode | Backend | UI flag | Submit a turn |
-| --- | --- | --- | --- |
-| Without VAD | Default Qwen turn deployment | `--stt` (default) | Press **Send turn** |
-| With VAD | Server VAD configuration and Silero artifact | `--vad` | Pause after speaking |
+The shared UI supports both explicit turns and Server VAD. Use the manual UI
+command above with the turn-based deployment, or start the VAD deployment above
+and launch the UI with `--vad`.
 
 Stop the existing UI process before starting another on the same port, then
-refresh the browser and reconnect. To use STT, start a backend with the default
-turn deployment and restart the UI with `--stt`. The duplex backend exposes
-Realtime duplex and ChatCompletion; it does not expose the legacy STT handler.
-To enable VAD on a default backend, first restart that backend with the overlay.
-Make `--backend` match the actual backend port; the UI and backend use separate
-ports. `Connection refused` means the target backend is unavailable: check its
-startup log and `/health` before connecting.
+refresh the browser and reconnect. To enable VAD on a default backend, restart
+that backend with the overlay. Make `--backend` match the actual backend port;
+the UI and backend use separate ports. `Connection refused` means the target
+backend is unavailable: check its startup log and `/health` before connecting.
 
 VAD connects with `duplex=1` and sends nested `session.audio.input` configuration
 with `create_response: true` and `interrupt_response: true`. It sends playback
@@ -176,24 +197,26 @@ native camera protocol, where Stage 0 interleaves frames at unit boundaries.
 
 This is a supported subset, not full OpenAI Realtime API compatibility.
 `duplex=1`, `overlap_policy`, `playback.ack`, and `session.close` remain vLLM-Omni
-extensions. The legacy `--stt` mode is unchanged and is not the standard Realtime
-conversation API. This demo does not add WebRTC, semantic VAD, or tool calling.
+extensions. This demo does not add WebRTC, semantic VAD, or tool calling.
 
 ## Shared host options
 
-The shared entry point can select either profile explicitly:
+The shared entry point can select a profile explicitly:
 
 ```bash
 python -m examples.online_serving.realtime_web --profile qwen3-turn \
-    --backend ws://127.0.0.1:8091 --stt --port 7863
+    --backend ws://127.0.0.1:8091 --vad --port 7863
 ```
+
+This Qwen3 UI profile requires the server-VAD deployment above.
 
 - `--backend` / `--ws-backend`: backend WebSocket origin (not the full `/v1/realtime` URL).
 - `--model`: override the wrapper's model name.
+- `--manual` / `--vad`: Qwen turn control; manual turns are the default.
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).
-- `--ref-audio`: required for MiniCPM; rejected for Qwen3.
+- `--ref-audio`: required for MiniCPM; rejected for Qwen3 and AURA.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.
@@ -211,7 +234,7 @@ pytest -m cpu tests/model_executor/models/qwen3_omni/test_duplex_plugin.py \
        tests/engine/test_duplex_orchestrator.py
 ```
 
-These CPU tests cover profile messages, two STT turns, VAD terminal/drain ordering,
+These CPU tests cover profile message serialization, VAD terminal/drain ordering,
 backpressure, native capture during playback, server config injection, and shared
 worklets. Backend regressions cover current audio inclusion in history-based
 prompts, delayed playback ACK ordering, and no extra generation during silence

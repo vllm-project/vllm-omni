@@ -11,6 +11,7 @@
                 }
             },
             "local_model",
+            "slow",
             "diffusion"
         ],
         "server_params": {
@@ -31,6 +32,45 @@
                 "height": {
                     "min": 512,
                     "max": 2048
+                },
+                "num_inference_steps": 50,
+                "enable_negative_prompt": true
+            }
+        ]
+    },
+    {
+        "test_name": "test_qwen_image_stability_a3",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "npu": "A3"
+                    },
+                    "num_cards": 1
+                }
+            },
+            "local_model",
+            "slow",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "Qwen/Qwen-Image"
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2i",
+                "backend": "vllm-omni",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "width": {
+                    "min": 512,
+                    "max": 1000
+                },
+                "height": {
+                    "min": 512,
+                    "max": 1000
                 },
                 "num_inference_steps": 50,
                 "enable_negative_prompt": true

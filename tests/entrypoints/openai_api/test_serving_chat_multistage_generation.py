@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for multistage generation input construction."""
 
 from __future__ import annotations
@@ -92,6 +93,34 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+@pytest.mark.parametrize("extra_body", [{}, {"bot_task": "think"}])
+def test_build_multistage_generation_inputs_leaves_mm_uuids_to_content_hash(serving_chat, extra_body):
+    """Fixed image UUIDs collide across requests with the same processor kwargs.
+
+    Leave UUID generation to vLLM so cache keys depend on image content.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[SamplingParams(temperature=0.0), OmniDiffusionSamplingParams()],
+    )
+    for images in ([Image.new("RGB", (32, 32), color="red")], [Image.new("RGB", (32, 32), c) for c in ("red", "blue")]):
+        engine_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+            serving_chat,
+            engine=engine,
+            prompt="edit me",
+            extra_body=dict(extra_body),
+            reference_images=images,
+            gen_params=OmniDiffusionSamplingParams(seed=0),
+        )
+        assert engine_prompt["multi_modal_data"]
+        assert "multi_modal_uuids" not in engine_prompt
 
 
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -18,13 +18,12 @@ from vllm.logger import init_logger
 from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
+from vllm_omni.engine.duplex.plugin import DuplexDataPlane, EncodeAudio
 from vllm_omni.outputs.duplex import (
     get_duplex_output_decision,
 )
 
 logger = init_logger(__name__)
-
-EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +136,7 @@ def _speech_end_event(request_id: str) -> dict[str, object]:
     }
 
 
-class NemotronVoiceChatDataPlaneSession:
+class NemotronVoiceChatDataPlaneSession(DuplexDataPlane):
     """Join frame-locked text/function outputs with Stage-2 audio."""
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
@@ -148,7 +147,14 @@ class NemotronVoiceChatDataPlaneSession:
         self._special_ids: dict[str, int] | None = None
 
     def configure_runtime(self, runtime_config: Mapping[str, object], *, tokenizer: Any | None = None) -> None:
-        """Install the serving-resolved tokenizer contract as the sole truth."""
+        """Install the serving-resolved tokenizer contract as the sole truth.
+
+        The data plane instance is engine-scoped (one per loaded plugin) while
+        :meth:`configure_runtime` runs once per session open. The contract is a
+        function of the checkpoint, so reconfiguration must be idempotent — a
+        second session that resolves a *different* contract indicates a server
+        bug or a mixed deployment and is rejected in the open path.
+        """
         try:
             special_ids = {
                 "bos": int(runtime_config["nvc_text_bos_id"]),
@@ -162,9 +168,15 @@ class NemotronVoiceChatDataPlaneSession:
         tokenizer_ref = runtime_config.get("nvc_tokenizer_ref")
         if not isinstance(tokenizer_ref, str) or not tokenizer_ref:
             raise ValueError("Nemotron VoiceChat data plane requires nvc_tokenizer_ref")
+        if self._special_ids is not None and (self._special_ids != special_ids or self._tokenizer_ref != tokenizer_ref):
+            raise ValueError(
+                "Nemotron VoiceChat data plane is engine-scoped: a later session resolved a "
+                f"different token contract ({self._tokenizer_ref!r} -> {tokenizer_ref!r})"
+            )
         self._special_ids = special_ids
         self._tokenizer_ref = tokenizer_ref
-        self._tokenizer = tokenizer
+        if tokenizer is not None:
+            self._tokenizer = tokenizer
 
     def begin_request(self, request_id: str) -> None:
         self._requests.setdefault(request_id, _RequestState()).terminal = False
@@ -185,24 +197,23 @@ class NemotronVoiceChatDataPlaneSession:
             if duplex_resource_request_belongs_to_session(request_id, session_id):
                 self._requests.pop(request_id, None)
 
-    def _load_tokenizer(self):
-        if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            if self._tokenizer_ref is None:
-                raise RuntimeError("Nemotron VoiceChat data plane was used before runtime configuration")
-            self._tokenizer = AutoTokenizer.from_pretrained(self._tokenizer_ref, trust_remote_code=False)
-        return self._tokenizer
-
     def _ids(self) -> dict[str, int]:
         if self._special_ids is None:
             raise RuntimeError("Nemotron VoiceChat data plane was used before runtime configuration")
         return self._special_ids
 
     def _decode(self, token_ids: list[int]) -> str:
+        """Decode token ids on the projection path; the tokenizer must already be installed.
+
+        ``configure_runtime`` (called from the plugin's ``prepare_runtime_config`` during
+        session open, off the event loop) is the only place a tokenizer is loaded.
+        """
         if not token_ids:
             return ""
-        return str(self._load_tokenizer().decode(token_ids, skip_special_tokens=True))
+        tokenizer = self._tokenizer
+        if tokenizer is None:
+            raise RuntimeError("Nemotron VoiceChat data plane was used before runtime configuration")
+        return str(tokenizer.decode(token_ids, skip_special_tokens=True))
 
     def project(
         self,
