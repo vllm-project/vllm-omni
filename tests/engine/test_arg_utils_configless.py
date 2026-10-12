@@ -63,9 +63,12 @@ def test_a_local_chatterbox_directory_with_an_invalid_config_is_left_alone_001(t
 
 
 def test_an_unlisted_model_type_is_left_alone_001(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{")
     args = OmniEngineArgs(model=str(tmp_path), model_arch="CosyVoice3Model")
     args.hf_config_path = None
 
     args._patch_empty_hf_config("cosyvoice3")
 
     assert args.hf_config_path is None
+    assert config_path.read_text() == "{"
