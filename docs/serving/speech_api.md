@@ -339,6 +339,14 @@ at each detected boundary (lower time-to-first-audio for STT/LLM pipelines).
 > payload vs chunked PCM). Text segmentation is controlled separately by
 > `split_granularity`.
 
+The server continues receiving messages while synthesizing audio and processes
+queued input in arrival order. Each connection retains at most 4096 pending
+messages and 8 MiB of pending UTF-8 message data, in addition to the existing
+per-message limits. Exceeding either queue limit aborts active generation,
+emits `Too many pending WebSocket messages`, and closes the connection with
+code `1008`. Disconnecting also aborts active generation. Active synthesis time
+does not count toward the idle timeout.
+
 ### WebSocket Protocol
 
 Client -> Server:
