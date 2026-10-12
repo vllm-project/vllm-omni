@@ -71,7 +71,7 @@ python ../text_to_audio/text_to_audio.py \
 `text_to_audio.py` already supports the relevant flags; SA3 just unlocks longer durations:
 
 | Flag | SA Open 1.0 max | SA3 Medium max | Notes |
-|------|----------------|-----------------|-------|
+| ------ | ---------------- | ----------------- | ------- |
 | `--audio-length` | ~47 s | **380 s** | Per Stability AI release |
 | `--num-inference-steps` | 100 (default) | 100 | Same default works |
 | `--guidance-scale` | 7.0 | 7.0 | CFG, same default |
@@ -88,7 +88,7 @@ SA3 ships three SAME variants (Small Music / Small SFX / Medium). The checkpoint
 ## Hardware
 
 | Variant | Peak VRAM | Notes |
-|---------|-----------|-------|
+| --------- | ----------- | ------- |
 | `stable-audio-3-medium` | ~6.5 GB | Single commodity GPU (RTX 3090 / 4070 / A100) |
 | `stable-audio-3-small-music` | CPU-targeted | Quality lower; use only when no GPU |
 | `stable-audio-3-small-sfx` | CPU-targeted | Quality lower; use only when no GPU |

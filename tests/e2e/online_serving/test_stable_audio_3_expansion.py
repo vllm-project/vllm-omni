@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stable Audio 3 online e2e: text-to-audio via the /v1/audio/generate endpoint.
 
 Mirrors the audio-diffusion serving path used by stable-audio-open
