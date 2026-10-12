@@ -128,8 +128,11 @@ def test_flag_parsing(monkeypatch) -> None:
         assert _event_driven_orch_enabled() is False
 
 
-def test_only_qwen3_tts_has_a_pipeline_default() -> None:
-    assert _event_driven_orch_default_for_pipeline("qwen3_tts") is True
+def test_event_driven_pipeline_default() -> None:
+    from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+
+    for model_type in ("qwen3_tts", PERSONAPLEX_PIPELINE.model_type):
+        assert _event_driven_orch_default_for_pipeline(model_type) is True
     for model_type in (None, "qwen3_omni_moe", "minicpmo_4_5", "moss_tts_delay"):
         assert _event_driven_orch_default_for_pipeline(model_type) is False
 

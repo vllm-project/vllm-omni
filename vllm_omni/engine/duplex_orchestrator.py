@@ -397,7 +397,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         if submission.already_submitted:
             if not submission.resumable:
                 raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")
-            replica_id = await pool.submit_update(context.request_id, request_state, request)
+            replica_id = await pool.submit_update(
+                context.request_id,
+                request_state,
+                request,
+                coalesce=self.plugin.coalesces_resumable_updates,
+            )
         else:
             replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
             if self.async_chunk and context.stage_id == 0:

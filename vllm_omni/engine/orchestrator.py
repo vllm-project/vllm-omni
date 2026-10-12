@@ -101,7 +101,10 @@ def _event_driven_orch_enabled(*, default: bool = False) -> bool:
 
 def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> bool:
     """Return whether a pipeline has a validated event-driven default."""
-    return pipeline_model_type == "qwen3_tts"
+    # PersonaPlex serves every live duplex session as one resumable Stage 0
+    # request that appends an 80 ms frame per step, and the loop that routes
+    # those outputs also runs every session's runner.
+    return pipeline_model_type in ("qwen3_tts", "personaplex")
 
 
 def _build_terminal_empty_output(

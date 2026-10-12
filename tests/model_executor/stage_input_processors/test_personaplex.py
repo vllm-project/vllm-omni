@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import SKIP_TRANSFER
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
     PersonaPlexTalkerForConditionalGeneration,
 )
@@ -73,14 +74,37 @@ def test_async_chunk_keeps_delay_tail_across_resumable_segments() -> None:
         is_finished=True,
     )
 
-    assert first is not None
-    assert first.codes is None
-    assert first.meta is not None
-    assert first.meta.finished.item() is False
-    assert first.meta.is_segment_finished.item() is False
+    assert first is SKIP_TRANSFER
     expected = torch.cat([first_frame[:, :1], second_frame[:, 1:]], dim=1).reshape(-1)
     assert torch.equal(second.codes.audio, expected)
     assert manager.request_payload["req"]["personaplex_frames"][0].equal(second_frame.reshape(-1))
+
+
+def test_async_chunk_emits_initial_then_fixed_chunks_and_skips_the_rest() -> None:
+    manager = SimpleNamespace(
+        connector=SimpleNamespace(config={"extra": {"initial_codec_chunk_frames": 1, "codec_chunk_frames": 5}})
+    )
+    request = SimpleNamespace(
+        request_id="req",
+        external_req_id="req",
+        resumable=True,
+        is_finished=lambda: True,
+        additional_information=None,
+    )
+    frames = [torch.arange(8, dtype=torch.long).reshape(1, 8) + 100 * i for i in range(17)]
+    chunks = []
+    for frame in frames:
+        request.additional_information = {"codes": {"audio": frame}}
+        payload = talker2code2wav_async_chunk(manager, multimodal_output=None, request=request, is_finished=True)
+        if payload is SKIP_TRANSFER:
+            continue
+        assert payload.meta.finished.item() is False
+        chunks.append(payload.codes.audio.reshape(8, -1))
+
+    assert [codes.shape[1] for codes in chunks] == [1, 5, 5, 5]
+    raw = torch.cat(frames, dim=0)
+    dedelayed = torch.cat([raw[:-1, :1], raw[1:, 1:]], dim=1).transpose(0, 1)
+    assert torch.equal(torch.cat(chunks, dim=1), dedelayed[:, :16])
 
 
 def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:

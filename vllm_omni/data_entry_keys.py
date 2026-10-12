@@ -31,6 +31,22 @@ TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 # scheduler pops these keys before the request reaches the model.
 ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
 
+
+class _SkipTransfer:
+    """Type of :data:`SKIP_TRANSFER`."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "SKIP_TRANSFER"
+
+
+# A next-stage input processor returns this to send nothing for a non-terminal
+# chunk, even at a resumable segment boundary where ``None`` would still send a
+# segment marker. Nothing reaches the connector and the chunk key is not used,
+# so the next chunk that is sent takes it. Terminal chunks always go out.
+SKIP_TRANSFER = _SkipTransfer()
+
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Talker -> Code2Wav input processors for PersonaPlex.
 
 The talker (stage 0) emits, per frame, the ``dep_q`` depformer audio codes under
@@ -21,9 +21,11 @@ from typing import Any
 import torch
 
 from vllm_omni.data_entry_keys import (
+    SKIP_TRANSFER,
     CodesStruct,
     MetaStruct,
     OmniPayloadStruct,
+    _SkipTransfer,
 )
 
 _NUM_ACTIVE_CODEBOOKS = 8  # agent cb 0..7 (the PCM-bearing rows)
@@ -153,12 +155,13 @@ def talker2code2wav_async_chunk(
     multimodal_output: Any,
     request: Any,
     is_finished: bool = False,
-) -> OmniPayloadStruct | None:
+) -> OmniPayloadStruct | _SkipTransfer:
     """Streaming: accumulate per-frame agent codes, emit a codebook-major chunk.
 
     Minimal fixed-chunk variant (no left-context / ref-code complexity, which
     PersonaPlex does not use). Frames are buffered on the transfer manager until a
-    chunk's worth is ready (or the request finishes), then flushed.
+    chunk's worth is ready (or the request finishes), then flushed; a frame that
+    only buffers sends nothing.
     """
     request_id = getattr(request, "external_req_id", getattr(request, "request_id", "?"))
     # The adapter passes ``is_finished=True`` for both a resumable segment
@@ -207,24 +210,17 @@ def talker2code2wav_async_chunk(
     # N + 1 raw depformer rows.
     available_frames = max(0, len(frames) - 1)
     if available_frames < target_frames and not finished:
-        # Each full-duplex input frame is a resumable stage-0 segment. Returning
-        # None would make the generic chunk adapter synthesize a
-        # segment-finished marker, wake Code2Wav with its one-token placeholder,
-        # and discard the buffered de-delay tail. Explicitly keep this transport
-        # chunk non-terminal until enough successor frames exist.
-        pending = torch.tensor(False, dtype=torch.bool)
-        return OmniPayloadStruct(
-            meta=MetaStruct(
-                finished=pending,
-                is_segment_finished=pending,
-            )
-        )
+        # Each full-duplex input frame is a resumable stage-0 segment. None
+        # would make the generic chunk adapter synthesize a segment-finished
+        # marker, wake Code2Wav with its one-token placeholder, and discard the
+        # buffered de-delay tail; send nothing until enough frames exist.
+        return SKIP_TRANSFER
     emit_frames = available_frames if finished else target_frames
     if emit_frames <= 0:
         if finished:
             request_payload.pop(request_id, None)
             return _empty_finished_payload()
-        return None
+        return SKIP_TRANSFER
 
     stacked = torch.stack(frames[: emit_frames + 1], dim=0)  # [F+1, dep_q]
     flat = _agent_codes_to_codebook_major(stacked)
