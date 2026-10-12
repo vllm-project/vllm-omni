@@ -52,8 +52,14 @@ class BoundedAllocatorCache:
         self.min_free_fraction = min_free_fraction
 
     def _should_release(self) -> bool:
-        reserved = int(torch.accelerator.memory_reserved(self.device))
-        allocated = int(torch.accelerator.memory_allocated(self.device))
+        if self.device.type == "npu":
+            # The NPU allocator does not implement the generic DeviceAllocator interface.
+            device_module = torch.get_device_module(self.device)
+            reserved = int(device_module.memory_reserved(self.device))
+            allocated = int(device_module.memory_allocated(self.device))
+        else:
+            reserved = int(torch.accelerator.memory_reserved(self.device))
+            allocated = int(torch.accelerator.memory_allocated(self.device))
         free, total = current_omni_platform.get_device_memory(self.device)
         cached = max(0, reserved - allocated)
         return cached > int(total * self.max_cached_fraction) or free < int(total * self.min_free_fraction)
@@ -66,7 +72,7 @@ class BoundedAllocatorCache:
                     return False
             except Exception as exc:
                 # Preserve the pre-retention behavior on platforms that do not
-                # expose allocator telemetry through torch.accelerator.
+                # expose allocator telemetry.
                 logger.debug("Allocator cache telemetry unavailable; releasing cache: %s", exc)
         current_omni_platform.empty_cache()
         return True
@@ -98,6 +104,12 @@ class PinnedModuleStager:
     A module iterable is treated as one staging group. It uses one copy stream
     and one reusable completion event. Tensors sharing storage keep their
     shapes, strides, offsets, dtypes, and aliases across every transition.
+
+    With ``retain_device_storage`` the device storages survive ``offload``:
+    ``load`` then only rebinds to the same fixed storages (weights are
+    immutable, so no H2D copy repeats). The stable storage addresses keep
+    CUDA-graph-captured weight pointers valid across offload/load swaps, at
+    the cost of keeping the device storage resident while offloaded.
     """
 
     def __init__(
@@ -108,6 +120,7 @@ class PinnedModuleStager:
         pin_memory: bool = True,
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
+        retain_device_storage: bool = False,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -117,6 +130,7 @@ class PinnedModuleStager:
         self.copy_stream = copy_stream if copy_stream is not None else current_omni_platform.Stream()
         self._ready_event = current_omni_platform.Event()
         self.cache_retention = cache_retention
+        self.retain_device_storage = retain_device_storage
         self.loaded = False
         self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
         self._device_storages: list[torch.Tensor] = []
@@ -191,9 +205,15 @@ class PinnedModuleStager:
         )
 
     def _bind(self, storages: list[torch.Tensor]) -> None:
+        # Staging commonly runs inside inference_mode. Assigning an inference
+        # tensor to Parameter.data would turn the parameter into an inference
+        # tensor too, silently disabling version increments on later edits.
+        # Preserve each target's original semantics. An inference parameter
+        # cannot acquire a version counter by rebinding its storage either.
         for storage, group in zip(storages, self._groups):
             for binding in group.bindings:
-                set_tensor_storage(binding.target, self._view(storage, binding))
+                with torch.inference_mode(self._local_tensor(binding.target).is_inference()):
+                    set_tensor_storage(binding.target, self._view(storage, binding))
 
     def _restore_masters(self) -> None:
         self._bind([group.master for group in self._groups])
@@ -234,6 +254,12 @@ class PinnedModuleStager:
     def load(self) -> None:
         if self.loaded:
             return
+        if self._device_storages:
+            # Storage retained from a previous load still holds the immutable
+            # weights; rebinding suffices, no H2D copy repeats.
+            self._bind(self._device_storages)
+            self.loaded = True
+            return
         try:
             self._load_once()
         except torch.OutOfMemoryError:
@@ -263,7 +289,8 @@ class PinnedModuleStager:
             self.loaded = False
             self._release_cache(force=True)
             raise
-        self._device_storages.clear()
+        if not self.retain_device_storage:
+            self._device_storages.clear()
         self.loaded = False
         self._release_cache()
 

@@ -11,6 +11,7 @@ import logging
 import os
 import struct
 import wave
+from collections import OrderedDict
 from dataclasses import FrozenInstanceError, replace
 from http import HTTPStatus
 from inspect import Signature, signature
@@ -29,11 +30,14 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.outputs import CompletionOutput
 
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
@@ -61,10 +65,13 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -77,11 +84,48 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     SPEAKER_EMBEDDING_DIM,
     TEXT_EOS_TOKEN_ID,
 )
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
+    REF_AUDIO_CACHE_KEY,
+    Qwen3TTSPromptEmbedsBuilder,
+)
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.mark.parametrize("sse", [False, True])
+@pytest.mark.parametrize("payload", [None, "empty", "valid"])
+@pytest.mark.asyncio
+async def test_moss_empty_stream_is_an_error(sse, payload):
+    serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    serving._tts_model_type = "moss_tts"
+    serving.engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5")
+    )
+    serving._adapter = MossTTSAdapter(SpeechServingContext(server=serving, engine_client=serving.engine_client))
+
+    async def results():
+        if payload is not None:
+            audio = torch.zeros(320) if payload == "valid" else torch.empty(0)
+            yield SimpleNamespace(multimodal_output={"model_outputs": audio, "sr": 24000})
+            yield SimpleNamespace(multimodal_output={"model_outputs": torch.empty(0), "sr": 24000})
+
+    if sse:
+        events = [event async for event in serving._generate_audio_sse_events(results(), "moss-empty")]
+        assert any("speech.audio.done" in event for event in events) == (payload == "valid")
+        assert any("speech.audio.error" in event for event in events) == (payload != "valid")
+    else:
+        chunks = serving._generate_audio_chunks(results(), "moss-empty", response_format="wav")
+        if payload == "valid":
+            output = [chunk async for chunk in chunks]
+            assert len(output) == 2 and output[0].startswith(b"RIFF")
+            assert len(output[1]) == 640
+        else:
+            with pytest.raises(TTSGenerationError, match="no audio"):
+                await anext(chunks)
 
 
 class TestAudioMixin:
@@ -828,7 +872,7 @@ class TestSpeechAPI:
             diffusion_engine=engine_client,
             model_name="test-model",
         )
-        assert server._adapter is None
+        assert isinstance(server._adapter, OmniVoiceAdapter)
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="test-input", voice="test-voice"))
 
@@ -3431,88 +3475,105 @@ class TestStreamingProtocolValidation:
         assert req.is_raw_audio_stream() is False
 
 
+def _build_streaming_speech_app(
+    mocker: MockerFixture,
+    chunk: torch.Tensor | None = None,
+    sample_rate: int | None = None,
+) -> FastAPI:
+    """Speech app whose mock engine yields one intermediate then one final chunk.
+
+    ``sample_rate`` is reported as the model's ``sr`` when given; omitted, the
+    serving layer's 24 kHz default applies (as for most TTS models).
+    """
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    if chunk is None:
+        chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
+
+    def _make_output(finished: bool) -> OmniRequestOutput:
+        mm_output: dict = {"audio": chunk}
+        if sample_rate is not None:
+            mm_output["sr"] = torch.tensor(sample_rate)
+
+        class MockCompletionOutput:
+            def __init__(self, index: int = 0):
+                self.index = index
+                self.text = ""
+                self.token_ids: list[int] = []
+                self.finish_reason = "stop"
+                self.stop_reason = None
+                self.logprobs = None
+
+        class MockRequestOutput:
+            def __init__(self, multimodal_output: dict):
+                self.request_id = "speech-stream-test"
+                self.outputs = [MockCompletionOutput(index=0)]
+                self.multimodal_output = multimodal_output
+                self.finished = finished
+                self.prompt_token_ids = None
+                self.encoder_prompt_token_ids = None
+                self.num_cached_tokens = None
+                self.prompt_logprobs = None
+                self.kv_transfer_params = None
+
+        return OmniRequestOutput.from_stage_output(
+            MockRequestOutput(mm_output),
+            stage_id=0,
+            final_output_type="audio",
+            finished=finished,
+        )
+
+    async def mock_generate_streaming(*args, **kwargs):
+        yield _make_output(finished=False)
+        yield _make_output(finished=True)
+
+    mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+    mock_engine_client.default_sampling_params_list = [{}]
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    speech_server = OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+    speech_server._tts_model_type = None
+    speech_server._adapter = None
+    speech_server._diffusion_mode = False
+    mocker.patch.object(speech_server, "_uses_native_speed_control", return_value=False)
+    mocker.patch.object(
+        speech_server,
+        "create_error_response",
+        side_effect=lambda message, **_: JSONResponse(
+            status_code=400,
+            content={"error": {"message": message}},
+        ),
+    )
+
+    original_create_speech = speech_server.create_speech
+    sig = signature(original_create_speech)
+    new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
+    new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+
+    async def awaitable_create_speech(*args, **kwargs):
+        return await original_create_speech(*args, **kwargs)
+
+    awaitable_create_speech.__signature__ = new_sig  # type: ignore[attr-defined]
+    speech_server.create_speech = awaitable_create_speech
+
+    app = FastAPI()
+    app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+    app.state.speech_server = speech_server
+    return app
+
+
 class TestStreamingResponse:
     """Integration tests for the streaming audio response path."""
 
     @pytest.fixture
     def streaming_app(self, mocker: MockerFixture):
         """Test app whose mock engine yields one intermediate chunk then a final chunk."""
-        mock_engine_client = mocker.MagicMock()
-        mock_engine_client.errored = False
-
-        def _make_output(finished: bool) -> OmniRequestOutput:
-            chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
-
-            class MockCompletionOutput:
-                def __init__(self, index: int = 0):
-                    self.index = index
-                    self.text = ""
-                    self.token_ids: list[int] = []
-                    self.finish_reason = "stop"
-                    self.stop_reason = None
-                    self.logprobs = None
-
-            class MockRequestOutput:
-                def __init__(self, audio_tensor: torch.Tensor):
-                    self.request_id = "speech-stream-test"
-                    self.outputs = [MockCompletionOutput(index=0)]
-                    self.multimodal_output = {"audio": audio_tensor}
-                    self.finished = finished
-                    self.prompt_token_ids = None
-                    self.encoder_prompt_token_ids = None
-                    self.num_cached_tokens = None
-                    self.prompt_logprobs = None
-                    self.kv_transfer_params = None
-
-            return OmniRequestOutput.from_stage_output(
-                MockRequestOutput(audio_tensor=chunk),
-                stage_id=0,
-                final_output_type="audio",
-                finished=finished,
-            )
-
-        async def mock_generate_streaming(*args, **kwargs):
-            yield _make_output(finished=False)
-            yield _make_output(finished=True)
-
-        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
-        mock_engine_client.default_sampling_params_list = [{}]
-        mock_models = mocker.MagicMock()
-        mock_models.is_base_model.return_value = True
-
-        speech_server = OmniOpenAIServingSpeech(
-            engine_client=mock_engine_client,
-            models=mock_models,
-            request_logger=mocker.MagicMock(),
-        )
-        speech_server._tts_model_type = None
-        speech_server._adapter = None
-        speech_server._diffusion_mode = False
-        mocker.patch.object(speech_server, "_uses_native_speed_control", return_value=False)
-        mocker.patch.object(
-            speech_server,
-            "create_error_response",
-            side_effect=lambda message, **_: JSONResponse(
-                status_code=400,
-                content={"error": {"message": message}},
-            ),
-        )
-
-        original_create_speech = speech_server.create_speech
-        sig = signature(original_create_speech)
-        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
-        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
-
-        async def awaitable_create_speech(*args, **kwargs):
-            return await original_create_speech(*args, **kwargs)
-
-        awaitable_create_speech.__signature__ = new_sig  # type: ignore[attr-defined]
-        speech_server.create_speech = awaitable_create_speech
-
-        app = FastAPI()
-        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
-        app.state.speech_server = speech_server
-        return app
+        return _build_streaming_speech_app(mocker)
 
     @staticmethod
     def _assert_sse_audio_response(response, response_format: str = "pcm"):
@@ -3566,6 +3627,7 @@ class TestStreamingResponse:
             tts_params=None,
             collect=None,
             target_sample_rate=None,
+            audio_format=None,
         ):
             captured["tts_params"] = tts_params
             captured["target_sample_rate"] = target_sample_rate
@@ -3751,6 +3813,146 @@ class TestStreamingResponse:
         response = client.post("/v1/audio/speech", json={"input": "Hello", "response_format": "wav"})
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
+
+
+class TestSpeechAudioFormatMetadata:
+    """pcm carries no header, so responses must state the model-native format."""
+
+    # 24 kHz mono (most TTS models) and 48 kHz [channels, samples] stereo
+    # (e.g. MOSS-TTS-Local v1.5); the serving layer must not care which.
+    _MONO = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 2400))
+    _STEREO = torch.stack([_MONO.repeat(2) * 0.5, -_MONO.repeat(2) * 0.25])
+
+    _CASES = [
+        pytest.param(None, None, 24000, 1, id="default-24k-mono"),
+        pytest.param(_MONO, 24000, 24000, 1, id="explicit-24k-mono"),
+        pytest.param(_STEREO, 48000, 48000, 2, id="48k-stereo"),
+    ]
+
+    @staticmethod
+    def _expected_pcm(chunk: torch.Tensor | None) -> bytes:
+        """Two engine outputs, each the chunk as interleaved s16le."""
+        # ``None`` is the builder's default chunk.
+        audio = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000)) if chunk is None else chunk
+        samples = audio.numpy().T if audio.ndim == 2 else audio.numpy()
+        # libsndfile-compatible PCM_16 conversion used by ``create_audio``.
+        one = np.clip(np.floor(samples.astype(np.float64) * 32768.0), -32768, 32767).astype("<i2").tobytes()
+        return one * 2
+
+    @pytest.mark.parametrize(("chunk", "model_sr", "rate", "channels"), _CASES)
+    def test_raw_pcm_stream_headers(self, mocker: MockerFixture, chunk, model_sr, rate, channels):
+        app = _build_streaming_speech_app(mocker, chunk=chunk, sample_rate=model_sr)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("audio/pcm")
+        assert response.headers["x-audio-sample-rate"] == str(rate)
+        assert response.headers["x-audio-channels"] == str(channels)
+        exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+        assert {"x-audio-sample-rate", "x-audio-channels"} <= exposed
+        # The body stays the model-native interleaved s16le stream, byte for byte.
+        assert response.content == self._expected_pcm(chunk)
+
+    # WAV streaming requires the model to report ``sr`` on its first chunk.
+    @pytest.mark.parametrize(("chunk", "model_sr", "rate", "channels"), _CASES[1:])
+    def test_raw_wav_stream_header_matches_metadata(self, mocker: MockerFixture, chunk, model_sr, rate, channels):
+        app = _build_streaming_speech_app(mocker, chunk=chunk, sample_rate=model_sr)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "wav"},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["x-audio-sample-rate"] == str(rate)
+        assert response.headers["x-audio-channels"] == str(channels)
+        num_channels, sample_rate = struct.unpack("<HI", response.content[22:28])
+        assert (sample_rate, num_channels) == (rate, channels)
+
+    @pytest.mark.parametrize(("chunk", "model_sr", "rate", "channels"), _CASES)
+    def test_sse_deltas_carry_format(self, mocker: MockerFixture, chunk, model_sr, rate, channels):
+        app = _build_streaming_speech_app(mocker, chunk=chunk, sample_rate=model_sr)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "response_format": "pcm"},
+        )
+
+        deltas = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and '"speech.audio.delta"' in line
+        ]
+        assert deltas
+        assert all((d["sample_rate"], d["channels"]) == (rate, channels) for d in deltas)
+
+    @pytest.mark.parametrize(("chunk", "model_sr", "rate", "channels"), _CASES)
+    def test_non_streaming_pcm_headers(self, mocker: MockerFixture, chunk, model_sr, rate, channels):
+        app = _build_streaming_speech_app(mocker, chunk=chunk, sample_rate=model_sr)
+        response = TestClient(app).post("/v1/audio/speech", json={"input": "Hello", "response_format": "pcm"})
+
+        assert response.status_code == 200
+        assert response.headers["x-audio-sample-rate"] == str(rate)
+        assert response.headers["x-audio-channels"] == str(channels)
+        assert len(response.content) % (2 * channels) == 0
+
+    def test_requested_sample_rate_is_reported(self, mocker: MockerFixture):
+        """The headers describe the bytes sent, i.e. after request.sample_rate resampling."""
+        app = _build_streaming_speech_app(mocker)
+        speech_server = app.state.speech_server
+        mocker.patch.object(speech_server, "_validate_speech_sample_rate", return_value=None)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm", "sample_rate": 8000},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["x-audio-sample-rate"] == "8000"
+        assert response.headers["x-audio-channels"] == "1"
+        # Two 1 s chunks at 8 kHz mono s16le, within resampler edge tolerance.
+        assert abs(len(response.content) - 2 * 8000 * 2) <= 2 * 64
+
+    def test_raw_stream_error_before_audio_is_an_http_error(self, mocker: MockerFixture):
+        """Priming the first chunk lets a pre-audio failure return a real status code."""
+        app = _build_streaming_speech_app(mocker)
+        speech_server = app.state.speech_server
+
+        async def failing_generate(*args, **kwargs):
+            raise RuntimeError("boom before audio")
+            yield  # pragma: no cover - generator marker, unreachable
+
+        speech_server.engine_client.generate = mocker.MagicMock(side_effect=failing_generate)
+        response = TestClient(app).post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm"},
+        )
+
+        assert response.status_code >= 400
+        assert "audio/pcm" not in response.headers.get("content-type", "")
+        assert "x-audio-sample-rate" not in response.headers
+
+    def test_primed_stream_closes_inner_generator(self):
+        """Closing the response body before iteration still closes the engine stream."""
+        from vllm_omni.entrypoints.openai.serving_speech import _PrimedAudioStream
+
+        closed: list[bool] = []
+
+        async def chunks():
+            try:
+                yield b"\x01\x00"
+                yield b"\x02\x00"
+            finally:
+                closed.append(True)
+
+        async def run() -> list[bytes]:
+            body = await _PrimedAudioStream.start(chunks())
+            await body.aclose()
+            assert closed == [True]
+            body = await _PrimedAudioStream.start(chunks())
+            return [c async for c in body]
+
+        assert asyncio.run(run()) == [b"\x01\x00", b"\x02\x00"]
 
 
 class TestSpeechBatchAPI:
@@ -5317,6 +5519,42 @@ class TestTTSAsyncOffloading:
         yield server
         server.shutdown()
 
+    @pytest.fixture(params=[True, False], ids=["stage-metrics-on", "stage-metrics-off"])
+    def qwen3_stage_output(self, request, mocker: MockerFixture):
+        """Use the real stage-stat builder and merge, not hand-written usage metadata."""
+        collect_stage_metrics = request.param
+
+        def make_output(request_id: str, finish_reason: str, output_tokens: int = 191) -> OmniRequestOutput:
+            processor = mocker.Mock(spec=MultimodalOutputProcessor)
+            processor.pop_native_text_metrics.return_value = {"num_generation_tokens": output_tokens}
+            pool = StagePool(0, [mocker.Mock(final_output_type="text")], output_processor=processor)
+            pool.collect_stage_metrics = collect_stage_metrics
+            talker_output = OmniRequestOutput(
+                request_id=request_id,
+                prompt_token_ids=[1, 2],
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text="",
+                        token_ids=[3],
+                        cumulative_logprob=None,
+                        logprobs=None,
+                        finish_reason=finish_reason,
+                    )
+                ],
+            )
+            stats = pool.build_stage_metrics([talker_output], submit_ts=1.0, request_timestamp=1.0, replica_id=0)
+            aggregator = OrchestratorAggregator(2, False, 0.0, 1)
+            aggregator.on_stage_metrics(0, request_id, stats, "text")
+            stage_metadata = aggregator._merge_stage_metric_event(
+                None, stats, collect_stage_metrics=collect_stage_metrics
+            )
+            output = create_mock_audio_output_for_test(request_id, metrics={"stage_metrics": {"0": stage_metadata}})
+            output.stage_id = 1
+            return output
+
+        return make_output
+
     def test_voxtral_loads_supported_speakers(self, mocker: MockerFixture):
         engine_client = mocker.MagicMock()
         engine_client.model_config.hf_config.audio_config = {
@@ -5418,13 +5656,14 @@ class TestTTSAsyncOffloading:
         voxtral_server._tts_model_type = legacy_tts_model_type
         mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())
         log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+        log_debug = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.debug")
 
         asyncio.run(voxtral_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
 
         assert adapter_model_type != legacy_tts_model_type
         assert any(
             call.args and call.args[0] == "TTS speech request %s: model=%s" and call.args[2] == adapter_model_type
-            for call in log_info.call_args_list
+            for call in log_info.call_args_list + log_debug.call_args_list
         )
 
     @pytest.mark.parametrize("word_timestamps", [False, True])
@@ -5618,7 +5857,9 @@ class TestTTSAsyncOffloading:
     ):
         """Base explicit true should reach the model prompt additional_information."""
         qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
-        qwen3_tts_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0] * 48000, 24000, "fake_cache_key"))
+        qwen3_tts_server._resolve_ref_audio_array = mocker.AsyncMock(
+            return_value=(np.zeros(48000, dtype=np.float32), 24000, "fake_cache_key")
+        )
         qwen3_tts_server._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value=None)
         qwen3_tts_server._adapter._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
 
@@ -5652,7 +5893,6 @@ class TestTTSAsyncOffloading:
             24000,
             artifact_key,
         )
-        qwen3_tts_server._ref_audio_model_artifact_ready.add((artifact_key, False))
         qwen3_tts_server._adapter.capabilities = replace(
             qwen3_tts_server._adapter.capabilities,
             codec_frame_rate=25.0,
@@ -5680,24 +5920,17 @@ class TestTTSAsyncOffloading:
             "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
             "voice-a",
         )
-        assert "ref_audio" not in tts_params
+        ((wire_wav, wire_sr),) = tts_params["ref_audio"]
+        assert wire_sr == 24000
+        assert wire_wav["__ndarray__"] is True and wire_wav["dtype"] == "float32"
+        assert wire_wav["shape"] == [len(wav_list)]
+        assert np.array_equal(np.frombuffer(wire_wav["data"], dtype=np.float32), np.asarray(wav_list, dtype=np.float32))
         assert "speaker" not in tts_params
         assert "voice_created_at" not in tts_params
         assert tts_params["_qwen3_tts_ref_audio_cache_key"] == [artifact_key]
         assert tts_params["ref_code_length"] == [50]
         prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["additional_information"] is tts_params
-
-    def test_qwen3_ref_audio_artifact_ready_is_evicted_with_resolve_cache(self, qwen3_tts_server):
-        qwen3_tts_server._ref_audio_resolve_cache_max_entries = 1
-        qwen3_tts_server._ref_audio_resolve_cache_max_bytes = 1_000_000
-
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
-        qwen3_tts_server._ref_audio_model_artifact_ready.add(("artifact-a", False))
-        qwen3_tts_server._put_resolved_ref_audio("ref-b", np.zeros(8, dtype=np.float32), 24000, "artifact-b")
-
-        assert ("artifact-a", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
-        assert "artifact-b" in {entry[3] for entry in qwen3_tts_server._ref_audio_resolve_cache.values()}
 
     @pytest.mark.asyncio
     async def test_qwen3_tts_nonstream_retries_codec_limit_once(self, qwen3_tts_server, mocker: MockerFixture) -> None:
@@ -5751,33 +5984,20 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._generate_audio_bytes.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_error(self, qwen3_tts_server):
+    async def test_generate_audio_chunks_propagates_generator_error(self, qwen3_tts_server):
         async def failing_generator():
             raise ValueError("boom")
             yield  # pragma: no cover
 
-        qwen3_tts_server._request_ref_audio_artifact_keys["req-fail"] = ("artifact-fail", False)
-
         with pytest.raises(ValueError, match="boom"):
             await anext(qwen3_tts_server._generate_audio_chunks(failing_generator(), "req-fail"))
 
-        assert "req-fail" not in qwen3_tts_server._request_ref_audio_artifact_keys
-        assert ("artifact-fail", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
-
     @pytest.mark.asyncio
-    async def test_generate_audio_chunks_rejects_qwen3_codec_limit_before_success(self, qwen3_tts_server):
+    async def test_generate_audio_chunks_rejects_qwen3_codec_limit_before_success(
+        self, qwen3_tts_server, qwen3_stage_output
+    ):
         async def length_limited_generator():
-            yield SimpleNamespace(
-                multimodal_output={"audio": torch.zeros(16, dtype=torch.float32), "sr": 24000},
-                metrics={
-                    "stage_metrics": {
-                        "0": {
-                            "num_tokens_out": 191,
-                            "finish_reason": "length",
-                        }
-                    }
-                },
-            )
+            yield qwen3_stage_output("req-codec-limit", "length")
 
         chunks = qwen3_tts_server._generate_audio_chunks(
             length_limited_generator(),
@@ -5789,19 +6009,9 @@ class TestTTSAsyncOffloading:
                 pass
 
     @pytest.mark.asyncio
-    async def test_sse_codec_limit_marks_partial_audio_for_discard(self, qwen3_tts_server):
+    async def test_sse_codec_limit_marks_partial_audio_for_discard(self, qwen3_tts_server, qwen3_stage_output):
         async def length_limited_generator():
-            yield SimpleNamespace(
-                multimodal_output={"audio": torch.zeros(16, dtype=torch.float32), "sr": 24000},
-                metrics={
-                    "stage_metrics": {
-                        "0": {
-                            "num_tokens_out": 191,
-                            "finish_reason": "length",
-                        }
-                    }
-                },
-            )
+            yield qwen3_stage_output("req-sse-codec-limit", "length")
 
         events = [
             event
@@ -5818,6 +6028,61 @@ class TestTTSAsyncOffloading:
         payload = json.loads(next(line for line in error_event.splitlines() if line.startswith("data: "))[6:])
         assert payload["error"]["partial_audio"] is True
         assert payload["error"]["action"] == "discard"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish_reason", ["length", "stop"])
+    async def test_qwen3_tts_base_nonstream_completion_and_usage(
+        self, qwen3_tts_server, qwen3_stage_output, mocker: MockerFixture, finish_reason: str
+    ):
+        async def generator():
+            yield qwen3_stage_output("req-base-usage", finish_reason)
+
+        params = {"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]}
+        mocker.patch.object(
+            qwen3_tts_server, "_prepare_speech_generation", return_value=("req-base-usage", generator(), params)
+        )
+        mocker.patch.object(qwen3_tts_server, "_count_usage_text_tokens", return_value=2)
+        usage: list[SpeechTokenUsage] = []
+        request = OpenAICreateSpeechRequest(input="Hello", task_type="Base")
+
+        if finish_reason == "length":
+            with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
+                await qwen3_tts_server._generate_audio_bytes(request, usage_out=usage)
+            assert usage == []
+        else:
+            audio, media_type = await qwen3_tts_server._generate_audio_bytes(request, usage_out=usage)
+            assert audio
+            assert media_type == "audio/wav"
+            assert len(usage) == 1
+            assert usage[0].output_tokens == 191
+            assert usage[0].input_tokens == 2
+            assert usage[0].total_tokens == 193
+
+    @pytest.mark.asyncio
+    async def test_qwen3_tts_base_sse_completion_usage(
+        self, qwen3_tts_server, qwen3_stage_output, mocker: MockerFixture
+    ):
+        async def generator():
+            yield qwen3_stage_output("req-base-sse-usage", "stop")
+
+        mocker.patch.object(qwen3_tts_server, "_count_usage_text_tokens", return_value=2)
+        events = [
+            event
+            async for event in qwen3_tts_server._generate_audio_sse_events(
+                generator(),
+                "req-base-sse-usage",
+                request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
+                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+            )
+        ]
+
+        assert any("event: speech.audio.delta" in event for event in events)
+        assert not any("event: speech.audio.error" in event for event in events)
+        done_event = next(event for event in events if "event: speech.audio.done" in event)
+        payload = json.loads(next(line for line in done_event.splitlines() if line.startswith("data: "))[6:])
+        assert payload["usage"]["output_tokens"] == 191
+        assert payload["usage"]["input_tokens"] == 2
+        assert payload["usage"]["total_tokens"] == 193
 
     @pytest.mark.asyncio
     async def test_sse_error_before_audio_is_not_marked_partial(self, qwen3_tts_server):
@@ -5911,7 +6176,7 @@ class TestTTSAsyncOffloading:
         assert struct.unpack("<I", chunks[0][24:28])[0] == 8000
 
     @pytest.mark.asyncio
-    async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
+    async def test_generate_audio_chunks_closes_engine_stream_when_cancelled_on_close(self, qwen3_tts_server):
         closed = asyncio.Event()
 
         async def pcm_generator():
@@ -5930,8 +6195,6 @@ class TestTTSAsyncOffloading:
                 await anyio.sleep(0)
                 closed.set()
 
-        qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = ("artifact-close", False)
-
         engine_stream = pcm_generator()
         stream = qwen3_tts_server._generate_audio_chunks(engine_stream, "req-close")
         assert await anext(stream)
@@ -5940,42 +6203,74 @@ class TestTTSAsyncOffloading:
             await stream.aclose()
 
         assert closed.is_set()
-        assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
-        assert ("artifact-close", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 
-    def test_qwen3_ref_audio_artifact_ready_requires_live_resolve_cache_entry(self, qwen3_tts_server):
-        qwen3_tts_server._request_ref_audio_artifact_keys["req-evicted"] = ("artifact-evicted", False)
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("x_vector_only_mode", [False, True])
+    async def test_qwen3_replayed_ref_audio_survives_engine_artifact_eviction(
+        self, qwen3_tts_server, x_vector_only_mode
+    ):
+        """The engine's per-replica ref_audio artifact LRU evicts on its own.
 
-        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-evicted")
+        Serve more distinct references than the engine cache holds, then
+        replay the first one. The replay must still carry the waveform:
+        an artifact-only request for an evicted key makes the engine's
+        ``build_prompt_embeds`` raise, which takes the whole EngineCore down.
+        """
+        engine_cache = Qwen3TTSPromptEmbedsBuilder.__new__(Qwen3TTSPromptEmbedsBuilder)
+        engine_cache._ref_audio_artifact_cache_max_entries = 2
+        engine_cache._ref_audio_artifact_cache = OrderedDict()
+        engine_cache._embedding_dtype = torch.bfloat16
+        unrecoverable: list[str] = []
 
-        assert "req-evicted" not in qwen3_tts_server._request_ref_audio_artifact_keys
-        assert ("artifact-evicted", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
+        def engine_generate(*, prompt, request_id, **_kwargs):
+            info = prompt["additional_information"]
+            key = info[REF_AUDIO_CACHE_KEY][0]
+            # Same condition as the artifact-only branch of build_prompt_embeds.
+            if not info.get("ref_audio") and engine_cache.get_ref_audio_artifacts(key) is None:
+                unrecoverable.append(request_id)
+            engine_cache.put_ref_audio_artifacts(
+                key,
+                ref_code=None if x_vector_only_mode else torch.zeros((2, 2), dtype=torch.long),
+                ref_spk_embedding=torch.zeros(4),
+            )
 
-    def test_qwen3_xvector_ready_artifact_does_not_enable_icl_artifact_only(self, qwen3_tts_server):
-        # An x-vector-only artifact (speaker embedding, no ref_code) must not enable
-        # the artifact-only path for a later ICL request with the same ref_audio (#5049).
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
-        qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
-        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
+            async def outputs():
+                yield OmniRequestOutput(
+                    request_id=request_id,
+                    final_output_type="audio",
+                    _multimodal_output={"audio": torch.zeros(2400), "sr": 24000},
+                )
 
-        icl_params = {"task_type": ["Base"], "x_vector_only_mode": [False]}
-        assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is False
+            return outputs()
 
-    def test_qwen3_xvector_ready_artifact_still_reusable_by_xvector_request(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
-        qwen3_tts_server._track_ref_audio_artifact_warmup("req-xvec", "artifact-a", x_vector_only=True)
-        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
+        qwen3_tts_server.engine_client.generate = engine_generate
+        qwen3_tts_server._adapter.capabilities = replace(qwen3_tts_server._adapter.capabilities, codec_frame_rate=25.0)
+        qwen3_tts_server._tts_tokenizer = lambda _text, padding=False: {"input_ids": list(range(10))}
+        qwen3_tts_server.engine_client.model_config.hf_config.talker_config = SimpleNamespace(
+            codec_language_id={},
+            spk_is_dialect={},
+        )
+        refs = [f"data:audio/wav;base64,ref-{i}" for i in range(3)]
+        for i, ref in enumerate(refs):
+            qwen3_tts_server._put_resolved_ref_audio(
+                hashlib.sha1(ref.encode("utf-8")).hexdigest(),
+                np.full(24000, 0.01 * (i + 1), dtype=np.float32),
+                24000,
+                f"{i:040d}",
+            )
 
-        xvec_params = {"task_type": ["Base"], "x_vector_only_mode": [True]}
-        assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(xvec_params, "artifact-a") is True
+        for n, ref in enumerate([*refs, refs[0]]):
+            request = OpenAICreateSpeechRequest(
+                input="hello",
+                task_type="Base",
+                ref_audio=ref,
+                ref_text=None if x_vector_only_mode else "reference",
+                x_vector_only_mode=x_vector_only_mode,
+            )
+            audio, _media_type = await qwen3_tts_server._generate_audio_bytes(request, request_id=f"req-{n}")
+            assert audio
 
-    def test_qwen3_icl_ready_artifact_enables_icl_artifact_only(self, qwen3_tts_server):
-        qwen3_tts_server._put_resolved_ref_audio("ref-a", np.zeros(8, dtype=np.float32), 24000, "artifact-a")
-        qwen3_tts_server._track_ref_audio_artifact_warmup("req-icl", "artifact-a", x_vector_only=False)
-        qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-icl")
-
-        icl_params = {"task_type": ["Base"], "x_vector_only_mode": [False]}
-        assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is True
+        assert unrecoverable == []
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""
@@ -6009,3 +6304,24 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+@pytest.mark.parametrize("request_logger", [None, RequestLogger(max_log_len=None)])
+@pytest.mark.parametrize("diffusion", [False, True])
+def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixture, request_logger, diffusion):
+    if diffusion:
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(), model_name="test-model", request_logger=request_logger
+        )
+        assert server.request_logger is request_logger
+    else:
+        server = object.__new__(OmniOpenAIServingSpeech)
+        server.request_logger = request_logger
+    log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+    log_debug = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.debug")
+
+    server._log_request("TTS speech request %s: model=%s", "req-1", "CustomVoice")
+
+    used, unused = (log_info, log_debug) if request_logger else (log_debug, log_info)
+    used.assert_called_once_with("TTS speech request %s: model=%s", "req-1", "CustomVoice")
+    unused.assert_not_called()

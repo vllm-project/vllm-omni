@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """GPU memory utilities for vLLM Omni workers.
 
 Includes a tolerant version of the upstream request_memory() that handles
@@ -25,9 +28,9 @@ def request_memory_tolerant(
     Like upstream ``request_memory()`` but tolerates multi-stage GPU sharing:
     if ``free_memory < requested_memory`` (because another stage on the same
     GPU has already consumed memory), caps the requested budget to the actual
-    free memory instead of raising ``ValueError``.  The downstream
-    ``OmniGPUWorkerBase.determine_available_memory()`` already does per-process
-    NVML accounting and correctly computes the KV cache budget regardless.
+    free memory instead of raising ``ValueError``. The downstream memory
+    profiler subtracts the model and runtime allocations from this capped
+    budget when sizing the KV cache.
 
     Logs a warning when the budget is capped so operators can detect
     under-provisioned GPU memory.
@@ -41,8 +44,8 @@ def request_memory_tolerant(
             "desired GPU memory utilization (%.2f, %s GiB). "
             "Capping requested memory to available free memory (%s GiB). "
             "This is expected when multiple Omni stages share a GPU; "
-            "the per-process NVML accounting in determine_available_memory() "
-            "will compute the correct KV cache budget.",
+            "determine_available_memory() will subtract the model and runtime "
+            "allocations from this capped budget when sizing the KV cache.",
             init_snapshot.device_,
             format_gib(init_snapshot.free_memory),
             format_gib(init_snapshot.total_memory),

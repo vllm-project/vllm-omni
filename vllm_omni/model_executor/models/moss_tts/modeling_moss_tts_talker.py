@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth impo
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
+from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 logger = init_logger(__name__)
 
@@ -1307,6 +1308,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.config: MossTTSLocalConfig = vllm_config.model_config.hf_config
+        self.first_frame_decoder = None
 
         qwen3_cfg = self.config.qwen3_config
         hidden_size = int(qwen3_cfg.hidden_size)
@@ -1349,7 +1351,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [nn.Linear(hidden_size, self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
         )
         self.local_text_lm_head = nn.Linear(hidden_size, 2, bias=False)
-        self.local_transformer = MossTTSLocalDepthTransformer(self.config.gpt2_config, hidden_size=hidden_size)
+        self.local_transformer = MossTTSLocalDepthTransformer(
+            self.config.gpt2_config,
+            hidden_size=hidden_size,
+            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", None),
+        )
 
         self._batch_state: list[dict[str, Any]] | None = None
         # Stacked embedding cache built after load_weights() for vectorised
@@ -1483,6 +1489,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         (outside the valid embedding range). Returns the ``(T, H)`` additive
         audio embedding, masking out pad positions per codebook.
         """
+        if (
+            self._stacked_audio_emb_w is not None
+            and self._stacked_audio_emb_w.dtype in (torch.bfloat16, torch.float16)
+            and codes.device.type == "cuda"
+        ):
+            from vllm_omni.model_executor.models.moss_tts.audio_embed_kernel import audio_embed
+
+            return audio_embed(codes, self._stacked_audio_emb_w, self.audio_pad_token_id)
         device = codes.device
         valid_mask = codes.ne(self.audio_pad_token_id)  # (T, n_vq)
         safe_codes = codes.masked_fill(~valid_mask, 0).clamp(0, self.audio_vocab_size - 1)
@@ -1520,16 +1534,18 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             embeds = self.model.embed_tokens(input_ids)
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
-            ref_offset = int(info_dict.get("ref_offset", 0))
+            # Cached prompt tokens already consumed their reference rows even
+            # though this request's preprocessing hook never saw those tokens.
+            ref_offset = int(info_dict.get("_omni_num_computed_tokens", info_dict.get("ref_offset", 0)))
             if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
                 if ref_codes.dim() == 1 and ref_codes.numel() % self.n_vq == 0:
                     ref_codes = ref_codes.view(-1, self.n_vq)
                 if isinstance(ref_codes, torch.Tensor) and ref_codes.dim() == 2:
                     end_off = ref_offset + span_len
                     chunk = ref_codes[ref_offset:end_off]
-                    if chunk.numel() > 0 and chunk.shape[0] == span_len:
+                    if chunk.numel() > 0:
                         codes = chunk.to(device=device, dtype=torch.long)
-                        embeds = embeds + self._audio_embed(codes)
+                        embeds[: chunk.shape[0]] += self._audio_embed(codes)
 
             info_update: dict[str, Any] = {
                 "audio_state": {"is_stopping": False},
@@ -1701,6 +1717,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         """Honor the same platform graph-safety override as the V1 runner."""
         return self.talker_mtp_graph_safe
 
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return self.talker_mtp_accepts_per_row_generators
+
     # Package runner-generated audio frames
     # ------------------------------------------------------------------
 
@@ -1820,6 +1840,13 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
 
+        # Build derived tables after loading, before compiling/capturing MTP.
+        # Other devices and FP32 retain the existing frame-local KV path.
+        if current_omni_platform.is_cuda() and self.local_transformer.ln_f.weight.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
         if not self.vllm_config.model_config.enforce_eager:
             self.local_transformer.setup_compile()
 
@@ -1833,6 +1860,27 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         not_loaded = [n for n in params_dict if n not in loaded]
         if not_loaded:
             logger.warning("[MossTTSLocal] %d params NOT loaded (first 5: %s)", len(not_loaded), not_loaded[:5])
+        # First audio is part of the MRV2 streaming slot-state path. Load it
+        # here so its weights and graphs count toward model memory profiling.
+        model_config = self.vllm_config.model_config
+        if (
+            model_config.use_v2_model_runner
+            and model_config.async_chunk
+            and getattr(self.config, "mrv2_gpu_slot_state", False)
+            and supports_in_process_first_audio(self.vllm_config)
+        ):
+            from .first_frame_decoder import MossFirstFrameDecoder
+
+            self.first_frame_decoder = MossFirstFrameDecoder(
+                getattr(
+                    self.config,
+                    "codec_model_name_or_path",
+                    getattr(self.config, "audio_tokenizer_name_or_path", "OpenMOSS-Team/MOSS-Audio-Tokenizer"),
+                ),
+                self.n_vq,
+            )
+            first_loaded = self.first_frame_decoder.load(self.vllm_config)
+            loaded.update("first_frame_decoder." + name for name in first_loaded)
         return loaded
 
 

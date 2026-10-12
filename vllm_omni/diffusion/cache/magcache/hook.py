@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Hook-based MagCache implementation for vLLM-Omni.
@@ -543,8 +543,11 @@ def apply_mag_cache_hook(
     state_manager = StateManager(MagCacheState, (), {})
     remaining_blocks = []
 
+    allowed = getattr(module, "_magcache_block_attrs", None)
     for name, submodule in module.named_children():
         if not isinstance(submodule, torch.nn.ModuleList):
+            continue
+        if allowed is not None and name not in allowed:
             continue
         for index, block in enumerate(submodule):
             remaining_blocks.append((f"{name}.{index}", block))

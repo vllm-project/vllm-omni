@@ -94,7 +94,7 @@ class _FakePool:
     def release_bindings(self, request_ids):
         pass
 
-    async def release_request_resources(self, request_ids):
+    def schedule_release_request_resources(self, request_ids):
         pass
 
 

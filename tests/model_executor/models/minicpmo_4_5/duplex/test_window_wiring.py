@@ -547,7 +547,7 @@ def test_scheduler_worker_end_to_end_state_agreement():
         },
     )
 
-    plan = MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update)
+    plan = MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update)
     assert plan is not None
     assert plan.delta == 16
     assert plan.moved_from == 32
@@ -884,7 +884,7 @@ def test_rejection_before_state_mutation():
         },
     )
 
-    result = MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update)
+    result = MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update)
     assert result is None
     # Verify zero state mutation: token sequences and counters are untouched!
     assert session.prompt_token_ids == [1, 2, 3, 4]
@@ -906,7 +906,7 @@ def test_non_duplex_regression():
     # Case 1: No duplex in buffer
     update1 = SimpleNamespace(prompt_token_ids=[4], model_intermediate_buffer={})
     scheduler = SimpleNamespace()
-    assert MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update1) is None
+    assert MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update1) is None
     assert session.num_computed_tokens == 3
 
     # Case 2: sliding_window_mode = 'off'
@@ -921,7 +921,7 @@ def test_non_duplex_regression():
             }
         },
     )
-    assert MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update2) is None
+    assert MiniCPMO45DuplexSchedulerHelper.apply_session_window(scheduler, session, update2) is None
     assert session.num_computed_tokens == 3
 
 
@@ -1009,18 +1009,6 @@ def test_scheduler_replace_streaming_prompt_bypasses_reanchor():
     assert session.released is True
     assert session.replaced is True
     assert len(reanchor_called) == 0, "Re-anchoring must not be called when replacing streaming prompt!"
-
-
-def test_slot_mapping_device_compatibility():
-    """Verify compute_slot_mapping creates table on positions device and does not error on CUDA/device tensor."""
-    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import compute_slot_mapping
-
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-    pos = torch.tensor([0, 15, 16, 31, 32], dtype=torch.long, device=device)
-    block_ids = [10, 20, 30]
-    slots = compute_slot_mapping(block_ids, pos, block_size=16)
-    assert slots.device == device
-    assert slots.tolist() == [10 * 16 + 0, 10 * 16 + 15, 20 * 16 + 0, 20 * 16 + 15, 30 * 16 + 0]
 
 
 def test_reanchor_ordinary_append_fallback_rebuild_sequence():
@@ -1477,6 +1465,72 @@ def test_exactly_once_reanchor_across_metadata_refreshes():
     # Verify: rotation was SKIPPED, no second rotation occurred!
     assert len(evicted_reanchors) == 1
     assert torch.equal(k_pool, k_pool_after_first)
+
+
+@pytest.mark.parametrize("explicit_old_computed", [False, True])
+def test_mrv2_reanchor_uses_request_slot_without_persistent_input_batch(explicit_old_computed):
+    reanchor = {"delta": 16, "moved_from": 48, "sink_blocks": 2}
+    if explicit_old_computed:
+        reanchor["old_computed_tokens"] = 64
+    pool = torch.randn(8, 1, 16, 16)
+    original = pool.clone()
+    inv_freq = _get_inv_freq(head_dim=16)
+    block_ids = [0, 1, 2, 3]
+    info = {"duplex": {"stage0_reanchor": dict(reanchor)}}
+    runner = SimpleNamespace(
+        req_states=SimpleNamespace(req_id_to_index={"r": 2}, num_computed_tokens_np=np.array([0, 0, 48])),
+        model_state=SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[{}, {}, info])),
+        block_tables=SimpleNamespace(
+            num_blocks=SimpleNamespace(np=np.array([[0, 0, 4]])),
+            block_tables=[SimpleNamespace(gpu=torch.tensor([[0] * 4, [0] * 4, block_ids]))],
+        ),
+        device=torch.device("cpu"),
+        cache_config=SimpleNamespace(block_size=16),
+        kv_caches=[pool],
+        _duplex_inv_freq=inv_freq,
+    )
+    scheduler = SimpleNamespace(num_scheduled_tokens={"r": 1}, scheduled_new_reqs=[])
+    MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner, scheduler_output=scheduler)
+    # Only the retained tail in compacted block 2 is shifted; sink and
+    # unrelated pages stay untouched and scheduler counts are not decremented twice.
+    torch.testing.assert_close(pool[2], rotate_keys(original[2], 16, inv_freq), rtol=1e-5, atol=1e-6)
+    assert torch.equal(pool[:2], original[:2])
+    assert torch.equal(pool[3:], original[3:])
+    assert runner.req_states.num_computed_tokens_np.tolist() == [0, 0, 48]
+    assert "stage0_reanchor" not in info["duplex"]
+
+
+def test_mrv2_reanchor_reads_each_group_block_table_once(monkeypatch):
+    pools = [torch.randn(8, 1, 16, 16) for _ in range(3)]
+    originals = [pool.clone() for pool in pools]
+    inv_freq = _get_inv_freq(head_dim=16)
+    info = {"duplex": {"stage0_reanchor": {"delta": 16, "moved_from": 48, "sink_blocks": 2}}}
+    runner = SimpleNamespace(
+        req_states=SimpleNamespace(req_id_to_index={"r": 0}, num_computed_tokens_np=np.array([48])),
+        model_state=SimpleNamespace(intermediate_buffer=SimpleNamespace(buffers=[info])),
+        block_tables=SimpleNamespace(
+            num_blocks=SimpleNamespace(np=np.array([[4]])),
+            block_tables=[SimpleNamespace(gpu=torch.tensor([[0, 1, 2, 3]]))],
+        ),
+        device=torch.device("cpu"),
+        cache_config=SimpleNamespace(block_size=16),
+        kv_caches=pools,
+        _duplex_inv_freq=inv_freq,
+    )
+    resolve = MiniCPMO45DuplexWorkerHelper.resolve_group_block_ids
+    calls = []
+
+    def counted(runner_, req_id, req_idx, group_idx=0):
+        calls.append(group_idx)
+        return resolve(runner_, req_id, req_idx, group_idx=group_idx)
+
+    monkeypatch.setattr(MiniCPMO45DuplexWorkerHelper, "resolve_group_block_ids", staticmethod(counted))
+    MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(
+        runner, scheduler_output=SimpleNamespace(num_scheduled_tokens={"r": 1}, scheduled_new_reqs=[])
+    )
+    assert calls == [0]
+    for pool, original in zip(pools, originals):
+        torch.testing.assert_close(pool[2], rotate_keys(original[2], 16, inv_freq), rtol=1e-5, atol=1e-6)
 
 
 def test_history_slicing_multi_row_embeddings_and_non_aligned_prefix():

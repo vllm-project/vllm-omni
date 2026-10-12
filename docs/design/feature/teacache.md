@@ -20,7 +20,7 @@ This section describes how to add TeaCache to a diffusion transformer model. We 
 
 ### What is TeaCache?
 
-TeaCache speeds up diffusion inference by caching transformer block computations when consecutive timesteps are similar. It provides **1.5x-2.0x speedup** with minimal quality loss.
+TeaCache speeds up diffusion inference by caching transformer block computations when consecutive timesteps are similar. It provides up to **1.5x-2.0x speedup** with minimal quality loss on models with calibrated coefficients; few-step distilled models gain less.
 
 The core insight is that the modulated input (after normalization and timestep conditioning) changes gradually across timesteps. By measuring the L1 distance between consecutive modulated inputs and comparing it to a threshold, TeaCache decides whether to execute the full transformer blocks or reuse the cached residual from the previous step.
 
@@ -260,7 +260,7 @@ The polynomial coefficients rescale L1 distances between consecutive modulated i
 
 | Approach | Performance | Effort |
 |----------|-------------|--------|
-| Using defaults from similar model | Within 5-10% of optimal | Low |
+| Using defaults from similar model | Unreliable: Z-Image with Qwen-Image's coefficients under-predicted output change ~3x and over-skipped steps (#8270); treat as a placeholder and calibrate | Low |
 | Estimating custom coefficients | Best performance | Medium |
 
 #### Implement Data Collection Adapter
@@ -268,7 +268,7 @@ The polynomial coefficients rescale L1 distances between consecutive modulated i
 Add an adapter in `vllm_omni/diffusion/cache/teacache/coefficient_estimator.py`:
 
 ```python
-class YourModelAdapter:
+class YourModelAdapter(DefaultAdapter):
     """Adapter for coefficient estimation on your model."""
 
     @staticmethod
@@ -398,7 +398,7 @@ images = omni.generate(
 **Verify:**
 
 1. **Check logs** - Look for TeaCache initialization messages
-2. **Compare performance** - Measure speedup vs baseline (expect 1.5x-2.0x)
+2. **Compare performance** - Measure speedup vs baseline (expect up to 1.5x-2.0x on 50-step runs; less on few-step distilled models)
 3. **Verify output quality** - Visually compare cached vs uncached outputs (should be nearly identical)
 
 See more detailed examples in [user guide for teacache](../../user_guide/diffusion/cache_acceleration/teacache.md).

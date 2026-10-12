@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-input processor for higgs-audio v2: Talker -> Code2Wav.
 
 Mirrors the qwen3_tts contract:
@@ -45,23 +45,7 @@ _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 25
 # stage-input-processor discovery.
 _NUM_CODEBOOKS = 8
 _AUDIO_STREAM_BOS_ID = 1024
-_AUDIO_STREAM_EOS_ID = 1025
 _NUM_REAL_CODES = _AUDIO_STREAM_BOS_ID  # codes in [0, 1023] are real
-
-
-def _filter_real_code_frames(audio_codes: torch.Tensor) -> torch.Tensor:
-    """Keep only frames whose codes are entirely in [0, 1023].
-
-    ``audio_codes`` has shape ``[num_frames, num_codebooks]`` after the
-    standard Stage-0 transpose. We drop frames containing stream specials
-    or anything padded outside the real-code range.
-    """
-    if audio_codes.numel() == 0:
-        return audio_codes
-    if audio_codes.ndim != 2:
-        raise ValueError(f"expected [num_frames, num_codebooks] audio_codes; got shape {tuple(audio_codes.shape)}")
-    valid = (audio_codes >= 0).all(dim=1) & (audio_codes < _NUM_REAL_CODES).all(dim=1)
-    return audio_codes[valid]
 
 
 def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:

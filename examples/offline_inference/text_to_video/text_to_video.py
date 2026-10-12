@@ -235,7 +235,7 @@ def parse_extra_body(value: str) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, MAGI-2, "
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, MAGI-2, Kandinsky 6, "
         "and other text-to-video models."
     )
     parser.add_argument(

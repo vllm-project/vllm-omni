@@ -48,8 +48,9 @@ PAYLOAD_NAMES = frozenset({"plan_timesteps", "plan_lengths", "time_embeddings", 
 class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
     """Exact projection caching with optional H3 schedule-bound sidecar results."""
 
-    def __init__(self, *, max_bytes: int = 256 * 1024**2) -> None:
+    def __init__(self, *, max_bytes: int = 256 * 1024**2, offload_weights: bool = False) -> None:
         super().__init__(max_bytes=max_bytes)
+        self.offload_weights = offload_weights
         self.sidecar: MiniMaxH3AdalnCache | None = None
         self._sidecar_signatures: dict[str, Any] = {}
         self._sidecar_plan: int | None = None
@@ -66,7 +67,11 @@ class MiniMaxH3RuntimeAdalnCache(ExactProjectionCache):
         self.sidecar = sidecar
         self._sidecar_signatures = signatures
 
+    @torch.compiler.disable
     def prepare(self, embedding: torch.Tensor) -> None:
+        # Hashing and cache bookkeeping stay outside compiled tensor compute.
+        # Regional compilation already calls this from the model's outer loop;
+        # this boundary also preserves reuse under full-model compilation.
         self._sidecar_plan = None
         super().prepare(embedding)
         if self._key is None or self.sidecar is None:

@@ -1,8 +1,11 @@
+<!-- markdownlint-disable MD001 MD025 -->
+
 # --8<-- [start:requirements]
 
 - GPU: Validated on Intel® Arc™ B-Series.
 
 # --8<-- [end:requirements]
+
 # --8<-- [start:set-up-using-python]
 
 vLLM-Omni currently recommends using the Docker image setup steps below.
@@ -26,9 +29,8 @@ DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.xpu -t vllm-omni-xpu --shm-s
 ```
 
 This layers vLLM-Omni on top of the published `vllm/vllm-openai-xpu:<VLLM_VERSION>`
-base image, which Docker pulls automatically. The Dockerfile still defaults to
-v0.30.0; the command above explicitly selects v0.31.0 to match this source
-checkout. To target a different vLLM release, pass
+base image, which Docker pulls automatically. The Dockerfile defaults to
+v0.31.0. To target a different vLLM release, pass
 `--build-arg VLLM_VERSION=<tag>`. If that tag has not been published yet, build
 the base from upstream's own Dockerfile first and point the build at it:
 
@@ -44,7 +46,7 @@ DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.xpu -t vllm-omni-xpu --shm-s
 
 ##### Launch with OpenAI API Server
 
-```
+```bash
 docker run -it -d --shm-size 10g \
   --name {container_name} \
   --net=host \

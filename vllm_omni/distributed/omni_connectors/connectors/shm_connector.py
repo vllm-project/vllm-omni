@@ -200,7 +200,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            self.reap_consumed()
+            # Keep per-send housekeeping small when unread chunks accumulate.
+            # Explicit sweeps retain a larger budget to drain stale records.
+            self.reap_consumed(max_keys=4)
             payload = self.serialize_obj(data)
             size = len(payload)
 
@@ -353,10 +355,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             self.cleanup(key)
         self._close_wakeups()
 
-    def reap_consumed(self) -> None:
+    def reap_consumed(self, *, max_keys: int = 64) -> None:
         """Bounded round-robin sweep; receivers unlink SHM in another process."""
         with self._pending_keys_lock:
-            for _ in range(min(64, len(self._pending_keys))):
+            for _ in range(min(max_keys, len(self._pending_keys))):
                 key, _ = self._pending_keys.popitem(last=False)
                 if os.path.exists(f"/dev/shm/{key}"):
                     self._pending_keys[key] = None

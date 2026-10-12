@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import math
@@ -50,9 +50,6 @@ if not HAS_FLASH_ATTN:
     )
 
 weight_norm = torch.nn.utils.parametrizations.weight_norm
-
-
-CODEC_NORM_EPS = 1e-2
 
 
 @dataclass

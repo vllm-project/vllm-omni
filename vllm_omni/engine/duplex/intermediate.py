@@ -132,17 +132,3 @@ def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | No
         info.get("tts_token_ids") if token_ids is None else token_ids,
         info.get("tts_hidden_states") if hidden_states is None else hidden_states,
     )
-
-
-def get_stream_request_key(info: dict[str, object]) -> str:
-    key = info.get("global_request_id") or info.get("request_id") or info.get("_omni_req_id")
-    if isinstance(key, (list, tuple)):
-        key = key[0] if key else None
-    if isinstance(key, bytes):
-        key = key.decode("utf-8", errors="replace")
-    if key is None:
-        raise ValueError(
-            "Duplex streaming handoff requires a stable request id; "
-            "expected global_request_id, request_id, or _omni_req_id."
-        )
-    return str(key)

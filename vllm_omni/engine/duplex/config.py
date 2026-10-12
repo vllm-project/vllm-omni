@@ -253,13 +253,6 @@ class DuplexPlaybackView:
 
 
 @dataclass
-class DuplexAudioChunk:
-    data: str
-    format: str = "wav"
-    sample_rate_hz: int | None = None
-
-
-@dataclass
 class DuplexSessionConfig:
     model: str | None = None
     modalities: list[str] = field(default_factory=lambda: ["text", "audio"])
@@ -848,7 +841,6 @@ def input_audio_transcription_config(session_payload: Mapping[str, object]) -> d
 
 __all__ = [
     "DuplexAssistantAudioTextMark",
-    "DuplexAudioChunk",
     "DuplexCapabilities",
     "DuplexCommittedInput",
     "DuplexConfigError",

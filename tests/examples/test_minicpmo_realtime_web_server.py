@@ -108,10 +108,10 @@ def test_build_app_exposes_realtime_websocket_and_static_assets():
 
 
 def test_qwen_config_does_not_inject_reference_voice():
-    client = TestClient(build_app(profile="qwen3-turn", adapter="vad", model="Qwen/Qwen3-Omni-30B-A3B-Instruct"))
+    client = TestClient(build_app(profile="qwen3-turn", turn_mode="vad", model="Qwen/Qwen3-Omni-30B-A3B-Instruct"))
     page = client.get("/").text
     assert '"profile": "qwen3-turn"' in page
-    assert '"adapter": "vad"' in page
+    assert '"turnMode": "vad"' in page
     assert '"refAudio": null' in page
     for name in ("common", "minicpm_native", "qwen3_turn", "aura_ptt"):
         assert client.get(f"/static/profiles/{name}.js").status_code == 200

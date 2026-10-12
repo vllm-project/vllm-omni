@@ -96,6 +96,9 @@ class FakeHandle:
         self.close_reasons: list[str] = []
         self.commands: list[commands.DuplexCommand] = []
         self._outbox = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+        #: When set, ``events()`` waits before the first yield so a test can
+        #: disconnect the reader before ``session.created`` is pumped.
+        self.hold_events: asyncio.Event | None = None
 
     def deliver(self, event: DuplexEvent) -> None:
         self._outbox.put(event)
@@ -109,6 +112,9 @@ class FakeHandle:
         self.commands.append(command)
 
     async def events(self):
+        if self.hold_events is not None:
+            await self.hold_events.wait()
+            self.hold_events = None
         while True:
             event = await self._outbox.get()
             if event is None:
@@ -143,6 +149,7 @@ class FakeOmni:
         #: Detaches the engine refused because the caller's lease generation was stale.
         self.detach_refused: list[tuple[str, int]] = []
         self.open_error: DuplexSessionError | None = None
+        self.hold_events: asyncio.Event | None = None
         #: When set, ``resume_session`` parks on it once the engine applied the
         #: resume: the lease generation is bumped, the result is still in flight.
         self.resume_gate: asyncio.Event | None = None
@@ -156,6 +163,7 @@ class FakeOmni:
             raise self.open_error
         session_id = f"duplex-{len(self.handles) + 1:032x}"
         handle = FakeHandle(session_id, self.capabilities, idle_timeout_s=self.idle_timeout_s)
+        handle.hold_events = self.hold_events
         self.handles[session_id] = handle
         handle.deliver(SessionCreated(session_id=session_id, session={"id": session_id, "model": config.get("model")}))
         return handle
@@ -391,6 +399,77 @@ async def test_transport_send_failure_detaches_the_session_instead_of_closing_it
     handle.deliver(SessionClosed(session_id=handle.session_id, reason="client_close"))
     await asyncio.sleep(0.05)
     assert handle.session_id not in handler._pumps
+
+
+@pytest.mark.asyncio
+async def test_session_created_send_failure_closes_instead_of_detaching() -> None:
+    """If ``session.created`` never reaches the client, serving must close (#7636 #9).
+
+    Covers the serving branch only (close vs detach). Production admission is
+    released when ``handle.close()`` waits for ``session.closed`` after cleanup.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws = FakeWebSocket({"duplex": "1", "autostart": "0"})
+    # Fail every wire send before ``session.created`` is pumped out.
+    ws.break_sends()
+    task = asyncio.create_task(handler.handle_realtime_session(ws))
+    ws.feed(_session_update())
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(omni.handles) == 1
+    handle = next(iter(omni.handles.values()))
+    assert handle.closed
+    assert handle.close_reasons == ["session_created_undelivered"]
+    assert omni.detached == []
+    assert "session.created" not in ws.types()
+
+
+async def _wait_until(predicate, *, timeout_s: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("timed out waiting for condition")
+
+
+@pytest.mark.asyncio
+async def test_disconnect_before_session_created_closes_instead_of_staying_detached() -> None:
+    """Reader drop before the pump sends ``session.created`` must close (#7636 #9).
+
+    ``send_event`` does not raise when the attachment is already gone and the
+    event is unjournaled. Delivery is the transport callback, not a journal write.
+    """
+    release = asyncio.Event()
+    omni = FakeOmni()
+    omni.hold_events = release
+    handler = _handler(omni)
+    ws = FakeWebSocket({"duplex": "1", "autostart": "0"})
+    task = asyncio.create_task(handler.handle_realtime_session(ws))
+    ws.feed(_session_update())
+    await _wait_until(lambda: bool(omni.handles) and bool(handler._pumps))
+    await asyncio.sleep(0.05)
+    assert "session.created" not in ws.types()
+
+    ws.disconnect()
+    await _wait_until(lambda: bool(omni.detached))
+    handle = next(iter(omni.handles.values()))
+    # Detach alone would keep the admission slot. The pump has not run yet.
+    assert handle.close_reasons == []
+    assert not handle.closed
+
+    release.set()
+    # The websocket task ends on disconnect. The session pump is separate and
+    # only then emits ``session.created`` into a detached registry.
+    await _wait_until(lambda: handle.closed)
+    if not task.done():
+        await asyncio.wait_for(task, timeout=2.0)
+    assert handle.closed
+    assert handle.close_reasons == ["session_created_undelivered"]
+    assert omni.detached == [handle.session_id]
+    assert "session.created" not in ws.types()
 
 
 @pytest.mark.asyncio

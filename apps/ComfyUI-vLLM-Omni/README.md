@@ -271,10 +271,10 @@ The [WF-05 template](example_workflows/vLLM-Omni%20MiniMax-H3%20Latent%20Mask%20
 Connect a **Latent Mask Editing** node to **Generate Video → latent_edit** to edit a source clip instead of generating from scratch. It uploads the source media and serializes the video/audio noise masks the MiniMax H3 API accepts:
 
 - `source_video` / `source_audio` — the media to edit.
-- `video_mask` — a ComfyUI mask image; `0` preserves a region, `1` regenerates it, fractional values blend. A 2D mask `[H, W]` is applied to every frame; a 3D mask `[T, H, W]` is treated as a temporal mask (one slice per frame) for continuation or extension. It is resized to the video latent grid.
+- `video_mask` — a ComfyUI mask image; `0` preserves a region, `1` regenerates it, fractional values blend. A 2D mask `[H, W]` is applied to every frame; a 3D mask `[T, H, W]` is treated as a temporal mask (one slice per frame) for continuation or extension. The client area-downsamples it by 16 to keep the upload small, and the server resizes it to the video latent grid.
 - `audio_mask` — a scalar in `[0, 1]`; `0` keeps the source audio, `1` regenerates it, fractional values blend.
 
-A non-trivial mask requires its matching source, and a source without a mask is rejected. This node only forwards inputs to the server; the served model must declare latent-mask editing support (MiniMax-H3).
+The node requires at least one mask; the server then enforces the cross-field rules (a source requires a matching mask, and a non-trivial mask requires its source). This node only forwards inputs to the server; the served model must declare latent-mask editing support (MiniMax-H3).
 
 ### TTS (e.g., Qwen TTS series)
 

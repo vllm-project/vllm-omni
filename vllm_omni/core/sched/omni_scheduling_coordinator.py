@@ -183,8 +183,8 @@ class OmniSchedulingCoordinator:
                 self.pending_input_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
-                        payload_sender_info=getattr(request, "payload_sender_info", None),
+                        external_req_id=request.external_req_id,
+                        payload_sender_info=request.payload_sender_info,
                     )
                 )
             elif request.status == RequestStatus.WAITING_FOR_INPUT:
@@ -197,8 +197,8 @@ class OmniSchedulingCoordinator:
                     self.pending_input_registrations.append(
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
-                            external_req_id=getattr(request, "external_req_id", None),
-                            payload_sender_info=getattr(request, "payload_sender_info", None),
+                            external_req_id=request.external_req_id,
+                            payload_sender_info=request.payload_sender_info,
                         )
                     )
         if to_remove:
@@ -456,7 +456,7 @@ class OmniSchedulingCoordinator:
                 self.pending_chunk_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
+                        external_req_id=request.external_req_id,
                     )
                 )
                 request.status = RequestStatus.WAITING_FOR_CHUNK

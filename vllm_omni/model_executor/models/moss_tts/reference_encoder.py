@@ -28,6 +28,8 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import threading
+import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from functools import lru_cache
@@ -49,6 +51,7 @@ from vllm_omni.model_executor.models.moss_tts.shared_reference_encoder import (
     SharedReferenceEncoderHost,
     SharedReferenceEncoderStartupError,
     elect_host,
+    socket_path_fits,
 )
 
 logger = init_logger(__name__)
@@ -71,8 +74,18 @@ _INT32_MAX = 2**31
 # Inline (data: URI) references already resolved and encoded, keyed by the
 # serving resolve key. Codes are small; the URI itself is not retained.
 _INLINE_INDEX_MAX_ENTRIES = 4096
-# Optional directory (e.g. under /dev/shm) that API processes of one server
-# share, so an inline reference encoded by any frontend is reused by all.
+# The shared code directory is bounded like the in-process index: any API
+# process that stores a new entry periodically drops the least recently used
+# files and stale temporary files. Every use of an entry, in memory or from
+# the file, refreshes the file's mtime at most once per interval.
+_SHARED_CODES_MAX_ENTRIES = _INLINE_INDEX_MAX_ENTRIES
+_SHARED_CODES_PRUNE_EVERY = 64
+_SHARED_CODES_STALE_TMP_S = 60.0
+_SHARED_CODES_TOUCH_S = 1.0
+# Directory that API processes of one server share, so an inline reference
+# encoded by any frontend is reused by all. Multi-API servers use a directory
+# scoped to the server by default; this overrides it, and an empty value
+# turns sharing off.
 _SHARED_CODES_DIR_ENV = "VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR"
 # "0" keeps one reference encoder per API process even with a shared directory.
 _SHARED_ENCODER_ENV = "VLLM_OMNI_MOSS_REF_SHARED_ENCODER"
@@ -82,7 +95,26 @@ _SHARED_WORKERS_ENV = "VLLM_OMNI_MOSS_REF_ENCODER_WORKERS"
 _SHARED_WORKER_BATCH_SECONDS = 96.0
 
 
-def shared_encoder_role() -> str:
+def shared_codes_dir(server_dir: str | None) -> str | None:
+    """Reference-code directory shared by this server's API processes, if any.
+
+    ``server_dir`` is the multi-API server's scratch directory (None with one
+    API process).
+    """
+    explicit = os.environ.get(_SHARED_CODES_DIR_ENV)
+    if explicit is not None:
+        return explicit or None
+    return os.path.join(server_dir, "moss-ref-codes") if server_dir else None
+
+
+def shared_encoder_enabled(shared_dir: str | None) -> bool:
+    """Whether API processes sharing ``shared_dir`` also share one encoder."""
+    if not shared_dir or os.environ.get(_SHARED_ENCODER_ENV, "1") == "0":
+        return False
+    return socket_path_fits(shared_dir)
+
+
+def shared_encoder_role(shared_dir: str | None) -> str:
     """``"host"``, ``"client"`` or ``""`` (no shared encoder) for this process.
 
     Decided once, before the processor places its tokenizer on the GPU, so
@@ -90,12 +122,16 @@ def shared_encoder_role() -> str:
     """
     global _shared_role
     if _shared_role is None:
-        shared_dir = os.environ.get(_SHARED_CODES_DIR_ENV)
-        if not shared_dir or os.environ.get(_SHARED_ENCODER_ENV, "1") == "0":
-            _shared_role = ""
-        else:
+        _shared_role = ""
+        if shared_dir and shared_encoder_enabled(shared_dir):
             os.makedirs(shared_dir, exist_ok=True)
             _shared_role = "host" if elect_host(shared_dir) else "client"
+        elif shared_dir and os.environ.get(_SHARED_ENCODER_ENV, "1") != "0":
+            logger.warning(
+                "MOSS shared reference encoder disabled: %s is too long a path for its Unix socket; "
+                "each API process encodes its own references",
+                shared_dir,
+            )
     return _shared_role
 
 
@@ -317,6 +353,7 @@ class MossReferenceEncoder:
         speaker_cache: Any,
         window_ms: float | None = None,
         max_batch: int = _REF_ENCODE_MAX_BATCH,
+        server_dir: str | None = None,
     ):
         self._processor = processor
         self._n_vq = int(n_vq)
@@ -328,13 +365,19 @@ class MossReferenceEncoder:
         self._model_type = f"moss_tts_{variant}_nq{int(n_vq)}"
         self._inflight: dict[str | tuple[str, str], asyncio.Task] = {}
         self._inline_index: OrderedDict[str, torch.Tensor] = OrderedDict()
-        self._shared_codes_dir = os.environ.get(_SHARED_CODES_DIR_ENV) or None
+        self._shared_codes_dir = shared_codes_dir(server_dir)
+        self._shared_codes_stores = 0
+        # Last mtime refresh of each indexed shared entry (monotonic seconds).
+        self._shared_codes_touched: dict[str, float] = {}
         if self._shared_codes_dir:
             os.makedirs(self._shared_codes_dir, exist_ok=True)
         # Realtime encodes with its own codec and never shares the encoder.
-        self._shares_encoder = bool(self._shared_codes_dir) and type(self)._encode_prepared is (
-            MossReferenceEncoder._encode_prepared
+        self._shares_encoder = type(self)._encode_prepared is MossReferenceEncoder._encode_prepared and (
+            shared_encoder_enabled(self._shared_codes_dir)
         )
+        # This process's own encodes replay its graphs, which hold one batch
+        # at a time; only a shared encoder's workers run batches concurrently.
+        self._local_lock = threading.Lock()
         self._shared_host: SharedReferenceEncoderHost | None = None
         self._shared_client: SharedReferenceEncoderClient | None = None
         self._graphs: MossReferenceEncoderGraphs | None = None
@@ -345,7 +388,7 @@ class MossReferenceEncoder:
         # A shared encoder serves several batches at once (one per host
         # worker); a process's own graphs replay one batch at a time.
         inflight = 1
-        if self._shares_encoder and os.environ.get(_SHARED_ENCODER_ENV, "1") != "0":
+        if self._shares_encoder:
             inflight = max(1, int(os.environ.get(_REF_ENCODE_INFLIGHT_ENV, "1")))
         self._local_stream: torch.cuda.Stream | None = None
         self._gpu_prep = os.environ.get(_REF_ENCODE_GPU_PREP_ENV, "0") == "1"
@@ -397,6 +440,7 @@ class MossReferenceEncoder:
                     # A data: URI is immutable content, and its serving
                     # resolve key is this same digest: skip the resolve hop.
                     self._inline_index.move_to_end(inline_key)
+                    self._touch_shared_codes(inline_key)
                     return _clone_out(codes), inline_key
             # Anonymous refs have no pre-resolve hot path: the content key must
             # come from the resolve itself (mtime/size from a single stat) so an
@@ -424,7 +468,8 @@ class MossReferenceEncoder:
         self._inline_index[key] = codes
         self._inline_index.move_to_end(key)
         while len(self._inline_index) > _INLINE_INDEX_MAX_ENTRIES:
-            self._inline_index.popitem(last=False)
+            evicted, _ = self._inline_index.popitem(last=False)
+            self._shared_codes_touched.pop(evicted, None)
 
     def _load_shared_codes(self, key: str) -> torch.Tensor | None:
         if not self._shared_codes_dir:
@@ -439,6 +484,17 @@ class MossReferenceEncoder:
         self._remember_inline(key, codes)
         return codes
 
+    def _touch_shared_codes(self, key: str) -> None:
+        """Refresh a used shared entry's mtime so pruning keeps it, at most once per interval."""
+        if not self._shared_codes_dir:
+            return
+        now = time.monotonic()
+        if now - self._shared_codes_touched.get(key, -_SHARED_CODES_TOUCH_S) < _SHARED_CODES_TOUCH_S:
+            return
+        self._shared_codes_touched[key] = now
+        with contextlib.suppress(OSError):
+            os.utime(os.path.join(self._shared_codes_dir, key + ".npy"))
+
     def _store_shared_codes(self, key: str, codes: torch.Tensor) -> None:
         if not self._shared_codes_dir:
             return
@@ -450,6 +506,40 @@ class MossReferenceEncoder:
             os.replace(tmp, path)
         except OSError:
             logger.warning("MOSS ref codes: could not write shared entry %s", path, exc_info=True)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            return
+        if self._shared_codes_stores % _SHARED_CODES_PRUNE_EVERY == 0:
+            self._prune_shared_codes()
+        self._shared_codes_stores += 1
+
+    def _prune_shared_codes(self) -> None:
+        """Keep the most recently used shared entries, across all API processes."""
+        assert self._shared_codes_dir is not None
+        entries: list[tuple[float, str]] = []
+        now = time.time()
+        try:
+            with os.scandir(self._shared_codes_dir) as scan:
+                for entry in scan:
+                    try:
+                        mtime = entry.stat().st_mtime
+                    except OSError:
+                        continue  # removed by another process
+                    if entry.name.endswith(".npy"):
+                        entries.append((mtime, entry.path))
+                    elif entry.name.endswith(".tmp") and now - mtime > _SHARED_CODES_STALE_TMP_S:
+                        with contextlib.suppress(OSError):
+                            os.unlink(entry.path)
+        except OSError:
+            return
+        excess = len(entries) - _SHARED_CODES_MAX_ENTRIES
+        if excess <= 0:
+            return
+        # Prune a little below the bound so the scan runs rarely.
+        entries.sort()
+        for _, stale in entries[: excess + _SHARED_CODES_PRUNE_EVERY]:
+            with contextlib.suppress(OSError):
+                os.unlink(stale)
 
     async def _single_flight(
         self,
@@ -539,7 +629,7 @@ class MossReferenceEncoder:
 
     def prepare(self) -> None:
         """Capture the CUDA graphs (or start the shared encoder) before the first request."""
-        role = shared_encoder_role() if self._shares_encoder else ""
+        role = shared_encoder_role(self._shared_codes_dir) if self._shares_encoder else ""
         if role == "host":
             self._host().wait_until_ready()
         elif role == "client":
@@ -547,7 +637,8 @@ class MossReferenceEncoder:
                 self._shared_client = SharedReferenceEncoderClient(self._shared_codes_dir)
             self._shared_client.wait_until_ready()
         elif role == "":
-            self._reference_graphs()
+            with self._local_lock:
+                self._reference_graphs()
 
     def _host(self) -> SharedReferenceEncoderHost:
         if self._shared_host is None:
@@ -561,9 +652,10 @@ class MossReferenceEncoder:
         return self._shared_host
 
     def _encode_shared_or_local(self, prepared: list[torch.Tensor]) -> list:
-        role = shared_encoder_role() if self._shares_encoder else ""
+        role = shared_encoder_role(self._shared_codes_dir) if self._shares_encoder else ""
         if role == "host":
             return self._host().encode(prepared)
+        place_tokenizer = False
         if role == "client":
             if self._shared_client is None:
                 self._shared_client = SharedReferenceEncoderClient(self._shared_codes_dir)
@@ -573,9 +665,15 @@ class MossReferenceEncoder:
                 raise
             except Exception:  # noqa: BLE001 — the host is unreachable: encode here
                 logger.warning("MOSS shared reference encoder unavailable; encoding locally", exc_info=True)
+                place_tokenizer = True
+        with self._local_lock:
+            # Moving the tokenizer rewrites its parameters one by one: with
+            # several batches in flight, another one must not encode until the
+            # whole module is on the device (its stream also follows the device).
+            if place_tokenizer:
                 self._place_tokenizer_for_local_encode()
-        with self._local_stream_context():
-            return self._encode_local(prepared)
+            with self._local_stream_context():
+                return self._encode_local(prepared)
 
     def _local_stream_context(self):
         tokenizer = getattr(self._processor, "audio_tokenizer", None)
@@ -777,6 +875,7 @@ def build_reference_encoder(
     *,
     variant: str,
     speaker_cache: Any,
+    server_dir: str | None = None,
 ) -> MossReferenceEncoder:
     """Build the per-server encoder for a MOSS-TTS ``variant``.
 
@@ -791,6 +890,7 @@ def build_reference_encoder(
             n_vq=16,
             sr_target=24000,
             speaker_cache=speaker_cache,
+            server_dir=server_dir,
         )
     n_vq = int(getattr(processor.model_config, "n_vq", 32))
     # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
@@ -805,6 +905,7 @@ def build_reference_encoder(
         n_vq=n_vq,
         sr_target=sr_target,
         speaker_cache=speaker_cache,
+        server_dir=server_dir,
     )
 
 

@@ -589,3 +589,45 @@ def test_receive_poll_interval_validation(monkeypatch, value, expected):
 
     monkeypatch.setenv("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", value)
     assert _recv_poll_seconds() == expected
+
+
+def test_put_limits_reaping_work_with_unread_backlog(connector, monkeypatch):
+    """A backlog must not turn every data send into a large filesystem sweep."""
+    prefix = f"reap_budget_{uuid.uuid4().hex}"
+    for index in range(128):
+        assert connector.put("0", "1", f"{prefix}_{index}", index)[0]
+
+    checked_paths = []
+    exists = os.path.exists
+
+    def track_exists(path):
+        if str(path).startswith(f"/dev/shm/{prefix}"):
+            checked_paths.append(path)
+        return exists(path)
+
+    monkeypatch.setattr(os.path, "exists", track_exists)
+    assert connector.put("0", "1", f"{prefix}_next", "next")[0]
+    # Keep per-send housekeeping small, independently of the backlog length.
+    assert len(checked_paths) <= 8
+
+
+def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
+    """Small send-time sweeps must still catch up with ongoing consumption."""
+    receiver = SharedMemoryConnector({})
+    prefix = f"reap_mixed_{uuid.uuid4().hex}"
+    unread_count = 128
+    try:
+        for index in range(unread_count):
+            assert connector.put("0", "1", f"{prefix}_held_{index}", index)[0]
+        for index in range(2048):
+            key = f"{prefix}_consumed_{index}"
+            assert connector.put("0", "1", key, index)[0]
+            assert receiver.get("0", "1", key)[0] == index
+            assert len(connector._pending_keys) <= 2 * unread_count
+        for index in range(unread_count):
+            assert receiver.get("0", "1", f"{prefix}_held_{index}")[0] == index
+        for _ in range(4):
+            connector.reap_consumed()
+        assert not connector._pending_keys
+    finally:
+        receiver.close()

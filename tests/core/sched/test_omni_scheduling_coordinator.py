@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm import SamplingParams
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
@@ -23,6 +24,9 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import _LoadEntry
+from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -440,3 +444,20 @@ class TestTimeoutDetection(unittest.TestCase):
         self.assertNotIn("r1", coord.requests_with_ready_chunks)
         self.assertEqual([r.request_id for r in coord._waiting_for_chunk_running], ["r2"])
         self.assertEqual([h.request_id for h in coord.pending_chunk_registrations], ["r2"])
+
+
+def test_sender_address_on_the_engine_request_reaches_both_receive_paths():
+    """Ensure the sender address the orchestrator puts on an engine request reaches the receivers."""
+    sender = {"host": "10.0.0.2", "zmq_port": 50071}
+    engine_request = build_engine_core_request_from_tokens(
+        "req-1", {"prompt_token_ids": [0]}, SamplingParams(max_tokens=1)
+    )
+    engine_request.payload_sender_info = sender
+    request = OmniRequest.from_engine_core_request(engine_request, block_hasher=None)
+    # Build the coordinator and process the request with sender info
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    coordinator.process_pending_full_payload_inputs(MockQueue([request]), stage_recv_req_ids=set())
+
+    # Ensure that the payload send info is accessible on both pending input registrations and a wrapped load entry
+    assert [handle.payload_sender_info for handle in coordinator.pending_input_registrations] == [sender]
+    assert _LoadEntry(request).source_metadata == {"source_host": "10.0.0.2", "source_port": 50071}

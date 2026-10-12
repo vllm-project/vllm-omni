@@ -183,6 +183,16 @@ emit these headers.
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
 WAV) as they are decoded.
 
+`pcm` is 16-bit signed little-endian, interleaved, at the model's native sample
+rate and channel count (24 kHz mono for most models; MOSS-TTS-Local v1.5 emits
+48 kHz stereo). Raw streams and non-streaming responses state the format in
+response headers:
+
+| Header | Description |
+| --- | --- |
+| `x-audio-sample-rate` | Sample rate of the returned audio in Hz (after any `sample_rate` resampling). |
+| `x-audio-channels` | Channel count of the returned audio. |
+
 Both streaming modes (`stream_format="audio"` and `"sse"`) require
 `response_format="pcm"` or `"wav"`, and `speed` must be `1.0` (or omitted).
 
@@ -193,8 +203,12 @@ Each event has an `event:` line and a JSON `data:` line:
 - `speech.audio.delta` — a base64 audio chunk:
 
     ```json
-    { "type": "speech.audio.delta", "audio": "<base64>", "response_format": "pcm" }
+    { "type": "speech.audio.delta", "audio": "<base64>", "response_format": "pcm",
+      "sample_rate": 24000, "channels": 1 }
     ```
+
+    `sample_rate` and `channels` extend the OpenAI event and describe the
+    decoded chunk.
 
 - `speech.audio.done` — terminal event, carrying token `usage`:
 
@@ -340,7 +354,7 @@ Server -> Client:
 
 | Message | Description |
 | --------- | ------------- |
-| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
+| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000, "channels": 1}` | Audio generation starting for the buffered input. With `stream_audio=true` it is sent with the first audio chunk, and for `pcm` it carries that audio's `sample_rate` and `channels` (omitted when no audio was produced). |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
 | `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
 | `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Flushed utterance complete |
@@ -973,15 +987,16 @@ Use `/v1/audio/voices` to list available voices for the loaded model.
 Multi-stage omni deployments route stage outputs through a single orchestrator
 loop. The legacy loop polls every stage replica on a 1 ms cadence. The
 event-driven mode replaces the poll with one reader task per live stage
-replica awaiting its client directly, and switches the serving-side
-final-output drain to a condition-variable wakeup at the same time. Qwen3-TTS
-uses this mode by default; other pipelines keep the legacy poll unless enabled.
+replica awaiting its client directly. Qwen3-TTS uses this mode by default;
+other pipelines keep the legacy poll unless enabled. The serving-side
+final-output loop is independent of this setting: it is always woken when the
+orchestrator queues output.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction and separately when the final-output drain starts. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
 
 Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
 before starting the server when overriding the pipeline default. For example,

@@ -23,6 +23,12 @@ from vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3 import (
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("topk", [0, -1])
+def test_h3_rejects_nonpositive_topk_at_construction(topk):
+    with pytest.raises(ValueError, match="topk must be positive"):
+        MiniMaxH3VSAImpl(num_heads=2, head_size=128, softmax_scale=128**-0.5, backend_kwargs={"topk": topk})
+
+
 def _h3_metadata(prefix_segments, video_shape, *, gate=None, packed_padding=None):
     extra: dict[str, Any] = {
         "vsa_h3_prefix_segments": prefix_segments,

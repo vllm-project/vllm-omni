@@ -135,4 +135,9 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
 # they have different talker architectures from the delay variant
 # (MossTTSRealtime / MossTTSLocalModel vs MossTTSDelayModel).
 
-__all__ = ["MOSS_TTS_PIPELINE", "MOSS_TTS_REALTIME_PIPELINE", "MOSS_TTS_LOCAL_PIPELINE"]
+
+__all__ = [
+    "MOSS_TTS_PIPELINE",
+    "MOSS_TTS_REALTIME_PIPELINE",
+    "MOSS_TTS_LOCAL_PIPELINE",
+]

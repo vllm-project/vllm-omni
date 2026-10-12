@@ -47,12 +47,30 @@ logger = init_logger(__name__)
 
 
 def _float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
-    """PCM_16 bytes of float32 samples, bit-identical to libsndfile's RAW writer.
+    """Convert channels-last float32 audio to interleaved little-endian PCM.
 
-    libsndfile (1.2) converts with ``floor(x * 0x8000)`` clipped to int16.
+    Match libsndfile's clipped float32 -> int32 -> PCM16 conversion, including
+    rounding at the int32 boundary before dropping its low 16 bits. Directly
+    rounding or truncating audio * 32768 produces different output samples.
+    Convert planar input in contiguous channel order, then interleave int16
+    samples so only the final, smaller buffer needs strided writes.
     """
-    scaled = np.floor(audio.astype(np.float64) * 32768.0)
-    return np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
+    planar = audio.ndim == 2 and not audio.flags.c_contiguous and audio.T.flags.c_contiguous
+    samples = audio.T if planar else audio
+    scaled = np.fmax(samples, np.float32(-1), order="C")
+    # Largest float32 below 1 keeps the int32 conversion in range.
+    np.minimum(scaled, np.float32(1 - 2**-24), out=scaled)
+    scaled *= 2147483648.0
+    np.rint(scaled, out=scaled)
+    pcm32 = scaled.astype(np.int32)
+    pcm32 >>= 16
+    pcm16 = pcm32.astype("<i2")
+    if planar:
+        interleaved = np.empty(audio.shape, dtype="<i2")
+        for index, channel in enumerate(pcm16):
+            interleaved[:, index] = channel
+        pcm16 = interleaved
+    return pcm16.tobytes()
 
 
 class AudioMixin:

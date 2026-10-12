@@ -152,6 +152,8 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     new_prompt_len_snapshot: int | None = None
     # Authoritative segment count when the native plane suppresses token IPC.
     num_generation_tokens: int | None = None
+    # Coalesced decode steps have no recoverable per-step ITL samples.
+    is_coalesced: bool = False
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

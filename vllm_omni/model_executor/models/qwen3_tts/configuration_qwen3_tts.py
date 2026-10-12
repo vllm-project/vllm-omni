@@ -23,7 +23,8 @@ logger = logging.get_logger(__name__)
 
 class Qwen3TTSSpeakerEncoderConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`Qwen3TTSSpeakerEncoder`].
+    This is the configuration class to store the configuration of the Qwen3TTS speaker encoder
+    ([`ECAPATimeDelayNet`]).
     It is used to instantiate a Qwen3TTS speaker encoder model according to the specified arguments, defining the model
     architecture. The architecture is based on the ECAPA-TDNN model.
 

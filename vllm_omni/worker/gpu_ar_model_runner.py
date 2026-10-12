@@ -182,6 +182,10 @@ def _snapshot_tensor_payload_to_cpu_async(
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
         cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
+        # An executor may discard an unconsumed output (e.g. cancellation).
+        # Keep the allocator from reusing its source storage before D2H ends.
+        for source in cuda_sources:
+            source.record_stream(copy_stream)
         ready_event.record(copy_stream)
     return _AsyncCPUPayloadSnapshot(cpu_payload, ready_event, cuda_sources)
 
@@ -1835,9 +1839,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             and needs_pooler_payload
             and (self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states())
         )
-        if not needs_pooler_payload and prefix_cache_step_id is not None:
-            # No consumer for this step's merge: consume the step context by
-            # id (exactly-once contract). The cache write still lands.
+        if prefix_cache_step_id is not None and (
+            not needs_pooler_payload or self._model_mm_outputs_written_in_sample()
+        ):
+            # No consumer for this step's merge, or the model wrote its mm
+            # outputs in sample() after the snapshot: consume the step context
+            # by id (exactly-once contract) and build from the live outputs.
+            # The cache write still lands.
             assert self.omni_prefix_cache is not None
             self.omni_prefix_cache.discard_step(prefix_cache_step_id)
             prefix_cache_step_id = None

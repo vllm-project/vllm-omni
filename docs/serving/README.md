@@ -154,18 +154,16 @@ All six routes are model- or configuration-dependent. In particular,
 pipeline declares a `duplex_plugin` and its deploy configuration sets
 `session_mode: duplex` (with `session_mode: turn` the same model boots the
 ordinary turn-based serving stack instead). On a duplex server a stock
-Realtime client needs no vendor query parameter; `duplex=0` selects the
-turn-based Realtime handler, which a duplex server does not mount, so that
-connection is refused with `Realtime API is not available`. Such a server
-serves the websocket route plus `POST /v1/chat/completions`, `/v1/models`
-and `/health`, and no other turn-based HTTP route. The chat route is the
-ordinary chat service running on the duplex engine: a request is a
-turn-based generation on the same stages, served alongside the live
-websocket sessions; it opens no duplex session and holds no
-`duplex_session.max_sessions` slot -- see [Full Duplex](full_duplex_api.md).
-On a server that is not duplex, an explicit `?duplex=1` is refused rather
-than answered by the turn-based handler, so a client that requested duplex
-never silently gets the other protocol.
+Realtime client needs no vendor query parameter; `duplex=0` opts out of native
+duplex and selects the turn-based Realtime handler. It runs generation on the
+same stages, alongside live websocket sessions, and opens no duplex session
+or consumes a `duplex_session.max_sessions` slot -- see
+[Full Duplex](full_duplex_api.md).
+Such a server serves the websocket route plus `POST /v1/chat/completions`,
+`/v1/models` and `/health`, and no other turn-based HTTP route. On a server
+that is not duplex, an explicit `?duplex=1` is refused rather than answered by
+the turn-based handler, so a client that requested duplex never silently gets
+the other protocol.
 
 ## Related Endpoints
 
