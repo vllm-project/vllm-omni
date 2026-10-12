@@ -441,3 +441,26 @@ def test_batched_graph_reuses_a_larger_batch_without_mixing_outputs() -> None:
             torch.testing.assert_close(previous, snapshot, atol=0, rtol=0)
         snapshots.append((actual, actual.clone()))
     assert list(wrapper._cache) == [(4, 8)]
+
+
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_compiled_decode_failure_falls_back_to_vae_decode(mocker) -> None:
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(), tile_frames=0)
+
+    # Set a dummy _compiled_decode that raises RuntimeError during capture
+    def failing_decode(x: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("compiled decode simulated failure")
+
+    wrapper._compiled_decode = failing_decode
+    latents = torch.randn(2, 8, vae.latent_dim, device="cuda")
+
+    # Decoding should catch the compiled capture error, fall back to vae.decode,
+    # and mark (2, 8) as uncapturable under compile.
+    actual = wrapper(latents)
+    expected = vae.decode(latents)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    assert (2, 8) in wrapper._uncapturable_compiled_shapes
+    assert (2, 8) in wrapper._cache

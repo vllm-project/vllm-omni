@@ -102,6 +102,16 @@ class _GraphEntry:
 class AuKVAEDecodeGraph:
     """Replay AuKVAE.decode for a batch of clips."""
 
+    _BATCH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
+
+    @classmethod
+    def _batch_bucket(cls, batch_size: int) -> int:
+        """Find the smallest batch ladder step >= batch_size."""
+        for b in cls._BATCH_LADDER:
+            if batch_size <= b:
+                return b
+        return batch_size
+
     def __init__(
         self,
         vae: AuKVAE,
@@ -140,6 +150,7 @@ class AuKVAEDecodeGraph:
         # Startup captures are separate from the bounded runtime graph cache.
         self._compiled: dict[tuple[int, int], _GraphEntry] = {}
         self._compiled_decode: Callable[[torch.Tensor], torch.Tensor] | None = None
+        self._uncapturable_compiled_shapes: set[tuple[int, int]] = set()
         # Which path served the last call: "compiled", "graph" or "eager".
         self.last_mode: str | None = None
 
@@ -197,14 +208,38 @@ class AuKVAEDecodeGraph:
         if entry is None:
             if len(self._cache) >= self.max_graphs:
                 self._retire_plain_graphs()
-            pool = self._plain_pools.get(B)
+            target_b = self._batch_bucket(B)
+            pool = self._plain_pools.get(target_b)
             if pool is None:
                 pool = torch.cuda.graph_pool_handle()
-                self._plain_pools[B] = pool
-            decode = self._compiled_decode if (B > 1 and self._compiled_decode is not None) else self.vae.decode
+                self._plain_pools[target_b] = pool
+            if (target_b, bucket) in self._uncapturable_compiled_shapes:
+                decode = self.vae.decode
+            elif target_b > 1 and self._compiled_decode is not None:
+                decode = self._compiled_decode
+            else:
+                decode = self.vae.decode
             warm_iters = 5 if decode is self._compiled_decode else 2
-            entry = self._capture(bucket, latents.device, decode, warm_iters=warm_iters, pool=pool, batch_size=B)
-            self._cache[(B, bucket)] = entry
+            try:
+                entry = self._capture(
+                    bucket, latents.device, decode, warm_iters=warm_iters, pool=pool, batch_size=target_b
+                )
+            except Exception:
+                if decode is self._compiled_decode:
+                    logger.warning(
+                        "Compiled AuK codec decode capture failed for batch_size=%d latent_frames=%d; "
+                        "falling back to plain CUDA graph with vae.decode",
+                        target_b,
+                        bucket,
+                        exc_info=True,
+                    )
+                    self._uncapturable_compiled_shapes.add((target_b, bucket))
+                    entry = self._capture(
+                        bucket, latents.device, self.vae.decode, warm_iters=2, pool=pool, batch_size=target_b
+                    )
+                else:
+                    raise
+            self._cache[(target_b, bucket)] = entry
             mode = "graph"
         self.last_mode = mode
 

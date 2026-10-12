@@ -27,6 +27,7 @@ from safetensors import safe_open
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from vllm.logger import init_logger
+from vllm.utils.math_utils import round_up
 
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -173,6 +174,7 @@ class _RequestCondition:
     ref: torch.Tensor
     generator: torch.Generator | None
     output_type: str
+    target_frames: int
 
 
 def _pad_conditions(tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -505,7 +507,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         if isinstance(generator, list):
             if len(generator) > 1:
                 logger.warning(
-                    "AuKPipeline runs one request per forward; using the first of %d generators", len(generator)
+                    "Each request condition expects a single generator; using the first of %d generators",
+                    len(generator),
                 )
             generator = generator[0] if generator else None
         if generator is None:
@@ -660,10 +663,11 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        """Batch requests with matching target length and Euler schedule.
+        """Batch requests with matching target bucket and Euler schedule.
 
-        Text and reference lengths may differ; their padding is masked. Seeds,
-        posterior sampling and output types remain request-local.
+        Text, reference and target lengths may differ within a target bucket;
+        their padding is masked. Seeds, posterior sampling and output types
+        remain request-local.
         """
         groups: dict[_ScheduleKey, list[_RequestCondition]] = {}
         for index, request in enumerate(req.requests):
@@ -691,20 +695,23 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                 generator=vae_generator,
             )
             gen_frames = self._target_frames(knobs.get("gen_seconds"), ref.shape[1])
+            target_bucket = round_up(gen_frames, AuKCUDAGraphWrapper._TARGET_ALIGNMENT)
             nfe, cfg, sway, t_grid = self._resolve_schedule(sampling_params, knobs)
-            key = (nfe, cfg, sway, tuple(t_grid) if t_grid is not None else None, gen_frames)
+            key = (nfe, cfg, sway, tuple(t_grid) if t_grid is not None else None, target_bucket)
             groups.setdefault(key, []).append(
-                _RequestCondition(index, text, ref, generator, sampling_params.output_type or "np")
+                _RequestCondition(index, text, ref, generator, sampling_params.output_type or "np", gen_frames)
             )
 
         outputs: dict[int, DiffusionOutput] = {}
-        for (nfe, cfg, sway, t_grid, gen_frames), items in groups.items():
+        for (nfe, cfg, sway, t_grid, target_bucket), items in groups.items():
             text, c_mask = _pad_conditions([item.text for item in items])
             if len(items) == 1:
                 ref = items[0].ref
                 ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=ref.device)
             else:
                 ref, ref_mask = _pad_conditions([item.ref[0] for item in items])
+            target_lens = torch.tensor([item.target_frames for item in items], device=self.device)
+            x_mask = torch.arange(target_bucket, device=self.device)[None, :] < target_lens[:, None]
             with self._dit_autocast():
                 latents = sample_latents(
                     self.dit,
@@ -712,7 +719,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     c_mask=c_mask,
                     ref=ref,
                     ref_mask=ref_mask,
-                    gen_frames=gen_frames,
+                    gen_frames=target_bucket,
+                    x_mask=x_mask,
                     nfe=nfe,
                     cfg_strength=cfg,
                     sway_sampling_coef=sway,
@@ -729,18 +737,21 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
             wav = None
             if any(item.output_type != "latent" for item in items):
+                # Zero out padded positions so the non-causal decoder input convolution
+                # (conv_pre) does not bleed unmasked noise into the trailing valid audio samples.
+                decode_latents = latents.masked_fill(~x_mask.unsqueeze(-1), 0.0)
                 # Transfer the group once rather than copying each waveform separately.
-                wav = self.vae_decode(latents).detach().to(device="cpu", dtype=torch.float32)
+                wav = self.vae_decode(decode_latents).detach().to(device="cpu", dtype=torch.float32)
                 if not torch.isfinite(wav).all():
                     raise RuntimeError("AuK generated audio contains NaN or Inf.")
             cpu_latents = latents.detach().cpu() if any(item.output_type == "latent" for item in items) else None
             for row, item in enumerate(items):
                 if item.output_type == "latent":
                     assert cpu_latents is not None
-                    output = cpu_latents[row : row + 1]
+                    output = cpu_latents[row : row + 1, : item.target_frames]
                 else:
                     assert wav is not None
-                    output = wav[row].reshape(-1)
+                    output = wav[row, : item.target_frames * self.hop_size].reshape(-1)
                 outputs[item.index] = DiffusionOutput(output=output)
         return [outputs[index] for index in range(req.num_reqs)]
 

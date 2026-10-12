@@ -275,9 +275,11 @@ def test_batch_sampling_preserves_each_request_seed(cfg_strength: float) -> None
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
     with pytest.raises(ValueError, match="one noise generator per request"):
         sample_latents(dit, **inputs, **common, generator=[torch.Generator().manual_seed(7)])
+    with pytest.raises(ValueError, match="when batch_size > 1"):
+        sample_latents(dit, **inputs, **common, generator=torch.Generator().manual_seed(7))
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
@@ -371,3 +373,54 @@ def test_text_only_eager_batch_with_unequal_lengths_matches_serial() -> None:
     # Short request in the batch must match its serial execution with tight tolerance
     actual_short = actual_batch[1:2]
     torch.testing.assert_close(actual_short, expected_serial, atol=1e-5, rtol=1e-5)
+
+
+@torch.inference_mode()
+def test_batched_unequal_target_lengths_matches_serial() -> None:
+    """Masking on target latents ensures shorter requests in a batch match their serial generation."""
+    dit = _make_dit("cpu")
+    text = torch.randn(2, 7, 8)
+    c_mask = torch.ones(2, 7, dtype=torch.bool)
+    ref = torch.randn(2, 4, 4)
+    ref_mask = torch.ones(2, 4, dtype=torch.bool)
+
+    # 1. Serial run of request 0 with target_bucket=9, masked to 6 valid frames
+    gen0 = torch.Generator().manual_seed(42)
+    x_mask0 = torch.tensor([[True] * 6 + [False] * 3])
+    expected_serial0 = sample_latents(
+        dit,
+        text=text[0:1],
+        c_mask=c_mask[0:1],
+        ref=ref[0:1],
+        ref_mask=ref_mask[0:1],
+        gen_frames=9,
+        x_mask=x_mask0,
+        generator=gen0,
+        t_grid=[0.0, 0.5, 1.0],
+        cfg_strength=2.0,
+        dtype=torch.float32,
+    )
+
+    # 2. Batched run with target_bucket=9, where row 0 has length 6 and row 1 has length 9
+    gen0_batch = torch.Generator().manual_seed(42)
+    gen1_batch = torch.Generator().manual_seed(99)
+    x_mask = torch.tensor([[True] * 6 + [False] * 3, [True] * 9])
+
+    actual_batch = sample_latents(
+        dit,
+        text=text,
+        c_mask=c_mask,
+        ref=ref,
+        ref_mask=ref_mask,
+        gen_frames=9,
+        x_mask=x_mask,
+        generator=[gen0_batch, gen1_batch],
+        t_grid=[0.0, 0.5, 1.0],
+        cfg_strength=2.0,
+        dtype=torch.float32,
+    )
+
+    # Valid frames of row 0 must match serial generation exactly
+    torch.testing.assert_close(actual_batch[0:1, :6], expected_serial0[:, :6], atol=1e-5, rtol=1e-5)
+    # The serial and batched calls with the same generator and bucket draw identical initial noise
+    torch.testing.assert_close(actual_batch[0:1], expected_serial0, atol=1e-5, rtol=1e-5)
