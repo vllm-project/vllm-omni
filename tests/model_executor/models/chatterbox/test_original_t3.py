@@ -126,6 +126,7 @@ def test_original_prompt_and_companion_metadata(weight):
     assert prompt["prompt_token_ids"] == [6561] * 41
     info = prompt["additional_information"]
     assert info["chatterbox"] == {"cfg_weight": weight, "exaggeration": 0.7}
+    info["global_request_id"] = ["external-request"]
     params = SamplingParams(max_tokens=1000)
     prepare_original_prompt(prompt, [params])
     expanded = expand_original_cfg_prompts(prompt, params)
@@ -137,7 +138,7 @@ def test_original_prompt_and_companion_metadata(weight):
         assert len(expanded) == 1
         companion_params, _ = expanded[0].apply_overrides(params, [params])
         pair_key, role, cfg_weight = params.extra_args["chatterbox_cfg"]
-        assert role == "cond" and cfg_weight == weight
+        assert (pair_key, role, cfg_weight) == ("external-request", "cond", weight)
         assert companion_params.extra_args["chatterbox_cfg"] == (pair_key, "uncond", weight)
         assert expanded[0].request_id_suffix == "__cfg_uncond"
         companion = expanded[0].prompt

@@ -11,7 +11,6 @@ contract.
 """
 
 from typing import Any
-from uuid import uuid4
 
 import torch
 
@@ -44,7 +43,7 @@ def prepare_original_prompt(prompt: dict, sampling_params_list: list[Any]) -> di
     info = prompt["additional_information"]["chatterbox"]
     params.extra_args = {
         **(params.extra_args or {}),
-        "chatterbox_cfg": (uuid4().hex, "cond", info["cfg_weight"]),
+        "chatterbox_cfg": (prompt["additional_information"]["global_request_id"][0], "cond", info["cfg_weight"]),
     }
     return prompt
 
