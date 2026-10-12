@@ -36,8 +36,9 @@ CosyVoice3 is intentionally absent: no online example exists for it yet. See its
 
 Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
 reference recording. No reference transcript is needed. Install the conditioning
-extra with `uv pip install -e '.[chatterbox]'`. This integration requires the
-shared runtime prerequisite [#8842](https://github.com/vllm-project/vllm-omni/pull/8842).
+extra with `uv pip install -e '.[chatterbox]'`. The integration includes its
+required adapter hooks; [#8842](https://github.com/vllm-project/vllm-omni/pull/8842)
+contains independent shared runtime fixes.
 
 ```bash
 vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091

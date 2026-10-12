@@ -36,8 +36,9 @@ list of supported architectures across all modalities, see
 
 Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
 reference recording. No reference transcript is needed. Install the conditioning
-extra with `uv pip install -e '.[chatterbox]'`. This integration requires the
-shared runtime prerequisite [#8842](https://github.com/vllm-project/vllm-omni/pull/8842).
+extra with `uv pip install -e '.[chatterbox]'`. The integration includes its
+required adapter hooks; [#8842](https://github.com/vllm-project/vllm-omni/pull/8842)
+contains independent shared runtime fixes.
 
 ```bash
 uv run examples/offline_inference/text_to_speech/chatterbox/end2end.py \
