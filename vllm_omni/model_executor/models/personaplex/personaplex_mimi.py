@@ -399,6 +399,10 @@ class PersonaPlexMimiCodec(nn.Module):
         self._batch_size: int | None = None
         self._cuda_graphs: dict[str, MimiFrameGraph] = {}
         self._all_active: torch.Tensor
+        # Operational telemetry: how often the frame steps replayed from a
+        # graph versus ran eagerly. Deliberately not touched by stream resets
+        # or resizes, so a lease's history stays observable.
+        self._graph_replay_stats = {"encode_graph": 0, "encode_eager": 0, "decode_graph": 0, "decode_eager": 0}
 
     # -- streaming state ------------------------------------------------------
 
@@ -429,6 +433,11 @@ class PersonaPlexMimiCodec(nn.Module):
             )
         self._batch_size = batch_size
         self._cuda_graphs = {}
+        if getattr(self, "_graph_replay_stats", None) is None:
+            # streaming_init is the one entry every codec (including ones
+            # assembled field-by-field in tests) passes through before any
+            # frame dispatch; a resize must not erase the telemetry history.
+            self._graph_replay_stats = {"encode_graph": 0, "encode_eager": 0, "decode_graph": 0, "decode_eager": 0}
         self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
         for s in self._conv_states():
             s.reset(batch_size, self.device, self.dtype)
@@ -484,6 +493,10 @@ class PersonaPlexMimiCodec(nn.Module):
         )
         return sorted(self._cuda_graphs)
 
+    def graph_replay_stats(self) -> dict[str, int]:
+        """Graph-replayed versus eager frame-step counts since construction."""
+        return dict(self._graph_replay_stats)
+
     # -- per-frame codec -------------------------------------------------------
 
     @staticmethod
@@ -508,7 +521,9 @@ class PersonaPlexMimiCodec(nn.Module):
         active = _normalize_active(active, self._all_active)
         graph = self._frame_graph("encode")
         if graph is not None:
+            self._graph_replay_stats["encode_graph"] += 1
             return graph.replay(pcm.reshape(-1, FRAME_SIZE), active)
+        self._graph_replay_stats["encode_eager"] += 1
         return self._encode_frame_eager(pcm, active)
 
     def _encode_frame_eager(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
@@ -553,7 +568,9 @@ class PersonaPlexMimiCodec(nn.Module):
         active = _normalize_active(active, self._all_active)
         graph = self._frame_graph(f"decode_f{codes.shape[-1]}")
         if graph is not None:
+            self._graph_replay_stats["decode_graph"] += 1
             return graph.replay(codes, active)
+        self._graph_replay_stats["decode_eager"] += 1
         return self._decode_frames_eager(codes, active)
 
     def _decode_frames_eager(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:

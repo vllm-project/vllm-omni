@@ -3,6 +3,7 @@
 """Fixed-buffer streaming state and CUDA graph replay of the PersonaPlex Mimi codec."""
 
 import gc
+import os
 import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -252,6 +253,120 @@ def test_multi_frame_decode_graph_matches_eager_chunks(batch_size: int) -> None:
         assert actual.shape == (batch_size, frames * FRAME_SIZE)
         rows = slice(None) if active is None else active
         _assert_waveform_matches(actual[rows], expected[rows])
+
+
+@pytest.mark.cpu
+def test_frame_graph_counts_eager_fallbacks() -> None:
+    from vllm_omni.model_executor.models.personaplex.personaplex_mimi_cudagraph import MimiFrameGraph
+
+    def eager(frame: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        del active
+        return frame
+
+    graph = MimiFrameGraph(
+        graph=SimpleNamespace(replay=lambda: None),
+        static_input=torch.zeros(2, CODEBOOKS, 1),
+        static_active=torch.ones(2, dtype=torch.bool),
+        static_output=torch.zeros(2, 1),
+        eager=eager,
+    )
+
+    # A batch width the graph was not recorded for must run eagerly, be
+    # counted, and never touch the recorded graph.
+    for _ in range(2):
+        out = graph.replay(torch.zeros(3, CODEBOOKS, 1), torch.ones(3, dtype=torch.bool))
+    assert out.shape == (3, CODEBOOKS, 1)
+    assert graph.replays == 0
+    assert graph.eager_fallbacks == 2
+
+
+@pytest.mark.cpu
+def test_graph_replay_stats_count_dispatch_and_survive_resets() -> None:
+    codec = _random_codec(torch.device("cpu"), batch_size=2)
+    assert codec.graph_replay_stats() == {
+        "encode_graph": 0,
+        "encode_eager": 0,
+        "decode_graph": 0,
+        "decode_eager": 0,
+    }
+
+    pcm = torch.randn(2, FRAME_SIZE)
+    codes = codec.encode_frame(pcm, _mask(True, False))
+    codec.decode_frame(codes, _mask(True, False))
+    assert codec.graph_replay_stats() == {
+        "encode_graph": 0,
+        "encode_eager": 1,
+        "decode_graph": 0,
+        "decode_eager": 1,
+    }
+
+    # An in-place stream reset (a recycled codec) keeps the counters.
+    codec.streaming_init(2)
+    codec.encode_frame(pcm)
+    assert codec.graph_replay_stats() == {
+        "encode_graph": 0,
+        "encode_eager": 2,
+        "decode_graph": 0,
+        "decode_eager": 1,
+    }
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graph_replay_stats_report_graph_and_eager_decode_calls() -> None:
+    device = torch.device("cuda")
+    codec = _random_codec(device, batch_size=2)
+    generator = torch.Generator(device="cpu").manual_seed(SEED)
+    chunk = _MIMI_DECODE_BATCH_FRAMES
+    frames_list = [1, chunk, chunk, chunk - 2]  # the partial chunk has no graph
+    codec.streaming_init(2)
+    assert codec.capture_cuda_graphs(encode=True, decode_frame_counts=(1, chunk)) == [
+        "decode_f1",
+        f"decode_f{chunk}",
+        "encode",
+    ]
+
+    for frames in frames_list:
+        codec.decode_frames(torch.randint(0, 2048, (2, CODEBOOKS, frames), generator=generator))
+    codec.encode_frame(torch.zeros(2, FRAME_SIZE))
+
+    assert codec.graph_replay_stats() == {
+        "encode_graph": 1,
+        "encode_eager": 0,
+        "decode_graph": 3,
+        "decode_eager": 1,
+    }
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not os.environ.get("PERSONAPLEX_MIMI_CHECKPOINT"),
+    reason="PERSONAPLEX_MIMI_CHECKPOINT must point at the bundled tokenizer safetensors",
+)
+def test_real_checkpoint_graph_replay_is_bitwise_equal_to_eager() -> None:
+    codec = PersonaPlexMimiCodec(
+        checkpoint=os.environ["PERSONAPLEX_MIMI_CHECKPOINT"],
+        device=torch.device("cuda"),
+    )
+    device = torch.device("cuda")
+    codec.streaming_init(2)
+    eager_codes, eager_pcm, _ = _drive(codec, frames=48, recycle_at=31, device=device)
+    after_eager = codec.graph_replay_stats()
+    assert after_eager["encode_eager"] == 48 and after_eager["encode_graph"] == 0
+    assert after_eager["decode_eager"] == 48 and after_eager["decode_graph"] == 0
+
+    codec.streaming_init(2)
+    assert codec.capture_cuda_graphs(decode_frame_counts=(1, 3)) == ["decode_f1", "decode_f3", "encode"]
+    graph_codes, graph_pcm, _ = _drive(codec, frames=48, recycle_at=31, device=device)
+
+    assert torch.equal(graph_codes, eager_codes)
+    _assert_waveform_matches(graph_pcm, eager_pcm)
+    # Counters accumulate since construction: the eager reference phase stays
+    # counted, and every graphed-drive dispatch replays.
+    stats = codec.graph_replay_stats()
+    assert stats["encode_graph"] == 48 and stats["encode_eager"] == 48
+    assert stats["decode_graph"] == 48 and stats["decode_eager"] == 48
 
 
 @pytest.mark.cuda
@@ -611,3 +726,61 @@ def test_capture_fallback_requires_successful_reset(capture_faults, point):
         capture_faults.capture()
     assert raised.value is error
     assert not capture_faults.warnings
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_shared_width_codec_rows_match_dedicated_codecs_and_graphs_stay_bitwise() -> None:
+    """One codec at N rows is the primitive of the shared Stage 1 decoder.
+
+    Row r of the width-N codec must track a dedicated B=1 codec over a mixed
+    frame-count schedule. Batched kernels reduce in different orders across
+    batch widths, so cross-width parity is a tolerance comparison (as the RFC
+    states for the encoder); graphed-versus-eager on the SAME width stays
+    bitwise, exactly like the per-codec B=1 graphs.
+    """
+    device = torch.device("cuda")
+    rows = 3
+    frame_counts = [1, 5, 5, 2, 1]  # first frame, full chunks, an uncaptured count
+    generator = torch.Generator(device="cpu").manual_seed(99)
+    codes = [
+        [torch.randint(0, 2048, (CODEBOOKS, frames), generator=generator).to(device) for frames in frame_counts]
+        for _ in range(rows)
+    ]
+    active = torch.ones(rows, dtype=torch.bool, device=device)
+    batches = [torch.stack([codes[row][step] for row in range(rows)]) for step in range(len(frame_counts))]
+
+    shared = _random_codec(device, rows)
+    per_request = [_random_codec(device, 1) for _ in range(rows)]  # same seed: same weights
+
+    # Cross-width: row r vs codec r, tolerance-bounded (fp32 reduction-order noise).
+    peak = rms = scale = 0.0
+    for step in range(len(frame_counts)):
+        expected = torch.cat(
+            [per_request[row].decode_frames(codes[row][step].unsqueeze(0)) for row in range(rows)],
+            dim=0,
+        )
+        actual = shared.decode_frames(batches[step], active)
+        error = (actual - expected).abs()
+        peak = max(peak, error.max().item())
+        rms = max(rms, error.square().mean().sqrt().item())
+        scale = max(scale, expected.abs().max().item())
+    # Measured on the random-weight codec: rel_peak ~1e-3, rel_rms ~2e-4,
+    # the expected fp32 batched-reduction noise amplified by the deep stack and
+    # the streaming state. Bounds keep a 2x margin over the measurement.
+    assert peak <= 2e-3 * scale, f"cross-width peak error {peak:.3e} on scale {scale:.3e}"
+    assert rms <= 5e-4 * scale, f"cross-width rms error {rms:.3e} on scale {scale:.3e}"
+
+    # Within-width: graphed vs eager on the same width-N codec is bitwise.
+    shared.streaming_init(rows)  # in-place reset; fresh stream
+    eager_audio = [shared.decode_frames(batch, active) for batch in batches]
+    shared.streaming_init(rows)
+    assert shared.capture_cuda_graphs(encode=False, decode_frame_counts=(1, 5)) == ["decode_f1", "decode_f5"]
+    before = shared.graph_replay_stats()
+    graph_audio = [shared.decode_frames(batch, active) for batch in batches]
+    for step, (eager, graphed) in enumerate(zip(eager_audio, graph_audio)):
+        assert torch.equal(eager, graphed), f"graphed step {step} diverged from eager at width {rows}"
+
+    after = shared.graph_replay_stats()
+    assert after["decode_graph"] - before["decode_graph"] == 4  # F in {1, 5}
+    assert after["decode_eager"] - before["decode_eager"] == 1  # F == 2 has no graph

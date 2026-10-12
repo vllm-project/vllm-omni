@@ -207,6 +207,12 @@ class PersonaPlexConfig(PretrainedConfig):
             Replay the streaming Mimi per-frame encode (Stage 0) and decode
             (Stage 1) from model-local CUDA graphs. Can be enabled through
             ``hf_overrides``.
+        mimi_shared_decoder (`bool`, *optional*, defaults to `False`):
+            Stage 1 decodes all sessions from one Mimi codec at
+            ``duplex_max_sessions`` rows (per-session row leases, one
+            full-width decode per frame-count group) instead of one B=1 codec
+            per session, saving (N-1) codec weight copies. Can be enabled
+            through ``hf_overrides``.
     """
 
     model_type = "personaplex"
@@ -227,6 +233,7 @@ class PersonaPlexConfig(PretrainedConfig):
         num_audio_codebooks: int = 16,
         mimi_name: str | None = None,
         mimi_cuda_graphs: bool = False,
+        mimi_shared_decoder: bool = False,
         **kwargs: Any,
     ) -> None:
         if temporal_config is None:
@@ -263,6 +270,7 @@ class PersonaPlexConfig(PretrainedConfig):
             self.mimi_config.mimi_name = mimi_name
         self.mimi_name = self.mimi_config.mimi_name
         self.mimi_cuda_graphs = mimi_cuda_graphs
+        self.mimi_shared_decoder = mimi_shared_decoder
 
     @staticmethod
     def _coerce(value: Any, config_cls: type[PretrainedConfig]) -> PretrainedConfig:

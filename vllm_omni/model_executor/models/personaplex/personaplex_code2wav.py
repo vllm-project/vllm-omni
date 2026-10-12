@@ -43,6 +43,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 _MIMI_DECODE_BATCH_FRAMES = 5
+# Report aggregate Mimi graph replay counters every N decoded requests, so a
+# serving run can state its decode graph hit rate (RFC #7389 evidence).
+_MIMI_GRAPH_STATS_LOG_INTERVAL = 1000
 
 
 def _codec_ids_from_payload_or_input(
@@ -96,6 +99,7 @@ class PersonaPlexCode2Wav(nn.Module):
         self._samples_per_frame = int(getattr(mimi_cfg, "samples_per_frame", 1920))
         self._mimi_name = getattr(mimi_cfg, "mimi_name", None) or getattr(self.config, "mimi_name", None)
         self._max_codec_sessions = int(getattr(vllm_config.model_config, "duplex_max_sessions", 1))
+        self._shared_decoder = bool(getattr(self.config, "mimi_shared_decoder", False))
 
         # The Mimi module is constructed in load_weights() (it owns its own
         # weight format) and assigned here so vLLM's memory profiler can see it.
@@ -104,6 +108,8 @@ class PersonaPlexCode2Wav(nn.Module):
         self._mimi_device: torch.device | None = None
         self._request_codec_slots: dict[str, int] = {}
         self._consumed_full_payload_requests: set[str] = set()
+        self._decoded_request_calls = 0
+        self._graph_stats_log_epoch = 0
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -199,6 +205,7 @@ class PersonaPlexCode2Wav(nn.Module):
         device = self._mimi_device or ids.device
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
+        pending: list[tuple[int, str | None, torch.Tensor]] = []
 
         for i, req_ids in enumerate(request_ids_list):
             runtime_info = (
@@ -227,9 +234,23 @@ class PersonaPlexCode2Wav(nn.Module):
                 if state_id in self._consumed_full_payload_requests:
                     continue
                 self._consumed_full_payload_requests.add(state_id)
-            wav = self._decode_streaming_frames(state_id, codes_kf.to(device=device))
-            if wav.numel() > 0:
-                audios[i] = wav.to(dtype=torch.float32).reshape(-1)
+            pending.append((i, state_id, codes_kf.to(device=device)))
+
+        if pending and self._shared_decoder:
+            self._decode_shared_batch(pending, audios)
+        else:
+            for i, state_id, codes_kf in pending:
+                wav = self._decode_streaming_frames(state_id, codes_kf)
+                self._decoded_request_calls += 1
+                if wav.numel() > 0:
+                    audios[i] = wav.to(dtype=torch.float32).reshape(-1)
+
+        # A duplex step decodes every scheduled request at once, so the counter
+        # jumps past interval boundaries; fire on crossing, not on landing.
+        epoch = self._decoded_request_calls // _MIMI_GRAPH_STATS_LOG_INTERVAL
+        if epoch > self._graph_stats_log_epoch:
+            self._graph_stats_log_epoch = epoch
+            self._log_mimi_graph_stats()
 
         return OmniOutput(
             text_hidden_states=None,
@@ -285,6 +306,95 @@ class PersonaPlexCode2Wav(nn.Module):
             codec.reset_streaming()
         return wav
 
+    def _lease_shared_rows(self, state_ids: list[str | None]) -> list[int]:
+        """Map every request of the batch to a codec row, leasing fresh rows in place."""
+        codec = self._mimi_codecs()[0]
+        reset_slot = getattr(codec, "reset_slot", None)
+        occupied = set(self._request_codec_slots.values())
+        rows: list[int] = []
+        for state_id in state_ids:
+            row = self._request_codec_slots.get(state_id) if state_id is not None else None
+            if row is None:
+                row = next((index for index in range(self._max_codec_sessions) if index not in occupied), None)
+                if row is None:
+                    raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {self._max_codec_sessions} is exhausted")
+                occupied.add(row)
+                if callable(reset_slot):
+                    reset_slot(row)
+                if state_id is not None:
+                    self._request_codec_slots[state_id] = row
+            rows.append(row)
+        return rows
+
+    def _decode_shared_batch(
+        self,
+        pending: list[tuple[int, str | None, torch.Tensor]],
+        audios: list[torch.Tensor],
+    ) -> None:
+        """Decode the step's requests on one codec: full-width groups per frame count.
+
+        The shared codec runs at ``max_sessions`` rows, so every call must be
+        assembled full-width with an active mask over the leased rows; a
+        request never decodes through a B=1 slice. Requests are chunked like
+        the per-request path, and one host copy serves each frame-count group.
+        """
+        codec = self._mimi_codecs()[0]
+        if not callable(getattr(codec, "decode_frames", None)):
+            raise RuntimeError("PersonaPlex Code2Wav shared decoder requires decode_frames")
+        rows = self._lease_shared_rows([state_id for _, state_id, _ in pending])
+        device = pending[0][2].device
+        k = int(self._num_codebooks)
+        width = self._max_codec_sessions
+        max_frames = max(codes.shape[1] for _, _, codes in pending)
+        self._decoded_request_calls += len(pending)
+        for start in range(0, max_frames, _MIMI_DECODE_BATCH_FRAMES):
+            groups: dict[int, list[tuple[int, int, torch.Tensor]]] = {}
+            for (out_index, _, codes), row in zip(pending, rows):
+                if codes.shape[1] <= start:
+                    continue
+                segment = codes[:, start : start + _MIMI_DECODE_BATCH_FRAMES]
+                groups.setdefault(segment.shape[1], []).append((out_index, row, segment))
+            for length, members in groups.items():
+                batch = torch.zeros(width, k, length, dtype=torch.long, device=device)
+                active = torch.zeros(width, dtype=torch.bool, device=device)
+                for out_index, row, segment in members:
+                    batch[row] = segment
+                    active[row] = True
+                audio = codec.decode_frames(batch, active).to(device="cpu")
+                for out_index, row, _ in members:
+                    segment_audio = audio[row, : length * self._samples_per_frame].to(dtype=torch.float32).reshape(-1)
+                    if segment_audio.numel() == 0:
+                        continue
+                    audios[out_index] = (
+                        segment_audio
+                        if audios[out_index].numel() == 0
+                        else torch.cat([audios[out_index], segment_audio])
+                    )
+
+    def _log_mimi_graph_stats(self) -> None:
+        totals = {"encode_graph": 0, "encode_eager": 0, "decode_graph": 0, "decode_eager": 0}
+        reporting = 0
+        for codec in self._mimi_codecs():
+            stats = getattr(codec, "graph_replay_stats", None)
+            if callable(stats):
+                reporting += 1
+                for key, value in stats().items():
+                    if key in totals:
+                        totals[key] += int(value)
+        if not reporting:
+            return
+        graph, eager = totals["decode_graph"], totals["decode_eager"]
+        hit_rate = 100.0 * graph / (graph + eager) if graph + eager else 0.0
+        logger.info(
+            "PersonaPlex Code2Wav Mimi decode graphs: graph_replays=%d eager_decodes=%d "
+            "hit_rate=%.1f%% streams=%d decoded_requests=%d",
+            graph,
+            eager,
+            hit_rate,
+            reporting,
+            self._decoded_request_calls,
+        )
+
     def _set_mimi_codecs(self, codecs: list[nn.Module]) -> None:
         if not codecs:
             raise ValueError("PersonaPlex Code2Wav requires at least one Mimi decoder")
@@ -324,7 +434,13 @@ class PersonaPlexCode2Wav(nn.Module):
             self._consumed_full_payload_requests.discard(state_id)
             slot = self._request_codec_slots.pop(state_id, None)
             codecs = self._mimi_codecs()
-            if slot is not None and slot < len(codecs):
+            if slot is None:
+                continue
+            if self._shared_decoder:
+                reset_slot = getattr(codecs[0], "reset_slot", None) if codecs else None
+                if callable(reset_slot):
+                    reset_slot(slot)
+            elif slot < len(codecs):
                 codecs[slot].reset_streaming()
 
     @staticmethod
@@ -382,35 +498,57 @@ class PersonaPlexCode2Wav(nn.Module):
         )
 
         checkpoint = Path(self.model_path) / (self._mimi_name or "tokenizer-e351c8d8-checkpoint125.safetensors")
-        codecs = [
-            PersonaPlexMimiCodec(
-                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-                device=str(device),
-            ).eval()
-            for _ in range(self._max_codec_sessions)
-        ]
-        if getattr(self.config, "mimi_cuda_graphs", False):
-            # Each decoder is leased per request and reset in place, so its B=1
-            # graphs stay valid. Deltas arrive as the first single frame and then
-            # full chunks, so those two frame counts are recorded; other counts
-            # run eagerly. The graphs replay one at a time on this stage's stream
-            # and copy their output, so they share one pool.
-            pool = torch.cuda.graph_pool_handle() if torch.device(str(device)).type == "cuda" else None
-            captured = 0
-            for codec in codecs:
-                codec.streaming_init(1)
-                captured += bool(
-                    codec.capture_cuda_graphs(
-                        encode=False,
-                        decode_frame_counts=(1, _MIMI_DECODE_BATCH_FRAMES),
-                        pool=pool,
-                    )
+        if self._shared_decoder:
+            # One decoder serves every session: a row per duplex slot, leased
+            # and recycled in place, so its width-N graphs stay valid. The
+            # (N-1) saved weight copies are the point of this mode.
+            codecs = [
+                PersonaPlexMimiCodec(
+                    checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+                    device=str(device),
+                ).eval()
+            ]
+            codecs[0].streaming_init(self._max_codec_sessions)
+            if getattr(self.config, "mimi_cuda_graphs", False) and torch.device(str(device)).type == "cuda":
+                captured = codecs[0].capture_cuda_graphs(
+                    encode=False,
+                    decode_frame_counts=(1, _MIMI_DECODE_BATCH_FRAMES),
                 )
-            logger.info(
-                "PersonaPlex Code2Wav replays Mimi decode from CUDA graphs on %d/%d stream(s)",
-                captured,
-                len(codecs),
-            )
+                logger.info(
+                    "PersonaPlex Code2Wav shared decoder replays Mimi decode from CUDA graphs (%s) at %d rows",
+                    "/".join(captured) or "capture failed",
+                    self._max_codec_sessions,
+                )
+        else:
+            codecs = [
+                PersonaPlexMimiCodec(
+                    checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+                    device=str(device),
+                ).eval()
+                for _ in range(self._max_codec_sessions)
+            ]
+            if getattr(self.config, "mimi_cuda_graphs", False):
+                # Each decoder is leased per request and reset in place, so its B=1
+                # graphs stay valid. Deltas arrive as the first single frame and then
+                # full chunks, so those two frame counts are recorded; other counts
+                # run eagerly. The graphs replay one at a time on this stage's stream
+                # and copy their output, so they share one pool.
+                pool = torch.cuda.graph_pool_handle() if torch.device(str(device)).type == "cuda" else None
+                captured = 0
+                for codec in codecs:
+                    codec.streaming_init(1)
+                    captured += bool(
+                        codec.capture_cuda_graphs(
+                            encode=False,
+                            decode_frame_counts=(1, _MIMI_DECODE_BATCH_FRAMES),
+                            pool=pool,
+                        )
+                    )
+                logger.info(
+                    "PersonaPlex Code2Wav replays Mimi decode from CUDA graphs on %d/%d stream(s)",
+                    captured,
+                    len(codecs),
+                )
         self._set_mimi_codecs(codecs)
         self._mimi_device = torch.device(str(device))
         reported_sr = getattr(codecs[0].model.config, "sampling_rate", None)

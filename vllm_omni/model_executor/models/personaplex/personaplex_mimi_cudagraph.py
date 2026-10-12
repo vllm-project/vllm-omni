@@ -102,6 +102,7 @@ class MimiFrameGraph:
         self.static_output = static_output
         self.eager = eager
         self.replays = 0
+        self.eager_fallbacks = 0
         self._warned = False
 
     def replay(self, frame: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
@@ -113,6 +114,7 @@ class MimiFrameGraph:
                     tuple(frame.shape),
                     tuple(self.static_input.shape),
                 )
+            self.eager_fallbacks += 1
             return self.eager(frame, active)
         self.static_input.copy_(frame)
         self.static_active.copy_(active)
