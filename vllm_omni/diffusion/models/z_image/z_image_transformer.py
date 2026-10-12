@@ -624,25 +624,14 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
-# The fused reduction changes Z-Image sampled outputs on the tested model.
-# Keep the eager chain by default until its numerical contract is validated;
-# deployments can opt in with VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS=0.
+# Preserve eager numerics by default; set VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS=0 to opt in.
 _FUSED_MIN_TOKENS = 2**63 - 1
 
 
 def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
-    """Pack a padded ``[B, S, D/2]`` ``(cos, sin)`` pair into the fused op's
-    ``[B*S, D]`` table. ``RotaryEmbedding`` applies ``cos[0]``/``sin[0]`` to
-    every batch element (see ``_prepare_half_head_dim_cos_sin``), so the
-    table repeats row 0 for the batch, in the activation dtype the eager
-    chain casts to. ``None`` below the token gate or on a device/dtype the
-    fused kernel cannot serve.
+    """Repeat cos[0]/sin[0] for all batches, matching RotaryEmbedding.
 
-    Sequence parallelism needs no special case. The refiner sites are not
-    parallelized at all (``_sp_plan`` shards only ``unified_prepare``'s
-    outputs), and at the unified site this runs *after* that sharding, so
-    ``cos``/``sin`` are already this rank's shard — the same coefficients the
-    eager chain would rotate with on this rank.
+    Sequence-parallel inputs already contain this rank's shard.
     """
     return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype, min_tokens=_FUSED_MIN_TOKENS)
 
