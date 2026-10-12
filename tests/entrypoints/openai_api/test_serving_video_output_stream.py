@@ -43,12 +43,13 @@ def _build_test_app(
     mock_generate: Callable[..., AsyncGenerator[OmniRequestOutput, None]],
     final_chunk: bytes = b"",
     stall_timeout: float = 5.0,
+    stage_configs: list[object] | None = None,
 ) -> tuple[FastAPI, OmniStreamingVideoOutputHandler, MagicMock]:
     engine_client = mocker.MagicMock()
     engine_client.abort = mocker.AsyncMock()
     engine_client.submit_interaction_async = mocker.AsyncMock()
     engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams()]
-    engine_client.stage_configs = [
+    engine_client.stage_configs = stage_configs or [
         SimpleNamespace(
             stage_type="diffusion",
             final_output=True,
@@ -152,11 +153,43 @@ def test_playback_feedback_reaches_engine_and_releases_next_chunk(mocker: Mocker
         ws.send_json({"type": "session.playback", "position_seconds": -1})
         assert ws.receive_json()["type"] == "error"
         engine.update_streaming_playback.assert_not_called()
+        ws.send_json({"type": "session.playback", "position_seconds": 10**401})
+        assert ws.receive_json()["type"] == "error"
+        engine.update_streaming_playback.assert_not_called()
         ws.send_json({"type": "session.playback", "position_seconds": 0.25})
         assert _receive_video_chunk(ws)[1] == b"last"
         assert ws.receive_json()["type"] == "session.done"
     assert observed == [0.75]
     engine.update_streaming_playback.assert_awaited_once_with(start["request_id"], 0.25)
+
+
+def test_paced_session_rejects_multi_stage_topology_at_start(mocker: MockerFixture):
+    generate_called = False
+
+    async def generate(*_args, **_kwargs):
+        nonlocal generate_called
+        generate_called = True
+        raise AssertionError("generation must not start for an unsupported topology")
+        yield  # pragma: no cover
+
+    app, _handler, engine = _build_test_app(
+        mocker=mocker,
+        streaming_chunks=[],
+        mock_generate=generate,
+        stage_configs=[
+            SimpleNamespace(stage_type="diffusion", final_output=False, final_output_type="video"),
+            SimpleNamespace(stage_type="diffusion", final_output=True, final_output_type="video"),
+        ],
+    )
+    engine.validate_streaming_playback_request = mocker.Mock(
+        side_effect=ValueError("playback feedback requires single-stage diffusion")
+    )
+    with TestClient(app) as client, client.websocket_connect("/v1/realtime/video") as ws:
+        ws.send_json({"type": "session.start", "prompt": "video", "streaming_buffer_seconds": 0.75})
+        error = ws.receive_json()
+        assert error["type"] == "error"
+        assert "single-stage diffusion" in error["message"]
+    assert not generate_called
 
 
 def test_disconnect_aborts_while_generation_waits_for_playback(mocker: MockerFixture):

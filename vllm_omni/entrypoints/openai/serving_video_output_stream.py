@@ -124,6 +124,14 @@ class OmniStreamingVideoOutputHandler:
             if start is None:
                 return
             request, output_format = start
+            if request.streaming_buffer_seconds is not None:
+                validate_pacing = getattr(self._engine_client, "validate_streaming_playback_request", None)
+                if callable(validate_pacing):
+                    try:
+                        validate_pacing()
+                    except ValueError as exc:
+                        await self._send_error(websocket, str(exc))
+                        return
 
             request_id = f"video_stream-{uuid.uuid4().hex}"
             progress = _SessionProgress()
@@ -328,12 +336,16 @@ class OmniStreamingVideoOutputHandler:
                 continue
             if msg_type == "session.playback":
                 position = msg.get("position_seconds")
-                if (
-                    isinstance(position, bool)
-                    or not isinstance(position, (int, float))
-                    or not math.isfinite(position)
-                    or position < 0
-                ):
+                invalid_position = isinstance(position, bool) or not isinstance(position, (int, float))
+                if not invalid_position:
+                    try:
+                        invalid_position = not math.isfinite(position) or position < 0
+                    except OverflowError:
+                        # JSON permits arbitrarily large integers; math.isfinite
+                        # raises instead of returning False for values outside
+                        # the platform float range.
+                        invalid_position = True
+                if invalid_position:
                     await self._send_error(
                         websocket, "position_seconds must be finite and non-negative", send_lock=send_lock
                     )

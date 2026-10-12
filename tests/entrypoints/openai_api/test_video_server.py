@@ -123,6 +123,17 @@ class FakeAsyncOmni:
         del request_id, timeout
 
 
+def test_regular_video_endpoint_rejects_realtime_pacing_parameter() -> None:
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    with pytest.raises(HTTPException, match="only supported by /v1/realtime/video"):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(prompt="video", streaming_buffer_seconds=0.75),
+                "regular-video",
+            )
+        )
+
+
 def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
     engine = FakeAsyncOmni()
     handler = OmniOpenAIServingVideo.for_diffusion(

@@ -269,15 +269,25 @@ class StageDiffusionProc:
 
         loop = asyncio.get_running_loop()
 
+        async def run_executor(method: Callable[..., Any], *method_args: Any) -> Any:
+            """Finish a worker-thread RPC before propagating task cancellation."""
+            future = loop.run_in_executor(self._executor, method, *method_args)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # Cancelling the asyncio wrapper does not cancel the thread.
+                # Drain the shielded future before run_loop closes the engine
+                # and executor, so teardown cannot race a live collective RPC.
+                try:
+                    await asyncio.shield(future)
+                except BaseException:
+                    pass
+                raise
+
         if method == "profile":
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await loop.run_in_executor(
-                self._executor,
-                self._engine.profile,
-                is_start,
-                profile_prefix,
-            )
+            return await run_executor(self._engine.profile, is_start, profile_prefix)
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
@@ -287,8 +297,7 @@ class StageDiffusionProc:
 
                 if not isinstance(lora_request, LoRARequest):
                     lora_request = msgspec.convert(lora_request, LoRARequest)
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "add_lora",
                 timeout,
@@ -299,8 +308,7 @@ class StageDiffusionProc:
             return all(results) if isinstance(results, list) else results
 
         if method == "remove_lora":
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "remove_lora",
                 timeout,
@@ -311,8 +319,7 @@ class StageDiffusionProc:
             return all(results) if isinstance(results, list) else results
 
         if method == "list_loras":
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "list_loras",
                 timeout,
@@ -329,8 +336,7 @@ class StageDiffusionProc:
 
         if method == "pin_lora":
             lora_id = args[0] if args else kwargs.get("adapter_id")
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "pin_lora",
                 timeout,
@@ -342,8 +348,7 @@ class StageDiffusionProc:
 
         # Fall back to DiffusionEngine.collective_rpc for all other methods
         # (e.g. worker extension RPCs like "test_extension_name").
-        return await loop.run_in_executor(
-            self._executor,
+        return await run_executor(
             self._engine.collective_rpc,
             method,
             timeout,

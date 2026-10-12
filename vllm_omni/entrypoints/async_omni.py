@@ -629,13 +629,17 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
         """Forward external-session playback progress to the diffusion engine."""
-        if self.num_stages != 1 or self.engine.get_stage_metadata(0).stage_type != "diffusion":
-            raise ValueError("playback feedback requires single-stage diffusion")
+        self.validate_streaming_playback_request()
         for state in list(self.request_states.values()):
             if state.external_request_id == request_id:
                 await self._engine_core_rpc(
                     "update_streaming_playback", stage_ids=[0], args=(state.request_id, position_seconds)
                 )
+
+    def validate_streaming_playback_request(self) -> None:
+        """Validate pacing topology before a realtime video request starts."""
+        if self.num_stages != 1 or self.engine.get_stage_metadata(0).stage_type != "diffusion":
+            raise ValueError("playback feedback requires single-stage diffusion")
 
     async def submit_interaction_async(
         self,
