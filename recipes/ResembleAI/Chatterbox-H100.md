@@ -1,12 +1,109 @@
 # Chatterbox Turbo and Original — H100
 
-These measurements used the combined model and runtime implementation. The
-shared runtime changes are now reviewed separately in
-[PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842); the model branch
-includes its required extension hooks. These measurements also include the
-broader runtime fixes from #8842 and do not qualify the standalone branch.
-Historical profiling and fresh split integration
-validation are identified separately below.
+This report separates standalone qualification from historical measurements
+that included the broader shared-runtime fixes in
+[PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842). The Chatterbox
+integration includes its required adapter hooks and does not depend on #8842.
+
+## Standalone 64-client HTTP qualification
+
+Measured October 12, 2026 at source revision `21bb93f10`, with no #8842
+runtime overlay. Inference is unchanged from `8efd2811f`; the later commit adds
+HTTP RTF/playback timing and its real-server regression checks. The four broader
+runtime files and both runner/sampler helpers were SHA256-verified against main
+`76f52f1ae` before benchmarking.
+
+Hardware/software: one H100 SXM 80 GB, driver 595.91.07, Ubuntu 24.04,
+Python 3.12.3, PyTorch 2.13.0/CUDA 13.0, torchaudio 2.11.0,
+vLLM 0.31.0 and Transformers 5.14.1. `OMP_NUM_THREADS=4`.
+Both models used their existing `*_high_concurrency_cuda.yaml` profiles:
+BF16 AR/flow, FP32 HiFT, native cuDNN flow attention, and CUDA MPS. No capacity
+limits or inference code were changed for this qualification.
+
+Each model used a fresh server on the same pod, Turbo first. Checkpoints were
+pre-downloaded; operating-system/library/kernel caches were shared between
+servers. Each workload had three synchronized waves of 64 clients, 192 timed
+requests, with the narration below, request-specific text/seed, PCM streaming,
+and a 1000-token allowance. Cold references are distinct deterministic gain
+envelopes of `tests/assets/qwen3_tts/clone_2.wav`, not different speakers. The
+source WAV SHA256 is
+`480f55f41c71c3d79c2a9acc48f0bfb3c5a46222e6e9ebf3e2888e93501a6b5c`.
+One additional request primes the repeated-reference workload.
+
+Both models completed **576/576 timed requests** with zero errors and zero exact
+audio replays: **1152 timed requests total**, plus two cache-prime requests.
+These checks establish completion and finite nonempty PCM, not semantic voice
+isolation or a new speech-quality evaluation. Eighteen representative WAVs,
+raw request/chunk timing, scheduler samples, package versions, source hashes,
+and server logs were retained before the temporary pod was deleted.
+
+| Model | Reference mode | p95 first audio (s) | p95 completion (s) | p95 RTF | p95 gap, raw (s) | p95 gap, 100 ms tolerance (s) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Turbo | Cold distinct | 28.378 | 36.039 | 1.800 | 0.079 | 0.000 |
+| Turbo | Cached repeated | 1.513 | 7.384 | 0.362 | 0.000 | 0.000 |
+| Turbo | Built-in | 1.640 | 8.126 | 0.459 | 0.000 | 0.000 |
+| Original | Cold distinct | 9.799 | 28.569 | 1.326 | 0.899 | 0.799 |
+| Original | Cached repeated | 3.533 | 25.598 | 1.201 | 2.317 | 2.217 |
+| Original | Built-in | 3.543 | 18.078 | 1.243 | 0.578 | 0.478 |
+
+RTF includes conditioning and transport: complete request time divided by audio
+duration. Gap is the maximum additional initial buffering needed when playback
+otherwise starts at the first PCM byte. Raw gap has no jitter allowance; the
+last column applies the historical report's 100 ms allowance per request before
+computing percentiles. The gap is derived from received PCM arrival timing; no audio device or browser
+playback was used during timing. No additional client playback buffer is assumed.
+
+Turbo's cached and built-in workloads kept up with real-time playback with zero
+measured gaps. Its aggregate cold result includes first-use conditioning startup:
+the three cold-wave p95 first-audio latencies were **28.390 / 4.921 / 5.314 s**,
+with p95 RTF **1.827 / 0.447 / 0.475**. The later two waves still miss the
+reference cache; they benefit from initialized encoders and first-use libraries.
+These first-use figures are not a controlled comparison of fully cold machines.
+
+Original exceeded real-time at p95 and had playback gaps in every reference
+mode at 64 clients. It is not qualified for smooth real-time serving at that
+load by this run. Historical results below differ in protocol, seed policy,
+hardware driver, and runtime revision; differences do not isolate the effect
+of #8842.
+
+Scheduler gauges were polled every 250 ms. All waves had 64 outstanding clients;
+row order below is wave 1 / 2 / 3. Original's AR target is 128 sequences for
+64 CFG-paired client requests; its decoder target remains 64 requests.
+
+| Model / mode | AR sequence peaks | Decoder request peaks |
+| --- | --- | --- |
+| Turbo cold | 64 / 58 / 63 | 64 / 63 / 63 |
+| Turbo cached | 64 / 64 / 64 | 64 / 64 / 64 |
+| Turbo built-in | 64 / 64 / 64 | 64 / 64 / 64 |
+| Original cold | 128 / 128 / 128 | 64 / 52 / 56 |
+| Original cached | 128 / 128 / 128 | 63 / 63 / 64 |
+| Original built-in | 128 / 128 / 128 | 64 / 64 / 64 |
+
+Turbo cold therefore does not prove 64 simultaneously active AR requests in
+every wave. Original proves 64 active CFG-paired AR requests in every wave;
+decoder occupancy varies as chunks become ready and requests finish. The
+harness's `capacity_confirmed` field checks AR capacity only. This standalone
+run qualifies HTTP streaming; historical WebSocket checks below included #8842.
+
+Reproduce each model from a fresh server:
+
+```bash
+vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/chatterbox_turbo_high_concurrency_cuda.yaml
+
+uv run benchmarks/tts/chatterbox_load.py ResembleAI/chatterbox-turbo \
+  tests/assets/qwen3_tts/clone_2.wav results/turbo-http64.json \
+  --concurrency 64 --cycles 3 --max-new-tokens 1000 --save-audio
+```
+
+For Original, restart with `ResembleAI/chatterbox` and
+`chatterbox_high_concurrency_cuda.yaml`, and pass
+`--stage0-sequences-per-request 2` to the load command. The timing harness's
+13 real-HTTP/WebSocket regression tests passed on both the existing development
+host and this H100 before the benchmarks. These measurements do not replace
+the separate FP32 nightly performance baselines.
+
+## Historical combined-branch measurements
 
 Measurements on October 12, 2026 used one H100 SXM 80 GB, PyTorch
 2.13.0/CUDA 13.0, vLLM 0.31.0 and Transformers 5.14.1. Serving runtime revision
