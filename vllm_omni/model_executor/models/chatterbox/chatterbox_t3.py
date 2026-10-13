@@ -198,7 +198,7 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
             layer_norm_epsilon=config.layer_norm_epsilon,
         )
         self.tfmr = GPT2Model(
-            vllm_config=vllm_config.with_hf_config(backbone, architectures=["ChatterboxT3ForConditionalGeneration"]),
+            vllm_config=vllm_config.with_hf_config(backbone, architectures=["ChatterboxForConditionalGeneration"]),
             prefix=maybe_prefix(prefix, "tfmr"),
         )
         self.heads = T3Heads(config)

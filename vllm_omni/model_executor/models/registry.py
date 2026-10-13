@@ -90,16 +90,6 @@ _OMNI_MODELS = {
         "chatterbox",
         "ChatterboxForConditionalGeneration",
     ),
-    "ChatterboxT3ForConditionalGeneration": (
-        "chatterbox",
-        "chatterbox_t3",
-        "ChatterboxT3ForConditionalGeneration",
-    ),
-    "ChatterboxS3Gen": (
-        "chatterbox",
-        "chatterbox_s3gen",
-        "ChatterboxS3Gen",
-    ),
     "CosyVoice3Model": (
         "cosyvoice3",
         "cosyvoice3",

@@ -507,12 +507,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # metadata, and sampling overrides. The model-type label remains in the
         # orchestrator for compatibility during this incremental migration.
         self._adapter = None
-        if self._tts_stage is not None:
-            adapter_cls = resolve_adapter(self._tts_model_type)
-            if adapter_cls is not None:
-                ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
-                self._adapter = adapter_cls(ctx)
-                logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
+        if adapter_cls is not None:
+            ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
+            self._adapter = adapter_cls(ctx)
+            logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
 
         adapter = self._adapter
         if adapter is not None:

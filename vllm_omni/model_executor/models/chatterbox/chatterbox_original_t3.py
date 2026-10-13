@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.chatterbox.original_heads import (
     original_speech_embeds,
     split_original_weights,
 )
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 CFG_SUFFIX = "__cfg_uncond"
 
@@ -34,20 +35,23 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
         nn.Module.__init__(self)
         if vllm_config.cache_config.enable_prefix_caching:
             raise ValueError("Chatterbox requires enable_prefix_caching=False for conditioned placeholder prompts")
-        self.config = vllm_config.model_config.hf_config
+        config: ChatterboxConfig = vllm_config.model_config.hf_config
+        self.config = config
+        # Upstream's LLAMA_520M_CONFIG_DICT: the checkpoint's own eight-row
+        # embedding table (the heads embed every token) and llama3 RoPE.
         backbone = LlamaConfig(
             vocab_size=8,
-            hidden_size=1024,
-            intermediate_size=4096,
-            num_hidden_layers=30,
-            num_attention_heads=16,
-            num_key_value_heads=16,
-            head_dim=64,
-            max_position_embeddings=131072,
-            hidden_act="silu",
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.hidden_size // config.num_attention_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            hidden_act=config.activation_function,
             attention_bias=False,
             mlp_bias=False,
-            rms_norm_eps=1e-5,
+            rms_norm_eps=config.layer_norm_epsilon,
             rope_theta=500000.0,
             rope_scaling={
                 "factor": 8.0,
