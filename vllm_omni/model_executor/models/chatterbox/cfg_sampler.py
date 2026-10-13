@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Original Chatterbox guidance before the upstream sampling pipeline."""
+"""Token-only Chatterbox output and Original guidance around upstream sampling."""
 
 from collections.abc import MutableMapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -94,7 +95,17 @@ class ChatterboxCFGSampler:
         return output
 
 
-class ChatterboxMRv2CFGSampler(OmniSampler):
+class ChatterboxMRv2Sampler(OmniSampler):
+    """Keep sampled tokens and owned metadata; S3Gen consumes no T3 hidden states."""
+
+    def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
+        output = super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
+        # make_omni_output creates fresh CPU flags every step, outside graph
+        # capture. No hidden-state copy or graph-output lifetime guard is needed.
+        return replace(output, include_hidden_states=False, owns_multimodal_outputs=True)
+
+
+class ChatterboxMRv2CFGSampler(ChatterboxMRv2Sampler):
     """MRv2 adapter with upstream request lifecycle and logits processing."""
 
     def __init__(self, base_sampler: Any, pairs: CFGPairRegistry):

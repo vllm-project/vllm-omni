@@ -23,6 +23,7 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxMRv2Sampler
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
@@ -175,8 +176,7 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
     # Has the runner call make_omni_output and keep what it returns.
     have_multimodal_outputs = True
     # Stage 1 reads the sampled ids, never the hidden states. Read by the
-    # default runner only; Model Runner V2 copies no hidden state when
-    # streaming and always copies it otherwise.
+    # default runner. MRv2 uses the sampler's token-only output contract below.
     omni_pooler_payload_include_hidden = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -210,6 +210,10 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed sampled speech ids. Part of vLLM's text-generation contract."""
         return self.heads.speech_emb(input_ids)
+
+    def mrv2_custom_sampler(self, sampler):
+        """Use upstream sampling without transporting unused hidden states."""
+        return ChatterboxMRv2Sampler(sampler), None
 
     def preprocess(
         self,

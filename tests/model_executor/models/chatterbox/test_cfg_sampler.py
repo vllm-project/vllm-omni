@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import (
     DEFAULT_CFG_WEIGHT,
@@ -13,9 +14,35 @@ from vllm_omni.model_executor.models.chatterbox.cfg_sampler import (
     ChatterboxCFGSampler,
     ChatterboxMRv2CFGSampler,
 )
+from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
+from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import ChatterboxT3ForConditionalGeneration
 from vllm_omni.worker.sampling_utils import call_model_sampler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("stage_type", [ChatterboxT3ForConditionalGeneration, ChatterboxOriginalT3])
+def test_mrv2_sampling_transports_tokens_without_unused_hidden_states_001(stage_type):
+    stage = object.__new__(stage_type)
+    torch.nn.Module.__init__(stage)
+    stage.cfg_pairs = {}
+    sampler, _ = stage.mrv2_custom_sampler(None)
+    hidden = torch.randn(2, 16)
+    counts, rejected = torch.ones(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32)
+    sampled = SamplerOutput(torch.tensor([[4], [4]]), None, None, counts, rejected)
+    calls = []
+
+    def standard_sample(hidden_states, input_batch, grammar_output):
+        calls.append(hidden_states)
+        return sampled, counts, rejected
+
+    result = sampler.sample_step(hidden, None, None, None, standard_sample)
+    assert len(calls) == 1 and calls[0] is hidden
+    assert result.sampler_output is sampled
+    assert result.num_sampled is counts and result.num_rejected is rejected
+    assert result.multimodal_outputs is None  # Preserve forward's per-token streaming metadata.
+    assert result.include_hidden_states is False
+    assert result.owns_multimodal_outputs is True
 
 
 class RecordingSampler:
