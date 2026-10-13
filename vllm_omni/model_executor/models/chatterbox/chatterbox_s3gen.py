@@ -54,7 +54,7 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.upsample_encoder impo
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.glm_tts.vocoder import ConvRNNF0Predictor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig, validate_flow_settings
 
 # CosyVoice 2's caches: eight mel frames, and HiFT's 480 samples per frame
 # (upsample rates 8 * 5 * 3 times an iSTFT hop of 4).
@@ -650,6 +650,8 @@ class ChatterboxS3Gen(S3GenDecoder):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         config: ChatterboxConfig = vllm_config.model_config.hf_config
+        # hf_overrides arrive one key at a time, so the pair is checked here.
+        validate_flow_settings(config.flow_dtype, config.flow_attention_backend)
         # The scheduler gives a new request what is left of the step's token
         # budget, and the decoder cannot tell part of an utterance from one.
         # That budget is the field vLLM's scheduler reads: the scheduled-token
