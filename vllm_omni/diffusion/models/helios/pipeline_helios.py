@@ -31,6 +31,7 @@ from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransform
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.utils import vae_latent_mean_std
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -354,14 +355,8 @@ class HeliosPipeline(
         )
         batch_size = prompt_embeds.shape[0]
 
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(self.vae.device, self.vae.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            self.vae.device, self.vae.dtype
-        )
+        latents_mean, latents_std = vae_latent_mean_std(self.vae.config, device=self.vae.device, dtype=self.vae.dtype)
+        latents_std = 1.0 / latents_std
 
         add_noise_to_image_latents = bool(extra.get("add_noise_to_image_latents", True))
         image_noise_sigma_min = float(extra.get("image_noise_sigma_min", 0.111))
@@ -1056,14 +1051,8 @@ class HeliosPipeline(
 
         history_sizes = sorted(history_sizes, reverse=True)
 
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(self.vae.device, self.vae.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            self.vae.device, self.vae.dtype
-        )
+        latents_mean, latents_std = vae_latent_mean_std(self.vae.config, device=self.vae.device, dtype=self.vae.dtype)
+        latents_std = 1.0 / latents_std
 
         # Prepare I2V image latents
         fake_image_latents = None

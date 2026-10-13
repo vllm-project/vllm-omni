@@ -47,6 +47,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.utils import denormalize_latents, normalize_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -632,18 +633,6 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         kv_caches = self.transformer.create_kv_cache()
         kv_caches.set_mode("write")
 
-        # Prepare VAE normalization parameters
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(device=self.device, dtype=prompt_embeds.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(device=self.device, dtype=prompt_embeds.dtype)
-        )
-
         # Process each condition image through transformer to populate KV cache
         for condition_image, condition_prior_token_id in zip(condition_images, prior_token_image_ids):
             condition_image = condition_image.to(device=self.device, dtype=prompt_embeds.dtype)
@@ -656,7 +645,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
             condition_latent = retrieve_latents(
                 self.vae.encode(condition_image.unsqueeze(0)), generator=generator, sample_mode="argmax"
             )
-            condition_latent = (condition_latent - latents_mean) / latents_std
+            condition_latent = normalize_latents(condition_latent, self.vae.config, ndim=4)
 
             # Run forward pass at timestep 0 to cache KV states
             # Empty encoder_hidden_states since we only want to cache image features
@@ -891,17 +880,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
 
         # 8. VAE decode
         latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents = latents * latents_std + latents_mean
+        latents = denormalize_latents(latents, self.vae.config, ndim=4)
         image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
         return DiffusionOutput(
