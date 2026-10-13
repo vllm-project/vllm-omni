@@ -42,6 +42,7 @@ def main():
     parser.add_argument("reference", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--runner", choices=("v1", "v2"), default="v2")
+    parser.add_argument("--cuda-graphs", action="store_true", help="Use the existing AR CUDA-graph path at FP32")
     parser.add_argument(
         "--profile", action="store_true", help="Trace an additional warmed request after each voice mode"
     )
@@ -158,7 +159,7 @@ def make_backend(args):
     settings["model_runner"] = args.runner
     for stage in settings["stages"]:
         stage["dtype"] = "float32"
-        stage["enforce_eager"] = True
+        stage["enforce_eager"] = not (args.cuda_graphs and stage["stage_id"] == 0)
         if args.profile:
             stage["profiler_config"] = {
                 "profiler": "torch",
@@ -259,6 +260,7 @@ def write_report(args, rows):
         precision="float32; TF32 disabled",
         concurrency=1,
         model_runner=args.runner if args.backend == "omni" else None,
+        cuda_graphs=args.backend == "omni" and args.cuda_graphs,
         max_new_tokens=1000,
         warmup_per_mode=2 * len(TEXTS),
         rows=rows,
