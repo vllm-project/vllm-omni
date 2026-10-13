@@ -182,8 +182,14 @@ platforms:
         # stages 0 and 2, so stage 1 kept the base value of 4.
         max_num_seqs: 8
         # Match CUDA's fixed KV budget and leave headroom for Stage 2
-        # (upstream #8735); 0.10 keeps device-level headroom for the
-        # colocated HiFi-GAN cuDNN workspace (measured on 910B1).
+        # (upstream #8735). When kv_cache_memory_bytes is not None, vLLM
+        # reserves exactly that for KV and skips memory profiling, so the
+        # gpu_memory_utilization below sizes nothing in this stage; it only
+        # acts as the device-level headroom knob for the colocated HiFi-GAN
+        # cuDNN workspace in the replica overlays that set this key to null
+        # (measured on 910B1: ~5.2 GiB Talker KV at 0.10 vs the 4 GiB
+        # fixed budget). Whether 4 GiB covers 8 concurrent Talker requests
+        # with the K=8 step is pending a sweep re-run on the merged config.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         gpu_memory_utilization: 0.10
         max_num_batched_tokens: 8192
@@ -206,8 +212,10 @@ platforms:
       - stage_id: 2
         max_num_seqs: 8
         # 0.22 covers the 64k-token Code2Wav budget; the headroom that
-        # survived a full three-tier concurrency sweep with 0.50/0.10
-        # upstream (measured on 910B1).
+        # survived a full three-tier concurrency sweep upstream (measured
+        # on 910B1 under the pre-merge config, where stage 1's 0.10 was
+        # still the live sizing knob). Stage 2 sets no kv_cache_memory_bytes,
+        # so 0.22 remains the live knob here; re-verify on the merged config.
         gpu_memory_utilization: 0.22
         # Stage 2 stays outer-eager; CFM Whole-Euler, HiFT and encoder
         # graphs use the shared Code2Wav wrappers with NPUGraph (upstream
@@ -228,7 +236,9 @@ platforms:
           # multiplies the shape space -- an 8-way concurrent stage-2 run
           # reaches 61 distinct shapes, not 19. Captured graph buffers are
           # allocated outside vLLM's gpu_memory_utilization budget, and this
-          # profile co-locates three stages on one card (0.50 + 0.10 + 0.22),
+          # profile co-locates three stages on one card (measured pre-merge
+          # as 0.50 + 0.10 + 0.22 with 0.10 the live stage-1 knob; after the
+          # merge stage 1 carries a fixed 4 GiB KV budget instead),
           # so a 64-entry pool OOMs the card at 128/8 while 32 completes all
           # three tiers. cfm_graph_batch_buckets above is what makes 32
           # sufficient: it collapses the batch axis so the 8-way shape space
