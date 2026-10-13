@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Chatterbox TTS configuration (Turbo defaults).
+"""Chatterbox TTS configuration.
 
-The Hub repo ships no ``config.json``, so every constant lives here. Values
-come from upstream ``chatterbox`` 0.1.7: ``GPT2_MEDIUM_CONFIG`` in
-``models/t3/llama_configs.py``, the ``T3Config`` overrides in
-``ChatterboxTurboTTS.from_local``, and ``models/s3gen``.
+The Hub repos ship no ``config.json``, so every constant lives here. Values
+come from upstream ``chatterbox`` 0.1.7: ``GPT2_MEDIUM_CONFIG`` and
+``LLAMA_520M_CONFIG_DICT`` in ``models/t3/llama_configs.py``, the ``T3Config``
+overrides in ``ChatterboxTurboTTS.from_local`` and ``ChatterboxTTS.from_local``,
+and ``models/s3gen``.
+
+``variant`` selects the checkpoint. Everything that differs between the two
+checkpoints is a property of the variant, so the deploy file's
+``hf_overrides: {variant: original}`` is enough however it arrives: at
+construction from a config.json, or afterwards through ``update``.
 """
+
+import operator
 
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
@@ -14,35 +22,84 @@ from transformers.configuration_utils import PretrainedConfig
 # Original's supported generation budget leaves room for its learned speech
 # boundary positions, regardless of the engine's configured context length.
 ORIGINAL_MAX_NEW_TOKENS = 4096
+# Upstream's ``ChatterboxTTS.generate`` defaults for its two controls.
+ORIGINAL_DEFAULT_EXAGGERATION = 0.5
+ORIGINAL_DEFAULT_CFG_WEIGHT = 0.5
 # Control ids shared by every checkpoint: the start-of-speech and stop tokens.
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
 # Request-id suffix of a guided request's unconditional companion.
 CFG_UNCOND_SUFFIX = "__cfg_uncond"
-# Upstream's ``ChatterboxTTS.generate`` defaults for its two controls.
-ORIGINAL_DEFAULT_EXAGGERATION = 0.5
-ORIGINAL_DEFAULT_CFG_WEIGHT = 0.5
+
+FLOW_DTYPES = frozenset({"float32", "bfloat16"})
+FLOW_ATTENTION_BACKENDS = frozenset({"auto", "cudnn"})
+
+# What differs between the checkpoints. The speech vocabulary sizes the
+# sampler (``vocab_size``): no tokenizer is loaded for these stages, and the
+# text vocabulary only sizes the text embedding and the backbone's idle
+# ``wte``.
+VARIANT_FIELDS: dict[str, dict[str, object]] = {
+    "turbo": {
+        "vocab_size": 6563,
+        "speech_vocab_size": 6563,
+        "text_vocab_size": 50276,
+        "num_hidden_layers": 24,
+        "max_position_embeddings": 8196,
+        "activation_function": "gelu_new",
+        "cond_prompt_len": 375,
+        "enc_cond_seconds": 15,
+        "min_ref_seconds": 5.0,
+        "loudness_target_lufs": -27.0,
+        "n_silence_tokens": 3,
+        "meanflow": True,
+        "n_cfm_timesteps": 2,
+        "t3_weights": "t3_turbo_v1.safetensors",
+        "s3gen_weights": "s3gen_meanflow.safetensors",
+    },
+    "original": {
+        "vocab_size": 8194,
+        "speech_vocab_size": 8194,
+        "text_vocab_size": 704,
+        "num_hidden_layers": 30,
+        "max_position_embeddings": 131072,
+        "activation_function": "silu",
+        "cond_prompt_len": 150,
+        "enc_cond_seconds": 6,
+        "min_ref_seconds": 0.0,
+        "loudness_target_lufs": None,
+        "n_silence_tokens": 0,
+        "meanflow": False,
+        "n_cfm_timesteps": 10,
+        "t3_weights": "t3_cfg.safetensors",
+        "s3gen_weights": "s3gen.safetensors",
+    },
+}
 
 
 def validate_flow_settings(dtype: str, backend: str) -> None:
-    """Reject unsupported precision/backend combinations before config mutation."""
-    if dtype not in {"float32", "bfloat16"}:
+    """Reject a flow precision and attention backend the decoder cannot run.
+
+    Raises:
+        ValueError: If either value is unknown, or cuDNN attention is asked
+            for without BF16 flow.
+    """
+    if dtype not in FLOW_DTYPES:
         raise ValueError("Chatterbox flow_dtype must be 'float32' or 'bfloat16'")
-    if backend not in {"auto", "cudnn"}:
+    if backend not in FLOW_ATTENTION_BACKENDS:
         raise ValueError("Chatterbox flow_attention_backend must be 'auto' or 'cudnn'")
     if backend == "cudnn" and dtype != "bfloat16":
         raise ValueError("Chatterbox cuDNN flow attention requires flow_dtype='bfloat16'")
 
 
 class ChatterboxConfig(PretrainedConfig):
-    """Constants for both Chatterbox stages."""
+    """Constants for both Chatterbox stages of one checkpoint."""
 
     model_type = "chatterbox"
 
     def __init__(
         self, variant: str = "turbo", flow_dtype: str = "float32", flow_attention_backend: str = "auto", **kwargs
     ):
-        if variant not in {"turbo", "original"}:
+        if variant not in VARIANT_FIELDS:
             raise ValueError("Chatterbox variant must be 'turbo' or 'original'")
         validate_flow_settings(flow_dtype, flow_attention_backend)
         kwargs.setdefault("eos_token_id", STOP_SPEECH_TOKEN)
@@ -51,36 +108,22 @@ class ChatterboxConfig(PretrainedConfig):
         self.flow_dtype = flow_dtype
         self.flow_attention_backend = flow_attention_backend
 
-        # The engine sizes its sampler by ``vocab_size``. No tokenizer is
-        # loaded for these stages, so that is the speech head's vocabulary,
-        # not the text one; the text vocabulary only sizes the text
-        # embedding and the backbone's idle ``wte``.
-        self.vocab_size = 6563
-        self.speech_vocab_size = 6563
-        self.text_vocab_size = 50276
         # Ids at or above this are control tokens the decoder must never see.
         self.speech_token_limit = START_SPEECH_TOKEN
         self.start_speech_token = START_SPEECH_TOKEN
         self.stop_speech_token = STOP_SPEECH_TOKEN
 
-        # T3 backbone (GPT-2 medium).
+        # T3 backbone (GPT-2 medium or LLaMA 520M: same width, heads and MLP).
         self.hidden_size = 1024
-        self.num_hidden_layers = 24
         self.num_attention_heads = 16
         self.num_key_value_heads = 16
         self.intermediate_size = 4096
-        self.max_position_embeddings = 8196
         self.layer_norm_epsilon = 1e-5
-        self.activation_function = "gelu_new"
         self.max_new_tokens = 1000
 
         # Reference conditioning.
         self.speaker_embed_size = 256
-        self.cond_prompt_len = 375
-        self.enc_cond_seconds = 15
         self.dec_cond_seconds = 10
-        self.min_ref_seconds = 5.0
-        self.loudness_target_lufs: float | None = -27.0
         self.s3_tokenizer_name = "speech_tokenizer_v2_25hz"
 
         # Speech tokens and audio.
@@ -100,59 +143,51 @@ class ChatterboxConfig(PretrainedConfig):
             "center": False,
         }
         self.silence_token = 4299
-        self.n_silence_tokens = 3
-        self.meanflow = True
-        self.n_cfm_timesteps = 2
-
-        # Checkpoint files inside the Hub repo.
-        self.t3_weights = "t3_turbo_v1.safetensors"
-        self.s3gen_weights = "s3gen_meanflow.safetensors"
         self.ve_weights = "ve.safetensors"
-        if variant == "original":
-            self.vocab_size = self.speech_vocab_size = 8194
-            self.text_vocab_size = 704
-            self.num_hidden_layers = 30
-            self.max_position_embeddings = 131072
-            self.activation_function = "silu"
-            self.cond_prompt_len = 150
-            self.enc_cond_seconds = 6
-            self.min_ref_seconds = 0.0
-            self.loudness_target_lufs = None
-            self.n_silence_tokens = 0
-            self.meanflow = False
-            self.n_cfm_timesteps = 10
-            self.t3_weights = "t3_cfg.safetensors"
-            self.s3gen_weights = "s3gen.safetensors"
 
-    def update(self, config_dict: dict) -> None:
-        """Apply variant defaults before vLLM's post-construction field overrides."""
-        validate_flow_settings(
-            config_dict.get("flow_dtype", self.flow_dtype),
-            config_dict.get("flow_attention_backend", self.flow_attention_backend),
-        )
-        variant = config_dict.get("variant", self.variant)
-        if variant != self.variant:
-            defaults = ChatterboxConfig(variant)
-            for name in (
-                "vocab_size",
-                "speech_vocab_size",
-                "text_vocab_size",
-                "num_hidden_layers",
-                "max_position_embeddings",
-                "activation_function",
-                "cond_prompt_len",
-                "enc_cond_seconds",
-                "min_ref_seconds",
-                "loudness_target_lufs",
-                "n_silence_tokens",
-                "meanflow",
-                "n_cfm_timesteps",
-                "t3_weights",
-                "s3gen_weights",
-            ):
-                setattr(self, name, getattr(defaults, name))
-        super().update(config_dict)
+    @property
+    def flow_dtype(self) -> str:
+        """Precision of the flow decoder: ``float32`` or ``bfloat16`` (autocast)."""
+        return self._flow_dtype
 
+    @flow_dtype.setter
+    def flow_dtype(self, value: str) -> None:
+        if value not in FLOW_DTYPES:
+            raise ValueError("Chatterbox flow_dtype must be 'float32' or 'bfloat16'")
+        self._flow_dtype = value
+
+    @property
+    def flow_attention_backend(self) -> str:
+        """Attention kernel of the flow decoder: ``auto`` or ``cudnn`` (needs BF16 flow)."""
+        return self._flow_attention_backend
+
+    @flow_attention_backend.setter
+    def flow_attention_backend(self, value: str) -> None:
+        if value not in FLOW_ATTENTION_BACKENDS:
+            raise ValueError("Chatterbox flow_attention_backend must be 'auto' or 'cudnn'")
+        self._flow_attention_backend = value
+
+    def to_dict(self) -> dict:
+        """Serialize with the flow settings under their public names."""
+        output = super().to_dict()
+        for name in ("flow_dtype", "flow_attention_backend"):
+            output[name] = output.pop(f"_{name}")
+        return output
+
+    def variant_field(self, name: str) -> object:
+        """The checkpoint-dependent value of ``name`` for the current variant.
+
+        Raises:
+            ValueError: If ``variant`` was overridden with an unknown value.
+        """
+        fields = VARIANT_FIELDS.get(self.variant)
+        if fields is None:
+            raise ValueError(f"Chatterbox variant must be 'turbo' or 'original', got {self.variant!r}")
+        return fields[name]
+
+
+for _name in VARIANT_FIELDS["turbo"]:
+    setattr(ChatterboxConfig, _name, property(operator.methodcaller("variant_field", _name)))
 
 AutoConfig.register("chatterbox", ChatterboxConfig)
 
