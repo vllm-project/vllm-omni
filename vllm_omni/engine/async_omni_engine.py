@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.kv_hints import KvHintsEnvelope
 
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -263,6 +264,7 @@ class AsyncOmniEngine(OmniEngineBase):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
@@ -293,6 +295,8 @@ class AsyncOmniEngine(OmniEngineBase):
         request_artifact_dirs: list[str] = []
 
         stage_type = self.stage_metadata[0].stage_type
+        if stage_type == "diffusion" and kv_hints is not None:
+            raise ValueError("kv_hints require an AR/LLM stage with a KV cache")
         output_prompt_text: Any = None
         _preprocess_ms = 0.0
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
@@ -347,6 +351,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,
                     resumable=resumable,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             except Exception:
                 if preselected_stage0_replica is not None and self.stage_pools:
@@ -577,6 +582,7 @@ class AsyncOmniEngine(OmniEngineBase):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
         *,
+        kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
         cancelled: threading.Event | None = None,
     ) -> _PreparedAddRequest | None:
