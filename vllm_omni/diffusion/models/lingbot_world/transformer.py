@@ -320,21 +320,46 @@ class LingBotSelfAttention(nn.Module):
         sink_tokens: int,
         update_cache: bool = True,
     ) -> torch.Tensor:
-        # Project logical [B, S, D] tokens into TP-local
-        # [B, S, num_local_heads, head_dim].
-        qkv, _ = self.qkv(hidden_states)
-        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        query = query.unflatten(2, (self.num_local_heads, self.head_dim))
-        key = key.unflatten(2, (self.num_local_heads, self.head_dim))
-        value = value.unflatten(2, (self.num_local_heads, self.head_dim))
+        query, key, value = self.project_qkv(hidden_states)
         if rotary_emb is not None:
             cos, sin = rotary_emb
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
+        output = self.attend(
+            query,
+            key,
+            value,
+            cache=cache,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            update_cache=update_cache,
+        )
+        return self.o(output.flatten(2, 3))
 
+    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project logical [B, S, D] tokens into normalized TP-local [B, S, num_local_heads, head_dim] q/k/v."""
+        qkv, _ = self.qkv(hidden_states)
+        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        return (
+            query.unflatten(2, (self.num_local_heads, self.head_dim)),
+            key.unflatten(2, (self.num_local_heads, self.head_dim)),
+            value.unflatten(2, (self.num_local_heads, self.head_dim)),
+        )
+
+    def attend(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        current_start: int,
+        sink_tokens: int,
+        update_cache: bool,
+    ) -> torch.Tensor:
+        """Attend position-encoded TP-local q/k/v over ``cache``; returns TP-local heads before ``o``."""
         if self.ulysses_world_size > 1:
             # One fused sequence->head all-to-all for q/k/v instead of three:
             # (B, S/N, 3, H, D) -> (B, S, 3, H/N, D). Same head-group assignment
@@ -376,10 +401,20 @@ class LingBotSelfAttention(nn.Module):
                 # Use the same block-table FlashAttention entry point as the
                 # realtime path so direct replay is a numerical oracle for
                 # paged execution, rather than a comparison between two
-                # different attention kernels.
-                block_size = key.shape[1]
-                key_cache = visible_key[0].unflatten(0, (-1, block_size))
-                value_cache = visible_value[0].unflatten(0, (-1, block_size))
+                # different attention kernels. A chunk that is not a legal
+                # page (FA2 pages only in multiples of 16 tokens) is paged at
+                # the kernel's finest unit instead; the padding past
+                # ``seq_lens`` is never read.
+                from vllm_omni.experimental.ar_diffusion.runner import paging_block_size  # noqa: PLC0415
+
+                block_size = paging_block_size(key.shape[1])
+                padding = -visible_key.shape[1] % block_size
+                key_pages, value_pages = visible_key[0], visible_value[0]
+                if padding:
+                    key_pages = F.pad(key_pages, (0, 0, 0, 0, 0, padding))
+                    value_pages = F.pad(value_pages, (0, 0, 0, 0, 0, padding))
+                key_cache = key_pages.unflatten(0, (-1, block_size))
+                value_cache = value_pages.unflatten(0, (-1, block_size))
                 block_count = key_cache.shape[0]
                 block_table = torch.arange(
                     block_count,
@@ -411,7 +446,7 @@ class LingBotSelfAttention(nn.Module):
                 output = self.attn(query, visible_key, visible_value)
         if self.ulysses_world_size > 1:
             output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
-        return self.o(output.flatten(2, 3))
+        return output
 
 
 class LingBotCrossAttention(nn.Module):
