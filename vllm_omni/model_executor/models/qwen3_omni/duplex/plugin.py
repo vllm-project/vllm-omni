@@ -435,7 +435,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 logger.info("Qwen duplex visual input capture request=%s path=%s", request_id, target)
             except (OSError, ValueError):
                 logger.exception("Failed to capture Qwen visual input request=%s", request_id)
-        return DuplexAppendPlan(prompt={"prompt": prompt, "multi_modal_data": mm})
+        prompt_payload = {"prompt": prompt, "multi_modal_data": mm}
+        voice = session_config.get("voice")
+        if isinstance(voice, str) and voice.strip():
+            # The Talker resolves absent speakers against its checkpoint default.
+            prompt_payload["additional_information"] = {"speaker": [voice.strip().lower()]}
+        return DuplexAppendPlan(prompt=prompt_payload)
 
     def decide_output(self, **kwargs):
         return None
