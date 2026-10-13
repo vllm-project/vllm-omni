@@ -25,6 +25,37 @@ from vllm_omni.worker.base import OmniGPUWorkerBase
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
+def _stub_cumem_if_unavailable(monkeypatch) -> None:
+    """Let ``vllm.device_allocator.cumem`` import on hosts without libcuda.
+
+    The real module links ``libcuda`` and therefore cannot be imported on a
+    CPU-only host. The allocator-facing tests below replace ``CuMemAllocator``
+    with a fake anyway, so install a stub module (with an inert placeholder) into
+    ``sys.modules`` to satisfy the lazy ``from ... import CuMemAllocator`` in
+    ``vllm_omni.worker.base``.
+    """
+    try:
+        import vllm.device_allocator.cumem  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    import sys
+    import types
+
+    stub = types.ModuleType("vllm.device_allocator.cumem")
+
+    class _UnavailableCuMemAllocator:  # pragma: no cover - replaced per test
+        @classmethod
+        def get_instance(cls):
+            raise RuntimeError("CuMemAllocator is unavailable on this host")
+
+    stub.CuMemAllocator = _UnavailableCuMemAllocator
+    monkeypatch.setitem(sys.modules, "vllm.device_allocator.cumem", stub)
+
+
 GIB = 1024**3
 
 
@@ -474,6 +505,7 @@ def test_memory_pool_context_disabled_returns_nullcontext():
 
 
 def test_memory_pool_context_enabled_uses_cumem_pool_with_tag(monkeypatch):
+    _stub_cumem_if_unavailable(monkeypatch)
     import vllm.device_allocator.cumem as cumem_mod
 
     worker = object.__new__(OmniGPUWorkerBase)
@@ -516,6 +548,7 @@ def _fake_platform():
     [(1, ("weights",)), (2, tuple())],
 )
 def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
+    _stub_cumem_if_unavailable(monkeypatch)
     import vllm.device_allocator.cumem as cumem_mod
 
     worker = object.__new__(OmniGPUWorkerBase)
@@ -552,6 +585,7 @@ def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
 
 
 def test_wake_up_forwards_tags_to_allocator(monkeypatch):
+    _stub_cumem_if_unavailable(monkeypatch)
     import vllm.device_allocator.cumem as cumem_mod
 
     worker = object.__new__(OmniGPUWorkerBase)
