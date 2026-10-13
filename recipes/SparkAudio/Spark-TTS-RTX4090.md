@@ -31,12 +31,25 @@ Spark HTTP service is needed.
 
 ## Hardware and software environment
 
-This profile was validated on one RTX 4090 24 GB with driver 550.67,
-Python 3.12.14, PyTorch 2.13.0+cu129, vLLM 0.30.0+cu129, and
-vLLM-Omni 0.30.1.dev15+g1b97ff118. The checkpoint revision was
+This profile was revalidated on 2026-10-13 with one RTX 4090 24 GB,
+driver 550.67, Python 3.12.14, PyTorch 2.13.0+cu129,
+vLLM 0.31.0+cu129, and transformers 5.14.1. The Omni source checkout
+was based on upstream `main` commit `b463516ff`. The checkpoint revision was
 `642071559bfc6346c2359d19dcb6be3f9dd8a05d`. These are validation
-versions, not a general installation lockfile. Select a compatible vLLM/Omni
-stack for your host before running this recipe.
+versions, not a general installation lockfile.
+
+The default vLLM 0.31.0 PyPI wheel uses CUDA 13.0. For this Linux x86_64
+CUDA 12.9 profile, select the official CUDA 12.9 wheel explicitly:
+
+```bash
+uv pip install --torch-backend=cu129 \
+  'https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm-0.31.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=5176ab746f4e736c4a354a11d0620abf0a941de287cad937ac34039293ca6f5f'
+uv pip install -e .
+```
+
+See the [vLLM 0.31.0 release artifacts](https://github.com/vllm-project/vllm/releases/tag/v0.31.0).
+The validation host also used `VLLM_USE_FLASHINFER_SAMPLER=0` and preloaded a
+compatible `libstdc++.so.6`; these are host-specific runtime settings.
 
 The official source used in validation was
 `2f1ea9082400547242641f5271b6f941c9f439d1`. Make it importable in the
@@ -116,9 +129,12 @@ reference recording that you have permission to use.
 The offline CUDA smoke test is
 `tests/e2e/offline_inference/test_spark_tts.py`. It checks that one control
 request produces nonempty, finite audio at 16 kHz. It passed with real weights
-on an RTX 4090; the Buildkite L4 GPU run has not been observed yet. A valid
-waveform does not establish transcript accuracy, naturalness, or speaker
-similarity. Those require separate evaluation.
+on an RTX 4090 using the stack above. Manual reference-audio clone smoke tests,
+with and without a reference transcript, also produced finite, nonempty,
+non-silent 16 kHz mono WAVs. Both stages exited without a forced kill or leaked
+semaphore warning in these runs. The Buildkite L4 GPU run has not been observed
+yet. A valid waveform does not establish transcript accuracy, naturalness, or
+speaker similarity. Those require separate evaluation.
 
 The provided deploy config uses `model_runner: v1`, eager execution,
 `async_chunk: false`, and a 1024-token generation limit. The two stages both
