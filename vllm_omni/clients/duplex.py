@@ -1193,7 +1193,9 @@ class DuplexClient(DuplexClientBase):
         except ImportError as exc:  # pragma: no cover - websockets is a pinned dep
             raise DuplexConnectionError("The duplex client requires the 'websockets' package") from exc
         try:
-            return await websockets.connect(url, max_size=_MAX_FRAME_BYTES)
+            # Startup warmup can hold the HTTP upgrade before session.created.
+            # Use the caller's handshake budget for this transport phase too.
+            return await websockets.connect(url, max_size=_MAX_FRAME_BYTES, open_timeout=self._handshake_timeout_s)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
