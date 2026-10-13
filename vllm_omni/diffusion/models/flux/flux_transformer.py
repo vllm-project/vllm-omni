@@ -51,12 +51,6 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
 
-# Joint-sequence token count (B * (txt + img)) below which the attention
-# blocks keep their eager RMSNorm -> cat -> RoPE chain; the fused path won at
-# every size measured on H200 for this chain (see Flux.2), so fuse by default
-# and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
-_FUSED_MIN_TOKENS = 0
-
 
 class ColumnParallelApproxGELU(nn.Module):
     def __init__(
@@ -541,9 +535,7 @@ def _with_qk_norm_rope_table(
     op; single blocks: joint sequence). Stored in the activation dtype — the
     eager chain rotates with ``cos``/``sin`` cast to that dtype too."""
     cos, sin = image_rotary_emb
-    table = pack_qk_norm_rope_table(
-        cos, sin, hidden_states.shape[0], dtype=hidden_states.dtype, min_tokens=_FUSED_MIN_TOKENS
-    )
+    table = pack_qk_norm_rope_table(cos, sin, hidden_states.shape[0], dtype=hidden_states.dtype)
     if table is None:
         return joint_attention_kwargs
     return {**(joint_attention_kwargs or {}), QK_NORM_ROPE_TABLE_KEY: table}

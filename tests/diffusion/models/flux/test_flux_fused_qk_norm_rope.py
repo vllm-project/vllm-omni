@@ -41,11 +41,10 @@ def _rope(seq_len: int):
     return torch.cos(angles), torch.sin(angles)
 
 
-def test_table_skipped_on_cpu(monkeypatch):
+def test_table_skipped_on_cpu():
     """No table (no allocation) where the fused kernel cannot run."""
     from vllm_omni.diffusion.models.flux.flux_transformer import _with_qk_norm_rope_table
 
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     cos, sin = torch.randn(40, 64), torch.randn(40, 64)
     x = torch.zeros(2, 40, _DIM, dtype=torch.bfloat16)
     assert _with_qk_norm_rope_table({"other": 1}, (cos, sin), x) == {"other": 1}
@@ -53,17 +52,14 @@ def test_table_skipped_on_cpu(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_table_gate_and_kwargs(monkeypatch):
+def test_table_and_kwargs():
     from vllm_omni.diffusion.models.flux.flux_transformer import QK_NORM_ROPE_TABLE_KEY, _with_qk_norm_rope_table
 
     cos, sin = torch.randn(2, 40, 64, device="cuda"), torch.randn(2, 40, 64, device="cuda")
     x = torch.zeros(2, 40, _DIM, dtype=torch.bfloat16, device="cuda")
-    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
     kw = _with_qk_norm_rope_table({"other": 1}, (cos[0], sin[0]), x)
     assert kw["other"] == 1 and kw[QK_NORM_ROPE_TABLE_KEY].shape == (80, _HEAD_DIM)
     assert kw[QK_NORM_ROPE_TABLE_KEY].dtype == torch.bfloat16
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "1000000")
-    assert _with_qk_norm_rope_table(None, (cos[0], sin[0]), x) is None
     assert _with_qk_norm_rope_table(None, (cos[0], sin[0]), x.half()) is None  # non-bf16 activations
 
 
@@ -96,7 +92,7 @@ def test_flux_attention_fused_matches_eager(_dist_env, double_stream):
     hidden = torch.randn(batch, img if double_stream else txt + img, _DIM, device="cuda", dtype=torch.bfloat16)
     encoder = torch.randn(batch, txt, _DIM, device="cuda", dtype=torch.bfloat16) if double_stream else None
     cos, sin = _rope(txt + img)
-    table = pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16, min_tokens=0)
+    table = pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16)
 
     with torch.no_grad():
         eager = attn(hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin))
