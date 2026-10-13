@@ -22,8 +22,10 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
+from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -388,6 +390,154 @@ def extract_bagel_context(
         hidden_states=packed_sequence,  # Use full packed sequence
         encoder_hidden_states=None,
         temb=packed_timestep_embeds,  # Approximate
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
+def extract_wan2_2_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.LongTensor,
+    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states_image: torch.Tensor | None = None,
+    intermediate_tensors: IntermediateTensors | None = None,
+    return_dict: bool = True,
+    attention_kwargs: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for WanTransformer3DModel.
+
+    This is the ONLY Wan2.2-specific code needed for TeaCache support.
+    It encapsulates preprocessing, modulated input extraction, transformer execution,
+    and postprocessing logic.
+
+    Args:
+        module: WanTransformer3DModel instance
+        hidden_states: Input hidden states tensor [B, C, F, H, W]
+        timestep: Current diffusion timestep (1D or 2D)
+        encoder_hidden_states: Text encoder outputs
+        encoder_hidden_states_image: Optional image encoder outputs for I2V/TI2V
+        return_dict: Whether to return dict format output
+        attention_kwargs: Additional attention arguments
+        **kwargs: Additional keyword arguments ignored by this extractor
+
+    Returns:
+        CacheContext with all information needed for generic caching
+
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "blocks") or len(module.blocks) == 0:
+        raise ValueError("Module must have blocks")
+
+    p_t, p_h, p_w = module.config.patch_size
+    post_patch_num_frames = hidden_states.shape[2] // p_t
+    post_patch_height = hidden_states.shape[3] // p_h
+    post_patch_width = hidden_states.shape[4] // p_w
+
+    current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
+    if module._cached_rope_resolution == current_rope_resolution and module._cached_rope_emb is not None:
+        rotary_emb = module._cached_rope_emb
+    else:
+        freqs_cos, freqs_sin = module.rope(hidden_states)
+        rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
+        module._hidden_states_shape = hidden_states.shape
+        module._cached_rope_emb = rotary_emb
+
+    if is_pipeline_first_stage():
+        hidden_states = module.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        hidden_states = module._sp_shard_point(hidden_states)
+    else:
+        if intermediate_tensors is None:
+            raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
+        hidden_states = intermediate_tensors["hidden_states"]
+
+    if timestep.ndim == 2:
+        ts_seq_len = timestep.shape[1]
+        timestep = timestep.flatten()
+    else:
+        ts_seq_len = None
+
+    temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = module.condition_embedder(
+        timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
+    )  # encoder_hidden_states_image: None for T2V, image embeds for I2V/TI2V
+    timestep_proj = module.timestep_proj_prepare(timestep_proj, ts_seq_len)
+
+    if encoder_hidden_states_image is not None:
+        encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+
+    hidden_states_mask = None
+    ctx = get_forward_context()
+    parallel_config = ctx.omni_diffusion_config.parallel_config
+    if parallel_config is not None and parallel_config.sequence_parallel_size > 1 and parallel_config.mask_sp_padding:
+        hidden_states_mask = build_local_sp_padding_mask(
+            hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
+        )
+        if hidden_states_mask is not None and hidden_states_mask.all():
+            hidden_states_mask = None
+
+    # make_layers leaves PPMissingLayer placeholders outside this stage's slice.
+    # Use the first local block for the TeaCache modulation signal.
+    block = module.blocks[module.start_layer]
+    if timestep_proj.ndim == 4:
+        # I2V/TI2V: per-token timestep [B, seq, 6, inner_dim]
+        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table.unsqueeze(0) + timestep_proj).chunk(6, dim=2)
+        shift_msa = shift_msa.squeeze(2)
+        scale_msa = scale_msa.squeeze(2)
+    else:
+        # T2V: single timestep per batch [B, 6, inner_dim]
+        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table + timestep_proj).chunk(6, dim=1)
+
+    norm_hidden_states = block.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
+    modulated_input = norm_hidden_states
+
+    def run_transformer_blocks():
+        h = hidden_states
+        vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
+        for block in module.blocks[module.start_layer : module.end_layer]:
+            h = block(
+                h,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+                vsa_dit_seq_shape,
+                module.preserve_vsa_all_blocks,
+            )
+        return (h,)
+
+    def postprocess(h):
+        if not is_pipeline_last_stage():
+            return IntermediateTensors({"hidden_states": h})
+
+        shift, scale = module.output_scale_shift_prepare(temb)
+        shift = shift.to(h.device)
+        scale = scale.to(h.device)
+        if shift.ndim == 2:
+            shift = shift.unsqueeze(1)
+            scale = scale.unsqueeze(1)
+
+        h = module.norm_out(h, scale, shift).type_as(h)
+        output = module.proj_out(h)
+
+        output = output.reshape(
+            output.shape[0], post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+        )
+        output = output.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        output = output.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )
@@ -1668,6 +1818,7 @@ def extract_cosmos3_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "WanTransformer3DModel": extract_wan2_2_context,
     "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,
     "Cosmos3VFMTransformer": extract_cosmos3_context,
     "ZImageTransformer2DModel": extract_zimage_context,

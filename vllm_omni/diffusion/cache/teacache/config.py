@@ -105,6 +105,15 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
+    # Default WanTransformer3DModel coefficients for 480x832 resolution
+    # Other resolutions may need model-specific calibration.
+    "WanTransformer3DModel": [
+        -4.95575015e01,
+        2.82816062e01,
+        -8.15628974e00,
+        2.12991172e00,
+        -1.01454960e-01,
+    ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
     # MammothModa2 DiT coefficients fitted from full-compute traces
