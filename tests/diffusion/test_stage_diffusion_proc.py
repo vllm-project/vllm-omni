@@ -4,6 +4,7 @@
 import asyncio
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from types import SimpleNamespace
@@ -200,9 +201,9 @@ async def test_proc_process_request_with_batching_async_output():
 class _FailingExecutor:
     def __init__(self, is_dead: bool = False) -> None:
         self.is_dead = is_dead
-        self.callbacks = []
+        self.callbacks: list[Callable[[], object]] = []
 
-    def register_failure_callback(self, callback) -> None:
+    def register_failure_callback(self, callback: Callable[[], object]) -> None:
         self.callbacks.append(callback)
 
 
@@ -446,9 +447,7 @@ async def test_proc_rpc_engine_death_wakes_recv_without_new_messages(proc_contro
     release = threading.Event()
 
     def collective_rpc(*_args):
-        # Let the RPC enter the executor before simulating the worker death.
-        # If ``is_dead`` is set before run_loop starts, the fatal_event wins
-        # the recv race and the queued RPC never gets its error envelope.
+        # A startup failure bypasses RPC dispatch; simulate death after entry.
         entered.set()
         assert release.wait(timeout=5)
         raise RuntimeError("DiffusionExecutor is closed")
@@ -472,5 +471,6 @@ async def test_proc_rpc_engine_death_wakes_recv_without_new_messages(proc_contro
         response_socket.close.assert_called_once()
         context.term.assert_called_once()
     finally:
+        release.set()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
