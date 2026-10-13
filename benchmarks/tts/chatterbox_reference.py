@@ -41,6 +41,10 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("reference", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--runner", choices=("v1", "v2"), default="v2")
+    parser.add_argument(
+        "--profile", action="store_true", help="Trace an additional warmed request after each voice mode"
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
@@ -49,7 +53,7 @@ def main():
     if args.backend == "quality":
         evaluate_quality(args)
         return
-    synthesize, close = make_backend(args)
+    synthesize, close, engine = make_backend(args)
     rows = []
     try:
         for voice in ("builtin", "clone"):
@@ -96,6 +100,8 @@ def main():
                     )
                     logging.info("%s %s %s: %.3fs, RTF %.3f", args.backend, voice, seed, elapsed, elapsed / duration)
             write_report(args, rows)
+            if args.profile:
+                profile_generation(args, synthesize, reference, voice, engine)
     finally:
         close()
 
@@ -122,7 +128,7 @@ def make_backend(args):
                 controls.update(min_p=0.05, cfg_weight=0.5, exaggeration=0.5)
             return model.generate(text, audio_prompt_path=str(reference) if reference else None, **controls)
 
-        return synthesize, lambda: None
+        return synthesize, lambda: None, None
 
     import yaml
     from vllm.sampling_params import SamplingParams
@@ -149,10 +155,17 @@ def make_backend(args):
     )
     settings = yaml.safe_load(deploy.read_text())
     settings["async_chunk"] = False
-    settings["model_runner"] = "v2"
+    settings["model_runner"] = args.runner
     for stage in settings["stages"]:
         stage["dtype"] = "float32"
         stage["enforce_eager"] = True
+        if args.profile:
+            stage["profiler_config"] = {
+                "profiler": "torch",
+                "torch_profiler_dir": str(args.output / "traces" / f"stage-{stage['stage_id']}"),
+                "torch_profiler_with_stack": False,
+                "torch_profiler_record_shapes": True,
+            }
     profile = args.output / "matched-deploy.yaml"
     profile.write_text(yaml.safe_dump(settings))
     engine = Omni(model=str(args.model), deploy_config=str(profile))
@@ -178,7 +191,29 @@ def make_backend(args):
         audio = output["audio"]
         return torch.cat([chunk.flatten() for chunk in audio]) if isinstance(audio, list) else audio
 
-    return synthesize, engine.close
+    return synthesize, engine.close, engine
+
+
+def profile_generation(args, synthesize, reference, voice, engine):
+    """Trace one extra request; profiled latency never enters benchmark rows."""
+    seed_everything(42)
+    if engine is not None:
+        engine.start_profile(profile_prefix=voice)
+    try:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as profile:
+            with torch.profiler.record_function(f"{args.backend}_{voice}_generate"):
+                synthesize(TEXTS[-1], reference, 42)
+                torch.accelerator.synchronize()
+    finally:
+        if engine is not None:
+            engine.stop_profile()
+    profile.export_chrome_trace(str(args.output / f"{args.backend}-{voice}.trace.json"))
+    (args.output / f"{args.backend}-{voice}.profile.txt").write_text(
+        profile.key_averages().table(sort_by="self_cuda_time_total", row_limit=60)
+    )
 
 
 def seed_everything(seed):
@@ -223,6 +258,7 @@ def write_report(args, rows):
         packages={name: importlib.metadata.version(name) for name in ("torch", "torchaudio", "transformers", "numpy")},
         precision="float32; TF32 disabled",
         concurrency=1,
+        model_runner=args.runner if args.backend == "omni" else None,
         max_new_tokens=1000,
         warmup_per_mode=2 * len(TEXTS),
         rows=rows,
