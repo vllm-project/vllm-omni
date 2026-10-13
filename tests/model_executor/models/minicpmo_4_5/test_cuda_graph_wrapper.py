@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from vllm.platforms import current_platform
 
 import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
@@ -22,7 +23,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     WholeEulerCFMGraphWrapper,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 class _F0Predictor(nn.Module):

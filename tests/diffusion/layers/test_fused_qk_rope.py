@@ -6,6 +6,8 @@ import torch
 from diffusers.models.embeddings import apply_rotary_emb
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
@@ -47,7 +49,7 @@ def _reference(q, k, cos, sin):
     )
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("sequence", [512, 4096, 4608])
@@ -66,7 +68,7 @@ def test_fused_qk_rope_is_bit_exact_at_longcat_production_shapes(sequence):
             assert torch.equal(actual[1], expected[1])
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_qk_rope_is_bit_exact_for_batch_and_full_width_odd_even_tables():
@@ -84,7 +86,7 @@ def test_fused_qk_rope_is_bit_exact_for_batch_and_full_width_odd_even_tables():
     assert torch.equal(actual[1], expected[1])
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_qk_rope_rejects_noncontiguous_and_non_fp32_tables():
@@ -108,7 +110,7 @@ def test_fused_qk_rope_rejects_noncontiguous_and_non_fp32_tables():
         assert not fused_qk_rope_supported(q_wide, k_wide, cos_wide, sin_wide)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_qk_rope_custom_op_has_fullgraph_fake():

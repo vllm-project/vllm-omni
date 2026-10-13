@@ -16,7 +16,7 @@ from torch import nn
 
 from tests.helpers.mark import hardware_test
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model, pytest.mark.gpu]
+pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model]
 
 
 class _SDPAAttention(nn.Module):

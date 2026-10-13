@@ -103,12 +103,15 @@ async def _wait_for_error_message(
     raise AssertionError(f"No ErrorMessage for req={request_id} within {max_messages} messages")
 
 
-@pytest.fixture
-def orchestrator_factory():
+@pytest.fixture(params=["0", "1"], ids=["legacy", "event-driven"])
+def orchestrator_factory(request, monkeypatch):
+    # Every scenario runs on both orchestration loops, which must behave identically.
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", request.param)
     fixtures: list[OrchestratorFixture] = []
 
     def _factory(*args, **kwargs) -> OrchestratorFixture:
         fixture = _build_harness(*args, **kwargs)
+        assert fixture.orchestrator._event_driven_orch is (request.param == "1")
         fixtures.append(fixture)
         return fixture
 
@@ -978,16 +981,13 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("event_driven", [False, True], ids=["legacy", "event-driven"])
 @pytest.mark.parametrize("first_speaker", ["Ryan", "not-a-real-speaker"])
 async def test_joyai_tts_request_validation_keeps_orchestrator_running(
     orchestrator_factory,
     monkeypatch: pytest.MonkeyPatch,
     first_speaker: str,
-    event_driven: bool,
 ) -> None:
     """Check that the same orchestrator can handle the next valid request."""
-    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", "1" if event_driven else "0")
 
     # Use a fixed token count so the test does not need tokenizer files.
     class FakeTokenizer:

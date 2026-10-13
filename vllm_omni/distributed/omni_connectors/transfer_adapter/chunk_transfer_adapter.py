@@ -269,7 +269,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "prompt_token_ids",
         ):
             if hasattr(request, name):
-                setattr(snapshot, name, snapshot_container(getattr(request, name)))
+                value = getattr(request, name)
+                if name == "prompt_token_ids" and value is not None:
+                    # Token IDs are immutable integers. Copy the sequence without
+                    # walking every prompt token in Python for each chunk.
+                    value = value.copy() if isinstance(value, list) else list(value)
+                else:
+                    value = snapshot_container(value)
+                setattr(snapshot, name, value)
 
         for private_name, public_name in (
             ("_all_token_ids", "all_token_ids"),
