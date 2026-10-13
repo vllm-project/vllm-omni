@@ -70,7 +70,7 @@ def test_ovis_attention_fused_matches_eager(_dist_env, double_stream):
     hidden = torch.randn(batch, img if double_stream else txt + img, _DIM, device="cuda", dtype=torch.bfloat16)
     encoder = torch.randn(batch, txt, _DIM, device="cuda", dtype=torch.bfloat16) if double_stream else None
     cos, sin = _rope(txt + img)
-    table = pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16, min_tokens=0)
+    table = pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16)
 
     with torch.no_grad():
         eager = attn(hidden, encoder_hidden_states=encoder, image_rotary_emb=(cos, sin))

@@ -43,12 +43,6 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
-# Joint-sequence token count (B * (txt + img)) below which the attention
-# blocks keep their eager RMSNorm -> cat -> RoPE chain; fuse by default (the
-# fused path won at every size measured on H200 for this chain, see Flux.2)
-# and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
-_FUSED_MIN_TOKENS = 0
-
 
 class OvisImageAttention(nn.Module):
     def __init__(
@@ -539,7 +533,6 @@ class OvisImageTransformer2DModel(nn.Module):
             image_rotary_emb[1],
             hidden_states.shape[0],
             dtype=hidden_states.dtype,
-            min_tokens=_FUSED_MIN_TOKENS,
         )
         if qk_norm_rope_table is not None:
             joint_attention_kwargs = {QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
