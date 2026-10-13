@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 import torch
@@ -109,18 +112,6 @@ def _flush_remaining_codes(
             finished=torch.tensor(True, dtype=torch.bool),
         ),
     )
-
-
-def _is_codes_empty(codes: Any) -> bool:
-    """Check whether code_predictor_codes should be treated as empty / invalid."""
-    if codes is None:
-        return True
-    if isinstance(codes, torch.Tensor):
-        return codes.numel() == 0 or not codes.any()
-    if hasattr(codes, "__len__") and len(codes) == 0:
-        return True
-    t = torch.tensor(codes, dtype=torch.long) if not isinstance(codes, torch.Tensor) else codes
-    return not t.any()
 
 
 def _to_code_tensor(codes: Any) -> torch.Tensor | None:

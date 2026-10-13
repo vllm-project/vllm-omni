@@ -24,6 +24,7 @@ class OmniServingCapability(Enum):
     """Serving capabilities that pipelines can shut down."""
 
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
+    IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
 
     @property
     def path(self) -> str:

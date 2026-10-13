@@ -1,28 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Guards for the duplex-only API server (unified full-duplex framework).
-
-A model whose pipeline declares ``duplex_plugin`` is served through
-``DuplexOmni`` and nothing else: sessions run over ``/v1/realtime?duplex=1``
-(alias ``/v1/duplex``) and every turn-based route reports "not available".
-These tests lock that shape, which ``test_api_server_guards.py`` covers for the
-diffusion and multi-stage servers:
-
-* the pipeline probe that decides duplex vs turn-based at startup,
-* the ``app.state`` snapshot of a duplex server (what is wired, what stays
-  ``None``),
-* both duplex websocket routes reaching the session handler, and
-  ``/v1/realtime`` without the flag still reporting the turn-based Realtime API
-  as unavailable,
-* the startup-warmup gate that holds real clients while the warmup session runs.
-
-CPU-only: no engine is started; ``DuplexOmni`` is subclassed with just the
-accessors the app-state wiring reads.
-"""
+"""CPU tests for serving-mode selection, duplex API wiring and warmup."""
 
 from __future__ import annotations
 
 import asyncio
+from argparse import Namespace
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -30,13 +14,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
+from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
+from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -70,14 +58,12 @@ _DUPLEX_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_streaming_video_output",
-    "openai_serving_realtime",
     "openai_serving_realtime_robot",
     "anthropic_serving_messages",
     "openai_serving_duplex",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
-#: Every turn-based service, plus the Realtime route that is not the duplex one.
 #: ``openai_serving_chat`` is absent: a duplex engine also serves chat, through
 #: the ordinary turn-based service, because DuplexOmni extends AsyncOmni.
 #: ``online_renderer`` is absent for the same reason -- the chat service needs it.
@@ -181,6 +167,7 @@ def _minimal_args(**overrides) -> SimpleNamespace:
         enable_force_include_usage=False,
         enable_log_outputs=False,
         enable_log_deltas=False,
+        log_error_stack=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -202,9 +189,10 @@ def _minimal_args(**overrides) -> SimpleNamespace:
         (None, False),
     ],
 )
-def test_duplex_model_probe_follows_the_pipeline_plugin(monkeypatch, pipeline_config, expected: bool) -> None:
-    """``duplex_plugin`` alone decides whether ``serve`` builds ``DuplexOmni``."""
+def test_duplex_serving_requires_a_pipeline_plugin(monkeypatch, tmp_path, pipeline_config, expected: bool) -> None:
     seen: dict[str, object] = {}
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text("session_mode: duplex\n")
 
     def fake_get_pipeline_config(*, model, trust_remote_code, deploy_config_path=None, **_kwargs):
         seen.update(model=model, trust_remote_code=trust_remote_code, deploy_config_path=deploy_config_path)
@@ -212,12 +200,12 @@ def test_duplex_model_probe_follows_the_pipeline_plugin(monkeypatch, pipeline_co
 
     monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", fake_get_pipeline_config)
 
-    kwargs = {"trust_remote_code": True, "deploy_config": "deploy.yaml"}
-    assert api_server._is_duplex_model("demo-duplex-model", kwargs) is expected
+    kwargs = {"trust_remote_code": True, "deploy_config": str(deploy_path)}
+    assert api_server._should_serve_duplex("demo-duplex-model", kwargs) is expected
     assert seen == {
         "model": "demo-duplex-model",
         "trust_remote_code": True,
-        "deploy_config_path": "deploy.yaml",
+        "deploy_config_path": str(deploy_path),
     }
 
 
@@ -230,7 +218,98 @@ def test_duplex_model_probe_propagates_resolution_errors(monkeypatch) -> None:
     monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", fake_get_pipeline_config)
 
     with pytest.raises(ValueError, match="trust_remote_code"):
-        api_server._is_duplex_model("demo-duplex-model", {})
+        api_server._should_serve_duplex("demo-duplex-model", {})
+
+
+@pytest.fixture
+def duplex_pipeline():
+    return PipelineConfig(
+        model_type="demo",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="demo", final_output=True),),
+        duplex_plugin="pkg.mod.Plugin",
+    )
+
+
+@pytest.mark.parametrize("session_mode", ["turn", "duplex"])
+@pytest.mark.parametrize("config_source", ["explicit", "default", "basename", "inherited"])
+@pytest.mark.asyncio
+async def test_serving_mode_selects_engine_and_preserves_stage_config(
+    monkeypatch, tmp_path, duplex_pipeline, session_mode, config_source
+):
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text("session_mode: duplex\nstages:\n  - stage_id: 0\n    max_num_seqs: 4\n")
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text(f"base_config: base.yaml\nsession_mode: {session_mode}\n")
+    if config_source == "inherited":
+        deploy_path = tmp_path / "overlay.yaml"
+        deploy_path.write_text("base_config: deploy.yaml\n")
+    pipeline = replace(duplex_pipeline, default_deploy_config_name=deploy_path.name)
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: pipeline)
+    monkeypatch.setattr(stage_config, "_DEPLOY_DIR", tmp_path)
+    kwargs = {}
+    if config_source != "default":
+        kwargs["deploy_config"] = deploy_path.name if config_source == "basename" else str(deploy_path)
+
+    created = []
+
+    class TurnEngine:
+        def __init__(self, model, **engine_kwargs):
+            self.model = model
+            self.kwargs = engine_kwargs
+            self.closed = False
+            created.append(self)
+
+        def shutdown(self):
+            self.closed = True
+
+    class DuplexEngine(TurnEngine):
+        pass
+
+    monkeypatch.setattr(api_server, "AsyncOmni", TurnEngine)
+    monkeypatch.setattr(api_server, "DuplexOmni", DuplexEngine)
+    args = TrackingNamespace(
+        Namespace(model="demo-model", disable_log_stats=True, **kwargs), frozenset({"model", *kwargs})
+    )
+    async with api_server.build_async_omni_from_stage_config(args) as engine:
+        assert type(engine) is (DuplexEngine if session_mode == "duplex" else TurnEngine)
+        assert engine.model == "demo-model"
+        assert engine.kwargs == {**kwargs, "log_stats": False}
+        assert not engine.closed
+    assert len(created) == 1
+    assert engine.closed
+    deploy = stage_config.load_deploy_config(deploy_path)
+    assert deploy.session_mode == session_mode
+    assert deploy.stages[0].max_num_seqs == 4
+
+
+@pytest.mark.parametrize("contents", ["{}\n", "session_mode: null\n", "session_mode: typo\n"])
+def test_duplex_serving_rejects_missing_or_invalid_mode(monkeypatch, tmp_path, duplex_pipeline, contents):
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text(contents)
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: duplex_pipeline)
+    with pytest.raises(ValueError, match="session_mode: turn or duplex"):
+        api_server._should_serve_duplex("demo-model", {"deploy_config": str(deploy_path)})
+
+
+def test_duplex_serving_requires_a_deploy_config(monkeypatch, duplex_pipeline):
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: duplex_pipeline)
+    with pytest.raises(ValueError, match="requires a deploy config"):
+        api_server._should_serve_duplex("demo-model", {})
+
+
+def test_duplex_serving_propagates_deploy_load_errors(monkeypatch, tmp_path, duplex_pipeline):
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: duplex_pipeline)
+    with pytest.raises(FileNotFoundError):
+        api_server._should_serve_duplex("demo-model", {"deploy_config": str(tmp_path / "missing.yaml")})
+
+
+@pytest.mark.parametrize("deploy_name,expected", [("minicpmo_4_5.yaml", True), ("minicpmo_4_5_turn.yaml", False)])
+def test_minicpmo_serving_profiles(monkeypatch, deploy_name, expected):
+    from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
+
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **_: MINICPMO_4_5_PIPELINE)
+    assert api_server._should_serve_duplex("openbmb/MiniCPM-o-4_5", {"deploy_config": deploy_name}) is expected
+    assert api_server._should_serve_duplex("openbmb/MiniCPM-o-4_5", {}) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -239,7 +318,8 @@ def test_duplex_model_probe_propagates_resolution_errors(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch) -> None:
+@pytest.mark.parametrize("log_error_stack", [False, True])
+async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, mocker, log_error_stack) -> None:
     """Lock the duplex ``app.state``: the two session-backed surfaces are live, every turn-based service is None.
 
     Fails if a turn-based service is wired into a duplex server (its route
@@ -249,12 +329,12 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch) -> 
     the turn-based chat service.
     """
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
-    monkeypatch.setattr(api_server, "OnlineRenderer", lambda **kwargs: SimpleNamespace(**kwargs))
+    renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", lambda **kwargs: SimpleNamespace(**kwargs))
     engine = _FakeDuplexOmni()
     state = State()
 
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=log_error_stack))
 
     present = {key for key in _DUPLEX_APP_STATE_KEYS if hasattr(state, key)}
     assert present == _DUPLEX_APP_STATE_KEYS
@@ -264,6 +344,10 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch) -> 
     assert not unexpectedly_set, f"turn-based services wired into a duplex server: {unexpectedly_set}"
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
     assert state.openai_serving_chat is not None
+    renderer_ctor.assert_called_once()
+    assert renderer_ctor.call_args.kwargs["log_error_stack"] is log_error_stack
+    assert state.openai_serving_chat.online_renderer is state.online_renderer is renderer_ctor.return_value
+    state.online_renderer.warmup.assert_called_once_with()
     assert state.engine_client is engine
     assert state.vllm_config is engine._vllm_config
 
@@ -290,9 +374,28 @@ def _duplex_app(handler: object) -> FastAPI:
     app = FastAPI()
     app.include_router(api_server.router)
     app.state.openai_serving_duplex = handler
-    # A duplex server serves no turn-based Realtime route.
-    app.state.openai_serving_realtime = None
     return app
+
+
+def _turn_based_realtime_app(handler: object | None, mocker) -> FastAPI:
+    app = _duplex_app(handler)
+    app.state.args = Namespace()
+    app.state.openai_serving_models = _FakeModels(
+        base_model_paths=[BaseModelPath(name="omni-model", model_path="omni-model")]
+    )
+    app.state.engine_client = mocker.Mock()
+    app.state.openai_serving_chat = mocker.Mock()
+    return app
+
+
+def _assert_openai_realtime_connection(client: TestClient, path: str) -> None:
+    with client.websocket_connect(path) as websocket:
+        assert websocket.receive_json()["type"] == "session.created"
+        websocket.send_json({"type": "unknown_event"})
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert error["error"]["type"] == "invalid_request_error"
+        assert error["error"]["code"] == "invalid_event"
 
 
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
@@ -343,21 +446,34 @@ def test_realtime_without_a_duplex_flag_reaches_the_session_handler(query: str) 
 
 
 @pytest.mark.parametrize("query", ["?duplex=0", "?duplex=false", "?duplex=off"])
-def test_realtime_opted_out_of_duplex_falls_through_to_the_turn_based_route(query: str) -> None:
-    """An explicit opt-out selects the legacy handler, which a duplex server does not mount."""
+def test_realtime_opted_out_of_duplex_falls_through_to_the_turn_based_route(query: str, mocker) -> None:
     handler = _RecordingHandler()
+    app = _turn_based_realtime_app(handler, mocker)
 
-    with TestClient(_duplex_app(handler)) as client:
-        with client.websocket_connect(f"/v1/realtime{query}") as websocket:
-            assert websocket.receive_json() == {
-                "type": "error",
-                "error": "Realtime API is not available",
-                "code": "unsupported",
-            }
-            with pytest.raises(WebSocketDisconnect):
-                websocket.receive_text()
+    with TestClient(app) as client:
+        _assert_openai_realtime_connection(client, f"/v1/realtime{query}")
 
     assert handler.queries == []
+
+
+def test_turn_based_deployment_uses_openai_realtime(mocker) -> None:
+    app = _turn_based_realtime_app(None, mocker)
+
+    with TestClient(app) as client:
+        _assert_openai_realtime_connection(client, "/v1/realtime?model=omni-model")
+
+
+def test_turn_based_realtime_answers_session_update_with_session_updated(mocker) -> None:
+    """Clients send session.update right after session.created and expect session.updated next."""
+    app = _turn_based_realtime_app(None, mocker)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime?model=omni-model") as websocket:
+            assert websocket.receive_json()["type"] == "session.created"
+            websocket.send_json(
+                {"type": "session.update", "session": {"type": "realtime", "instructions": "Be brief."}}
+            )
+            assert websocket.receive_json()["type"] == "session.updated"
 
 
 # --------------------------------------------------------------------------- #
@@ -377,7 +493,7 @@ async def test_warmup_gate_holds_clients_until_the_warmup_session_finishes() -> 
     warmup_done = asyncio.Event()
     websocket = _warmup_websocket(warmup_done, {})
 
-    waiting = asyncio.create_task(api_server._wait_for_duplex_warmup(websocket))
+    waiting = asyncio.create_task(wait_for_duplex_warmup(websocket))
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(asyncio.shield(waiting), timeout=0.05)
 
@@ -397,18 +513,83 @@ async def test_warmup_gate_holds_clients_until_the_warmup_session_finishes() -> 
 async def test_warmup_gate_lets_the_warmup_connection_and_plain_servers_through(warmup_done, query) -> None:
     websocket = _warmup_websocket(warmup_done, query)
 
-    await asyncio.wait_for(api_server._wait_for_duplex_warmup(websocket), timeout=1.0)
+    await asyncio.wait_for(wait_for_duplex_warmup(websocket), timeout=1.0)
 
 
 @pytest.mark.asyncio
-async def test_a_model_that_does_not_declare_chat_completions_does_not_get_the_route(monkeypatch) -> None:
-    """The decision stays the model's: no capability, no chat service, and the route says so."""
+@pytest.mark.parametrize(
+    "supports_chat, supported_tasks", [(False, ("generate",)), (True, ())], ids=["no-capability", "no-generation"]
+)
+async def test_duplex_chat_initialization_respects_model_gates(
+    monkeypatch, mocker, supports_chat, supported_tasks
+) -> None:
+    """Neither gate may construct or warm up a chat renderer."""
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
+    renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
+    chat_ctor = mocker.patch.object(api_server, "OmniOpenAIServingChat")
     engine = _FakeDuplexOmni()
-    engine._capabilities = DuplexCapabilities(supports_chat_completions=False)
+    engine._capabilities = DuplexCapabilities(supports_chat_completions=supports_chat)
+    mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
     state = State()
 
     await api_server.omni_init_app_state(engine, state, _minimal_args())
 
     assert state.openai_serving_chat is None
+    assert state.openai_serving_chat_batch is None
+    renderer_ctor.assert_not_called()
+    chat_ctor.assert_not_called()
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
+
+
+def test_qwen_plugin_preserves_custom_turn_deployment_default(monkeypatch, tmp_path):
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+
+    monkeypatch.setattr(StageConfigFactory, "get_pipeline_config", lambda **kwargs: QWEN3_OMNI_PIPELINE)
+    deploy = tmp_path / "qwen.yaml"
+    deploy.write_text("stages: []\n")
+    assert not api_server._should_serve_duplex("qwen", {"deploy_config": str(deploy)})
+    deploy.write_text("session_mode: duplex\nstages: []\n")
+    assert api_server._should_serve_duplex("qwen", {"deploy_config": str(deploy)})
+
+
+@pytest.mark.parametrize("flag", ["1", "true", "on"])
+def test_turn_deployment_rejects_explicit_duplex_without_falling_back_to_stt(flag: str) -> None:
+    app = _duplex_app(None)
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/v1/realtime?duplex={flag}") as websocket:
+            assert websocket.receive_json() == {
+                "type": "error",
+                "code": "unsupported",
+                "error": "VAD realtime is not enabled",
+            }
+            with pytest.raises(WebSocketDisconnect) as exc:
+                websocket.receive_text()
+            assert exc.value.code == 1008
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "explicit_template, tokenizer_template, tokenizer_error, expected",
+    [
+        ("explicit", None, False, "explicit"),
+        (None, "tokenizer", False, None),
+        (None, None, False, "model-json"),
+        (None, None, True, "model-json"),
+    ],
+)
+async def test_shared_chat_template_resolution(
+    mocker, explicit_template, tokenizer_template, tokenizer_error, expected
+):
+    engine = _FakeDuplexOmni()
+    tokenizer = mocker.patch.object(
+        engine,
+        "get_tokenizer",
+        return_value=SimpleNamespace(chat_template=tokenizer_template),
+        side_effect=RuntimeError("tokenizer unavailable") if tokenizer_error else None,
+    )
+    mocker.patch.object(api_server, "load_chat_template", return_value=explicit_template)
+    model_template = mocker.patch.object(api_server, "_load_model_chat_template_json", return_value="model-json")
+
+    assert await api_server._resolve_chat_template(engine, _minimal_args()) == expected
+    assert tokenizer.call_count == (0 if explicit_template is not None else 1)
+    assert model_template.call_count == (1 if expected == "model-json" else 0)

@@ -107,6 +107,8 @@ async def async_request_image_edits(
 
     if extra_body.get("guidance_scale") is not None:
         form.add_field("guidance_scale", str(extra_body["guidance_scale"]))
+    if extra_body.get("guidance_scale_2") is not None:
+        form.add_field("guidance_scale_2", str(extra_body["guidance_scale_2"]))
     if extra_body.get("negative_prompt") is not None:
         form.add_field("negative_prompt", str(extra_body["negative_prompt"]))
     if extra_body.get("true_cfg_scale") is not None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -215,8 +215,8 @@ def test_mel_head_preserves_official_checkpoint_bias_and_hidden_payload_policy(
 
     assert seen["bias"] is True
     assert talker.mel_head.bias is not None
-    assert talker.omni_pooler_payload_include_hidden is use_gpt_latent
-    assert talker.omni_payload_at_request_end is (model_type == "indextts2_5")
+    assert talker.omni_pooler_payload_include_hidden is False
+    assert talker.omni_payload_at_request_end is True
 
 
 def test_v2_load_weights_loads_exact_mel_head_bias_parameter(monkeypatch):

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared MiniMax H3 media normalization and Qwen presentation building.
 
 Builds the positive presentation token stream:
@@ -34,7 +35,6 @@ _VIDEO_TAG = 0
 
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
-MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
     "21:9": 21.0 / 9.0,
@@ -134,15 +134,24 @@ def resolve_minimax_h3_aspect_ratio(
     return numeric_value
 
 
-def resolve_minimax_h3_reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    """Resize an H3 reference image to the official 2048-short-edge canvas."""
+def resolve_minimax_h3_reference_image_shape(
+    image: Image.Image,
+    *,
+    max_area: int | None = None,
+) -> tuple[int, int]:
+    """Preserve reference resolution, rounding each axis to the 32-pixel grid.
+
+    ``max_area`` scales the reference down, keeping its aspect ratio, so its
+    pixel area does not exceed the output canvas. Timeline-guided requests use
+    it because their references ride through every step next to the guides.
+    """
     width, height = image.size
     ratio = width / height
     if not 0.4 <= ratio <= 2.5:
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    scale = 1.0 if max_area is None else min(1.0, math.sqrt(max_area / (width * height)))
     return (
         _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
         _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),

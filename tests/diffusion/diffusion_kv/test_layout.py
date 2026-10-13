@@ -17,6 +17,7 @@ from vllm_omni.diffusion.diffusion_kv.layout import (
     adopt_kv_cache_layout,
     assert_backend_layout_supported,
     build_kv_cache_tensor,
+    get_connector_required_kv_cache_layout,
     resolve_diffusion_kv_cache_layout,
 )
 
@@ -133,6 +134,51 @@ def test_block_stride_requirement_propagates_control_plane_to_worker() -> None:
     assert_backend_layout_supported(worker, _BlockStrideBackend)
     with pytest.raises(ValueError, match="contradicts the attention"):
         assert_backend_layout_supported(worker, _DenseBackend)
+
+
+def test_explicit_connector_layout_is_distinct_from_block_stride_requirement() -> None:
+    config = _config()
+
+    layout = resolve_diffusion_kv_cache_layout(config, required_layout=KVCacheLayout.LBHNC)
+
+    assert layout is KVCacheLayout.LBHNC
+    assert config.cache_config.get_resolved_kv_cache_layout() is KVCacheLayout.LBHNC
+
+
+def test_connector_declared_layout_is_resolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Connector:
+        @classmethod
+        def get_required_kvcache_layout(cls, config):
+            del config
+            return "LBHNC"
+
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    monkeypatch.setattr(KVConnectorFactory, "get_connector_class", lambda config: _Connector)
+    config = _config()
+    config.kv_transfer_config = object()
+
+    assert get_connector_required_kv_cache_layout(config) is KVCacheLayout.LBHNC
+
+
+def test_connector_layout_rejects_same_block_order_but_different_head_order() -> None:
+    config = _config()
+    config.cache_config.kv_cache_layout = KVCacheLayout.LBNHC.name
+    with pytest.raises(ValueError, match="contradicts"):
+        resolve_diffusion_kv_cache_layout(config, required_layout=KVCacheLayout.LBHNC)
+
+
+def test_connector_layout_cannot_override_backend_requirement() -> None:
+    with pytest.raises(ValueError, match="contradicts the attention"):
+        resolve_diffusion_kv_cache_layout(
+            _config(), indexes_kv_by_block_stride=True, required_layout=KVCacheLayout.LBHNC
+        )
+
+
+def test_connector_layout_without_cache_config() -> None:
+    config = _config()
+    config.cache_config = None
+    assert resolve_diffusion_kv_cache_layout(config, required_layout="LBHNC") is KVCacheLayout.LBHNC
 
 
 def test_tensor_strides_come_from_the_upstream_derivation() -> None:

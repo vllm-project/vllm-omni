@@ -9,6 +9,12 @@ the owner document for `vllm_omni/engine/duplex/**`,
 `vllm_omni/entrypoints/duplex_omni.py`, `vllm_omni/entrypoints/duplex/**`,
 `vllm_omni/clients/**` and the per-model `duplex/` packages.
 
+`vllm_omni/protocol/realtime/**` (the OpenAI Realtime API) and
+`vllm_omni/protocol/duplex/**` (vLLM-Omni's extension of it) are the shared
+wire codec duplex is built on. Duplex is its first consumer but not its owner: the codec
+is deliberately runtime-agnostic so a second Realtime surface can reuse it
+(RFC #6592 P0a).
+
 The public wire contract lives in
 [`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md);
 this page describes how it is produced.
@@ -108,23 +114,56 @@ plugin and the session runtime config to `DuplexOrchestrator` directly.
    `AsyncOmniEngine`, `OrchestratorBase` and `Orchestrator` carry only
    template seams; `tests/engine/test_duplex_import_boundary.py` checks that
    importing the turn-based stack loads no duplex module.
-4. **Every surface a duplex server exposes is backed by a session.**
+4. **Deployment selects the serving stack.**
    `vllm-omni serve` constructs `DuplexOmni` when the pipeline declares
-   `duplex_plugin`; the server exposes `/v1/realtime?duplex=1` (alias
+   `duplex_plugin` and the deploy configuration sets `session_mode: duplex`.
+   An explicit `session_mode: turn` selects `AsyncOmni` instead, without
+   changing the pipeline's duplex capability. In duplex mode the server exposes `/v1/realtime?duplex=1` (alias
    `/v1/duplex`), `POST /v1/chat/completions`, `/v1/models` and `/health`, and
-   every other turn-based route reports "not available". The chat route is
-   served by `DuplexChatCompletionsAdapter`, a Realtime client that runs one
-   short-lived session per request: speech becomes a committed turn, text is
-   seeded as the session's opening turn because a model-native model takes a
-   turn only when it hears speech. Whether a model can be reached with text is
-   `DuplexCapabilities.supports_chat_completions`; one that cannot is refused
-   at once rather than left to idle out. Turn-based use of the same model stays
-   available offline through `Omni` / `AsyncOmni`.
+   every other turn-based route reports "not available". The chat route uses
+   the ordinary chat service on the duplex engine, without a session, when
+   the plugin declares `DuplexCapabilities.supports_chat_completions`.
+   Turn-based deployments use the ordinary API initialization and retain
+   model capability checks and endpoint restrictions.
 5. **Serving is transport only.** The websocket handler does socket I/O,
    wire-envelope validation, command translation, event rendering and the
    attachment/resume/replay bookkeeping; it holds no session state.
 6. **No `typing.Protocol`** in the duplex surfaces: the plugin, data plane,
    session state, PCM buffer, stage port and client transport seams are ABCs.
+7. **The wire codec is not duplex, and a wire type is not a mailbox message.**
+   The event and command *vocabulary* plus its wire rendering, the audio format
+   negotiation, the conversation-item rules and the error envelope are model-
+   and runtime-agnostic, and split along the three tiers
+   [`docs/serving/realtime_duplex_api.md`](../serving/realtime_duplex_api.md)
+   already defines: **Tier 1** (identical to OpenAI) is
+   `vllm_omni/protocol/realtime/**`; **Tier 2** (OpenAI names carrying our
+   extensions) and **Tier 3** (ours alone) are `vllm_omni/protocol/duplex/**`.
+   A Tier 2 class *subclasses* its Tier 1 twin and declares only what it adds,
+   so the OpenAI surface stays honestly pure --- `session.created` without
+   `resume_token`, `input_audio_buffer.append` without `video_frames`. Our
+   error **codes** are Tier 3 (`protocol/duplex/errors.py`); only the envelope
+   shape and OpenAI's three `error.type` classes are Tier 1.
+   What stays engine-side is everything that is *internal representation*
+   rather than contract: `DuplexCommand.payload()` renders the session runner's
+   mailbox dictionary, whose channel genuinely differs from the client event
+   (`session.update` and the three `conversation.item.*` commands all travel on
+   `turn.signal`); `engine/duplex/realtime_commands.py` decides which command a
+   decoded event becomes; `engine/duplex/realtime_events.py` holds the
+   session's projection state. The codec may not import the engine, the
+   entrypoints, `model_executor` or the clients
+   (`tests/protocol/realtime/test_protocol_import_boundary.py`), and there is
+   exactly one implementation of each codec behaviour
+   (`tests/protocol/realtime/test_realtime_codec_single_source.py`).
+   The dependency chain is `protocol/realtime` <- `protocol/duplex` <- engine /
+   entrypoints / clients, and a duplex consumer uses **only** the middle link:
+   `protocol/duplex/**` re-exports the Tier 1 names it does not extend, so a
+   helper that later needs a duplex-specific version (`convert_input_audio_with_rate`
+   resamples to MiniCPM-o's 16 kHz rather than the client's rate) is overridden
+   in one file instead of at every call site
+   (`tests/protocol/duplex/test_duplex_protocol_facade.py`).
+   `DuplexEvent` is therefore a plain alias of `RealtimeEvent` --- an event has
+   no engine-internal half --- while `DuplexCommand` is a real class, because a
+   command does.
 
 ## Package layout
 
@@ -140,9 +179,35 @@ vllm_omni/
 │   │   ├── realtime_input.py        RealtimeEnvelope (query rules, first message), parse_resume_request
 │   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
 │   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
-│   │   ├── chat_completions.py      DuplexChatCompletionsAdapter (/v1/chat/completions on a session per request)
+│   │   ├── openai.py                dispatch_realtime_websocket (turn-based /v1/realtime, when duplex mode is not selected)
+│   │   ├── warmup.py                startup warmup probe; wait_for_duplex_warmup holds clients until it finishes
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
+├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
+│   ├── realtime/                    the OpenAI Realtime API itself
+│   │   ├── events.py                RealtimeEvent + OpenAI's 30 server events (22 ship as Tier 1;
+│   │   │                            8 have a Tier 2 twin in protocol/duplex)
+│   │   ├── commands.py              RealtimeCommand + OpenAI's 10 client commands (8 Tier 1,
+│   │   │                            2 with a Tier 2 twin) --- wire_type + fields, no payload()
+│   │   ├── formats.py               audio format spellings, what is supported, per-session validation
+│   │   ├── session.py               session-object readers; RealtimeInputDefaults (append defaults)
+│   │   ├── items.py                 conversation item shape, truncation, transcripts, camera frames
+│   │   ├── audio_input.py           decode_audio_append -> RealtimeAudioAppend; client speech hints
+│   │   ├── audio.py                 PCM / G.711 / WAV decode, resample, re-encode
+│   │   ├── errors.py                RealtimeProtocolError (the envelope's exception type)
+│   │   └── capabilities.py          RealtimeProtocolCapabilities: what one consumer can serve
+│   └── duplex/                      Tier 2 + Tier 3, and the one door a duplex consumer uses
+│       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
+│       │                            items, session, capabilities) so the engine never
+│       │                            imports protocol/realtime directly
+│       ├── events.py                the whole 42-event vocabulary: 22 Tier-1 re-exports,
+│       │                            8 Tier-2 subclasses (session.created + resume_token, ...),
+│       │                            12 Tier-3 events (listen/speak, playback, resume, ...);
+│       │                            DuplexEvent = RealtimeEvent
+│       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
+│       │                            2 Tier-2 subclasses (append + hints, commit + final),
+│       │                            7 Tier-3 commands (barge_in, playback.ack, ...)
+│       └── errors.py                our error-code vocabulary (Tier 3) + RealtimeProtocolError
 ├── engine/
 │   ├── omni_engine_base.py          OmniEngineBase (stage processes, orchestrator thread, queues, RPC)
 │   ├── async_omni_engine.py         AsyncOmniEngine (turn-based request building)
@@ -150,16 +215,21 @@ vllm_omni/
 │   ├── orchestrator.py              OrchestratorBase + Orchestrator
 │   ├── duplex_orchestrator.py       DuplexOrchestrator (+ DuplexOrchestratorRequestState; implements DuplexStagePort)
 │   └── duplex/
-│       ├── commands.py              DuplexCommand dataclasses, command_from_realtime
-│       ├── realtime_commands.py     Realtime client event -> DuplexCommand translation
-│       ├── events.py                DuplexEvent dataclasses (+ to_realtime), REALTIME_ERROR_TYPES_BY_CODE
+│       ├── commands.py              mailbox half: DuplexCommand.payload() + the mailbox `type`,
+│       │                            paired with each protocol command; command_from_realtime
+│       ├── realtime_commands.py     duplex binding of the codec: decoded event -> DuplexCommand,
+│       │                            DUPLEX_REALTIME_CAPABILITIES, duplex_response_format
+│       ├── events.py                re-export shim (DuplexEvent = RealtimeEvent) + the runner's
+│       │                            epoch-filter sets DOMAIN_TERMINAL_EVENTS / MODEL_OUTPUT_EVENTS
+│       ├── delivery.py              DuplexOutputBuffer (bounded output shared with the session handle)
 │       ├── realtime_events.py       RealtimeProjectionState: internal event -> typed events
 │       ├── messages.py              queue envelopes (Open/Close/Resume/Touch/Command/Result/Event), DuplexSessionError
 │       ├── config.py                DuplexSessionConfig, DuplexCapabilities, ResponseCreateOptions
 │       ├── contracts.py             DuplexFence (session_id, epoch, turn_id), stage request records, DuplexStagePort
 │       ├── plugin.py                DuplexModelPlugin, DuplexModelSessionState, DuplexDataPlane, PcmAppendBuffer ABCs
 │       ├── turn_detection.py        server-side VAD turn detector used by the session
-│       ├── audio.py / vad.py / intermediate.py
+│       ├── audio.py                 compatibility re-export, via protocol/duplex
+│       ├── vad.py / intermediate.py
 │       └── session/                 one engine-resident session and everything that runs it
 │           ├── engine_session.py    DuplexEngineSession: ledgers, lease, fence, stage resources, append sequencing
 │           ├── runner.py            DuplexSessionRunner (per-session mailbox on the orchestrator loop)
@@ -174,10 +244,15 @@ vllm_omni/
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
 ├── config/stage_config.py           PipelineConfig.duplex_plugin; DuplexSessionRuntimeConfig
 ├── model_executor/models/minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, ...)
+├── model_executor/models/nemotron_voicechat/duplex/plugin.py   NemotronVoiceChatDuplexPlugin (+ data_plane, input, capabilities)
+├── model_executor/models/personaplex/duplex/plugin.py   PersonaPlexDuplexPlugin (+ stage0, data_plane, input, policy)
+├── model_executor/models/qwen3_omni/duplex/plugin.py   Qwen3OmniDuplexPlugin (+ input, session)
+├── model_executor/models/aura_omni/duplex/plugin.py   AuraDuplexPlugin
 └── clients/
     ├── duplex.py                    DuplexClientBase (ABC), DuplexClient (websocket), client-side events
     ├── inline_duplex.py             InlineDuplexClient (in-process, over DuplexOmni)
     ├── minicpmo_4_5.py              MiniCPM-o 4.5 session preset
+    ├── nemotron_voicechat.py        Nemotron VoiceChat session preset
     └── personaplex.py               PersonaPlex session preset
 ```
 
@@ -214,18 +289,29 @@ command  handle.submit(DuplexCommand)
          -> engine.submit_command_async -> DuplexSessionCommandMessage on the request queue [one-way]
          -> DuplexSessionManager.dispatch: unknown_session / input_backpressure checks, then runner mailbox
 output   DuplexOrchestrator._intercept_stage_output -> runner.on_stage_output -> mailbox -> typed events
-         -> output_sink (DuplexSessionEventMessage) -> DuplexOmni._route_engine_message -> handle.events()
-detach   DuplexOmni.detach_session -> touch(DETACH): engine-owned disconnect grace; expiry -> SessionExpired
-resume   DuplexOmni.resume_session(expected_lease_generation) -> lease CAS; the existing handle is re-entered
+         -> session's bounded output buffer -> handle.events(); closure and errors without a live session
+            use output_sink (DuplexSessionEventMessage) -> DuplexOmni._route_engine_message
+detach   DuplexOmni.detach_session(expected_lease_generation) -> touch(DETACH): engine-owned disconnect
+         grace, refused for a lease newer than the one the caller held; expiry -> SessionExpired
+resume   DuplexOmni.resume_session(expected_lease_generation) -> lease CAS keyed by the control id (a replay
+         answers with the generation it produced); the existing handle is re-entered. A caller cancelled
+         mid-RPC observes the outcome afterwards (replaying until the engine answers) and settles a landed
+         resume: the generation goes to the resume waiting to activate, else to the connection still
+         attached, else the lease is detached again
 close    DuplexOmni.close_session -> close RPC; the manager tears the runner down, then the stage cleanup
-         (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result: seeing
-         the event means the admission slot is free (it is held until the cleanup succeeded)
+         (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result.
+         SessionClosed is emitted after the cleanup attempt (in a finally), so it is also sent when the
+         stage cleanup failed; in that case the admission slot is intentionally retained and the cleanup
+         is retried by the reaper, and opening a replacement session can still be refused with
+         resource_exhausted. Seeing the event therefore does not by itself guarantee a free slot.
 reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, cleanup retries
 ```
 
 ### Concurrency and ordering model of the runner
 
-Everything below runs on the orchestrator asyncio loop; there is no lock.
+The runner's session state is owned by the orchestrator asyncio loop and
+needs no lock. The output buffer shared with the caller thread uses a lock
+for queue updates and the final validity check before delivery.
 
 - **Single writer per session.** `DuplexEngineSession` is mutated only by its
   runner. Inputs reach the runner through one mailbox in this order: client
@@ -254,13 +340,15 @@ Everything below runs on the orchestrator asyncio loop; there is no lock.
   on one loop in program order, nothing can be emitted for an old epoch after
   its terminal event; `runner.emit()` still drops a terminal carrying a stale
   epoch and stamps `epoch` on every event for clients that filter
-  defensively. This is a statement about order, not about latency: the engine
-  output queue and each `DuplexSessionHandle` outbox are unbounded and FIFO,
-  so a cancellation is delivered behind whatever audio was already emitted for
-  the response it cancels. A client that must stop quickly cancels its own
-  playback on `response.done` / `audio.cancelled` rather than waiting for the
-  stream to drain. Bounding those buffers and letting an accepted invalidation
-  skip undelivered media is left to the follow-up RFC.
+  defensively. In this experimental follow-up, public output goes directly to
+  one bounded buffer shared by the engine and `DuplexSessionHandle`. Accepted
+  cancellation removes queued `AudioDelta` events for that response through
+  the cancelled epoch. Text increments, audio/transcript completion markers,
+  other responses and normal completion retain FIFO order. The consumer also
+  checks an event already taken from the buffer: WebSocket delivery repeats
+  that check under the connection lock, before sequencing and journaling.
+  Already sequenced replay entries are unchanged; already delivered audio
+  still requires the client to stop its own playback.
 - **Backpressure before the mailbox.** `DuplexSessionManager.dispatch`
   checks `max_pending_input_bytes_per_session` and reserves a pending turn for
   `Commit` before the put; a rejected command is answered with
@@ -270,6 +358,46 @@ Everything below runs on the orchestrator asyncio loop; there is no lock.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+
+### Experimental output limits
+
+`max_pending_output_bytes_per_session` defaults to 2 MiB and
+`max_pending_output_events_per_session` to 512. The byte limit counts compact
+Realtime JSON, including base64 audio, not decoded PCM or Python object
+overhead. Audio is already base64-encoded by the producer; counting its length
+avoids serializing or decoding that large field again. Neither default has
+been tuned from a performance study.
+
+Errors and response endings have an additional 64 KiB / eight-event reserve
+and retain FIFO order. One final session-closure notification has an independent
+slot, so an exhausted reserve cannot prevent closure or break delivery to
+other sessions. If that reserve also fills, an error or response-ending
+notification may be omitted; the final session-closure notification still
+has its independent slot. Oversized close details (over 4 KiB with generated identity)
+are replaced by a compact reason, preserving terminal type and identity.
+Late writes after closure are ignored; a locally ended iterator is not reopened
+by a late terminal, and a failed open closes the abandoned handle. Events other
+than errors are not forwarded once their session's buffer has been removed.
+One event held by the consumer is outside the queued budget.
+
+The overflow policy fails the active response without committing its partial
+text to history and closes only the affected session. If overflow occurs while
+a completion batch is being delivered, its not-yet-queued `ResponseDone` is
+converted to failure with its identity and output preserved; any history entry
+for that response is removed. An ending already accepted by the buffer is not
+replaced or followed by a second ending. After overflow, newly
+emitted ordinary events are suppressed, including text/audio completion,
+content-part and output-item completion markers. Previously queued non-audio
+events retain FIFO order; error and failed response-ending notifications may
+use the reserve before the independent closure notification. This differs from
+accepted cancellation, which removes only matching audio. See the
+[public error and closure fields](../serving/realtime_duplex_api.md#output-limits-and-slow-consumers).
+Response-only recovery is not implemented. These limits do not bound the runner's raw stage
+output mailbox, replay journal, or client playback queues. The shared buffer
+requires the current same-process, separate-thread engine arrangement; it is
+not a cross-process delivery protocol. Direct handle iteration and WebSocket
+delivery share buffer validity, but end-to-end client behavior still needs
+independent real-model verification.
 
 ## Orchestrator seams
 
@@ -312,7 +440,7 @@ policy that used to be two separately configured objects:
 | Half | Members |
 | --- | --- |
 | engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
-| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
@@ -320,12 +448,12 @@ sampling defaults once the stage pools exist. Plugin hooks that may block
 (`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
 offloaded from the loop.
 
-The MiniCPM-o 4.5 plugin (`model_executor/models/minicpmo_4_5/duplex/plugin.py`)
-is the only integration in this framework version. PersonaPlex and Nemotron
-VoiceChat still carry their pre-framework duplex code (runtime extension plus
-serving adapter) and are therefore not served over this framework yet: their
-pipelines declare no `duplex_plugin`, so they run turn-based until the
-follow-up PRs port them (RFC vllm-omni#7181, PR 2/3).
+Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
+for the shared request identity, sequencing and config snapshots. Token budgets,
+PCM framing and model-specific worker fields remain in the plugins.
+
+See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
+for the current plugin integrations and deployment configurations.
 
 ## Serving
 
@@ -362,7 +490,8 @@ follow-up PRs port them (RFC vllm-omni#7181, PR 2/3).
   `tests/entrypoints/openai/test_duplex_session_attachment.py`,
   `tests/entrypoints/openai_api/test_duplex_api_server.py` (the duplex
   server: pipeline probe, app state, routes, warmup gate),
-  `tests/entrypoints/duplex/test_chat_completions_adapter.py`,
+  `tests/entrypoints/duplex/test_duplex_warmup.py`,
+  `tests/entrypoints/duplex/test_startup_warmup.py`,
   `tests/clients/**`, `tests/engine/test_duplex_import_boundary.py`,
   `tests/model_executor/models/minicpmo_4_5/duplex/**`,
   `tests/worker/test_native_duplex_hooks.py`.

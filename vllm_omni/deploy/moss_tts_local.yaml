@@ -1,10 +1,14 @@
-# MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocalModel, n_vq=12, 48 kHz stereo)
-# HF: OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5
-# Codec: OpenMOSS-Team/MOSS-Audio-Tokenizer-v2 (48 kHz, stereo, channel-interleaved RVQ)
-# Uses a 1-layer GPT2-style local depth transformer (no delay warm-up), reset every
-# frame — same per-frame timing (80 ms/frame, 12.5 fps) as MOSS-TTS-Realtime.
+# MOSS-TTS-Local-Transformer-v1.5: one single-GPU deploy profile.
+# CUDA: MRV2, 128 stream slots, full-quota private MPS, 32 GiB Talker KV.
+# Validated on H200; budget room for the codec and first-audio graphs.
+# Other platforms use V1; NPU retains its codec graph override.
+# Stage0 sends the first frame directly; Stage1 streams subsequent chunks.
+model_runner: v1
+dtype: bfloat16
 async_chunk: true
-
+speech_cache:
+  resolve_max_bytes: 2147483648  # 2 GiB
+  resolve_max_entries: 2048
 connectors:
   shm:
     name: SharedMemoryConnector
@@ -12,22 +16,20 @@ connectors:
       connector_get_sleep_s: 0.005
       connector_get_max_wait_first_chunk: 1000
       connector_get_max_wait: 300
-      initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
-      codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
+      initial_codec_chunk_frames: 1  # 80 ms first packet at 48 kHz
+      codec_chunk_frames: 15  # 1.2 s steady chunks
       codec_left_context_frames: 0
-
+      generation_min_batch_size: 16
+      generation_max_wait_ms: 6
 stages:
   - stage_id: 0
     max_num_seqs: 64
-    gpu_memory_utilization: 0.60
+    gpu_memory_utilization: 0.6
     enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 65536
     max_model_len: 4096
-    devices: "0"
-    # profiler_config:
-    #   profiler: torch
-    #   torch_profiler_dir: /root/vllm-omni-workspace/vllm-omni/results/moss_local_stage0/batch_8
+    devices: '0'
     output_connectors:
       to_stage_1: shm
     default_sampling_params:
@@ -37,24 +39,18 @@ stages:
       max_tokens: 4096
       seed: 42
       repetition_penalty: 1.0
-
   - stage_id: 1
     max_num_seqs: 64
-    gpu_memory_utilization: 0.30
+    gpu_memory_utilization: 0.3
     enforce_eager: false
     enable_prefix_caching: false
     async_scheduling: true
     compilation_config:
-      # Reused by the codec as execution-batch buckets; T is derived from
-      # initial_codec_chunk_frames and codec_chunk_frames.
       cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
       cudagraph_num_of_warmups: 1
-    # profiler_config:
-    #   profiler: torch
-    #   torch_profiler_dir: /root/vllm-omni-workspace/vllm-omni/results/moss_local_stage1/batch_8
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "0"
+    devices: '0'
     input_connectors:
       from_stage_0: shm
     default_sampling_params:
@@ -64,3 +60,47 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+platforms:
+  cuda:
+    model_runner: v2
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 512
+        max_num_seqs: 128
+        hf_overrides:
+          mrv2_gpu_slot_state: true
+          mrv2_batch_prefill: true
+          mrv2_direct_tokens: true
+          local_compile_audio_sampler: true
+        compilation_config:
+          mode: 3
+          cudagraph_mode: FULL
+          max_cudagraph_capture_size: 512
+          cudagraph_num_of_warmups: 1
+        kv_cache_memory_bytes: 34359738368  # 32 GiB
+        enable_prefix_caching: true
+        attention_config:
+          backend: TRITON_ATTN
+      - stage_id: 1
+        # Graphs cover both batch B and codec chunk length T={1, 15}.
+        compilation_config:
+          mode: 3
+          backend: inductor
+          cudagraph_mode: FULL
+          cudagraph_capture_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128]
+          cudagraph_num_of_warmups: 1
+          inductor_compile_config:
+            combo_kernels: false
+            benchmark_combo_kernel: false
+        max_num_seqs: 128
+        hf_overrides:
+          codec_attention_backend: triton_slot
+    cuda_mps: true
+  npu:
+    stages:
+      - stage_id: 1
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+          cudagraph_num_of_warmups: 1
+    model_runner: v1

@@ -40,6 +40,7 @@ from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
     SHUTDOWN_JOIN_TIMEOUT_S,
+    OutputQueueSink,
     enqueue_orchestrator_shutdown,
     is_abort_transport_shutdown,
     is_janus_sync_queue_shutdown,
@@ -55,17 +56,18 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     OutputMessage,
 )
-from vllm_omni.engine.orchestrator import OrchestratorBase
+from vllm_omni.engine.orchestrator import OrchestratorBase, _event_driven_orch_default_for_pipeline
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
+    OmniClientConfig,
     StageRuntimeInfo,
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -73,6 +75,8 @@ logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+# Output messages one serving-loop wakeup takes before yielding the event loop.
+_OUTPUT_DRAIN_MAX_BATCH = 256
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
 
 
@@ -118,12 +122,13 @@ class OmniEngineBase:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when stage-init / forward paths touch these attrs.
     _log_stats: bool = False
+    _collect_stage_metrics: bool = True
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
-    # Lazily created by get_output_blocking_async().
-    _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
+    _client_config: OmniClientConfig | None = None
+    _output_sink: OutputQueueSink | None = None
 
     def __init__(
         self,
@@ -134,8 +139,10 @@ class OmniEngineBase:
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
+        collect_stage_metrics: bool = True,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
+        client_config: OmniClientConfig | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -154,7 +161,9 @@ class OmniEngineBase:
         # replica) vllm:* wrap stays registered but reads zero. Respects the
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
+        self._collect_stage_metrics = collect_stage_metrics
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
+        self._client_config = client_config
 
         logger.info(f"[OmniEngine] Initializing with model {model}")
 
@@ -166,6 +175,8 @@ class OmniEngineBase:
         _stage_id_kwarg = kwargs.get("stage_id")
         if isinstance(_stage_id_kwarg, int) and not single_stage_mode:
             single_stage_mode = True
+        if client_config is not None and int(client_config.get("client_count", 1)) > 1 and single_stage_mode:
+            raise ValueError("Multiple API servers cannot be combined with single-stage distributed mode")
 
         self.single_stage_mode: bool = single_stage_mode
         self._single_stage_id_filter: int | None = (
@@ -272,7 +283,14 @@ class OmniEngineBase:
 
         self.num_stages = len(self.stage_configs)
         self.async_chunk = any(
-            bool(getattr(getattr(stage, "engine_args", None), "async_chunk", False)) for stage in self.stage_configs
+            bool(
+                getattr(
+                    getattr(stage, "connector_config", None),
+                    "async_chunk",
+                    getattr(getattr(stage, "engine_args", None), "async_chunk", False),
+                )
+            )
+            for stage in self.stage_configs
         )
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
@@ -289,6 +307,7 @@ class OmniEngineBase:
         # it (the orchestrator loop), so cross-thread use stays correct.
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        self._output_sink = OutputQueueSink(self.output_queue.sync_q)
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
@@ -343,6 +362,9 @@ class OmniEngineBase:
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
             model_class_name = resolve_model_class_name(self.model)
+            if model_class_name is None:
+                # use registered diffusers cls name as fallback
+                model_class_name = getattr(self.pipeline_config, "diffusers_class_name", None)
             metadata = get_diffusion_model_metadata(model_class_name)
             self._diffusion_od_config_view = SimpleNamespace(
                 model_class_name=model_class_name,
@@ -371,6 +393,7 @@ class OmniEngineBase:
             omni_lb_policy=self._omni_lb_policy,
             request_queue=self.request_queue,
             log_stats=self._log_stats,
+            client_config=self._client_config,
         )
         self._runtime.initialize()
 
@@ -408,7 +431,7 @@ class OmniEngineBase:
             for client in self.stage_clients
         ]
         supported_tasks: set[str] = set()
-        if any(getattr(client, "is_comprehension", False) for client in self.stage_clients):
+        if any(getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs):
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
@@ -433,7 +456,7 @@ class OmniEngineBase:
 
             orchestrator = self._create_orchestrator(
                 request_async_queue=self.request_queue.async_q,
-                output_async_queue=self.output_queue.async_q,
+                output_async_queue=self._output_sink,
                 rpc_async_queue=self.rpc_output_queue.async_q,
                 stage_pools=self.stage_pools,
                 async_chunk=self.async_chunk,
@@ -444,7 +467,9 @@ class OmniEngineBase:
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
+                collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
+                event_driven_orch_default=self._event_driven_orch_default,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -461,8 +486,8 @@ class OmniEngineBase:
             error_text = str(e) or "Orchestrator thread crashed"
             try:
                 error_msg = ErrorMessage(error=error_text, fatal=True)
-                if self.output_queue is not None:
-                    self.output_queue.sync_q.put_nowait(error_msg)
+                if self._output_sink is not None:
+                    self._output_sink.put_nowait(error_msg)
                 if self.rpc_output_queue is not None:
                     self.rpc_output_queue.sync_q.put_nowait(error_msg)
             except Exception:
@@ -865,6 +890,9 @@ class OmniEngineBase:
     ) -> None:
         """Initialize engine-wide settings resolved from pipeline metadata."""
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
+        self._event_driven_orch_default = _event_driven_orch_default_for_pipeline(
+            pipeline_config.model_type if pipeline_config is not None else None
+        )
         # No duplex_runtime_extension / duplex_serving_adapter / duplex_control
         # here: the pre-framework wiring they named is gone, and design rule 3
         # in docs/design/fullduplex.md keeps duplex vocabulary out of the base.
@@ -885,24 +913,15 @@ class OmniEngineBase:
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
-        for legacy_arg in ("stage_configs_path", "stage_configs"):
-            if legacy_arg in kwargs:
-                raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
-
-        # log_stats is captured by __init__; its CLI-only negative alias must
-        # not cross into per-stage structured config ownership validation.
-        kwargs.pop("disable_log_stats", None)
-        deploy_config_path = kwargs.pop("deploy_config", None)
-        strategy_config_path = kwargs.pop("strategy_config", None)
-        # CLI callers arrive pre-parsed; offline Python callers may use the
-        # JSON-string form documented in recipes.
-        stage_overrides = parse_stage_overrides(kwargs.pop("stage_overrides", None))
-
-        # ``diffusion_streaming_output`` is the public AsyncOmni/serve kwarg;
-        # stage configs know the field as ``streaming_output``. Mirror only a
-        # truthy value so the CLI's False default does not override deploy YAML.
-        if kwargs.get("diffusion_streaming_output") and kwargs.get("streaming_output") is None:
-            kwargs["streaming_output"] = True
+        config_inputs = prepare_stage_config_inputs(
+            model,
+            kwargs,
+            trust_remote_code=trust_remote_code,
+        )
+        kwargs = config_inputs.kwargs
+        deploy_config_path = config_inputs.deploy_config_path
+        strategy_config_path = config_inputs.strategy_config_path
+        stage_overrides = config_inputs.stage_overrides
 
         resolution = cast(
             _ConfigResolutionResult,
@@ -943,50 +962,37 @@ class OmniEngineBase:
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
-    async def try_get_output_async(self) -> EngineQueueMessage | None:
-        """Async read from the Orchestrator output queue."""
-        try:
-            return self.output_queue.sync_q.get_nowait()
-        except queue.Empty:
-            if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-            return None
+    async def get_outputs_async(
+        self,
+        timeout: float = 1.0,
+        max_messages: int = _OUTPUT_DRAIN_MAX_BATCH,
+    ) -> list[EngineQueueMessage]:
+        """Wait for Orchestrator output on the serving event loop.
 
-    async def get_output_blocking_async(self, timeout: float = 1.0) -> EngineQueueMessage | None:
-        """Blocking-wait read from the Orchestrator output queue.
-
-        Waits up to ``timeout`` seconds in a dedicated drain thread for the
-        next message (condition-variable wakeup instead of a poll cadence);
-        returns ``None`` on timeout so the caller keeps its liveness check,
-        mirroring ``try_get_output_async``'s contract. Used by the serving
-        final-output drain when ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` is on.
+        Returns the messages queued so far (up to ``max_messages``), waiting
+        for the orchestrator's next put when none are queued. Returns an empty
+        list after ``timeout`` with the orchestrator alive, so the caller keeps
+        its liveness check.
         """
-        executor = self._output_drain_executor
-        if executor is None:
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="omni-output-drain",
-            )
-            self._output_drain_executor = executor
-
-        sync_q = self.output_queue.sync_q
-
-        def _drain_get() -> EngineQueueMessage | None:
-            # Exceptions are swallowed to a None sentinel: the queue may be
-            # closed mid-shutdown, and an exception left on an executor future
-            # after task cancellation would warn as never-retrieved.
-            try:
-                return sync_q.get(timeout=timeout)
-            except queue.Empty:
-                return None
-            except Exception:
-                return None
-
-        loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(executor, _drain_get)
-        if msg is None and not self.is_alive():
-            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
-        return msg
+        sink = self._output_sink
+        assert sink is not None
+        msgs = sink.drain(max_messages)
+        if msgs:
+            return msgs
+        ready = sink.arm_wakeup()
+        msgs = sink.drain(max_messages)
+        if msgs:
+            return msgs
+        try:
+            await asyncio.wait_for(ready.wait(), timeout)
+        except asyncio.TimeoutError:
+            # A put that skipped the wakeup (e.g. an error written while the
+            # orchestrator thread died) is still delivered before giving up.
+            msgs = sink.drain(max_messages)
+            if not msgs and not self.is_alive():
+                raise RuntimeError("Orchestrator died unexpectedly. See logs above.") from None
+            return msgs
+        return sink.drain(max_messages)
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""
@@ -1178,12 +1184,6 @@ class OmniEngineBase:
                     q.close()
             except Exception:
                 pass
-
-        if self._output_drain_executor is not None:
-            # Any in-flight blocking get bails out within its ≤1 s timeout
-            # (or immediately via the queue close above), so don't wait.
-            self._output_drain_executor.shutdown(wait=False)
-            self._output_drain_executor = None
 
         if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:

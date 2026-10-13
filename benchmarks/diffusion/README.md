@@ -164,3 +164,22 @@ batch may still pay compile or CUDA-graph capture cost.
 
 For a Qwen-Image continuous-batching replay example, see
 [`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
+
+## HunyuanImage3 reference-prefix reuse
+
+The prefix-cache benchmark uses the unified `vllm bench serve --omni` runner,
+not this legacy diffusion benchmark. It reuses the two-image IT2I input on a
+single DiT stage, comparing dense, paged without caching, and paged with caching.
+See [Shared-reference benchmark](../../docs/design/feature/prefix_caching.md#shared-reference-benchmark)
+for the configuration, commands, and separate partial-hit accuracy coverage.
+
+The accuracy regression compares paged-no-cache, partial-hit and exact-repeat
+outputs against the checked-in official-repository reference-image goldens at
+**50 steps, CFG=2.5, seeds 43/45** (both CFG branches remain on CFGP1).
+It uses the AR-to-DiT image criteria: CLIP ≥ 90, SSIM ≥ 0.26, PSNR ≥ 12.5 dB.
+`HUNYUAN_IMAGE3_INCLUDE_DENSE=1` adds dense as another comparison to the goldens.
+It also requires actual reference-image hits and model-side query slicing,
+and checks bitwise repeatability for repeated requests at the same hit boundary.
+Images, logs, deployment YAMLs, hit traces and quality metrics are saved under
+pytest's temporary output directory. `HUNYUAN_IMAGE3_MODEL` selects a local model;
+DFX uses the repository's normal model/cache resolution.

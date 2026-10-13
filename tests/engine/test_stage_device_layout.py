@@ -18,6 +18,7 @@ import types
 from unittest import mock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.stage_init_utils import (
@@ -156,6 +157,43 @@ def test_replica_guard_and_splitter_share_local_world_size(devices, expected):
     assert replica_devices_map == {0: expected}
 
 
+@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
+@pytest.mark.parametrize("local_dp", [None, 0, 1, 2])
+@pytest.mark.parametrize("pool_devices", [False, True], ids=["template", "pool"])
+def test_replica_layout_preserves_local_dp_semantics(typed, local_dp, pool_devices):
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
+    from vllm_omni.engine.stage_engine_startup import get_headless_replica_devices
+
+    engine_args = {
+        "tensor_parallel_size": 2,
+        "data_parallel_size": 4,
+        "data_parallel_size_local": local_dp,
+        "pipeline_parallel_size": 2,
+    }
+    width = 2 * max(1, local_dp if local_dp is not None else 4) * 2
+    devices = ",".join(str(i) for i in range(width * (2 if pool_devices else 1)))
+    if typed:
+        pipeline = PipelineConfig(
+            model_type="test",
+            model_arch="TestModel",
+            stages=(StagePipelineConfig(stage_id=0, model_stage="ar", final_output=True),),
+        )
+        stage = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            cli_overrides={
+                f"stage_0_{key}": value for key, value in {**engine_args, "devices": devices, "num_replicas": 2}.items()
+            },
+        ).stage_configs[0]
+    else:
+        stage = _stage(0, devices=devices, num_replicas=2, engine_args=engine_args)
+    expected = [",".join(str(i) for i in range(r * width, (r + 1) * width)) for r in range(2)]
+
+    assert get_stage_devices_per_replica(stage) == width
+    assert compute_replica_layout([stage]) == ([2], {0: expected})
+    assert get_headless_replica_devices(stage, stage_id=0, omni_dp_size_local=2) == expected
+
+
 def test_non_tp_layout_error_uses_generic_guidance():
     """A PP mismatch must not be reported as a top-level TP broadcast."""
     stage = _stage(0, devices="0")
@@ -203,7 +241,7 @@ def test_build_vllm_config_fails_before_engine_config_on_mismatch():
     get_class.assert_not_called()
 
 
-def test_build_vllm_config_proceeds_on_consistent_layout():
+def test_build_vllm_config_proceeds_on_consistent_layout(mocker: MockerFixture) -> None:
     """The guard must not false-positive: a consistent single-GPU stage flows past
     it and reaches ``create_engine_config`` / ``Executor.get_class`` as usual."""
     stage = _stage(1, devices="1")
@@ -212,18 +250,30 @@ def test_build_vllm_config_proceeds_on_consistent_layout():
         model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace()),
     )
     sentinel_executor = object()
-    with (
-        mock.patch.object(
-            stage_init_utils.OmniEngineArgs, "create_engine_config", return_value=fake_config
-        ) as create_engine_config,
-        mock.patch.object(stage_init_utils.Executor, "get_class", return_value=sentinel_executor),
-        mock.patch.object(stage_init_utils.OmniINCConfig, "maybe_upgrade", side_effect=lambda quant: quant),
-    ):
-        vllm_config, executor_class = build_vllm_config(
-            stage,
-            model="dummy-model",
-            engine_args_dict={"tensor_parallel_size": 1},
-        )
+    captured_api_process_config: dict[str, int] = {}
+
+    def capture_create_engine_config(engine_args, *args, **kwargs):
+        captured_api_process_config["count"] = engine_args._api_process_count
+        captured_api_process_config["rank"] = engine_args._api_process_rank
+        return fake_config
+
+    create_engine_config = mocker.patch.object(
+        stage_init_utils.OmniEngineArgs,
+        "create_engine_config",
+        autospec=True,
+        side_effect=capture_create_engine_config,
+    )
+    mocker.patch.object(stage_init_utils.Executor, "get_class", return_value=sentinel_executor)
+    mocker.patch.object(stage_init_utils.OmniINCConfig, "maybe_upgrade", side_effect=lambda quant: quant)
+
+    vllm_config, executor_class = build_vllm_config(
+        stage,
+        model="dummy-model",
+        engine_args_dict={"tensor_parallel_size": 1},
+        api_process_count=3,
+        api_process_rank=2,
+    )
     create_engine_config.assert_called_once()
     assert vllm_config is fake_config
     assert executor_class is sentinel_executor
+    assert captured_api_process_config == {"count": 3, "rank": 2}

@@ -105,10 +105,10 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     audex,
     audex_tta,
     audio8_tts,
+    auk,
     breeze_tts_2,
     cosyvoice3,
     covo_audio,
-    dots_tts,
     fish_speech,
     gepard,
     glm_tts,
@@ -124,6 +124,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     step_audio2,
     voxcpm2,
     voxtral,
+    yue2,
 )
 
 __all__ = [

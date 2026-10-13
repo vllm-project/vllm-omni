@@ -130,6 +130,25 @@ class StageDiffusionProc:
         )
         self._fatal_event.set()
 
+    def _watch_executor_failure(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Tear down when the executor fails between requests.
+
+        Executor monitors fire failure callbacks from their own threads, so
+        the signal is marshalled onto ``run_loop``'s event loop.
+        """
+        executor: DiffusionExecutor | None = getattr(self._engine, "executor", None)
+        if executor is None:
+            return
+
+        def _on_executor_failure() -> None:
+            # The loop is closed once run_loop has exited; nothing to signal.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._signal_fatal_engine_failure, "diffusion executor failed")
+
+        executor.register_failure_callback(_on_executor_failure)
+        if executor.is_dead:
+            self._signal_fatal_engine_failure("diffusion executor failed before run_loop started")
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -168,6 +187,7 @@ class StageDiffusionProc:
         kv_sender_info: dict[str, Any] | None = None,
         on_request_started: Callable[[OmniRequestOutput], Awaitable[None]] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -178,6 +198,7 @@ class StageDiffusionProc:
             request_id=request_id,
             kv_sender_info=kv_sender_info,
             kv_transfer_params=kv_transfer_params,
+            payload_sender_info=payload_sender_info,
         )
 
         # Non-streaming callers share the streaming engine path but only
@@ -204,6 +225,7 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -214,6 +236,7 @@ class StageDiffusionProc:
             request_id=request_id,
             kv_sender_info=kv_sender_info,
             kv_transfer_params=kv_transfer_params,
+            payload_sender_info=payload_sender_info,
         )
 
         async for results in self._engine.step_streaming(request):  # pyright: ignore[reportOptionalMemberAccess]
@@ -353,6 +376,7 @@ class StageDiffusionProc:
         # "DiffusionExecutor is closed" on every subsequent request.
         fatal_event = asyncio.Event()
         self._fatal_event = fatal_event
+        self._watch_executor_failure(asyncio.get_running_loop())
 
         async def _dispatch_request(
             request_id: str,
@@ -360,6 +384,7 @@ class StageDiffusionProc:
             sampling_params_dict: dict,
             kv_sender_info: dict[str, Any] | None = None,
             kv_transfer_params: dict[str, Any] | None = None,
+            payload_sender_info: dict[str, Any] | None = None,
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
@@ -375,6 +400,7 @@ class StageDiffusionProc:
                         kv_sender_info=kv_sender_info,
                         on_request_started=_send_request_started,
                         kv_transfer_params=kv_transfer_params,
+                        payload_sender_info=payload_sender_info,
                     )
                     await response_socket.send(encoder.encode({"type": "result", "output": result}))
                 else:
@@ -384,6 +410,7 @@ class StageDiffusionProc:
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
                         kv_transfer_params=kv_transfer_params,
+                        payload_sender_info=payload_sender_info,
                     ):
                         await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
@@ -462,7 +489,8 @@ class StageDiffusionProc:
                             msg["prompt"],
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
-                            msg.get("kv_transfer_params"),
+                            kv_transfer_params=msg.get("kv_transfer_params"),
+                            payload_sender_info=msg.get("payload_sender_info"),
                         )
                     )
                     tasks[request_id] = task
@@ -752,6 +780,7 @@ class StageDiffusionProcManager:
         )
         proc.start()
         self.proc = proc
+        self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name: str | None = None
@@ -789,6 +818,7 @@ class StageDiffusionProcManager:
         )
         proc.start()
         self.proc = proc
+        self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name = None
@@ -826,6 +856,12 @@ class StageDiffusionProcManager:
     def shutdown(self, timeout: float | None = None) -> None:
         self.manager_stopped = True
         shutdown([self.proc], timeout=timeout)
+
+    def wait_for_shutdown(self, timeout: float | None = None) -> bool:
+        """Wait for subprocess cleanup without sending a termination signal."""
+        self.manager_stopped = True
+        self.proc.join(timeout)
+        return not self.proc.is_alive()
 
     def sentinels(self) -> list[int]:
         return [self.proc.sentinel]

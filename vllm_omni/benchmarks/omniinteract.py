@@ -32,6 +32,7 @@ from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractCase,
     OmniInteractPreparedInput,
     case_manifest,
+    sampled_case_row,
 )
 
 # The duplex client library (vllm_omni.clients) is imported lazily inside the
@@ -48,7 +49,7 @@ PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
 OUTPUT_SAMPLE_RATE = 24_000
 SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
-BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl")
+BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl", "sampled_cases.jsonl")
 ARTIFACT_LOCK_FILE = ".omniinteract.lock"
 _INPUT_CHUNK_MS = 200
 # Minimum new played audio between two incremental playback.ack sends for one
@@ -816,6 +817,7 @@ def write_batch_artifacts(
         for case, result in zip(cases, results, strict=True)
         if result.success and result.eligible_for_official_eval
     ]
+    sampled_rows = [sampled_case_row(case) for case in cases]
     ineligible = [result for result in results if result.success and not result.eligible_for_official_eval]
     if ineligible:
         reasons = Counter(
@@ -830,6 +832,12 @@ def write_batch_artifacts(
     _atomic_write_text(
         root / "official_eval_manifest.jsonl",
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+    )
+    # Every sampled case (including failed / ineligible) so official MiniCPM-o
+    # ``--video_list`` can replay the same video set without re-deriving ids.
+    _atomic_write_text(
+        root / "sampled_cases.jsonl",
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in sampled_rows),
     )
 
 
@@ -968,6 +976,42 @@ def _populate_response_metrics(
     result.duplex_session_metrics = bundle.session_metrics
 
 
+def _session_capabilities(client: _RealtimeSession) -> dict[str, object]:
+    info = getattr(getattr(client, "_client", None), "session_info", None)
+    if isinstance(info, dict) and isinstance(info.get("capabilities"), dict):
+        return info["capabilities"]
+    for event in client.events.events:
+        if event.get("type") != "session.created":
+            continue
+        session = event.get("session")
+        if isinstance(session, dict) and isinstance(session.get("capabilities"), dict):
+            return session["capabilities"]
+    return {}
+
+
+def _wants_annotation_video_clock(client: _RealtimeSession) -> bool:
+    """Video-required turn-commit sessions use the AURA annotation clock.
+
+    The shared 1 FPS soundtrack path is unchanged unless both capability bits
+    are set. The AURA module is imported only in that case.
+    """
+    caps = _session_capabilities(client)
+    required = caps.get("required_input_modalities") or ()
+    if isinstance(required, str):
+        required = (required,)
+    try:
+        video_required = "video" in {str(item) for item in required}
+    except TypeError:
+        return False
+    if not video_required or not caps.get("supports_turn_commit_only"):
+        return False
+    from vllm_omni.model_executor.models.aura_omni.benchmarks.omniinteract_clock import (
+        wants_annotation_video_clock,
+    )
+
+    return wants_annotation_video_clock(caps)
+
+
 async def run_omniinteract_case(
     case: OmniInteractCase,
     config: OmniInteractBenchmarkConfig,
@@ -1020,10 +1064,38 @@ async def run_omniinteract_case(
             try:
                 input_duration_s = len(pcm) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
                 upload_timeout_s = config.timeout_s + input_duration_s
-                try:
-                    chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(
-                        stream_inputs(client, pcm, frames, playback), timeout=upload_timeout_s
+                if _wants_annotation_video_clock(client):
+                    from vllm_omni.model_executor.models.aura_omni.benchmarks.omniinteract_clock import (
+                        ANNOTATION_VIDEO_FPS,
+                        stream_annotation_clock,
                     )
+
+                    duration, _, frames = await asyncio.to_thread(
+                        prepare_media,
+                        case.video_path,
+                        ANNOTATION_VIDEO_FPS,
+                        timeout_s=config.media_timeout_s,
+                        max_duration_s=config.max_video_duration_s,
+                    )
+                    if not any(frames):
+                        raise ValueError(f"No video frames were decoded from {case.video_path}")
+                    upload_timeout_s = config.timeout_s + duration
+                    stream = stream_annotation_clock(
+                        client,
+                        frames,
+                        playback,
+                        video_path=case.video_path,
+                        fps=ANNOTATION_VIDEO_FPS,
+                    )
+                    logger.info(
+                        "OmniInteract annotation video clock: video=%s fps=%s",
+                        case.video_path.name,
+                        ANNOTATION_VIDEO_FPS,
+                    )
+                else:
+                    stream = stream_inputs(client, pcm, frames, playback)
+                try:
+                    chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(stream, timeout=upload_timeout_s)
                 except asyncio.TimeoutError as exc:
                     raise TimeoutError(f"Realtime upload timed out after {upload_timeout_s:g}s") from exc
                 commit_from = len(client.events.events)

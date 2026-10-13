@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage 1 (codec decoder) for higgs-audio v3.
 
 Reuses higgs-audio-v2's RVQ + DAC codec decoder but loads weights from the
@@ -10,6 +10,7 @@ prefix) rather than from a standalone tokenizer repo.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import torch
@@ -57,6 +58,9 @@ class HiggsAudioV3Code2Wav(nn.Module):
 
     input_modalities = "audio"
 
+    supports_native_payload_input = True
+    batched_gpu_staging_keys = {("codes", "audio")}
+
     def __init__(
         self,
         config: HiggsAudioV3Config | None = None,
@@ -81,6 +85,11 @@ class HiggsAudioV3Code2Wav(nn.Module):
             self._model_path = None
             self.vllm_config = None
 
+        _, self._codec_graph_enabled = self.config.resolve_graph_defaults(
+            use_v2_model_runner=bool(
+                getattr(getattr(self.vllm_config, "model_config", None), "use_v2_model_runner", False)
+            )
+        )
         self.sample_rate: int = int(self.config.sample_rate)
         self.num_codebooks: int = int(self.config.num_codebooks)
         self.num_real_codes: int = int(self.config.num_real_codes)
@@ -97,6 +106,8 @@ class HiggsAudioV3Code2Wav(nn.Module):
         self.quantizer: HiggsAudioRVQ | None = None
         self.fc2: nn.Linear | None = None
         self.acoustic_decoder: nn.Module | None = None
+        self._decode_graphs: dict[tuple[int, int], tuple[Any, torch.Tensor, torch.Tensor]] = {}
+        self._decode_graphs_initialized = False
         self._loaded: bool = False
         # Do NOT eagerly load from standalone tokenizer here.
         # load_weights() will try bundled V3 codec first, then fall back.
@@ -452,6 +463,30 @@ class HiggsAudioV3Code2Wav(nn.Module):
             self._ensure_codec_loaded()
 
         codes = self._validate_codes(audio_codes)
+        if codes.is_cuda and self._codec_graph_enabled:
+            batch, _, frames = codes.shape
+            entry = self._decode_graphs.get((batch, frames))
+            if entry is not None:
+                graph, static_codes, static_audio = entry
+                static_codes[:batch].copy_(codes)
+                graph.replay()
+                # The next group may replay the same graph. Own the output
+                # before reusing its storage or shared graph memory pool.
+                return static_audio[:batch].clone()
+        return self._decode_codes_impl(codes)
+
+    @torch.inference_mode()
+    def capture_auxiliary_graphs(self) -> None:
+        """Capture exact codec shapes before the generation worker is ready."""
+        if not self._codec_graph_enabled or self._decode_graphs_initialized:
+            return
+        if not self._loaded:
+            self._ensure_codec_loaded()
+        device = self.fc2.weight.device
+        if device.type == "cuda":
+            self._capture_decode_graphs(device)
+
+    def _decode_codes_impl(self, codes: torch.Tensor) -> torch.Tensor:
         rvq_codes = codes.transpose(0, 1).long()
         quantized = self.quantizer.decode(rvq_codes)
         quantized = quantized.to(dtype=self.fc2.weight.dtype)
@@ -463,6 +498,55 @@ class HiggsAudioV3Code2Wav(nn.Module):
         if audio.dim() == 2:
             audio = audio.unsqueeze(1)
         return audio.to(codes.device)
+
+    def _decode_graph_shapes(self) -> list[tuple[int, int]]:
+        single_max = int(getattr(self.config, "codec_graph_single_max_frames", 150))
+        batches = getattr(self.config, "codec_graph_batch_sizes", (2, 4, 8, 16))
+        frames = getattr(self.config, "codec_graph_frame_sizes", (5, 29, 54))
+        if single_max < 1 or any(int(n) < 1 for n in (*batches, *frames)):
+            raise ValueError("Higgs codec graph dimensions must be positive")
+        return sorted({(1, n) for n in range(1, single_max + 1)} | {(int(b), int(f)) for b in batches for f in frames})
+
+    @torch.inference_mode()
+    def _capture_decode_graphs(self, device: torch.device) -> None:
+        # Never pad time: convolution boundary conditions must stay exact.
+        # Batch size also stays exact: padding can change convolution
+        # algorithms and rounding. Uncovered shapes retain the eager path.
+        start = time.perf_counter()
+        memory_before = torch.accelerator.memory_allocated(device)
+        reserved_before = torch.accelerator.memory_reserved(device)
+        shapes = self._decode_graph_shapes()
+        previous_device = current_omni_platform.current_device()
+        current_omni_platform.set_device(device)
+        try:
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            pool = torch.cuda.graph_pool_handle()
+            for batch, frames in shapes:
+                codes = torch.zeros((batch, self.num_codebooks, frames), device=device, dtype=torch.long)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        self._decode_codes_impl(codes)
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool, stream=stream):
+                    audio = self._decode_codes_impl(codes)
+                self._decode_graphs[batch, frames] = (graph, codes, audio)
+            torch.cuda.current_stream(device).wait_stream(stream)
+        finally:
+            current_omni_platform.set_device(torch.device(device.type, previous_device))
+        self._decode_graphs_initialized = True
+        torch.accelerator.synchronize()
+        logger.info(
+            "Higgs codec captured %d exact-frame CUDA graphs in %.2f s "
+            "(allocated delta %.1f MiB, reserved delta %.1f MiB, reserved total %.1f MiB)",
+            len(self._decode_graphs),
+            time.perf_counter() - start,
+            (torch.accelerator.memory_allocated(device) - memory_before) / 2**20,
+            (torch.accelerator.memory_reserved(device) - reserved_before) / 2**20,
+            torch.accelerator.memory_reserved(device) / 2**20,
+        )
 
     @torch.inference_mode()
     def forward_chunk(
@@ -518,6 +602,18 @@ class HiggsAudioV3Code2Wav(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
+        # Native MRV2 uses token placeholders for scheduling. The connector
+        # payload owns the actual codebook-major codec sequence, including an
+        # empty terminal payload which must not decode a placeholder token.
+        if runtime_additional_information is not None:
+            for i, info in enumerate(runtime_additional_information):
+                if i >= len(request_ids_list):
+                    break
+                codes = info.get("codes", {}) if isinstance(info, dict) else {}
+                audio = codes.get("audio") if isinstance(codes, dict) else None
+                if isinstance(audio, torch.Tensor):
+                    request_ids_list[i] = audio.reshape(-1).to(device=ids.device, dtype=torch.long)
+
         left_context_size = [0] * len(request_ids_list)
         right_holdback_size = [0] * len(request_ids_list)
         if runtime_additional_information is not None:
@@ -530,11 +626,14 @@ class HiggsAudioV3Code2Wav(nn.Module):
                 if "right_holdback_size" in meta:
                     right_holdback_size[i] = int(meta["right_holdback_size"])
 
-        wavs: list[torch.Tensor] = []
+        wavs: list[torch.Tensor] = [empty] * len(request_ids_list)
+        # Requests with identical codec windows are independent along B. Keep
+        # time lengths and overlap trims exact rather than padding the temporal
+        # axis, which could change the convolution boundary conditions.
+        groups: dict[tuple[int, int, int], list[tuple[int, torch.Tensor]]] = {}
         for i, req_ids in enumerate(request_ids_list):
             n = int(req_ids.numel())
             if n == 0:
-                wavs.append(empty)
                 continue
             if n % self.num_codebooks != 0:
                 logger.warning(
@@ -542,23 +641,43 @@ class HiggsAudioV3Code2Wav(nn.Module):
                     n,
                     self.num_codebooks,
                 )
-                wavs.append(empty)
                 continue
             frames = n // self.num_codebooks
-            codes_qf = req_ids.reshape(self.num_codebooks, frames)
-            codes_bqf = codes_qf.unsqueeze(0)
+            key = (frames, left_context_size[i], right_holdback_size[i])
+            groups.setdefault(key, []).append((i, req_ids.reshape(self.num_codebooks, frames)))
+
+        for (_, left, right), group in groups.items():
+            codes_bqf = group[0][1].unsqueeze(0) if len(group) == 1 else torch.stack([codes for _, codes in group])
             try:
                 pcm = self.forward_chunk(
                     codes_bqf,
-                    left_context_size=left_context_size[i],
-                    right_holdback_size=right_holdback_size[i],
+                    left_context_size=left,
+                    right_holdback_size=right,
                     hop_length=self.hop_length,
                 )
             except ValueError as exc:
-                logger.warning("HiggsAudioV3Code2Wav: decode skipped (%s)", exc)
-                wavs.append(empty)
+                if len(group) == 1:
+                    logger.warning("HiggsAudioV3Code2Wav: decode skipped (%s)", exc)
+                    continue
+                # An invalid row must not discard valid peers. This slow path
+                # retains the previous per-request validation/error behavior.
+                for index, codes in group:
+                    try:
+                        row_pcm = self.forward_chunk(
+                            codes.unsqueeze(0),
+                            left_context_size=left,
+                            right_holdback_size=right,
+                            hop_length=self.hop_length,
+                        )
+                        wavs[index] = row_pcm[0, 0].to(torch.float32)
+                    except ValueError as row_exc:
+                        logger.warning("HiggsAudioV3Code2Wav: decode skipped (%s)", row_exc)
                 continue
-            wavs.append(pcm.squeeze(0).squeeze(0).to(torch.float32).cpu())
+            pcm = pcm.to(torch.float32)
+            for row, (index, _) in enumerate(group):
+                # The generation runner owns the batched pinned D2H copy and
+                # its completion event; avoid blocking once per request here.
+                wavs[index] = pcm[row, 0]
 
         return OmniOutput(
             text_hidden_states=None,

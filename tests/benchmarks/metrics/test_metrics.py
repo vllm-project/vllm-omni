@@ -6,15 +6,35 @@ Unit tests for metrics.py
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
 from vllm.benchmarks.serve import TaskType
 
-from vllm_omni.benchmarks.metrics.metrics import _build_stage_metrics_from_outputs, calculate_metrics
+from vllm_omni.benchmarks.metrics.metrics import (
+    _build_stage_metrics_from_outputs,
+    aggregate_stage_durations,
+    calculate_metrics,
+    print_stage_durations_metrics,
+)
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
+from vllm_omni.metrics.definitions import stage_modality_flags
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def test_stage_modality_flags_match_print_stage():
+    text = stage_modality_flags("text", "")
+    audio = stage_modality_flags("", "audio")
+    stream = stage_modality_flags("latent", "stream")
+    video_frames = stage_modality_flags("video", "image")
+
+    assert text.is_text_stage and not text.is_audio_stage
+    assert audio.is_audio_stage and not audio.is_internal_stream_stage
+    assert stream.is_internal_stream_stage and not stream.is_text_stage
+    assert video_frames.is_video_stage and not video_frames.is_image_stage
+    assert not stage_modality_flags(None, None).is_text_stage
 
 
 def test_tpot_matches_mean_itl_per_request():
@@ -380,12 +400,7 @@ class _EmptyAwareTokenizer:
     """
 
     def __call__(self, text, add_special_tokens=False):
-        class _R:
-            pass
-
-        r = _R()
-        r.input_ids = [0] * len(text)
-        return r
+        return SimpleNamespace(input_ids=[0] * len(text))
 
 
 def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
@@ -629,6 +644,81 @@ def test_stage_timing_excludes_missing_values_but_retains_measured_zero(duplex):
     stage = _build_stage_metrics_from_outputs(outputs)[0]
     assert stage.stage_gen_times_ms == [0.0, 100.0]
     assert stage.postprocess_times_ms == [5.0]
+
+
+def test_aggregate_stage_durations_mean_p50_p99() -> None:
+    ok_a = MixRequestFuncOutput()
+    ok_a.success = True
+    ok_a.stage_durations = {"diffuse": 1.0, "vae.decode": 0.2, "stage_0_gen_ms": 50.0}
+    ok_b = MixRequestFuncOutput()
+    ok_b.success = True
+    ok_b.stage_durations = {"diffuse": 3.0, "vae.decode": 0.4, "stage_1_gen_ms": 80.0}
+    failed = MixRequestFuncOutput()
+    failed.success = False
+    failed.stage_durations = {"diffuse": 99.0}
+
+    summaries = aggregate_stage_durations([ok_a, ok_b, failed])
+    assert summaries["stage_durations_mean"]["diffuse"] == pytest.approx(2.0)
+    assert summaries["stage_durations_p50"]["diffuse"] == pytest.approx(2.0)
+    assert summaries["stage_durations_mean"]["vae.decode"] == pytest.approx(0.3)
+    assert "stage_durations_p99" in summaries
+    assert "stage_0_gen_ms" not in summaries["stage_durations_mean"]
+    assert "stage_1_gen_ms" not in summaries["stage_durations_mean"]
+
+
+def test_print_stage_durations_metrics(capsys) -> None:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.stage_durations = {
+        "Wan22I2VPipeline.diffuse": 1.25,
+        "Wan22I2VPipeline.text_encoder.forward": 0.4,
+        "queue_wait_ms": 0.5,
+        "stage_0_gen_ms": 1000.0,
+    }
+    summaries = aggregate_stage_durations([output])
+    metrics = SimpleNamespace(**summaries)
+    print_stage_durations_metrics([99.0], metrics)
+    out = capsys.readouterr().out
+    assert "Wan22I2VPipeline" not in out
+    assert "Mean Diffuse (s):" in out
+    assert "Median Diffuse (s):" in out
+    assert "P99 Diffuse (s):" in out
+    assert "Mean Text Encoder Forward (s):" in out
+    assert "Mean Queue Wait (ms):" in out
+    assert "Stage 0 Gen" not in out
+    assert "stage_0_gen" not in out
+
+
+def test_profiler_stage_durations_print_without_print_stage(capsys) -> None:
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = 8
+    output.latency = 1.0
+    output.stage_durations = {
+        "Wan22I2VPipeline.diffuse": 1.25,
+        "queue_wait_ms": 0.5,
+        "stage_0_gen_ms": 1000.0,
+    }
+    common = dict(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["e2el"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+    metrics, _ = calculate_metrics(**common, print_stage=False)
+    shown = capsys.readouterr().out
+    assert "Mean Diffuse (s):" in shown
+    assert "Mean Queue Wait (ms):" in shown
+    assert "Stage 0 Gen" not in shown
+    assert metrics.stage_durations_mean["Wan22I2VPipeline.diffuse"] == pytest.approx(1.25)
+    assert "stage_0_gen_ms" not in metrics.stage_durations_mean
 
 
 if __name__ == "__main__":

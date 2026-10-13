@@ -54,6 +54,10 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SIGMA_SHIFT,
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.ar_diffusion.capability import (
@@ -439,9 +443,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             self.vae = DistributedAutoencoderKLWan()
             self.vae.init_distributed()
-        if not (
-            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
-        ):
+        if resolve_offload_strategy(od_config) not in (OffloadStrategy.MODEL_LEVEL, OffloadStrategy.LAYER_WISE):
             self.vae = self.vae.to(device=get_local_device(), dtype=od_config.dtype)
         self.register_buffer(
             "vae_latents_mean",
@@ -720,7 +722,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     def warmup_compile(self) -> None:
         """Warm up compiled text/image/VAE paths before timed inference."""
-        if not torch.cuda.is_available():
+        if not torch.accelerator.is_available():
             return
 
         state = self.state
@@ -801,12 +803,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         latents: tuple[torch.Tensor, torch.Tensor],
         do_true_cfg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-step sync: .contiguous() + cuda.synchronize()"""
+        """Post-step sync: .contiguous() + accelerator stream synchronize"""
         latents = tuple(t.contiguous() for t in latents)
         if do_true_cfg and get_classifier_free_guidance_world_size() > 1:
-            device = next((t.device for t in latents if t.is_cuda), None)
+            device = next((t.device for t in latents if t.device.type != "cpu"), None)
             if device is not None:
-                torch.cuda.current_stream(device).synchronize()
+                torch.accelerator.current_stream(device).synchronize()
         return latents
 
     # -----------------------------------------------------------------------

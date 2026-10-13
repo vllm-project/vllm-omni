@@ -10,11 +10,9 @@ Ray workers can unpickle ``vLLMOmniHttpServerLocal`` via
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
-from dataclasses import asdict
 from enum import Enum
 from typing import Any
 
@@ -22,14 +20,13 @@ import torchvision.transforms as T
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from vllm.entrypoints.openai.api_server import build_app
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 import vllm_omni.entrypoints.cli.serve
-from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import omni_init_app_state
 from vllm_omni.inputs.data import OmniCustomPrompt, OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +180,6 @@ class vLLMOmniHttpServerLocal:
             "tensor_parallel_size": _cfg_get(self.config, "tensor_model_parallel_size", 1),
             "seed": self.replica_rank + int(_cfg_get(self.config, "seed", 0) or 0),
             "override_generation_config": json.dumps({}),
-            "scheduling_policy": _cfg_get(self.config, "scheduling_policy", "fcfs"),
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
@@ -191,7 +187,7 @@ class vLLMOmniHttpServerLocal:
         model_path = str(_cfg_get(self.model_config, "local_path", None) or _cfg_get(self.model_config, "path"))
         server_args_list = ["serve", model_path] + build_cli_args_from_config(args)
 
-        parser = FlexibleArgumentParser(description="vLLM-Omni CLI")
+        parser = TrackingArgumentParser(description="vLLM-Omni CLI")
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds: dict[str, Any] = {}
         for cmd in vllm_omni.entrypoints.cli.serve.cmd_init():
@@ -204,11 +200,10 @@ class vLLMOmniHttpServerLocal:
 
         await self.run_server(parsed)
 
-    async def run_server(self, args: argparse.Namespace) -> None:
-        engine_args = OmniEngineArgs.from_cli_args(args)
-        engine_args = asdict(engine_args)
-
-        engine_args["enable_dummy_pipeline"] = True
+    async def run_server(self, args: TrackingNamespace) -> None:
+        # Match the production entrypoint: parser defaults are not user overrides.
+        engine_args = args.get_explicit_kwargs_dict()
+        engine_args["model"] = args.model
         engine_args["custom_pipeline_args"] = {"pipeline_class": CUSTOM_PIPELINE_CLASS}
 
         engine_client = AsyncOmni(**engine_args)

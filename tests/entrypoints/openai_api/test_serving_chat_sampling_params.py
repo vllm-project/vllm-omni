@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for OmniOpenAIServingChat sampling params handling.
 
@@ -8,6 +9,7 @@ are correctly applied to the comprehension stage while preserving YAML defaults.
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from pytest_mock import MockerFixture
@@ -324,6 +326,64 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_cl
     assert (diffusion_params.height, diffusion_params.width) == (512, 768)
     assert diffusion_params.extra_args == {"solver": "euler"}
     assert captured["prompt"]["negative_prompt"] == "avoid blur"
+
+
+def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engine_client, mocker: MockerFixture):
+    """Exercise the production chat path, not only the tagging helper."""
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(stage_type="llm", is_comprehension=True),
+        SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+    ]
+    mock_engine_client.default_sampling_params_list = [
+        SamplingParams(),
+        OmniDiffusionSamplingParams(),
+    ]
+    mock_engine_client.output_modalities = ["text", "image"]
+    mock_engine_client.errored = False
+    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object())
+    captured: dict[str, object] = {}
+
+    async def results():
+        if False:
+            yield None
+
+    def generate(**kwargs):
+        captured.update(kwargs)
+        return results()
+
+    mock_engine_client.generate = generate
+    serving_chat = build_serving_chat(
+        engine_client=mock_engine_client,
+        models=SimpleNamespace(model_name=lambda _: "test"),
+        online_renderer=SimpleNamespace(validate_chat_template=lambda **_: None),
+        trust_request_chat_template=True,
+    )
+    serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = frozenset()
+    mocker.patch.multiple(
+        serving_chat,
+        _check_model=mocker.AsyncMock(return_value=None),
+        _maybe_get_adapters=mocker.Mock(return_value=None),
+        _effective_chat_template_kwargs=mocker.Mock(return_value={}),
+        _preprocess_chat=mocker.AsyncMock(return_value=([], [{"prompt": "raw"}])),
+        _base_request_id=mocker.Mock(return_value="test"),
+        _log_inputs=mocker.Mock(),
+        chat_completion_full_generator=mocker.AsyncMock(return_value="done"),
+    )
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "describe this image"}],
+        modalities=["text"],
+    )
+
+    assert asyncio.run(serving_chat._create_chat_completion(request)) == "done"
+
+    sampling_params_list = cast(list[Any], captured["sampling_params_list"])
+    assert sampling_params_list[0].extra_args == {"ar_task_mode": "comprehension"}
+    assert sampling_params_list[1].extra_args == {}
+    assert captured["output_modalities"] == ["text"]
 
 
 @pytest.fixture
@@ -865,3 +925,54 @@ class TestResolveHeightWidth:
         h, w = OmniOpenAIServingChat._resolve_height_width_from_extra_body({"size": "invalid"})
         assert h is None
         assert w is None
+
+
+# Tests for _apply_text_chat_ar_task_mode (#6088)
+
+
+def _tag_request(modalities):
+    return SimpleNamespace(modalities=modalities)
+
+
+def _apply_tag(params, modalities):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    OmniOpenAIServingChat._apply_text_chat_ar_task_mode(params, _tag_request(modalities))
+    return params
+
+
+@pytest.mark.parametrize("modalities", [[], ["text"]])
+def test_text_only_chat_tags_ar_stage_as_comprehension(modalities):
+    ar = SamplingParams()
+    params = _apply_tag([ar], modalities)
+    assert params[0].extra_args == {"ar_task_mode": "comprehension"}
+
+
+@pytest.mark.parametrize("modalities", [["image"], ["text", "audio"], ["video"]])
+def test_non_text_output_request_is_untouched(modalities):
+    ar = SamplingParams()
+    _apply_tag([ar], modalities)
+    assert ar.extra_args is None
+
+
+def test_diffusion_stage_params_are_untouched():
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    ar = SamplingParams()
+    dit = OmniDiffusionSamplingParams()
+    dit_extra_before = getattr(dit, "extra_args", None)
+    _apply_tag([ar, dit], ["text"])
+    assert ar.extra_args == {"ar_task_mode": "comprehension"}
+    assert getattr(dit, "extra_args", None) == dit_extra_before
+
+
+def test_explicit_caller_ar_task_mode_is_preserved():
+    ar = SamplingParams(extra_args={"ar_task_mode": "generation"})
+    _apply_tag([ar], ["text"])
+    assert ar.extra_args["ar_task_mode"] == "generation"
+
+
+def test_existing_extra_args_are_merged_not_replaced():
+    ar = SamplingParams(extra_args={"custom": 1})
+    _apply_tag([ar], None)
+    assert ar.extra_args == {"custom": 1, "ar_task_mode": "comprehension"}
