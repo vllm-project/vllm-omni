@@ -251,96 +251,31 @@ reached 128 simultaneous Original CFG branches.
 H100 results, including historical microbatch measurements, are recorded in the
 [H100 recipe](Chatterbox-H100.md). They do not qualify this A5000 profile.
 
-Start a fresh server before each model run so the first cold wave includes conditioner initialization.
-Supply an actual speech recording of more than five seconds:
+These sessions were driven by a Chatterbox-specific load harness that has
+since been removed in favour of the shared `benchmarks/tts/bench_tts.py`
+driver (see the [TTS benchmark README](../../benchmarks/tts/README.md)).
+Reproduce the HTTP workload from a fresh server, so the first wave includes
+conditioner initialization:
 
 ```bash
-uv run benchmarks/tts/chatterbox_load.py \
-  ResembleAI/chatterbox-turbo reference.wav turbo-c64-short.json \
-  --concurrency 64 --cycles 3 --max-new-tokens 128
+python benchmarks/tts/bench_tts.py \
+  --model ResembleAI/chatterbox-turbo \
+  --task voice_clone --locale en \
+  --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+  --host 127.0.0.1 --port 8091 \
+  --concurrency 64 --num-prompts 192 --num-warmups 64 \
+  --output-dir results/turbo-c64
 ```
 
-The harness sends three synchronized waves per workload: distinct cold references,
-a repeated reference with a separately reported priming request, then the built-in voice.
-A single recording produces deterministic, distinct amplitude-envelope variants
-of real speech; these stress cache misses but are not 64 distinct speakers.
-Alternatively, supply a directory containing at least `concurrency * cycles`
-distinct WAV recordings. The report records the mode and reference hashes.
-Cold cache claims require a fresh server and previously unseen recordings; cache
-hits are inferred from repeated inputs, not measured by the client.
-
-Repeat with `ResembleAI/chatterbox` and `--stage0-sequences-per-request 2`
-after restarting the server for Original.
-Run a separate longer workload with `--max-new-tokens 1000` and a fresh server;
-the 128-token run is a short stress test and does not establish long-utterance
-capacity. Keep hardware, reference recordings, concurrency, and caps identical
-when comparing models or Qwen3-TTS using its model-specific benchmark.
-
-For the measured long capacity probe, use a fresh server and this fixed input
-(the paragraph is deliberately repeated). This probes occupancy, not narration quality:
-
-```bash
-uv run python - ResembleAI/chatterbox reference.wav original-c64-long.json \
-  --concurrency 64 --stage0-sequences-per-request 2 --cycles 1 \
-  --max-new-tokens 1000 --save-audio <<'PYTHON'
-import benchmarks.tts.chatterbox_load as benchmark
-
-paragraph = (
-    "The morning train arrived beside the river just as the town began to "
-    "wake. People carried baskets to the market, and a baker opened the "
-    "windows of a small shop near the station. Across the square, children "
-    "gathered around an old map and tried to trace the road that would take "
-    "them into the hills. Their teacher explained that the stone bridge had "
-    "connected the two valleys for generations. It had survived winter "
-    "storms, spring floods, and the slow passage of countless travelers. "
-    "Today they would cross that bridge together and follow the path "
-    "through the orchard. They packed water, bread, and notebooks, then "
-    "checked the weather one last time. A gentle breeze moved through the "
-    "trees as they set off, listening to birds and watching the sunlight "
-    "spread across the fields. "
-)
-benchmark.TEXT = "Request number {index}. " + paragraph + paragraph
-benchmark.main()
-PYTHON
-```
-
-For Turbo, change the model ID and use `--stage0-sequences-per-request 1`.
-
-JSON includes every request, PCM hashes, reference hashes, errors, first audio
-latency (TTFA), end-to-end p50/p95/p99/max, request throughput, audio throughput,
-and peak outstanding client requests. Success requires all streams to finish
-with nonzero mono 24 kHz PCM and no exact audio replay across distinct text/seed
-requests. PCM integers are finite by construction; this cannot detect nonfinite
-internal tensors before PCM conversion. Hashes detect exact replay, not semantic
-speaker leakage. The harness polls `/metrics` every 250 ms and separately reports
-per-stage peak running/waiting sequences and `capacity_confirmed`. Missing
-metrics cannot confirm capacity. Original requires 128 running CFG branches for
-64 requests. Cold conditioning may feed the GPU gradually; inspect each workload
-separately. These gauges do not expose encoder cache counters, quality, or VRAM:
-pair the report with server logs and GPU memory telemetry. A peak of 64 clients
-alone does not establish active capacity or acceptable latency. HTTP 200 alone
-never passes.
+Repeat with `ResembleAI/chatterbox` after restarting the server for Original.
+Keep hardware, reference recordings, concurrency and caps identical when
+comparing models. The driver reports first-audio latency, real-time factor and
+streaming continuity (`audio_underrun`, `audio_continuity_ok`); it does not
+sample scheduler occupancy, so client completion alone does not establish
+active capacity. The sentence-segmented WebSocket frontend has no shared load
+driver.
 
 ### Sentence-segmented WebSocket sessions
-
-Validate the sentence frontend separately from HTTP streaming:
-
-```bash
-uv run benchmarks/tts/chatterbox_load.py \
-  ResembleAI/chatterbox-turbo reference.wav turbo-c64-sentences.json \
-  --transport websocket --url http://127.0.0.1:8091/v1/audio/speech/stream \
-  --concurrency 64 --cycles 3 --max-new-tokens 128 --save-audio
-```
-
-This opens 64 overlapping sessions per wave with `split_granularity="sentence"`
-and `stream_audio=true`. Each sends two text chunks, then `input.done`, and checks
-ordered `audio.start`, binary PCM, `audio.done`, and `session.done` messages.
-The current narration produces five independently validated sentence segments
-from those two input chunks. The report adds
-per-segment results and latency tails measured from session submission, so later
-segments include time behind earlier sentences. Reference workloads, scheduler
-metrics, capacity thresholds, and saved audio use the HTTP harness conventions.
-For Original with CFG, include `--stage0-sequences-per-request 2`.
 
 The WebSocket receiver continues draining input during generation so protocol
 keepalive replies remain readable. Each connection permits up to 8 MiB of pending

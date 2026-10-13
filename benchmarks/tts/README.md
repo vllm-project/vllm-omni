@@ -13,20 +13,14 @@ are wired into both the manual CLI and the DFX nightly CI matrix
 
 ### Chatterbox concurrency and conditioning checks
 
-`chatterbox_load.py` validates Chatterbox Turbo and Original through their public
-HTTP or sentence-segmented WebSocket APIs, with cold distinct references, a warm
-repeated reference, and the built-in voice. `chatterbox_conditioning.py` checks
-real-weight serial/batch parity over 64 references on CPU or an explicit CUDA
-device. These are separate from the universal benchmark registry below.
-The load harness uses the longer parity narration so early completions are
-less likely to hide scheduler occupancy. Its report separately records
-successful clients and sampled active-sequence capacity; neither implies the
-other. HTTP reports also include per-request RTF, raw PCM arrival timing, and
-playback deficit: the additional initial buffer needed to avoid underruns when
-playback otherwise begins at the first received audio byte. These timings include
-conditioning and client transport; no sentence-level gap is silently excluded. Pass `--max-new-tokens 1000` to validate the default output allowance.
-See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-A5000.md#conditioning-load-validation-at-64-clients)
-for commands, measured 64-client results, and capacity and quality limitations.
+Chatterbox Turbo and Original are registered in `model_configs.yaml`, so their
+HTTP load, latency and streaming-continuity measurements come from the shared
+`bench_tts.py` driver below (`audio_ttfp`, `audio_rtf`, `audio_underrun`,
+`audio_continuity_ok`), as the nightly perf job's do. The sentence-segmented
+WebSocket frontend has no shared load driver. `chatterbox_conditioning.py`
+checks real-weight serial/batch parity over 64 references on CPU or an explicit
+CUDA device. See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-A5000.md#conditioning-load-validation-at-64-clients)
+for measured 64-client results and their capacity and quality limitations.
 
 `chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech
 codes replayed from the checkpoint's built-in voice. It measures first,
@@ -367,8 +361,8 @@ Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
 H100 baselines come from the October 12 integration run documented in the
 [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-workload-and-cuda-graph-comparison).
 B200 is routed as a CI mirror without an assigned performance baseline.
-The job does not replace cold-reference or WebSocket validation with
-`chatterbox_load.py`.
+The job measures the built-in voice over HTTP; cold-reference and WebSocket
+behaviour are qualified separately in the recipes.
 
 ## Matched Chatterbox reference qualification
 

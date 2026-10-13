@@ -167,23 +167,30 @@ decoder occupancy varies as chunks become ready and requests finish. The
 harness's `capacity_confirmed` field checks AR capacity only. This standalone
 run qualifies HTTP streaming; historical WebSocket checks below included #8842.
 
-Reproduce each model from a fresh server:
+The tables in this section and in "Fresh conditioning and protocol
+qualification" were produced by a Chatterbox-specific load harness that has
+since been removed in favour of the shared `benchmarks/tts/bench_tts.py`
+driver; its "playback deficit" corresponds to the shared driver's
+`audio_underrun` and `audio_continuity_ok` fields. Reproduce the HTTP
+workload from a fresh server with the shared driver:
 
 ```bash
 vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091 \
   --deploy-config vllm_omni/deploy/chatterbox_turbo_high_concurrency_cuda.yaml
 
-uv run benchmarks/tts/chatterbox_load.py ResembleAI/chatterbox-turbo \
-  tests/assets/qwen3_tts/clone_2.wav results/turbo-http64.json \
-  --concurrency 64 --cycles 3 --max-new-tokens 1000 --save-audio
+python benchmarks/tts/bench_tts.py \
+  --model ResembleAI/chatterbox-turbo \
+  --task voice_clone --locale en \
+  --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+  --host 127.0.0.1 --port 8091 \
+  --concurrency 64 --num-prompts 192 --num-warmups 64 \
+  --output-dir results/turbo-c64
 ```
 
 For Original, restart with `ResembleAI/chatterbox` and
-`chatterbox_high_concurrency_cuda.yaml`, and pass
-`--stage0-sequences-per-request 2` to the load command. The timing harness's
-13 real-HTTP/WebSocket regression tests passed on both the existing development
-host and this H100 before the benchmarks. These measurements do not replace
-the separate FP32 nightly performance baselines.
+`chatterbox_high_concurrency_cuda.yaml`. The shared driver has no
+sentence-segmented WebSocket mode. These measurements do not replace the
+separate FP32 nightly performance baselines.
 
 ## Historical combined-branch measurements
 
@@ -460,20 +467,9 @@ demo for Turbo and Original. Both native players reached the end without a
 media error. This verifies browser delivery and playback; it is not a concurrent
 underrun measurement or a subjective speaker-quality assessment.
 
-To reproduce HTTP qualification after starting the CUDA profile:
-
-```bash
-uv run python benchmarks/tts/chatterbox_load.py \
-  ResembleAI/chatterbox-turbo tests/assets/qwen3_tts/clone_2.wav turbo-http.json \
-  --url http://127.0.0.1:8091/v1/audio/speech \
-  --concurrency 64 --cycles 3 --max-new-tokens 1000 --save-audio
-```
-
-For WebSocket, restart the server and add `--transport websocket`, changing the
-URL to `ws://127.0.0.1:8091/v1/audio/speech/stream`. For Original, use
-`ResembleAI/chatterbox`, its CUDA profile and `--stage0-sequences-per-request 2`.
-The capacity field requires every wave to reach the active-sequence target;
-client completion alone does not establish that target.
+The HTTP workload is reproduced with the shared driver command in "Standalone
+64-client HTTP qualification". The WebSocket sessions were driven by the
+removed harness; the shared driver does not open sentence-segmented sessions.
 
 Historical profiling matrices, traces, quality logs, 64-output quality WAV sets,
 and Original concurrency reports were saved locally before the earlier shutdown. The final hot
