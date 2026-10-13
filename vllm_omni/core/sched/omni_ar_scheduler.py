@@ -526,7 +526,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             max_len = None
         prefill_pending = self._talker_waiting_prefill_may_run()
         widths: set[int] = set()
-        pad_starved: list = []
         for req in self.running:
             computed = int(req.num_computed_tokens)
             prompt_len = len(req.prompt_token_ids)
@@ -545,38 +544,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         widths.add(1 + num_spec)
                     else:
                         widths.add(1)
-                        pad_starved.append(req)
             else:
                 widths.add(delta)
         uneven = len(widths) > 1
         if not prefill_pending and not uneven:
             return
-        # A request too close to max_model_len to carry the padded width sits
-        # next to neighbours that can -- and *padding does not depend on the
-        # drafts*, so the drop below cannot defuse that mix: the next
-        # schedule() books 1 and 1+num_spec in one step and the runner dies
-        # anyway. The starved request is at the context edge (its headroom is
-        # under one K-step) and would hit the engine's own
-        # FINISHED_LENGTH_CAPPED within a handful of single-frame steps, so
-        # finishing it here caps the audio by less than one K-step and keeps
-        # the remaining batch uniform.
-        if not prefill_pending and uneven and 1 in widths and any(w > 1 for w in widths) and pad_starved:
-            starved_ids = tuple(req.request_id for req in pad_starved)
-            logger.error(
-                "[kstep] %d request(s) %s cannot carry the padded K-frame width "
-                "within max_model_len; finishing them (length-capped) so the "
-                "rest of the batch schedules a uniform span instead of the "
-                "non-uniform one the multi-frame loop declines",
-                len(starved_ids),
-                list(starved_ids)[:4],
-            )
-            self.finish_requests(starved_ids, RequestStatus.FINISHED_LENGTH_CAPPED)
-            for req in pad_starved:
-                if req in self.running:
-                    self.running.remove(req)
-            widths.discard(1)
-            if len(widths) <= 1:
-                return
+        # A request too close to max_model_len to carry the padded width
+        # schedules a single row next to the neighbours' 1+num_spec. Do NOT
+        # finish it here: finishing bypasses the final output, so the
+        # downstream stage never sees a terminal chunk and its input-stall
+        # watchdog fails the request after 600s (seed-tts WER regression:
+        # 8/20 requests). Instead let it ride along -- dropping every draft
+        # books a uniform single-frame step, the engine's own
+        # FINISHED_LENGTH_CAPPED caps the request within num_spec+2 steps
+        # through the normal output path, and constant_drafts re-arms the
+        # K-step right after.
         for req in self.running:
             if req.spec_token_ids:
                 req.spec_token_ids = []

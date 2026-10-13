@@ -375,14 +375,15 @@ def test_enforce_noop_when_not_armed():
     assert out.total_num_scheduled_tokens == 8
 
 
-def test_guard_finishes_a_request_the_padded_width_cannot_fit():
+def test_guard_drops_drafts_when_padded_width_cannot_fit():
     """A request too close to max_model_len to carry the padded 1+num_spec
-    width schedules 1 row against the neighbours' 1+num_spec -- and padding
-    does not depend on the drafts, so dropping drafts cannot defuse that
-    mix; the runner would die on the refusal anyway. The starved request is
-    within a handful of single-frame steps of the engine's own
-    FINISHED_LENGTH_CAPPED, so the guard finishes it and the rest of the
-    batch schedules a uniform span."""
+    width schedules 1 row against the neighbours' 1+num_spec. The guard must
+    NOT finish the starved request: finishing here bypasses the final output,
+    so the downstream stage never sees a terminal chunk and its input-stall
+    watchdog fails the request after 600s (seed-tts WER regression: 8/20
+    requests). Instead the whole batch drops its drafts and rides a uniform
+    single-frame step until the engine's own FINISHED_LENGTH_CAPPED closes
+    the request through the normal output path."""
     healthy = _req(computed=100, prompt=100, spec=[0] * 7, total=101, req_id="healthy")
     # 4090 + 1 + 7 + 1 > 4096: the padded width does not fit.
     starved = _req(computed=4090, prompt=100, spec=[0] * 7, total=4091, req_id="starved")
@@ -392,11 +393,12 @@ def test_guard_finishes_a_request_the_padded_width_cannot_fit():
     sched.finish_requests = lambda ids, status: finished.append((ids, status))
 
     sched._drop_talker_drafts_if_prefill_pending()
-    assert finished and finished[0][0] == ("starved",)
-    assert starved not in sched.running
-    # Only the starved request left: the batch is uniform again, so the
-    # healthy request keeps its drafts and the K-step resumes.
-    assert healthy.spec_token_ids == [0] * 7
+    assert not finished
+    assert starved in sched.running and healthy in sched.running
+    # Uniform single-frame ride-along: every draft goes so the step books
+    # one row per request; constant_drafts re-arms the K-step afterwards.
+    assert healthy.spec_token_ids == []
+    assert starved.spec_token_ids == []
 
 
 def test_guard_drops_drafts_when_waiting_request_pending():
