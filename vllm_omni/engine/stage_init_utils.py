@@ -1523,6 +1523,25 @@ def build_vllm_config(
 
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
 
+    # Same round-trip problem for fault_tolerance_config (issue #8816):
+    # vLLM's EngineArgs defaults fault_tolerance_config to a typed
+    # FaultToleranceConfig instance (never None), so ``asdict`` always
+    # emits a dict even when the user never opted into FT.  Rebuilding
+    # OmniEngineArgs(**dict) then triggers EngineArgs.__post_init__'s
+    # "any dict means explicit CLI override" heuristic, which silently
+    # auto-enables FT — and later fails because FT requires an external
+    # data-parallel load balancer.  Drop the default-valued dict when FT
+    # was not explicitly enabled, and only reconstruct a
+    # FaultToleranceConfig when FT truly is on.
+    ftc = filtered_engine_args_dict.get("fault_tolerance_config")
+    if isinstance(ftc, dict):
+        if filtered_engine_args_dict.get("enable_fault_tolerance") is True:
+            from vllm.config import FaultToleranceConfig
+
+            filtered_engine_args_dict["fault_tolerance_config"] = FaultToleranceConfig(**ftc)
+        else:
+            filtered_engine_args_dict.pop("fault_tolerance_config", None)
+
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 
     # Guard against a per-stage world size that its assigned ``devices`` cannot
