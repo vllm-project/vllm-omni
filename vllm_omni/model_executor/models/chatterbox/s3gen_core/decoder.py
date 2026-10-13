@@ -18,7 +18,6 @@ import torch.nn as nn
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.embeddings import TimestepEmbedding
 
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.intmeanflow import get_intmeanflow_time_mixer
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_decoder import (
     Block1D,
     ResnetBlock1D,
@@ -178,7 +177,12 @@ class ConditionalDecoder(nn.Module):
         self.initialize_weights()
         self.time_embed_mixer = None
         if self.meanflow:
-            self.time_embed_mixer = get_intmeanflow_time_mixer(time_embed_dim)
+            # Diagonal init as described in 3.3 https://arxiv.org/pdf/2510.07979
+            self.time_embed_mixer = nn.Linear(time_embed_dim * 2, time_embed_dim, bias=False)
+            with torch.no_grad():
+                target_weight = torch.zeros(time_embed_dim, 2 * time_embed_dim)
+                target_weight[:, 0:time_embed_dim] = torch.eye(time_embed_dim)
+                self.time_embed_mixer.weight.data = target_weight
 
     @property
     def dtype(self):

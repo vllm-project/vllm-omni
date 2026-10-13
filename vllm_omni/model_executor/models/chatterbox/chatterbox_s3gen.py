@@ -32,6 +32,12 @@ gives a new sample on every call; the vocoder's source module still draws
 its own phase and noise per call. Chunks still differ from a one-chunk
 decode of the same tokens, because a chunk is decoded before the tokens
 that follow it exist and from a bounded context.
+
+The flow's own modules are in ``s3gen_core``: the Conformer token encoder
+(its layers are IndexTTS2's, its look-ahead convolution CosyVoice3's), the
+causal U-Net estimator (its transformer blocks are diffusers') and the
+flow-matching solver. The vocoder is CosyVoice3's HiFT with GLM-TTS's F0
+predictor.
 """
 
 import math
@@ -45,7 +51,6 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.configs import CFM_PARAMS
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.decoder import ConditionalDecoder
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.flow import CausalMaskedDiffWithXvec
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.flow_matching import CausalConditionalCFM
@@ -153,40 +158,6 @@ def fade_in_out(fade_in: torch.Tensor, fade_out: torch.Tensor, window: torch.Ten
     return fade_in
 
 
-def encode(encoder: UpsampleConformerEncoder, tokens: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    """Upstream's ``UpsampleConformerEncoder.forward`` with the padding zeroed.
-
-    Upstream masks the token embeddings but not the encoder's own input
-    projection, whose bias and LayerNorm turn a padded row's zeros into a
-    constant. The pre-lookahead layer then convolves three positions ahead
-    of every frame, so a short row's last tokens would mix that constant in
-    and the row would not decode as it does alone. Zeroing after ``embed``
-    changes nothing when there is nothing to pad.
-
-    Nothing else of upstream's ``forward`` applies: the encoder is built
-    without dynamic chunking, CNN module or CMVN, so its chunk masks are the
-    padding masks.
-
-    Args:
-        encoder: ``flow.encoder``.
-        tokens: Shape (B, T, 512), the masked token embeddings.
-        lengths: Shape (B,), each row's token count.
-
-    Returns:
-        Shape (B, 2T, 512).
-    """
-    masks = ~make_pad_mask(lengths, tokens.shape[1]).unsqueeze(1)
-    hidden, pos_emb, masks = encoder.embed(tokens, masks)
-    hidden = encoder.pre_lookahead_layer(hidden * masks.transpose(1, 2).to(hidden))
-    hidden = encoder.forward_layers(hidden, masks, pos_emb, masks)
-    hidden, lengths = encoder.up_layer(hidden.transpose(1, 2).contiguous(), lengths)
-    hidden = hidden.transpose(1, 2).contiguous()
-    masks = ~make_pad_mask(lengths, hidden.shape[1]).unsqueeze(1)
-    hidden, pos_emb, masks = encoder.up_embed(hidden, masks)
-    hidden = encoder.forward_up_layers(hidden, masks, pos_emb, masks)
-    return encoder.after_norm(hidden)
-
-
 def flow_mels(
     flow: CausalMaskedDiffWithXvec,
     tokens: list[torch.Tensor],
@@ -240,7 +211,7 @@ def flow_mels(
         nn.functional.normalize(torch.cat([ref.embedding for ref in references]), dim=1)
     )
     token_mask = (~make_pad_mask(token_len, token.shape[1])).unsqueeze(-1).to(embedding)
-    h = flow.encoder_proj(encode(flow.encoder, flow.input_embedding(token) * token_mask, token_len))
+    h = flow.encoder_proj(flow.encoder(flow.input_embedding(token) * token_mask, token_len))
 
     frames = torch.arange(h.shape[1], device=device)
     mask = (frames[None, :] < torch.tensor(valid, device=device)[:, None]).unsqueeze(1).to(h)
@@ -305,7 +276,7 @@ class S3GenDecoder(nn.Module):
         )
         self.flow = CausalMaskedDiffWithXvec(
             encoder=encoder,
-            decoder=CausalConditionalCFM(cfm_params=CFM_PARAMS, estimator=estimator),
+            decoder=CausalConditionalCFM(estimator=estimator),
             token_mel_ratio=config.token_mel_ratio,
             pre_lookahead_len=config.pre_lookahead_len,
         )

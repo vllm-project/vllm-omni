@@ -26,6 +26,7 @@ from torch.nn import functional as F
 
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.attention import EspnetRelPositionMultiHeadedAttention
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 from vllm_omni.model_executor.models.indextts2.gpt.conformer_encoder import (
     ConformerEncoderLayer,
     PositionwiseFeedForward,
@@ -273,16 +274,36 @@ class UpsampleConformerEncoder(torch.nn.Module):
     def output_size(self) -> int:
         return self._output_size
 
-    def forward_layers(
-        self, xs: torch.Tensor, chunk_masks: torch.Tensor, pos_emb: torch.Tensor, mask_pad: torch.Tensor
-    ) -> torch.Tensor:
-        for layer in self.encoders:
-            xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
-        return xs
+    def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor) -> torch.Tensor:
+        """Upstream's ``forward`` with the padding zeroed.
 
-    def forward_up_layers(
-        self, xs: torch.Tensor, chunk_masks: torch.Tensor, pos_emb: torch.Tensor, mask_pad: torch.Tensor
-    ) -> torch.Tensor:
+        Upstream masks the token embeddings but not the encoder's own input
+        projection, whose bias and LayerNorm turn a padded row's zeros into a
+        constant. The pre-lookahead layer then convolves three positions ahead
+        of every frame, so a short row's last tokens would mix that constant in
+        and the row would not decode as it does alone. Zeroing after ``embed``
+        changes nothing when there is nothing to pad.
+
+        Nothing else of upstream's ``forward`` applies: the encoder is built
+        without dynamic chunking, CNN module or CMVN, so its chunk masks are the
+        padding masks.
+
+        Args:
+            xs (torch.Tensor): Shape (B, T, 512), the masked token embeddings.
+            xs_lens (torch.Tensor): Shape (B,), each row's token count.
+
+        Returns:
+            torch.Tensor: Shape (B, 2T, 512).
+        """
+        masks = ~make_pad_mask(xs_lens, xs.shape[1]).unsqueeze(1)
+        xs, pos_emb, masks = self.embed(xs, masks)
+        xs = self.pre_lookahead_layer(xs * masks.transpose(1, 2).to(xs))
+        for layer in self.encoders:
+            xs, masks, _, _ = layer(xs, masks, pos_emb, masks)
+        xs, xs_lens = self.up_layer(xs.transpose(1, 2).contiguous(), xs_lens)
+        xs = xs.transpose(1, 2).contiguous()
+        masks = ~make_pad_mask(xs_lens, xs.shape[1]).unsqueeze(1)
+        xs, pos_emb, masks = self.up_embed(xs, masks)
         for layer in self.up_encoders:
-            xs, chunk_masks, _, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
-        return xs
+            xs, masks, _, _ = layer(xs, masks, pos_emb, masks)
+        return self.after_norm(xs)

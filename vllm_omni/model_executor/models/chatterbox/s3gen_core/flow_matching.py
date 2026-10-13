@@ -15,104 +15,28 @@
 # limitations under the License.
 import torch
 
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.configs import CFM_PARAMS
+# Upstream's classifier-free guidance strength (``CFM_PARAMS``), used by the
+# standard checkpoint; the distilled meanflow checkpoint needs none.
+INFERENCE_CFG_RATE = 0.7
 
 
 def cast_all(*args, dtype):
     return [a if (not a.dtype.is_floating_point) or a.dtype == dtype else a.to(dtype) for a in args]
 
 
-class ConditionalCFM(torch.nn.Module):
-    """Shared estimator and guided Euler solver for causal inference."""
+class CausalConditionalCFM(torch.nn.Module):
+    """S3Gen's flow-matching solver around the U-Net estimator.
 
-    def __init__(self, cfm_params, estimator: torch.nn.Module):
+    Args:
+        estimator (torch.nn.Module): The velocity estimator, ``ConditionalDecoder``.
+    """
+
+    def __init__(self, estimator: torch.nn.Module):
         super().__init__()
-        self.t_scheduler = cfm_params.t_scheduler
-        self.inference_cfg_rate = cfm_params.inference_cfg_rate
         self.estimator = estimator
 
-    def solve_euler(self, x, t_span, mu, mask, spks, cond, meanflow=False):
-        """
-        Fixed euler solver for ODEs.
-        Args:
-            x (torch.Tensor): random noise
-            t_span (torch.Tensor): n_timesteps interpolated
-                shape: (n_timesteps + 1,)
-            mu (torch.Tensor): output of encoder
-                shape: (batch_size, n_feats, mel_timesteps)
-            mask (torch.Tensor): output_mask
-                shape: (batch_size, 1, mel_timesteps)
-            spks (torch.Tensor, optional): speaker ids. Defaults to None.
-                shape: (batch_size, spk_emb_dim)
-            cond: Not used but kept for future purposes
-            meanflow: meanflow mode
-        """
-        in_dtype = x.dtype
-        x, t_span, mu, mask, spks, cond = cast_all(x, t_span, mu, mask, spks, cond, dtype=self.estimator.dtype)
-
-        # Duplicated batch dims are for CFG
-        # Do not use concat, it may cause memory format changed and trt infer with wrong results!
-        B, T = mu.size(0), x.size(2)
-        x_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
-        mask_in = torch.zeros([2 * B, 1, T], device=x.device, dtype=x.dtype)
-        mu_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
-        t_in = torch.zeros([2 * B], device=x.device, dtype=x.dtype)
-        spks_in = torch.zeros([2 * B, 80], device=x.device, dtype=x.dtype)
-        cond_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
-        r_in = torch.zeros([2 * B], device=x.device, dtype=x.dtype)  # (only used for meanflow)
-
-        for t, r in zip(t_span[:-1], t_span[1:]):
-            t = t.unsqueeze(dim=0)
-            r = r.unsqueeze(dim=0)
-            # Shapes:
-            #      x_in  ( 2B, 80, T )
-            #   mask_in  ( 2B,  1, T )
-            #     mu_in  ( 2B, 80, T )
-            #      t_in  ( 2B,       )
-            #   spks_in  ( 2B, 80,   )
-            #   cond_in  ( 2B, 80, T )
-            #      r_in  ( 2B,       )
-            #         x  (  B, 80, T )
-            #      mask  (  B,  1, T )
-            #        mu  (  B, 80, T )
-            #         t  (  B,       )
-            #      spks  (  B, 80,   )
-            #      cond  (  B, 80, T )
-            #         r  (  B,       )
-
-            x_in[:B] = x_in[B:] = x
-            mask_in[:B] = mask_in[B:] = mask
-            mu_in[:B] = mu
-            t_in[:B] = t_in[B:] = t
-            spks_in[:B] = spks
-            cond_in[:B] = cond
-            r_in[:B] = r_in[B:] = r  # (only used for meanflow)
-            dxdt = self.estimator.forward(
-                x=x_in,
-                mask=mask_in,
-                mu=mu_in,
-                t=t_in,
-                spks=spks_in,
-                cond=cond_in,
-                r=r_in if meanflow else None,
-            )
-            dxdt, cfg_dxdt = torch.split(dxdt, [B, B], dim=0)
-            dxdt = (1.0 + self.inference_cfg_rate) * dxdt - self.inference_cfg_rate * cfg_dxdt
-            dt = r - t
-            x = x + dt * dxdt
-
-        return x.to(in_dtype)
-
-
-class CausalConditionalCFM(ConditionalCFM):
-    def __init__(self, cfm_params=CFM_PARAMS, estimator=None):
-        super().__init__(cfm_params, estimator)
-        # No fixed noise of its own: ``forward`` takes the noise it starts
-        # from (``noised_mels``) or draws it per call.
-        self.rand_noise = None
-
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, noised_mels=None, meanflow=False):
+    def forward(self, mu, mask, n_timesteps, spks=None, cond=None, noised_mels=None, meanflow=False):
         """Forward diffusion
 
         Args:
@@ -121,11 +45,11 @@ class CausalConditionalCFM(ConditionalCFM):
             mask (torch.Tensor): output_mask
                 shape: (batch_size, 1, mel_timesteps)
             n_timesteps (int): number of diffusion steps
-            temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
-            cond (torch.Tensor, optional): Not used but kept for future purposes.
-            noised_mels (torch.Tensor, optional): gt mels noised a time t.
+            cond (torch.Tensor, optional): Conditioning mel, the reference prompt's frames.
+            noised_mels (torch.Tensor, optional): The noise the last frames start from; the
+                frames before them are drawn here.
             meanflow (bool, optional): Whether the estimator is a meanflow model. Defaults to False.
 
         Returns:
@@ -141,8 +65,6 @@ class CausalConditionalCFM(ConditionalCFM):
 
         # time steps for reverse diffusion
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        if (not meanflow) and (self.t_scheduler == "cosine"):
-            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
         # NOTE: right now, the only meanflow models are also distilled models, which don't need CFG
         #   because they were distilled with CFG outputs. We would need to add another hparam and
@@ -150,7 +72,75 @@ class CausalConditionalCFM(ConditionalCFM):
         if meanflow:
             return self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
 
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, meanflow=meanflow), None
+        # The standard checkpoint steps on a cosine schedule.
+        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+
+    def solve_euler(self, x, t_span, mu, mask, spks, cond):
+        """
+        Fixed euler solver for ODEs, with classifier-free guidance.
+        Args:
+            x (torch.Tensor): random noise
+            t_span (torch.Tensor): n_timesteps interpolated
+                shape: (n_timesteps + 1,)
+            mu (torch.Tensor): output of encoder
+                shape: (batch_size, n_feats, mel_timesteps)
+            mask (torch.Tensor): output_mask
+                shape: (batch_size, 1, mel_timesteps)
+            spks (torch.Tensor, optional): speaker ids. Defaults to None.
+                shape: (batch_size, spk_emb_dim)
+            cond: Conditioning mel, the reference prompt's frames.
+        """
+        in_dtype = x.dtype
+        x, t_span, mu, mask, spks, cond = cast_all(x, t_span, mu, mask, spks, cond, dtype=self.estimator.dtype)
+
+        # Duplicated batch dims are for CFG
+        # Do not use concat, it may cause memory format changed and trt infer with wrong results!
+        B, T = mu.size(0), x.size(2)
+        x_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
+        mask_in = torch.zeros([2 * B, 1, T], device=x.device, dtype=x.dtype)
+        mu_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
+        t_in = torch.zeros([2 * B], device=x.device, dtype=x.dtype)
+        spks_in = torch.zeros([2 * B, 80], device=x.device, dtype=x.dtype)
+        cond_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
+
+        for t, r in zip(t_span[:-1], t_span[1:]):
+            t = t.unsqueeze(dim=0)
+            r = r.unsqueeze(dim=0)
+            # Shapes:
+            #      x_in  ( 2B, 80, T )
+            #   mask_in  ( 2B,  1, T )
+            #     mu_in  ( 2B, 80, T )
+            #      t_in  ( 2B,       )
+            #   spks_in  ( 2B, 80,   )
+            #   cond_in  ( 2B, 80, T )
+            #         x  (  B, 80, T )
+            #      mask  (  B,  1, T )
+            #        mu  (  B, 80, T )
+            #         t  (  B,       )
+            #      spks  (  B, 80,   )
+            #      cond  (  B, 80, T )
+
+            x_in[:B] = x_in[B:] = x
+            mask_in[:B] = mask_in[B:] = mask
+            mu_in[:B] = mu
+            t_in[:B] = t_in[B:] = t
+            spks_in[:B] = spks
+            cond_in[:B] = cond
+            dxdt = self.estimator.forward(
+                x=x_in,
+                mask=mask_in,
+                mu=mu_in,
+                t=t_in,
+                spks=spks_in,
+                cond=cond_in,
+            )
+            dxdt, cfg_dxdt = torch.split(dxdt, [B, B], dim=0)
+            dxdt = (1.0 + INFERENCE_CFG_RATE) * dxdt - INFERENCE_CFG_RATE * cfg_dxdt
+            dt = r - t
+            x = x + dt * dxdt
+
+        return x.to(in_dtype)
 
     def basic_euler(self, x, t_span, mu, mask, spks, cond):
         in_dtype = x.dtype
