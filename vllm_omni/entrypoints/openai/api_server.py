@@ -940,7 +940,7 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
 
-supported_tasks = await engine_client.get_supported_tasks()
+        supported_tasks = await engine_client.get_supported_tasks()
         state.openai_serving_speech = (
             OmniOpenAIServingSpeech.for_diffusion(
                 diffusion_engine=engine_client,
