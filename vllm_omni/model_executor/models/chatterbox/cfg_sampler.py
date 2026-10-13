@@ -4,15 +4,19 @@
 
 from collections.abc import MutableMapping, Sequence
 from dataclasses import replace
-from typing import Any
 
 import torch
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.sampler import Sampler as GpuSampler
 
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
-DEFAULT_CFG_WEIGHT = 0.5
-SPEECH_START_TOKEN = 6561
-SPEECH_STOP_TOKEN = 6562
+SPEECH_START_TOKEN = ChatterboxConfig().start_speech_token
+SPEECH_STOP_TOKEN = ChatterboxConfig().stop_speech_token
 # Request ID -> (pair key, role, weight). The model owns registration/cleanup.
 CFGPairRegistry = MutableMapping[str, tuple[str, str, float]]
 
@@ -29,7 +33,7 @@ class ChatterboxCFGSampler:
     The wrapper deliberately owns no nn.Module state or request lifecycle.
     """
 
-    def __init__(self, base_sampler: Any, pairs: CFGPairRegistry):
+    def __init__(self, base_sampler: Sampler | GpuSampler, pairs: CFGPairRegistry):
         self.base_sampler = base_sampler
         self.pairs = pairs
 
@@ -62,7 +66,7 @@ class ChatterboxCFGSampler:
                 raise ValueError(f"Duplicate Chatterbox CFG role in pair: {key}")
             group[role] = (row, weight)
         row_pairs = []
-        guided = logits.float().clone()
+        guided = logits.to(torch.float32, copy=True)
         for key, group in groups.items():
             if len(group) == 1 and "cond" in group and group["cond"][1] == 0.0:
                 continue
@@ -85,7 +89,9 @@ class ChatterboxCFGSampler:
         guided[:, SPEECH_STOP_TOKEN + 1 :] = -torch.inf
         return guided, row_pairs
 
-    def sample(self, logits: torch.Tensor, sampling_metadata: Any, per_req_extra_args: list[dict]) -> Any:
+    def sample(
+        self, logits: torch.Tensor, sampling_metadata: SamplingMetadata, per_req_extra_args: list[dict]
+    ) -> SamplerOutput:
         """V1 model sampler entry point; preserve upstream sampling metadata."""
         pairs = [extra["chatterbox_cfg"] for extra in per_req_extra_args]
         guided, row_pairs = self.prepare_logits(logits, [pair[0] for pair in pairs], pair_metadata=pairs)
@@ -108,11 +114,11 @@ class ChatterboxMRv2Sampler(OmniSampler):
 class ChatterboxMRv2CFGSampler(ChatterboxMRv2Sampler):
     """MRv2 adapter with upstream request lifecycle and logits processing."""
 
-    def __init__(self, base_sampler: Any, pairs: CFGPairRegistry):
+    def __init__(self, base_sampler: GpuSampler, pairs: CFGPairRegistry):
         super().__init__(base_sampler)
         self.cfg_sampler = ChatterboxCFGSampler(base_sampler, pairs)
 
-    def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
+    def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
         # InputBatch.make_dummy supplies zero prefill lengths and random IDs.
         # Every real Chatterbox prompt contains conditioning and has positive
         # length. Inspect CPU metadata, avoiding a device sync on every token.

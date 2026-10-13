@@ -13,6 +13,9 @@ from transformers.configuration_utils import PretrainedConfig
 # Original's supported generation budget leaves room for its learned speech
 # boundary positions, regardless of the engine's configured context length.
 ORIGINAL_MAX_NEW_TOKENS = 4096
+# Upstream's ``ChatterboxTTS.generate`` defaults for its two controls.
+ORIGINAL_DEFAULT_EXAGGERATION = 0.5
+ORIGINAL_DEFAULT_CFG_WEIGHT = 0.5
 
 
 def validate_flow_settings(dtype: str, backend: str) -> None:

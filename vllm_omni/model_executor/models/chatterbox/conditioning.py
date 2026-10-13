@@ -31,7 +31,11 @@ from vllm_omni.model_executor.models.chatterbox.original_heads import ORIGINAL_M
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.xvector import CAMPPlus
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
-from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import (
+    ORIGINAL_DEFAULT_CFG_WEIGHT,
+    ORIGINAL_DEFAULT_EXAGGERATION,
+    ChatterboxConfig,
+)
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.audio import mel_filter_bank
 
@@ -422,8 +426,8 @@ def build_prompt(
     conditioning: VoiceConditioning,
     config: ChatterboxConfig,
     *,
-    exaggeration: float = 0.5,
-    cfg_weight: float = 0.5,
+    exaggeration: float = ORIGINAL_DEFAULT_EXAGGERATION,
+    cfg_weight: float = ORIGINAL_DEFAULT_CFG_WEIGHT,
 ) -> dict:
     """The engine prompt for one utterance.
 

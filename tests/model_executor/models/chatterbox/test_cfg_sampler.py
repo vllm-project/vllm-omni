@@ -8,7 +8,6 @@ import torch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import (
-    DEFAULT_CFG_WEIGHT,
     SPEECH_START_TOKEN,
     SPEECH_STOP_TOKEN,
     ChatterboxCFGSampler,
@@ -16,6 +15,7 @@ from vllm_omni.model_executor.models.chatterbox.cfg_sampler import (
 )
 from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import ChatterboxT3ForConditionalGeneration
+from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_DEFAULT_CFG_WEIGHT as DEFAULT_CFG_WEIGHT
 from vllm_omni.worker.sampling_utils import call_model_sampler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

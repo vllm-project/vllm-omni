@@ -7,10 +7,13 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_DEFAULT_EXAGGERATION, ChatterboxConfig
+
 # Fixed by the English Original checkpoint, including text BOS/EOS positions.
 ORIGINAL_MAX_TEXT_TOKENS = 2048
 ORIGINAL_TEXT_POSITIONS = ORIGINAL_MAX_TEXT_TOKENS + 2
 ORIGINAL_SPEECH_POSITIONS = 4100
+START_SPEECH_TOKEN = ChatterboxConfig().start_speech_token
 
 
 class OriginalAttention(nn.Module):
@@ -96,7 +99,7 @@ def original_prefill_embeds(
     text_ids: torch.Tensor,
     cond_tokens: torch.Tensor,
     speaker_emb: torch.Tensor,
-    exaggeration: float = 0.5,
+    exaggeration: float = ORIGINAL_DEFAULT_EXAGGERATION,
     unconditional: bool = False,
 ) -> torch.Tensor:
     """Build one raw-text request's exact Original prompt, shape (T + 38, H).
@@ -116,7 +119,7 @@ def original_prefill_embeds(
     reference = original_speech_embeds(heads, cond_tokens, torch.arange(cond_tokens.shape[0], device=device))
     reference = heads.cond_enc.perceiver(reference[None])[0]
     emotion = heads.cond_enc.emotion_adv_fc(text.new_tensor([[exaggeration]]))
-    bos = original_speech_embeds(heads, text_ids.new_tensor([6561]), text_ids.new_tensor([0])).tile(2, 1)
+    bos = original_speech_embeds(heads, text_ids.new_tensor([START_SPEECH_TOKEN]), text_ids.new_tensor([0])).tile(2, 1)
     return torch.cat((heads.cond_enc.spkr_enc(speaker_emb), reference, emotion, text, bos))
 
 

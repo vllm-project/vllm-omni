@@ -107,7 +107,8 @@ class ConditionalCFM(torch.nn.Module):
 class CausalConditionalCFM(ConditionalCFM):
     def __init__(self, cfm_params=CFM_PARAMS, estimator=None):
         super().__init__(cfm_params, estimator)
-        # TODO: BAD BAD IDEA - IT'LL MESS UP DISTILLATION - SETTING TO NONE
+        # No fixed noise of its own: ``forward`` takes the noise it starts
+        # from (``noised_mels``) or draws it per call.
         self.rand_noise = None
 
     @torch.inference_mode()

@@ -13,6 +13,7 @@ contract.
 from typing import Any
 
 import torch
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.data_entry_keys import CodesStruct, EmbeddingsStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -28,7 +29,7 @@ SPEECH_TOKEN_LIMIT = ChatterboxConfig().speech_token_limit
 PRE_LOOKAHEAD = ChatterboxConfig().pre_lookahead_len
 
 
-def prepare_original_prompt(prompt: dict, sampling_params_list: list[Any]) -> dict:
+def prepare_original_prompt(prompt: dict, sampling_params_list: list[SamplingParams]) -> dict:
     """Reject unsupported speech budgets before stage-0 input processing.
 
     This admission hook also runs for unguided and stage-0-only requests.
@@ -48,7 +49,7 @@ def prepare_original_prompt(prompt: dict, sampling_params_list: list[Any]) -> di
     return prompt
 
 
-def expand_original_cfg_prompts(prompt: dict, sampling_params: Any) -> list[ExpandedPrompt]:
+def expand_original_cfg_prompts(prompt: dict, sampling_params: SamplingParams) -> list[ExpandedPrompt]:
     """Add an unconditional twin; the atomic CFG scheduler admits both together."""
     info = prompt["additional_information"]
     if info["chatterbox"]["cfg_weight"] == 0:

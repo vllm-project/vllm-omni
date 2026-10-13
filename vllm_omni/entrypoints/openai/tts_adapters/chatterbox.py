@@ -31,7 +31,12 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
     load_text_tokenizer,
     tokenize_text,
 )
-from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_MAX_NEW_TOKENS, ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import (
+    ORIGINAL_DEFAULT_CFG_WEIGHT,
+    ORIGINAL_DEFAULT_EXAGGERATION,
+    ORIGINAL_MAX_NEW_TOKENS,
+    ChatterboxConfig,
+)
 
 CONDITIONING_MAX_PENDING = 64
 CONDITIONING_CACHE_ENTRIES = 128
@@ -206,8 +211,8 @@ class ChatterboxAdapter(ARTTSAdapter):
     def prepare_prompt(
         self,
         text: str,
-        exaggeration: float = 0.5,
-        cfg_weight: float = 0.5,
+        exaggeration: float = ORIGINAL_DEFAULT_EXAGGERATION,
+        cfg_weight: float = ORIGINAL_DEFAULT_CFG_WEIGHT,
         voice: VoiceConditioning | None = None,
     ) -> dict:
         """Load and condition on a worker thread, outside the API event loop."""
@@ -232,7 +237,10 @@ class ChatterboxAdapter(ARTTSAdapter):
             voice = await self.resolve_voice(source)
         controls = request.extra_params or {}
         prompt = await self.build_async(
-            request.input, controls.get("exaggeration", 0.5), controls.get("cfg_weight", 0.5), voice
+            request.input,
+            controls.get("exaggeration", ORIGINAL_DEFAULT_EXAGGERATION),
+            controls.get("cfg_weight", ORIGINAL_DEFAULT_CFG_WEIGHT),
+            voice,
         )
         return PreparedRequest(prompt=prompt, model_type=self.name)
 
@@ -265,8 +273,11 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
         error = super().validate(request)
         if error:
             return error.replace("Chatterbox Turbo", "Chatterbox Original")
-        for name in ("exaggeration", "cfg_weight"):
-            value = (request.extra_params or {}).get(name, 0.5)
+        for name, default in (
+            ("exaggeration", ORIGINAL_DEFAULT_EXAGGERATION),
+            ("cfg_weight", ORIGINAL_DEFAULT_CFG_WEIGHT),
+        ):
+            value = (request.extra_params or {}).get(name, default)
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 return f"{name} must be a finite nonnegative number"
         return None
