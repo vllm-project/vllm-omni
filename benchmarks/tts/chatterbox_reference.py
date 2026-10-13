@@ -54,10 +54,11 @@ def main():
     try:
         for voice in ("builtin", "clone"):
             reference = args.reference if voice == "clone" else None
-            # Two warmups for each conditioning mode; never include them in percentiles.
-            for seed in (997, 998):
-                seed_everything(seed)
-                synthesize(TEXTS[0], reference, seed)
+            # Warm every text length in each voice mode before timing.
+            for text in TEXTS:
+                for seed in (997, 998):
+                    seed_everything(seed)
+                    synthesize(text, reference, seed)
             for text_index, text in enumerate(TEXTS):
                 for seed in SEEDS:
                     seed_everything(seed)
@@ -108,6 +109,9 @@ def make_backend(args):
         cls = ChatterboxTurboTTS if args.variant == "turbo" else ChatterboxTTS
         model = cls.from_local(str(args.model), "cuda")
         builtin = model.conds
+        for component in (model.t3, model.s3gen, model.ve):
+            if {parameter.dtype for parameter in component.parameters()} != {torch.float32}:
+                raise ValueError("The canonical reference must run in FP32")
 
         def synthesize(text, reference, seed):
             model.conds = builtin
@@ -219,7 +223,7 @@ def write_report(args, rows):
         precision="float32; TF32 disabled",
         concurrency=1,
         max_new_tokens=1000,
-        warmup_per_mode=2,
+        warmup_per_mode=2 * len(TEXTS),
         rows=rows,
         summaries=summaries,
         scope="warm whole utterance including clone conditioning and CPU waveform assembly; excludes WAV writing",

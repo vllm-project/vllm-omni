@@ -376,7 +376,7 @@ The job does not replace cold-reference or WebSocket validation with
 API with `Omni.generate` on an exclusive GPU, one request at a time. Use pinned
 local checkpoints and the same reference WAV. It measures whole utterances in
 FP32/eager mode, including fresh reference conditioning for every cloned-voice
-request, with two warmups per voice mode and three texts across three seeds.
+request, with two warmups per text and voice mode and three texts across three seeds.
 Initialization and WAV writing are excluded. Whole-device memory includes
 Omni's separate workers and is sampled every 100 ms.
 
