@@ -22,8 +22,10 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
+from vllm_omni.diffusion.forward_context import build_local_sp_padding_mask, get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -399,6 +401,7 @@ def extract_wan2_2_context(
     timestep: torch.LongTensor,
     encoder_hidden_states: torch.Tensor,
     encoder_hidden_states_image: torch.Tensor | None = None,
+    intermediate_tensors: IntermediateTensors | None = None,
     return_dict: bool = True,
     attention_kwargs: dict[str, Any] | None = None,
     **kwargs: Any,
@@ -423,10 +426,6 @@ def extract_wan2_2_context(
     Returns:
         CacheContext with all information needed for generic caching
 
-    Note:
-        Sequence parallel (SP) is not currently supported for Wan TeaCache:
-        - hidden_states is full-sequence while block output is sharded
-        - hidden_states_mask for auto-padding is not passed to blocks
     """
     from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
@@ -438,11 +437,23 @@ def extract_wan2_2_context(
     post_patch_height = hidden_states.shape[3] // p_h
     post_patch_width = hidden_states.shape[4] // p_w
 
-    freqs_cos, freqs_sin = module.rope(hidden_states)
-    rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
+    current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
+    if module._cached_rope_resolution == current_rope_resolution and module._cached_rope_emb is not None:
+        rotary_emb = module._cached_rope_emb
+    else:
+        freqs_cos, freqs_sin = module.rope(hidden_states)
+        rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
+        module._hidden_states_shape = hidden_states.shape
+        module._cached_rope_emb = rotary_emb
 
-    hidden_states = module.patch_embedding(hidden_states)
-    hidden_states = hidden_states.flatten(2).transpose(1, 2)
+    if is_pipeline_first_stage():
+        hidden_states = module.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        hidden_states = module._sp_shard_point(hidden_states)
+    else:
+        if intermediate_tensors is None:
+            raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
+        hidden_states = intermediate_tensors["hidden_states"]
 
     if timestep.ndim == 2:
         ts_seq_len = timestep.shape[1]
@@ -458,7 +469,23 @@ def extract_wan2_2_context(
     if encoder_hidden_states_image is not None:
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
-    block = module.blocks[0]
+    hidden_states_mask = None
+    ctx = get_forward_context()
+    parallel_config = ctx.omni_diffusion_config.parallel_config
+    if (
+        parallel_config is not None
+        and parallel_config.sequence_parallel_size > 1
+        and parallel_config.mask_sp_padding
+    ):
+        hidden_states_mask = build_local_sp_padding_mask(
+            hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
+        )
+        if hidden_states_mask.all():
+            hidden_states_mask = None
+
+    # make_layers leaves PPMissingLayer placeholders outside this stage's slice.
+    # Use the first local block for the TeaCache modulation signal.
+    block = module.blocks[module.start_layer]
     if timestep_proj.ndim == 4:
         # I2V/TI2V: per-token timestep [B, seq, 6, inner_dim]
         shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table.unsqueeze(0) + timestep_proj).chunk(6, dim=2)
@@ -473,11 +500,23 @@ def extract_wan2_2_context(
 
     def run_transformer_blocks():
         h = hidden_states
-        for block in module.blocks:
-            h = block(h, encoder_hidden_states, timestep_proj, rotary_emb)
+        vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
+        for block in module.blocks[module.start_layer : module.end_layer]:
+            h = block(
+                h,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+                vsa_dit_seq_shape,
+                module.preserve_vsa_all_blocks,
+            )
         return (h,)
 
     def postprocess(h):
+        if not is_pipeline_last_stage():
+            return IntermediateTensors({"hidden_states": h})
+
         shift, scale = module.output_scale_shift_prepare(temb)
         shift = shift.to(h.device)
         scale = scale.to(h.device)

@@ -10,7 +10,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from vllm.sequence import IntermediateTensors
 
+from vllm_omni.diffusion.cache.teacache import extractors as teacache_extractors
 from vllm_omni.diffusion.cache.teacache.extractors import extract_wan2_2_context
 from vllm_omni.diffusion.models.wan2_2 import wan2_2_transformer as wan
 
@@ -83,8 +85,15 @@ def _make_wan_model():
 def test_wan_extractor_matches_native_single_device_forward(monkeypatch, mode, return_dict):
     monkeypatch.setattr(wan, "is_pipeline_first_stage", lambda: True)
     monkeypatch.setattr(wan, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: True, raising=False)
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: True, raising=False)
     monkeypatch.setattr(
         wan,
+        "get_forward_context",
+        lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(parallel_config=None)),
+    )
+    monkeypatch.setattr(
+        teacache_extractors,
         "get_forward_context",
         lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(parallel_config=None)),
     )
@@ -144,3 +153,90 @@ def test_wan_extractor_matches_native_single_device_forward(monkeypatch, mode, r
     assert actual_sample.shape == hidden_states.shape
     assert actual_sample.dtype == hidden_states.dtype
     torch.testing.assert_close(actual_sample, expected_sample)
+
+
+def test_wan_extractor_preserves_pipeline_stage_boundaries(monkeypatch):
+    """Patchify only the first PP stage and return tokens from a non-last stage."""
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: True, raising=False)
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: False, raising=False)
+    monkeypatch.setattr(
+        teacache_extractors,
+        "get_forward_context",
+        lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(parallel_config=None)),
+    )
+    model = _make_wan_model()
+    stage_block = Mock(side_effect=lambda h, *args: h + 3)
+    stage_block.scale_shift_table = model.blocks[0].scale_shift_table
+    stage_block.norm1 = model.blocks[0].norm1
+    model.blocks = [model.blocks[0], stage_block]
+    model.start_layer, model.end_layer = 1, 2
+    hidden_states = torch.arange(96, dtype=torch.bfloat16).reshape(1, 2, 2, 4, 6)
+    text = torch.zeros(1, 3, 4, dtype=torch.bfloat16)
+
+    first = extract_wan2_2_context(model, hidden_states, torch.tensor([1]), text)
+    (first_output,) = first.run_transformer_blocks()
+    first_result = first.postprocess(first_output)
+    assert model.patch_embedding.call_count == 1
+    assert isinstance(first_result, IntermediateTensors)
+    torch.testing.assert_close(first_result["hidden_states"], first_output)
+    assert model.blocks[0].call_count == 0
+    assert model.blocks[1].call_count == 1
+
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: False, raising=False)
+    model.patch_embedding.reset_mock()
+    model.blocks[1].reset_mock()
+    intermediate = IntermediateTensors({"hidden_states": first_output})
+    non_first = extract_wan2_2_context(
+        model, hidden_states, torch.tensor([1]), text, intermediate_tensors=intermediate
+    )
+    (non_first_output,) = non_first.run_transformer_blocks()
+    assert model.patch_embedding.call_count == 0
+    torch.testing.assert_close(non_first.hidden_states, first_output)
+    assert model.blocks[1].call_count == 1
+    assert isinstance(non_first.postprocess(non_first_output), IntermediateTensors)
+
+
+def test_wan_extractor_uses_native_sp_padding_mask_and_block_arguments(monkeypatch):
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: True, raising=False)
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: True, raising=False)
+    parallel_config = SimpleNamespace(sequence_parallel_size=2, mask_sp_padding=True)
+    monkeypatch.setattr(
+        teacache_extractors,
+        "get_forward_context",
+        lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(parallel_config=parallel_config)),
+    )
+    padding_mask = torch.tensor([[True, True, False, False, False, False]])
+    build_mask = Mock(return_value=padding_mask)
+    monkeypatch.setattr(teacache_extractors, "build_local_sp_padding_mask", build_mask, raising=False)
+    model = _make_wan_model()
+    model._sp_shard_point = Mock(side_effect=lambda value: value)
+    hidden_states = torch.zeros(1, 2, 1, 4, 6, dtype=torch.bfloat16)
+    context = extract_wan2_2_context(model, hidden_states, torch.tensor([1]), torch.zeros(1, 3, 4))
+    context.run_transformer_blocks()
+
+    build_mask.assert_called_once_with(1, 6, hidden_states.device)
+    assert model._sp_shard_point.call_count == 1
+    args = model.blocks[0].call_args.args
+    assert args[4] is padding_mask
+    assert args[5] == (1, 2, 3)
+    assert args[6] is False
+
+
+def test_wan_extractor_preserves_vsa_grid_and_all_blocks_setting(monkeypatch):
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: True, raising=False)
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(
+        teacache_extractors,
+        "get_forward_context",
+        lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(parallel_config=None)),
+    )
+    model = _make_wan_model()
+    model.preserve_vsa_all_blocks = True
+    hidden_states = torch.zeros(1, 2, 2, 4, 6, dtype=torch.bfloat16)
+    context = extract_wan2_2_context(model, hidden_states, torch.tensor([1]), torch.zeros(1, 3, 4))
+    context.run_transformer_blocks()
+
+    args = model.blocks[0].call_args.args
+    assert args[4] is None
+    assert args[5] == (2, 2, 3)
+    assert args[6] is True
