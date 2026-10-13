@@ -12,15 +12,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import vllm_omni.diffusion.executor.multiproc_executor as executor_module
 from vllm_omni.diffusion.data import AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
+from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
+from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_executor(step_execution=False):
     """Create a minimal MultiprocDiffusionExecutor-like object with pump state."""
-    from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
-
     od_config = MagicMock()
     od_config.step_execution = step_execution
 
@@ -681,10 +685,8 @@ class TestDropOutput:
             late.result(timeout=0)
 
     def test_dropped_ids_memory_is_bounded(self, monkeypatch):
-        from vllm_omni.diffusion.executor import multiproc_executor as mpe
-
         cap = 8
-        monkeypatch.setattr(mpe, "_DROPPED_OUTPUT_IDS_MAX", cap)
+        monkeypatch.setattr(executor_module, "_DROPPED_OUTPUT_IDS_MAX", cap)
         executor = _make_executor()
         n = cap + 5
         for i in range(n):
@@ -962,12 +964,6 @@ def test_async_request_output_preserves_error_metadata(status_code, error_type):
 @pytest.mark.parametrize("dp_wave", [False, True])
 @pytest.mark.parametrize("status_code", [400, 422, None])
 def test_request_rpc_exception_keeps_metadata_for_every_request(monkeypatch, mocker, dp_wave, status_code):
-    import vllm_omni.diffusion.executor.multiproc_executor as executor_module
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
-    from vllm_omni.errors import OmniClientError
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
     executor = _make_executor()
     monkeypatch.setattr(executor_module, "any_selected_component_uses_allgather", lambda config: dp_wave)
     monkeypatch.setattr(executor_module, "_uses_text_encoder_allgather", lambda config: False)
