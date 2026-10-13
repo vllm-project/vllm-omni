@@ -74,6 +74,9 @@ class _FakePool:
     def get_bound_client(self, request_id):
         return self.stage_client
 
+    def get_payload_sender_info(self, request_id):
+        return None
+
 
 def _orchestrator(payload_func: Any = None, cls: type[Orchestrator] = Orchestrator) -> Orchestrator:
     """Thinker -> Talker (no payload hook) -> Code2Wav (``payload_func``, if any)."""

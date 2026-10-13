@@ -17,6 +17,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionReque
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
+from vllm_omni.entrypoints.openai.stage_params import to_sampling_params_list
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -821,14 +822,14 @@ def test_to_sampling_params_list_pads_missing_tail_stage_with_defaults(mocker: M
     engine_client = mocker.MagicMock()
     engine_client.stage_configs = [SimpleNamespace(stage_type="llm") for _ in range(4)]
     engine_client.default_sampling_params_list = default_params
-    instance = build_serving_chat(engine_client=engine_client)
 
-    result = instance._to_sampling_params_list(
+    result = to_sampling_params_list(
+        engine_client,
         [
             {"max_tokens": 1},
             {"max_tokens": 2},
             {"max_tokens": 3},
-        ]
+        ],
     )
 
     assert len(result) == 4

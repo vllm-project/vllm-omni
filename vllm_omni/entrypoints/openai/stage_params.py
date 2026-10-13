@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import copy
+from dataclasses import fields, is_dataclass
 from typing import Any
 
 from vllm import SamplingParams
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.utils import get_stage_type
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 
 logger = init_logger(__name__)
 
@@ -83,3 +84,42 @@ def build_stage_sampling_params_list(
                 )
             )
     return sampling_params_list
+
+
+def to_sampling_params_list(engine_client: Any, sampling_params_list: list[dict]) -> list[Any]:
+    """Convert request dicts to stage-typed sampling params objects.
+
+    For diffusion stages, build ``OmniDiffusionSamplingParams`` so
+    downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
+    requires a dataclass) works. For LLM stages build ``SamplingParams``.
+    If callers provide params for fewer stages than the native pipeline has
+    (for example AURA has three semantic models but four engine stages),
+    append cloned deploy defaults for the omitted tail stages.
+    """
+    stage_configs = list(getattr(engine_client, "stage_configs", []) or [])
+    default_params_list = list(getattr(engine_client, "default_sampling_params_list", []) or [])
+    final_sampling_params_list: list[Any] = []
+    for idx, sampling_params in enumerate(sampling_params_list):
+        stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
+        target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
+        if isinstance(sampling_params, dict):
+            final_sampling_params_list.append(target_cls(**sampling_params))
+        elif isinstance(sampling_params, target_cls):
+            final_sampling_params_list.append(sampling_params)
+        elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
+            # Cross-typed (e.g. user passed SamplingParams but this is a
+            # diffusion stage) — rebuild via a dict round-trip so we end
+            # up with the correct target class.
+            as_dict = {
+                f.name: getattr(sampling_params, f.name)
+                for f in (fields(sampling_params) if is_dataclass(sampling_params) else [])
+            } or sampling_params.__dict__
+            final_sampling_params_list.append(target_cls(**as_dict))
+        else:
+            raise ValueError(f"Invalid sampling params: {sampling_params}")
+    for idx in range(len(final_sampling_params_list), len(stage_configs)):
+        if idx < len(default_params_list):
+            final_sampling_params_list.append(clone_sampling_params(default_params_list[idx]))
+        else:
+            final_sampling_params_list.append(SamplingParams())
+    return final_sampling_params_list

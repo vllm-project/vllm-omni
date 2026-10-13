@@ -89,6 +89,7 @@ def _make_scheduler(scheduler_cls):
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = None
     scheduler._pending_request_prewarms = {}
+    scheduler._outputs_awaiting_stage_payload = {}
     return scheduler
 
 

@@ -643,6 +643,7 @@ def test_scheduler_chunk_gate_preserves_kv_holding_queue(build_adapter, active_s
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.running = []
     scheduler.chunk_transfer_adapter = adapter
     scheduler.input_coordinator = None
@@ -2481,6 +2482,7 @@ def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
 
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request] if placement == "running" else []
@@ -2529,6 +2531,7 @@ def test_finish_requests_does_not_reopen_off_queue_resumable_segment(build_adapt
 
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {request.request_id: request}
     scheduler.running = []
@@ -2785,6 +2788,7 @@ def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.chunk_transfer_adapter = adapter
+    sched._outputs_awaiting_stage_payload = {}
     sched.requests = {}
     sched.running = []
     sched.waiting = []
@@ -2801,6 +2805,7 @@ def _parked_sender_scheduler(adapter, session):
     """A minimal OmniARScheduler holding one parked streaming session."""
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {session.request_id: session}
     scheduler.running = []

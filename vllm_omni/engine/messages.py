@@ -9,7 +9,7 @@ import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -39,6 +39,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    # Stage ID to provide the output of current request for use in external routing.
+    # Only set when that stage has a next stage; otherwise it's a normal request.
+    yield_stage_id: int | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -111,6 +114,29 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     metrics: StageRequestMetrics | None = None
     finished: bool
     stage_submit_ts: float | None = None
+
+
+class NextStageInputMessage(EngineQueueMessage, kw_only=True):
+    """Input for the next stage, to support external routing.
+
+    NOTE: This encapsulates everything needed to submit to the receiver
+    in the next request since in this case, each stage call is a separate
+    request. This message should not be used in normal cases, since
+    most of the state lives on objects held by the orchestrator and connectors.
+    """
+
+    type: Literal["next_stage_input"] = "next_stage_input"
+    request_id: str
+    source_stage_id: int
+    receiver_stage_id: int
+    requests: list[EngineCoreRequest] | list[OmniPromptType]
+    submit_kwargs: dict[str, object] | None
+    stage_output: OmniRequestOutput | None
+    prompt: OmniPromptType
+    # Currently, sampling params are set by the stage 0 call & carried to every later call
+    sampling_params_list: list[OmniSamplingParams]
+    final_stage_id: int
+    final_output_stage_ids: list[int]
 
 
 class AbortResultMessage(EngineQueueMessage, kw_only=True):

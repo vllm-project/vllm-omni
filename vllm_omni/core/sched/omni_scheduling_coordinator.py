@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Any
+from typing import Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.data_entry_keys import Codes, OmniPayload, OmniPayloadMeta, payload_audio_codes, payload_finished
 
 logger = init_logger(__name__)
 
@@ -41,6 +42,36 @@ def uses_full_payload_input_coordinator(model_config: Any) -> bool:
     if getattr(model_config, "async_chunk", False):
         return False
     return bool(getattr(model_config, "requires_full_payload_input", False))
+
+
+def payload_for_scheduler(payload: OmniPayload) -> OmniPayload:
+    """Keep only what the scheduler reads; large tensors such as hidden states stay in the worker."""
+    scheduler_payload = OmniPayload()
+    if scheduler_meta := extract_scheduler_meta(payload):
+        scheduler_payload["meta"] = scheduler_meta
+    if (audio_codes := payload_audio_codes(payload)) is not None:
+        scheduler_payload["codes"] = Codes(audio=audio_codes)
+    return scheduler_payload
+
+
+def extract_scheduler_meta(payload: OmniPayload) -> OmniPayloadMeta:
+    """Return the meta fields the scheduler reads."""
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        meta = OmniPayloadMeta()
+    scheduler_meta = OmniPayloadMeta()
+    if "next_stage_prompt_len" in meta:
+        scheduler_meta["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
+    elif (legacy_prompt_len := cast(dict[str, Any], payload).get("next_stage_prompt_len")) is not None:
+        logger.warning_once("legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'")
+        scheduler_meta["next_stage_prompt_len"] = legacy_prompt_len
+    if "left_context_size" in meta:
+        scheduler_meta["left_context_size"] = meta["left_context_size"]
+    elif "left_context_size" in payload:
+        logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
+    if "finished" in meta:
+        scheduler_meta["finished"] = meta["finished"]
+    return scheduler_meta
 
 
 class OmniSchedulingCoordinator:
@@ -325,7 +356,7 @@ class OmniSchedulingCoordinator:
     def update_request_metadata(
         self,
         requests: dict[str, Request],
-        request_metadata: dict[str, dict[str, Any]],
+        request_metadata: dict[str, OmniPayload],
         model_mode: str = "ar",
     ) -> None:
         """Apply received scheduling metadata to request objects.
@@ -341,15 +372,16 @@ class OmniSchedulingCoordinator:
             if request is None:
                 continue
 
-            if metadata.get("input_terminal") is True:
+            if payload_finished(metadata):
                 self.input_terminal_req_ids.add(req_id)
+            meta = metadata.get("meta", OmniPayloadMeta())
 
             # Handle next_stage_prompt_len if present (for models like Qwen3-Omni).
             # Only apply when the request has not started decoding yet
             # (no output tokens). Resetting a mid-decode request would
             # destroy generated tokens and desync KV cache state.
-            if "next_stage_prompt_len" in metadata:
-                next_len = metadata["next_stage_prompt_len"]
+            if "next_stage_prompt_len" in meta:
+                next_len = meta["next_stage_prompt_len"]
                 if isinstance(next_len, int) and next_len > 0:
                     output_token_ids = getattr(request, "_output_token_ids", None)
                     if output_token_ids is not None and len(output_token_ids) > 0:
@@ -379,12 +411,12 @@ class OmniSchedulingCoordinator:
                             )
 
             if model_mode != "ar":
-                new_codes = metadata.get("code_predictor_codes")
+                new_codes = payload_audio_codes(metadata)
                 new_ids = self._flatten_prompt_token_ids(new_codes)
                 runtime_seed = None
-                if "left_context_size" in metadata:
+                if "left_context_size" in meta:
                     runtime_seed = {
-                        "meta": {"left_context_size": metadata["left_context_size"]},
+                        "meta": {"left_context_size": meta["left_context_size"]},
                     }
                 request._omni_initial_model_buffer = runtime_seed
                 # An explicit empty snapshot clears a previous codec chunk
