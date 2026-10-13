@@ -339,9 +339,14 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         #     model_params.pop("type", None)  # internal fields
 
         client = VLLMOmniClient(url)
+        from comfy.utils import ProgressBar
+
+        progress = ProgressBar(100)
+        progress.update_absolute(0)
         output = await client.generate_video(
             model=model,
             spec_model=spec_model,
+            on_progress=progress.update_absolute,
             prompt=prompt,
             frame=frame,  # frame present => fl2va / Wan I2V
             first_frame=first_frame,

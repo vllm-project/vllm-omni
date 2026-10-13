@@ -436,6 +436,9 @@ async def _run_video_generation_job(
         async def _mark_started() -> None:
             await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
 
+        async def _mark_progress(value: int) -> None:
+            await VIDEO_STORE.update_fields(video_id, {"progress": value})
+
         video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
             await handler.generate_video_bytes(
                 request,
@@ -444,6 +447,7 @@ async def _run_video_generation_job(
                 reference_video=reference_video,
                 reference_audio=reference_audio,
                 on_started=_mark_started,
+                on_progress=_mark_progress,
                 latent_edit_input=latent_edit_input,
             )
         )

@@ -44,6 +44,7 @@ from PIL import Image
 from pydantic import ValidationError
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.data import get_diffusion_progress
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest, VideoParams
@@ -682,6 +683,8 @@ class OmniStreamingVideoOutputHandler:
             sampling_params_list=sampling_params_list,
         ):
             progress.touch()
+            if get_diffusion_progress(output) is not None:
+                continue
             yield output
 
     @staticmethod

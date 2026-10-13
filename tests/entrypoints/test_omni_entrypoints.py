@@ -1541,3 +1541,37 @@ def test_del_shutsdown_engine(monkeypatch: pytest.MonkeyPatch):
     del app
     gc.collect()
     assert engine.shutdown_called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frontend", ["offline_list", "offline_generator", "async"])
+async def test_diffusion_progress_is_only_exposed_by_async_frontend(frontend, monkeypatch):
+    from vllm_omni.diffusion.data import DIFFUSION_PROGRESS_KEY, get_diffusion_progress
+
+    def enqueue_outputs(engine, msg):
+        progress = OmniRequestOutput.from_diffusion(
+            request_id=msg["request_id"], images=[], finished=False, custom_output={DIFFUSION_PROGRESS_KEY: 50}
+        )
+        engine.output_q.put(
+            OutputMessage(request_id=msg["request_id"], stage_id=0, engine_outputs=progress, finished=False)
+        )
+        _enqueue_async_diffusion_only_output(engine, msg)
+
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=DIFFUSION_ONLY_META,
+        default_sampling_params_list=[SamplingParams(max_tokens=8)],
+        on_add_request=enqueue_outputs,
+    )
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model") if frontend == "async" else Omni("dummy-model")
+    try:
+        if frontend == "async":
+            outputs = [output async for output in app.generate("test", request_id="video")]
+            assert [get_diffusion_progress(output) for output in outputs] == [50, None]
+        else:
+            outputs = list(app.generate("test", py_generator=frontend == "offline_generator", use_tqdm=False))
+            assert [get_diffusion_progress(output) for output in outputs] == [None]
+        assert outputs[-1].finished
+        assert outputs[-1].images == [f"{engine.submitted[0]['request_id']}-image"]
+    finally:
+        app.shutdown()

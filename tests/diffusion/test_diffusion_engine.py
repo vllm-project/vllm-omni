@@ -16,6 +16,7 @@ from pytest_mock import MockerFixture
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import (
+    DIFFUSION_PROGRESS_KEY,
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
@@ -26,6 +27,7 @@ from vllm_omni.diffusion.diffusion_engine import (
     DiffusionExecutionMode,
     _move_tensor_tree_to_cpu,
 )
+from vllm_omni.diffusion.models.progress_bar import DiffusionProgress
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -149,6 +151,7 @@ def _make_admission_engine(pre_process_func) -> DiffusionEngine:
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()
     engine.pre_process_func = pre_process_func
+    engine._out_streams_lock = threading.Lock()
     engine._out_streams = {}
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
@@ -211,6 +214,34 @@ def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
         DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED,
     }
     assert formatted.finished is False
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("completed", "total", "expected"),
+    [(0, 49, 0), (1, 3, 33), (31, 49, 63), (49, 49, 100)],
+)
+@pytest.mark.asyncio
+async def test_progress_output_is_non_final(completed, total, expected) -> None:
+    request = OmniDiffusionRequest(
+        prompt="test video",
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_id="video-progress",
+    )
+    engine = object.__new__(DiffusionEngine)
+    emitted = asyncio.Queue()
+    engine.main_loop = asyncio.get_running_loop()
+    engine._out_streams_lock = threading.Lock()
+    engine._out_streams = {request.request_id: emitted}
+
+    engine._on_progress(DiffusionProgress(request.request_id, completed, total))
+    output = await asyncio.wait_for(emitted.get(), timeout=1)
+
+    [formatted] = engine.postprocess_output(request, output)
+    assert formatted.request_id == request.request_id
+    assert formatted.custom_output == {DIFFUSION_PROGRESS_KEY: expected}
+    assert formatted.finished is False
+    assert formatted.images == []
 
 
 class TestRequestBatchCapability:
@@ -905,6 +936,7 @@ def test_engine_admission_preprocesses_request_once(entrypoint: str) -> None:
 async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()
+    engine._out_streams_lock = threading.Lock()
     engine._out_streams = {}
     engine.abort_queue: queue.Queue[str] = queue.Queue()
     engine._rpc_queue = queue.Queue()

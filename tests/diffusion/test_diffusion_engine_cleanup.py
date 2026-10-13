@@ -38,6 +38,7 @@ def _make_engine() -> DiffusionEngine:
     engine.executor = SimpleNamespace(shutdown=Mock())
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
+    engine._out_streams_lock = threading.Lock()
     engine._out_streams = {}
     engine._closed = False
     engine._shutting_down = False

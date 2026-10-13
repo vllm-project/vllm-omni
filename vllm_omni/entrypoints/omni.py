@@ -13,10 +13,11 @@ from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.diffusion.data import get_diffusion_progress
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.messages import OutputMessage
+from vllm_omni.engine.messages import EngineQueueMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni_base import OmniBase
+from vllm_omni.entrypoints.omni_base import OmniBase, OutputMessageHandleResult
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -31,6 +32,11 @@ class Omni(OmniBase):
 
     def _create_engine(self, **engine_kwargs: Any) -> AsyncOmniEngine:
         return AsyncOmniEngine(**engine_kwargs)
+
+    def _handle_output_message(self, msg: EngineQueueMessage | None) -> OutputMessageHandleResult:
+        if isinstance(msg, OutputMessage) and get_diffusion_progress(msg.engine_outputs) is not None:
+            return True, None, None, None
+        return super()._handle_output_message(msg)
 
     def _maybe_force_final_only_for_llm_stages(
         self,

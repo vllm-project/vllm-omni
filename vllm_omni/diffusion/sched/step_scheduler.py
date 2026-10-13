@@ -129,6 +129,17 @@ class StepScheduler(BaseScheduler):
 
         return self._finalize_update_from_output(sched_output, terminal_statuses, terminal_errors)
 
+    def get_request_progress(self, request_id: str) -> tuple[int, int] | None:
+        """Get the request's denoising progress.
+
+        Returns:
+            (completed_steps, total_steps), or None when the request has no tracked progress.
+        """
+        progress = self._request_progress.get(request_id)
+        if progress is None:
+            return None
+        return progress.current_step, progress.total_steps
+
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
 

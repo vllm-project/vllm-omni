@@ -27,6 +27,7 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.models.progress_bar import DiffusionProgress
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
     any_selected_component_uses_allgather,
@@ -964,7 +965,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
                 continue
 
-            if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
+            if msg.kind == AsyncOutputKind.PROGRESS:
+                if self.progress_callback is not None:
+                    progress = cast(DiffusionProgress, msg.result)
+                    try:
+                        self.progress_callback(progress)
+                    except Exception:
+                        logger.warning(
+                            "Failed to deliver diffusion progress for %s", progress.request_id, exc_info=True
+                        )
+            elif msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
                 with self._futures_lock:
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
                 if fut is not None and not fut.done():

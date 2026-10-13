@@ -1818,6 +1818,19 @@ class OmniDiffusionConfig:
 
 DIFFUSION_REQUEST_LIFECYCLE_KEY = "_diffusion_request_lifecycle"
 DIFFUSION_REQUEST_STARTED = "started"
+DIFFUSION_PROGRESS_KEY = "_diffusion_progress"
+
+
+def is_diffusion_control_output(output: Any) -> bool:
+    return is_diffusion_request_started_output(output) or get_diffusion_progress(output) is not None
+
+
+def get_diffusion_progress(output: Any) -> int | None:
+    """Return the denoising percentage [0, 100], or None for outputs without progress."""
+    custom_output = getattr(output, "custom_output", None)
+    if isinstance(custom_output, dict):
+        return custom_output.get(DIFFUSION_PROGRESS_KEY)
+    return None
 
 
 def is_diffusion_request_started_output(output: Any) -> bool:
@@ -1889,6 +1902,8 @@ class DiffusionOutput:
     # transport optimizations; unmarked legacy outputs retain their old path.
     video_output_index: int | None = None
 
+    denoising_progress: int | None = None
+
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
             raise TypeError(f"media must be DiffusionMediaOutput, got {type(self.media).__name__}")
@@ -1932,12 +1947,14 @@ class DiffusionOutput:
 class AsyncOutputKind(Enum):
     """Message kind for ``AsyncDiffusionOutput`` — routes async results.
 
+    * ``PROGRESS`` — denoising step update carried in ``result``
     * ``RPC_RESULT`` — ordinary RPC return (sleep, wake, profile, etc.)
     * ``COMPUTE_DONE`` — worker forward finished, GPU can start next request
     * ``OUTPUT_READY`` — background D2H/SHM packing finished, final output
       is available via ``async_output_id``
     """
 
+    PROGRESS = "progress"
     RPC_RESULT = "rpc_result"
     COMPUTE_DONE = "compute_done"
     OUTPUT_READY = "output_ready"

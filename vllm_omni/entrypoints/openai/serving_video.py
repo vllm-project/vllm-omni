@@ -19,7 +19,7 @@ from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import is_diffusion_request_started_output
+from vllm_omni.diffusion.data import get_diffusion_progress, is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import DiffusionModelMetadata, get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
@@ -319,6 +319,7 @@ class OmniOpenAIServingVideo:
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
         on_started: Callable[[], Awaitable[None]] | None = None,
+        on_progress: Callable[[int], Awaitable[None]] | None = None,
         latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
@@ -526,6 +527,7 @@ class OmniOpenAIServingVideo:
             gen_params,
             reference_id,
             on_started=on_started,
+            on_progress=on_progress,
         )
         multimodal_output = self._extract_multimodal_output(result)
         metadata = multimodal_output.get("metadata") if isinstance(multimodal_output, dict) else {}
@@ -616,6 +618,7 @@ class OmniOpenAIServingVideo:
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
         on_started: Callable[[], Awaitable[None]] | None = None,
+        on_progress: Callable[[int], Awaitable[None]] | None = None,
         latent_edit_input: LatentEditInput | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
@@ -626,6 +629,7 @@ class OmniOpenAIServingVideo:
             reference_video=reference_video,
             reference_audio=reference_audio,
             on_started=on_started,
+            on_progress=on_progress,
             latent_edit_input=latent_edit_input,
         )
         if len(artifacts.videos) > 1:
@@ -737,6 +741,7 @@ class OmniOpenAIServingVideo:
         request_id: str,
         *,
         on_started: Callable[[], Awaitable[None]] | None = None,
+        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> object:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
@@ -771,6 +776,10 @@ class OmniOpenAIServingVideo:
             request_id=request_id,
             sampling_params_list=sampling_params_list,
         ):
+            progress = get_diffusion_progress(output)
+            if progress is not None and on_progress is not None:
+                await on_progress(progress)
+                continue
             if is_diffusion_request_started_output(output):
                 if on_started is not None and not started_notified:
                     await on_started()

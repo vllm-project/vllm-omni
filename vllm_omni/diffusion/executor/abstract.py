@@ -17,6 +17,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.models.progress_bar import DiffusionProgress
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -26,6 +27,7 @@ class DiffusionExecutor(ABC):
     """Abstract base class for Diffusion executors."""
 
     uses_multiproc: bool = False
+    progress_callback: Callable[[DiffusionProgress], None] | None = None
 
     @staticmethod
     def get_class(od_config: OmniDiffusionConfig) -> type[DiffusionExecutor]:

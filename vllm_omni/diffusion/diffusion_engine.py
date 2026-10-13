@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
+    DIFFUSION_PROGRESS_KEY,
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
@@ -44,6 +45,7 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
+from vllm_omni.diffusion.models.progress_bar import DiffusionProgress
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     any_selected_component_uses_allgather,
@@ -299,6 +301,7 @@ class DiffusionEngine:
                     kv_vllm_config=kv_vllm_config,
                 )
             self._init_runtime_state()
+            self.executor.progress_callback = self._on_progress
             self._init_execute_fn()
             self._log_execution_mode(od_config)
         except Exception:
@@ -408,6 +411,7 @@ class DiffusionEngine:
         # busy loop rather than via mutual exclusion.
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
+        self._out_streams_lock = threading.Lock()
         self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
         self._closed = False
         self._shutting_down = False
@@ -551,6 +555,28 @@ class DiffusionEngine:
             final_output = output
         return final_output or []
 
+    def _on_progress(self, progress: DiffusionProgress) -> None:
+        loop = self.main_loop
+        if loop is None or not loop.is_running() or progress.total <= 0:
+            return
+        with self._out_streams_lock:
+            queue = self._out_streams.get(progress.request_id)
+        if queue is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._deliver_progress, progress, queue)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+
+    def _deliver_progress(self, progress: DiffusionProgress, queue: asyncio.Queue[DiffusionOutput]) -> None:
+        with self._out_streams_lock:
+            current_queue = self._out_streams.get(progress.request_id)
+        if current_queue is queue:
+            queue.put_nowait(
+                DiffusionOutput(finished=False, denoising_progress=progress.completed * 100 // progress.total)
+            )
+
     def postprocess_output(
         self,
         request: OmniDiffusionRequest,
@@ -567,6 +593,12 @@ class DiffusionEngine:
                     error_type=output.error_type,
                 )
             raise RuntimeError(output.error)
+        if output.denoising_progress is not None:
+            return format_empty_diffusion_outputs(
+                request,
+                finished=False,
+                custom_output={DIFFUSION_PROGRESS_KEY: output.denoising_progress},
+            )
         if output.request_started:
             return format_empty_diffusion_outputs(
                 request,
@@ -947,7 +979,8 @@ class DiffusionEngine:
                 self._request_cancellations.cancel_all()
             if self.stop_event is not None:
                 self.stop_event.set()
-            streams = list(self._out_streams.values())
+            with self._out_streams_lock:
+                streams = list(self._out_streams.values())
             self._cv.notify_all()
 
         logger.error("Diffusion engine failed; stopping workers before releasing KV pages", exc_info=exc)
@@ -1030,10 +1063,14 @@ class DiffusionEngine:
                     missing_result_error="Diffusion step execution finished without a final output.",
                 )
                 delivered_finished_req_ids.add(request_id)
-            elif req_output is not None and req_output.result is not None:
-                # This is a non-terminal chunk. It is not in scheduler's
-                # finished_ids, but it still belongs on the request stream.
-                self._put_output(request_id, req_output.result)
+            else:
+                progress = self.scheduler.get_request_progress(request_id)
+                if progress is not None:
+                    completed, total = progress
+                    self._on_progress(DiffusionProgress(request_id, completed, total))
+                if req_output is not None and req_output.result is not None:
+                    # Preserve non-terminal media chunks alongside progress.
+                    self._put_output(request_id, req_output.result)
 
         # Then handle other requests that are finished in this round.
         for request_id in finished_ids - delivered_finished_req_ids:
@@ -1044,7 +1081,7 @@ class DiffusionEngine:
             )
 
     def _has_output_stream(self, request_id: str) -> bool:
-        with self._cv:
+        with self._out_streams_lock:
             return request_id in self._out_streams
 
     @staticmethod
@@ -1165,7 +1202,8 @@ class DiffusionEngine:
                     self._request_cancellations.finish(request.request_id)
                     request.cancellation_signal = None
                 raise
-            self._out_streams[request_id] = queue
+            with self._out_streams_lock:
+                self._out_streams[request_id] = queue
             self._cv.notify_all()
 
         return request_id
@@ -1175,7 +1213,7 @@ class DiffusionEngine:
         return self._add_prepared_request(request)
 
     async def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
-        with self._cv:
+        with self._out_streams_lock:
             queue = self._out_streams.get(request_id)
         if queue is None:
             raise RuntimeError(f"Request {request_id} not found in output queue.")
@@ -1189,7 +1227,7 @@ class DiffusionEngine:
             logger.error(f"Wait for response failed: {e}")
             raise
         finally:
-            with self._cv:
+            with self._out_streams_lock:
                 if self._out_streams.get(request_id) is queue:
                     self._out_streams.pop(request_id, None)
 
@@ -1563,7 +1601,7 @@ class DiffusionEngine:
             queue.put_nowait(output)
 
     def _put_output(self, request_id: str, output: DiffusionOutput) -> None:
-        with self._cv:
+        with self._out_streams_lock:
             queue = self._out_streams.get(request_id)
         if queue is None:
             return
@@ -1580,8 +1618,9 @@ class DiffusionEngine:
                     self._request_cancellations.cancel_all()
                 if self.stop_event is not None:
                     self.stop_event.set()
-                pending_streams = list(self._out_streams.values())
-                self._out_streams.clear()
+                with self._out_streams_lock:
+                    pending_streams = list(self._out_streams.values())
+                    self._out_streams.clear()
                 self._cv.notify_all()
 
         closed_output = DiffusionOutput(error="DiffusionEngine is closed.")

@@ -2306,3 +2306,35 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         plain_state,
     )
     assert output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_diffusion_progress_does_not_complete_request() -> None:
+    from vllm_omni.diffusion.data import DIFFUSION_PROGRESS_KEY
+
+    outputs = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=outputs,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[StagePool(0, FakeStageClient(stage_type="diffusion", final_output=True))],
+    )
+    output = OmniRequestOutput.from_diffusion(
+        request_id="video", finished=False, images=[], custom_output={DIFFUSION_PROGRESS_KEY: 50}
+    )
+    state = OrchestratorRequestState(request_id="video", final_stage_id=0)
+    await orchestrator._route_output(0, 0, output, state, None)
+    message = outputs.get_nowait()
+    assert message.engine_outputs is output
+    assert not message.finished
+    assert not state.finished_stage_ids
+
+    media = OmniRequestOutput.from_diffusion(
+        request_id="video", images=["video-result"], final_output_type="video", finished=True
+    )
+    orchestrator.request_states["video"] = state
+    await orchestrator._route_output(0, 0, media, state, None)
+    message = outputs.get_nowait()
+    assert message.engine_outputs is media
+    assert message.finished
+    assert outputs.empty()

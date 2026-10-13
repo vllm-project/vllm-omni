@@ -71,6 +71,7 @@ from vllm_omni.diffusion.ipc import (
     payload_carries_typed_media,
 )
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
+from vllm_omni.diffusion.models.progress_bar import DiffusionProgress, progress_callback, progress_requests
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -697,7 +698,7 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
-        with ctx:
+        with ctx, progress_requests([req]):
             kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
             if diffusion_kv_metadata is not None:
                 kwargs["diffusion_kv_metadata"] = diffusion_kv_metadata
@@ -730,7 +731,7 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
-        with ctx:
+        with ctx, progress_requests([nr.req for nr in scheduler_output.scheduled_new_reqs]):
             output = self.model_runner.execute_model_batch(scheduler_output, od_config)
         if profiler:
             profiler.step()
@@ -1246,6 +1247,9 @@ class WorkerProc:
         with self._result_mq_lock:
             self.result_mq.enqueue(msg)
 
+    def _report_progress(self, progress: DiffusionProgress) -> None:
+        self._enqueue_result(AsyncDiffusionOutput(kind=AsyncOutputKind.PROGRESS, result=progress))
+
     def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""
         if self.result_mq is None:
@@ -1461,7 +1465,10 @@ class WorkerProc:
             if method in _MEMORY_RELEASING_METHODS:
                 self.drain_async_outputs()
             # Use execute_method from WorkerWrapperBase for consistent method resolution
-            result = self.worker.execute_method(method, *args, **kwargs)
+            with progress_callback(
+                self._report_progress if should_reply and not self.od_config.step_execution else None
+            ):
+                result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             status.update(

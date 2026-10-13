@@ -932,6 +932,7 @@ class TestWorkerProcRpcRankStatus:
     def _make_worker_proc(self, has_result_mq: bool = True):
         proc = object.__new__(WorkerProc)
         proc.gpu_id = 0
+        proc.od_config = SimpleNamespace(step_execution=False)
         proc.result_mq = object() if has_result_mq else None
         proc.worker = SimpleNamespace(execute_method=Mock(return_value=True))
         return proc
@@ -1831,6 +1832,7 @@ def test_engine_close_interrupts_only_ray_before_join(backend):
     engine._closed = False
     engine._shutdown_complete = False
     engine.stop_event = threading.Event()
+    engine._out_streams_lock = threading.Lock()
     engine._out_streams = {}
     interrupted = threading.Event()
     engine.executor = MagicMock()

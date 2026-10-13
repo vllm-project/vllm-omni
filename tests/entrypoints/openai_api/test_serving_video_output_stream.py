@@ -1055,3 +1055,33 @@ class TestStreamingVideoOutputExtraParams:
         _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
 
         assert gen_params.extra_args["flow_shift"] == 3.0
+
+
+def test_streaming_video_ignores_progress_between_media_chunks(mocker: MockerFixture) -> None:
+    from vllm_omni.diffusion.data import DIFFUSION_PROGRESS_KEY
+
+    async def mock_generate(*args, **kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[_fake_video_frames()], final_output_type="image", finished=False
+        )
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[], custom_output={DIFFUSION_PROGRESS_KEY: 50}, finished=False
+        )
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[_fake_video_frames()], final_output_type="image", finished=True
+        )
+
+    app, handler, engine_client = _build_test_app(
+        mocker=mocker,
+        streaming_chunks=[(b"chunk-0", False), (b"chunk-1", True)],
+        mock_generate=mock_generate,
+    )
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime/video") as ws:
+            ws.send_json({"type": "session.start", "prompt": "test"})
+            assert ws.receive_json()["type"] == "video.start"
+            assert _receive_video_chunk(ws)[1] == b"chunk-0"
+            assert _receive_video_chunk(ws)[1] == b"chunk-1"
+            done = ws.receive_json()
+            assert done["type"] == "session.done"
+            assert done["chunks"] == 2

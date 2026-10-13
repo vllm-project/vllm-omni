@@ -496,6 +496,14 @@ class BaseScheduler(ABC):
         del decision, now, stable_since
         return True
 
+    def get_request_progress(self, request_id: str) -> tuple[int, int] | None:
+        """Get the request's denoising progress.
+
+        Returns:
+            (completed_steps, total_steps), or None when unavailable.
+        """
+        return None
+
     def get_request_state(self, request_id: str) -> SchedulerRequestState | None:
         return self._request_states.get(request_id)
 

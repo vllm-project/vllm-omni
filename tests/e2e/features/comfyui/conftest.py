@@ -87,3 +87,11 @@ def _setup_comfyui_test_environment():
     sys.modules["comfy_api.latest"] = mock_comfy_api_latest
     sys.modules["comfy_extras"] = mock_comfy_extras
     sys.modules["comfy_extras.nodes_audio"] = mock_nodes_audio
+
+    # Generate Video uses ComfyUI's native node progress hook.
+    mock_comfy = ModuleType("comfy")
+    mock_comfy_utils = ModuleType("comfy.utils")
+    mock_comfy_utils.ProgressBar = lambda total: SimpleNamespace(update_absolute=lambda *args: None)
+    mock_comfy.utils = mock_comfy_utils
+    sys.modules["comfy"] = mock_comfy
+    sys.modules["comfy.utils"] = mock_comfy_utils
