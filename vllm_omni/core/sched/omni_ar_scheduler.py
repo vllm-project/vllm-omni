@@ -541,6 +541,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             max_len = None
         prefill_pending = self._talker_waiting_prefill_may_run()
         widths: set[int] = set()
+        starved_req_ids: list[str] = []
         for req in self.running:
             computed = int(req.num_computed_tokens)
             prompt_len = len(req.prompt_token_ids)
@@ -559,6 +560,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         widths.add(1 + num_spec)
                     else:
                         widths.add(1)
+                        starved_req_ids.append(req.request_id)
             else:
                 widths.add(delta)
         uneven = len(widths) > 1
@@ -574,6 +576,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # FINISHED_LENGTH_CAPPED caps the request within num_spec+2 steps
         # through the normal output path, and constant_drafts re-arms the
         # K-step right after.
+        if not prefill_pending and starved_req_ids:
+            # Every one of these steps forfeits the batch's drafts, which
+            # visibly eats into the K-step RTF gain when several requests
+            # reach the context edge at different times. Log once per
+            # request so the drain is observable without flooding the log.
+            logged = getattr(self, "_kstep_starved_logged", None)
+            if logged is None:
+                logged = set()
+                self._kstep_starved_logged = logged
+            fresh = [rid for rid in starved_req_ids if rid not in logged]
+            if fresh:
+                logged.update(fresh)
+                logger.warning(
+                    "[kstep] %d request(s) starved of the padded width "
+                    "(near max_model_len); the batch drops its drafts "
+                    "until FINISHED_LENGTH_CAPPED closes them: %s",
+                    len(fresh), ", ".join(map(str, fresh)))
         for req in self.running:
             if req.spec_token_ids:
                 req.spec_token_ids = []
