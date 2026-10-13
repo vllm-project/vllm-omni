@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch
 from vllm_omni.diffusion.models.ming_image.condition import MingImageConditioning
 from vllm_omni.diffusion.models.ming_image.transformer import MingImageTransformer2DModel
+from vllm_omni.diffusion.models.utils import vae_scale_factor_from_vae
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
@@ -191,7 +192,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self.text_encoder = None
         self.tokenizer = None
 
-        self.vae_scale_factor = 2 ** len(self.vae.config.temperal_downsample)
+        self.vae_scale_factor = vae_scale_factor_from_vae(self.vae, config_key="temperal_downsample", exponent_offset=0)
         self.image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor * 2,
             do_convert_rgb=False,
