@@ -19,6 +19,20 @@ AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test
 CUDA_MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
 CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
+FLASH_AITER_CORE_LABEL = "ROCm · FlashAttention/AITER Core Prewarm"
+FLASH_AITER_DENSE_LABEL = "ROCm · FlashAttention/AITER Dense Prewarm"
+FLASH_AITER_VARLEN_LABEL = "ROCm · FlashAttention/AITER Varlen Prewarm"
+FLASH_AITER_VALIDATION_LABEL = "ROCm · FlashAttention/AITER GPU Coverage"
+FLASH_AITER_CORE_KEY = "rocm-flash-aiter-core-prewarm"
+FLASH_AITER_DENSE_KEY = "rocm-flash-aiter-dense-prewarm"
+FLASH_AITER_VARLEN_KEY = "rocm-flash-aiter-varlen-prewarm"
+FLASH_AITER_VALIDATION_KEY = "rocm-flash-aiter-validation"
+FLASH_AITER_CORE_MODULE = "module_aiter_core.so"
+FLASH_AITER_DENSE_MODULE = "mha_fwd_bf16_nbias_nmask_nlse_ndropout_nqscale.so"
+FLASH_AITER_VARLEN_MODULE = "mha_varlen_fwd_bf16_nlogits_nbias_nmask_nlse_ndropout_nskip_nqscale.so"
+FLASH_AITER_MARKERS = "core_model and rocm and MI325 and cards_1"
+FLASH_AITER_ATTENTION_PATH = "tests/diffusion/attention/"
+FLASH_AITER_MAMMOTH_PATH = "tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
 AR_PAGED_ATTENTION_MARKERS = "core_model and rocm and MI325 and cards_1"
 JOY_GPU_LABEL = "Diffusion · JoyImage GPU Inference Test"
@@ -362,6 +376,100 @@ def test_joy_gpu_lane_is_not_on_amd_ready_or_merge_critical_path(pipeline_path: 
     assert not _find_joy_gpu_steps(pipeline_path)
 
 
+def test_ready_flash_aiter_prewarm_shards_are_staged_nonblocking_cache_producers() -> None:
+    core = _find_step(FLASH_AITER_CORE_LABEL, AMD_READY_PIPELINE)
+    dense = _find_step(FLASH_AITER_DENSE_LABEL, AMD_READY_PIPELINE)
+    varlen = _find_step(FLASH_AITER_VARLEN_LABEL, AMD_READY_PIPELINE)
+
+    expected = (
+        (core, FLASH_AITER_CORE_KEY, "core", FLASH_AITER_CORE_MODULE, "amd-build"),
+        (dense, FLASH_AITER_DENSE_KEY, "dense", FLASH_AITER_DENSE_MODULE, FLASH_AITER_CORE_KEY),
+        (varlen, FLASH_AITER_VARLEN_KEY, "varlen", FLASH_AITER_VARLEN_MODULE, FLASH_AITER_CORE_KEY),
+    )
+    for step, key, variant, module, dependency in expected:
+        assert step["key"] == key
+        assert step["agent_pool"] == "mi300_1"
+        assert step["depends_on"] == dependency
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["grade"] == "NonBlocking"
+        assert "parallelism" not in step
+        assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+        assert 'export AITER_JIT_DIR="/tmp/vllm-omni-aiter-$$BUILDKITE_JOB_ID"' in step["commands"]
+        assert 'export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-torch-extensions-$$BUILDKITE_JOB_ID"' in step["commands"]
+        prewarm = next(command for command in step["commands"] if "prewarm_flash_aiter.py" in command)
+        assert f"--variant {variant}" in prewarm
+        assert any(module in command and command.lstrip().startswith("cp -v") for command in step["commands"])
+
+    assert core["timeout_in_minutes"] == 10
+    assert dense["timeout_in_minutes"] == 30
+    assert varlen["timeout_in_minutes"] == 15
+    assert core["artifact_paths"] == ["artifacts/rocm-flash-aiter-cache/core/*.so"]
+    assert dense["artifact_paths"] == ["artifacts/rocm-flash-aiter-cache/dense/*.so"]
+    assert varlen["artifact_paths"] == ["artifacts/rocm-flash-aiter-cache/varlen/*.so"]
+    assert "5m" in next(command for command in core["commands"] if "prewarm_flash_aiter.py" in command)
+    assert "24m" in next(command for command in dense["commands"] if "prewarm_flash_aiter.py" in command)
+    assert "10m" in next(command for command in varlen["commands"] if "prewarm_flash_aiter.py" in command)
+
+    for step in (dense, varlen):
+        downloads = [command for command in step["commands"] if "buildkite-agent artifact download" in command]
+        assert len(downloads) == 1
+        assert FLASH_AITER_CORE_KEY in downloads[0]
+        assert FLASH_AITER_CORE_MODULE in downloads[0]
+
+
+def test_ready_flash_aiter_validation_preserves_selectors_and_result_artifacts() -> None:
+    step = _find_step(FLASH_AITER_VALIDATION_LABEL, AMD_READY_PIPELINE)
+
+    assert step["key"] == FLASH_AITER_VALIDATION_KEY
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == [FLASH_AITER_DENSE_KEY, FLASH_AITER_VARLEN_KEY]
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 60
+    assert "artifact_paths" not in step
+    assert "retry" not in step
+    assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+    assert 'export AITER_JIT_DIR="/tmp/vllm-omni-aiter-$$BUILDKITE_JOB_ID"' in step["commands"]
+    assert 'export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-torch-extensions-$$BUILDKITE_JOB_ID"' in step["commands"]
+
+    downloads = [command for command in step["commands"] if "buildkite-agent artifact download" in command]
+    assert len(downloads) == 3
+    assert any(FLASH_AITER_CORE_KEY in command and FLASH_AITER_CORE_MODULE in command for command in downloads)
+    assert any(FLASH_AITER_DENSE_KEY in command and FLASH_AITER_DENSE_MODULE in command for command in downloads)
+    assert any(FLASH_AITER_VARLEN_KEY in command and FLASH_AITER_VARLEN_MODULE in command for command in downloads)
+
+    pytest_commands = [command for command in step["commands"] if "pytest" in split(command)]
+    assert len(pytest_commands) == 2
+    attention = next(command for command in pytest_commands if FLASH_AITER_ATTENTION_PATH in split(command))
+    mammoth = next(command for command in pytest_commands if FLASH_AITER_MAMMOTH_PATH in split(command))
+    attention_argv = split(attention)
+    mammoth_argv = split(mammoth)
+    assert attention_argv[:6] == ["timeout", "--signal=TERM", "--kill-after=2m", "55m", "pytest", "-s"]
+    assert attention_argv.count(FLASH_AITER_ATTENTION_PATH) == 1
+    assert attention_argv[attention_argv.index("-m") + 1] == FLASH_AITER_MARKERS
+    assert attention_argv[attention_argv.index("--run-level") + 1] == "core_model"
+    assert "-n" in attention_argv and attention_argv[attention_argv.index("-n") + 1] == "1"
+    assert "--durations=0" in attention_argv
+    assert "-k" not in attention_argv
+    assert mammoth_argv[:6] == ["timeout", "--signal=TERM", "--kill-after=2m", "10m", "pytest", "-s"]
+    assert mammoth_argv.count(FLASH_AITER_MAMMOTH_PATH) == 1
+    assert mammoth_argv[mammoth_argv.index("--run-level") + 1] == "core_model"
+    assert "-n" in mammoth_argv and mammoth_argv[mammoth_argv.index("-n") + 1] == "1"
+    assert "--durations=0" in mammoth_argv
+    assert "-k" not in mammoth_argv
+
+    assert _find_steps_selecting_path(AMD_READY_PIPELINE, FLASH_AITER_ATTENTION_PATH) == [step]
+    mammoth_steps = _find_steps_selecting_path(AMD_READY_PIPELINE, FLASH_AITER_MAMMOTH_PATH)
+    assert step in mammoth_steps
+    assert len(mammoth_steps) == 2
+    sdpa_step = next(candidate for candidate in mammoth_steps if candidate != step)
+    assert sdpa_step["label"] == "Diffusion · Model Test"
+    assert any(
+        "env DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in command and FLASH_AITER_MAMMOTH_PATH in command
+        for command in sdpa_step["commands"]
+    )
+
+
 def test_joy_gpu_nightly_lane_is_unique_nonblocking_and_preserves_default_backend() -> None:
     steps = _find_joy_gpu_steps(AMD_NIGHTLY_PIPELINE)
     assert len(steps) == 1
@@ -572,6 +680,14 @@ def test_amd_template_preserves_step_retry_policy() -> None:
     # policy when the source suite is rendered into the uploaded pipeline.
     assert template.count("{% if step.retry %}") == 2
     assert template.count("{% for retry_rule in step.retry.automatic %}") == 2
+
+
+def test_amd_template_preserves_step_keys_and_custom_dependencies() -> None:
+    template = AMD_TEMPLATE.read_text(encoding="utf-8")
+    assert template.count("{% if step.key %}") == 2
+    assert template.count('key: "{{ step.key }}"') == 2
+    assert template.count("{% if step.depends_on %}") == 2
+    assert template.count("depends_on: {{ step.depends_on }}") == 2
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
