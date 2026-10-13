@@ -592,7 +592,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     "[kstep] %d request(s) starved of the padded width "
                     "(near max_model_len); the batch drops its drafts "
                     "until FINISHED_LENGTH_CAPPED closes them: %s",
-                    len(fresh), ", ".join(map(str, fresh)))
+                    len(fresh),
+                    ", ".join(map(str, fresh)),
+                )
         for req in self.running:
             if req.spec_token_ids:
                 req.spec_token_ids = []
