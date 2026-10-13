@@ -144,6 +144,15 @@ class StageEngineCoreProc(EngineCoreProc):
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
 
+    def _handle_client_request(self, request_type: EngineCoreRequestType, request: Any) -> None:
+        super()._handle_client_request(request_type, request)
+        if request_type == EngineCoreRequestType.ABORT:
+            # The eager abort queue can run before earlier ADDs are drained.
+            # Only this FIFO dispatch fences those appends and permits ID reuse.
+            release_overflowed = getattr(self.scheduler, "release_overflowed_requests", None)
+            if release_overflowed is not None:
+                release_overflowed(request)
+
     def omni_release_request_resources(self, request_ids: list[str]) -> None:
         """Release this stage's inter-stage transfer resources for *request_ids*.
 

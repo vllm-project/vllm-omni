@@ -2154,3 +2154,107 @@ def test_decode_replays_encoder_graph_in_capture_autocast(monkeypatch, ragged, a
     assert replays == [2]
     assert len(audios) == len(next_states) == 2
     assert all(audio.numel() > 0 for audio in audios)
+
+
+@pytest.mark.parametrize("graph_hit", [True, False])
+def test_cfm_padding_mask_is_deferred_until_graph_fallback(monkeypatch, graph_hit):
+    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import _build_capture_mask
+
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    adapter._cfm_graph_bucket_frames = 4
+    expected_mask = torch.tensor([True, True, True, False]).expand(2, 4, 4)
+    sentinel = (torch.ones(1, 1, 3), None, None)
+
+    def replay(**kwargs):
+        assert kwargs["attn_mask"] is None
+        assert kwargs["mel_frames"] == 3 and kwargs["pad_frames"] == 1
+        mask = _build_capture_mask(
+            attn_mask=None,
+            batch_size=1,
+            query_cap=4,
+            offset=0,
+            mel_width=4,
+            mel_frames=3,
+            device=torch.device("cpu"),
+        )
+        torch.testing.assert_close(mask, expected_mask)
+        return sentinel if graph_hit else None
+
+    adapter._whole_euler_graph_wrapper = SimpleNamespace(enabled=True, replay=replay)
+    estimator = adapter.flow.decoder.estimator
+    original = estimator.blocks_forward_chunk
+    masks = []
+
+    def record(inputs, time, mask, *args):
+        masks.append(mask.clone())
+        return original(inputs, time, mask, *args)
+
+    monkeypatch.setattr(estimator, "blocks_forward_chunk", record)
+    result = adapter._decode_cfm(
+        torch.ones(1, 1, 3),
+        torch.ones(1, 1),
+        torch.zeros(1, 1, 3),
+        cnn_cache=None,
+        att_cache=None,
+    )
+    if graph_hit:
+        assert result is sentinel and not masks
+    else:
+        assert masks
+        for mask in masks:
+            torch.testing.assert_close(mask, expected_mask)
+
+
+@pytest.mark.parametrize("offsets", [None, (2, 2), (1, 3)])
+def test_ragged_cfm_mask_preserves_query_and_cache_validity(offsets):
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    lengths = [3, 1]
+    cache = None if offsets is None else [torch.zeros(1, 1, 2, 1, n, 2) for n in offsets]
+    seen = []
+
+    def replay(**kwargs):
+        mask = kwargs["attn_mask"]
+        cache_lengths = offsets or (0, 0)
+        expected = torch.zeros(4, 3, 3 + max(cache_lengths), dtype=torch.bool)
+        for row in range(4):
+            length, cached = lengths[row % 2], cache_lengths[row % 2]
+            expected[row, :length, :length] = True
+            expected[row, :length, 3 : 3 + cached] = True
+        torch.testing.assert_close(mask, expected)
+        seen.append(True)
+        return kwargs["x"], None, None
+
+    adapter._whole_euler_graph_wrapper = SimpleNamespace(enabled=True, ragged_body=object(), replay=replay)
+    adapter._decode_cfm(
+        torch.ones(2, 1, 3),
+        torch.ones(2, 1),
+        torch.zeros(2, 1, 3),
+        cnn_cache=None,
+        att_cache=cache,
+        valid_lengths=lengths,
+    )
+    assert seen == [True]
+
+
+def test_eager_ragged_euler_reuses_uploaded_lengths():
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    _enable_fake_ragged_kernel(adapter)
+    original = adapter._blocks_forward_chunk_ragged
+    seen = []
+
+    def recording(*args):
+        seen.append(args[-1])
+        return original(*args)
+
+    adapter._blocks_forward_chunk_ragged = recording
+    adapter._decode_cfm(
+        torch.ones(2, 1, 3),
+        torch.ones(2, 1),
+        torch.zeros(2, 1, 3),
+        cnn_cache=None,
+        att_cache=None,
+        valid_lengths=[3, 1],
+    )
+    assert len(seen) == adapter.n_timesteps
+    assert all(lengths is seen[0] for lengths in seen)
+    torch.testing.assert_close(seen[0], torch.tensor([3, 1, 3, 1]))

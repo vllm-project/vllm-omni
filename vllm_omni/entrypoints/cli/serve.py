@@ -26,6 +26,10 @@ from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.registry import resolve_native_single_file
+from vllm_omni.entrypoints.api_server_shared_dir import (
+    create_api_server_shared_dir,
+    remove_api_server_shared_dir,
+)
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
@@ -1315,6 +1319,9 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=True)
+    # API processes share one server-scoped scratch directory.
+    shared_dir = create_api_server_shared_dir()
+    args._omni_api_server_shared_dir = shared_dir
     stage_runtime = None
     api_server_manager = None
     engine_launch = None
@@ -1351,6 +1358,7 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
         if stage_runtime is not None:
             stage_runtime.shutdown()
         sock.close()
+        remove_api_server_shared_dir(shared_dir)
         if shutdown_requested:
             logger.info("Shared API server shutdown completed")
 

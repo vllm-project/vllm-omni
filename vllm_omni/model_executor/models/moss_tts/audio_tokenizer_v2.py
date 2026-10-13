@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -200,6 +201,9 @@ class StreamingExecutionContext:
     state_slot_ids: torch.Tensor
     valid_rows: torch.Tensor
     attention_metadata: StreamingAttentionMetadata | None = None
+    # One transformer's ``rope_angles`` result, shared by its layers, whose
+    # per-slot offsets advance together.
+    rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
         if self.state_slot_ids.shape != (batch_size,):
@@ -356,6 +360,45 @@ def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
 # =============================================================================
 
 
+def _rope_angles(
+    offset: torch.Tensor,
+    batch: int,
+    num_frames: int,
+    head_dim: int,
+    max_period: float,
+    time_before_heads: bool,
+    device: torch.device,
+    freqs_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """fp32 rotation angles, (B, T, 1, D/2) or (B, 1, T, D/2)."""
+    if freqs_cache is None:
+        ds = torch.arange(head_dim // 2, device=device, dtype=torch.float32)
+        freqs_cache = torch.exp(ds * (-math.log(max_period) * 2 / head_dim))
+    ts = offset.float().view(-1, 1) + torch.arange(num_frames, device=device, dtype=torch.float32)
+    return freqs_cache * (ts.view(batch, -1, 1, 1) if time_before_heads else ts.view(batch, 1, -1, 1))
+
+
+@torch.library.custom_op("vllm_omni::moss_codec_rope_angles", mutates_args=())
+def rope_angles(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cos, sin)``, each (B, 1, T, D/2) fp32, as ``apply_rope`` computes them.
+
+    Opaque to Inductor on purpose: a materialized table is shared by many
+    layers instead of being recomputed inside every rotation kernel.
+    """
+    angles = _rope_angles(offset, offset.shape[0], num_frames, head_dim, max_period, False, offset.device, freqs_cache)
+    return torch.cos(angles), torch.sin(angles)
+
+
+@rope_angles.register_fake
+def _(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (offset.shape[0], 1, num_frames, head_dim // 2)
+    return offset.new_empty(shape, dtype=torch.float32), offset.new_empty(shape, dtype=torch.float32)
+
+
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -363,6 +406,7 @@ def apply_rope(
     max_period: float = 10_000,
     time_before_heads: bool = False,
     freqs_cache: torch.Tensor | None = None,
+    table: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Apply rotary position embedding (GPT-J interleaved convention).
 
@@ -390,24 +434,13 @@ def apply_rope(
     if D <= 0 or (D % 2) != 0:
         raise ValueError(f"RoPE requires an even last dimension, got D={D}")
 
-    if freqs_cache is not None:
-        freqs = freqs_cache
-    else:
-        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
-
-    if time_before_heads:
-        ts = ts.view(B, -1, 1, 1)
-    else:
-        ts = ts.view(B, 1, -1, 1)
-
     # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
     if q.device.type == "npu":
         torch_npu = _get_torch_npu()
 
-        cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
-        sin_d2 = torch.sin(freqs * ts)
+        angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+        cos_d2 = torch.cos(angles)  # (..., 1, T, D//2)
+        sin_d2 = torch.sin(angles)
         # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
         cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
         sin = torch.cat([sin_d2, sin_d2], dim=-1)
@@ -432,8 +465,13 @@ def apply_rope(
     qr, qi = q[..., 0].float(), q[..., 1].float()
     kr, ki = k[..., 0].float(), k[..., 1].float()
 
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
+    if table is not None:
+        # Precomputed by ``rope_angles`` for these offsets: same values.
+        rotr, roti = table
+    else:
+        angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+        rotr = torch.cos(angles)
+        roti = torch.sin(angles)
 
     qor = qr * rotr - qi * roti
     qoi = qr * roti + qi * rotr
@@ -472,10 +510,11 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
         k: torch.Tensor,
         offset: torch.Tensor,
         time_before_heads: bool = False,
+        table: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         D = q.shape[-1]
         freqs = self._get_freqs(D, q.device)  # noqa: N806
-        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs)
+        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs, table=table)
 
 
 # =============================================================================
@@ -923,7 +962,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         q, k, v = projected[0], projected[1], projected[2]
 
         if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+            table = execution_context.rope_table if execution_context is not None else None
+            q, k = self.rope(q, k, offset, time_before_heads=False, table=table)
 
         slot_attention = getattr(self, "_slot_attention", None)
         slot_attention_rows = getattr(self, "_slot_attention_rows", None)
@@ -1252,7 +1292,7 @@ class MossAudioTokenizerTransformer(StreamingModule):
         self._kv_capacity = context if context is not None else 1024
         self._kv_context = context
         self._kv_causal = causal
-
+        self._head_dim = d_model // num_heads
         self.rope: MossAudioTokenizerRotaryEmbedding | None = None
         if positional_embedding in {"rope", "sin_rope"}:
             self.rope = MossAudioTokenizerRotaryEmbedding(max_period=max_period)
@@ -1324,6 +1364,14 @@ class MossAudioTokenizerTransformer(StreamingModule):
             positions = positions + offsets.view(-1, 1, 1)
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
+
+        if self.rope is not None and execution_context is not None and getattr(self, "_shared_rope", False):
+            # Every layer's attention offset equals these offsets (one reset,
+            # one advance per call), so they share one rotation table.
+            table = rope_angles(
+                offsets, T, self._head_dim, float(self.rope.max_period), self.rope._get_freqs(self._head_dim, x.device)
+            )
+            execution_context = dataclasses.replace(execution_context, rope_table=table)
 
         for layer in self.layers:
             x = layer(x, *args, execution_context=execution_context, **kwargs)

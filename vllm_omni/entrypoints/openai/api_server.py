@@ -1208,6 +1208,7 @@ async def omni_init_app_state(
         request_logger=request_logger,
         model_name=model_name,
         speech_cache_config=speech_cache_config,
+        api_server_shared_dir=getattr(args, "_omni_api_server_shared_dir", None),
         forced_aligner_enabled=build_forced_aligner_config(
             getattr(args, "forced_aligner", None),
             getattr(args, "forced_aligner_config", None),

@@ -10,6 +10,7 @@ import torch
 
 from tests.diffusion.models.magi2.test_native_preview import _initialize_tiny_model, _tiny_config
 from tests.diffusion.models.magi2.test_pipeline_magi2 import _pipeline, _request
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.models.magi2 import attention
 from vllm_omni.diffusion.models.magi2 import pipeline_magi2 as pipeline
@@ -143,7 +144,7 @@ def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type
         resolver.assert_not_called()
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_actual_musa_constructor_selects_device(monkeypatch):
     require_musa()
     assert pipeline.current_omni_platform.is_musa()
@@ -154,7 +155,7 @@ def test_actual_musa_constructor_selects_device(monkeypatch):
     assert pipe.device_str == f"musa:{torch.accelerator.current_device_index()}"
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_request_seed_reaches_musa_rng():
     require_musa()
     pipeline._seed_request(1927)
@@ -167,7 +168,7 @@ def test_request_seed_reaches_musa_rng():
     assert not torch.equal(first, different)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_musa_tiny_native_transformer_matches_cpu():
     """Component smoke, not a full checkpoint/video or optimized FA3 test."""
     require_musa()
@@ -193,7 +194,7 @@ def test_musa_tiny_native_transformer_matches_cpu():
     torch.testing.assert_close(actual.cpu(), expected, rtol=2e-4, atol=2e-5)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_actual_musa_forward_instrumentation():
     require_musa()
     pipe, runtime = _pipeline()

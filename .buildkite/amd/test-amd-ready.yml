@@ -242,11 +242,13 @@ steps:
         # Preserve legacy one-GPU tests without cards_1 while excluding every
         # registered multi-GPU marker from this one-GPU job.
         # JoyImage's nonblocking nightly lane owns its cold AITER builds.
+        # H3 VAE ops assume NVIDIA CUDA; ROCm sets torch.version.hip.
         - >-
           timeout 15m pytest -sv tests/diffusion/models/
           --ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py
           --ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py
           --ignore=tests/diffusion/models/joy_image/test_joy_image_gpu.py
+          --ignore=tests/diffusion/models/minimax_h3/test_minimax_h3_vae_ops.py
           -m 'core_model and cuda and not
           (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --run-level "core_model"

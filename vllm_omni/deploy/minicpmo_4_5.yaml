@@ -181,8 +181,10 @@ platforms:
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.
         max_num_seqs: 8
-        # 0.10 keeps 5.2GiB of Talker KV (measured on 910B1) with
-        # device-level headroom for the colocated HiFi-GAN cuDNN workspace.
+        # Match CUDA's fixed KV budget and leave headroom for Stage 2
+        # (upstream #8735); 0.10 keeps device-level headroom for the
+        # colocated HiFi-GAN cuDNN workspace (measured on 910B1).
+        kv_cache_memory_bytes: 4294967296  # 4 GiB
         gpu_memory_utilization: 0.10
         max_num_batched_tokens: 8192
         # Multi-frame decode: 8 codec frames per step. NPU-only -- only the NPU
@@ -207,8 +209,9 @@ platforms:
         # survived a full three-tier concurrency sweep with 0.50/0.10
         # upstream (measured on 910B1).
         gpu_memory_utilization: 0.22
-        # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
-        # estimator kernels through the NPU platform patch.
+        # Stage 2 stays outer-eager; CFM Whole-Euler, HiFT and encoder
+        # graphs use the shared Code2Wav wrappers with NPUGraph (upstream
+        # #8735).
         additional_config:
           code2wav_enable_npu_graph: true
           # Batch sizes round up to the next bucket before capture, so the
