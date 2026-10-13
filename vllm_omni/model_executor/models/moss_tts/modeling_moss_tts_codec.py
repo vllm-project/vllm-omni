@@ -53,8 +53,6 @@ def load_codec(
     load_config: LoadConfig,
     num_quantizers: int,
     attention_backend: str = "sdpa",
-    skip_empty_tiles: bool = False,
-    fused_slots: bool = False,
 ) -> tuple[PretrainedConfig, nn.Module]:
     """Load and prepare a codec without creating stream state or CUDA graphs."""
     logger.info("Loading MOSS Audio Tokenizer from %s directly on %s", codec_path, device)
@@ -160,19 +158,16 @@ def load_codec(
                 slot_ring_attention_rows,
             )
 
-            if skip_empty_tiles and fused_slots:
-                raise ValueError("codec_skip_empty_attention_tiles requires unfused slot attention")
-            if skip_empty_tiles:
-                slot_ring_attention = partial(slot_ring_attention, skip_empty_tiles=True)
-                logger.info("MOSS codec slot attention: skipping empty tiles for T <= 32")
+            slot_ring_attention = partial(slot_ring_attention, skip_empty_tiles=True)
+            slot_ring_attention_rows = partial(slot_ring_attention_rows, skip_empty_tiles=True)
+            logger.info("MOSS codec slot attention: skipping empty tiles for T <= 32")
 
         for module in codec.decoder.modules():
             if isinstance(module, MossAudioTokenizerMultiheadAttention):
                 module._streaming_attention = masked_attention
                 if attention_backend == "triton_slot":
                     module._slot_attention = slot_ring_attention
-                    if fused_slots:
-                        module._slot_attention_rows = slot_ring_attention_rows
+                    module._slot_attention_rows = slot_ring_attention_rows
         logger.info("Enabled codec attention backend=%s", attention_backend)
     build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
     if callable(build_decode_lut):
@@ -1135,9 +1130,16 @@ class MossTTSCodecDecoder(nn.Module):
             load_config=self.vllm_config.load_config,
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
-            skip_empty_tiles=bool(self._connector_int("codec_skip_empty_attention_tiles", default=0)),
-            fused_slots=bool(self._connector_int("codec_fused_slot_attention", default=0)),
         )
+        if device.type == "cuda":
+            from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
+
+            shared = 0
+            for module in codec.decoder.modules():
+                if isinstance(module, MossAudioTokenizerTransformer) and module.rope is not None:
+                    module._shared_rope = True
+                    shared += 1
+            logger.info("MOSS codec shared RoPE table: %d decoder transformers", shared)
         self._codec = codec
         inferred_channels = 2 if "v2" in self._codec_path.lower() else 1
         self._n_channels = int(

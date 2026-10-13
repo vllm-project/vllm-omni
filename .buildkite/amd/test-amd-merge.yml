@@ -70,10 +70,50 @@ steps:
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --ignore=tests/diffusion/cache/test_teacache_extractors.py
           --ignore=tests/diffusion/models/pi05/test_pi05_units.py
+          --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
+          --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
+          --deselect='tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
+          --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+          --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
+          --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
           --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
           --shard-id=$$BUILDKITE_PARALLEL_JOB
           --durations=50
           --junitxml="$$DIFFUSION_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml"
+
+    # Hash sharding put these six CPU cases on shard 2/5. Main builds 13600 and
+    # 13615 spent about 15 and 23 minutes on them. A separate job keeps that
+    # cost off the five-way critical path.
+    - label: "Simple · Diffusion Slow CPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 40
+      artifact_paths:
+        - "artifacts/amd-diffusion-slow-cpu/pytest.xml"
+      # Same exit-134 retry as the five-way shards. Buildkite cannot prove
+      # every 134 is a GPU hang. Assertions (1), timeouts (124), and OOMs
+      # (137) remain non-retryable.
+      retry:
+        automatic:
+          - exit_status: 134
+            limit: 1
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - export DIFFUSION_SLOW_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-slow-cpu"
+        - mkdir -p "$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR"
+        - >-
+          pytest -sv
+          'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
+          'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
+          'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
+          'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+          'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
+          'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
+          -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+          --durations=20
+          --junitxml="$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR/pytest.xml"
 
     - label: "Diffusion · AuK VAE GPU Test"
       agent_pool: mi300_1

@@ -19,6 +19,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
@@ -93,7 +94,7 @@ def tiny_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
 class CapablePipeline:
     def __init__(self, spec: ARDiffusionKVCacheSpec) -> None:
         self.spec = spec
-        self.bound_state = None
+        self.bound_state: ARDiffusionKVState | None = None
         self.binds: list[str] = []
         self.resets: list[str] = []
         self.closes: list[str] = []
@@ -431,6 +432,7 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
 
     def boom(self, req, kv_prefetch_job=None):
         state = pipeline.bound_state
+        assert state is not None
         ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
         ctx.ensure_video_slots(torch.device("cpu"))
         raise RuntimeError("layer exploded")
@@ -451,6 +453,34 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
 
 
+def test_decode_failure_after_kv_commit_releases_session(monkeypatch):
+    pipeline = CapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline)
+    kv = runner.kv_cache
+    assert kv is not None
+    free_total = kv.manager.block_pool.get_num_free_blocks()
+
+    def decode_failure(self, req, kv_prefetch_job=None):
+        state = commit_one_block(runner, "broken", "main")
+        assert state is pipeline.bound_state
+        assert state._committed["main"] > 0
+        raise RuntimeError("VAE decode failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", decode_failure)
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
+
+    with pytest.raises(RuntimeError, match="VAE decode failed"):
+        runner.execute_model(request)
+
+    assert pipeline.closes == ["broken"]
+    assert not runner._sessions
+    assert not kv._adapters
+    assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
 def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
     pipeline = CapablePipeline(lingbot_like_spec())
     runner = make_runner(pipeline)
@@ -460,6 +490,7 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
 
     def return_after_allocation(self, req, kv_prefetch_job=None):
         state = pipeline.bound_state
+        assert state is not None
         ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
         ctx.ensure_video_slots(torch.device("cpu"))
         return object()
@@ -569,6 +600,40 @@ def test_execute_stepwise_exception_releases_kv_and_does_not_resume_pages(monkey
     assert "req-1" not in runner._sessions
     second = runner._get_or_create_session("req-1")
     assert second is not first
+
+
+def test_execute_stepwise_decode_error_after_kv_commit_releases_session(monkeypatch):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    kv = runner.kv_cache
+    assert kv is not None
+    free_total = kv.manager.block_pool.get_num_free_blocks()
+
+    def decode_error(self, scheduler_output):
+        state = commit_one_block(runner, "req-1", "main")
+        assert state is pipeline.bound_state
+        assert state._committed["main"] > 0
+        return BatchRunnerOutput.from_list(
+            [
+                RunnerOutput(
+                    request_id="req-1",
+                    finished=True,
+                    result=DiffusionOutput(error="VAE decode failed"),
+                )
+            ]
+        )
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", decode_error)
+    output = runner.execute_stepwise(scheduler_output())
+
+    assert output.get_request_output("req-1").result.error == "VAE decode failed"
+    assert pipeline.closes == ["req-1"]
+    assert not runner._sessions
+    assert not kv._adapters
+    assert kv.manager.block_pool.get_num_free_blocks() == free_total
 
 
 def test_execute_stepwise_closes_session_for_scheduler_aborted_request(monkeypatch):

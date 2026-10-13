@@ -1120,8 +1120,12 @@ def llm2tts(
             if not handoff_ids:
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
-        if native_turn_end_handoff:
-            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
+        if is_native_duplex_handoff:
+            # Always write the flag: the connector merges per-request meta across
+            # units, so a turn_end=True left by the previous turn's last unit would
+            # otherwise stick and give every later unit the multi-unit turn-end
+            # Talker budget (speech overruns each 1 s unit and repeats words).
+            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = native_turn_end_handoff
 
         condition_sequence_state = None
         condition_sequence_value = None

@@ -6,23 +6,31 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
+import zmq
 
 # Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
 # Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
+import vllm.v1.engine.core as engine_core
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.engine import FinishReason
+from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -37,6 +45,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
+    sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode),
     )
@@ -151,6 +160,7 @@ def _run_resumable_segment_stop(
     inter_stage_output=None,
 ):
     sched = MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -306,6 +316,7 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise(
     session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
     sched = mocker.MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -399,6 +410,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     num_output_placeholders = session.num_output_placeholders
 
     sched = MagicMock()
+    sched._hold_payloadless_outputs = False
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
@@ -475,6 +487,7 @@ def test_legacy_stale_async_marker_bypasses_real_placeholder_accounting() -> Non
     request.num_stale_output_tokens = 0
 
     sched = OmniARAsyncScheduler.__new__(OmniARAsyncScheduler)
+    sched._hold_payloadless_outputs = False
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.chunk_transfer_adapter = None
@@ -1338,6 +1351,117 @@ def test_stage0_streaming_update_that_overflows_max_model_len_finishes_the_sessi
     assert _run_idle_step(sched) == {}
 
 
+def test_late_append_cannot_recreate_an_overflowed_session_before_abort() -> None:
+    sched = _make_live_session_scheduler(max_model_len=8)
+    sched.spec_decode_metrics_level = "none"
+    session = _make_request()
+    _park_session(sched, session)
+    sched._update_request_as_session(session, _make_update([10, 20, 30]))
+    _run_idle_step(sched)
+    assert sched._streaming_context_overflow == {}
+
+    # The error is already on its way to the owner, while more input is in flight.
+    late = _make_request()
+    late.resumable = True
+    sched.add_request(late)
+    assert session.request_id not in sched.requests
+    assert len(sched.waiting) == 0
+
+    # An eager abort must keep the fence, even after the request itself is gone.
+    sched.finish_requests([session.request_id], RequestStatus.FINISHED_ABORTED)
+    sched.add_request(late)
+    assert session.request_id not in sched.requests
+    # Ordered owner cleanup permits reuse without unbounded request-ID tombstones.
+    sched.release_overflowed_requests([session.request_id])
+    replacement = _make_request()
+    sched.add_request(replacement)
+    assert sched.requests[session.request_id] is replacement
+
+
+@pytest.mark.parametrize("fifo_published_before_drain", [False, True])
+def test_overflow_guard_survives_eager_abort_until_fifo_cleanup(mocker, fifo_published_before_drain) -> None:
+    sched = _make_live_session_scheduler(max_model_len=8)
+    sched.spec_decode_metrics_level = "none"
+    sched._pause_state = PauseState.UNPAUSED
+    session = _make_request()
+    _park_session(sched, session)
+    sched._update_request_as_session(session, _make_update([10, 20, 30]))
+    _run_idle_step(sched)
+
+    # Another request keeps the engine active after the overflow error is sent.
+    other = _make_request()
+    other.request_id = "other-live-session"
+    sched.add_request(other)
+    assert sched.waiting.pop_request() is other
+    other.status = RequestStatus.RUNNING
+    sched.running.append(other)
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = sched
+    engine.engines_running = False
+    engine.batch_queue = None
+    engine.shutdown_state = engine_core.EngineShutdownState.RUNNING
+    engine.input_queue = Queue()
+    engine.tensor_ipc_receiver = None
+    late = _make_request()
+    late.resumable = True
+    engine.input_queue.put_nowait((EngineCoreRequestType.ADD, (late, 0)))
+
+    eager_published, resume_publication = Event(), Event()
+
+    class PausedAbortQueue(Queue):
+        def put_nowait(self, item):
+            super().put_nowait(item)
+            eager_published.set()
+            assert resume_publication.wait(5), "abort publication was not resumed"
+
+    engine.aborts_queue = PausedAbortQueue()
+    # Run the real socket decoder and its two queue publications. Only socket
+    # I/O and the startup handshake are mocked; stop after the one ABORT message.
+    socket = mocker.MagicMock(spec=zmq.Socket)
+    socket.__enter__.return_value = socket
+    socket.recv_multipart.return_value = [
+        zmq.Frame(EngineCoreRequestType.ABORT.value),
+        zmq.Frame(msgspec.msgpack.encode([session.request_id])),
+    ]
+    mocker.patch.object(engine_core, "make_zmq_socket", return_value=socket)
+    poller = mocker.patch.object(engine_core.zmq, "Poller").return_value
+    poller.poll.side_effect = [[(socket, zmq.POLLIN)], StopIteration]
+    mocker.patch.object(engine, "_make_ready_response", return_value=None)
+
+    def publish_abort():
+        with pytest.raises(StopIteration):
+            engine.process_input_sockets(["unused"], None, b"test", Event())
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        publication = executor.submit(publish_abort)
+        try:
+            assert eager_published.wait(5), "eager abort was not published"
+            assert engine.has_work()
+            # This is the eager-abort drain performed after a model step.
+            engine._process_aborts_queue()
+            if fifo_published_before_drain:
+                resume_publication.set()
+                publication.result(timeout=5)
+
+            engine._process_input_queue()
+            assert sched.requests[other.request_id] is other
+            assert sched.running == [other]
+            assert session.request_id not in sched.requests
+            assert len(sched.waiting) == 0
+            assert (session.request_id in sched._overflowed_streaming_requests) is not fifo_published_before_drain
+        finally:
+            resume_publication.set()
+            publication.result(timeout=5)
+
+    # The FIFO abort eventually releases the marker; deliberate ID reuse works.
+    engine._process_input_queue()
+    assert session.request_id not in sched._overflowed_streaming_requests
+    replacement = _make_request()
+    engine.input_queue.put_nowait((EngineCoreRequestType.ADD, (replacement, 0)))
+    engine._process_input_queue()
+    assert sched.requests[session.request_id] is replacement
+
+
 def test_stage0_streaming_update_that_fills_max_model_len_exactly_finishes_the_session() -> None:
     """An exactly full prompt leaves no room for the token every duplex step
     samples: upstream's running budget drops to -1, which ``schedule()`` does
@@ -1536,6 +1660,7 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
     assert output.finish_reason == FinishReason.ERROR
     assert output.stop_reason == "context_length_exceeded: too long"
     assert output.new_token_ids == []
+    assert output.is_segment_finished is False
     assert sched._streaming_context_overflow == {}
 
     sched._emit_streaming_context_overflow_outputs(outputs)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for fused_group_norm_silu operator.
 
 Tests numeric correctness against PyTorch native implementation:
@@ -8,12 +11,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.common.ops import fused_group_norm_silu
 
 # Skip tests if CUDA not available
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton kernels"),
 ]
 

@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.outputs import CompletionOutput
 
 from vllm_omni.config.stage_config import StagePipelineConfig
@@ -65,6 +66,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter, Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
@@ -870,7 +872,7 @@ class TestSpeechAPI:
             diffusion_engine=engine_client,
             model_name="test-model",
         )
-        assert server._adapter is None
+        assert isinstance(server._adapter, OmniVoiceAdapter)
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="test-input", voice="test-voice"))
 
@@ -5654,13 +5656,14 @@ class TestTTSAsyncOffloading:
         voxtral_server._tts_model_type = legacy_tts_model_type
         mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())
         log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+        log_debug = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.debug")
 
         asyncio.run(voxtral_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
 
         assert adapter_model_type != legacy_tts_model_type
         assert any(
             call.args and call.args[0] == "TTS speech request %s: model=%s" and call.args[2] == adapter_model_type
-            for call in log_info.call_args_list
+            for call in log_info.call_args_list + log_debug.call_args_list
         )
 
     @pytest.mark.parametrize("word_timestamps", [False, True])
@@ -6301,3 +6304,24 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+@pytest.mark.parametrize("request_logger", [None, RequestLogger(max_log_len=None)])
+@pytest.mark.parametrize("diffusion", [False, True])
+def test_per_request_success_logs_follow_enable_log_requests(mocker: MockerFixture, request_logger, diffusion):
+    if diffusion:
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(), model_name="test-model", request_logger=request_logger
+        )
+        assert server.request_logger is request_logger
+    else:
+        server = object.__new__(OmniOpenAIServingSpeech)
+        server.request_logger = request_logger
+    log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
+    log_debug = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.debug")
+
+    server._log_request("TTS speech request %s: model=%s", "req-1", "CustomVoice")
+
+    used, unused = (log_info, log_debug) if request_logger else (log_debug, log_info)
+    used.assert_called_once_with("TTS speech request %s: model=%s", "req-1", "CustomVoice")
+    unused.assert_not_called()

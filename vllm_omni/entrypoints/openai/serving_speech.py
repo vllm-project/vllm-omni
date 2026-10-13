@@ -30,6 +30,7 @@ from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -66,6 +67,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
@@ -323,6 +325,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     _media_connector: MediaConnector | None = None
     _allowed_local_media_path: str = ""
     _tts_executor: ThreadPoolExecutor | None = None
+    # Scratch directory shared by the API processes of a multi-API server.
+    api_server_shared_dir: str | None = None
 
     def _init_speaker_storage(self) -> None:
         """Initialize speaker storage + cache, restoring any persisted uploads."""
@@ -441,6 +445,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         allowed_local_media_path: str = "",
         allowed_media_domains: list[str] | None = None,
         speech_cache_config: SpeechCacheConfig | None = None,
+        request_logger: RequestLogger | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -448,6 +453,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         engine client that pure diffusion engines don't provide.
         """
         instance = cls.__new__(cls)
+        instance.request_logger = request_logger
         instance.speech_cache_config = speech_cache_config or SpeechCacheConfig()
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
@@ -461,7 +467,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Diffusion-only instances don't have a TTS stage; set None so any
         # ``_tts_stage`` access doesn't raise AttributeError.
         instance._tts_stage = None
-        instance._adapter = None
+        # Set adapter to OmniVoice as it is currently the only diffusion TTS model
+        # Temporary assignment until https://github.com/vllm-project/vllm-omni/issues/4327 is completed
+        instance._adapter = OmniVoiceAdapter(
+            SpeechServingContext(server=instance, diffusion_engine=instance._diffusion_engine)
+        )
         instance._init_speaker_storage()
         return instance
 
@@ -470,6 +480,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._allowed_local_media_path = ""
         self.model_name = kwargs.pop("model_name", None)
         self.speech_cache_config = kwargs.pop("speech_cache_config", None) or SpeechCacheConfig()
+        self.api_server_shared_dir = kwargs.pop("api_server_shared_dir", None)
         # True when the server was launched with --forced-aligner (a pooling
         # aligner stage is appended to the pipeline). Gates word_timestamps.
         self.forced_aligner_enabled: bool = bool(kwargs.pop("forced_aligner_enabled", False))
@@ -1511,6 +1522,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             resolved.append((wav_list, sr))
         return resolved
 
+    def _log_request(self, msg: str, *args: object) -> None:
+        """Per-request success logging: INFO with --enable-log-requests, DEBUG otherwise.
+
+        Every speech request logged twice at INFO, which formats and flushes
+        on the API server's event loop under load.
+        """
+        if getattr(self, "request_logger", None):
+            logger.info(msg, *args)
+        else:
+            logger.debug(msg, *args)
+
     def _observe_speech_audio_ttfp(
         self,
         *,
@@ -1802,14 +1824,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             if first_audio_chunk_s is not None:
                 first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
-                logger.info(
+                self._log_request(
                     "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
                     request_id,
                     total_ms,
                     first_chunk_ms,
                 )
             else:
-                logger.info(
+                self._log_request(
                     "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
                     request_id,
                     total_ms,
@@ -1910,7 +1932,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             ) as chunks:
                 async for chunk in chunks:
-                    payload = {
+                    payload: dict[str, Any] = {
                         "type": "speech.audio.delta",
                         "audio": base64.b64encode(chunk).decode("ascii"),
                         "response_format": response_format,
@@ -2054,7 +2076,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 model_type = tts_params.get("task_type", ["unknown"])[0]
             else:
                 model_type = "generic"
-        logger.info("TTS speech request %s: model=%s", request_id, model_type)
+        self._log_request("TTS speech request %s: model=%s", request_id, model_type)
         _rl = getattr(self, "request_logger", None)
         if _rl:
             base_len = len(f"TTS speech request {request_id}: text=")
@@ -2376,35 +2398,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
 
+            # Set `has_inline_ref_audio` before calling validate
+            # since it calls `_apply_uploaded_speaker`
+            # which modifies request.ref_audio
+            has_inline_ref_audio = request.ref_audio is not None
+
+            # Normalise voice before specialised adapter validation
+            # to allow tests to catch invalid voices generally
+            request.voice = self._get_normalized_voice(request.voice)
+
+            # Assume that this will follow the same adapter pattern
+            # once all RFC is implemented
+            validation_error = self._adapter.validate(request)
+            if validation_error is not None:
+                raise ValueError(validation_error)
+
             if request.ref_audio is not None:
                 fmt_err = self._validate_ref_audio_format(request.ref_audio)
                 if fmt_err:
                     return self._diffusion_error_response(fmt_err, status_code=400)
 
-            request.voice = self._get_normalized_voice(request.voice)
-
-            has_inline_ref_audio = request.ref_audio is not None
-            err = self._apply_uploaded_speaker(request)
-            if err:
-                raise ValueError(err)
-
             request_id = f"speech-{random_uuid()}"
-            prompt: dict[str, Any] = {"input": request.input}
-            if request.ref_audio:
-                wav, sr, _ = await self._resolve_ref_audio(cast(str, request.ref_audio))
-                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
-            if request.ref_text:
-                prompt["ref_text"] = request.ref_text
-            if request.voice:
-                if request.voice in self.uploaded_speakers and not has_inline_ref_audio:
-                    prompt["voice_name"] = request.voice
-                    prompt["voice_created_at"] = self._voice_created_at(request.voice)
-            if request.language:
-                prompt["lang"] = request.language
-            if request.instructions:
-                prompt["instruct"] = request.instructions
+            prepared_request = await self._adapter.build(
+                request, sampling_params_list=[], has_inline_ref_audio=has_inline_ref_audio
+            )
+            prompt = prepared_request.prompt
 
-            logger.info(
+            self._log_request(
                 "Diffusion TTS speech request %s: voice_clone=%s",
                 request_id,
                 "ref_audio" in prompt,
@@ -2707,7 +2727,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request_arrival_ts=request_arrival_ts,
                 )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
-            logger.info(
+            self._log_request(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
                 request_id,
                 total_ms,
