@@ -17,13 +17,13 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Simple · Diffusion Models Test"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 20
         commands:
           - "pytest -sv tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 20
         commands:
           - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
@@ -98,36 +98,20 @@ steps:
           - timeout 15m pytest -sv -n 4 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
-  - group: ":card_index_dividers: Engine&Model Executor Test"
+  - group: ":card_index_dividers: Engine&Model Executor&Work Test"
     depends_on: upload-ready-pipeline
     steps:
-      - label: "Engine&Model Executor Test · L4"
-        timeout_in_minutes: 15
+      - label: "Engine&Model Executor&Work Test · L4"
+        timeout_in_minutes: 30
         commands:
-          - "pytest -sv tests/engine/ tests/model_executor/ -m 'core_model and cuda and L4' --run-level='core_model'"
+          - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
         mirror_hardwares: l4_1
 
-      - label: "Engine&Model Executor Test · H100"
-        timeout_in_minutes: 15
-        source_file_dependencies: engine_model_executor_function
+      - label: "Engine&Model Executor&Work Test · H100"
+        timeout_in_minutes: 20
+        source_file_dependencies: engine_model_executor_worker_function
         commands:
-          - "pytest -sv tests/model_executor/ tests/engine/ -m 'core_model and cuda and H100' --run-level=core_model"
-        mirror_hardwares: h100_1
-
-  - group: ":card_index_dividers: Worker Test"
-    depends_on: upload-ready-pipeline
-    steps:
-      - label: "Worker Test · L4"
-        timeout_in_minutes: 15
-        commands:
-          - "pytest -sv tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
-        mirror_hardwares: l4_1
-
-      - label: "Worker Test · H100"
-        timeout_in_minutes: 15
-        source_file_dependencies: worker_function
-        commands:
-          - "pytest -sv tests/worker_v2/ tests/worker/ -m 'core_model and cuda and H100' --run-level 'core_model'"
+          - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and H100' --run-level 'core_model'"
         mirror_hardwares: h100_1
 
   - label: "Distributed Test"

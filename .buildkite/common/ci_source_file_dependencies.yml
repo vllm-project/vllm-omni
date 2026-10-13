@@ -227,17 +227,15 @@ source_file_dependencies:
     - tests/entrypoints/
     - vllm_omni/entrypoints/
 
-  worker_function:
+  engine_model_executor_worker_function:
+    - tests/engine/
+    - tests/model_executor/
     - tests/worker_v2/
     - tests/worker/
+    - vllm_omni/engine/
+    - vllm_omni/model_executor/
     - vllm_omni/worker_v2/
     - vllm_omni/worker/
-
-  engine_model_executor_function:
-    - tests/model_executor/
-    - tests/engine/
-    - vllm_omni/model_executor/
-    - vllm_omni/engine/
 
   omni_qwen3_omni_function:
     - *qwen3_omni
