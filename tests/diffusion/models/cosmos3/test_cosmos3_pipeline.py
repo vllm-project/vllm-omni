@@ -1420,6 +1420,29 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert "preprocessed_video" not in additional
 
 
+def test_transfer_resize_antialiases_downscales_like_reference() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # One-pixel stripes shrunk 3x. The reference's torchvision resize (and the
+    # training loader) averages them; plain bilinear samples single columns,
+    # which would return the stripes as alternating 0 and 255.
+    stripes = torch.zeros(3, 2, 6, 18, dtype=torch.uint8)
+    stripes[..., 1::2] = 255
+    resized = transfer.resize_center_crop_uint8_cthw(stripes, 2, 6)
+    assert tuple(resized.shape) == (3, 2, 2, 6)
+    assert resized.min() >= 100 and resized.max() <= 155
+
+
+def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # Cropping 7 rows to 4 leaves 3. torchvision rounds the 1.5-row offset to 2,
+    # as for 1720x1080 fisheye inputs at 480p (43 spare rows, offset 22).
+    rows = torch.arange(0, 70, 10, dtype=torch.uint8).reshape(1, 1, 7, 1).expand(3, 1, 7, 4).contiguous()
+    cropped = transfer.resize_center_crop_uint8_cthw(rows, 4, 4)
+    assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
+
+
 def test_transfer_control_weight_validation_and_normalization() -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
 

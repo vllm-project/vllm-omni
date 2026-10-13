@@ -57,7 +57,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     OutputMessage,
 )
-from vllm_omni.engine.orchestrator import OrchestratorBase, _event_driven_orch_default_for_pipeline
+from vllm_omni.engine.orchestrator import OrchestratorBase
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
@@ -475,7 +475,6 @@ class OmniEngineBase:
                 log_stats=self._log_stats,
                 collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
-                event_driven_orch_default=self._event_driven_orch_default,
                 cfg_companion_timeout=self._cfg_companion_timeout_s,
             )
             if not startup_future.done():
@@ -897,9 +896,6 @@ class OmniEngineBase:
     ) -> None:
         """Initialize engine-wide settings resolved from pipeline metadata."""
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
-        self._event_driven_orch_default = _event_driven_orch_default_for_pipeline(
-            pipeline_config.model_type if pipeline_config is not None else None
-        )
         # No duplex_runtime_extension / duplex_serving_adapter / duplex_control
         # here: the pre-framework wiring they named is gone, and design rule 3
         # in docs/design/fullduplex.md keeps duplex vocabulary out of the base.

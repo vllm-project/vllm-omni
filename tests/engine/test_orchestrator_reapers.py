@@ -125,7 +125,6 @@ def test_engine_rejects_invalid_cfg_timeout_before_startup(value):
 def test_engine_bootstrap_passes_cfg_timeout_to_orchestrator(monkeypatch, mocker):
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
     engine._cfg_companion_timeout_s = 0.125
-    engine._event_driven_orch_default = False
     engine._engines_waiting_counter = None
     engine._running_counter = None
     engine.async_chunk = False

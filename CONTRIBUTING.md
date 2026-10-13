@@ -2,6 +2,8 @@
 
 You may find information about contributing to vLLM-Omni on [Contributing](https://vllm-omni.readthedocs.io/en/latest/contributing/).
 
+Maintainer triage and merge operations are described in the [PR merge loop](docs/contributing/ci/pr_merge_loop.md).
+
 AI-assisted contributions must follow the [AI Usage Policy](docs/contributing/README.md#ai-usage-policy), including disclosure, human review, and validation requirements.
 
 Local `pre-commit` gates (SPDX, forbidden imports, `torch.cuda`, shellcheck,
