@@ -101,6 +101,7 @@ class OmniModelState(DefaultModelState):
     _eager_mtp = False
     _eager_fastpath = False
     _eager_rows: tuple[InputBatch, list[tuple[int, int, str, bool]], torch.Tensor] | None = None
+    preprocess_keeps_mm_inputs = False
     _first_audio_stream: torch.cuda.Stream | None = None
     # Set by the stage engine process when it can take one-request outputs directly.
     _first_audio_sender: Any = None
@@ -155,9 +156,24 @@ class OmniModelState(DefaultModelState):
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
         self._embed_dim = self._get_embed_dim(model, device) if self.has_preprocess else 0
 
+        # A preprocess model may also take native multimodal inputs (MiniCPM-o's
+        # duplex Thinker serves media chat). The encoder runner rewrites every
+        # active row of its buffer each step, so that buffer is the static one.
+        encoder_runner = getattr(self, "encoder_runner", None)
+        encoder_embeds = getattr(encoder_runner, "inputs_embeds", None)
+        self.preprocess_keeps_mm_inputs = bool(
+            self.has_preprocess
+            and self.supports_mm_inputs
+            and getattr(model, "preprocess_keeps_mm_inputs", False)
+            and isinstance(encoder_embeds, torch.Tensor)
+            and tuple(encoder_embeds.shape) == (self.max_num_tokens, self._embed_dim)
+        )
+
         # Static inputs_embeds buffer for FULL CUDA graph — preprocess fills it in-place each step.
         self._static_inputs_embeds: torch.Tensor | None = None
-        if self._embed_dim > 0:
+        if self.preprocess_keeps_mm_inputs:
+            self._static_inputs_embeds = encoder_embeds
+        elif self._embed_dim > 0:
             self._static_inputs_embeds = torch.zeros(
                 (self.max_num_tokens, self._embed_dim),
                 dtype=self.dtype,
@@ -722,7 +738,11 @@ class OmniModelState(DefaultModelState):
         if embeds is None:
             embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens])
             model_inputs["inputs_embeds"] = embeds
-        elif self._static_inputs_embeds is not None and embeds.data_ptr() == self._static_inputs_embeds.data_ptr():
+        elif (
+            not self.preprocess_keeps_mm_inputs
+            and self._static_inputs_embeds is not None
+            and embeds.data_ptr() == self._static_inputs_embeds.data_ptr()
+        ):
             # FULL graph replay requires a stable inputs_embeds address. Refresh
             # the active rows from the current token ids before model-specific
             # preprocessing; otherwise decode reuses embeddings left by the

@@ -96,12 +96,12 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import (
     MING_TTS_PIPELINE,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
-from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
+from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_DECODE_PIPELINE, MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_music3.pipeline import MINIMAX_MUSIC3_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
+    MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
     MOSS_TTS_REALTIME_PIPELINE,
-    resolve_moss_tts_local_pipeline,
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
 from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
@@ -181,9 +181,10 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_tts_moe": MING_TTS_MOE_PIPELINE,
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
+    "minimax_h3_disaggregated_decode": MINIMAX_H3_DECODE_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
-    "moss_tts_local": resolve_moss_tts_local_pipeline,
+    "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,
     # Alias: the Nemotron-Labs-Audex-2B repo-root config.json reports

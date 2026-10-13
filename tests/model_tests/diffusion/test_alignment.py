@@ -50,6 +50,9 @@ EXCLUDED_MODELS = [
     "LTX2I2VDMD2Pipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
+    # Decoder-only stage consumes upstream latents; covered by H3 decoder
+    # handoff tests and real-checkpoint disaggregated E2E validation.
+    "MiniMaxH3DecoderPipeline",
     "StableAudioPipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
