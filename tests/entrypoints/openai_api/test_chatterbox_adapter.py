@@ -8,6 +8,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import PreTrainedTokenizerFast
 from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -83,16 +87,11 @@ async def test_builtin_request_uses_shared_prompt_builder_without_reference_enco
         prompt_feat=torch.randn(1, 4, 80),
         embedding=torch.randn(1, 192),
     )
-    normalized = []
-
-    def encode(text, *, add_special_tokens):
-        normalized.append((text, add_special_tokens))
-        return [42, 43]
-
-    adapter.tokenizer = SimpleNamespace(encode=encode)
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "Hello": 42, ".": 43}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    adapter.tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]")
     request = OpenAICreateSpeechRequest(input="hello")
     prepared = await adapter.build(request, [SamplingParams()], False)
-    assert normalized == [("Hello.", False)]
     assert prepared.prompt["prompt_token_ids"] == [6561] * 7
     assert prepared.prompt["additional_information"]["ids"] == {"prompt": [42, 43], "speech_token": [1, 2, 3]}
     assert adapter.conditioner is None

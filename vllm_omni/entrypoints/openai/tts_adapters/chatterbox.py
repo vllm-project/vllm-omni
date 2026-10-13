@@ -4,7 +4,6 @@
 
 import asyncio
 import math
-import os
 from collections import OrderedDict
 from collections.abc import Mapping
 from threading import Lock
@@ -12,7 +11,7 @@ from threading import Lock
 import numpy as np
 import torch
 from tokenizers import Tokenizer
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 from vllm.utils.async_utils import make_async
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -29,10 +28,10 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
     VoiceConditioner,
     VoiceConditioning,
     build_prompt,
-    punc_norm,
+    load_text_tokenizer,
+    tokenize_text,
 )
 from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_MAX_NEW_TOKENS, ChatterboxConfig
-from vllm_omni.transformers_utils.repo_utils import hf_api
 
 CONDITIONING_MAX_PENDING = 64
 CONDITIONING_CACHE_ENTRIES = 128
@@ -59,7 +58,7 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.conditioning_device = torch.device(overrides.get("conditioning_device", "cpu"))
         if self.conditioning_device.type not in {"cpu", "cuda"}:
             raise ValueError("Chatterbox conditioning_device must be cpu or cuda")
-        self.tokenizer: PreTrainedTokenizerBase | None = None
+        self.tokenizer: PreTrainedTokenizerBase | Tokenizer | None = None
         self.builtin_voice: VoiceConditioning | None = None
         self.conditioner: VoiceConditioner | None = None
         # Publish fully initialized components before concurrent requests use them.
@@ -198,11 +197,11 @@ class ChatterboxAdapter(ARTTSAdapter):
         return None
 
     def encode_text(self, model: str, text: str) -> list[int]:
-        """Load Turbo's explicitly selected tokenizer for its config-less checkpoint."""
+        """Load the variant tokenizer once and encode outside the event loop."""
         with self.initialization_lock:
             if self.tokenizer is None:
-                self.tokenizer = AutoTokenizer.from_pretrained(model, tokenizer_type="gpt2")
-        return self.tokenizer.encode(punc_norm(text), add_special_tokens=False)
+                self.tokenizer = load_text_tokenizer(model, self.variant)
+        return tokenize_text(text, self.tokenizer, self.variant)
 
     def prepare_prompt(
         self,
@@ -262,10 +261,6 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
     variant = "original"
     max_new_tokens_max = ORIGINAL_MAX_NEW_TOKENS
 
-    def __init__(self, ctx: SpeechServingContext) -> None:
-        super().__init__(ctx)
-        self.original_tokenizer: Tokenizer | None = None
-
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         error = super().validate(request)
         if error:
@@ -275,12 +270,3 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 return f"{name} must be a finite nonnegative number"
         return None
-
-    def encode_text(self, model: str, text: str) -> list[int]:
-        with self.initialization_lock:
-            if self.original_tokenizer is None:
-                model_dir = model
-                if not os.path.isdir(model):
-                    model_dir = hf_api().snapshot_download(model, allow_patterns=["tokenizer.json"])
-                self.original_tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
-        return self.original_tokenizer.encode(punc_norm(text, "original").replace(" ", "[SPACE]")).ids

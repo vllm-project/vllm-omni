@@ -3,14 +3,18 @@
 import numpy as np
 import pytest
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
     VoiceConditioner,
     VoiceConditioning,
     build_prompt,
+    load_text_tokenizer,
     normalize_loudness,
     punc_norm,
+    tokenize_text,
     trim_silence,
     voice_encoder_mel,
 )
@@ -162,3 +166,10 @@ def test_prepare_batch_is_bounded_and_keeps_order() -> None:
 def test_original_prompt_rejects_text_beyond_learned_positions():
     with pytest.raises(ValueError, match="2048 text tokens"):
         build_prompt([5] * 2049, conditioning(10, 125), ChatterboxConfig("original"))
+
+
+def test_original_text_helper_loads_local_tokenizer_and_normalizes_spaces(tmp_path):
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "Hello[SPACE]world.": 7}, unk_token="[UNK]"))
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    loaded = load_text_tokenizer(str(tmp_path), "original")
+    assert tokenize_text("hello world", loaded, "original") == [7]

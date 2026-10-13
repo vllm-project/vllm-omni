@@ -40,15 +40,10 @@ extra with `uv pip install -e '.[chatterbox]'`. The integration includes its
 required adapter hooks; [#8842](https://github.com/vllm-project/vllm-omni/pull/8842)
 contains independent shared runtime fixes.
 
-```bash
-uv run examples/offline_inference/text_to_speech/chatterbox/end2end.py \
-  ResembleAI/chatterbox-turbo "Hello, this is Chatterbox speaking." output.wav
-# Use ResembleAI/chatterbox with --variant original for Original.
-# Add --ref-audio /path/to/reference.wav to clone a voice.
-```
-
-The example uses the same prompt builder and conditioning as the serving
-adapter. Output is a complete mono 24 kHz WAV, consolidating streaming deltas.
+Use the production `load_text_tokenizer`, `tokenize_text`, `build_prompt`, and
+`VoiceConditioning` helpers with `Omni.generate`. The [offline command in the
+A5000 recipe](../../../recipes/ResembleAI/Chatterbox-A5000.md#offline-inference)
+saves a complete mono 24 kHz WAV and uses the same preparation as serving.
 
 See the [A5000 recipe](../../../recipes/ResembleAI/Chatterbox-A5000.md) and
 [H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for profiles,

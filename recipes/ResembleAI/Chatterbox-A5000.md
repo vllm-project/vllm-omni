@@ -19,6 +19,45 @@ It supports the checkpoint's built-in voice and voice cloning from one recording
 | Hardware | One NVIDIA RTX A5000, 24 GB, PCIe; no inter-GPU communication |
 | Maintainer | PR author; see [#8700](https://github.com/vllm-project/vllm-omni/pull/8700) |
 
+## Offline inference
+
+The production tokenizer and conditioning helpers also prepare offline requests.
+Run from the repository root after installing the Chatterbox extra:
+
+```bash
+uv run python - <<'PYTHON'
+import soundfile as sf
+import torch
+from vllm_omni import Omni
+from vllm_omni.model_executor.models.chatterbox.conditioning import (
+    VoiceConditioning, build_prompt, load_text_tokenizer, tokenize_text,
+)
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+
+model, variant = "ResembleAI/chatterbox-turbo", "turbo"
+# For Original: model, variant = "ResembleAI/chatterbox", "original"
+config = ChatterboxConfig(variant)
+tokenizer = load_text_tokenizer(model, variant)
+voice = VoiceConditioning.from_builtin(model)
+ids = tokenize_text("Hello, this is Chatterbox speaking.", tokenizer, variant)
+prompt = build_prompt(ids, voice, config)
+engine = Omni(model=model)
+try:
+    output = list(engine.generate([prompt]))[0].outputs[0].multimodal_output
+    audio = output["audio"]
+    if isinstance(audio, list):
+        audio = torch.cat([chunk.flatten() for chunk in audio])
+    sf.write("output.wav", audio.flatten().numpy(force=True), config.sample_rate)
+finally:
+    engine.close()
+PYTHON
+```
+
+For cloning, load a recording with `soundfile.read` and replace `voice` with
+`VoiceConditioner(model, config, torch.device("cpu")).prepare(wav, sample_rate)`.
+The recording must be mono and meet the variant's reference-duration minimum.
+The interactive streaming player lives at `apps/chatterbox/gradio_demo.py`.
+
 ## Supported model contract
 
 | Surface | Contract |

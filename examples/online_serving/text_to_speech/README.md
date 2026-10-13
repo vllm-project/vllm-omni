@@ -54,7 +54,7 @@ non-streaming responses and PCM/WAV streaming. Original additionally accepts
 For browser playback, install `vllm-omni[demo]` and run:
 
 ```bash
-uv run examples/online_serving/text_to_speech/chatterbox/gradio_demo.py
+uv run apps/chatterbox/gradio_demo.py
 ```
 
 The demo streams PCM deltas into the browser audio player and accepts an optional

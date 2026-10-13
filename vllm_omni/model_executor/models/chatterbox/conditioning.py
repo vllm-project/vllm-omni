@@ -22,6 +22,8 @@ import numpy as np
 import torch
 import torchaudio
 from safetensors.torch import load_file
+from tokenizers import Tokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from vllm.inputs import tokens_input
 from vllm.multimodal.parse import MultiModalDataParser
 
@@ -67,6 +69,34 @@ def punc_norm(text: str, variant: str = "turbo") -> str:
     if not text.endswith(SENTENCE_ENDERS):
         text += "."
     return text
+
+
+def load_text_tokenizer(model: str, variant: str) -> PreTrainedTokenizerBase | Tokenizer:
+    """Load the checkpoint tokenizer, including Original's config-less JSON."""
+    if variant == "turbo":
+        return AutoTokenizer.from_pretrained(model, tokenizer_type="gpt2")
+    if variant != "original":
+        raise ValueError(f"Unsupported Chatterbox variant: {variant}")
+    path = (
+        os.path.join(model, "tokenizer.json")
+        if os.path.isdir(model)
+        else hf_api().hf_hub_download(model, "tokenizer.json")
+    )
+    return Tokenizer.from_file(path)
+
+
+def tokenize_text(text: str, tokenizer: PreTrainedTokenizerBase | Tokenizer, variant: str) -> list[int]:
+    """Encode normalized text with the variant's released tokenizer contract."""
+    normalized = punc_norm(text, variant)
+    if variant == "original":
+        if not isinstance(tokenizer, Tokenizer):
+            raise TypeError("Original requires a tokenizers.Tokenizer")
+        return tokenizer.encode(normalized.replace(" ", "[SPACE]")).ids
+    if variant != "turbo":
+        raise ValueError(f"Unsupported Chatterbox variant: {variant}")
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        raise TypeError("Turbo requires a Transformers tokenizer")
+    return tokenizer.encode(normalized, add_special_tokens=False)
 
 
 def normalize_loudness(wav: np.ndarray, sample_rate: int, target_lufs: float) -> np.ndarray:

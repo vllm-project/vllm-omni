@@ -369,3 +369,28 @@ H100 baselines come from the October 12 integration run documented in the
 B200 is routed as a CI mirror without an assigned performance baseline.
 The job does not replace cold-reference or WebSocket validation with
 `chatterbox_load.py`.
+
+## Matched Chatterbox reference qualification
+
+`chatterbox_reference.py` compares the canonical upstream Python `generate`
+API with `Omni.generate` on an exclusive GPU, one request at a time. Use pinned
+local checkpoints and the same reference WAV. It measures whole utterances in
+FP32/eager mode, including fresh reference conditioning for every cloned-voice
+request, with two warmups per voice mode and three texts across three seeds.
+Initialization and WAV writing are excluded. Whole-device memory includes
+Omni's separate workers and is sampled every 100 ms.
+
+```bash
+uv run benchmarks/tts/chatterbox_reference.py upstream turbo /models/turbo reference.wav results/turbo
+uv run benchmarks/tts/chatterbox_reference.py omni turbo /models/turbo reference.wav results/turbo
+uv run benchmarks/tts/chatterbox_reference.py quality turbo /models/turbo reference.wav results/turbo
+```
+
+Repeat with `original` and its checkpoint. Run upstream in its reference
+environment and Omni in the project's environment; record both package lists.
+Quality evaluation needs the project environment, `jiwer`, and Whisper
+large-v3 weights. It retains transcripts, WER edits, final-phrase completion,
+and checkpoint voice-encoder cosine similarity. These are narrow automated
+checks, not human listening scores. Upstream retains its Perth watermark;
+Omni uses fixed flow noise, and equal seeds do not imply equal stochastic
+token draws. See the H100 recipe for exact pins, commands and measured results.
