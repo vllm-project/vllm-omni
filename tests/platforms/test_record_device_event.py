@@ -18,6 +18,7 @@ class TestOmniPlatformRecordDeviceEventInterface:
         assert OmniPlatform.record_device_event() is None
 
 
+@hardware_test(res={"cuda": "L4"})
 class TestCudaOmniPlatformRecordDeviceEvent:
     """Test CudaOmniPlatform.record_device_event with mocked torch.Event."""
 
