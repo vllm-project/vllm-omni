@@ -285,76 +285,70 @@ def write_report(args, rows):
 
 
 def evaluate_quality(args):
-    """Apply one frozen ASR and speaker encoder to every retained output."""
-    import jiwer
-    import torchaudio
-    import whisper
-    from safetensors.torch import load_file
-    from whisper.normalizers import EnglishTextNormalizer
+    """Score every retained output with the shared Seed-TTS evaluator, one group per backend and voice."""
+    from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import compute_seed_tts_wer_metrics
+    from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 
-    from vllm_omni.model_executor.models.chatterbox.conditioning import trim_silence, voice_encoder_mel
-    from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
-
-    encoder = VoiceEncoder(VoiceEncConfig()).to("cuda").eval()
-    weights = load_file(str(args.model / "ve.safetensors"))
-    encoder.load_state_dict(weights)
-    asr = whisper.load_model("large-v3", device="cuda")
-    normalizer = EnglishTextNormalizer()
-
-    @torch.inference_mode()
-    def speaker(wav16):
-        mel = voice_encoder_mel(trim_silence(wav16.numpy(force=True)), encoder.hp)
-        return encoder.inference(mel[None].to("cuda"), mel_lens=[mel.shape[0]], rate=1.3)[0].float().cpu()
-
-    ref, ref_rate = sf.read(args.reference, dtype="float32", always_2d=True)
-    reference_embedding = speaker(torchaudio.functional.resample(torch.from_numpy(ref.mean(axis=1)), ref_rate, 16000))
-    builtin = torch.load(args.model / "conds.pt", map_location="cpu", weights_only=True)["t3"]["speaker_emb"].flatten()
-    rows = []
-    reports = {
-        backend: json.loads((args.output / f"{backend}-{args.variant}.json").read_text())
-        for backend in ("upstream", "omni")
-    }
-    for backend, report in reports.items():
-        for row in report["rows"]:
-            wav, rate = sf.read(args.output / row["audio"], dtype="float32")
-            if rate != 24000 or wav.ndim != 1 or len(wav) != row["audio_samples"]:
-                raise ValueError("Output waveform does not match its timed report")
-            wav16 = torchaudio.functional.resample(torch.from_numpy(wav), rate, 16000)
-            transcript = asr.transcribe(wav16.numpy(force=True), language="en", temperature=0, fp16=False)["text"]
-            expected, actual = normalizer(row["text"]), normalizer(transcript)
-            errors = jiwer.process_words(expected, actual)
-            target = reference_embedding if row["voice"] == "clone" else builtin
-            embedding = speaker(wav16)
-            cosine = torch.nn.functional.cosine_similarity(embedding[None], target[None]).item()
-            rows.append(
-                {
-                    **row,
-                    "backend": backend,
-                    "transcript": transcript,
-                    "wer": errors.wer,
-                    "substitutions": errors.substitutions,
-                    "deletions": errors.deletions,
-                    "insertions": errors.insertions,
-                    "reference_words": len(expected.split()),
-                    "tail_complete": actual.endswith(" ".join(expected.split()[-3:])),
-                    "speaker_cosine": cosine,
-                }
-            )
-            logging.info(
-                "%s %s seed %s: WER %.3f, speaker %.3f", backend, row["voice"], row["seed"], errors.wer, cosine
-            )
-            (args.output / f"quality-{args.variant}.json").write_text(
-                json.dumps(
-                    {
-                        "asr": "openai-whisper large-v3; temperature=0; FP32",
-                        "normalization": "Whisper EnglishTextNormalizer",
-                        "speaker_metric": "checkpoint VoiceEncoder cosine to reference/builtin target; not human MOS",
-                        "rows": rows,
-                    },
-                    indent=2,
+    # The built-in voice ships as embeddings, not a recording, so SIM covers cloned rows only.
+    os.environ["SEED_TTS_SIM_EVAL"] = "1"
+    rows, summaries = [], {}
+    for backend in ("upstream", "omni"):
+        report = json.loads((args.output / f"{backend}-{args.variant}.json").read_text())
+        for voice in ("builtin", "clone"):
+            selected = [row for row in report["rows"] if row["voice"] == voice]
+            requests, outputs = [], []
+            for row in selected:
+                wav, rate = sf.read(args.output / row["audio"], dtype="float32")
+                if rate != 24000 or wav.ndim != 1 or len(wav) != row["audio_samples"]:
+                    raise ValueError("Output waveform does not match its timed report")
+                requests.append(
+                    SeedTTSSampleRequest(
+                        prompt=row["text"],
+                        prompt_len=0,
+                        seed_tts_utterance_id=Path(row["audio"]).stem,
+                        seed_tts_locale="en",
+                        seed_tts_ref_wav_path=str(args.reference) if voice == "clone" else "",
+                    )
                 )
-                + "\n"
-            )
+                pcm = (np.clip(wav, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+                outputs.append(MixRequestFuncOutput(success=True, tts_output_pcm_bytes=pcm))
+            metrics = compute_seed_tts_wer_metrics(requests, outputs, include_per_item=True)
+            if "seed_tts_eval_setup_error" in metrics:
+                raise RuntimeError(metrics["seed_tts_eval_setup_error"])
+            items = metrics.pop("seed_tts_wer_eval_items")
+            summaries[f"{backend}-{voice}"] = metrics
+            for row, item in zip(selected, items, strict=True):
+                if "error" in item:
+                    raise ValueError(f"{item['utterance_id']}: {item['error']} {item.get('detail', '')}")
+                expected, actual = (
+                    "".join(c for c in text.lower() if c.isalnum() or c.isspace()).split()
+                    for text in (item["reference_raw"], item["asr_raw"])
+                )
+                sim = item.get("sim")
+                rows.append(
+                    {
+                        **row,
+                        "backend": backend,
+                        "transcript": item["asr_raw"],
+                        "wer": item["wer"],
+                        "tail_complete": actual[-3:] == expected[-3:],
+                        "speaker_sim": sim,
+                    }
+                )
+                logging.info("%s %s seed %s: WER %.3f, SIM %s", backend, voice, row["seed"], item["wer"], sim)
+    (args.output / f"quality-{args.variant}.json").write_text(
+        json.dumps(
+            {
+                "evaluator": "vllm_omni.benchmarks.data_modules.seed_tts_eval: Whisper large-v3 WER; "
+                "WavLM cosine SIM to the cloned reference; not human listening scores",
+                "summaries": summaries,
+                "rows": rows,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 if __name__ == "__main__":

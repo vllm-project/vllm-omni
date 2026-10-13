@@ -162,11 +162,14 @@ single-request configuration Omni is slower than upstream; with the default
 profile (stage 0 CUDA graphs) the nightly latency row below reaches
 upstream's Turbo RTF.
 
-Quality, same Whisper large-v3 (FP32, temperature zero, English text
-normalizer; checkpoint SHA256
+Quality, scored at the time with `openai-whisper` large-v3 (FP32,
+temperature zero, English text normalizer; checkpoint SHA256
 `e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb`) and
 the checkpoint's voice encoder for both backends. Speaker cosine is to the
-reference embedding (clone) or the checkpoint speaker embedding (built-in):
+reference embedding (clone) or the checkpoint speaker embedding (built-in).
+The script's quality mode now scores through the shared Seed-TTS evaluator
+(`transformers` Whisper large-v3 WER; WavLM SIM for cloned rows only); this
+table predates that change and has not been rerun with it:
 
 | Model | Backend | Voice | Aggregate WER | Mean speaker cosine | Final phrase complete |
 | --- | --- | --- | --- | --- | --- |

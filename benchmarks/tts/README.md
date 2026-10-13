@@ -382,9 +382,11 @@ uv run benchmarks/tts/chatterbox_reference.py quality turbo /models/turbo refere
 
 Repeat with `original` and its checkpoint. Run upstream in its reference
 environment and Omni in the project's environment; record both package lists.
-Quality evaluation needs the project environment, `jiwer`, and Whisper
-large-v3 weights. It retains transcripts, WER edits, final-phrase completion,
-and checkpoint voice-encoder cosine similarity. These are narrow automated
-checks, not human listening scores. Upstream retains its Perth watermark;
+Quality evaluation runs in the project environment with the `dev` extra and
+scores every retained waveform through the shared Seed-TTS evaluator above
+(Whisper large-v3 WER; WavLM SIM to the cloned reference, since the built-in
+voice ships as embeddings rather than a recording), per backend and voice,
+plus final-phrase completion. These are narrow automated checks, not human
+listening scores. Upstream retains its Perth watermark;
 Omni uses fixed flow noise, and equal seeds do not imply equal stochastic
 token draws. See the H100 recipe for exact pins, commands and measured results.
