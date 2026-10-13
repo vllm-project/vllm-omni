@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GPU end-to-end FP8 A/B gates for the MammothModa2 AR stage.
 
-These tests load the real ``MammothModa2-Dev`` checkpoint and compare BF16 vs
-FP8 generation, scoped to the AR stage:
+These tests load the real ``MammothModa2-Preview`` and ``MammothModa2-Dev``
+checkpoints and compare BF16 vs FP8 generation, scoped to the AR stage:
 
 * ``test_ar_generation_smoke`` — each format loads and produces tokens.
 * ``test_bf16_vs_fp8_generation_consistency`` — AR-only understanding: the
-  base head / understanding expert under FP8 (token agreement + logprob
-  similarity + MAE).
+  base head / understanding expert under FP8 (reported token agreement and
+  MAE; shared-prefix logprob similarity gate).
 * ``test_bf16_vs_fp8_t2i_image_consistency`` — t2i (AR→DiT): drives the AR
   stage to emit visual tokens, which exercises the generation experts
   (``gen_mlp``) and the extra vocabulary/head (``gen_embed_tokens`` /
@@ -20,6 +20,7 @@ The CPU-only structural unit tests live in
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -31,8 +32,21 @@ from tests.helpers.mark import hardware_test
 # Constants
 # ---------------------------------------------------------------------------
 
-# Local Dev checkpoint; override via env for CI / hub ids.
-MODEL_PATH = os.environ.get("MAMMOTH_MODA2_MODEL", "bytedance-research/MammothModa2-Dev")
+# Override each checkpoint independently for local runs / CI. The legacy
+# MAMMOTH_MODA2_MODEL override remains a fallback for Dev only.
+MODEL_CASES = [
+    pytest.param(
+        os.environ.get("MAMMOTH_MODA2_PREVIEW_MODEL", "bytedance-research/MammothModa2-Preview"),
+        id="preview",
+    ),
+    pytest.param(
+        os.environ.get(
+            "MAMMOTH_MODA2_DEV_MODEL",
+            os.environ.get("MAMMOTH_MODA2_MODEL", "bytedance-research/MammothModa2-Dev"),
+        ),
+        id="dev",
+    ),
+]
 
 # Quantization cases for the A/B gate. ``None`` is the BF16 baseline (the
 # ``quantization`` stage key is removed). FP8 is vLLM's runtime W8A8
@@ -46,23 +60,30 @@ QUANTIZATION_CASES = [None, "fp8"]
 # non-CUDA hosts from erroring out locally, and does not restrict the marks.
 _CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 
-# Minimum token-level agreement between BF16 and a quantized run, required for
-# the A/B test to pass. TODO: tune after measuring real greedy-decoding drift.
-MIN_TOKEN_AGREEMENT = 0.9
+# Token agreement is reported only: one greedy-token change can shift the
+# continuation and make positional agreement misleading. Require at least two
+# identical initial tokens before scoring shared-prefix logprob similarity,
+# matching the MammothModa2 INT8 A/B gate.
+MIN_SHARED_PREFIX = 2
 
-# Minimum cosine similarity between BF16 and quantized top-1 logprob sequences.
-# FP8 W8A8 typically lands ~0.94-0.99 on greedy logprobs (measured 0.9447 on
-# RTX PRO 6000); keep a margin below that to catch real breakage, not normal
-# quantization drift.
+# Minimum cosine similarity between BF16 and quantized top-1 logprobs on the
+# shared greedy prefix. Steps from divergent continuations are not scored.
 MIN_LOGPROB_COSINE = 0.90
 
 _PROMPT = "Explain multimodal generation in three sentences."
+_SEED = 42
 
 # L4 nightly suite selected by the dedicated H100 step in
 # ``.buildkite/cuda/test-nightly.yml``. Not ``slow``: that marker routes tests
 # into the weekly ``-m "slow and ..."`` sweeps, which would run this full
 # checkpoint A/B gate a second time.
 pytestmark = [pytest.mark.full_model]
+
+
+@pytest.fixture(scope="module", params=MODEL_CASES)
+def model_path(request) -> str:
+    """Run every GPU gate independently for Preview and Dev."""
+    return request.param
 
 
 # ---------------------------------------------------------------------------
@@ -79,9 +100,12 @@ def _stage_config(quantization: str | None) -> str:
     from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
     base = get_deploy_config_path("mammoth_moda2_ar.yaml")
+    # OmniRunner stores its seed but does not forward it to the engine.
+    updates = {"stages": {0: {"seed": _SEED}}}
     if quantization is None:
-        return modify_stage_config(base, deletes={"stages": {0: ["quantization"]}})
-    return modify_stage_config(base, updates={"stages": {0: {"quantization": quantization}}})
+        return modify_stage_config(base, updates=updates, deletes={"stages": {0: ["quantization"]}})
+    updates["stages"][0]["quantization"] = quantization
+    return modify_stage_config(base, updates=updates)
 
 
 def _generate(model: str, quantization: str | None) -> tuple[list[int], list[float]]:
@@ -98,28 +122,34 @@ def _generate(model: str, quantization: str | None) -> tuple[list[int], list[flo
         prompt=_PROMPT,
         has_image=False,
     )
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=32, detokenize=False, logprobs=1)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=32, seed=_SEED, detokenize=True, logprobs=1)
 
-    with OmniRunner(model, seed=42, deploy_config=_stage_config(quantization)) as runner:
+    with OmniRunner(model, seed=_SEED, deploy_config=_stage_config(quantization)) as runner:
         outputs = list(runner.omni.generate([prompt_dict], [sampling_params]))
 
     for out in outputs:
         for completion in getattr(out, "outputs", None) or []:
             token_ids = list(getattr(completion, "token_ids", None) or [])
-            return token_ids, _top1_logprobs(completion)
+            logprobs = _top1_logprobs(completion)
+            print(f"[FP8 AR output] model={model} quantization={quantization!r} seed={_SEED}")
+            print(f"  text={getattr(completion, 'text', None)!r}")
+            print(f"  token_ids={token_ids}")
+            print(f"  top1_logprobs={logprobs}")
+            return token_ids, logprobs
     return [], []
 
 
 def _top1_logprobs(completion) -> list[float]:
-    """Extract the top-1 logprob at each generated step (empty if unavailable)."""
+    """Extract finite top-1 logprobs, rejecting missing or invalid steps."""
     logprobs = getattr(completion, "logprobs", None)
     if not logprobs:
         return []
     result: list[float] = []
-    for step in logprobs:
-        if not step:
-            result.append(float("nan"))
-            continue
+    for index, step in enumerate(logprobs):
+        assert step, f"missing logprobs at generated step {index}"
+        assert all(math.isfinite(float(lp.logprob)) for lp in step.values()), (
+            f"non-finite logprobs at generated step {index}"
+        )
         best = max(step.values(), key=lambda lp: lp.logprob)
         result.append(float(best.logprob))
     return result
@@ -143,19 +173,19 @@ def _mean_abs_diff(a: list[float], b: list[float]) -> float:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("quantization", QUANTIZATION_CASES, ids=["bf16", "fp8"])
-def test_ar_generation_smoke(quantization: str | None):
+def test_ar_generation_smoke(model_path: str, quantization: str | None):
     """Each supported format loads and produces a non-empty greedy sequence."""
-    token_ids, _ = _generate(MODEL_PATH, quantization)
+    token_ids, _ = _generate(model_path, quantization)
     assert token_ids, f"no tokens generated for quantization={quantization!r}"
 
 
 @_CUDA_ONLY
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"})
-def test_bf16_vs_fp8_generation_consistency():
-    """A/B: BF16 vs FP8 — report token agreement + logprob similarity + MAE."""
-    bf16_ids, bf16_lp = _generate(MODEL_PATH, None)
-    fp8_ids, fp8_lp = _generate(MODEL_PATH, "fp8")
+def test_bf16_vs_fp8_generation_consistency(model_path: str):
+    """Gate shared-prefix logprob cosine; report token agreement and MAE."""
+    bf16_ids, bf16_lp = _generate(model_path, None)
+    fp8_ids, fp8_lp = _generate(model_path, "fp8")
 
     assert bf16_ids, "BF16 baseline produced no tokens"
     assert fp8_ids, "FP8 run produced no tokens"
@@ -165,26 +195,35 @@ def test_bf16_vs_fp8_generation_consistency():
         f"fp8={len(fp8_ids)} (bf16={bf16_ids} fp8={fp8_ids})"
     )
     token_agree = sum(a == b for a, b in zip(bf16_ids, fp8_ids)) / len(bf16_ids)
+    first_mismatch = next((i for i, (a, b) in enumerate(zip(bf16_ids, fp8_ids)) if a != b), None)
+    shared_prefix = len(bf16_ids) if first_mismatch is None else first_mismatch
+    print(f"[FP8 AR comparison] model={model_path} first_mismatch_index={first_mismatch}")
 
-    # The logprob gate must actually run: assert both sides reported a top-1
-    # logprob for every generated token instead of silently skipping on NaN.
+    # Validate every generated step, including the unscored continuation.
+    # _top1_logprobs also rejects empty steps and non-finite values.
     assert len(bf16_lp) == len(bf16_ids), f"BF16 top-1 logprobs missing: got {len(bf16_lp)} for {len(bf16_ids)} tokens"
     assert len(fp8_lp) == len(fp8_ids), f"FP8 top-1 logprobs missing: got {len(fp8_lp)} for {len(fp8_ids)} tokens"
 
-    lp_common = min(len(bf16_lp), len(fp8_lp))
-    logprob_cos = _cosine_sim(bf16_lp[:lp_common], fp8_lp[:lp_common])
-    logprob_mae = _mean_abs_diff(bf16_lp[:lp_common], fp8_lp[:lp_common])
-
-    print(f"[FP8 A/B] token_agreement={token_agree:.4f} logprob_cosine={logprob_cos:.4f} logprob_mae={logprob_mae:.4f}")
-
-    assert token_agree >= MIN_TOKEN_AGREEMENT, (
-        f"BF16/FP8 greedy sequences diverge too much: agreement={token_agree:.3f} < "
-        f"{MIN_TOKEN_AGREEMENT}. bf16={bf16_ids} fp8={fp8_ids}"
+    assert shared_prefix >= MIN_SHARED_PREFIX, (
+        f"BF16/FP8 share only {shared_prefix}/{len(bf16_ids)} initial token(s); "
+        f"need at least {MIN_SHARED_PREFIX} steps to score logprobs. "
+        f"bf16={bf16_ids} fp8={fp8_ids}"
     )
-    if logprob_cos == logprob_cos:  # not NaN
-        assert logprob_cos >= MIN_LOGPROB_COSINE, (
-            f"BF16/FP8 logprob sequences diverge too much: cosine={logprob_cos:.4f} < {MIN_LOGPROB_COSINE}"
-        )
+
+    # At and after the first token mismatch the predictions concern different
+    # tokens, then different histories. Score only the identical initial path.
+    logprob_cos = _cosine_sim(bf16_lp[:shared_prefix], fp8_lp[:shared_prefix])
+    logprob_mae = _mean_abs_diff(bf16_lp[:shared_prefix], fp8_lp[:shared_prefix])
+    assert math.isfinite(logprob_cos), f"non-finite logprob cosine: {logprob_cos}"
+
+    print(
+        f"[FP8 A/B] token_agreement={token_agree:.4f} (reported only) "
+        f"agree_prefix={shared_prefix}/{len(bf16_ids)} "
+        f"logprob_cosine={logprob_cos:.4f} logprob_mae={logprob_mae:.4f}"
+    )
+    assert logprob_cos >= MIN_LOGPROB_COSINE, (
+        f"BF16/FP8 shared-prefix logprobs diverge too much: cosine={logprob_cos:.4f} < {MIN_LOGPROB_COSINE}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +276,13 @@ def _t2i_stage_config(quantization: str | None) -> str:
     from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
     base = get_deploy_config_path("mammoth_moda2.yaml")
+    # Only the AR engine accepts a deployment seed. DiT must receive its seed
+    # through request sampling parameters (see dit_sampling below).
+    updates = {"stages": {0: {"seed": _SEED}}}
     if quantization is None:
-        return base
-    return modify_stage_config(base, updates={"stages": {0: {"quantization": quantization}}})
+        return modify_stage_config(base, updates=updates, deletes={"stages": {0: ["quantization"]}})
+    updates["stages"][0]["quantization"] = quantization
+    return modify_stage_config(base, updates=updates)
 
 
 def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
@@ -263,11 +306,14 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
         temperature=0.0,
         top_k=1,
         max_tokens=max(1, expected_grid_tokens + 1),
+        seed=_SEED,
         detokenize=False,
     )
-    dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    # Diffusion requests without an explicit seed receive a random seed, even
+    # with greedy AR decoding and a fixed engine seed. Pin the initial noise.
+    dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, seed=_SEED, detokenize=False)
 
-    with OmniRunner(model, seed=42, deploy_config=_t2i_stage_config(quantization)) as runner:
+    with OmniRunner(model, seed=_SEED, deploy_config=_t2i_stage_config(quantization)) as runner:
         outputs = list(
             runner.omni.generate(
                 [
@@ -390,10 +436,10 @@ def _image_metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
 @_CUDA_ONLY
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bf16_vs_fp8_t2i_image_consistency():
+def test_bf16_vs_fp8_t2i_image_consistency(model_path: str):
     """A/B: BF16 vs FP8 t2i — decoded image must match (gen experts + head OK)."""
-    bf16_img = _generate_t2i_image(MODEL_PATH, None)
-    fp8_img = _generate_t2i_image(MODEL_PATH, "fp8")
+    bf16_img = _generate_t2i_image(model_path, None)
+    fp8_img = _generate_t2i_image(model_path, "fp8")
 
     expected_shape = (3, _T2I_IMAGE_SIZE[1], _T2I_IMAGE_SIZE[0])
     for name, image in (("BF16", bf16_img), ("FP8", fp8_img)):
