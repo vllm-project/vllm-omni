@@ -28,9 +28,10 @@ from vllm.inputs import tokens_input
 from vllm.multimodal.parse import MultiModalDataParser
 
 from vllm_omni.model_executor.models.chatterbox.original_heads import ORIGINAL_MAX_TEXT_TOKENS
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.xvector import CAMPPlus
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
+from vllm_omni.model_executor.models.indextts2.preprocess_utils import compute_fbank
+from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
 from vllm_omni.transformers_utils.configs.chatterbox import (
     CFG_UNCOND_SUFFIX,
     ORIGINAL_DEFAULT_CFG_WEIGHT,
@@ -263,7 +264,8 @@ class VoiceConditioner:
         )
         self.tokenizer.to(device).eval()
 
-        self.campplus = CAMPPlus(memory_efficient=False)
+        # The same CAMPPlus as IndexTTS2's, at S3Gen's 192-dim x-vector.
+        self.campplus = CAMPPlus(feat_dim=80, embedding_size=192, memory_efficient=False)
         self.campplus.load_state_dict(
             {
                 name.removeprefix("speaker_encoder."): tensor
@@ -384,7 +386,9 @@ class VoiceConditioner:
             groups.setdefault(wav.shape[0], []).append(index)
         embeddings = {}
         for indices in groups.values():
-            batch = self.campplus.inference([decoder_clips_16[index].to(self.device) for index in indices])
+            batch = self.campplus(
+                torch.cat([compute_fbank(decoder_clips_16[index].to(self.device), self.device) for index in indices])
+            )
             for row, index in enumerate(indices):
                 embeddings[index] = batch[row : row + 1].float().cpu().clone()
         results = []
