@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for the audio-streaming continuity helper.
 
@@ -73,18 +73,17 @@ def test_single_gap_above_threshold_breaks_continuity() -> None:
     assert stats.is_continuous is False
 
 
-def test_underrun_is_max_across_gaps_not_sum() -> None:
-    # Two gaps: a 200ms shortfall and a 50ms shortfall.  max_underrun_s
-    # must surface the 200ms one, not the sum.
+def test_single_stall_is_separate_from_legacy_cumulative_deficit() -> None:
+    # Actual stalls are 200ms and 50ms; maximum=200ms, total=250ms.
     stats = compute_continuity_stats(
         chunk_arrival_times_s=[0.0, 0.3, 0.45],
         chunk_bytes=[_BPS // 10, _BPS // 10, _BPS // 10],  # 100ms chunks
         sample_rate=_SR,
         threshold_s=0.1,
     )
-    # At t=0.3 the player consumed 300ms but only 100ms received -> 200ms deficit
-    # At t=0.45 player consumed 450ms, received 200ms -> 250ms deficit.
+    assert stats.max_single_underrun_s == pytest.approx(0.2, abs=1e-6)
     assert stats.max_underrun_s == pytest.approx(0.25, abs=1e-6)
+    assert stats.total_underrun_s == pytest.approx(0.25, abs=1e-6)
     assert stats.underrun_event_count == 2
     assert stats.is_continuous is False
 

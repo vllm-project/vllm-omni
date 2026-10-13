@@ -36,7 +36,7 @@ def _sample_value(output: str, line_prefix: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Family registration — 7 audio families served from modality.py
+# Family registration
 # ---------------------------------------------------------------------------
 
 
@@ -46,6 +46,11 @@ _EXPECTED_FAMILIES = [
     defs.AUDIO_RTF_METRIC,
     defs.AUDIO_FRAMES_METRIC,
     defs.AUDIO_UNDERRUN_S,
+    defs.AUDIO_MAX_SINGLE_UNDERRUN_S,
+    defs.TOTAL_UNDERRUN_S,
+    defs.AUDIO_UNDERRUN_EVENT_COUNT_METRIC,
+    defs.AUDIO_UNDERRUN_RATIO_METRIC,
+    defs.AUDIO_UNDERRUN_EVENTS_PER_MINUTE_METRIC,
     defs.AUDIO_CONTINUITY_OK_METRIC,
     defs.AUDIO_SKIPPED_REQUESTS_METRIC,
     defs.SPEECH_STREAM_ABORTED_METRIC,
@@ -70,6 +75,15 @@ class TestRegistration:
         mod.observe_audio_rtf("s", "r", 0.5)
         mod.inc_audio_frames("s", "r", 1)
         mod.observe_audio_underrun("s", "r", 0.01)
+        mod.observe_audio_stall_details(
+            "s",
+            "r",
+            max_single_underrun_s=0.0,
+            total_underrun_s=0.01,
+            event_count=1,
+            underrun_ratio=0.1,
+            events_per_minute=60,
+        )
         mod.inc_audio_continuity_ok("s", "r", 100)
         mod.inc_audio_skipped("s", "r", "malformed_codec")
         mod.inc_speech_stream_aborted("error")
@@ -237,6 +251,14 @@ class TestDiffusion:
 
     def test_log_stats_false_skips(self) -> None:
         silent = OmniModalityMetrics(model_name="silent-model", log_stats=False)
+        silent.observe_audio_stall_details(
+            "s",
+            "r",
+            total_underrun_s=0.25,
+            event_count=2,
+            underrun_ratio=1 / 3,
+            events_per_minute=240,
+        )
         silent.observe_diffusion_exec("s", "r", 1.0)
         silent.observe_diffusion_exec_per_step("s", "r", 0.02)
         silent.observe_diffusion_preprocess("s", "r", 0.01)
@@ -268,6 +290,9 @@ class _StubModMetrics:
 
     def observe_audio_underrun(self, s, r, u):
         self.calls.append(("observe_audio_underrun", s, r, u))
+
+    def observe_audio_stall_details(self, s, r, **details):
+        self.calls.append(("observe_audio_stall_details", s, r, details))
 
     def inc_audio_continuity_ok(self, s, r, threshold_ms):
         self.calls.append(("inc_audio_continuity_ok", s, r, threshold_ms))
@@ -650,6 +675,68 @@ class TestObserveAudioFirstPacket:
 
 
 class TestObserveAudioStreamingFinalize:
+    def test_multiple_stalls_and_total_budget(self):
+        stub = _StubModMetrics()
+        observe_audio_streaming_finalize(
+            stub,
+            stage_id=1,
+            replica_id=0,
+            chunk_arrival_times_s=[0, 0.1875, 0.375],
+            chunk_bytes=[6000] * 3,
+            sample_rate=24000,
+            threshold_s=0.1,
+        )
+        assert ("observe_audio_underrun", "1", "0", 0.125) in stub.calls
+        details = next(c[-1] for c in stub.calls if c[0] == "observe_audio_stall_details")
+        assert details == {
+            "max_single_underrun_s": 0.0625,
+            "total_underrun_s": 0.125,
+            "event_count": 2,
+            "underrun_ratio": 0.25,
+            "events_per_minute": 320,
+        }
+        assert not any(c[0] == "inc_audio_continuity_ok" for c in stub.calls)
+
+    def test_stall_histograms_observe_each_response_once(self, mod: OmniModalityMetrics):
+        stage, replica = "stall_details_once", "0"
+        observe_audio_streaming_finalize(
+            mod,
+            stage_id=stage,
+            replica_id=replica,
+            chunk_arrival_times_s=[0.3, 0.45, 0.85],
+            chunk_bytes=[4800, 9600, 9600],
+            sample_rate=24000,
+        )
+        labels = {"model_name": _MODEL, "stage": stage, "replica": replica}
+        expected = {
+            defs.AUDIO_UNDERRUN_S: 0.25,
+            defs.AUDIO_MAX_SINGLE_UNDERRUN_S: 0.2,
+            defs.TOTAL_UNDERRUN_S: 0.25,
+            defs.AUDIO_UNDERRUN_EVENT_COUNT_METRIC: 2,
+            defs.AUDIO_UNDERRUN_RATIO_METRIC: 1 / 3,
+            defs.AUDIO_UNDERRUN_EVENTS_PER_MINUTE_METRIC: 240,
+        }
+        for metric, value in expected.items():
+            assert REGISTRY.get_sample_value(f"{metric}_count", labels) == 1
+            assert REGISTRY.get_sample_value(f"{metric}_sum", labels) == pytest.approx(value)
+        assert (
+            REGISTRY.get_sample_value(defs.AUDIO_CONTINUITY_OK_METRIC + "_total", {**labels, "threshold_ms": "100"})
+            is None
+        )
+
+    @pytest.mark.parametrize("times,sizes", [([0], []), ([0], [0]), ([1, 0], [4800, 4800])])
+    def test_invalid_timeline_is_unmeasured(self, times, sizes):
+        stub = _StubModMetrics()
+        observe_audio_streaming_finalize(
+            stub,
+            stage_id=1,
+            replica_id=0,
+            chunk_arrival_times_s=times,
+            chunk_bytes=sizes,
+            sample_rate=24000,
+        )
+        assert stub.calls == []
+
     def test_continuous_run_emits_underrun_and_continuity_ok(self):
         stub = _StubModMetrics()
         # Three back-to-back chunks of 0.5s each at 24 kHz s16le mono:
