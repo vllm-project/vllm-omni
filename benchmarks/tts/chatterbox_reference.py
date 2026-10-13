@@ -173,7 +173,8 @@ def make_backend(args):
             top_k=1000 if args.variant == "turbo" else -1,
             min_p=0.0 if args.variant == "turbo" else 0.05,
         )
-        output = list(engine.generate([prompt], sampling_params_list=[sampling]))[0].outputs[0].multimodal_output
+        params = [sampling, *engine.default_sampling_params_list[1:]]
+        output = list(engine.generate([prompt], sampling_params_list=params))[0].outputs[0].multimodal_output
         audio = output["audio"]
         return torch.cat([chunk.flatten() for chunk in audio]) if isinstance(audio, list) else audio
 
