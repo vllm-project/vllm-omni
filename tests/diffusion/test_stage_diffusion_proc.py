@@ -442,11 +442,24 @@ async def test_proc_full_rpc_queue_rejects_without_blocking_abort(proc_control_l
 @pytest.mark.asyncio
 async def test_proc_rpc_engine_death_wakes_recv_without_new_messages(proc_control_loop):
     proc, submit, outgoing, request_socket, response_socket, context = proc_control_loop
-    proc._engine.executor.is_dead = True
-    proc._engine.collective_rpc.side_effect = RuntimeError("DiffusionExecutor is closed")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def collective_rpc(*_args):
+        # Let the RPC enter the executor before simulating the worker death.
+        # If ``is_dead`` is set before run_loop starts, the fatal_event wins
+        # the recv race and the queued RPC never gets its error envelope.
+        entered.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("DiffusionExecutor is closed")
+
+    proc._engine.collective_rpc.side_effect = collective_rpc
     task = asyncio.create_task(proc.run_loop("request", "response"))
     try:
         submit({"type": "collective_rpc", "rpc_id": "interaction", "method": "submit_interaction"})
+        assert await asyncio.to_thread(entered.wait, 1)
+        proc._engine.executor.is_dead = True
+        release.set()
         with pytest.raises(RuntimeError, match="executor reported permanent failure"):
             await asyncio.wait_for(task, 1)
         assert outgoing.get_nowait() == {
