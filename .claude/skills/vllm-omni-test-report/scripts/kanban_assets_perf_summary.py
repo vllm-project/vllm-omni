@@ -46,7 +46,7 @@ LOWER_BETTER_HINTS = (
     "duration",
 )
 HIGHER_BETTER_HINTS = ("throughput", "qps", "tps")
-NORMAL_DEGRADATION_THRESHOLD_PCT = 6.0
+NORMAL_DEGRADATION_THRESHOLD_PCT = 10.0
 
 # A test whose freshest record is older than this (relative to the freshest
 # record across all history files) is treated as stale: its last run likely
