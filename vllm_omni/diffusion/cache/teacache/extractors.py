@@ -472,15 +472,11 @@ def extract_wan2_2_context(
     hidden_states_mask = None
     ctx = get_forward_context()
     parallel_config = ctx.omni_diffusion_config.parallel_config
-    if (
-        parallel_config is not None
-        and parallel_config.sequence_parallel_size > 1
-        and parallel_config.mask_sp_padding
-    ):
+    if parallel_config is not None and parallel_config.sequence_parallel_size > 1 and parallel_config.mask_sp_padding:
         hidden_states_mask = build_local_sp_padding_mask(
             hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
         )
-        if hidden_states_mask.all():
+        if hidden_states_mask is not None and hidden_states_mask.all():
             hidden_states_mask = None
 
     # make_layers leaves PPMissingLayer placeholders outside this stage's slice.
@@ -545,7 +541,6 @@ def extract_wan2_2_context(
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )
-
 
 
 def extract_zimage_context(

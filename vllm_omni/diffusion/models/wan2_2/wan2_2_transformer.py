@@ -1133,7 +1133,7 @@ class WanTransformer3DModel(nn.Module):
                 hidden_states.shape[1],
                 hidden_states.device,
             )
-            if hidden_states_mask.all():
+            if hidden_states_mask is not None and hidden_states_mask.all():
                 hidden_states_mask = None
         elif (
             parallel_config is not None

@@ -186,9 +186,7 @@ def test_wan_extractor_preserves_pipeline_stage_boundaries(monkeypatch):
     model.patch_embedding.reset_mock()
     model.blocks[1].reset_mock()
     intermediate = IntermediateTensors({"hidden_states": first_output})
-    non_first = extract_wan2_2_context(
-        model, hidden_states, torch.tensor([1]), text, intermediate_tensors=intermediate
-    )
+    non_first = extract_wan2_2_context(model, hidden_states, torch.tensor([1]), text, intermediate_tensors=intermediate)
     (non_first_output,) = non_first.run_transformer_blocks()
     assert model.patch_embedding.call_count == 0
     torch.testing.assert_close(non_first.hidden_states, first_output)
@@ -232,7 +230,7 @@ def test_wan_extractor_uses_native_sp_padding_mask_and_block_arguments(monkeypat
     assert args[6] is False
 
 
-def test_wan_extractor_omits_all_true_sp_padding_mask(monkeypatch):
+def test_wan_extractor_handles_absent_sp_padding_mask(monkeypatch):
     monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: True, raising=False)
     monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: True, raising=False)
     parallel_config = SimpleNamespace(sequence_parallel_size=2, mask_sp_padding=True)
@@ -244,13 +242,36 @@ def test_wan_extractor_omits_all_true_sp_padding_mask(monkeypatch):
     monkeypatch.setattr(
         teacache_extractors,
         "build_local_sp_padding_mask",
-        Mock(return_value=torch.ones(1, 6, dtype=torch.bool)),
+        Mock(return_value=None),
         raising=False,
     )
     model = _make_wan_model()
     hidden_states = torch.zeros(1, 2, 1, 4, 6, dtype=torch.bfloat16)
     context = extract_wan2_2_context(model, hidden_states, torch.tensor([1]), torch.zeros(1, 3, 4))
     context.run_transformer_blocks()
+
+    assert model.blocks[0].call_args.args[4] is None
+
+
+def test_wan_native_forward_handles_absent_sp_padding_mask(monkeypatch):
+    monkeypatch.setattr(wan, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(wan, "is_pipeline_last_stage", lambda: True)
+    parallel_config = SimpleNamespace(sequence_parallel_size=2, mask_sp_padding=True)
+    monkeypatch.setattr(
+        wan,
+        "get_forward_context",
+        lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(parallel_config=parallel_config)),
+    )
+    monkeypatch.setattr(wan, "build_local_sp_padding_mask", Mock(return_value=None), raising=False)
+    model = _make_wan_model()
+    hidden_states = torch.zeros(1, 2, 1, 4, 6, dtype=torch.bfloat16)
+
+    wan.WanTransformer3DModel.forward(
+        model,
+        hidden_states,
+        torch.tensor([1]),
+        torch.zeros(1, 3, 4),
+    )
 
     assert model.blocks[0].call_args.args[4] is None
 
