@@ -11,73 +11,6 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from torch.nn import Linear as LoRACompatibleLinear
 
 
-class SnakeBeta(nn.Module):
-    """A modified Snake function which uses separate parameters for the magnitude of the periodic components.
-
-    The input has shape (B, C, T) and the output has the same shape. This activation function is a modified version
-    based on the paper by Liu Ziyin, Tilman Hartwig and Masahito Ueda: https://arxiv.org/abs/2006.08195
-
-    Attributes:
-        alpha: Trainable parameter that controls frequency.
-        beta: Trainable parameter that controls magnitude.
-
-    Examples:
-        >>> a1 = snakebeta(256)
-        >>> x = torch.randn(256)
-        >>> x = a1(x)
-    """
-
-    def __init__(self, in_features, out_features, alpha=1.0, alpha_trainable=True, alpha_logscale=True):
-        """Initialize the activation.
-
-        Alpha is initialized to 1 by default, higher values = higher-frequency.
-        Beta is initialized to 1 by default, higher values = higher-magnitude.
-        Alpha will be trained along with the rest of your model.
-
-        Args:
-            in_features (int): Shape of the input.
-            out_features (int): Number of output features of the input projection.
-            alpha (float): Initial value of the trainable parameters alpha and beta.
-            alpha_trainable (bool): Whether alpha and beta are trained.
-            alpha_logscale (bool): Whether alpha and beta are kept on a log scale.
-        """
-        super().__init__()
-        self.in_features = out_features if isinstance(out_features, list) else [out_features]
-        self.proj = LoRACompatibleLinear(in_features, out_features)
-
-        # initialize alpha
-        self.alpha_logscale = alpha_logscale
-        if self.alpha_logscale:  # log scale alphas initialized to zeros
-            self.alpha = nn.Parameter(torch.zeros(self.in_features) * alpha)
-            self.beta = nn.Parameter(torch.zeros(self.in_features) * alpha)
-        else:  # linear scale alphas initialized to ones
-            self.alpha = nn.Parameter(torch.ones(self.in_features) * alpha)
-            self.beta = nn.Parameter(torch.ones(self.in_features) * alpha)
-
-        self.alpha.requires_grad = alpha_trainable
-        self.beta.requires_grad = alpha_trainable
-
-        self.no_div_by_zero = 0.000000001
-
-    def forward(self, x):
-        """
-        Forward pass of the function.
-        Applies the function to the input elementwise.
-        SnakeBeta ∶= x + 1/b * sin^2 (xa)
-        """
-        x = self.proj(x)
-        if self.alpha_logscale:
-            alpha = torch.exp(self.alpha)
-            beta = torch.exp(self.beta)
-        else:
-            alpha = self.alpha
-            beta = self.beta
-
-        x = x + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(torch.sin(x * alpha), 2)
-
-        return x
-
-
 class FeedForward(nn.Module):
     r"""
     A feed-forward layer.
@@ -112,8 +45,6 @@ class FeedForward(nn.Module):
             act_fn = GEGLU(dim, inner_dim)
         elif activation_fn == "geglu-approximate":
             act_fn = ApproximateGELU(dim, inner_dim)
-        elif activation_fn == "snakebeta":
-            act_fn = SnakeBeta(dim, inner_dim)
 
         self.net = nn.ModuleList([])
         # project in

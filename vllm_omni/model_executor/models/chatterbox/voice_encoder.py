@@ -6,8 +6,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from numpy.lib.stride_tricks import as_strided
-from torch import Tensor, nn
+from torch import nn
 
 
 class VoiceEncConfig:
@@ -15,7 +14,6 @@ class VoiceEncConfig:
     sample_rate = 16000
     speaker_embed_size = 256
     ve_hidden_size = 256
-    flatten_lstm_params = False
     n_fft = 400
     hop_size = 160
     win_size = 400
@@ -27,47 +25,6 @@ class VoiceEncConfig:
     ve_partial_frames = 160
     ve_final_relu = True
     stft_magnitude_min = 1e-4
-
-
-def pack(arrays, seq_len: int = None, pad_value=0):
-    """
-    Given a list of length B of array-like objects of shapes (Ti, ...), packs them in a single tensor of
-    shape (B, T, ...) by padding each individual array on the right.
-
-    Args:
-        arrays (list): A list of array-like objects of matching shapes except for the first axis.
-        seq_len (int): The value of T. It must be the maximum of the lengths Ti of the arrays at
-            minimum. Will default to that value if None.
-        pad_value (float): The value to pad the arrays with.
-
-    Returns:
-        packed (torch.Tensor): A (B, T, ...) tensor.
-    """
-    if seq_len is None:
-        seq_len = max(len(array) for array in arrays)
-    else:
-        assert seq_len >= max(len(array) for array in arrays)
-
-    # Convert lists to np.array
-    if isinstance(arrays[0], list):
-        arrays = [np.array(array) for array in arrays]
-
-    # Convert to tensor and handle device
-    device = None
-    if isinstance(arrays[0], torch.Tensor):
-        tensors = arrays
-        device = tensors[0].device
-    else:
-        tensors = [torch.as_tensor(array) for array in arrays]
-
-    # Fill the packed tensor with the array data
-    packed_shape = (len(tensors), seq_len, *tensors[0].shape[1:])
-    packed_tensor = torch.full(packed_shape, pad_value, dtype=tensors[0].dtype, device=device)
-
-    for i, tensor in enumerate(tensors):
-        packed_tensor[i, : tensor.size(0)] = tensor
-
-    return packed_tensor
 
 
 def get_num_wins(
@@ -100,50 +57,6 @@ def get_frame_step(
     return frame_step
 
 
-def stride_as_partials(
-    mel: np.ndarray,
-    hp: VoiceEncConfig,
-    overlap: float = 0.5,
-    rate: float | None = None,
-    min_coverage: float = 0.8,
-) -> np.ndarray:
-    """Slice an unscaled mel spectrogram into overlapping encoder windows.
-
-    Args:
-        mel: Spectrogram with shape (frames, mel bins).
-        hp: Voice encoder configuration defining window size and mel bins.
-        overlap: Fraction of adjacent windows shared when rate is None.
-        rate: Optional window rate used instead of overlap to choose the step.
-        min_coverage: Minimum fraction of a final window covered by input.
-
-    Returns:
-        Float32 windows with shape (windows, window frames, mel bins), after
-        padding or trimming the spectrogram to fit the selected windows.
-    """
-    assert 0 < min_coverage <= 1
-    frame_step = get_frame_step(overlap, rate, hp)
-
-    # Compute how many partials can fit in the mel
-    n_partials, target_len = get_num_wins(len(mel), frame_step, min_coverage, hp)
-
-    # Trim or pad the mel spectrogram to match the number of partials
-    if target_len > len(mel):
-        mel = np.concatenate((mel, np.full((target_len - len(mel), hp.num_mels), 0)))
-    elif target_len < len(mel):
-        mel = mel[:target_len]
-
-    # Ensure the numpy array data is float32 and contiguous in memory
-    mel = mel.astype(np.float32, order="C")
-
-    # Re-arrange the array in memory to be of shape (N, P, M) with partials overlapping eachother,
-    # where N is the number of partials, P is the number of frames of each partial and M the
-    # number of channels of the mel spectrograms.
-    shape = (n_partials, hp.ve_partial_frames, hp.num_mels)
-    strides = (mel.strides[0] * frame_step, mel.strides[0], mel.strides[1])
-    partials = as_strided(mel, shape, strides)
-    return partials
-
-
 class VoiceEncoder(nn.Module):
     def __init__(self, hp=VoiceEncConfig()):
         super().__init__()
@@ -152,17 +65,11 @@ class VoiceEncoder(nn.Module):
 
         # Network definition
         self.lstm = nn.LSTM(self.hp.num_mels, self.hp.ve_hidden_size, num_layers=3, batch_first=True)
-        if hp.flatten_lstm_params:
-            self.lstm.flatten_parameters()
         self.proj = nn.Linear(self.hp.ve_hidden_size, self.hp.speaker_embed_size)
 
         # Cosine similarity scaling (fixed initial parameter values)
         self.similarity_weight = nn.Parameter(torch.tensor([10.0]), requires_grad=True)
         self.similarity_bias = nn.Parameter(torch.tensor([-5.0]), requires_grad=True)
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
 
     def forward(self, mels: torch.FloatTensor):
         """
@@ -240,49 +147,3 @@ class VoiceEncoder(nn.Module):
         embeds = raw_embeds / torch.linalg.norm(raw_embeds, dim=1, keepdim=True)
 
         return embeds
-
-    @staticmethod
-    def utt_to_spk_embed(utt_embeds: np.ndarray):
-        """
-        Takes an array of L2-normalized utterance embeddings, computes the mean embedding and L2-normalize it to get a
-        speaker embedding.
-        """
-        assert utt_embeds.ndim == 2
-        utt_embeds = np.mean(utt_embeds, axis=0)
-        return utt_embeds / np.linalg.norm(utt_embeds, 2)
-
-    @staticmethod
-    def voice_similarity(embeds_x: np.ndarray, embeds_y: np.ndarray):
-        """
-        Cosine similarity for L2-normalized utterance embeddings or speaker embeddings
-        """
-        embeds_x = embeds_x if embeds_x.ndim == 1 else VoiceEncoder.utt_to_spk_embed(embeds_x)
-        embeds_y = embeds_y if embeds_y.ndim == 1 else VoiceEncoder.utt_to_spk_embed(embeds_y)
-        return embeds_x @ embeds_y
-
-    def embeds_from_mels(self, mels: Tensor | list[np.ndarray], mel_lens=None, as_spk=False, batch_size=32, **kwargs):
-        """
-        Convenience function for deriving utterance or speaker embeddings from mel spectrograms.
-
-        Args:
-            mels: Unscaled mels strictly within [0, 1] as either a (B, T, M) tensor or a list of (Ti, M) arrays.
-            mel_lens (list[int] | None): If passing mels as a tensor, individual mel lengths.
-            as_spk (bool): Whether to return utterance embeddings or a single speaker embedding.
-            batch_size (int): Number of partial utterances embedded per forward pass.
-            **kwargs (dict): Args for inference().
-
-        Returns:
-            embeds (np.ndarray): Embeds as a (B, E) float32 array if `as_spk` is False, else as a (E,) array.
-        """
-        # Load mels in memory and pack them
-        if isinstance(mels, list):
-            mels = [np.asarray(mel) for mel in mels]
-            assert all(m.shape[1] == mels[0].shape[1] for m in mels), "Mels aren't in (B, T, M) format"
-            mel_lens = [mel.shape[0] for mel in mels]
-            mels = pack(mels)
-
-        # Embed them
-        with torch.inference_mode():
-            utt_embeds = self.inference(mels.to(self.device), mel_lens, batch_size=batch_size, **kwargs).numpy()
-
-        return self.utt_to_spk_embed(utt_embeds) if as_spk else utt_embeds

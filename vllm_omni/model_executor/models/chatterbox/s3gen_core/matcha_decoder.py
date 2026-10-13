@@ -4,7 +4,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.activations import get_activation
 
 
@@ -58,15 +57,6 @@ class ResnetBlock1D(torch.nn.Module):
         return output
 
 
-class Downsample1D(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = torch.nn.Conv1d(dim, dim, 3, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
 class TimestepEmbedding(nn.Module):
     def __init__(
         self,
@@ -112,44 +102,3 @@ class TimestepEmbedding(nn.Module):
         if self.post_act is not None:
             sample = self.post_act(sample)
         return sample
-
-
-class Upsample1D(nn.Module):
-    """A 1D upsampling layer with an optional convolution.
-
-    Args:
-        channels (int): Number of channels in the inputs.
-        use_conv (bool): Whether to convolve after nearest-neighbour upsampling. Has no effect when
-            ``use_conv_transpose`` is set. Defaults to False.
-        use_conv_transpose (bool): Whether to upsample with a transposed convolution instead of
-            nearest-neighbour interpolation. Defaults to True.
-        out_channels (int, optional): Number of channels either convolution outputs. Defaults to
-            ``channels``.
-        name (str): Stored as ``name``; nothing reads it. Defaults to "conv".
-    """
-
-    def __init__(self, channels, use_conv=False, use_conv_transpose=True, out_channels=None, name="conv"):
-        super().__init__()
-        self.channels = channels
-        self.out_channels = out_channels or channels
-        self.use_conv = use_conv
-        self.use_conv_transpose = use_conv_transpose
-        self.name = name
-
-        self.conv = None
-        if use_conv_transpose:
-            self.conv = nn.ConvTranspose1d(channels, self.out_channels, 4, 2, 1)
-        elif use_conv:
-            self.conv = nn.Conv1d(self.channels, self.out_channels, 3, padding=1)
-
-    def forward(self, inputs):
-        assert inputs.shape[1] == self.channels
-        if self.use_conv_transpose:
-            return self.conv(inputs)
-
-        outputs = F.interpolate(inputs, scale_factor=2.0, mode="nearest")
-
-        if self.use_conv:
-            outputs = self.conv(outputs)
-
-        return outputs

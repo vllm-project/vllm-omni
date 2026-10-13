@@ -9,9 +9,9 @@ paths were rewritten and training-only code removed (plus a demo block, a
 duplicate logger line and a missing `import logging`); the code then follows
 this repository's conventions (absolute imports, lint, Google-style
 docstrings and plain torch operations in place of einops). Unused flow
-configuration fields and overridden base flow methods were removed. The
-reference ``CausalMaskedDiffWithXvec.inference`` path remains for numerical
-comparison tests. Registry entries in ``class_utils`` that this checkpoint
-does not select are retained from upstream. Numeric parity against the source
-package, not textual closeness, is what is checked.
+configuration fields and overridden base flow methods were removed, and so
+was everything the checkpoint never reaches: the layer registries and the
+variants they would select, the non-causal and multi-level decoder blocks,
+and upstream's reference ``inference`` path. Numeric parity against the
+source package, not textual closeness, is what is checked.
 """

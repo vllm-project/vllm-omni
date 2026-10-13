@@ -154,7 +154,7 @@ def fade_in_out(fade_in: torch.Tensor, fade_out: torch.Tensor, window: torch.Ten
 
 
 def encode(encoder: UpsampleConformerEncoder, tokens: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    """``UpsampleConformerEncoder.forward`` with the padding zeroed.
+    """Upstream's ``UpsampleConformerEncoder.forward`` with the padding zeroed.
 
     Upstream masks the token embeddings but not the encoder's own input
     projection, whose bias and LayerNorm turn a padded row's zeros into a
@@ -289,18 +289,11 @@ class S3GenDecoder(nn.Module):
             dropout_rate=0.1,
             positional_dropout_rate=0.1,
             attention_dropout_rate=0.1,
-            normalize_before=True,
-            input_layer="linear",
-            pos_enc_layer_type="rel_pos_espnet",
-            selfattention_layer_type="rel_selfattn",
             input_size=512,
-            use_cnn_module=False,
-            macaron_style=False,
         )
         estimator = ConditionalDecoder(
             in_channels=320,
             out_channels=80,
-            causal=True,
             channels=[256],
             dropout=0.0,
             attention_head_dim=64,

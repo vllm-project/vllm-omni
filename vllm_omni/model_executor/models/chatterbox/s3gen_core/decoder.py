@@ -18,14 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.intmeanflow import get_intmeanflow_time_mixer
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.mask import add_optional_chunk_mask
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_decoder import (
     Block1D,
-    Downsample1D,
     ResnetBlock1D,
     SinusoidalPosEmb,
     TimestepEmbedding,
-    Upsample1D,
 )
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_transformer import BasicTransformerBlock
 
@@ -116,7 +113,6 @@ class ConditionalDecoder(nn.Module):
         self,
         in_channels=320,
         out_channels=80,
-        causal=True,
         channels=[256],
         dropout=0.0,
         attention_head_dim=64,
@@ -126,16 +122,22 @@ class ConditionalDecoder(nn.Module):
         act_fn="gelu",
         meanflow=False,
     ):
-        """
+        """Matcha-TTS's causal U-Net with one level, as the S3Gen checkpoint has it.
+
         This decoder requires an input with the same shape of the target. So, if your text content
         is shorter or longer than the outputs, please re-sampling it before feeding to the decoder.
+
+        Raises:
+            ValueError: If ``channels`` has more than one level: the checkpoint's U-Net does not
+                down- or upsample, and the layers that would are not ported.
         """
         super().__init__()
+        if len(channels) != 1:
+            raise ValueError(f"ConditionalDecoder supports one channel level, got {len(channels)}")
         channels = tuple(channels)
         self.meanflow = meanflow
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.causal = causal
         self.time_embeddings = SinusoidalPosEmb(in_channels)
         time_embed_dim = channels[0] * 4
         self.time_mlp = TimestepEmbedding(
@@ -148,19 +150,11 @@ class ConditionalDecoder(nn.Module):
         self.mid_blocks = nn.ModuleList([])
         self.up_blocks = nn.ModuleList([])
 
-        # NOTE jrm: `static_chunk_size` is missing?
-        self.static_chunk_size = 0
-
         output_channel = in_channels
-        for i, channel in enumerate(channels):
+        for channel in channels:
             input_channel = output_channel
             output_channel = channel
-            is_last = i == len(channels) - 1
-            resnet = (
-                CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
-                if self.causal
-                else ResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
-            )
+            resnet = CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
             transformer_blocks = nn.ModuleList(
                 [
                     BasicTransformerBlock(
@@ -173,23 +167,13 @@ class ConditionalDecoder(nn.Module):
                     for _ in range(n_blocks)
                 ]
             )
-            downsample = (
-                Downsample1D(output_channel)
-                if not is_last
-                else CausalConv1d(output_channel, output_channel, 3)
-                if self.causal
-                else nn.Conv1d(output_channel, output_channel, 3, padding=1)
-            )
+            downsample = CausalConv1d(output_channel, output_channel, 3)
             self.down_blocks.append(nn.ModuleList([resnet, transformer_blocks, downsample]))
 
         for _ in range(num_mid_blocks):
             input_channel = channels[-1]
             out_channels = channels[-1]
-            resnet = (
-                CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
-                if self.causal
-                else ResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
-            )
+            resnet = CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
 
             transformer_blocks = nn.ModuleList(
                 [
@@ -210,20 +194,7 @@ class ConditionalDecoder(nn.Module):
         for i in range(len(channels) - 1):
             input_channel = channels[i] * 2
             output_channel = channels[i + 1]
-            is_last = i == len(channels) - 2
-            resnet = (
-                CausalResnetBlock1D(
-                    dim=input_channel,
-                    dim_out=output_channel,
-                    time_emb_dim=time_embed_dim,
-                )
-                if self.causal
-                else ResnetBlock1D(
-                    dim=input_channel,
-                    dim_out=output_channel,
-                    time_emb_dim=time_embed_dim,
-                )
-            )
+            resnet = CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
             transformer_blocks = nn.ModuleList(
                 [
                     BasicTransformerBlock(
@@ -236,17 +207,9 @@ class ConditionalDecoder(nn.Module):
                     for _ in range(n_blocks)
                 ]
             )
-            upsample = (
-                Upsample1D(output_channel, use_conv_transpose=True)
-                if not is_last
-                else CausalConv1d(output_channel, output_channel, 3)
-                if self.causal
-                else nn.Conv1d(output_channel, output_channel, 3, padding=1)
-            )
+            upsample = CausalConv1d(output_channel, output_channel, 3)
             self.up_blocks.append(nn.ModuleList([resnet, transformer_blocks, upsample]))
-        self.final_block = (
-            CausalBlock1D(channels[-1], channels[-1]) if self.causal else Block1D(channels[-1], channels[-1])
-        )
+        self.final_block = CausalBlock1D(channels[-1], channels[-1])
         self.final_proj = nn.Conv1d(channels[-1], self.out_channels, 1)
         self.initialize_weights()
         self.time_embed_mixer = None
@@ -309,9 +272,9 @@ class ConditionalDecoder(nn.Module):
             mask_down = masks[-1]
             x = resnet(x, mask_down, t)
             x = x.transpose(1, 2).contiguous()
-            # attn_mask = torch.matmul(mask_down.transpose(1, 2).contiguous(), mask_down)
-            attn_mask = add_optional_chunk_mask(x, mask_down.bool(), False, False, 0, self.static_chunk_size, -1)
-            attn_mask = mask_to_bias(attn_mask == 1, x.dtype)
+            # A row with no valid frame attends to every frame rather than to none.
+            attn_mask = mask_down.bool() | ~mask_down.bool().any(dim=-1, keepdim=True)
+            attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
                     hidden_states=x,
@@ -328,9 +291,9 @@ class ConditionalDecoder(nn.Module):
         for resnet, transformer_blocks in self.mid_blocks:
             x = resnet(x, mask_mid, t)
             x = x.transpose(1, 2).contiguous()
-            # attn_mask = torch.matmul(mask_mid.transpose(1, 2).contiguous(), mask_mid)
-            attn_mask = add_optional_chunk_mask(x, mask_mid.bool(), False, False, 0, self.static_chunk_size, -1)
-            attn_mask = mask_to_bias(attn_mask == 1, x.dtype)
+            # A row with no valid frame attends to every frame rather than to none.
+            attn_mask = mask_mid.bool() | ~mask_mid.bool().any(dim=-1, keepdim=True)
+            attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
                     hidden_states=x,
@@ -345,9 +308,9 @@ class ConditionalDecoder(nn.Module):
             x = torch.cat([x[:, :, : skip.shape[-1]], skip], dim=1)
             x = resnet(x, mask_up, t)
             x = x.transpose(1, 2).contiguous()
-            # attn_mask = torch.matmul(mask_up.transpose(1, 2).contiguous(), mask_up)
-            attn_mask = add_optional_chunk_mask(x, mask_up.bool(), False, False, 0, self.static_chunk_size, -1)
-            attn_mask = mask_to_bias(attn_mask == 1, x.dtype)
+            # A row with no valid frame attends to every frame rather than to none.
+            attn_mask = mask_up.bool() | ~mask_up.bool().any(dim=-1, keepdim=True)
+            attn_mask = mask_to_bias(attn_mask, x.dtype)
             for transformer_block in transformer_blocks:
                 x = transformer_block(
                     hidden_states=x,
