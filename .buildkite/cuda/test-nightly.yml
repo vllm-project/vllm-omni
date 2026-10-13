@@ -181,15 +181,6 @@ steps:
           - export VLLM_MOE_USE_DEEP_GEMM="0"
           - pytest -s -v tests/e2e/ -m "full_model and L4 and B200 and tts and cards_1" --run-level "full_model" --ignore=tests/e2e/accuracy
 
-      - label: ":full_moon: TTS · Chatterbox Perf and CUDA Graph Comparison"
-        source_file_dependencies: tts_chatterbox_perf
-        timeout_in_minutes: 180
-        artifact_paths:
-          - tests/dfx/perf/results/*.json
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_chatterbox.json -m "full_model and H100 and B200 and cards_1"
-
       - label: ":full_moon: TTS · Perf Test · Single-GPU"
         source_file_dependencies: tts_qwen3_tts_perf
         key: nightly-tts-performance-single
