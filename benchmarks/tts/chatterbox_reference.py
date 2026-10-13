@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import json
 import logging
+import os
 import random
 import statistics
 import subprocess
@@ -41,12 +42,18 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("reference", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--gpu", default="0", help="Physical nvidia-smi GPU index or UUID")
     parser.add_argument("--runner", choices=("v1", "v2"), default="v2")
     parser.add_argument("--cuda-graphs", action="store_true", help="Use the existing AR CUDA-graph path at FP32")
     parser.add_argument(
         "--profile", action="store_true", help="Trace an additional warmed request after each voice mode"
     )
     args = parser.parse_args()
+    identity = subprocess.check_output(
+        ["nvidia-smi", f"--id={args.gpu}", "--query-gpu=uuid,name", "--format=csv,noheader"], text=True
+    ).strip()
+    args.gpu_uuid, args.gpu_name = identity.split(", ", 1)
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_uuid
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -69,7 +76,9 @@ def main():
                     seed_everything(seed)
                     samples = []
                     finished = threading.Event()
-                    monitor = threading.Thread(target=sample_gpu_memory, args=(finished, samples), daemon=True)
+                    monitor = threading.Thread(
+                        target=sample_gpu_memory, args=(finished, samples, args.gpu_uuid), daemon=True
+                    )
                     monitor.start()
                     torch.accelerator.synchronize()
                     started = time.perf_counter()
@@ -224,11 +233,11 @@ def seed_everything(seed):
     torch.manual_seed(seed)
 
 
-def sample_gpu_memory(finished, samples):
+def sample_gpu_memory(finished, samples, gpu_uuid):
     """Sample whole-device used memory, including Omni's separate workers."""
     while not finished.is_set():
         value = subprocess.check_output(
-            ["nvidia-smi", "--id=0", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], text=True
+            ["nvidia-smi", f"--id={gpu_uuid}", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], text=True
         )
         samples.append(int(value.strip()))
         finished.wait(0.1)
@@ -252,6 +261,8 @@ def write_report(args, rows):
             }
     report = dict(
         backend=args.backend,
+        gpu=args.gpu_name,
+        gpu_uuid=args.gpu_uuid,
         variant=args.variant,
         model=str(args.model),
         checkpoint=args.model.name,
