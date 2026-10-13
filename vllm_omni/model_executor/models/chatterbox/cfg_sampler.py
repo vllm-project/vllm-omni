@@ -12,11 +12,9 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler as GpuSampler
 
-from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import START_SPEECH_TOKEN, STOP_SPEECH_TOKEN
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
-SPEECH_START_TOKEN = ChatterboxConfig().start_speech_token
-SPEECH_STOP_TOKEN = ChatterboxConfig().stop_speech_token
 # Request ID -> (pair key, role, weight). The model owns registration/cleanup.
 CFGPairRegistry = MutableMapping[str, tuple[str, str, float]]
 
@@ -48,7 +46,7 @@ class ChatterboxCFGSampler:
         """Resolve current batch rows by request identity and apply guidance."""
         if logits.ndim != 2 or logits.shape[0] != len(req_ids):
             raise ValueError("Chatterbox CFG requires one logits row per request")
-        if logits.shape[1] <= SPEECH_STOP_TOKEN:
+        if logits.shape[1] <= STOP_SPEECH_TOKEN:
             raise ValueError("Chatterbox CFG requires the Original speech vocabulary")
         groups: dict[str, dict[str, tuple[int, float]]] = {}
         for row, req_id in enumerate(req_ids):
@@ -85,8 +83,8 @@ class ChatterboxCFGSampler:
             guided[cond] = blended
             guided[uncond] = blended
             row_pairs.append((cond, uncond))
-        guided[:, SPEECH_START_TOKEN] = -torch.inf
-        guided[:, SPEECH_STOP_TOKEN + 1 :] = -torch.inf
+        guided[:, START_SPEECH_TOKEN] = -torch.inf
+        guided[:, STOP_SPEECH_TOKEN + 1 :] = -torch.inf
         return guided, row_pairs
 
     def sample(

@@ -20,9 +20,7 @@ from vllm_omni.model_executor.models.chatterbox.original_heads import (
     original_speech_embeds,
     split_original_weights,
 )
-from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
-
-CFG_SUFFIX = "__cfg_uncond"
+from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, ChatterboxConfig
 
 
 class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
@@ -92,7 +90,7 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
         """Reconstruct learned positions from scheduler progress, including recomputation."""
         role = "cond" if cfg_group is None else cfg_group["role"]
         external_id = global_request_id[0]
-        pair_id = external_id.removesuffix(CFG_SUFFIX) if role == "uncond" else external_id
+        pair_id = external_id.removesuffix(CFG_UNCOND_SUFFIX) if role == "uncond" else external_id
         # MRv1 supplies request_id; MRv2 supplies req_id.
         identity = request_id if request_id is not None else req_id
         if identity is None:

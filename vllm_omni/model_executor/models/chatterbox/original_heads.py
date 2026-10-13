@@ -7,13 +7,12 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_DEFAULT_EXAGGERATION, ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_DEFAULT_EXAGGERATION, START_SPEECH_TOKEN
 
 # Fixed by the English Original checkpoint, including text BOS/EOS positions.
 ORIGINAL_MAX_TEXT_TOKENS = 2048
 ORIGINAL_TEXT_POSITIONS = ORIGINAL_MAX_TEXT_TOKENS + 2
 ORIGINAL_SPEECH_POSITIONS = 4100
-START_SPEECH_TOKEN = ChatterboxConfig().start_speech_token
 
 
 class OriginalAttention(nn.Module):

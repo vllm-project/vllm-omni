@@ -278,10 +278,10 @@ async def test_shutdown_cancels_encoder_waiters(adapter):
     assert adapter.conditioning_queue.empty()
 
 
-@pytest.mark.parametrize("config_field", ["model_config", "engine_args"])
+@pytest.mark.parametrize("config_field", ["runtime_config", "engine_args"])
 def test_conditioning_device_is_explicit_in_stage_config(adapter, config_field):
     adapter.ctx.server._tts_stage = SimpleNamespace(
-        **{config_field: SimpleNamespace(hf_overrides={"conditioning_device": "cuda:2"})}
+        **{config_field: SimpleNamespace(additional_config={"conditioning_device": "cuda:2"})}
     )
     configured = ChatterboxAdapter(adapter.ctx)
     assert configured.conditioning_device == torch.device("cuda:2")
@@ -289,7 +289,7 @@ def test_conditioning_device_is_explicit_in_stage_config(adapter, config_field):
 
 def test_unsupported_conditioning_device_is_rejected(adapter):
     adapter.ctx.server._tts_stage = SimpleNamespace(
-        model_config=SimpleNamespace(hf_overrides={"conditioning_device": "meta"})
+        runtime_config=SimpleNamespace(additional_config={"conditioning_device": "meta"})
     )
     with pytest.raises(ValueError, match="must be cpu or cuda"):
         ChatterboxAdapter(adapter.ctx)

@@ -5,7 +5,6 @@
 import asyncio
 import math
 from collections import OrderedDict
-from collections.abc import Mapping
 from threading import Lock
 
 import numpy as np
@@ -55,12 +54,9 @@ class ChatterboxAdapter(ARTTSAdapter):
     def __init__(self, ctx: SpeechServingContext) -> None:
         super().__init__(ctx)
         self.config = ChatterboxConfig(self.variant)
-        stage = getattr(ctx.server, "_tts_stage", None)
-        model_config = getattr(stage, "model_config", None) or getattr(stage, "engine_args", None)
-        overrides = getattr(model_config, "hf_overrides", None) or {}
-        if not isinstance(overrides, Mapping):
-            raise ValueError("Chatterbox serving requires mapping HF overrides")
-        self.conditioning_device = torch.device(overrides.get("conditioning_device", "cpu"))
+        # The deploy file's stage 0 ``additional_config`` names where the
+        # reference encoders run; the API process must see that device.
+        self.conditioning_device = torch.device(self.stage_additional_config().get("conditioning_device", "cpu"))
         if self.conditioning_device.type not in {"cpu", "cuda"}:
             raise ValueError("Chatterbox conditioning_device must be cpu or cuda")
         self.tokenizer: PreTrainedTokenizerBase | Tokenizer | None = None

@@ -354,6 +354,15 @@ class TTSModelAdapter(ABC):
     async def warmup(self) -> None:
         return
 
+    def stage_additional_config(self) -> Mapping[str, Any]:
+        """The serving stage's deploy ``additional_config``, from a typed or legacy stage config."""
+        stage = getattr(self.ctx.server, "_tts_stage", None)
+        for owner in (getattr(stage, "runtime_config", None), getattr(stage, "engine_args", None)):
+            config = getattr(owner, "additional_config", None)
+            if isinstance(config, Mapping):
+                return config
+        return {}
+
     def shutdown(self) -> None:
         """Release model-specific serving work before the executor shuts down."""
 

@@ -19,7 +19,7 @@ from vllm_omni.data_entry_keys import CodesStruct, EmbeddingsStruct, MetaStruct,
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
-from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_MAX_NEW_TOKENS, ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, ORIGINAL_MAX_NEW_TOKENS, ChatterboxConfig
 
 # S3Gen's constants, the same for every checkpoint that decodes with it.
 SPEECH_TOKEN_LIMIT = ChatterboxConfig().speech_token_limit
@@ -58,7 +58,7 @@ def expand_original_cfg_prompts(prompt: dict, sampling_params: SamplingParams) -
         **prompt,
         "additional_information": {
             **info,
-            "cfg_group": {"role": "uncond", "uncond_suffix": "__cfg_uncond"},
+            "cfg_group": {"role": "uncond", "uncond_suffix": CFG_UNCOND_SUFFIX},
         },
     }
     pair_key, _, weight = sampling_params.extra_args["chatterbox_cfg"]
@@ -66,7 +66,7 @@ def expand_original_cfg_prompts(prompt: dict, sampling_params: SamplingParams) -
         ExpandedPrompt(
             prompt=companion,
             role="uncond",
-            request_id_suffix="__cfg_uncond",
+            request_id_suffix=CFG_UNCOND_SUFFIX,
             sampling_params_override={
                 "extra_args": {**sampling_params.extra_args, "chatterbox_cfg": (pair_key, "uncond", weight)}
             },
@@ -125,7 +125,7 @@ def t3_to_s3gen_async_chunk(
             them with no other symptom.
     """
     request_id = request.external_req_id
-    if request_id.endswith("__cfg_uncond"):
+    if request_id.endswith(CFG_UNCOND_SUFFIX):
         return None
     # A connector's config is its ``extra`` section of the deploy file.
     settings = transfer_manager.connector.config

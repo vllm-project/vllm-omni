@@ -615,3 +615,65 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+# Chatterbox's Hub repository ships no config.json, so its Hub id is patched
+# like a config-less local directory; a config.json that exists but fails to
+# load stays on vLLM's error path.
+def _config_less_args(model: str) -> OmniEngineArgs:
+    args = object.__new__(OmniEngineArgs)
+    args.model = model
+    args.model_arch = "ChatterboxForConditionalGeneration"
+    args.revision = None
+    args.hf_config_path = None
+    return args
+
+
+def _patched_config(args: OmniEngineArgs) -> dict:
+    with open(os.path.join(args.hf_config_path, "config.json"), encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
+@pytest.mark.parametrize("model", ["ResembleAI/chatterbox-turbo", "local-directory"])
+def test_config_less_chatterbox_gets_a_config_written(monkeypatch, tmp_path, model):
+    if model == "local-directory":
+        model = str(tmp_path)
+    monkeypatch.setattr(
+        PretrainedConfig,
+        "get_config_dict",
+        classmethod(lambda cls, m, **kw: (_ for _ in ()).throw(OSError("no config"))),
+    )
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: False)
+    args = _config_less_args(model)
+    try:
+        args._patch_empty_hf_config("chatterbox")
+        assert _patched_config(args) == {
+            "model_type": "chatterbox",
+            "architectures": ["ChatterboxForConditionalGeneration"],
+        }
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+def test_chatterbox_config_that_exists_but_fails_to_load_is_left_alone(monkeypatch, tmp_path):
+    (tmp_path / "config.json").write_text("{")
+    args = _config_less_args(str(tmp_path))
+    args._patch_empty_hf_config("chatterbox")
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
+    monkeypatch.setattr(
+        PretrainedConfig, "get_config_dict", classmethod(lambda cls, m, **kw: (_ for _ in ()).throw(OSError("gated")))
+    )
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: True)
+    hub = _config_less_args("ResembleAI/chatterbox-turbo")
+    hub._patch_empty_hf_config("chatterbox")
+    assert hub.hf_config_path is None
+
+
+def test_unlisted_model_type_without_a_loadable_config_is_left_alone(tmp_path):
+    (tmp_path / "config.json").write_text("{")
+    args = _config_less_args(str(tmp_path))
+    args.model_arch = "CosyVoice3Model"
+    args._patch_empty_hf_config("cosyvoice3")
+    assert args.hf_config_path is None

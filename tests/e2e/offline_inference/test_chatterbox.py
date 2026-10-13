@@ -3,14 +3,16 @@
 """Offline Chatterbox audio consolidation on both model runners."""
 
 import pytest
-from tokenizers import Tokenizer
-from transformers import AutoTokenizer
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
-from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt, punc_norm
+from vllm_omni.model_executor.models.chatterbox.conditioning import (
+    VoiceConditioning,
+    build_prompt,
+    load_text_tokenizer,
+    tokenize_text,
+)
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
-from vllm_omni.transformers_utils.repo_utils import hf_api
 
 RUNNERS = [
     pytest.param(
@@ -35,15 +37,8 @@ def test_text_to_audio_001(omni_runner, offline_client):
     model = omni_runner.model_name
     variant = "turbo" if model.endswith("-turbo") else "original"
     texts = ("The weather is nice today.", "Please leave your name and number after the tone.")
-    if variant == "turbo":
-        tokenizer = AutoTokenizer.from_pretrained(model, tokenizer_type="gpt2")
-        text_ids = [tokenizer.encode(punc_norm(text), add_special_tokens=False) for text in texts]
-    else:
-        tokenizer_path = hf_api().hf_hub_download(model, "tokenizer.json")
-        original_tokenizer = Tokenizer.from_file(tokenizer_path)
-        text_ids = [
-            original_tokenizer.encode(punc_norm(text, "original").replace(" ", "[SPACE]")).ids for text in texts
-        ]
+    tokenizer = load_text_tokenizer(model, variant)
+    text_ids = [tokenize_text(text, tokenizer, variant) for text in texts]
     voice = VoiceConditioning.from_builtin(model)
     prompts = [build_prompt(ids, voice, ChatterboxConfig(variant)) for ids in text_ids]
     offline_client.send_tokenized_tts_request(

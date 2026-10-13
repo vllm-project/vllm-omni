@@ -32,6 +32,7 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.xvector import CAMPPl
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.transformers_utils.configs.chatterbox import (
+    CFG_UNCOND_SUFFIX,
     ORIGINAL_DEFAULT_CFG_WEIGHT,
     ORIGINAL_DEFAULT_EXAGGERATION,
     ChatterboxConfig,
@@ -460,5 +461,5 @@ def build_prompt(
     if config.variant == "original":
         prompt["additional_information"]["chatterbox"] = {"exaggeration": exaggeration, "cfg_weight": cfg_weight}
         if cfg_weight > 0:
-            prompt["additional_information"]["cfg_group"] = {"role": "cond", "uncond_suffix": "__cfg_uncond"}
+            prompt["additional_information"]["cfg_group"] = {"role": "cond", "uncond_suffix": CFG_UNCOND_SUFFIX}
     return prompt

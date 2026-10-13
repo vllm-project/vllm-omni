@@ -8,11 +8,17 @@ come from upstream ``chatterbox`` 0.1.7: ``GPT2_MEDIUM_CONFIG`` in
 ``ChatterboxTurboTTS.from_local``, and ``models/s3gen``.
 """
 
+from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
 # Original's supported generation budget leaves room for its learned speech
 # boundary positions, regardless of the engine's configured context length.
 ORIGINAL_MAX_NEW_TOKENS = 4096
+# Control ids shared by every checkpoint: the start-of-speech and stop tokens.
+START_SPEECH_TOKEN = 6561
+STOP_SPEECH_TOKEN = 6562
+# Request-id suffix of a guided request's unconditional companion.
+CFG_UNCOND_SUFFIX = "__cfg_uncond"
 # Upstream's ``ChatterboxTTS.generate`` defaults for its two controls.
 ORIGINAL_DEFAULT_EXAGGERATION = 0.5
 ORIGINAL_DEFAULT_CFG_WEIGHT = 0.5
@@ -39,7 +45,7 @@ class ChatterboxConfig(PretrainedConfig):
         if variant not in {"turbo", "original"}:
             raise ValueError("Chatterbox variant must be 'turbo' or 'original'")
         validate_flow_settings(flow_dtype, flow_attention_backend)
-        kwargs.setdefault("eos_token_id", 6562)
+        kwargs.setdefault("eos_token_id", STOP_SPEECH_TOKEN)
         super().__init__(**kwargs)
         self.variant = variant
         self.flow_dtype = flow_dtype
@@ -53,9 +59,9 @@ class ChatterboxConfig(PretrainedConfig):
         self.speech_vocab_size = 6563
         self.text_vocab_size = 50276
         # Ids at or above this are control tokens the decoder must never see.
-        self.speech_token_limit = 6561
-        self.start_speech_token = 6561
-        self.stop_speech_token = 6562
+        self.speech_token_limit = START_SPEECH_TOKEN
+        self.start_speech_token = START_SPEECH_TOKEN
+        self.stop_speech_token = STOP_SPEECH_TOKEN
 
         # T3 backbone (GPT-2 medium).
         self.hidden_size = 1024
@@ -146,3 +152,8 @@ class ChatterboxConfig(PretrainedConfig):
             ):
                 setattr(self, name, getattr(defaults, name))
         super().update(config_dict)
+
+
+AutoConfig.register("chatterbox", ChatterboxConfig)
+
+__all__ = ["ChatterboxConfig"]
