@@ -287,7 +287,7 @@ def evaluate_quality(args):
     encoder = VoiceEncoder(VoiceEncConfig()).to("cuda").eval()
     weights = load_file(str(args.model / "ve.safetensors"))
     encoder.load_state_dict(weights)
-    asr = whisper.load_model("large-v3", device="cuda", download_root="/opt/whisper-cache")
+    asr = whisper.load_model("large-v3", device="cuda")
     normalizer = EnglishTextNormalizer()
 
     @torch.inference_mode()
