@@ -36,9 +36,7 @@ list of supported architectures across all modalities, see
 
 Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
 reference recording. No reference transcript is needed. Install the conditioning
-extra with `uv pip install -e '.[chatterbox]'`. The integration includes its
-required adapter hooks; [#8842](https://github.com/vllm-project/vllm-omni/pull/8842)
-contains independent shared runtime fixes.
+extra with `uv pip install -e '.[chatterbox]'`.
 
 Use the production `load_text_tokenizer`, `tokenize_text`, `build_prompt`, and
 `VoiceConditioning` helpers with `Omni.generate`. The [offline command in the

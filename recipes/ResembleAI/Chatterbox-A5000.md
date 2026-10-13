@@ -1,28 +1,118 @@
 # Chatterbox Turbo and Original — RTX A5000
 
-The model integration includes its required adapter extension hooks.
-[PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842) contains independent
-shared runtime fixes. Historical measurements below used the combined implementation
-and do not qualify the standalone branch.
-
-[Chatterbox Turbo](https://huggingface.co/ResembleAI/chatterbox-turbo) generates
-mono 24 kHz English speech. The integration uses vLLM's GPT-2 backbone for
-speech-token generation and S3Gen meanflow with HiFT for waveform decoding.
-It supports the checkpoint's built-in voice and voice cloning from one recording.
-
 ## Summary
+
+- Vendor: Resemble AI
+- Model: `ResembleAI/chatterbox-turbo` (Turbo) and `ResembleAI/chatterbox` (English Original)
+- Task: English text-to-speech with the checkpoint's built-in voice or a voice cloned from one recording
+- Mode: offline `Omni.generate`; online `/v1/audio/speech` (complete or streamed audio) and the sentence-segmented WebSocket frontend
+- Hardware: 1x NVIDIA RTX A5000 24 GB
+- Maintainer: @will-rice
+
+## When to use this recipe
+
+One 24 GB card serving a handful of concurrent streams with the default
+profiles. The reference encoders run on the CPU of the API process, so the
+GPU holds only the two model stages.
+
+## Supported model contract
+
+| Task | Entrypoint |
+| --- | --- |
+| Built-in voice | `voice: "default"` on `/v1/audio/speech`; `VoiceConditioning.from_builtin` offline |
+| Voice cloning | one `ref_audio` recording (URL or data URL), no transcript; `VoiceConditioner.prepare` offline |
+| Long text | the shared WebSocket frontend with `split_granularity: "sentence"` ([speech API](../../docs/serving/speech_api.md#streaming-text-input-websocket)) |
+
+| Input | Limit |
+| --- | --- |
+| Text | English. Turbo: the 2048-token stage 0 context (prompt plus output); Original: at most 2048 text tokens |
+| Reference recording | mono; Turbo: longer than 5 s; Original: the shared 1 s minimum. T3 conditions on the first 15 s (Turbo) or 6 s (Original), S3Gen on the first 10 s |
+| Original controls | `extra_params.exaggeration` and `extra_params.cfg_weight`, finite and nonnegative, default 0.5; Turbo rejects them |
+| Speech tokens | `max_new_tokens` default 1000 (40 s at 25 tokens/s), API ceiling 4096, bounded by the stage 0 context |
+
+| Output | Value |
+| --- | --- |
+| Audio | mono, 24 kHz, float32 offline; WAV, PCM, MP3 or FLAC online; streamed PCM or WAV as delta chunks |
+| Streaming | first chunk 15 tokens plus reference alignment, then 30 and 60; a fixed 50-token left context and position-aligned flow noise keep chunks consistent |
+
+| Profile on this hardware | Status |
+| --- | --- |
+| `chatterbox_turbo.yaml` (default): BF16 T3 with CUDA graphs, FP32 eager S3Gen, 8 AR slots, Model Runner V2 | runtime-qualified, both runners and both handoff modes |
+| `chatterbox.yaml` (default Original): the same with the Llama T3 and paired classifier-free guidance (two AR slots per guided request) | runtime-qualified offline and at 64 WebSocket sessions with a 128-token cap |
+| `*_high_concurrency.yaml` and `*_high_concurrency_cuda.yaml` (64 requests, GPU conditioning, BF16 flow) | configuration-only here; qualified in the [H100 recipe](Chatterbox-H100.md) |
+
+## References
+
+- [Upstream implementation](https://github.com/resemble-ai/chatterbox) (`chatterbox-tts` 0.1.7)
+- [Offline examples](../../examples/offline_inference/text_to_speech/README.md#chatterbox-turbo-and-original)
+- [Online examples](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original)
+- [Speech API contract](../../docs/serving/speech_api.md#chatterbox-turbo-and-original)
+- [Supported models](../../docs/models/supported_models.md)
+- [Async chunk streaming](../../docs/design/feature/async_chunk.md)
+
+## Hardware
+
+- Accelerator model and per-device memory: NVIDIA RTX A5000, 24 GB
+- Number of devices: 1 (`devices: "0"` for both stages)
+- Device interconnect: none used; PCIe host attachment
+- Host memory: the reference encoders (voice encoder, S3 tokenizer, CAMPPlus) and the built-in voice live in the API process on the CPU; peak host memory was not recorded
+- Qualification scope: the default profiles, offline and online, on CUDA only
+
+## Software environment
 
 | Field | Value |
 | --- | --- |
-| Vendor / checkpoints | ResembleAI: `chatterbox-turbo`, `chatterbox` |
-| Runtime / mode | vLLM-Omni, two-stage offline and streaming speech serving |
-| Hardware | One NVIDIA RTX A5000, 24 GB, PCIe; no inter-GPU communication |
-| Maintainer | PR author; see [#8700](https://github.com/vllm-project/vllm-omni/pull/8700) |
+| OS | Ubuntu 24.04 |
+| Python | 3.12 |
+| Driver / runtime | 580.159.04, CUDA 13.0; PyTorch 2.13.0+cu130, torchaudio 2.11.0+cu130 |
+| vLLM | 0.31.0 |
+| vLLM-Omni | the head of [#8700](https://github.com/vllm-project/vllm-omni/pull/8700) |
+| Checkpoints | Turbo `749d1c1a46eb10492095d68fbcf55691ccf137cd`; Original `5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18` |
 
-## Offline inference
+The 64-session WebSocket run below predates this environment and its
+software versions were not retained.
 
-The production tokenizer and conditioning helpers also prepare offline requests.
-Run from the repository root after installing the Chatterbox extra:
+## Command
+
+Install the reference-conditioning extra, then serve:
+
+```bash
+uv pip install -e '.[chatterbox]'
+vllm serve ResembleAI/chatterbox-turbo --omni --host 127.0.0.1 --port 8091
+# Original: vllm serve ResembleAI/chatterbox --omni --host 127.0.0.1 --port 8091
+```
+
+Built-in voice:
+
+```bash
+curl --fail http://127.0.0.1:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "ResembleAI/chatterbox-turbo",
+    "input": "Hello, welcome to the speech synthesis demonstration.",
+    "voice": "default",
+    "response_format": "wav",
+    "seed": 42
+  }' --output chatterbox.wav
+```
+
+Cloned voice, and the Original's controls:
+
+```json
+{
+  "model": "ResembleAI/chatterbox",
+  "input": "Please read this new sentence in the reference voice.",
+  "ref_audio": "data:audio/wav;base64,<base64-encoded-reference>",
+  "extra_params": {"exaggeration": 0.7, "cfg_weight": 0.5},
+  "response_format": "wav"
+}
+```
+
+For streamed audio add `"stream": true`, `"stream_format": "audio"` and
+`"response_format": "pcm"` (signed 16-bit little-endian, 24 kHz) or `"wav"`.
+Pass `--no-async-chunk` to decode each finished utterance once instead.
+
+Offline, with the same tokenizer, prompt and conditioning code serving uses:
 
 ```bash
 uv run python - <<'PYTHON'
@@ -53,248 +143,79 @@ finally:
 PYTHON
 ```
 
-For cloning, load a recording with `soundfile.read` and replace `voice` with
-`VoiceConditioner(model, config, torch.device("cpu")).prepare(wav, sample_rate)`.
-The recording must be mono and meet the variant's reference-duration minimum.
-The interactive streaming player lives at `apps/chatterbox/gradio_demo.py`.
+To clone offline, read a recording with `soundfile.read` and replace `voice`
+with `VoiceConditioner(model, config, torch.device("cpu")).prepare(wav, sample_rate)`.
 
-## Supported model contract
-
-| Surface | Contract |
-| --- | --- |
-| Input | English text; optional single reference recording, no transcript |
-| Reference limits | Turbo: more than 5 seconds; Original: shared API minimum 1 second |
-| Output | Mono 24 kHz; non-streaming WAV/PCM/MP3/FLAC; streamed PCM/WAV |
-| Default profiles | `chatterbox_turbo.yaml`, `chatterbox.yaml`: BF16 AR, FP32 decoder, 8 AR slots; Original CFG uses two slots per request |
-| High-concurrency profiles | 64 requests; A5000 qualification below uses a reduced 128-token cap, not the default full-context allowance |
-| Unsupported | Multilingual checkpoint, VoiceDesign, free-form instructions, prefix caching |
-
-## Hardware and software qualification
-
-The A5000 qualification below used one 24 GB device and CPU reference staging.
-Host-memory peak, OS, Python, driver and framework versions were not retained
-with that historical run; do not infer them from the separate H100 environment.
-Revision `223f3c5f6` identifies that run, which predates the full-batch decoder.
-The current head has unit coverage; fresh cold-conditioning and WebSocket load
-qualification of the full-batch decoder is still outstanding.
-
-## References
-
-- [Upstream implementation](https://github.com/resemble-ai/chatterbox)
-- [Offline examples](../../examples/offline_inference/text_to_speech/README.md#chatterbox-turbo-and-original)
-- [Online examples](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original)
-- [Speech API](../../docs/serving/speech_api.md)
-- [Supported models](../../docs/models/supported_models.md)
-
-## Installation and serving
-
-Follow the source installation guide, then install the reference-conditioning extra:
+## Verification
 
 ```bash
-uv pip install -e '.[chatterbox]'
-vllm-omni serve ResembleAI/chatterbox-turbo --omni --host 127.0.0.1 --port 8091
+pytest tests/e2e/offline_inference/test_chatterbox.py -m advanced_model --run-level advanced_model
 ```
 
-The default deployment uses one CUDA GPU with 24 GB, Model Runner V2,
-BF16 autoregressive generation with CUDA graphs, and eager FP32 waveform decoding.
-Both stages also support Model Runner V1. Set `model_runner: v1` in a copy of
-`vllm_omni/deploy/chatterbox_turbo.yaml` and pass it with `--deploy-config`.
-Only the CUDA deployment has been validated.
+Expected: every parametrized case (both checkpoints, both runners, chunked
+and whole-utterance) passes, each returning finite, nonempty mono 24 kHz
+audio of at least one second for two distinct prompts. The curl command
+above writes a playable WAV; `soundfile.info("chatterbox.wav")` reports
+`samplerate=24000, channels=1`.
 
-Stage 1 can opt into BF16 flow autocast with
-`hf_overrides: {flow_dtype: bfloat16}` while retaining FP32 HiFT and FP32
-output audio. The default remains `float32`. This is a numerical tradeoff:
-validate speech and speaker quality for the intended workload before enabling
-it. Decoder-only measurements are not end-to-end performance guarantees.
-On CUDA, add `flow_attention_backend: cudnn` to the same `hf_overrides` to
-select native cuDNN SDPA with the existing flow masks. This requires BF16 flow;
-unsupported devices or attention shapes fail. The default backend is `auto`.
+## Notes
 
-For the measured H100 throughput settings, use the opt-in
-`vllm_omni/deploy/chatterbox_turbo_high_concurrency_cuda.yaml` profile. It inherits
-the 64-request profile and enables BF16 flow, native cuDNN attention, and CUDA
-MPS across the API conditioner and model stages. It requires
-`nvidia-cuda-mps-control` on PATH. HiFT remains FP32. The ordinary profiles retain
-FP32 flow. See the [profiling report](Chatterbox-H100.md) for batch-size
-measurements, warmup requirements, numerical checks, and latency limitations.
+- Memory usage: stage 0 reserves 35 % and stage 1 15 % of the card for 8
+  slots; the encoders add their weights to host memory, not the GPU.
+- Key flags: `model_runner: v1` in a copy of the deploy file selects the
+  default runner (both are supported; V2 is the default on CUDA). Stage 1
+  accepts `hf_overrides: {flow_dtype: bfloat16, flow_attention_backend: cudnn}`
+  for BF16 flow with native cuDNN attention; HiFT and the output stay FP32,
+  and the audio changes numerically, so validate quality before enabling it.
+- Deploy relations: keep stage 1's `max_model_len` at least stage 0's and its
+  `max_num_batched_tokens` at least `max_num_seqs * max_model_len`; the
+  stages refuse to start otherwise. Prefix caching must stay off: prompts are
+  placeholder ids whose embeddings differ per request.
+- Original: each guided request holds two AR slots; `cfg_weight: 0` drops the
+  companion. Prefix caching, chunked prefill and asynchronous scheduling stay
+  disabled for its atomic scheduler.
+- Known limitations: English only (the multilingual checkpoint is not
+  served); no VoiceDesign or free-form instructions; no prefix caching. Text
+  that needs more than 1000 speech tokens is cut at the cap, as upstream's
+  `generate` is; both Omni and upstream produce repetition or unrelated speech
+  on unsplit narration of several hundred words, so send long text through
+  the sentence frontend. A WebSocket connection may hold 8 MiB or 4096
+  queued messages; exceeding either aborts the session with close code 1008.
 
-```bash
-curl --fail http://127.0.0.1:8091/v1/audio/speech \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "ResembleAI/chatterbox-turbo",
-    "input": "Hello, welcome to the speech synthesis demonstration.",
-    "voice": "default",
-    "response_format": "wav",
-    "max_new_tokens": 250,
-    "seed": 42
-  }' --output chatterbox.wav
-```
-
-## Reference voices
-
-Supply `ref_audio` as an audio URL or base64 data URL, either a string or a
-one-item list. The shared speech API's audio-access restrictions apply.
-A transcript is unnecessary. Reference recordings must contain more than five
-seconds of audio. Conditioning uses up to fifteen seconds for T3 and ten seconds
-for S3Gen, with loudness normalization to -27 LUFS.
-
-```json
-{
-  "model": "ResembleAI/chatterbox-turbo",
-  "input": "Please read this new sentence in the reference voice.",
-  "ref_audio": "data:audio/wav;base64,<base64-encoded-reference>",
-  "response_format": "wav"
-}
-```
-
-Each request carries its own voice tensors. Requests without `ref_audio` use
-`conds.pt` from the selected model directory or Hub snapshot. Reference encoding
-runs outside the API event loop; the encoder is initialized on its first
-reference request. A bounded queue admits up to 64 conditioning requests, and
-one encoder owner processes batches of up to eight. Identical cache misses share
-one encoding operation, and a 128-entry cache stores completed conditioning.
-The initialization lock does not serialize request generation.
-
-## Chatterbox Original
-
-Serve `ResembleAI/chatterbox` with the same command to select the Original
-deployment (`vllm_omni/deploy/chatterbox.yaml`). It uses a Llama backbone,
-classifier-free guidance, and ten-step S3Gen instead of Turbo's GPT-2 and
-meanflow decoder. Both deployments expose the same speech and streaming API.
-Original uses six seconds of reference audio for T3, ten seconds for S3Gen,
-and does not apply Turbo's loudness normalization or five-second minimum.
-Its opt-in acceleration profile is
-`vllm_omni/deploy/chatterbox_high_concurrency_cuda.yaml`. It enables the same
-BF16 flow, cuDNN attention and MPS settings as Turbo. Admitting 64 requests
-does not guarantee real-time Original audio; consult the profiling report.
-This overlay starts with 30-token chunks to reduce early flow work; the ordinary
-profiles keep the 15-token initial setting.
-
-Original accepts `extra_params` with `exaggeration` and `cfg_weight`, both
-defaulting to 0.5. Values must be finite and nonnegative. Setting `cfg_weight`
-to zero disables the unconditional companion. Otherwise each request occupies
-two autoregressive sequence slots; the atomic scheduler keeps both branches
-together, and only the conditional branch produces audio. Keep prefix caching,
-chunked prefill, and asynchronous scheduling disabled for this deployment.
-
-```json
-{
-  "model": "ResembleAI/chatterbox",
-  "input": "Hello, welcome to the speech synthesis demonstration.",
-  "voice": "default",
-  "extra_params": {"exaggeration": 0.7, "cfg_weight": 0.5},
-  "response_format": "wav"
-}
-```
-
-Turbo supports English and checkpoint vocal-event tags such as `[laugh]`.
-It does not support VoiceDesign, free-form `instructions`, speaker embeddings
-from other models, or the Original model's exaggeration and CFG controls.
-
-## Streaming and limits
-
-For raw streamed audio, request `"stream": true`, `"stream_format": "audio"`,
-and `"response_format": "pcm"` or `"wav"`. PCM is signed 16-bit little-endian
-audio at 24 kHz. Complete responses consolidate the same internal chunks.
-Set `--no-async-chunk` to decode each finished utterance once instead.
-
-The deployment starts with 15-token chunks, ramps to 30 and 60, and waits for
-the flow decoder's three-token lookahead. Reference-length alignment can
-increase the first chunk. The decoder keeps a fixed 50-token left context
-and stable noise positions for each request.
-
-`max_new_tokens` caps speech tokens at 25 tokens per second, including EOS.
-The public API accepts at most 4096 new speech tokens for either variant.
-Original enforces the same 4096-token ceiling for offline sampling, including
-unguided and stage-0-only requests; an explicit unlimited output budget is unsupported.
-Original also accepts at most 2048 text tokens because its text positions are learned.
-The default is 1000, subject to the remaining 2048-token stage-0 context.
-The prompt occupies one speaker slot, up to 375 reference tokens, the tokenized
-text, and one start token. Prefix caching must remain disabled because these
-positions use placeholder IDs with request-specific embeddings.
-
-When tuning the deployment, keep stage 1's `max_model_len` at least as large
-as stage 0's and `max_num_batched_tokens` at least
-`max_num_seqs * max_model_len`. These bounds cover the full utterance even
-when a request raises the default output cap. Stage 1 requires FP32 for the
-vocoder. Memory and latency depend on concurrency, text length, and reference
-length; tune on the intended hardware.
-
-## Conditioning load validation at 64 clients
-
-Use the public streaming API harness for both deployments on the same hardware.
-Unlike a configuration limit, this exercises reference loading, reference conditioning,
-autoregressive generation, and waveform decoding together. The opt-in
-`chatterbox_turbo_high_concurrency.yaml` and `chatterbox_high_concurrency.yaml`
-profiles admit 64 requests (128 Original CFG branches), batch conditioning in
-groups of eight and decode the scheduled waveform batch together. They explicitly
-set stage 0 `hf_overrides.conditioning_device: cuda:0`: the API process and both
-stages must share visible GPU zero on one host. The standard profiles retain CPU
-conditioning. Include encoder weights and activations in the GPU memory budget.
-
-Conditioning has one encoder owner, a 64-request admission bound, batches of up
-to eight references, and a 128-entry content-keyed cache. Concurrent identical
-references share encoding work; each caller receives separate conditioning
-tensors. Cancellation retains admission until its encoder work finishes.
-
-On an RTX A5000 (24 GB), revision `223f3c5f6` completed 576 Original WebSocket
-sessions and 1152 sentence segments at 64 clients, with a 128-token cap, across
-three waves each of cold distinct-reference, warm repeated-reference, and
-built-in-voice workloads. All streams passed; speech shared-memory entries
-returned to zero while the server remained running. Cold/warm/built-in session
-p95 completion times were 111.64/106.40/66.27 seconds. These short runs do not
-establish the default 1000-token capacity or latency parity with Qwen3-TTS.
-The strict per-wave scheduler-capacity check was false: not every sampled wave
-reached 128 simultaneous Original CFG branches.
-
-H100 results, including historical microbatch measurements, are recorded in the
-[H100 recipe](Chatterbox-H100.md). They do not qualify this A5000 profile.
-
-These sessions were driven by a Chatterbox-specific load harness that has
-since been removed in favour of the shared `benchmarks/tts/bench_tts.py`
-driver (see the [TTS benchmark README](../../benchmarks/tts/README.md)).
-Reproduce the HTTP workload from a fresh server, so the first wave includes
-conditioner initialization:
-
-```bash
-python benchmarks/tts/bench_tts.py \
-  --model ResembleAI/chatterbox-turbo \
-  --task voice_clone --locale en \
-  --dataset-path benchmarks/build_dataset/seed_tts_smoke \
-  --host 127.0.0.1 --port 8091 \
-  --concurrency 64 --num-prompts 192 --num-warmups 64 \
-  --output-dir results/turbo-c64
-```
-
-Repeat with `ResembleAI/chatterbox` after restarting the server for Original.
-Keep hardware, reference recordings, concurrency and caps identical when
-comparing models. The driver reports first-audio latency, real-time factor and
-streaming continuity (`audio_underrun`, `audio_continuity_ok`); it does not
-sample scheduler occupancy, so client completion alone does not establish
-active capacity. The sentence-segmented WebSocket frontend has no shared load
-driver.
-
-### Sentence-segmented WebSocket sessions
-
-The WebSocket receiver continues draining input during generation so protocol
-keepalive replies remain readable. Each connection permits up to 8 MiB of pending
-messages and 4096 queued messages, in addition to the existing per-message limits.
-Exceeding either backlog bound aborts active generation and closes with code 1008.
-
-## Supported features and verification
+## Supported features
 
 | Feature | Status |
 | --- | --- |
-| Built-in voice / reference voice | Both variants; [request contract](../../docs/serving/speech_api.md#chatterbox-turbo-and-original) |
-| Async chunk streaming | Delta audio; [shared streaming guide](../../docs/design/feature/async_chunk.md) |
-| AR CUDA graphs | vLLM runner capture; decoder remains eager |
-| Original CFG / exaggeration | Supported; Turbo rejects these controls |
-| Other accelerator platforms | Configuration-only; no qualification claimed |
+| Built-in voice, voice cloning | both variants; [request contract](../../docs/serving/speech_api.md#chatterbox-turbo-and-original) |
+| Async chunk streaming | delta audio on both runners; [feature guide](../../docs/design/feature/async_chunk.md) |
+| Model Runner V2, native data plane | default on CUDA; V1 supported |
+| AR CUDA graphs | on by default; S3Gen stays eager |
+| Original CFG and exaggeration | supported; Turbo rejects the fields |
+| BF16 flow, cuDNN attention, CUDA MPS | opt-in overlays, qualified only on H100 |
+| Multilingual, VoiceDesign, instructions, prefix caching | unsupported |
+| NPU, XPU, ROCm, MUSA | configuration-only (`model_runner: v1` kept there); not qualified |
 
-For offline verification, use the [Chatterbox example](../../examples/offline_inference/text_to_speech/README.md#chatterbox-turbo-and-original).
-Expect a finite, nonempty mono waveform at 24 kHz. For browser playback use the
-[streaming demo](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original).
-MP3/FLAC and eager-versus-graph checks passed on the fresh H100 integration
-run; browser playback is qualified separately in the
-[H100 recipe](Chatterbox-H100.md). These are not new A5000 measurements.
+## Qualification evidence
+
+Turbo, default profile, streaming, short English reference clip, three
+sentences scored with Whisper (`small`), medians of three runs over two
+engine starts:
+
+| Runner | First audio, 1 stream | RTF, 1 stream | First audio, 8 streams | RTF, 8 streams |
+| --- | --- | --- | --- | --- |
+| V1 | 0.31–0.38 s | 0.17–0.20 | 1.03–1.04 s | 0.44 |
+| V2 | 0.32–0.40 s | 0.17–0.21 | 1.08–1.09 s | 0.44–0.45 |
+
+Transcripts over eight runs per runner: mean WER 0.089 (V1, 72 utterances)
+and 0.087 (V2, 48 utterances); 7 of 72 and 4 of 48 utterances exceeded 0.17,
+nearly all on product-name words. Streaming also completed at 12 concurrent
+streams with no error line. This is a bounded qualification run, not a
+benchmark; per-utterance WER varies with the talker's sampling.
+
+Original, an earlier revision (`223f3c5f6`) with a 128-token cap: 576
+WebSocket sessions and 1152 sentence segments completed at 64 clients across
+three waves each of cold distinct references, a repeated reference and the
+built-in voice, with no failure; p95 session completion 111.6, 106.4 and
+66.3 s. Shared-memory entries returned to zero afterwards. Not every wave
+reached 128 simultaneous CFG branches, and the run does not establish the
+default 1000-token capacity.
