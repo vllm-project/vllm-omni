@@ -5,6 +5,88 @@ that included the broader shared-runtime fixes in
 [PR #8842](https://github.com/vllm-project/vllm-omni/pull/8842). The Chatterbox
 integration includes its required adapter hooks and does not depend on #8842.
 
+## Matched canonical upstream comparison
+
+Measured October 13, 2026 at `cb46790382d7a01e93111544bce6945bbc02459c`,
+without #8842, on one H100 SXM 80 GB (driver 580.159.04).
+Canonical upstream Chatterbox was pinned to
+`5de7a54aa4e5e2baadb0182dde554908b48b85c2` (0.1.7), with Perth pinned to
+`ff1c8ac55a976971245cdd53c18d6131ca00d993`.
+Turbo checkpoint revision: `749d1c1a46eb10492095d68fbcf55691ccf137cd`;
+Original: `5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18`.
+
+Main used the project `vllm-omni` environment: vLLM/Omni 0.31.0,
+PyTorch 2.13.0+cu130, torchaudio 2.11.0+cu130, NumPy 2.3.5 and
+Transformers 5.14.1.
+Canonical upstream used a separate environment with its declared dependencies:
+PyTorch/torchaudio 2.6.0+cu124, NumPy 1.26.4, Transformers 5.2.0 and
+Diffusers 0.29.0. Both used Python 3.12.3 and four CPU threads.
+These dependency differences make this a supported-environment comparison,
+not an isolated kernel A/B test.
+
+The committed `benchmarks/tts/chatterbox_reference.py` ran three fixed texts
+with seeds 0, 42 and 123, using both built-in and cloned voices: nine timed
+requests per mode, 18 per backend/model, **72 timed generations total**.
+Each mode first warmed every text with two additional seeds, giving 48 warmups.
+Each backend/model started in a fresh process. Turbo ran upstream first;
+Original ran Omni first. All inference was FP32 with TF32 disabled,
+concurrency one and a 1000-token allowance. Omni used eager whole-utterance
+execution with its default stage capacity and KV reservation.
+The exact same `clone_2.wav` reference and SHA256 listed below were used.
+Clone requests include fresh conditioning; model loading, warmup and WAV writes
+are excluded. Host timing includes CPU waveform assembly and synchronization.
+Upstream's unmodified public generate includes CPU Perth watermarking.
+Omni uses fixed flow noise; equal seeds do not imply identical token draws.
+
+| Model | Backend | Voice | E2E mean ± SD (s) | E2E p95 (s) | RTF mean ± SD | RTF p95 | GPU used p95 (MiB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Turbo | upstream | builtin | 1.130 ± 0.803 | 2.276 | 0.149 ± 0.007 | 0.158 | 4315 |
+| Turbo | upstream | clone | 1.340 ± 1.027 | 2.836 | 0.156 ± 0.008 | 0.166 | 4595 |
+| Turbo | omni | builtin | 2.107 ± 1.572 | 4.327 | 0.278 ± 0.012 | 0.292 | 32334 |
+| Turbo | omni | clone | 2.421 ± 1.430 | 4.511 | 0.320 ± 0.054 | 0.399 | 32524 |
+| Original | upstream | builtin | 1.907 ± 1.236 | 3.688 | 0.302 ± 0.024 | 0.330 | 4952 |
+| Original | upstream | clone | 2.718 ± 1.743 | 5.113 | 0.292 ± 0.019 | 0.315 | 5277 |
+| Original | omni | builtin | 2.887 ± 1.678 | 5.302 | 0.494 ± 0.117 | 0.632 | 31588 |
+| Original | omni | clone | 4.094 ± 2.955 | 8.780 | 0.443 ± 0.074 | 0.554 | 32332 |
+
+Memory is whole-device usage sampled every 100 ms, including Omni workers,
+resident conditioning encoders and reserved KV cache. It is not minimum model
+memory. The three text lengths contribute to E2E variability; percentiles use
+only nine observations per row. Omni was slower than canonical upstream in
+this FP32 eager single-request workload. These results do not replace or
+extend the separate 64-client streaming qualification.
+
+Quality used the same frozen Whisper large-v3 (FP32, temperature zero,
+EnglishTextNormalizer) and checkpoint VoiceEncoder for both backends.
+ASR checkpoint SHA256:
+`e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb`.
+Speaker cosine targets the exact reference embedding for cloning and checkpoint
+speaker embedding for built-in voices. It is a proxy, not human MOS.
+
+| Model | Backend | Voice | Aggregate WER | Mean speaker cosine | Final phrase complete |
+| --- | --- | --- | --- | --- | --- |
+| Turbo | upstream | builtin | 0.0000 | 0.9389 | 9/9 |
+| Turbo | upstream | clone | 0.0000 | 0.8417 | 9/9 |
+| Turbo | omni | builtin | 0.0000 | 0.9362 | 9/9 |
+| Turbo | omni | clone | 0.0000 | 0.8296 | 9/9 |
+| Original | upstream | builtin | 0.0000 | 0.6241 | 9/9 |
+| Original | upstream | clone | 0.0000 | 0.9123 | 9/9 |
+| Original | omni | builtin | 0.0042 | 0.6411 | 9/9 |
+| Original | omni | clone | 0.0000 | 0.9075 | 9/9 |
+
+All 72 WAVs were finite, nonempty mono PCM at 24 kHz. Predeclared guards passed
+for both voice modes of both models: Omni aggregate WER no more than 0.05 above
+upstream, mean speaker cosine no more than 0.05 below upstream, and at most one
+additional missing final three-word phrase per nine requests. Original Omni
+had one transcription word error in the built-in mode. This small English
+sample establishes narrow automated agreement, not statistical equivalence,
+multilingual coverage or subjective audio-quality parity.
+
+Reproduction commands and environment separation are documented in
+[the TTS benchmark README](../../benchmarks/tts/README.md).
+Per-request timings, transcripts, 72 WAVs, package freezes, source blob hashes,
+protocol and logs were recovered before deleting the temporary pod.
+
 ## Standalone 64-client HTTP qualification
 
 Measured October 12, 2026 at source revision `21bb93f10`, with no #8842
