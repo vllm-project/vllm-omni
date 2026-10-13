@@ -146,6 +146,44 @@ def test_invalid_windows(window, sink) -> None:
         )
 
 
+def test_omitted_history_uses_checkpoint_defaults() -> None:
+    request = pipeline()._validate_conditioning_request(params(257), None)
+    assert (request.window_frames, request.sink_frames) == (51, 1)
+
+
+@pytest.mark.parametrize("frames", [1, 121, 257, 901])
+@pytest.mark.parametrize("source", ["extra_args", "attribute", "prompt", "additional_information"])
+def test_explicit_null_selects_complete_rollout(frames: int, source: str) -> None:
+    sp = params(frames)
+    prompt = {}
+    if source == "extra_args":
+        sp.extra_args["kv_cache_inference_size"] = None
+        sp.kv_cache_inference_size = 7  # Lower-precedence values must not mask explicit null.
+    elif source == "attribute":
+        sp.kv_cache_inference_size = None
+        prompt["kv_cache_inference_size"] = 7
+    elif source == "prompt":
+        prompt = {"kv_cache_inference_size": None, "additional_information": {"kv_cache_inference_size": 7}}
+    else:
+        prompt = {"additional_information": {"kv_cache_inference_size": None}}
+    request = pipeline()._validate_conditioning_request(sp, None, prompt_data=prompt)
+    assert (request.window_frames, request.sink_frames) == ((frames - 1) // 4 + 1, 0)
+
+
+def test_integer_history_override_takes_precedence_over_prompt_null() -> None:
+    request = pipeline()._validate_conditioning_request(
+        params(257, kv_cache_inference_size=30, attention_sink_size=3),
+        None,
+        prompt_data={"kv_cache_inference_size": None},
+    )
+    assert (request.window_frames, request.sink_frames) == (30, 3)
+
+
+def test_full_history_rejects_nonzero_sinks() -> None:
+    with pytest.raises(ValueError, match="full history requires attention_sink_size=0"):
+        pipeline()._validate_conditioning_request(params(kv_cache_inference_size=None, attention_sink_size=1), None)
+
+
 def test_chunk4_full_history_contract() -> None:
     p = pipeline(4)
     assert p._validate_conditioning_request(params(113), None).num_pixel_frames == 113
@@ -153,19 +191,22 @@ def test_chunk4_full_history_contract() -> None:
         p._validate_conditioning_request(params(121), None)
     with pytest.raises(ValueError, match="full history"):
         p._validate_conditioning_request(params(193), None)
+    request = p._validate_conditioning_request(params(193, kv_cache_inference_size=None), None)
+    assert (request.window_frames, request.sink_frames) == (99, 0)
 
 
-@pytest.mark.parametrize("window,sink", [(1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
+@pytest.mark.parametrize("window,sink", [(None, 0), (1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
 @pytest.mark.parametrize("joint", [False, True])
-def test_rollout_history_matches_reference_visibility(window: int, sink: int, joint: bool) -> None:
+def test_rollout_history_matches_reference_visibility(window: int | None, sink: int, joint: bool) -> None:
     p = pipeline()
     state = Cosmos3NanoSimBimanualSessionState(session_id="test")
     geometry = Cosmos3NanoSimBimanualGeometry(height=32, width=32)
-    total = 3 * window + 1
+    total = 65 if window is None else 3 * window + 1
     request = p._validate_conditioning_request(
         params(1 + 4 * (total - 1), kv_cache_inference_size=window, attention_sink_size=sink),
         None,
     )
+    window = request.window_frames
     conditioning = _TransferConditioning(request, torch.zeros(1, 48, total, 2, 2))
     if joint:
         p._ar_diffusion_kv_state = None

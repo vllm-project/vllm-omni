@@ -59,7 +59,7 @@ def make_cache(spec, block_size=None):
     )
 
 
-@pytest.mark.parametrize("window,sink", [(1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
+@pytest.mark.parametrize("window,sink", [(None, 0), (1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
 @pytest.mark.parametrize("size,block_size", [(32, 1), (96, 16)])
 def test_transfer_paged_rollout_visibility_and_attention(window, sink, size, block_size, monkeypatch):
     """Exercise real allocation, scratch writes, attention, eviction and reuse.
@@ -70,6 +70,11 @@ def test_transfer_paged_rollout_visibility_and_attention(window, sink, size, blo
     monkeypatch.delenv("VLLM_OMNI_AR_DIFFUSION_KV_GATHER", raising=False)
     p = paged_pipeline()
     geometry = Cosmos3NanoSimBimanualGeometry(height=size, width=size)
+    total = 65 if window is None else 3 * window + 1
+    request = p._validate_conditioning_request(
+        params(1 + 4 * (total - 1), kv_cache_inference_size=window, attention_sink_size=sink), None
+    )
+    window = request.window_frames
     spec = p._kv_spec_for_geometry(geometry, window_frames=window, sink_frames=sink, text_capacity=3)
     cache = make_cache(spec, block_size=block_size)
     tokens = spec.tokens_per_frame
@@ -77,10 +82,6 @@ def test_transfer_paged_rollout_visibility_and_attention(window, sink, size, blo
     adapter = cache.begin_request("paired")
     paged = ARDiffusionKVState(cache, "paired", {"main": adapter}, num_layers=2)
     state = Cosmos3NanoSimBimanualSessionState(session_id="paired")
-    total = 3 * window + 1
-    request = p._validate_conditioning_request(
-        params(1 + 4 * (total - 1), kv_cache_inference_size=window, attention_sink_size=sink), None
-    )
     conditioning = _TransferConditioning(request, torch.zeros(1, 48, total, 2, 2))
     calls = []
     scratch_slots = []
@@ -150,7 +151,9 @@ def test_transfer_paged_rollout_visibility_and_attention(window, sink, size, blo
         )
     assert ("clean", total - 1) not in calls
     assert adapter.completed_chunks == 2 * total - 1
-    if block_size == 1:
+    if total <= window:
+        assert adapter.compacted_tokens == 0
+    elif block_size == 1:
         assert adapter.compacted_tokens > 0
     assert len(table_shapes) == 1
     if block_size == 1:
@@ -181,6 +184,24 @@ def test_transfer_request_spec_uses_control_geometry_and_overrides(window, sink,
     p.validate_ar_diffusion_effective_spec(spec)
     batch = SimpleNamespace(prompts=[request.prompt], sampling_params=sp)
     assert p.ar_diffusion_request_spec(batch) == result
+
+
+@pytest.mark.parametrize("frames", [1, 121, 257, 901])
+def test_transfer_full_history_allocation_matches_execution(frames: int) -> None:
+    p = paged_pipeline()
+    sp = params(
+        frames, kv_cache_inference_size=None, resolution="480", depth={"control": {"height": 480, "width": 832}}
+    )
+    request = SimpleNamespace(prompt={"prompt": "test"}, sampling_params=sp)
+    admitted = p.ar_diffusion_request_spec(request)
+    executed = p._validate_conditioning_request(sp, None, prompt_data=request.prompt)
+    latent_frames = (frames - 1) // 4 + 1
+    assert admitted.geometry_key[1:3] == (executed.window_frames, executed.sink_frames) == (latent_frames, 0)
+    assert admitted.kv_spec.window_frames == 2 * latent_frames - 1
+    assert admitted.kv_spec.sink_frames == 0
+    p.validate_ar_diffusion_effective_spec(admitted.kv_spec)
+    batch = SimpleNamespace(prompts=[request.prompt], sampling_params=sp)
+    assert p.ar_diffusion_request_spec(batch) == admitted
 
 
 def test_transfer_default_request_spec_uses_control_latent_layout():

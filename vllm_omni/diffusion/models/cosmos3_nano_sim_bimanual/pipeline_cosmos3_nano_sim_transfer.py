@@ -93,13 +93,19 @@ def _prompt_value(prompt_data: Any, key: str) -> Any:
     return None
 
 
-def _request_value(sampling_params: Any, prompt_data: Any, key: str, default: Any = None) -> Any:
+def _request_value(
+    sampling_params: Any, prompt_data: Any, key: str, default: Any = None, *, preserve_none: bool = False
+) -> Any:
     extra = getattr(sampling_params, "extra_args", None)
-    if isinstance(extra, Mapping) and extra.get(key) is not None:
+    if isinstance(extra, Mapping) and key in extra and (preserve_none or extra[key] is not None):
         return extra[key]
     value = getattr(sampling_params, key, None)
-    if value is not None:
+    if value is not None or (preserve_none and hasattr(sampling_params, key)):
         return value
+    if preserve_none and isinstance(prompt_data, Mapping):
+        for source in (prompt_data, prompt_data.get("additional_information")):
+            if isinstance(source, Mapping) and key in source:
+                return source[key]
     value = _prompt_value(prompt_data, key)
     return default if value is None else value
 
@@ -591,11 +597,10 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         del tick
         raise ValueError("Cosmos3-Nano-Sim-Transfer tick transport is Phase T3 and is not supported by this pipeline.")
 
-    def _request_param(self, sp: Any, prompt_data: Any, key: str, default: Any = None) -> Any:
-        value = self._get_sp_param(sp, key, None)
-        if value is None:
-            value = _prompt_value(prompt_data, key)
-        return default if value is None else value
+    def _request_param(
+        self, sp: Any, prompt_data: Any, key: str, default: Any = None, *, preserve_none: bool = False
+    ) -> Any:
+        return _request_value(sp, prompt_data, key, default, preserve_none=preserve_none)
 
     def _resolve_request_fps(self, sp: Any, prompt_data: Any) -> float:
         input_fps = _prompt_value(prompt_data, "transfer_input_fps")
@@ -761,18 +766,16 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             "emphasize_control_in_prompt",
         )
 
-        window = _strict_integer(
-            self._request_param(sp, prompt_data, "kv_cache_inference_size", self.manifest.window_frames),
-            "kv_cache_inference_size",
+        window = self._request_param(
+            sp, prompt_data, "kv_cache_inference_size", self.manifest.window_frames, preserve_none=True
         )
+        full_history = window is None
         sink = _strict_integer(
-            self._request_param(sp, prompt_data, "attention_sink_size", self.manifest.sink_frames),
+            self._request_param(
+                sp, prompt_data, "attention_sink_size", 0 if full_history else self.manifest.sink_frames
+            ),
             "attention_sink_size",
         )
-        if window <= 0 or not 0 <= sink < window:
-            raise ARDiffusionRequestRejectedError("Require kv_cache_inference_size > attention_sink_size >= 0.")
-        if self.manifest.chunk_size != 1 and sink != 0:
-            raise ARDiffusionRequestRejectedError("Transfer sink history requires chunk_size=1.")
 
         num_pixel_frames = _strict_integer(self._request_param(sp, prompt_data, "num_frames", 1))
         frame_stride = self.manifest.temporal_compression_factor * self.manifest.chunk_size
@@ -784,6 +787,19 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             )
         latent_frames = (num_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
         required_history_frames = 2 * latent_frames + 1
+        if full_history:
+            if sink != 0:
+                raise ARDiffusionRequestRejectedError("Transfer full history requires attention_sink_size=0.")
+            # Resolve explicit null before both runner admission and generation.
+            # Framewise windows count temporal frames; chunkwise capacity counts
+            # control/generated spans. Neither mode evicts within this rollout.
+            window = latent_frames if self.manifest.chunk_size == 1 else required_history_frames
+        else:
+            window = _strict_integer(window, "kv_cache_inference_size")
+        if window <= 0 or not 0 <= sink < window:
+            raise ARDiffusionRequestRejectedError("Require kv_cache_inference_size > attention_sink_size >= 0.")
+        if self.manifest.chunk_size != 1 and sink != 0:
+            raise ARDiffusionRequestRejectedError("Transfer sink history requires chunk_size=1.")
         # Framewise inference uses window/sink retention regardless of
         # conditioning.no_eviction. Chunkwise inference requires full-history capacity.
         if self.manifest.chunk_size != 1 and required_history_frames > window:
