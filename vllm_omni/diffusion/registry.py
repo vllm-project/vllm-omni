@@ -186,6 +186,11 @@ _DIFFUSION_MODELS = {
         "pipeline",
         "LingBotWorldCausalDMDPipeline",
     ),
+    "SolarWMH3Pipeline": (
+        "solarwm_h3",
+        "pipeline_solarwm_h3",
+        "SolarWMH3Pipeline",
+    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
@@ -441,6 +446,9 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    # Solar's clean KV commit must execute every block. Approximate DiT step
+    # skipping cannot preserve the raw, locally re-rotated world history.
+    "SolarWMH3Pipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
     # step-skipping hooks.

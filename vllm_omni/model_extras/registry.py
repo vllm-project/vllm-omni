@@ -102,6 +102,7 @@ from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.solarwm_h3 import solarwm_h3_transformer_config_subfolder
 from vllm_omni.model_extras.vace import (
     VACE_EXTRA_BODY_PARAMS,
     VACE_EXTRA_OUTPUT_PARAMS,
@@ -222,6 +223,9 @@ def _always_preserve_reference_image_size(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
+    "SolarWMH3Pipeline": {
+        "transformer_config_subfolder_resolver": solarwm_h3_transformer_config_subfolder,
+    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,

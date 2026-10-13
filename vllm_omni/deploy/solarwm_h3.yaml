@@ -1,0 +1,32 @@
+# SolarWM-H3 Stage-2 causal world model. Eager, TP1, strict pure Ulysses.
+# Set solarwm_checkpoint_path to an explicit local Stage-2 artifact directory
+# when the selected model root does not include the published checkpoint.
+pipeline: solarwm_h3
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: SolarWMH3Pipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    ulysses_degree: 4
+    default_sampling_params:
+      height: 768
+      width: 1344
+      num_frames: 158
+      num_inference_steps: 4
+      guidance_scale: 1.0
+      fps: 24
+      output_type: pil
+    model_config:
+      # solarwm_checkpoint_path: /models/SolarWM-h3-33B-sgf-stage2-158f-fix
+      ar_diffusion_height: 768
+      ar_diffusion_width: 1344
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6

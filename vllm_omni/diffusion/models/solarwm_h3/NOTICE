@@ -1,0 +1,39 @@
+SolarWM-H3 integration
+
+Portions of camera.py, layout.py, sampling.py, checkpoint.py, attention.py,
+vae.py, and decode.py
+are adapted from SolarWM, Copyright 2026 SolarWM Contributors, licensed under
+the Apache License, Version 2.0 (see the repository's LICENSE).
+
+Source revision: ce1da4e7705391eda8eeda6016c0fd3f614b975e
+https://github.com/Junchao-cs/SolarWM
+
+The adaptations replace the training runtime with native vLLM-Omni modules,
+fixed EMA adapter loading, and runner-owned transactional KV storage.
+
+Camera projective arithmetic also derives from PRoPE, as vendored in SolarWM's
+src/solarwm/backends/wan22/runtime/modeling/camera_prope.py and adapted in
+src/solarwm/backends/minimax_h3/torch_prope.py. The original notice follows.
+
+MIT License
+
+Copyright (c) Authors of
+"PRoPE: Projective Positional Encoding for Multiview Transformers"
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
