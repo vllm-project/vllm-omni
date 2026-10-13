@@ -416,6 +416,40 @@ A successful transport/session result is therefore not proof that every final
 input produced a response, nor an accuracy score. Final-input lifecycle
 hardening is separate from this entrypoint integration.
 
+#### Per-stage metrics
+
+Add `--print-stage` to the serving command above to aggregate the final cumulative
+snapshot from each assistant response. Each response contributes once, even when
+it sends multiple metric updates; a video can therefore contribute several
+responses to each stage table. Serving tables honor `--percentile-metrics` and
+`--percentiles`.
+
+The standalone generation command also supports stage tables:
+
+```bash
+vllm bench omni-duplex-eval --omni generate \
+  --url 'ws://127.0.0.1:8000/v1/realtime?duplex=1' \
+  --model openbmb/MiniCPM-o-4_5 \
+  --ref-audio /path/to/reference.wav \
+  --dataset Hothan/Omni-DuplexEval \
+  --split PR_correction --limit 1 --concurrency 1 \
+  --response-root ./duplex-eval-responses \
+  --overwrite --print-stage
+```
+
+Standalone generation uses a fixed metric selection (`ttft`, `tpot`, `itl`,
+`audio_ttfp`, `audio_duration`) and reports mean, median and P99 where applicable.
+Only samples generated in the current run contribute to this table. Existing
+response files are skipped by default; their stage snapshots are not loaded for
+printing. The command reports skipped samples on stderr and suggests
+`--overwrite` to regenerate them. If the server returns no stage snapshots, it
+reports that instead of printing an empty table.
+
+For both regular and duplex stage tables, missing or null `stage_gen_time_ms`
+and `postprocess_time_ms` values are excluded from timing distributions. Measured
+zeros remain samples. Complete snapshots retain the previous statistics; partial
+snapshots no longer lower timing means by contributing artificial zeros.
+
 ### OmniInteract Realtime Benchmark
 
 OmniInteract runs each video as one native-duplex WebSocket sample in the standard serving-benchmark lifecycle:

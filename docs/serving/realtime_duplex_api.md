@@ -302,8 +302,13 @@ summary = collector.timing_summary(after_s=commit_sent_at, input_committed_at_s=
 `timing_summary` reports client-observed first-text / first-audio latency,
 audio cadence, and, when the deployment attaches engine stage metrics to the
 response events (the benchmark requests them with
-`extra_body.return_stage_metrics=True`), the Stage 0 token metrics
-(`ttft_ms`, `tpot_ms`, `itls_ms`). It reports raw measurements only —
+`extra_body.return_stage_metrics=True`), per-stage engine metrics under `stages`
+(keyed by stage id), with Stage 0 also available as `stage0_tokens`
+(`ttft_ms`, `tpot_ms`, `itls_ms`). The `stage_metrics` mapping retains each stage's
+final cumulative raw snapshot for benchmark aggregation, including fields such
+as `num_tokens_out`, `vllm_ttft_ms`, and `stage_gen_time_ms`. Pass `response_id`
+to scope these snapshots to one assistant response in a multi-turn session.
+It reports raw measurements only —
 derived metrics such as the audio RTF are computed by the caller from
 `audio_generation_ms` / `audio_duration_ms` (the benchmarks use
 `vllm_omni.metrics.definitions.compute_audio_rtf`), keeping metric

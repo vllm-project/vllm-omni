@@ -103,7 +103,11 @@ def collect_duplex_session_metrics(
             metric["stage0_tokens"] = dict(stage0)
             output_tokens += int(stage0.get("output_token_count") or 0)
         if isinstance(stage_metrics, dict):
-            metric["stage_metrics"] = stage_metrics
+            metric["stage_metrics"] = {
+                str(stage_id): dict(snapshot)
+                for stage_id, snapshot in stage_metrics.items()
+                if isinstance(snapshot, dict)
+            }
         if isinstance(raw_metric, dict) or copied_stages or isinstance(stage0, dict) or isinstance(stage_metrics, dict):
             request_metrics.append(metric)
     session_metrics = summarize_session_request_metrics(

@@ -3017,6 +3017,11 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         output.audio_rtf = metric_mean(result.session_metrics.get("rtf")) or 0.0
         output.duplex_request_metrics = result.request_metrics
         output.duplex_session_metrics = result.session_metrics
+        output.stage_metrics_by_response = {
+            str(metric["response_id"]): snapshots
+            for metric in result.request_metrics
+            if metric.get("response_id") is not None and isinstance((snapshots := metric.get("stage_metrics")), dict)
+        }
         _apply_stage0_token_timings(
             output,
             [row.get("stage0_tokens") for row in result.request_metrics],

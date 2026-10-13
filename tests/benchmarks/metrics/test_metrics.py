@@ -17,6 +17,7 @@ from vllm_omni.benchmarks.metrics.metrics import (
     aggregate_stage_durations,
     calculate_metrics,
     print_stage_durations_metrics,
+    print_stage_metrics,
 )
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 from vllm_omni.metrics.definitions import stage_modality_flags
@@ -723,3 +724,28 @@ def test_profiler_stage_durations_print_without_print_stage(capsys) -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+@pytest.mark.parametrize("duplex", [False, True])
+def test_complete_stage_timings_keep_zero_samples_in_printed_statistics(duplex, capsys):
+    outputs = []
+    for index, duration in enumerate((0.0, 100.0)):
+        output = MixRequestFuncOutput(success=True)
+        snapshot = {"0": {"stage_gen_time_ms": duration, "postprocess_time_ms": duration / 10}}
+        if duplex:
+            output.stage_metrics_by_response = {f"r{index}": snapshot}
+        else:
+            output.stage_metrics = snapshot
+        outputs.append(output)
+    stage = _build_stage_metrics_from_outputs(outputs)[0]
+    assert stage.stage_gen_times_ms == [0.0, 100.0]
+    assert stage.postprocess_times_ms == [0.0, 10.0]
+    print_stage_metrics(TaskType.GENERATION, [], [99.0], stage)
+    printed = capsys.readouterr().out
+    for label, expected in (
+        ("Mean stage_gen_time (ms):", "50.00"),
+        ("Median stage_gen_time (ms):", "50.00"),
+        ("P99 stage_gen_time (ms):", "99.00"),
+        ("Mean postprocess (ms):", "5.00"),
+    ):
+        assert next(line for line in printed.splitlines() if line.startswith(label)).split()[-1] == expected

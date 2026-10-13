@@ -138,7 +138,10 @@ def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("collect_stage_metrics", [False, True])
+async def test_generate_exercises_realtime_socket_and_media_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collect_stage_metrics: bool
+):
     import websockets
 
     received = []
@@ -198,6 +201,7 @@ async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path
         path.write_bytes(b"data")
     sample = DuplexSample("sample", "PR_correction", "pr", "correction", video, audio)
 
+    extra_body = {"temperature": 0.2, "return_stage_metrics": False}
     async with websockets.serve(handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         result = await runner.generate_sample(
@@ -206,7 +210,8 @@ async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path
             model="mock",
             ref_audio=ref,
             output_root=tmp_path / "responses",
-            collect_stage_metrics=True,
+            collect_stage_metrics=collect_stage_metrics,
+            extra_body=extra_body,
         )
 
     assert json.loads(result.output.read_text(encoding="utf-8")) == [{"sentence": "Done.", "start": 0.8, "end": 0.8}]
@@ -225,7 +230,11 @@ async def test_generate_exercises_realtime_socket_and_media_clock(tmp_path: Path
     }
     assert result.session_metrics["stream_ttfp_ms"] is not None
     session_update = next(event for event in received if event["type"] == "session.update")
-    assert session_update["session"]["extra_body"]["return_stage_metrics"] is True
+    assert session_update["session"]["extra_body"] == {
+        "temperature": 0.2,
+        "return_stage_metrics": collect_stage_metrics,
+    }
+    assert extra_body == {"temperature": 0.2, "return_stage_metrics": False}
     assert any(event["type"] == "playback.ack" for event in received)
 
 
@@ -641,3 +650,18 @@ def test_judge_exercises_openai_http_schema():
     assert authorization == "Bearer token"
     assert payload["model"] == "judge"
     assert payload["messages"] == [{"role": "user", "content": "prompt"}]
+
+
+def test_session_metrics_copy_raw_stage_maps(monkeypatch):
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "r1"}}, received_at_s=1.0)
+    snapshots = {"0": {"num_tokens_out": 7, "stage_gen_time_ms": 10.0}}
+    monkeypatch.setattr(collector, "timing_summary", lambda **kwargs: {"stage_metrics": snapshots})
+    monkeypatch.setattr(collector, "global_timing_summary", lambda **kwargs: {})
+
+    bundle = collect_duplex_session_metrics(collector, stream_start=1.0, session_id="sample")
+    retained = bundle.request_metrics[0]["stage_metrics"]
+    assert retained == snapshots
+    retained["0"]["num_tokens_out"] = 99
+    retained["1"] = {"stage_gen_time_ms": 5.0}
+    assert snapshots == {"0": {"num_tokens_out": 7, "stage_gen_time_ms": 10.0}}

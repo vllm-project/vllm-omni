@@ -80,7 +80,10 @@ def add_cli_args(parser: argparse.ArgumentParser) -> None:
     generate.add_argument(
         "--print-stage",
         action="store_true",
-        help="Print aggregated per-stage metrics from samples generated in this run.",
+        help=(
+            "Print aggregated per-stage metrics from samples generated in this run "
+            "(mean, median and P99; fixed metric selection)."
+        ),
     )
     evaluate = actions.add_parser("evaluate")
     _common(evaluate)
