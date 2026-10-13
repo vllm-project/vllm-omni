@@ -18,15 +18,147 @@
 # Modified from ESPnet(https://github.com/espnet/espnet)
 """Encoder definition."""
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.attention import RelPositionMultiHeadedAttention
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.embedding import EspnetRelPositionalEncoding
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.encoder_layer import ConformerEncoderLayer
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.positionwise_feed_forward import PositionwiseFeedForward
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.subsampling import LinearNoSubsampling
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.attention import EspnetRelPositionMultiHeadedAttention
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+from vllm_omni.model_executor.models.indextts2.gpt.conformer_encoder import (
+    ConformerEncoderLayer,
+    PositionwiseFeedForward,
+)
+
+
+class EspnetRelPositionalEncoding(torch.nn.Module):
+    """Relative positional encoding module (new implementation).
+
+    Details can be found in https://github.com/espnet/espnet/pull/2816.
+
+    See : Appendix B in https://arxiv.org/abs/1901.02860
+
+    Args:
+        d_model (int): Embedding dimension.
+        dropout_rate (float): Dropout rate.
+        max_len (int): Maximum input length.
+
+    """
+
+    def __init__(self, d_model: int, dropout_rate: float, max_len: int = 5000):
+        """Construct an PositionalEncoding object."""
+        super().__init__()
+        self.d_model = d_model
+        self.xscale = math.sqrt(self.d_model)
+        self.dropout = torch.nn.Dropout(p=dropout_rate)
+        self.pe = None
+        self.extend_pe(torch.tensor(0.0).expand(1, max_len))
+
+    def extend_pe(self, x: torch.Tensor):
+        """Reset the positional encodings."""
+        if self.pe is not None:
+            # self.pe contains both positive and negative parts
+            # the length of self.pe is 2 * input_len - 1
+            if self.pe.size(1) >= x.size(1) * 2 - 1:
+                if self.pe.dtype != x.dtype or self.pe.device != x.device:
+                    self.pe = self.pe.to(dtype=x.dtype, device=x.device)
+                return
+        # Suppose `i` means to the position of query vector and `j` means the
+        # position of key vector. We use position relative positions when keys
+        # are to the left (i>j) and negative relative positions otherwise (i<j).
+        pe_positive = torch.zeros(x.size(1), self.d_model)
+        pe_negative = torch.zeros(x.size(1), self.d_model)
+        position = torch.arange(0, x.size(1), dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / self.d_model)
+        )
+        pe_positive[:, 0::2] = torch.sin(position * div_term)
+        pe_positive[:, 1::2] = torch.cos(position * div_term)
+        pe_negative[:, 0::2] = torch.sin(-1 * position * div_term)
+        pe_negative[:, 1::2] = torch.cos(-1 * position * div_term)
+
+        # Reserve the order of positive indices and concat both positive and
+        # negative indices. This is used to support the shifting trick
+        # as in https://arxiv.org/abs/1901.02860
+        pe_positive = torch.flip(pe_positive, [0]).unsqueeze(0)
+        pe_negative = pe_negative[1:].unsqueeze(0)
+        pe = torch.cat([pe_positive, pe_negative], dim=1)
+        self.pe = pe.to(device=x.device, dtype=x.dtype)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scale the input and take the positions it spans.
+
+        Args:
+            x (torch.Tensor): Input tensor (batch, time, `*`).
+
+        Returns:
+            torch.Tensor: Encoded tensor (batch, time, `*`).
+            torch.Tensor: Positional embedding (1, 2 * time - 1, `*`), every
+                relative distance from ``time - 1`` to ``-(time - 1)``.
+        """
+        self.extend_pe(x)
+        x = x * self.xscale
+        size = x.size(1)
+        pos_emb = self.pe[:, self.pe.size(1) // 2 - size + 1 : self.pe.size(1) // 2 + size]
+        return self.dropout(x), self.dropout(pos_emb)
+
+
+class LinearNoSubsampling(torch.nn.Module):
+    """Linear transform the input without subsampling
+
+    Args:
+        idim (int): Input dimension.
+        odim (int): Output dimension.
+        dropout_rate (float): Dropout rate.
+        pos_enc_class (torch.nn.Module): The positional encoding applied after the projection.
+    """
+
+    def __init__(self, idim: int, odim: int, dropout_rate: float, pos_enc_class: torch.nn.Module):
+        """Construct an linear object."""
+        super().__init__()
+        self.out = torch.nn.Sequential(
+            torch.nn.Linear(idim, odim),
+            torch.nn.LayerNorm(odim, eps=1e-5),
+            torch.nn.Dropout(dropout_rate),
+        )
+        self.pos_enc = pos_enc_class
+
+    def forward(self, x: torch.Tensor, x_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Input x.
+
+        Args:
+            x (torch.Tensor): Input tensor (#batch, time, idim).
+            x_mask (torch.Tensor): Input mask (#batch, 1, time).
+
+        Returns:
+            torch.Tensor: linear input tensor (#batch, time', odim),
+                where time' = time .
+            torch.Tensor: positional embedding (1, 2 * time' - 1, odim).
+            torch.Tensor: linear input mask (#batch, 1, time'),
+                where time' = time .
+        """
+        x = self.out(x)
+        x, pos_emb = self.pos_enc(x)
+        return x, pos_emb, x_mask
+
+
+class WenetConformerEncoderLayer(ConformerEncoderLayer):
+    """IndexTTS2's pre-norm Conformer layer with WeNet's LayerNorm epsilon.
+
+    The S3Gen checkpoint was trained with ``eps=1e-12`` in both of the
+    layer's norms; IndexTTS2's layer uses PyTorch's default ``1e-5``.
+
+    Args:
+        size (int): Input dimension.
+        self_attn (torch.nn.Module): Self-attention module.
+        feed_forward (torch.nn.Module): Feed-forward module.
+        dropout_rate (float): Dropout rate.
+    """
+
+    def __init__(self, size: int, self_attn: torch.nn.Module, feed_forward: torch.nn.Module, dropout_rate: float):
+        super().__init__(size, self_attn, feed_forward, dropout_rate=dropout_rate)
+        self.norm_ff.eps = self.norm_mha.eps = 1e-12
 
 
 class Upsample1D(nn.Module):
@@ -51,44 +183,6 @@ class Upsample1D(nn.Module):
         outputs = F.pad(outputs, (self.stride * 2, 0), value=0.0)
         outputs = self.conv(outputs)
         return outputs, input_lengths * self.stride
-
-
-class PreLookaheadLayer(nn.Module):
-    def __init__(self, channels: int, pre_lookahead_len: int = 1):
-        super().__init__()
-        self.channels = channels
-        self.pre_lookahead_len = pre_lookahead_len
-        self.conv1 = nn.Conv1d(
-            channels,
-            channels,
-            kernel_size=pre_lookahead_len + 1,
-            stride=1,
-            padding=0,
-        )
-        self.conv2 = nn.Conv1d(
-            channels,
-            channels,
-            kernel_size=3,
-            stride=1,
-            padding=0,
-        )
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """
-        inputs: (batch_size, seq_len, channels)
-        """
-        outputs = inputs.transpose(1, 2).contiguous()
-        # look ahead
-        outputs = F.pad(outputs, (0, self.pre_lookahead_len), mode="constant", value=0.0)
-        outputs = F.leaky_relu(self.conv1(outputs))
-        # outputs
-        outputs = F.pad(outputs, (2, 0), mode="constant", value=0.0)
-        outputs = self.conv2(outputs)
-        outputs = outputs.transpose(1, 2).contiguous()
-
-        # residual connection
-        outputs = outputs + inputs
-        return outputs
 
 
 class UpsampleConformerEncoder(torch.nn.Module):
@@ -145,14 +239,14 @@ class UpsampleConformerEncoder(torch.nn.Module):
             dropout_rate,
             activation,
         )
-        self.pre_lookahead_layer = PreLookaheadLayer(channels=512, pre_lookahead_len=3)
+        self.pre_lookahead_layer = PreLookaheadLayer(in_channels=512, channels=512, pre_lookahead_len=3)
         self.encoders = torch.nn.ModuleList(
             [
-                ConformerEncoderLayer(
+                WenetConformerEncoderLayer(
                     output_size,
-                    RelPositionMultiHeadedAttention(*encoder_selfattn_layer_args),
+                    EspnetRelPositionMultiHeadedAttention(*encoder_selfattn_layer_args),
                     PositionwiseFeedForward(*positionwise_layer_args),
-                    dropout_rate=dropout_rate,
+                    dropout_rate,
                 )
                 for _ in range(num_blocks)
             ]
@@ -166,11 +260,11 @@ class UpsampleConformerEncoder(torch.nn.Module):
         )
         self.up_encoders = torch.nn.ModuleList(
             [
-                ConformerEncoderLayer(
+                WenetConformerEncoderLayer(
                     output_size,
-                    RelPositionMultiHeadedAttention(*encoder_selfattn_layer_args),
+                    EspnetRelPositionMultiHeadedAttention(*encoder_selfattn_layer_args),
                     PositionwiseFeedForward(*positionwise_layer_args),
-                    dropout_rate=dropout_rate,
+                    dropout_rate,
                 )
                 for _ in range(4)
             ]

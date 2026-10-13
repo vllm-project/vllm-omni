@@ -49,9 +49,9 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.configs import CFM_PA
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.decoder import ConditionalDecoder
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.flow import CausalMaskedDiffWithXvec
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.flow_matching import CausalConditionalCFM
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.mask import make_pad_mask
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.upsample_encoder import UpsampleConformerEncoder
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 from vllm_omni.model_executor.models.glm_tts.vocoder import ConvRNNF0Predictor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig, validate_flow_settings

@@ -15,7 +15,6 @@
 # limitations under the License.
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.embeddings import TimestepEmbedding
 
@@ -25,6 +24,7 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_decoder import
     ResnetBlock1D,
     SinusoidalPosEmb,
 )
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import CausalConv1d
 
 
 def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -70,42 +70,6 @@ class CausalResnetBlock1D(ResnetBlock1D):
         super().__init__(dim, dim_out, time_emb_dim, groups)
         self.block1 = CausalBlock1D(dim, dim_out)
         self.block2 = CausalBlock1D(dim_out, dim_out)
-
-
-class CausalConv1d(torch.nn.Conv1d):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int = 1,
-        dilation: int = 1,
-        groups: int = 1,
-        bias: bool = True,
-        padding_mode: str = "zeros",
-        device=None,
-        dtype=None,
-    ) -> None:
-        super().__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding=0,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-            padding_mode=padding_mode,
-            device=device,
-            dtype=dtype,
-        )
-        assert stride == 1
-        self.causal_padding = (kernel_size - 1, 0)
-
-    def forward(self, x: torch.Tensor):
-        x = F.pad(x, self.causal_padding)
-        x = super().forward(x)
-        return x
 
 
 class ConditionalDecoder(nn.Module):
