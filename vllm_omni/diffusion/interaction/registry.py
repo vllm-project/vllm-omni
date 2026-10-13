@@ -25,4 +25,7 @@ STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     "LingBotWorldCausalDMDPipeline": {
         "camera": SE3DeltaCameraHandler,
     },
+    "SelfForcingPipeline": {
+        "prompt": PromptInteractionHandler,
+    },
 }
