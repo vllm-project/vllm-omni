@@ -48,15 +48,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Joint-sequence token count (B * (txt + img)) below which the attention
-# blocks keep their eager RMSNorm -> cat -> RoPE chain. Unlike Boogu-Image's
-# 2048-token crossover, Flux.2's eager chain is itself several launches (per
-# stream RMSNorm, three cats, RoPE), so on one H200 the fused path won at
-# every measured size, 768 to 16896 joint tokens (3.3x to 7.5x per block);
-# fuse by default and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS
-# overrides on other hardware; see fused_qk_norm_rope_min_tokens().
-_FUSED_MIN_TOKENS = 0
-
 
 def _join_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
@@ -1011,7 +1002,6 @@ class Flux2Transformer2DModel(nn.Module):
             *concat_rotary_emb,
             hidden_states.shape[0],
             dtype=hidden_states.dtype,
-            min_tokens=_FUSED_MIN_TOKENS,
             sequence_parallel_size=sp_size,
         )
         # Never mutate the caller-owned dict: rebind to a copy with (or

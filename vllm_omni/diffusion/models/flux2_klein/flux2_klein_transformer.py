@@ -62,9 +62,6 @@ from vllm_omni.diffusion.offloader.config import offload_enabled
 
 logger = init_logger(__name__)
 
-# Joint-sequence token count below which the blocks keep their eager chain;
-# same default as Flux.2 (fuse always), VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
-_FUSED_MIN_TOKENS = 0
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -1084,7 +1081,6 @@ class Flux2Transformer2DModel(nn.Module):
             *concat_rotary_emb,
             hidden_states.shape[0],
             dtype=hidden_states.dtype,
-            min_tokens=_FUSED_MIN_TOKENS,
             sequence_parallel_size=sp_size,
         )
         # Never mutate the caller-owned dict: rebind to a copy with (or
