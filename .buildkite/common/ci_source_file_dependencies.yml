@@ -482,6 +482,11 @@ source_file_dependencies:
     - tests/dfx/perf/scripts/run_diffusion_benchmark.py
     - tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
+  diffusion_qwen_image_21_perf:
+    - *qwen_image_21
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
+
   diffusion_text_to_image_doc:
     - *qwen_image
     - *z_image
