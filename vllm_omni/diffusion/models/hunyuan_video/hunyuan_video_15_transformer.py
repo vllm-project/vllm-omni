@@ -43,12 +43,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Joint-sequence token count (B * (video + text)) below which the attention
-# blocks keep their eager RMSNorm -> RoPE -> cat chain; fuse by default (the
-# fused path won at every size measured on H200 for this chain, see Flux.2)
-# and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
-_FUSED_MIN_TOKENS = 0
-
 
 class HunyuanVideo15PatchEmbed(nn.Module):
     def __init__(
@@ -902,7 +896,6 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 *image_rotary_emb,
                 hidden_states.shape[0],
                 dtype=hidden_states.dtype,
-                min_tokens=_FUSED_MIN_TOKENS,
                 identity_rows=encoder_hidden_states.shape[1],
             )
 

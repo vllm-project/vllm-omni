@@ -153,6 +153,30 @@ def test_fused_qk_norm_rope_half_split_general_dim():
     torch.testing.assert_close(actual[1], expected[1], atol=0.0625, rtol=0.02)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("eps", [1e-6, 1e-5])
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
+def test_fused_qk_norm_rope_cuda_rms_norm_is_bitwise(eps, table_dtype):
+    from vllm import _custom_ops as ops
+
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import _apply_rope_table, fused_qk_norm_rope
+
+    torch.manual_seed(17)
+    qkv = torch.randn(257, 13, 128, device="cuda", dtype=torch.bfloat16)
+    q, k = qkv[:, :7], qkv[:, 7:10]
+    weights = [torch.empty(128, device="cuda", dtype=torch.bfloat16).uniform_(0.5, 1.5) for _ in range(2)]
+    theta = torch.randn(257, 64, device="cuda")
+    table = torch.cat((theta.cos(), theta.sin()), dim=-1).to(table_dtype)
+    expected = []
+    for x, weight in zip((q, k), weights):
+        normalized = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        ops.rms_norm(normalized, x.contiguous(), weight, eps)
+        expected.append(_apply_rope_table(normalized, table, 128, interleaved=True, dtype=torch.float32))
+    actual = fused_qk_norm_rope(q, k, *weights, table, eps, interleaved=True, cuda_rms_norm=True)
+    for a, e in zip(actual, expected):
+        assert torch.equal(a.view(torch.int16), e.view(torch.int16))
+
+
 def test_fused_qk_norm_rope_min_tokens_resolution(monkeypatch):
     """The op-level token-gate override: unset or blank -> caller's default; a
     non-negative integer string overrides it (``0`` = always fuse); anything
@@ -343,53 +367,22 @@ def test_fused_joint_qkv_norm_rope_rejects_bad_shapes():
         fused_joint_qkv_norm_rope(q0[0], q0, q0, q1, q1, q1, w, w, w, w, table, 1e-6)
 
 
-def test_pack_qk_norm_rope_table_skips_when_fused_path_unavailable(monkeypatch):
+def test_pack_qk_norm_rope_table_skips_when_fused_path_unavailable():
     """No table (and no allocation) on devices/dtypes the fused kernel cannot
     serve: CPU tensors, non-bf16 activations, unsupported geometry."""
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import pack_qk_norm_rope_table
 
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     cos, sin = torch.randn(16, 64), torch.randn(16, 64)  # CPU
-    assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, min_tokens=0) is None
+    assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16) is None
     if torch.cuda.is_available() and HAS_TRITON:
         cos, sin = cos.cuda(), sin.cuda()
-        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float16, min_tokens=0) is None
-        assert (
-            pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float32, min_tokens=0, activation_dtype=torch.float16)
-            is None
-        )
-        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, min_tokens=0, head_dim=512) is None  # > 256
-        table = pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, min_tokens=0)
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float16) is None
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float32, activation_dtype=torch.float16) is None
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, head_dim=512) is None  # > 256
+        table = pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16)
         assert table is not None and table.shape == (32, 128) and table.dtype == torch.bfloat16
         # fp32 table for bf16 activations (Qwen-Image style) is allowed
-        assert (
-            pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float32, min_tokens=0, activation_dtype=torch.bfloat16)
-            is not None
-        )
-
-
-def test_pack_qk_norm_rope_table_token_gate_boundary(monkeypatch):
-    """``None`` strictly below the resolved token gate, a table at and above
-    it; the env override wins over the consumer default. CPU-only: the
-    device/dtype check is stubbed so only the gate decides."""
-    from vllm_omni.diffusion.layers import fused_qk_norm_rope as mod
-
-    monkeypatch.setattr(mod, "fused_qk_norm_rope_available", lambda *a, **k: True)
-    env = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
-    monkeypatch.delenv(env, raising=False)
-    cos, sin = torch.randn(8, 4), torch.randn(8, 4)  # S=8, rotary_dim=8
-    batch = 2  # 16 tokens
-
-    assert mod.pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16, min_tokens=17) is None
-    table = mod.pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16, min_tokens=16)
-    assert table is not None and table.shape == (16, 8) and table.dtype == torch.bfloat16
-    assert torch.equal(table.view(batch, 8, 8)[1], torch.cat((cos, sin), dim=-1).to(torch.bfloat16))
-    assert mod.pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16, min_tokens=0) is not None
-
-    monkeypatch.setenv(env, "17")  # env override: consumer default 0 no longer fuses
-    assert mod.pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16, min_tokens=0) is None
-    monkeypatch.setenv(env, "0")  # env override: consumer default 1000 fuses
-    assert mod.pack_qk_norm_rope_table(cos, sin, batch, dtype=torch.bfloat16, min_tokens=1000) is not None
+        assert pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.float32, activation_dtype=torch.bfloat16) is not None
 
 
 def test_pack_qk_norm_rope_table_skips_under_sequence_parallel(monkeypatch):
@@ -398,19 +391,13 @@ def test_pack_qk_norm_rope_table_skips_under_sequence_parallel(monkeypatch):
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as mod
 
     monkeypatch.setattr(mod, "fused_qk_norm_rope_available", lambda *a, **k: True)
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     cos, sin = torch.randn(8, 4), torch.randn(8, 4)
 
     for sp_size in (2, 8):
-        assert (
-            mod.pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, min_tokens=0, sequence_parallel_size=sp_size)
-            is None
-        )
+        assert mod.pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, sequence_parallel_size=sp_size) is None
     for inactive_sp_size in (None, 0, 1):
         assert (
-            mod.pack_qk_norm_rope_table(
-                cos, sin, 1, dtype=torch.bfloat16, min_tokens=0, sequence_parallel_size=inactive_sp_size
-            )
+            mod.pack_qk_norm_rope_table(cos, sin, 1, dtype=torch.bfloat16, sequence_parallel_size=inactive_sp_size)
             is not None
         )
 
@@ -474,22 +461,18 @@ def test_fused_ops_bitwise_under_torch_compile_and_cuda_graph():
 
 def test_pack_qk_norm_rope_table_identity_rows(monkeypatch):
     """``identity_rows`` appends ``cos = 1, sin = 0`` rows after the rotated
-    rows (per batch element) and counts toward the token gate."""
+    rows (per batch element)."""
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as mod
 
     monkeypatch.setattr(mod, "fused_qk_norm_rope_available", lambda *a, **k: True)
-    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
     cos, sin = torch.randn(5, 4), torch.randn(5, 4)
-    table = mod.pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, min_tokens=0, identity_rows=3)
+    table = mod.pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, identity_rows=3)
     assert table is not None and table.shape == (2 * 8, 8) and table.dtype == torch.bfloat16
     per_batch = table.view(2, 8, 8)
     assert torch.equal(per_batch[0], per_batch[1])
     assert torch.equal(per_batch[0, :5], torch.cat((cos, sin), dim=-1).to(torch.bfloat16))
     assert torch.equal(per_batch[0, 5:, :4], torch.ones(3, 4, dtype=torch.bfloat16))
     assert torch.equal(per_batch[0, 5:, 4:], torch.zeros(3, 4, dtype=torch.bfloat16))
-    # Identity rows count toward the gate: 2 * (5 + 3) = 16 tokens.
-    assert mod.pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, min_tokens=17, identity_rows=3) is None
-    assert mod.pack_qk_norm_rope_table(cos, sin, 2, dtype=torch.bfloat16, min_tokens=16, identity_rows=3) is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
