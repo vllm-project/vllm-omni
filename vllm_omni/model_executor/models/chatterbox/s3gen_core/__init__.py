@@ -12,8 +12,10 @@ docstrings and plain torch operations in place of einops). Unused flow
 configuration fields and overridden base flow methods were removed, and so
 was everything the checkpoint never reaches: the layer registries and the
 variants they would select, the non-causal and multi-level decoder blocks,
-and upstream's reference ``inference`` path. The reference x-vector model
-(3D-Speaker's CAMPPlus) is IndexTTS2's, imported by ``conditioning``.
+and upstream's reference ``inference`` path. The U-Net's transformer block
+and timestep embedding are diffusers' own, which Matcha-TTS had copied, and
+the reference x-vector model (3D-Speaker's CAMPPlus) is IndexTTS2's,
+imported by ``conditioning``.
 Numeric parity against the source package, not textual closeness, is what
 is checked.
 """

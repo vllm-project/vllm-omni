@@ -16,15 +16,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.models.attention import BasicTransformerBlock
+from diffusers.models.embeddings import TimestepEmbedding
 
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.intmeanflow import get_intmeanflow_time_mixer
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_decoder import (
     Block1D,
     ResnetBlock1D,
     SinusoidalPosEmb,
-    TimestepEmbedding,
 )
-from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_transformer import BasicTransformerBlock
 
 
 def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
