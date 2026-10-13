@@ -196,6 +196,16 @@ def test_wan_extractor_preserves_pipeline_stage_boundaries(monkeypatch):
     assert isinstance(non_first.postprocess(non_first_output), IntermediateTensors)
 
 
+def test_wan_extractor_requires_intermediate_tensors_on_non_first_pp_stage(monkeypatch):
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: False, raising=False)
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: False, raising=False)
+    model = _make_wan_model()
+    hidden_states = torch.zeros(1, 2, 1, 4, 6, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="intermediate_tensors must be provided for non-first PP stages"):
+        extract_wan2_2_context(model, hidden_states, torch.tensor([1]), torch.zeros(1, 3, 4))
+
+
 def test_wan_extractor_uses_native_sp_padding_mask_and_block_arguments(monkeypatch):
     monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: True, raising=False)
     monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: True, raising=False)
@@ -220,6 +230,29 @@ def test_wan_extractor_uses_native_sp_padding_mask_and_block_arguments(monkeypat
     assert args[4] is padding_mask
     assert args[5] == (1, 2, 3)
     assert args[6] is False
+
+
+def test_wan_extractor_omits_all_true_sp_padding_mask(monkeypatch):
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_first_stage", lambda: True, raising=False)
+    monkeypatch.setattr(teacache_extractors, "is_pipeline_last_stage", lambda: True, raising=False)
+    parallel_config = SimpleNamespace(sequence_parallel_size=2, mask_sp_padding=True)
+    monkeypatch.setattr(
+        teacache_extractors,
+        "get_forward_context",
+        lambda: SimpleNamespace(omni_diffusion_config=SimpleNamespace(parallel_config=parallel_config)),
+    )
+    monkeypatch.setattr(
+        teacache_extractors,
+        "build_local_sp_padding_mask",
+        Mock(return_value=torch.ones(1, 6, dtype=torch.bool)),
+        raising=False,
+    )
+    model = _make_wan_model()
+    hidden_states = torch.zeros(1, 2, 1, 4, 6, dtype=torch.bfloat16)
+    context = extract_wan2_2_context(model, hidden_states, torch.tensor([1]), torch.zeros(1, 3, 4))
+    context.run_transformer_blocks()
+
+    assert model.blocks[0].call_args.args[4] is None
 
 
 def test_wan_extractor_preserves_vsa_grid_and_all_blocks_setting(monkeypatch):
