@@ -42,6 +42,7 @@ recipes/
 
 | Recipe | Task | Hardware |
 | -------- | ------ | ---------- |
+| [`ACVLab/ABot-World.md`](./ACVLab/ABot-World.md) | Offline, typed realtime, and stepwise generation | 1x NVIDIA H200 (measured) |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
 | [`black-forest-labs/FLUX.1-schnell.md`](./black-forest-labs/FLUX.1-schnell.md) | Offline text-to-image generation with CPU offload | 1x NVIDIA GeForce RTX 5090 32GB |
