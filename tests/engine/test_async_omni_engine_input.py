@@ -52,8 +52,9 @@ def original_admission_prompt(weight: float) -> dict:
     return build_prompt([12, 13, 14], voice, ChatterboxConfig("original"), cfg_weight=weight)
 
 
-# Guided requests finish at the audio stage; stage-0-only requests are unguided.
-@pytest.mark.parametrize("weight,final_stage_id", [(0.0, 0), (0.0, 1), (0.5, 1)])
+# A guided request gets its companion whatever stage it ends at: the atomic
+# CFG scheduler admits a cfg_group member only together with its twin.
+@pytest.mark.parametrize("weight,final_stage_id", [(0.0, 0), (0.0, 1), (0.5, 0), (0.5, 1)])
 @pytest.mark.parametrize("max_tokens", [None, 4096])
 def test_original_offline_admission_preserves_supported_budget(
     original_admission_engine, weight, final_stage_id, max_tokens
@@ -79,7 +80,8 @@ def test_original_offline_admission_preserves_supported_budget(
         assert companion.companion_id == "original__cfg_uncond"
 
 
-def test_stage0_only_does_not_expand_downstream_cfg(mocker: MockerFixture, original_admission_engine):
+def test_unguided_stage0_only_request_is_not_expanded(mocker: MockerFixture, original_admission_engine):
+    """Without a cfg_group the stage-0-only gate still keeps the expansion hook idle."""
     engine = original_admission_engine
     engine.prompt_expand_func = mocker.Mock(side_effect=AssertionError("downstream CFG must stay idle"))
     engine.add_request("plain", original_admission_prompt(0.0), final_stage_id=0)
