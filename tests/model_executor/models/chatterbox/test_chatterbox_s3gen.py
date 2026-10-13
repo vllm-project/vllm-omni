@@ -729,8 +729,8 @@ def test_profile_with_64_slots_skips_neural_decode(decoder, monkeypatch):
     [
         ("chatterbox", 128, ""),
         ("chatterbox_turbo", 64, ""),
-        ("chatterbox", 128, "_cuda"),
-        ("chatterbox_turbo", 64, "_cuda"),
+        ("chatterbox", 128, "_bf16_mps"),
+        ("chatterbox_turbo", 64, "_bf16_mps"),
     ],
 )
 def test_high_concurrency_profiles_admit_64_complete_requests(name, stage0_slots, suffix):

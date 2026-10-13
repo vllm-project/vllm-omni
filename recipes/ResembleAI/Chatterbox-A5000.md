@@ -39,7 +39,7 @@ GPU holds only the two model stages.
 | --- | --- |
 | `chatterbox_turbo.yaml` (default): BF16 T3 with CUDA graphs, FP32 eager S3Gen, 8 AR slots, Model Runner V2 | runtime-qualified, both runners and both handoff modes |
 | `chatterbox.yaml` (default Original): the same with the Llama T3 and paired classifier-free guidance (two AR slots per guided request) | runtime-qualified offline and at 64 WebSocket sessions with a 128-token cap |
-| `*_high_concurrency.yaml` and `*_high_concurrency_cuda.yaml` (64 requests, GPU conditioning, BF16 flow) | configuration-only here; qualified in the [H100 recipe](Chatterbox-H100.md) |
+| `*_high_concurrency.yaml` and `*_high_concurrency_bf16_mps.yaml` (64 requests, GPU conditioning, BF16 flow) | configuration-only here; qualified in the [H100 recipe](Chatterbox-H100.md) |
 
 ## References
 

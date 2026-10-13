@@ -13,7 +13,7 @@
 
 One 80 GB card serving many concurrent streams: the `*_high_concurrency`
 profiles admit 64 requests, condition references on the GPU, and the
-`*_cuda` overlays add BF16 flow, native cuDNN attention and CUDA MPS. This
+`*_bf16_mps` overlays add BF16 flow, native cuDNN attention and CUDA MPS. This
 recipe also holds the comparison with the canonical upstream implementation.
 
 ## Supported model contract
@@ -26,7 +26,7 @@ and the [A5000 recipe](Chatterbox-A5000.md#supported-model-contract).
 | --- | --- |
 | `chatterbox_turbo.yaml`, `chatterbox.yaml` (default: 8 AR slots, CPU conditioning) | runtime-qualified; nightly latency and throughput baselines below |
 | `chatterbox_turbo_high_concurrency.yaml`, `chatterbox_high_concurrency.yaml` (64 requests, `conditioning_device: cuda:0`) | runtime-qualified at 64 HTTP clients |
-| `chatterbox_turbo_high_concurrency_cuda.yaml`, `chatterbox_high_concurrency_cuda.yaml` (BF16 flow, cuDNN attention, MPS; Original starts with 30-token chunks) | runtime-qualified at 64 HTTP clients; Original is not real-time there |
+| `chatterbox_turbo_high_concurrency_bf16_mps.yaml`, `chatterbox_high_concurrency_bf16_mps.yaml` (BF16 flow, cuDNN attention, MPS; Original starts with 30-token chunks) | runtime-qualified at 64 HTTP clients; Original is not real-time there |
 
 Admission at 64 is a capacity contract, not a real-time guarantee: see the
 evidence below for where each model keeps up with playback.
@@ -68,12 +68,12 @@ NumPy 1.26.4, Transformers 5.2.0, Diffusers 0.29.0, Perth
 ```bash
 uv pip install -e '.[chatterbox]'
 vllm serve ResembleAI/chatterbox-turbo --omni --port 8091 \
-  --deploy-config vllm_omni/deploy/chatterbox_turbo_high_concurrency_cuda.yaml
+  --deploy-config vllm_omni/deploy/chatterbox_turbo_high_concurrency_bf16_mps.yaml
 # Original: vllm serve ResembleAI/chatterbox --omni --port 8091 \
-#   --deploy-config vllm_omni/deploy/chatterbox_high_concurrency_cuda.yaml
+#   --deploy-config vllm_omni/deploy/chatterbox_high_concurrency_bf16_mps.yaml
 ```
 
-The `_cuda` overlays need `nvidia-cuda-mps-control` on `PATH`. Without MPS
+The `_bf16_mps` overlays need `nvidia-cuda-mps-control` on `PATH`. Without MPS
 or BF16 flow, use the `*_high_concurrency.yaml` profiles instead.
 
 Load with the shared driver (`ResembleAI/chatterbox` for Original):
