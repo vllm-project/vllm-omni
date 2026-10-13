@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+from vllm import envs as vllm_envs
+from vllm import ir
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
@@ -345,11 +347,16 @@ class ZImageAttention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        # Fused RMSNorm + RoPE in one launch when the forward supplied the
-        # packed table and the CUDA kernel accepts the geometry; otherwise
-        # the original eager chain.
-        if qk_norm_rope_table is not None and _fused_cuda_supported(
-            query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
+        # Compiled RMSNorm has a different reduction order from the CUDA provider.
+        if (
+            qk_norm_rope_table is not None
+            and not torch.compiler.is_compiling()
+            and not vllm_envs.VLLM_BATCH_INVARIANT
+            and self.head_dim == qk_norm_rope_table.shape[-1] == 128
+            and self.norm_q.weight.dtype == self.norm_k.weight.dtype == torch.bfloat16
+            and _fused_cuda_supported(query, key, self.head_dim, 128, interleaved=True)
+            and ir.ops.rms_norm.dispatch(query, self.norm_q.weight, self.norm_q.variance_epsilon, None).provider
+            == "vllm_c"
         ):
             batch_size, seq_len, num_heads, head_dim = query.shape
             num_kv_heads = key.shape[2]
@@ -361,6 +368,7 @@ class ZImageAttention(nn.Module):
                 qk_norm_rope_table,
                 self.norm_q.variance_epsilon,
                 interleaved=True,
+                cuda_rms_norm=True,
             )
             query = query.view(batch_size, seq_len, num_heads, head_dim)
             key = key.view(batch_size, seq_len, num_kv_heads, head_dim)
@@ -624,16 +632,16 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
-# Preserve eager numerics by default; set VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS=0 to opt in.
-_FUSED_MIN_TOKENS = 2**63 - 1
-
-
 def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
     """Repeat cos[0]/sin[0] for all batches, matching RotaryEmbedding.
 
     Sequence-parallel inputs already contain this rank's shard.
     """
-    return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype, min_tokens=_FUSED_MIN_TOKENS)
+    if is_forward_context_available():
+        config = get_forward_context().omni_diffusion_config
+        if config is not None and not config.enforce_eager:
+            return None
+    return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype)
 
 
 class ZImageTransformer2DModel(CachedTransformer):

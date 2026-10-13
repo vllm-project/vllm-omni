@@ -196,6 +196,7 @@ if HAS_TRITON:
         rotary_half: tl.constexpr,
         eps: tl.constexpr,
         interleaved: tl.constexpr,
+        cuda_rms_norm: tl.constexpr = False,
     ):
         """One ``[heads_per_program, padded_dim]`` RMSNorm + RoPE tile.
 
@@ -207,7 +208,28 @@ if HAS_TRITON:
         offsets = in_row * in_stride_t + heads[:, None] * in_stride_h + dims[None, :] * in_stride_d
         x = tl.load(in_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         weight = tl.load(weight_ptr + dims, mask=dim_mask, other=0.0).to(tl.float32)
-        inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
+        if cuda_rms_norm:
+            # Match vLLM CUDA's vector accumulation and ordered lane reduction.
+            tl.static_assert(head_dim == 128 and rotary_half == 64 and interleaved)
+            hpp: tl.constexpr = heads.shape[0]
+            groups = tl.arange(0, 16)
+            head_mask = tl.gather(mask, tl.full((hpp, 1), 0, tl.int32), axis=1)
+            row = in_row * in_stride_t + heads[:, None] * in_stride_h
+            acc = tl.full((hpp, 16), 0, tl.float32)
+            for element in tl.static_range(8):
+                xv = tl.load(
+                    in_ptr + row + (groups * 8 + element)[None, :] * in_stride_d, mask=head_mask, other=0.0
+                ).to(tl.float32)
+                acc = tl.fma(xv, xv, acc)
+            for step in tl.static_range(4):
+                distance = 1 << step
+                indices = tl.broadcast_to(((groups + distance) & 15)[None, :], (hpp, 16))
+                other = tl.gather(acc, indices, axis=1)
+                acc = tl.where((groups + distance)[None, :] < 16, acc + other, acc)
+            total = tl.sum(tl.where(groups[None, :] == 0, acc, 0.0), axis=1)
+            inv_rms = tl.rsqrt(total / head_dim + eps)
+        else:
+            inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
         normalized = (x * inv_rms[:, None] * weight[None, :]).to(tl.bfloat16)
 
         rotary_dim = rotary_half * 2
@@ -275,6 +297,7 @@ if HAS_TRITON:
         heads_per_program: tl.constexpr,
         q_head_groups: tl.constexpr,
         interleaved: tl.constexpr,
+        cuda_rms_norm: tl.constexpr = False,
     ):
         """Fused per-head RMSNorm + RoPE for Q and K in one launch.
 
@@ -348,6 +371,7 @@ if HAS_TRITON:
             rotary_half,
             eps,
             interleaved,
+            cuda_rms_norm,
         )
 
     @triton.jit
@@ -693,6 +717,7 @@ def _launch_fused_qk_norm_rope(
     rope_table: torch.Tensor,
     eps: float,
     interleaved: bool,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens, q_heads, head_dim = q.shape
     kv_heads = k.shape[1]
@@ -744,6 +769,8 @@ def _launch_fused_qk_norm_rope(
         interleaved=interleaved,
         num_warps=num_warps,
         num_stages=num_stages,
+        cuda_rms_norm=cuda_rms_norm,
+        enable_fp_fusion=not cuda_rms_norm,
     )
     return out_q, out_k
 
@@ -758,6 +785,7 @@ def _fused_qk_norm_rope_impl(
     head_dim: int,
     rotary_dim: int,
     interleaved: bool,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if _fused_npu_supported(q, k, head_dim, rotary_dim, interleaved):
         return _npu_qk_norm_rope(
@@ -782,7 +810,9 @@ def _fused_qk_norm_rope_impl(
             interleaved,
         )
     if interleaved:
-        return _launch_fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, eps, interleaved=True)
+        return _launch_fused_qk_norm_rope(
+            q, k, q_weight, k_weight, rope_table, eps, interleaved=True, cuda_rms_norm=cuda_rms_norm
+        )
     # Half-split production traffic keeps the historical per-tensor kernel;
     # _qk_norm_rope_kernel's half-split mode awaits the maintainers' call.
     return (
@@ -801,8 +831,9 @@ def _fused_qk_norm_rope_fake(
     head_dim: int,
     rotary_dim: int,
     interleaved: bool,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del q_weight, k_weight, rope_table, eps, head_dim, rotary_dim, interleaved
+    del q_weight, k_weight, rope_table, eps, head_dim, rotary_dim, interleaved, cuda_rms_norm
     return torch.empty_like(q), torch.empty_like(k)
 
 
@@ -1088,23 +1119,7 @@ _MIN_TOKENS_ENV = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
 
 
 def fused_qk_norm_rope_min_tokens(default: int) -> int:
-    """Token span below which a consumer should keep its eager chain.
-
-    Taking the fused path costs a fixed amount of host time per call (the
-    custom-op dispatch into the Python impl and the Triton launcher), while the
-    GPU time it saves grows with the number of tokens the call covers. Below a
-    host- and stack-dependent crossover a call is host-bound and the fused path
-    can cost more end-to-end than it saves; above it the fused path wins.
-    Consumers pass the default they measured on their reference hardware
-    (Boogu-Image: 2048 tokens on one H200) and a deployment on other hardware
-    overrides it once, for every consumer, through
-    ``VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS`` (``0`` = always fuse).
-
-    Resolved at call time — consumers call this once per forward, not per
-    attention site — so tests and operators can flip it without re-importing.
-    Unset or blank means the caller's default; anything else that is not a
-    non-negative integer raises ``ValueError``.
-    """
+    """Resolve a per-stream token threshold, using the caller's default when unset."""
     raw = envs.VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS
     if raw is None or not raw.strip():
         return default
@@ -1123,26 +1138,17 @@ def pack_qk_norm_rope_table(
     batch_size: int,
     *,
     dtype: torch.dtype,
-    min_tokens: int,
     activation_dtype: torch.dtype | None = None,
     head_dim: int | None = None,
     sequence_parallel_size: int | None = None,
     identity_rows: int = 0,
 ) -> torch.Tensor | None:
-    """Pack theta-width ``cos``/``sin`` ``[S, D/2]`` (shared by the batch) into
-    the ``[B*S, D] = [cos | sin]`` table the fused ops index by flattened
-    token, in ``dtype``. ``identity_rows`` extra rows with the identity
-    rotation (``cos = 1``, ``sin = 0``, applied exactly by the kernels) are
-    appended after the ``S`` rotated rows, for a trailing stream whose tokens
-    are normalised but not rotated (HunyuanVideo's text tokens); ``S`` then
-    counts ``S + identity_rows`` positions. Returns ``None`` — so every
-    attention site keeps its eager chain for that forward and nothing is
-    allocated — when the fused CUDA kernel would not run for activations of
-    ``activation_dtype`` (defaults to ``dtype``) on this device/geometry, when
-    ``B*S`` is below the consumer's token gate
-    (``fused_qk_norm_rope_min_tokens(min_tokens)``), or under sequence
-    parallelism (``sequence_parallel_size > 1``: RoPE is then applied per
-    stream/shard and the consumer keeps its eager chain)."""
+    """Pack shared ``[S, D/2]`` coefficients into a ``[B*S, D]`` table.
+
+    Append identity rotations for trailing unrotated tokens, then repeat
+    the table per batch. Return ``None`` for unsupported CUDA inputs or
+    sequence parallelism, where attention keeps its per-stream path.
+    """
     if sequence_parallel_size is not None and sequence_parallel_size > 1:
         return None
     rotary_dim = 2 * cos.shape[-1]
@@ -1151,8 +1157,6 @@ def pack_qk_norm_rope_table(
     ):
         return None
     tokens = batch_size * (cos.shape[0] + identity_rows)
-    if tokens < fused_qk_norm_rope_min_tokens(min_tokens):
-        return None
     table = torch.cat((cos, sin), dim=-1).to(dtype)
     if identity_rows:
         half = cos.shape[-1]
@@ -1174,8 +1178,13 @@ def fused_qk_norm_rope(
     head_dim: int | None = None,
     rotary_dim: int | None = None,
     interleaved: bool = False,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply Q/K RMSNorm and packed RoPE (half-split or adjacent pairs)."""
+    """Apply Q/K RMSNorm and packed RoPE (half-split or adjacent pairs).
+
+    ``cuda_rms_norm`` preserves the CUDA RMSNorm reduction for BF16 D=128
+    followed by eager interleaved RoPE.
+    """
     if q.ndim != 3 or k.ndim != 3:
         raise ValueError(f"q and k must be [tokens, heads, head_dim], got {q.shape} and {k.shape}")
     if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
@@ -1202,6 +1211,12 @@ def fused_qk_norm_rope(
         raise ValueError("rope_table must be on q/k's device with their dtype or float32")
     if rope_table.shape != (q.shape[0], rotary_dim):
         raise ValueError(f"Expected rope_table [{q.shape[0]}, {rotary_dim}], got {tuple(rope_table.shape)}")
+    if cuda_rms_norm and not (
+        _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved)
+        and head_dim == rotary_dim == 128
+        and q_weight.dtype == k_weight.dtype == torch.bfloat16
+    ):
+        raise ValueError("cuda_rms_norm requires BF16 CUDA inputs/weights and interleaved head_dim=rotary_dim=128")
 
     q_weight = q_weight.contiguous()
     k_weight = k_weight.contiguous()
@@ -1227,6 +1242,7 @@ def fused_qk_norm_rope(
             head_dim,
             rotary_dim,
             interleaved,
+            cuda_rms_norm,
         )
     return torch.ops.vllm_omni.fused_qk_norm_rope(
         q,
@@ -1238,6 +1254,7 @@ def fused_qk_norm_rope(
         head_dim,
         rotary_dim,
         interleaved,
+        cuda_rms_norm,
     )
 
 

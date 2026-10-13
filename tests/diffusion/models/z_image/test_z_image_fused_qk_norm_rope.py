@@ -24,55 +24,53 @@ def _dist_env():
         initialize_model_parallel,
     )
 
+    from vllm_omni.platforms import current_omni_platform
+
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29519")
-    with set_current_vllm_config(VllmConfig()):
+    config = VllmConfig()
+    with (
+        set_current_vllm_config(config),
+        current_omni_platform.get_default_ir_op_priority(config).set_priority(),
+    ):
         init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
         initialize_model_parallel()
         yield
         cleanup_dist_env_and_memory()
 
 
-def test_packed_table_skipped_on_cpu(monkeypatch):
+def test_packed_table_skipped_on_cpu():
     from vllm_omni.diffusion.models.z_image.z_image_transformer import _packed_qk_norm_rope_table
 
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     cos, sin = torch.randn(3, 20, _HEAD_DIM // 2), torch.randn(3, 20, _HEAD_DIM // 2)
     assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_packed_table_uses_row_zero_like_rotary_embedding(monkeypatch):
+def test_packed_table_uses_row_zero_like_rotary_embedding():
     from vllm_omni.diffusion.models.z_image.z_image_transformer import _packed_qk_norm_rope_table
 
-    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
     cos, sin = torch.randn(3, 20, _HEAD_DIM // 2, device="cuda"), torch.randn(3, 20, _HEAD_DIM // 2, device="cuda")
-    assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     table = _packed_qk_norm_rope_table(cos, sin, torch.bfloat16)
     assert table.shape == (60, _HEAD_DIM) and table.dtype == torch.bfloat16
     expected = torch.cat((cos[0], sin[0]), dim=-1).to(torch.bfloat16)
     assert torch.equal(table, expected.repeat(3, 1))
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "1000000")
-    assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     assert _packed_qk_norm_rope_table(cos, sin, torch.float16) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_packed_table_is_built_under_sequence_parallelism(monkeypatch):
+def test_packed_table_is_built_under_sequence_parallelism():
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.forward_context import set_forward_context
     from vllm_omni.diffusion.models.z_image.z_image_transformer import _packed_qk_norm_rope_table
 
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
     shard = 10
     cos = torch.randn(3, shard, _HEAD_DIM // 2, device="cuda")
     sin = torch.randn(3, shard, _HEAD_DIM // 2, device="cuda")
 
-    od_config = OmniDiffusionConfig(model=None, parallel_config={"ulysses_degree": 2})
+    od_config = OmniDiffusionConfig(model=None, enforce_eager=True, parallel_config={"ulysses_degree": 2})
     assert od_config.parallel_config.sequence_parallel_size == 2
     with set_forward_context(omni_diffusion_config=od_config):
         table = _packed_qk_norm_rope_table(cos, sin, torch.bfloat16)
@@ -80,17 +78,21 @@ def test_packed_table_is_built_under_sequence_parallelism(monkeypatch):
     assert table is not None and table.shape == (3 * shard, _HEAD_DIM)
     expected = torch.cat((cos[0], sin[0]), dim=-1).to(torch.bfloat16)
     assert torch.equal(table, expected.repeat(3, 1))
+    od_config.enforce_eager = False
+    with set_forward_context(omni_diffusion_config=od_config):
+        assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_z_image_attention_fused_matches_eager(_dist_env, monkeypatch):
-    from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageAttention, _packed_qk_norm_rope_table
+@pytest.mark.parametrize("compiled", [False, True])
+def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
+    from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image
 
-    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", "0")
+    fused_op = mocker.spy(z_image, "fused_qk_norm_rope")
     torch.manual_seed(3)
     with torch.device("cuda"):
-        attn = ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
+        attn = z_image.ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
     attn = attn.to(torch.bfloat16).eval()
     with torch.no_grad():
         for p in attn.parameters():
@@ -102,9 +104,12 @@ def test_z_image_attention_fused_matches_eager(_dist_env, monkeypatch):
     angles = torch.randn(batch, seq, _HEAD_DIM // 2, device="cuda")
     cos, sin = torch.cos(angles), torch.sin(angles)
     mask = torch.ones(batch, seq, dtype=torch.bool, device="cuda")
-    table = _packed_qk_norm_rope_table(cos, sin, torch.bfloat16)
+    table = z_image._packed_qk_norm_rope_table(cos, sin, torch.bfloat16)
 
+    if compiled:
+        attn = torch.compile(attn, fullgraph=True)
     with torch.no_grad():
         eager = attn(hidden, mask, cos, sin)
         fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
-    torch.testing.assert_close(fused, eager, atol=0.05, rtol=0.05)
+    assert torch.equal(fused, eager)
+    assert fused_op.call_count == (0 if compiled else 1)
