@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Play Chatterbox PCM deltas through Gradio's native streaming audio player."""
+"""Play a speech server's streamed PCM through Gradio's native streaming audio player."""
 
 import argparse
 import io
@@ -11,33 +11,44 @@ import numpy as np
 import pybase64
 import soundfile as sf
 
-SAMPLE_RATE = 24000
-
 
 def main():
-    """Connect the browser player to an existing Chatterbox speech server."""
+    """Connect the browser player to a running ``/v1/audio/speech`` server."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-base", default="http://127.0.0.1:8091")
+    parser.add_argument("--model", default=None, help="Served model id; omitted for a single-model server")
+    parser.add_argument("--voice", default="default", help="Voice name the server accepts")
+    parser.add_argument("--sample-rate", type=int, default=24000, help="PCM sample rate of the served model")
     args = parser.parse_args()
-    with gr.Blocks(title="Chatterbox speech") as demo:
-        gr.Markdown("# Chatterbox Turbo / Original\nEnglish speech; optional reference, no transcript.")
+    with gr.Blocks(title="Speech streaming player") as demo:
+        gr.Markdown(
+            "# Speech streaming player\nPlays PCM as the server streams it; a reference upload clones that voice."
+        )
         api = gr.Textbox(value=args.api_base, label="Speech server URL")
-        text = gr.Textbox(value="Hello, this is Chatterbox speaking.", label="Text")
+        text = gr.Textbox(value="Hello, this is a streamed sentence.", label="Text")
         reference = gr.Audio(type="filepath", label="Reference voice (optional)")
         audio = gr.Audio(streaming=True, autoplay=True, label="Generated speech")
-        gr.Button("Speak").click(stream_speech, [api, text, reference], audio)
+        gr.Button("Speak").click(
+            lambda api_base, text, reference: stream_speech(
+                api_base, text, reference, model=args.model, voice=args.voice, sample_rate=args.sample_rate
+            ),
+            [api, text, reference],
+            audio,
+        )
     demo.launch()
 
 
-def stream_speech(api_base: str, text: str, reference: str | None):
+def stream_speech(api_base: str, text: str, reference: str | None, *, model: str | None, voice: str, sample_rate: int):
     """Yield independent WAV chunks without replaying previously received PCM."""
     payload = {
         "input": text,
-        "voice": "default",
+        "voice": voice,
         "stream": True,
         "stream_format": "audio",
         "response_format": "pcm",
     }
+    if model is not None:
+        payload["model"] = model
     if reference is not None:
         # Gradio's audio upload is a WAV file; use an inline URL for API access policy.
         waveform, rate = sf.read(reference, dtype="float32", always_2d=True)
@@ -47,10 +58,10 @@ def stream_speech(api_base: str, text: str, reference: str | None):
     with httpx.stream("POST", f"{api_base.rstrip('/')}/v1/audio/speech", json=payload, timeout=300.0) as response:
         response.raise_for_status()
         # Native Gradio playback benefits from consistent one-second chunks.
-        for chunk in response.iter_bytes(chunk_size=SAMPLE_RATE * 2):
+        for chunk in response.iter_bytes(chunk_size=sample_rate * 2):
             waveform = np.frombuffer(chunk, dtype="<i2")
             encoded = io.BytesIO()
-            sf.write(encoded, waveform, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+            sf.write(encoded, waveform, sample_rate, format="WAV", subtype="PCM_16")
             yield encoded.getvalue()
 
 

@@ -110,8 +110,8 @@ clients.
   (Original, 128 CFG sequences at 2048 tokens) of the card for stage 0 and
   15 % for stage 1; whole-device usage during the single-request comparison
   was about 32 GB including workers and the resident encoders.
-- Key flags: `conditioning_device: cuda:0` under stage 0 `hf_overrides` puts
-  the reference encoders on the GPU; `flow_dtype: bfloat16` with
+- Key flags: `conditioning_device: cuda:0` under stage 0 `additional_config`
+  puts the reference encoders on the GPU; `flow_dtype: bfloat16` with
   `flow_attention_backend: cudnn` under stage 1 `hf_overrides` selects the
   faster flow at the cost of numerically different audio (HiFT stays FP32);
   `cuda_mps: true` shares the device between the API process and the stages.

@@ -49,3 +49,13 @@ stages:
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

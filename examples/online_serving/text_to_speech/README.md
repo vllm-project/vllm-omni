@@ -49,15 +49,15 @@ Original uses the shared one-second minimum. Both expose WAV/PCM/MP3/FLAC
 non-streaming responses and PCM/WAV streaming. Original additionally accepts
 `extra_params: {exaggeration: 0.5, cfg_weight: 0.5}`; Turbo rejects those controls.
 
-For browser playback, install `vllm-omni[demo]` and run:
+For browser playback, install `vllm-omni[demo]` and run the shared
+[speech streaming player](../../../apps/tts_streaming_player/README.md):
 
 ```bash
-uv run apps/chatterbox/gradio_demo.py
+uv run apps/tts_streaming_player/gradio_demo.py --sample-rate 24000
 ```
 
-The demo streams PCM deltas into the browser audio player and accepts an optional
-reference upload. It does not sentence-segment long text; use the shared
-WebSocket speech frontend for long narration. Multilingual is unsupported.
+It does not sentence-segment long text; use the shared WebSocket speech
+frontend for long narration. Multilingual is unsupported.
 
 See the [A5000 recipe](../../../recipes/ResembleAI/Chatterbox-A5000.md) and
 [H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for profiles,
