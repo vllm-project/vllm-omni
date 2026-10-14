@@ -46,6 +46,9 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
 vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
     --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml
+
+# Chatterbox Turbo (built-in voice or one reference recording; `pip install 'vllm-omni[chatterbox]'`)
+vllm serve ResembleAI/chatterbox-turbo --omni --port 8091
 ```
 
 ### Generate Speech
