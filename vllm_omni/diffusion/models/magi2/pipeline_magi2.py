@@ -873,13 +873,14 @@ class Magi2Pipeline(
             yield refiner
 
     @contextmanager
-    def _conditioning_memory_window(self):
-        """Make room for the 27B text encoder on the output rank.
+    def _output_rank_memory_window(self):
+        """Make room on the output rank for the 27B text encoder or the video decode.
 
-        The text encoder and a resident Preview shard may not fit together on
-        the qualified devices.  Layerwise offloading already keeps the DiT on
-        the host; otherwise stage the output rank's shard to CPU for the two
-        prompt encodes and restore it before any model collective begins.
+        Neither fits next to a resident Preview shard on the qualified devices
+        (the 1080p decode also has the refiner resident).  Layerwise offloading
+        already keeps the DiT on the host; otherwise stage the output rank's
+        shard to CPU for the window and restore it before any model collective
+        begins.
         """
 
         stage_transformer = (
@@ -1114,7 +1115,7 @@ class Magi2Pipeline(
             "MAGI2_NEGATIVE_PROMPT",
             DEFAULT_NEGATIVE_PROMPT,
         )
-        with self._conditioning_memory_window():
+        with self._output_rank_memory_window():
             context, context_null = self._encode_prompts((prompt, negative_prompt))
             special = self._pool_figure_token(prompt, context) if ref_image_feat is not None else None
 
@@ -1190,7 +1191,8 @@ class Magi2Pipeline(
                 height=refiner_height,
                 num_inference_steps=refiner_num_inference_steps,
             )
-        video = self._decode_video(latent)
+        with self._output_rank_memory_window():
+            video = self._decode_video(latent)
         audio = self._decode_audio(audio_latent)
         return video, audio
 

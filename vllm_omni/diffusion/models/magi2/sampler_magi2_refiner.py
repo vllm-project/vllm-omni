@@ -34,7 +34,8 @@ def _zero_snr_sigmas(linear_start: float, linear_end: float, num_timesteps: int)
     # runs in float64 on the host and only the fp32 table leaves this function.
     betas = torch.linspace(linear_start**0.5, linear_end**0.5, num_timesteps, dtype=torch.float64, device="cpu") ** 2
     alphas_cumprod = np.cumprod(1.0 - betas.numpy(), axis=0)
-    sigmas = torch.tensor(alphas_cumprod, dtype=torch.float32, device="cpu").sqrt()
+    # numpy's fp32 sqrt is correctly rounded; some torch CPU builds are off by one ULP.
+    sigmas = torch.from_numpy(np.sqrt(alphas_cumprod.astype(np.float32)))
     first, last = sigmas[0].clone(), sigmas[-1].clone()
     # Rescale to zero terminal SNR; the factor is evaluated before the product.
     return (sigmas - last) * (first / (first - last))

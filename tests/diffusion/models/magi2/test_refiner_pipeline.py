@@ -443,7 +443,7 @@ def _install_runtime_fakes(pipe: Magi2Pipeline, state: _Runtime) -> Magi2Pipelin
     events = state.events
     pipe.device_str = "cpu"
     pipe.sampler = state.sampler
-    pipe._conditioning_memory_window = MethodType(lambda _self: contextlib.nullcontext(), pipe)
+    pipe._output_rank_memory_window = MethodType(lambda _self: contextlib.nullcontext(), pipe)
 
     def encode_prompts(_self, prompts):
         events.append("encode")

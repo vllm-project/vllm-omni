@@ -11,6 +11,8 @@ MagiCompiler and external Triton runtime dependencies.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -38,6 +40,31 @@ def swiglu7(
     return _swiglu7_op.forward_native(x, alpha, limit, out_dtype)
 
 
+# Eager row concatenations at or above this many output elements are copied group by group.
+_CAT_ROWS_MAX_NUMEL = 2**31
+
+
+def cat_rows(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Concatenate along dim 0 with the exact result of ``torch.cat(tensors, dim=0)``.
+
+    MUSA: ``torch.cat`` writes wrong values past 2**31 output elements, so a
+    concatenation that large copies each tensor into its rows of the output.
+    """
+
+    if (
+        torch.compiler.is_compiling()
+        or sum(t.numel() for t in tensors) < _CAT_ROWS_MAX_NUMEL
+        or any(t.dtype != tensors[0].dtype or t.device != tensors[0].device for t in tensors)
+    ):
+        return torch.cat(tensors, dim=0)
+    output = tensors[0].new_empty((sum(t.shape[0] for t in tensors), *tensors[0].shape[1:]))
+    start = 0
+    for tensor in tensors:
+        output.narrow(0, start, tensor.shape[0]).copy_(tensor)
+        start += tensor.shape[0]
+    return output
+
+
 class ModalityDispatcher:
     """Precompute stable modality grouping and inverse permutation metadata."""
 
@@ -60,7 +87,7 @@ class ModalityDispatcher:
 
     @staticmethod
     def undispatch(*groups: torch.Tensor) -> torch.Tensor:
-        return torch.cat(groups, dim=0)
+        return cat_rows(groups)
 
     def permute(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.index_select(0, self.permute_mapping)
@@ -196,7 +223,7 @@ class Magi2GroupedLinear(nn.Module):
                 F.linear(part, weight[index], None if linear_bias is None else linear_bias[index])
                 for index, part in enumerate(inputs)
             ]
-            output = torch.cat(outputs, dim=0)
+            output = cat_rows(outputs)
 
         if self.parallel_mode == "row" and self.tp_group.world_size > 1:
             dist.all_reduce(output, group=self.tp_group.group)
@@ -206,7 +233,7 @@ class Magi2GroupedLinear(nn.Module):
             else:
                 assert modality_dispatcher is not None
                 outputs = [part + bias[index] for index, part in enumerate(modality_dispatcher.dispatch(output))]
-                output = torch.cat(outputs, dim=0)
+                output = cat_rows(outputs)
         return output
 
 
