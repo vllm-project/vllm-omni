@@ -21,6 +21,7 @@ from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
+from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.utils.tracking_parser import TrackingNamespace
@@ -390,7 +391,6 @@ def _turn_based_realtime_app(handler: object | None, mocker) -> FastAPI:
 def _assert_openai_realtime_connection(client: TestClient, path: str) -> None:
     with client.websocket_connect(path) as websocket:
         assert websocket.receive_json()["type"] == "session.created"
-        assert websocket.receive_json()["type"] == "conversation.created"
         websocket.send_json({"type": "unknown_event"})
         error = websocket.receive_json()
         assert error["type"] == "error"
@@ -463,6 +463,19 @@ def test_turn_based_deployment_uses_openai_realtime(mocker) -> None:
         _assert_openai_realtime_connection(client, "/v1/realtime?model=omni-model")
 
 
+def test_turn_based_realtime_answers_session_update_with_session_updated(mocker) -> None:
+    """Clients send session.update right after session.created and expect session.updated next."""
+    app = _turn_based_realtime_app(None, mocker)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime?model=omni-model") as websocket:
+            assert websocket.receive_json()["type"] == "session.created"
+            websocket.send_json(
+                {"type": "session.update", "session": {"type": "realtime", "instructions": "Be brief."}}
+            )
+            assert websocket.receive_json()["type"] == "session.updated"
+
+
 # --------------------------------------------------------------------------- #
 # Startup warmup gate                                                         #
 # --------------------------------------------------------------------------- #
@@ -480,7 +493,7 @@ async def test_warmup_gate_holds_clients_until_the_warmup_session_finishes() -> 
     warmup_done = asyncio.Event()
     websocket = _warmup_websocket(warmup_done, {})
 
-    waiting = asyncio.create_task(api_server._wait_for_duplex_warmup(websocket))
+    waiting = asyncio.create_task(wait_for_duplex_warmup(websocket))
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(asyncio.shield(waiting), timeout=0.05)
 
@@ -500,7 +513,7 @@ async def test_warmup_gate_holds_clients_until_the_warmup_session_finishes() -> 
 async def test_warmup_gate_lets_the_warmup_connection_and_plain_servers_through(warmup_done, query) -> None:
     websocket = _warmup_websocket(warmup_done, query)
 
-    await asyncio.wait_for(api_server._wait_for_duplex_warmup(websocket), timeout=1.0)
+    await asyncio.wait_for(wait_for_duplex_warmup(websocket), timeout=1.0)
 
 
 @pytest.mark.asyncio

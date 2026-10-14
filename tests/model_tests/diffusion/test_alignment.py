@@ -50,6 +50,9 @@ EXCLUDED_MODELS = [
     "LTX2I2VDMD2Pipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
+    # Decoder-only stage consumes upstream latents; covered by H3 decoder
+    # handoff tests and real-checkpoint disaggregated E2E validation.
+    "MiniMaxH3DecoderPipeline",
     "StableAudioPipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
@@ -79,6 +82,9 @@ EXCLUDED_MODELS = [
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
+    # Requires camera/action assets and persistent AR state; covered by its
+    # dedicated CPU contract tests and manual real-checkpoint smoke tests instead.
+    "ABotWorldCausalPipeline",
     # The 270+ GiB multimodal checkpoint needs 4/8-way native sequence/head
     # parallel execution; covered by focused native contract and GPU tests.
     "Magi2Pipeline",

@@ -56,6 +56,47 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cosmos3_conditioning_with_encoder_fastpath(dtype):
+    from types import MethodType
+
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG, bits_equal
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install_wan_vae_encoder_fastpath
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    torch.manual_seed(7)
+    vae = OmniAutoencoderKLWan(**CONFIG).eval().to(dtype)
+    vae.register_to_config(latents_mean=[0.1, -0.2, 0.3, -0.4], latents_std=[0.5, 0.6, 0.7, 0.8])
+    pipeline = SimpleNamespace(
+        vae=vae,
+        dtype=dtype,
+        device=torch.device("cpu"),
+        vae_scale_factor_spatial=16,
+        sampling_dtype=Cosmos3OmniDiffusersPipeline.sampling_dtype,
+    )
+    for name in (
+        "_to_vae_device",
+        "_get_latents_mean_std",
+        "_normalize_vae_latent",
+        "_latent_hw_from_image_size",
+        "_crop_latent_to_image_size",
+    ):
+        setattr(pipeline, name, MethodType(getattr(Cosmos3OmniDiffusersPipeline, name), pipeline))
+    image = torch.rand(1, 3, 32, 32) * 2 - 1
+    video = torch.rand(1, 3, 5, 32, 32) * 2 - 1
+    encode_image = Cosmos3OmniDiffusersPipeline._encode_conditioning_image_latent
+    encode_video = Cosmos3OmniDiffusersPipeline._encode_video_tensor
+    expected_image = encode_image(pipeline, image)
+    expected_video = encode_video(pipeline, video, image_size=[32, 32, 16, 32])
+    assert install_wan_vae_encoder_fastpath(vae).installed
+    bits_equal(encode_image(pipeline, image), expected_image)
+    bits_equal(encode_video(pipeline, video, image_size=[32, 32, 16, 32]), expected_video)
+    assert expected_image.shape == (1, 4, 1, 2, 2)
+    assert expected_video.shape == (1, 4, 2, 1, 2)
+
+
 def test_component_selective_model_offload_fails_before_component_loading(monkeypatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 
@@ -325,6 +366,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "frame_rate": None,
         "resolved_frame_rate": None,
         "max_sequence_length": None,
+        "output_type": None,
         "extra_args": {},
     }
     values.update(overrides)
@@ -1068,7 +1110,7 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
             ),
         )
         output = pipeline.forward(request)
-        return output.output["video"]
+        return output.media.video.tensor
 
     first = run(123)
     second = run(123)
@@ -1376,6 +1418,29 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
     assert additional["transfer_input_fps"] == 12.5
     assert "preprocessed_video" not in additional
+
+
+def test_transfer_resize_antialiases_downscales_like_reference() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # One-pixel stripes shrunk 3x. The reference's torchvision resize (and the
+    # training loader) averages them; plain bilinear samples single columns,
+    # which would return the stripes as alternating 0 and 255.
+    stripes = torch.zeros(3, 2, 6, 18, dtype=torch.uint8)
+    stripes[..., 1::2] = 255
+    resized = transfer.resize_center_crop_uint8_cthw(stripes, 2, 6)
+    assert tuple(resized.shape) == (3, 2, 2, 6)
+    assert resized.min() >= 100 and resized.max() <= 155
+
+
+def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # Cropping 7 rows to 4 leaves 3. torchvision rounds the 1.5-row offset to 2,
+    # as for 1720x1080 fisheye inputs at 480p (43 spare rows, offset 22).
+    rows = torch.arange(0, 70, 10, dtype=torch.uint8).reshape(1, 1, 7, 1).expand(3, 1, 7, 4).contiguous()
+    cropped = transfer.resize_center_crop_uint8_cthw(rows, 4, 4)
+    assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
 
 
 def test_transfer_control_weight_validation_and_normalization() -> None:
@@ -2942,7 +3007,11 @@ class TestForwardRouting:
 
         output = pipeline.forward(make_request_batch(prompt, sampling_params))
 
-        assert expected["key"] in output.output
+        if expected["key"] == "video":
+            assert output.media is not None
+            assert output.output is None
+        else:
+            assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]

@@ -26,13 +26,22 @@ connectors:
       # A future initial_codec_chunk_frames shape will use lazy capture unless
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
+      # Capture batch-1 continuation/tail shapes without padding: with the
+      # 8-frame mel cache these codec widths cover 16-64 mel frames.
+      hift_graph_continuation_frames: [4, 28]
+      hift_graph_exact_batch_sizes: [1]
       enable_cfm_graph: true
-      # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to
-      # micro_batch_size, which defaults to Stage 2 max_num_seqs: all graphs
-      # share one attention-cache arena of that many requests (~0.6 GiB each
-      # in fp32, 10 GiB at 16). Larger batches replay micro-batches;
-      # B > max_graph_batch runs eager.
-      max_graph_batch: 16
+      # Small exact encoder batches share one arena; larger batches replay
+      # in groups, preserving cache lengths without batch padding.
+      enable_code2wav_encoder_graph: true
+      code2wav_encoder_graph_rows: 4
+      code2wav_encoder_max_graphs: 12
+      code2wav_encoder_capture_after: 8
+      # Admit C32 to Whole-Euler while reserving workspace for only four
+      # requests. Persistent request caches still scale with concurrency.
+      max_graph_batch: 32
+      micro_batch_size: 4
+      cfm_precapture_empty_cache: true
       cfm_max_graphs: 32
 
 stages:
@@ -127,16 +136,21 @@ platforms:
   npu:
     stages:
       - stage_id: 0
+        additional_config:
+          encoder_enable_npu_graph: true
+          encoder_max_npu_graphs: 4  # Per encoder (vision/audio).
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 1
+        # Match CUDA's fixed KV budget and leave headroom for Stage 2.
+        kv_cache_memory_bytes: 4294967296  # 4 GiB
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
       - stage_id: 2
-        # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
-        # estimator kernels through the NPU platform patch.
+        # Stage 2 stays outer-eager; CFM Whole-Euler, HiFT and encoder
+        # graphs use the shared Code2Wav wrappers with NPUGraph.
         additional_config:
           code2wav_enable_npu_graph: true
           code2wav_max_npu_graphs: 32

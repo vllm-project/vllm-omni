@@ -77,7 +77,6 @@ class _FakeTalker:
         self,
         text_token,
         last_agent,
-        prev_agent,
         device,
         user_d0=None,
         user_d1=None,
@@ -86,7 +85,6 @@ class _FakeTalker:
             {
                 "text_token": text_token.clone(),
                 "last_agent": None if last_agent is None else last_agent.clone(),
-                "prev_agent": None if prev_agent is None else prev_agent.clone(),
                 "user_d0": None if user_d0 is None else user_d0.clone(),
                 "user_d1": None if user_d1 is None else user_d1.clone(),
             }
@@ -221,7 +219,6 @@ def test_frame_embed_uses_previous_effective_agent_frame() -> None:
         fake_talker,
         torch.tensor([3]),
         last_agent,
-        torch.arange(8),
         torch.device("cpu"),
     )
 
@@ -257,20 +254,18 @@ def test_next_append_uses_prior_sample_and_causally_delayed_user_frame() -> None
     runtime.prepare_append(_duplex_info(seq=3), prompt_len=20, request_id="req")
 
     first_call = runtime.stage_model.frame_calls[0]
-    assert all(torch.equal(first_call[key], silence) for key in ("last_agent", "prev_agent"))
+    assert torch.equal(first_call["last_agent"], silence)
     assert all(torch.equal(first_call[key], sine) for key in ("user_d0", "user_d1"))
 
     second_call = runtime.stage_model.frame_calls[1]
     assert second_call["text_token"].tolist() == [101]
     assert torch.equal(second_call["last_agent"], expected_first_effective)
-    assert torch.equal(second_call["prev_agent"], expected_first_effective)
     assert torch.equal(second_call["user_d0"], torch.full((8,), 1, dtype=torch.long))
     assert torch.equal(second_call["user_d1"], sine)
 
     third_call = runtime.stage_model.frame_calls[2]
     assert third_call["text_token"].tolist() == [102]
     assert torch.equal(third_call["last_agent"], second_agent)
-    assert torch.equal(third_call["prev_agent"], second_agent)
     assert torch.equal(third_call["user_d0"], torch.full((8,), 2, dtype=torch.long))
     assert torch.equal(third_call["user_d1"], torch.full((8,), 1, dtype=torch.long))
 

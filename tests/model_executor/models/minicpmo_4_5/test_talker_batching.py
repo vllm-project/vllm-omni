@@ -295,12 +295,15 @@ def test_talker_sample_blanks_penalty_prompt_without_touching_runner_state(mocke
             captured["prompt"] = prompt
             return None
 
-    mocker.patch(
+    factory = mocker.patch(
         "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts.Sampler",
-        return_value=_Recorder(),
+        return_value=mocker.Mock(side_effect=_Recorder()),
     )
-    talker.sample(torch.zeros(1, 8), metadata)
+    for _ in range(2):
+        talker.sample(torch.zeros(1, 8), metadata)
 
+    factory.assert_called_once_with()
+    assert factory.return_value.call_count == 2
     assert captured["prompt"].tolist() == [[8, 8, 8]]
     assert metadata.prompt_token_ids is not None
     assert metadata.prompt_token_ids.tolist() == [[0, 2, 0]]
@@ -1147,7 +1150,8 @@ def test_native_duplex_rollover_matches_official_sliding_recompute(mocker) -> No
     assert build_condition.call_count == 3
 
 
-def test_native_duplex_condition_advance_without_rollover_updates_window_state(mocker) -> None:
+@pytest.mark.parametrize("mrv2", [False, True])
+def test_native_duplex_condition_advance_without_rollover_updates_window_state(mocker, mrv2) -> None:
     talker = _make_talker()
     talker.emb_text = nn.Embedding(1, 2)
     talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
@@ -1172,7 +1176,10 @@ def test_native_duplex_condition_advance_without_rollover_updates_window_state(m
     initial_state = talker._request_condition_states["req-history"]
     assert initial_state["condition_seq"] == 0
     assert torch.equal(initial_state["condition"], first_condition)
-    talker._request_audio_states["req-history"]["recent_codes"] = [1, 2, 3]
+    if not mrv2:
+        talker._request_audio_states["req-history"]["recent_codes"] = [1, 2, 3]
+    else:
+        common["ids"] = {"streaming_prompt_previous_codes": [1, 2, 3]}
 
     _, embeds, _ = talker.preprocess(
         torch.zeros(4, dtype=torch.long),
@@ -1201,6 +1208,7 @@ def test_native_duplex_condition_advance_without_rollover_updates_window_state(m
     assert torch.equal(retry_embeds, second_condition)
     assert talker._request_condition_states["req-history"]["base_recent_codes"] == (1, 2, 3)
 
+    common.pop("ids", None)
     previous_codes = [4, 5]
     expected_rollover = torch.cat(
         [
@@ -1372,3 +1380,103 @@ def test_turn_end_drain_masks_only_the_cadence_eos() -> None:
     )
     logits = talker.compute_logits(output.text_hidden_states)
     assert torch.isfinite(logits[0, 7])
+
+
+@pytest.mark.parametrize("aux_penalty", [None, "frequency", "presence"])
+def test_sample_skips_only_neutral_upstream_penalties(mocker, aux_penalty):
+    from vllm.sampling_params import SamplingParams
+
+    talker = _make_talker()
+    talker._penalty_histories = [torch.tensor([1, 1, 2])]
+    params = SamplingParams(
+        repetition_penalty=1.05,
+        frequency_penalty=0.2 if aux_penalty == "frequency" else 0,
+        presence_penalty=-0.2 if aux_penalty == "presence" else 0,
+    )
+    metadata = _CodecSamplingMetadata(
+        repetition_penalties=torch.tensor([1.05]), prompt_token_ids=torch.tensor([[0, 1]])
+    )
+    captured = _capture_sampler_logits(mocker)
+    blank = mocker.patch(
+        "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts.blank_scheduler_prompt_for_penalties",
+        wraps=blank_scheduler_prompt_for_penalties,
+    )
+    logits = torch.arange(-4, 4).float().reshape(1, 8)
+    talker.sample(logits, metadata, per_req_sampling_params=[params])
+    expected = _reference_repetition_penalty(logits, torch.tensor([1, 1, 2]), penalty=1.05, window_size=16)
+    torch.testing.assert_close(captured["logits"], expected)
+    assert captured["metadata"].no_penalties is (aux_penalty is None)
+    assert blank.call_count == (0 if aux_penalty is None else 1)
+    assert metadata.no_penalties is False
+    assert metadata.repetition_penalties.tolist() == [pytest.approx(1.05)]
+    assert metadata.prompt_token_ids is not None
+    assert metadata.prompt_token_ids.tolist() == [[0, 1]]
+    assert talker._penalty_histories is None
+
+
+@pytest.mark.parametrize("params", [None, [], [None], [None, None]])
+def test_sample_keeps_general_penalties_when_request_context_is_missing(mocker, params):
+    talker = _make_talker()
+    talker._penalty_histories = [torch.tensor([1])]
+    captured = _capture_sampler_logits(mocker)
+    talker.sample(torch.ones(1, 8), _CodecSamplingMetadata(torch.tensor([1.05])), per_req_sampling_params=params)
+    assert captured["metadata"].no_penalties is False
+    assert captured["metadata"].repetition_penalties.tolist() == [1.0]
+
+
+def test_sample_keeps_general_penalties_without_codec_history(mocker):
+    from vllm.sampling_params import SamplingParams
+
+    talker = _make_talker()
+    captured = _capture_sampler_logits(mocker)
+    talker.sample(
+        torch.ones(1, 8),
+        _CodecSamplingMetadata(torch.tensor([1.05])),
+        per_req_sampling_params=[SamplingParams(repetition_penalty=1.05)],
+    )
+    assert captured["metadata"].no_penalties is False
+    assert captured["metadata"].repetition_penalties.tolist() == [pytest.approx(1.05)]
+
+
+@pytest.mark.parametrize("legacy_none", [False, True])
+@pytest.mark.parametrize("sessions", [2, 4, 8, 16])
+def test_mrv2_overlapping_native_conditions_use_distinct_request_ids(mocker, legacy_none, sessions):
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.ones(2, 2))
+
+    def condition(req_id, seq, turn_start=False):
+        return talker.preprocess(
+            torch.zeros(2, dtype=torch.long),
+            None,
+            **({"request_id": None} if legacy_none else {}),
+            req_id=req_id,
+            native_duplex=True,
+            _omni_is_prefill=True,
+            _omni_prompt_len=2,
+            tts_token_ids=torch.tensor([1]),
+            tts_hidden_states=torch.ones(1, 2),
+            meta={"streaming_condition_seq": seq, "turn_start": turn_start},
+        )
+
+    condition("session-a", 0, True)
+    for seq in (1, 2, 3):
+        condition("session-a", seq)
+    others = [f"session-{i}" for i in range(sessions - 1)]
+    for req_id in others:
+        condition(req_id, 0, True)
+    for seq in range(4, 12):
+        condition("session-a", seq)
+        for req_id in reversed(others):
+            condition(req_id, seq - 3)
+    assert talker._request_condition_states["session-a"]["condition_seq"] == 11
+    assert all(talker._request_condition_states[req_id]["condition_seq"] == 8 for req_id in others)
+    assert set(talker._request_audio_states) == {"session-a", *others}
+    talker.on_requests_finished({others[0]})
+    talker._flush_deferred_cleanup()
+    assert others[0] not in talker._request_condition_states
+    assert others[0] not in talker._request_audio_states
+    condition("new-session", 0, True)
+    condition("session-a", 12)
+    assert talker._request_condition_states["new-session"]["condition_seq"] == 0
+    assert talker._request_condition_states["session-a"]["condition_seq"] == 12

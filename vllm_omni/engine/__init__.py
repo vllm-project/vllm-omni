@@ -143,7 +143,7 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     # hidden/codec handoff). vLLM strictly decodes ``pooling_output`` as a
     # ``torch.Tensor``, so a per-request dict payload cannot ride that field. The
     # producer (OmniARScheduler) sets ``pooling_output=None`` and serializes the
-    # dict here; the consumer (StagePool._poll_stage_raw) rehydrates it back into
+    # dict here; the consumer (StagePool.read_llm_raw_output) rehydrates it back into
     # ``pooling_output`` after decode. Tensor pooling outputs are unaffected.
     pooling_output_payload: AdditionalInformationPayload | None = None
     # Finished flag for streaming input segment
@@ -152,6 +152,8 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     new_prompt_len_snapshot: int | None = None
     # Authoritative segment count when the native plane suppresses token IPC.
     num_generation_tokens: int | None = None
+    # Coalesced decode steps have no recoverable per-step ITL samples.
+    is_coalesced: bool = False
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

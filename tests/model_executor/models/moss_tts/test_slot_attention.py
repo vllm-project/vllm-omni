@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
     MossAudioTokenizerMultiheadAttention,
     MossAudioTokenizerRotaryEmbedding,
@@ -14,7 +15,7 @@ from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
 )
 from vllm_omni.model_executor.models.moss_tts.slot_attention import slot_ring_attention, slot_ring_attention_rows
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.mark.parametrize(
@@ -299,3 +300,61 @@ def test_fused_rows_attention_integrates_with_mha_offsets(frames, context):
         if step == 4:
             for model in (reference, candidate):
                 model._streaming_state.reset_slots(torch.tensor([0], device="cuda"))
+
+
+@pytest.mark.parametrize("frames,capacity", [(1, 125), (15, 125), (15, 250), (32, 400), (60, 400), (480, 400)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_rows_empty_tile_skip_is_exact(frames, capacity, dtype):
+    torch.manual_seed(51)
+    batch, heads, states, dim = 3, 2, 5, 64
+    projected = torch.randn(batch, frames, 3, heads, dim, device="cuda", dtype=dtype)
+    q, k, v = projected.permute(2, 0, 3, 1, 4).unbind(0)
+    base_cache = torch.randn(2, states, heads, capacity, dim, device="cuda", dtype=dtype)
+    slots = torch.tensor([0, 4, 2], device="cuda")
+    lengths = torch.tensor([frames, max(1, frames - 3), 0], device="cuda", dtype=torch.int32)
+    for start in [0, 1, capacity - 1, capacity + 9, 3 * capacity]:
+        starts = torch.full((batch,), start, device="cuda", dtype=torch.long)
+        expected_cache, cache = base_cache.clone(), base_cache.clone()
+        expected = slot_ring_attention_rows(q, k, v, expected_cache, starts, slots, lengths, 17)
+        actual = slot_ring_attention_rows(q, k, v, cache, starts, slots, lengths, 17, skip_empty_tiles=True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+
+
+def test_slot_attention_output_is_time_major_storage():
+    q, k, v = [torch.randn(2, 3, 5, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    cache = torch.zeros(2, 4, 3, 125, 64, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([1, 2], device="cuda")
+    lengths = torch.full((2,), 5, device="cuda", dtype=torch.int32)
+    end = torch.zeros(4, device="cuda", dtype=torch.long)
+    out = slot_ring_attention(q, k, v, cache.clone(), end, slots, lengths, 17)
+    rows = slot_ring_attention_rows(
+        q, k, v, cache.clone(), torch.zeros(2, device="cuda", dtype=torch.long), slots, lengths, 17
+    )
+    for result in (out, rows):
+        assert result.shape == q.shape
+        # (B, H, T, D) view over (B, T, H, D) storage: the codec reshape is a view.
+        assert result.transpose(1, 2).is_contiguous()
+    torch.testing.assert_close(out, rows, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("frames,capacity,context", [(129, 400, 400), (240, 400, 400), (480, 400, 400), (300, 125, 50)])
+def test_long_chunk_rows_dispatch_matches_fused_launch_exactly(frames, capacity, context, monkeypatch):
+    import vllm_omni.model_executor.models.moss_tts.slot_attention as slot_attention
+
+    torch.manual_seed(54)
+    batch, heads, states, dim = 4, 2, 6, 64
+    projected = torch.randn(batch, frames, 3, heads, dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = projected.permute(2, 0, 3, 1, 4).unbind(0)
+    base_cache = torch.randn(2, states, heads, capacity, dim, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([0, 5, 2, 3], device="cuda")
+    lengths = torch.tensor([frames, frames - 3, 0, frames // 2], device="cuda", dtype=torch.int32)
+    for start in [0, 1, capacity - 1, capacity + 9, 3 * capacity + 5]:
+        starts = torch.tensor([start, start + 2, start, max(0, start - 7)], device="cuda", dtype=torch.long)
+        split_cache, fused_cache = base_cache.clone(), base_cache.clone()
+        split = slot_ring_attention_rows(q, k, v, split_cache, starts, slots, lengths, context)
+        monkeypatch.setattr(slot_attention, "_FUSED_ROWS_MAX_FRAMES", 1 << 30)
+        fused = slot_ring_attention_rows(q, k, v, fused_cache, starts, slots, lengths, context)
+        monkeypatch.undo()
+        torch.testing.assert_close(split, fused, rtol=0, atol=0)
+        torch.testing.assert_close(split_cache, fused_cache, rtol=0, atol=0)

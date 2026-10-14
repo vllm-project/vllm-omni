@@ -25,6 +25,11 @@ FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
+# Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
+# an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
+# scalars (a dict holding a tensor would come back as a list); the receiving
+# scheduler pops these keys before the request reaches the model.
+ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload

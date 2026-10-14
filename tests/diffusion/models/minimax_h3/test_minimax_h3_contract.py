@@ -730,6 +730,10 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         fake_download,
     )
 
+    # The pipeline download is mocked above; config normalization must not
+    # independently resolve the gated repository through the local HF cache.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
     od_config = OmniDiffusionConfig(
         model="MiniMaxAI/MiniMax-H3",
         trust_remote_code=trust_remote_code,
