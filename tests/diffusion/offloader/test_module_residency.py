@@ -151,6 +151,38 @@ def test_staging_transitions_are_idempotent_and_reuse_one_event(patched_runtime,
     retention.release_if_needed.assert_called_once_with(force=False)
 
 
+def test_start_loaded_keeps_the_device_storage_until_the_first_offload(patched_runtime, mocker):
+    module = nn.Linear(2, 2)
+    weight = module.weight.detach().clone()
+    original = module.weight.untyped_storage().data_ptr()
+    retention = mocker.Mock(spec=BoundedAllocatorCache)
+    stager = PinnedModuleStager(
+        module,
+        torch.device("cpu"),
+        pin_memory=False,
+        cache_retention=retention,
+        start_loaded=True,
+    )
+
+    assert stager.loaded
+    assert module.weight.untyped_storage().data_ptr() == original
+    stager.load()
+    assert stager._ready_event.record_count == 0
+
+    stager.offload()
+    assert not stager.loaded
+    retention.release_if_needed.assert_called_once_with(force=False)
+    stager.load()
+    assert stager.loaded
+    assert stager._ready_event.record_count == 1
+    assert torch.equal(module.weight, weight)
+
+
+def test_start_loaded_requires_the_module_on_the_staging_device(patched_runtime):
+    with pytest.raises(ValueError, match="start_loaded needs every tensor on cuda"):
+        PinnedModuleStager(nn.Linear(2, 2), torch.device("cuda"), pin_memory=False, start_loaded=True)
+
+
 def test_failed_load_restores_master_and_forces_cache_release(monkeypatch, patched_runtime, mocker):
     module = nn.Linear(2, 2)
     expected = module.weight.detach().clone()

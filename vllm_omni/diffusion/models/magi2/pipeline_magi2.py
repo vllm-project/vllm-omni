@@ -67,6 +67,7 @@ from .configuration_magi2 import (
     MAGI2_REFINER_GENERATION_CONFIG,
     Magi2RefinerConfig,
 )
+from .layers import Magi2MultiHeadMoE
 from .parallel import get_magi2_replica_group, get_magi2_ulysses_group
 from .preview_data_proxy import Magi2DataProxy
 from .refiner_data_proxy import Magi2RefinerDataProxy
@@ -802,6 +803,9 @@ class Magi2Pipeline(
         if not hasattr(self.transformer, "load_weights"):
             raise RuntimeError("Native MAGI-2 transformer has no strict weight loader")
         loaded = self.transformer.load_weights(stripped_weights())
+        if self._stages_transformer(all_ranks=self._releases_preview_on_every_rank()):
+            # Pay the host snapshot at startup rather than in the first request.
+            self._prepare_transformer_staging()
         return {prefix + name for name in loaded}
 
     def _validate_refiner_topology(self) -> None:
@@ -887,8 +891,8 @@ class Magi2Pipeline(
     def _refiner_memory_window(self) -> Iterator[nn.Module]:
         """Hold the refiner on the device for one refinement.
 
-        The Preview transformer stays resident.  The refiner is staged in
-        once on entry and staged out on exit; the window yields the refiner
+        The Preview shard has been released by then.  The refiner is staged
+        in once on entry and staged out on exit; the window yields the refiner
         transformer.
         """
 
@@ -897,30 +901,74 @@ class Magi2Pipeline(
         with self._component_on_device(self.refiner) as refiner:
             yield refiner
 
-    @contextmanager
-    def _output_rank_memory_window(self):
-        """Make room on the output rank for the 27B text encoder or the video decode.
+    def _release_preview(self, *, all_ranks: bool = False) -> None:
+        """Drop the Preview shard from the device until the next denoise.
 
-        Neither fits next to a resident Preview shard on the qualified devices
-        (the 1080p decode also has the refiner resident).  Layerwise offloading
-        already keeps the DiT on the host; otherwise stage the output rank's
-        shard to CPU for the window and restore it before any model collective
-        begins.
+        The 27B text encoder, the refiner and the video decode do not fit next
+        to a resident Preview shard on the qualified devices.  Layerwise
+        offloading already keeps the DiT on the host; otherwise the output
+        rank, or every rank with ``all_ranks``, drops its device copy and
+        ``_ensure_preview_resident`` reloads it from the host snapshot.
         """
 
-        stage_transformer = (
-            self._is_output_rank
+        if not self._stages_transformer(all_ranks=all_ranks):
+            return
+        self._prepare_transformer_staging()
+        if self._transformer_stager.loaded:
+            self._release_transformer_device_references()
+            self._transformer_stager.offload()
+            torch.accelerator.empty_cache()
+
+    def _releases_preview_on_every_rank(self) -> bool:
+        """Whether requests can drop the Preview on every rank: refined requests or a distributed decode."""
+
+        from .modeling_magi2_refiner import CHECKPOINT_INDEX_FILE
+
+        root = getattr(self, "checkpoint_root", None)
+        has_refiner = root is not None and (Path(root) / "refiner" / CHECKPOINT_INDEX_FILE).is_file()
+        return has_refiner or getattr(self, "_distributed_video_decode", False)
+
+    def _ensure_preview_resident(self) -> None:
+        stager = getattr(self, "_transformer_stager", None)
+        if stager is not None and not stager.loaded:
+            self._load_staged_transformer()
+
+    def _stages_transformer(self, *, all_ranks: bool = False) -> bool:
+        return (
+            (self._is_output_rank or all_ranks)
             and not self._transformer_is_layerwise_offloaded
             and not getattr(self, "_transformer_is_hsdp", False)
         )
-        if stage_transformer:
-            self.transformer.to("cpu")
-            torch.accelerator.empty_cache()
-        try:
-            yield
-        finally:
-            if stage_transformer:
-                self.transformer.to(self.device_str)
+
+    def _prepare_transformer_staging(self) -> None:
+        """Snapshot this rank's Preview shard into host memory once.
+
+        The weights are immutable, so a release then only drops the device
+        copy, and a reload copies from the host, with no device-to-host copy.
+        """
+
+        if getattr(self, "_transformer_stager", None) is not None:
+            return
+        # Snapshot without dropping the device copy: dropping and reloading
+        # it here would need room for a second copy while the allocator
+        # still holds the first one's blocks.
+        self._transformer_stager = PinnedModuleStager(
+            self.transformer,
+            torch.device(self.device_str),
+            pin_memory=bool(getattr(self.od_config, "pin_cpu_memory", True)),
+            start_loaded=True,
+        )
+
+    def _release_transformer_device_references(self) -> None:
+        for module in self.transformer.modules():
+            if isinstance(module, Magi2MultiHeadMoE):
+                module.release_device_references()
+
+    def _load_staged_transformer(self) -> None:
+        self._transformer_stager.load()
+        for module in self.transformer.modules():
+            if isinstance(module, Magi2MultiHeadMoE):
+                module.restore_owned_layout()
 
     def _broadcast_tensor(self, tensor: torch.Tensor | None) -> torch.Tensor:
         group = self._parallel_group
@@ -1140,9 +1188,9 @@ class Magi2Pipeline(
             "MAGI2_NEGATIVE_PROMPT",
             DEFAULT_NEGATIVE_PROMPT,
         )
-        with self._output_rank_memory_window():
-            context, context_null = self._encode_prompts((prompt, negative_prompt))
-            special = self._pool_figure_token(prompt, context) if ref_image_feat is not None else None
+        self._release_preview()
+        context, context_null = self._encode_prompts((prompt, negative_prompt))
+        special = self._pool_figure_token(prompt, context) if ref_image_feat is not None else None
 
         latent_height = height // MAGI2_GENERATION_CONFIG.video_vae_stride[1]
         latent_width = width // MAGI2_GENERATION_CONFIG.video_vae_stride[2]
@@ -1205,7 +1253,11 @@ class Magi2Pipeline(
             ref_image_feat_len=ref_image_feat_len,
             ref_image_special_token_embedding=special,
         )
+        self._ensure_preview_resident()
         latent, audio_latent = self.sampler.sample(sampler_input)
+        # The refiner and the decode run without the Preview; the next request
+        # reloads it after its prompt encoding, which also needs the room.
+        self._release_preview(all_ranks=refiner_size is not None or getattr(self, "_distributed_video_decode", False))
         if refiner_size is not None:
             refiner_width, refiner_height = refiner_size
             latent = self._evaluate_refiner(
@@ -1216,8 +1268,7 @@ class Magi2Pipeline(
                 height=refiner_height,
                 num_inference_steps=refiner_num_inference_steps,
             )
-        with self._output_rank_memory_window():
-            video = self._decode_video(latent)
+        video = self._decode_video(latent)
         audio = self._decode_audio(audio_latent)
         return video, audio
 

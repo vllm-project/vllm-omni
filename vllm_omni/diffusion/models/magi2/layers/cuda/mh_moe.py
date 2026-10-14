@@ -557,6 +557,37 @@ class BF16Magi2MultiHeadMoE(NativeMagi2MultiHeadMoE):
         self._rebind_w13_to_owned_bank()
         self._owns_fused_layout = True
 
+    def release_device_references(self) -> None:
+        """Drop the device tensors held beside the parameters.
+
+        Call before staging the parameters off the device without ``_apply``
+        (``PinnedModuleStager`` rebinds their storage), so that nothing keeps
+        the device copy alive.
+        """
+
+        self._owned_w13 = None
+        self._bf16_packed_w13 = None
+        self._bf16_packed_w13_key = None
+        self._bf16_route_buffers = None
+
+    def restore_owned_layout(self) -> None:
+        """Own the W13 bank again after a restage that kept its storage layout.
+
+        The restaged gate/up are views into one storage laid out as the bank,
+        so the bank becomes a view of that storage instead of a new copy.
+        """
+
+        if not self._owns_fused_layout or self._get_owned_w13() is not None:
+            return
+        gate = self.W_gate
+        shape = (self.local_flatten_num_experts, 2 * self.d_expert, self.d_head)
+        storage = gate.untyped_storage()
+        if gate.storage_offset() == 0 and storage.nbytes() == math.prod(shape) * gate.element_size():
+            self._owned_w13 = torch.empty(0, dtype=gate.dtype, device=gate.device).set_(storage, 0, shape)
+            if self._get_owned_w13() is not None:
+                return
+        self.prepare_owned_layout()
+
     def prepare_bf16_weights(self) -> None:
         """Materialize derived BF16 weights outside the inference hot path."""
 
