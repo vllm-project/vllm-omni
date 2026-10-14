@@ -10,7 +10,8 @@
     "matmul_tf32": false,
     "cudnn_tf32": true,
     "deterministic_algorithms": false,
-    "noise_generator": "torch.Generator(device=cuda).manual_seed(123)"
+    "noise_generator": "torch.Generator(device=cuda).manual_seed(123)",
+    "gpu": "NVIDIA H200"
   },
   "prompt": "pick up the red block and place it in the bin",
   "state": [

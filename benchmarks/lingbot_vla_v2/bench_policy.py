@@ -16,8 +16,10 @@ from lerobot.policies.lingbot_vla_v2.configuration_lingbot_vla_v2 import Lingbot
 from lerobot.policies.lingbot_vla_v2.modeling_lingbot_vla_v2 import LingbotVLAV2Policy
 from safetensors.torch import load_file
 
+import vllm_omni
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.lingbot_vla_v2.pipeline_lingbot_vla_v2 import LingBotVLAV2Pipeline
+from vllm_omni.platforms import current_omni_platform
 
 
 def main() -> None:
@@ -141,6 +143,9 @@ def main() -> None:
             "dtype": "float32",
             "matmul_tf32": False,
             "cudnn_tf32": True,
+            "device": current_omni_platform.get_device_name(),
+            "model": str(model),
+            "vllm_omni": vllm_omni.__version__,
             "torch": str(torch.__version__),
             "transformers": transformers.__version__,
             "scope": "Direct inference on the same device/runtime; excludes loading, HTTP and simulation.",
