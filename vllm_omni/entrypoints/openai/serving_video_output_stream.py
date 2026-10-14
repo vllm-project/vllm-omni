@@ -126,6 +126,9 @@ class OmniStreamingVideoOutputHandler:
         generation_done = False
         interaction_event_ids: set[str] = set()
         request: VideoGenerationRequest | None = None
+        # Single-slot stamp shared with the control loop: when session.stop was
+        # received, so session.done can report the cancellation response latency.
+        stop_received_at: list[float] = []
 
         try:
             start = await self._receive_start(websocket)
@@ -185,6 +188,7 @@ class OmniStreamingVideoOutputHandler:
                     progress,
                     interaction_event_ids,
                     interaction_queue,
+                    stop_received_at=stop_received_at,
                     response_queue=response_queue,
                 )
             )
@@ -234,6 +238,7 @@ class OmniStreamingVideoOutputHandler:
                         "request_id": request_id,
                         "chunks": chunks_sent,
                         "stopped": stopped or stop_event.is_set(),
+                        **({"stop_latency_s": time.monotonic() - stop_received_at[0]} if stop_received_at else {}),
                     },
                     send_lock,
                 ),
@@ -247,7 +252,17 @@ class OmniStreamingVideoOutputHandler:
                     await asyncio.wait_for(
                         self._send_json(
                             websocket,
-                            {"type": "session.done", "request_id": request_id, "chunks": chunks_sent, "stopped": True},
+                            {
+                                "type": "session.done",
+                                "request_id": request_id,
+                                "chunks": chunks_sent,
+                                "stopped": True,
+                                **(
+                                    {"stop_latency_s": time.monotonic() - stop_received_at[0]}
+                                    if stop_received_at
+                                    else {}
+                                ),
+                            },
                             send_lock,
                         ),
                         timeout=1.0,
@@ -378,6 +393,7 @@ class OmniStreamingVideoOutputHandler:
         interaction_event_ids: set[str],
         interaction_queue: asyncio.Queue[OmniInteractionPrompt],
         *,
+        stop_received_at: list[float],
         response_queue: asyncio.Queue[dict[str, Any]],
     ) -> None:
         try:
@@ -431,6 +447,8 @@ class OmniStreamingVideoOutputHandler:
 
                 msg_type = msg.get("type")
                 if msg_type == "session.stop":
+                    if not stop_received_at:
+                        stop_received_at.append(time.monotonic())
                     await self._abort_request(request_id)
                     stop_event.set()
                     return

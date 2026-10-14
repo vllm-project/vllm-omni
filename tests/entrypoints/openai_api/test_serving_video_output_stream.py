@@ -1458,4 +1458,6 @@ async def test_stop_after_final_media_cancels_pending_interaction(mocker: Mocker
     engine.abort.assert_awaited()
     assert ws.sent_json[-1]["type"] == "session.done"
     assert ws.sent_json[-1]["stopped"] is True
+    # Cancellation response latency is exposed on the stop terminal.
+    assert 0 <= ws.sent_json[-1]["stop_latency_s"] < 30
     assert not (asyncio.all_tasks() - tasks_before)

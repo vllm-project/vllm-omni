@@ -29,7 +29,7 @@ The `--diffusion-streaming-output` CLI flag is forwarded as `streaming_output=Tr
 | Client to server | `session.playback` | JSON text: `{"type":"session.playback","position_seconds":1.25}` | Playback progress for sessions that opt into `streaming_pacing`. Position must be finite and non-negative. |
 | Client to server | `session.ping` | JSON text: `{"type":"session.ping"}` | Optional keepalive; refreshes the server stall clock. |
 | Server to client | `session.interaction.queued` | JSON text: `{"type":"session.interaction.queued","request_id":"...","event_id":"xxx"}` | Confirms the server queued the interaction for the active request. |
-| Server to client | `session.done` | JSON text: `{"type":"session.done","request_id":"...","chunks":3,"stopped":false}` | Ends a completed or stopped session. |
+| Server to client | `session.done` | JSON text: `{"type":"session.done","request_id":"...","chunks":3,"stopped":false}` | Ends a completed or stopped session. Sessions stopped by `session.stop` also carry `stop_latency_s`: seconds from stop receipt to the done frame. |
 | Server to client | `session.pong` | JSON text: `{"type":"session.pong"}` | Reply to `session.ping`. |
 | Server to client | `error` | JSON text: `{"type":"error","message":"..."}` | Reports invalid input, unsupported formats, inactive requests, unsupported prompt updates, generation failures, control-message errors, or stall timeout. |
 

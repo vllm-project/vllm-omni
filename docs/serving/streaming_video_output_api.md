@@ -45,7 +45,7 @@ bytes.
 | Server to client | `session.interaction.queued` | Confirms that an interaction was queued |
 | Client to server | `session.ping` | Refreshes the stall clock |
 | Server to client | `session.pong` | Acknowledges a ping |
-| Client to server | `session.stop` | Cancels the active generation |
+| Client to server | `session.stop` | Cancels the active generation; the resulting `session.done` reports `stop_latency_s` |
 | Server to client | `session.done` | Reports completion or cancellation and the chunk count |
 | Server to client | `error` | Reports validation, generation, or timeout failures |
 
