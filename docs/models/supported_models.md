@@ -59,7 +59,7 @@ th {
 | `SanaImageToVideoPipeline` | SANA-Video-2B I2V (native and Diffusers adapter validated at 480p/720p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-Video-2B.md) |
 | `SeedVR2Pipeline` | [SeedVR2 3B](seedvr2.md) video restoration | `ByteDance-Seed/SeedVR2-3B` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ByteDance/SeedVR2-RTX-5090.md) |
 | `MiniMaxH3Pipeline` | MiniMax H3 T2VA, first/last-keyframe FL2VA, and mixed-reference Ref2VA | `MiniMaxAI/MiniMax-H3` | ✅︎ | ✅︎ | | | [Published](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) |
-| `Magi2Pipeline` | MAGI-2 native Preview-stage T2VA and I2VA (272p/540p) | `sand-ai/MAGI-2-preview` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SandAI/MAGI-2-preview-L20X.md) |
+| `Magi2Pipeline` | MAGI-2 native Preview-stage T2VA and I2VA (272p/540p; experimental 1080p refiner) | `sand-ai/MAGI-2-preview` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SandAI/MAGI-2-preview-L20X.md) |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Pi0Pipeline` | π0 (Pi-Zero) VLA | `lerobot/pi0_base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi0.md) |
 | `Pi05Pipeline` | π0.5 VLA | `lerobot/pi05_base` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md) |
