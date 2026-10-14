@@ -505,7 +505,8 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 if self.semantic_codec_type != "repcodec":
                     raise ValueError("IndexTTS 2.5 expects W2V-BERT reference embeddings, not semantic-code indices")
                 with torch.no_grad():
-                    s_ref_emb = semantic_codec.quantizer.vq2emb(s_ref_codes.unsqueeze(1))
+                    # ResidualVQ.vq2emb expects [num_quantizers, B, T].
+                    s_ref_emb = semantic_codec.quantizer.vq2emb(s_ref_codes.unsqueeze(0))
                 s_ref_emb = s_ref_emb.transpose(1, 2).to(dtype=model_dtype)
 
             ref_batch_size = int(ref_mel.shape[0])
@@ -914,7 +915,10 @@ class IndexTTS2S2MelDecoder(nn.Module):
         if self.semantic_codec_type == "enhanced":
             semantic = codec.decode(mel_codes)
         else:
-            semantic = codec.quantizer.vq2emb(mel_codes.unsqueeze(1))
+            # ResidualVQ.vq2emb expects [num_quantizers, B, T]. Official
+            # IndexTTS2 uses unsqueeze(1), which only coincides for B == 1;
+            # with B > 1 it would decode only the first request's codes.
+            semantic = codec.quantizer.vq2emb(mel_codes.unsqueeze(0))
             semantic = semantic.transpose(1, 2)
         semantic = semantic.to(device=mel_codes.device, dtype=dtype)
 
