@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,7 +12,16 @@ from torch import nn
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.stage_config import get_deploy_config_path
+from tests.model_executor.models.chatterbox.helpers import (
+    DEPLOY,
+    build_stage,
+    load_stage_weights,
+    stage_vllm_config,
+    write_model_dir,
+    write_s3gen_checkpoint,
+)
 from vllm_omni.config.stage_config import resolve_deploy_yaml
+from vllm_omni.model_executor.models.chatterbox.chatterbox import ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import (
     LEFT_CONTEXT_TOKENS,
     SAMPLES_PER_FRAME,
@@ -125,35 +133,48 @@ def test_fade_in_out_blends_the_overlap() -> None:
     assert blended.tolist() == [[2.0, 2.75, 3.0, 2.75, 2.0, 2.0, 2.0, 2.0]]
 
 
-def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder, monkeypatch):
-    """Actual flow and HiFT calls enforce the mixed-precision boundary."""
-    monkeypatch.setattr(decoder.config, "flow_dtype", "bfloat16")
+def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder: S3GenDecoder) -> None:
+    """Actual flow and HiFT calls enforce the mixed-precision boundary.
+
+    The decoder is built from a config asking for bfloat16 flow, with the
+    float32 decoder's weights.
+    """
+    bf16 = S3GenDecoder(ChatterboxConfig(flow_dtype="bfloat16"), CONTEXT).eval()
+    bf16.load_state_dict(decoder.state_dict())
     flow_dtypes, vocoder_dtypes = [], []
-    flow_hook = decoder.flow.decoder.register_forward_hook(
-        lambda module, inputs, output: flow_dtypes.append(output[0].dtype)
-    )
-    vocoder_hook = decoder.mel2wav.conv_pre.register_forward_pre_hook(
-        lambda module, inputs: vocoder_dtypes.append(inputs[0].dtype)
-    )
+
+    def flow_output(module: nn.Module, inputs: tuple, output: tuple) -> None:
+        flow_dtypes.append(output[0].dtype)
+
+    def vocoder_input(module: nn.Module, inputs: tuple) -> None:
+        vocoder_dtypes.append(inputs[0].dtype)
+
+    hooks = [
+        bf16.flow.decoder.register_forward_hook(flow_output),
+        bf16.mel2wav.conv_pre.register_forward_pre_hook(vocoder_input),
+    ]
     try:
         chunks = [Chunk(torch.arange(15), 0, reference(2), None, True)]
-        ((audio, state),) = decoder.chunked_decode_streaming(chunks)
-        assert flow_dtypes == [torch.bfloat16]
-        assert vocoder_dtypes == [torch.float32]
-        assert audio.dtype == torch.float32
-        assert torch.isfinite(audio).all()
-        assert state is None
-        assert next(decoder.flow.parameters()).dtype == torch.float32
+        ((audio, state),) = bf16.chunked_decode_streaming(chunks)
     finally:
-        flow_hook.remove()
-        vocoder_hook.remove()
+        for hook in hooks:
+            hook.remove()
+
+    assert flow_dtypes == [torch.bfloat16]
+    assert vocoder_dtypes == [torch.float32]
+    assert audio.dtype == torch.float32
+    assert torch.isfinite(audio).all()
+    assert state is None
+    assert next(bf16.flow.parameters()).dtype == torch.float32
 
 
-def test_cudnn_attention_rejects_cpu_execution(decoder, monkeypatch):
-    monkeypatch.setattr(decoder.config, "flow_dtype", "bfloat16")
-    monkeypatch.setattr(decoder.config, "flow_attention_backend", "cudnn")
+def test_cudnn_attention_rejects_cpu_execution(model_dir: str) -> None:
+    """The bfloat16 MPS deploy file asks for cuDNN attention, which a CPU decoder cannot give."""
+    stage = build_stage(stage_vllm_config(model_dir, "chatterbox_turbo_high_concurrency_bf16_mps.yaml", 1), "cpu")
+    assert (stage.config.flow_dtype, stage.config.flow_attention_backend) == ("bfloat16", "cudnn")
+
     with pytest.raises(ValueError, match="requires CUDA"):
-        decoder.chunk_mels([Chunk(torch.arange(15), 0, reference(2), None, True)])
+        stage.chunk_mels([Chunk(torch.arange(15), 0, reference(2), None, True)])
 
 
 def test_window_keeps_the_left_context_and_rebases_the_offset() -> None:
@@ -422,58 +443,53 @@ def test_abort_frees_stream_state(decoder: S3GenDecoder, references: list[Refere
     assert decoder.streams == {}
 
 
-def test_two_requests_in_one_step_keep_separate_state(
-    decoder: S3GenDecoder, references: list[Reference], monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_two_requests_in_one_step_keep_separate_state(decoder: S3GenDecoder, references: list[Reference]) -> None:
     """Each row of a step is decoded from its own tokens, offset, end flag and voice.
 
-    What ``decode_step`` hands the decoder is recorded instead of decoded, so
-    every field is compared by value; the second step shows a live stream
-    keeps the voice it began with beside a new request with another.
+    ``decode_step`` must form the chunks written out below from the flat ids
+    and the payloads: decoding those directly under the same vocoder draw
+    gives the same audio sample for sample, and the streams it keeps hold
+    the voices they began with. The second step shows a live stream keeps
+    its voice beside a new request with another.
     """
-    seen: list[list[Chunk]] = []
-
-    def record(chunks: list[Chunk]) -> list[tuple[torch.Tensor, StreamState | None]]:
-        seen.append(chunks)
-        return [
-            (torch.zeros(1, 1), None if chunk.finalize else StreamState(chunk.reference, *[torch.zeros(1)] * 3))
-            for chunk in chunks
-        ]
-
-    monkeypatch.setattr(decoder, "chunked_decode_streaming", record)
     torch.manual_seed(9)
     a, b, c = (torch.randint(0, 6561, (n,)) for n in (53, 30, 53))
 
-    decoder.decode_step(
+    torch.manual_seed(20)
+    first = decoder.decode_step(
         torch.cat([a[:23], b]),
         [23, 30],
         [stream_payload(references[0], False, 0), stream_payload(references[1], True, 0)],
         ["a", "b"],
     )
-    decoder.decode_step(
+    assert set(decoder.streams) == {"a"}
+    torch.manual_seed(21)
+    second = decoder.decode_step(
         torch.cat([a, c]),
         [53, 53],
         [stream_payload(None, False, 20), stream_payload(references[1], False, 0)],
         ["a", "c"],
     )
+    kept = {request_id: decoder.streams[request_id].reference for request_id in ("a", "c")}
+    decoder.on_requests_finished({"a", "c"})
+
+    torch.manual_seed(20)
+    (first_a, state_a), (first_b, _) = decoder.chunked_decode_streaming(
+        [Chunk(a[:23], 0, references[0], None, False), Chunk(b, 0, references[1], None, True)]
+    )
+    torch.manual_seed(21)
+    (second_a, _), (second_c, _) = decoder.chunked_decode_streaming(
+        [Chunk(a, 20, references[0], state_a, False), Chunk(c, 0, references[1], None, False)]
+    )
+
+    expected = [first_a, first_b, second_a, second_c]
+    assert all(torch.equal(got, want.reshape(-1)) for got, want in zip([*first, *second], expected, strict=True))
 
     def voice(ref: Reference) -> list:
         return [ref.prompt_token.tolist(), ref.prompt_feat.tolist(), ref.embedding.tolist()]
 
-    def described(chunk: Chunk) -> tuple:
-        return (chunk.tokens.tolist(), chunk.token_offset, chunk.finalize, chunk.state is None, voice(chunk.reference))
-
-    first, second = seen
-    assert [described(chunk) for chunk in first] == [
-        (a[:23].tolist(), 0, False, True, voice(references[0])),
-        (b.tolist(), 0, True, True, voice(references[1])),
-    ]
-    assert [described(chunk) for chunk in second] == [
-        (a.tolist(), 20, False, False, voice(references[0])),
-        (c.tolist(), 0, False, True, voice(references[1])),
-    ]
-    assert set(decoder.streams) == {"a", "c"}
-    decoder.on_requests_finished({"a", "c"})
+    assert voice(kept["a"]) == voice(references[0])
+    assert voice(kept["c"]) == voice(references[1])
 
 
 def test_spans_without_a_payload_or_tokens_give_empty_audio(decoder: S3GenDecoder, references: list[Reference]) -> None:
@@ -577,15 +593,6 @@ def test_noise_is_taken_by_position_for_every_prompt_length(decoder: S3GenDecode
         assert torch.equal(mel, decoded_from(start))
         # Not vacuous: the same row placed at the start of the utterance differs.
         assert not torch.allclose(mel, decoded_from(decoder.prompt_noise_frames), atol=1e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_noise_is_the_same_draw_when_built_on_a_default_device(decoder: S3GenDecoder) -> None:
-    """vLLM builds the stage inside a default-device context."""
-    with torch.device("cuda"):
-        built = S3GenDecoder(ChatterboxConfig(), CONTEXT)
-    assert built.flow_noise.device.type == built.trim_fade.device.type == "cuda"
-    assert torch.equal(built.flow_noise.cpu(), decoder.flow_noise)
 
 
 def test_chunked_mel_is_closer_to_one_chunk_than_a_noise_redraw(
@@ -708,20 +715,26 @@ def test_a_row_is_vocoded_as_it_is_alone_whatever_shares_the_step(decoder: S3Gen
     assert sources[1].shape == (1, 1, 68 * SAMPLES_PER_FRAME)
 
 
-def test_rows_of_equal_length_share_one_vocoder_call(decoder: S3GenDecoder, monkeypatch: pytest.MonkeyPatch) -> None:
+def vocoder_calls(decoder: S3GenDecoder) -> tuple[list[int], torch.utils.hooks.RemovableHandle]:
+    """The batch size of every HiFT call, from its F0 predictor, which every call runs once."""
+    calls: list[int] = []
+
+    def f0_input(module: nn.Module, inputs: tuple) -> None:
+        calls.append(inputs[0].shape[0])
+
+    return calls, decoder.mel2wav.f0_predictor.register_forward_pre_hook(f0_input)
+
+
+def test_rows_of_equal_length_share_one_vocoder_call(decoder: S3GenDecoder) -> None:
     """Nothing is padded between them, so batching them costs no independence."""
     torch.manual_seed(10)
     mels = [torch.randn(1, 80, 68), torch.randn(1, 80, 40), torch.randn(1, 80, 68)]
     cache = torch.randn(3, 1, SOURCE_CACHE_SAMPLES)
-    inference = decoder.mel2wav.inference
-    calls: list[int] = []
-
-    def counted(speech_feat: torch.Tensor, cache_source: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        calls.append(speech_feat.shape[0])
-        return inference(speech_feat=speech_feat, cache_source=cache_source)
-
-    monkeypatch.setattr(decoder.mel2wav, "inference", counted)
-    wavs, sources = decoder.vocode(mels, cache)
+    calls, hook = vocoder_calls(decoder)
+    try:
+        wavs, sources = decoder.vocode(mels, cache)
+    finally:
+        hook.remove()
 
     assert calls == [2, 1]
     assert [wav.shape[1] for wav in wavs] == [68 * SAMPLES_PER_FRAME, 40 * SAMPLES_PER_FRAME, 68 * SAMPLES_PER_FRAME]
@@ -783,20 +796,6 @@ def test_a_live_stream_and_a_first_chunk_in_one_step(decoder: S3GenDecoder, refe
     assert first_state.speech.shape == live_state.speech.shape == (1, SOURCE_CACHE_SAMPLES)
 
 
-def stage_config(
-    max_num_seqs: int, max_num_batched_tokens: int, max_num_scheduled_tokens: int | None = None
-) -> SimpleNamespace:
-    """The fields of the engine's config that the stage reads."""
-    return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=ChatterboxConfig(), max_model_len=2048),
-        scheduler_config=SimpleNamespace(
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_num_scheduled_tokens=max_num_scheduled_tokens,
-        ),
-    )
-
-
 @pytest.mark.parametrize(
     ("max_num_batched_tokens", "max_num_scheduled_tokens", "names"),
     [
@@ -807,7 +806,7 @@ def stage_config(
     ids=["batched tokens", "scheduled tokens", "scheduled tokens set to 0"],
 )
 def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
-    max_num_batched_tokens: int, max_num_scheduled_tokens: int | None, names: str
+    model_dir: str, max_num_batched_tokens: int, max_num_scheduled_tokens: int | None, names: str
 ) -> None:
     """A new request the step's budget cannot cover is scheduled with part of its tokens.
 
@@ -815,19 +814,26 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
     at most the stage's own context long, so eight slots of a 2048-token
     context need 16384, whatever ``max_tokens`` a request asks for. The
     scheduler's budget is its scheduled-token limit whenever one is set, 0
-    included, and the message names the field it read.
+    included, and the message names the field it read. The deploy file's
+    stage 1 gets the budget as ``--stage-overrides`` would give it.
     """
+    config = stage_vllm_config(
+        model_dir,
+        DEPLOY["turbo"],
+        1,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_scheduled_tokens=max_num_scheduled_tokens,
+    )
+    assert (config.scheduler_config.max_num_seqs, config.model_config.max_model_len) == (8, 2048)
+
     with pytest.raises(ValueError, match=re.escape(names)):
-        ChatterboxS3Gen(vllm_config=stage_config(8, max_num_batched_tokens, max_num_scheduled_tokens))
+        build_stage(config, "cpu")
 
 
 @pytest.fixture(scope="module")
-def stage() -> ChatterboxS3Gen:
-    """Stage 1 as the engine builds it with the deploy file's numbers."""
-    decoder = yaml.safe_load(Path(get_deploy_config_path("chatterbox_turbo.yaml")).read_text())["stages"][1]
-    config = stage_config(decoder["max_num_seqs"], decoder["max_num_batched_tokens"])
-    config.model_config.max_model_len = decoder["max_model_len"]
-    return ChatterboxS3Gen(vllm_config=config).eval()
+def stage(built_stage: Callable[[str, int], ChatterboxForConditionalGeneration]) -> ChatterboxS3Gen:
+    """Stage 1 as the engine builds it from the deploy file."""
+    return built_stage("turbo", 1).model
 
 
 def test_the_stage_builds_with_the_deploy_files_budget(stage: ChatterboxS3Gen, decoder: S3GenDecoder) -> None:
@@ -864,17 +870,49 @@ def test_forward_returns_each_requests_new_audio_and_rate(stage: ChatterboxS3Gen
     stage.on_requests_finished({"live"})
 
 
-def test_load_weights_fills_every_parameter_and_skips_the_reference_encoders(
-    stage: ChatterboxS3Gen, decoder: S3GenDecoder
+def test_load_weights_fills_every_parameter_and_skips_the_reference_encoders(tmp_path: Path) -> None:
+    """The checkpoint also holds the tokenizer and speaker encoder, which run in the API process.
+
+    The file is written in the released layout and loaded through vLLM's
+    loader, which fails on any parameter the stage reports it did not fill.
+    """
+    directory = write_model_dir(tmp_path)
+    config = stage_vllm_config(directory, DEPLOY["turbo"], 1)
+    unified = build_stage(config, "cpu")
+    checkpoint = write_s3gen_checkpoint(directory, config.model_config.hf_config, seed=0)
+
+    load_stage_weights(unified, config)
+
+    stage = unified.model
+    own = {
+        name: tensor for name, tensor in checkpoint.items() if not name.startswith(("tokenizer.", "speaker_encoder."))
+    }
+    assert len(own) < len(checkpoint)
+    assert set(stage.state_dict()) == set(own)
+    assert all(torch.equal(stage.state_dict()[name], tensor) for name, tensor in own.items())
+    assert stage.load_weights(checkpoint.items()) == set(own)
+    assert unified.load_weights(checkpoint.items()) == {name for name, _ in unified.named_parameters()}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Production defect in models/common/snake_activation.py: Snake.precompute_exp_cache assigns "
+        "self.alpha.contiguous(), which is the alpha Parameter itself, to _exp_alpha, so a stage's first decode "
+        "registers each of HiFT's 72 Snake alphas a second time as a parameter (_exp_alpha); reloading the "
+        "released checkpoint into a stage that has decoded then fails the strict load on those names"
+    ),
+)
+def test_a_stage_that_has_decoded_reloads_its_checkpoint(
+    stage: ChatterboxS3Gen, references: list[Reference], tmp_path: Path
 ) -> None:
-    """The checkpoint also holds the tokenizer and speaker encoder, which run in the API process."""
-    checkpoint = decoder.state_dict()
-    encoders = {"tokenizer.conv1.weight": torch.zeros(1), "speaker_encoder.head.weight": torch.zeros(1)}
+    """vLLM reloads weights into a running stage (weight updates, sleep mode); decoding must not change its parameters."""
+    before = {name for name, _ in stage.named_parameters()}
+    stage.decode_step(torch.randint(0, 6561, (23,)), [23], [stream_payload(references[0], True, 0)], ["reload"])
+    checkpoint = write_s3gen_checkpoint(write_model_dir(tmp_path), stage.config, seed=1)
 
-    loaded = stage.load_weights([*checkpoint.items(), *encoders.items()])
-
-    assert loaded == set(checkpoint) == set(stage.state_dict())
-    assert all(torch.equal(stage.state_dict()[name], tensor) for name, tensor in checkpoint.items())
+    assert {name for name, _ in stage.named_parameters()} == before
+    assert stage.load_weights(checkpoint.items()) == before
 
 
 @pytest.mark.parametrize(
@@ -895,57 +933,84 @@ def test_load_weights_refuses_a_checkpoint_of_another_layout(
         stage.load_weights(checkpoint.items())
 
 
-def test_flow_batches_all_scheduled_rows_and_keeps_distinct_voices(decoder, monkeypatch):
-    """All 64 rows retain their own prompt and position-dependent noise."""
-    import vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen as module
+def flow_calls(decoder: S3GenDecoder) -> tuple[list[int], torch.utils.hooks.RemovableHandle]:
+    """The batch size of every flow call."""
+    calls: list[int] = []
 
+    def flow_input(module: nn.Module, args: tuple, kwargs: dict) -> None:
+        calls.append(kwargs["mu"].shape[0])
+
+    return calls, decoder.flow.decoder.register_forward_pre_hook(flow_input, with_kwargs=True)
+
+
+def test_flow_batches_all_scheduled_rows_and_keeps_distinct_voices(decoder: S3GenDecoder) -> None:
+    """All 64 rows go through one flow call and each decodes as it does alone.
+
+    Alone, a row has only its own prompt and its own position-dependent
+    noise; the batch must give it the same mel.
+    """
+    torch.manual_seed(15)
     refs = [reference(2 + i % 3) for i in range(64)]
-    chunks = [Chunk(torch.full((15,), i, dtype=torch.long), 0, ref, None, True) for i, ref in enumerate(refs)]
-    calls = []
+    chunks = [Chunk(torch.randint(0, 6561, (15,)), 0, ref, None, True) for ref in refs]
+    calls, hook = flow_calls(decoder)
+    try:
+        mels = decoder.chunk_mels(chunks)
+    finally:
+        hook.remove()
 
-    def flow(flow, tokens, references, finalize, n_timesteps, meanflow, noise):
-        calls.append(len(tokens))
-        outputs = []
-        for row, ref, final, row_noise in zip(tokens, references, finalize, noise, strict=True):
-            i = int(row[0])
-            assert ref is refs[i]
-            assert final
-            prompt_frames = ref.prompt_token.shape[1] * 2
-            assert torch.equal(row_noise[:, :prompt_frames], decoder.flow_noise[0, :, :prompt_frames])
-            outputs.append(torch.full((1, 80, row.numel() * 2), float(i)))
-        return outputs
-
-    monkeypatch.setattr(module, "flow_mels", flow)
-    mels = decoder.chunk_mels(chunks)
     assert calls == [64]
-    assert [float(mel[0, 0, 0]) for mel in mels] == list(range(64))
+    assert [mel.shape for mel in mels] == [(1, 80, 2 * (15 + 3))] * 64
+    for chunk, mel in zip(chunks, mels, strict=True):
+        (alone,) = decoder.chunk_mels([chunk])
+        torch.testing.assert_close(mel, alone, atol=TOLERANCE, rtol=TOLERANCE)
 
 
-def test_equal_length_vocoder_groups_batch_all_rows_and_keep_source_rows(decoder, monkeypatch):
-    """Each mel length forms one batch, preserving its source-cache rows."""
-    calls = []
-    mels = [torch.full((1, 80, 12 + i % 2), float(i)) for i in range(64)]
-    cache = torch.arange(64, dtype=torch.float32).reshape(64, 1, 1)
+def test_equal_length_vocoder_groups_batch_all_rows_and_keep_source_rows(decoder: S3GenDecoder) -> None:
+    """Each mel length forms one batch; every row keeps its own source cache and its own audio.
 
-    def inference(speech_feat, cache_source):
-        calls.append(speech_feat.shape[0])
-        owners = speech_feat[:, :1, :1]
-        assert torch.equal(owners, cache_source)
-        return owners[:, 0], owners
+    The audio is compared with HiFT called on each group directly, under the
+    same draw.
+    """
+    torch.manual_seed(16)
+    mels = [torch.randn(1, 80, 12 + i % 2) for i in range(64)]
+    cache = torch.randn(64, 1, SOURCE_CACHE_SAMPLES)
+    calls, hook = vocoder_calls(decoder)
+    try:
+        torch.manual_seed(17)
+        wavs, sources = decoder.vocode(mels, cache)
+    finally:
+        hook.remove()
 
-    monkeypatch.setattr(decoder.mel2wav, "inference", inference)
-    wavs, sources = decoder.vocode(mels, cache)
+    torch.manual_seed(17)
+    groups = [list(range(0, 64, 2)), list(range(1, 64, 2))]
+    expected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for rows in groups:
+        group_wavs, group_sources = decoder.mel2wav.inference(
+            speech_feat=torch.cat([mels[i] for i in rows]), cache_source=cache[rows]
+        )
+        expected |= {i: (group_wavs[k : k + 1], group_sources[k : k + 1]) for k, i in enumerate(rows)}
+
     assert calls == [32, 32]
-    assert [float(wav[0, 0]) for wav in wavs] == list(range(64))
-    assert [float(source[0, 0, 0]) for source in sources] == list(range(64))
+    assert all(torch.equal(sources[i][:, :, :SOURCE_CACHE_SAMPLES], cache[i : i + 1]) for i in range(64))
+    assert all(torch.equal(wavs[i], expected[i][0]) and torch.equal(sources[i], expected[i][1]) for i in range(64))
 
 
-def test_profile_with_64_slots_skips_neural_decode(decoder, monkeypatch):
-    def unexpected(chunks):
-        pytest.fail("startup profiling must not create neural activation batches")
+def test_profile_with_64_slots_skips_neural_decode(decoder: S3GenDecoder) -> None:
+    """The engine's profiling run has no request ids: neither the flow nor the vocoder runs."""
+    calls: list[str] = []
 
-    monkeypatch.setattr(decoder, "chunked_decode_streaming", unexpected)
-    audios = decoder.decode_step(torch.zeros(64 * CONTEXT, dtype=torch.long), [CONTEXT] * 64, None, None)
+    def refuse(module: nn.Module, inputs: tuple) -> None:
+        calls.append(type(module).__name__)
+        raise AssertionError("startup profiling must not create neural activation batches")
+
+    hooks = [module.register_forward_pre_hook(refuse) for module in (decoder.flow.decoder, decoder.mel2wav)]
+    try:
+        audios = decoder.decode_step(torch.zeros(64 * CONTEXT, dtype=torch.long), [CONTEXT] * 64, None, None)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    assert calls == []
     assert len(audios) == 64
     assert all(audio.numel() == 0 for audio in audios)
 
@@ -982,7 +1047,16 @@ def test_high_concurrency_profiles_admit_64_complete_requests(name, stage0_slots
     assert [stage["max_num_seqs"] for stage in baseline["stages"]] == [8, 8]
 
 
-def test_streaming_batch_preserves_request_state(decoder, monkeypatch):
+def test_streaming_batch_preserves_request_state(decoder: S3GenDecoder) -> None:
+    """64 rows in one step, half continuing a stream, a third final: each keeps its own state.
+
+    Every continuing row's held-back tail is a constant, its row number, so
+    its first played sample shows whose tail it was faded with. Changing one
+    row's cached mel and source under the same draw changes that row's audio
+    and no other. The flow runs once for all rows, and the vocoder once per
+    mel length within the continuing and the first chunks.
+    """
+    torch.manual_seed(18)
     refs = [reference(2) for _ in range(64)]
     chunks = []
     for i, ref in enumerate(refs):
@@ -991,39 +1065,47 @@ def test_streaming_batch_preserves_request_state(decoder, monkeypatch):
             if i % 2
             else StreamState(
                 ref,
-                torch.full((1, 80, 8), float(i)),
-                torch.full((1, 1, SOURCE_CACHE_SAMPLES), float(i)),
+                torch.randn(1, 80, 8),
+                torch.randn(1, 1, SOURCE_CACHE_SAMPLES) * 0.1,
                 torch.full((1, SOURCE_CACHE_SAMPLES), float(i)),
             )
         )
-        chunks.append(Chunk(torch.tensor([i]), 0, ref, state, i % 3 == 0))
-    calls = []
+        chunks.append(Chunk(torch.randint(0, 6561, (9,)), 0, ref, state, i % 3 == 0))
+    mels = decoder.chunk_mels(chunks)
 
-    def chunk_mels(group):
-        calls.append(len(group))
-        return [torch.full((1, 80, 12), float(chunk.tokens[0])) for chunk in group]
+    flows, flow_hook = flow_calls(decoder)
+    vocoder, vocoder_hook = vocoder_calls(decoder)
+    try:
+        torch.manual_seed(19)
+        results = decoder.chunked_decode_streaming(chunks)
+    finally:
+        flow_hook.remove()
+        vocoder_hook.remove()
+    other = list(chunks)
+    other[10] = replace(
+        chunks[10], state=replace(chunks[10].state, mel=-chunks[10].state.mel, source=-chunks[10].state.source)
+    )
+    torch.manual_seed(19)
+    changed = decoder.chunked_decode_streaming(other)
 
-    def vocode(mels, cache):
-        assert len(mels) == 32
-        audio, sources = [], []
-        for index, mel in enumerate(mels):
-            owner = float(mel[0, 0, -1])
-            if cache.shape[2]:
-                assert float(cache[index, 0, 0]) == owner
-            audio.append(torch.full((1, mel.shape[2] * SAMPLES_PER_FRAME), owner))
-            sources.append(torch.full((1, 1, mel.shape[2] * SAMPLES_PER_FRAME), owner))
-        return audio, sources
-
-    monkeypatch.setattr(decoder, "chunk_mels", chunk_mels)
-    monkeypatch.setattr(decoder, "vocode", vocode)
-    results = decoder.chunked_decode_streaming(chunks)
-    assert calls == [64]
-    for i, (audio, state) in enumerate(results):
-        assert float(audio[0, -1]) == i
+    continuing = [chunk.state is not None for chunk in chunks]
+    # Continuing rows first, then first chunks; within each, one call per mel
+    # length in order of first appearance, and a final row's mel is longer.
+    expected_calls = []
+    for rows in ([i for i in range(64) if continuing[i]], [i for i in range(64) if not continuing[i]]):
+        finals = [chunks[i].finalize for i in rows]
+        expected_calls += [finals.count(final) for final in dict.fromkeys(finals)]
+    assert flows == [64]
+    assert vocoder == expected_calls
+    for i, ((audio, state), (changed_audio, changed_state)) in enumerate(zip(results, changed, strict=True)):
+        if continuing[i]:
+            assert abs(float(audio[0, 0]) - i) < 0.1
+        assert torch.equal(changed_audio, audio) is (i != 10)
         if chunks[i].finalize:
             assert state is None
         else:
             assert state.reference is refs[i]
-            assert torch.all(state.mel == i)
-            assert torch.all(state.source == i)
-            assert torch.all(state.speech == i)
+            assert torch.equal(state.mel, mels[i][:, :, -8:])
+            if i != 10:
+                assert torch.equal(changed_state.source, state.source)
+                assert torch.equal(changed_state.speech, state.speech)

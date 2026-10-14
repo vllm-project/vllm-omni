@@ -7,12 +7,19 @@ import numpy as np
 import pyloudnorm
 import pytest
 import torch
+import torchaudio
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
-from vllm.multimodal.parse import MultiModalDataParser
+from torch import nn
 
+from tests.model_executor.models.chatterbox.helpers import (
+    write_model_dir,
+    write_s3gen_checkpoint,
+    write_voice_encoder,
+)
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
+    CONDITIONING_BATCH_SIZE,
     VoiceConditioner,
     VoiceConditioning,
     build_prompt,
@@ -25,10 +32,39 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
 )
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
-from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(scope="module")
+def conditioners(tmp_path_factory: pytest.TempPathFactory) -> dict[str, VoiceConditioner]:
+    """Each checkpoint's reference encoders, built by the conditioner from a model directory.
+
+    The directory holds what the conditioner reads, in the released files'
+    layout: ``ve.safetensors`` and the variant's S3Gen file, whose
+    ``tokenizer.*`` and ``speaker_encoder.*`` tensors come from the module
+    definitions with seeded initial weights. The S3 tokenizer is the
+    ``s3tokenizer`` package's own, which needs no download.
+    """
+    directory = write_model_dir(tmp_path_factory.mktemp("conditioner"))
+    write_voice_encoder(directory, seed=0)
+    built = {}
+    for variant in ("turbo", "original"):
+        config = ChatterboxConfig(variant)
+        write_s3gen_checkpoint(directory, config, seed=1)
+        built[variant] = VoiceConditioner(directory, config, torch.device("cpu"))
+    return built
+
+
+def tokenizer_calls(conditioner: VoiceConditioner) -> tuple[list[int], torch.utils.hooks.RemovableHandle]:
+    """The batch size of every S3 tokenizer quantization, from its encoder, which each one runs once."""
+    calls: list[int] = []
+
+    def encoder_input(module: nn.Module, inputs: tuple) -> None:
+        calls.append(inputs[0].shape[0])
+
+    return calls, conditioner.tokenizer.encoder.register_forward_pre_hook(encoder_input)
 
 
 def conditioning(cond_tokens: int, prompt_tokens: int) -> VoiceConditioning:
@@ -144,50 +180,52 @@ def test_voice_encoder_padded_batch_matches_individual_references() -> None:
     torch.testing.assert_close(batched, individual, atol=1e-6, rtol=1e-5)
 
 
-def test_tokenize_batch_uses_one_quantization_and_isolates_rows() -> None:
-    """The package supplies the real padding primitive; no weights are needed."""
-    import s3tokenizer
-
-    class Quantizer:
-        def __init__(self):
-            self.calls = 0
-
-        def quantize(self, mels, lengths):
-            self.calls += 1
-            assert mels.shape[0] == 2
-            return torch.arange(mels.shape[-1]).tile(2, 1), lengths // 4
-
-    conditioner = object.__new__(VoiceConditioner)
-    conditioner.s3tokenizer = s3tokenizer
-    conditioner.tokenizer = Quantizer()
-    conditioner.device = torch.device("cpu")
+def test_tokenize_batch_uses_one_quantization_and_isolates_rows(conditioners: dict[str, VoiceConditioner]) -> None:
+    """Both clips go through one quantization; each keeps its own length, and its own tensor."""
+    conditioner = conditioners["turbo"]
     wavs = [torch.randn(length) for length in (16000, 24000)]
-    tokens = conditioner.tokenize_batch(wavs, 30)
-    assert conditioner.tokenizer.calls == 1
+    calls, hook = tokenizer_calls(conditioner)
+    try:
+        tokens = conditioner.tokenize_batch(wavs, 30)
+    finally:
+        hook.remove()
+
+    assert calls == [2]
+    # 25 tokens a second; the second clip's 38 are cut to 30.
     assert [token.shape for token in tokens] == [(1, 25), (1, 30)]
     tokens[0].fill_(-1)
-    assert tokens[1].min() == 0
+    assert tokens[1].min() >= 0
 
 
-def test_prepare_batch_is_bounded_and_keeps_order() -> None:
-    from vllm_omni.model_executor.models.chatterbox.conditioning import CONDITIONING_BATCH_SIZE
+def test_prepare_batch_is_bounded_and_keeps_order(conditioners: dict[str, VoiceConditioner]) -> None:
+    """Seventeen references are encoded eight at a time, and each result is its own reference's.
 
-    class Conditioner(VoiceConditioner):
-        def __init__(self):
-            self.sizes = []
-
-        def resample(self, wav, sample_rate):
-            return wav, wav
-
-        def from_resampled_batch(self, clips):
-            self.sizes.append(len(clips))
-            return [int(wav[0]) for wav, _ in clips]
-
-    conditioner = Conditioner()
+    Each clip is 40 ms (one prompt token) longer than the one before, so the
+    prompt lengths show the order; one clip encoded alone shows a result in
+    a full batch is that clip's own.
+    """
+    conditioner = conditioners["turbo"]
+    rng = np.random.default_rng(4)
     count = CONDITIONING_BATCH_SIZE * 2 + 1
-    references = [(np.array([index]), 16000) for index in range(count)]
-    assert conditioner.prepare_batch(references) == list(range(count))
-    assert conditioner.sizes == [CONDITIONING_BATCH_SIZE, CONDITIONING_BATCH_SIZE, 1]
+    references = [
+        ((0.05 * rng.standard_normal(6 * 24000 + 960 * index)).astype(np.float32), 24000) for index in range(count)
+    ]
+    calls, hook = tokenizer_calls(conditioner)
+    try:
+        voices = conditioner.prepare_batch(references)
+    finally:
+        hook.remove()
+    (alone,) = conditioner.prepare_batch(references[3:4])
+
+    # Per batch, the conditioning tokens and the prompt tokens.
+    assert calls == [CONDITIONING_BATCH_SIZE] * 4 + [1, 1]
+    lengths = [voice.prompt_token.shape[1] for voice in voices]
+    assert lengths == list(range(lengths[0], lengths[0] + count))
+    assert torch.equal(voices[3].cond_tokens, alone.cond_tokens)
+    assert torch.equal(voices[3].prompt_token, alone.prompt_token)
+    assert torch.equal(voices[3].prompt_feat, alone.prompt_feat)
+    assert torch.equal(voices[3].embedding, alone.embedding)
+    torch.testing.assert_close(voices[3].speaker_emb, alone.speaker_emb, atol=1e-6, rtol=1e-5)
     assert conditioner.prepare_batch([]) == []
 
 
@@ -203,31 +241,16 @@ def test_original_text_helper_loads_local_tokenizer_and_normalizes_spaces(tmp_pa
     assert tokenize_text("hello world", loaded, "original") == [7]
 
 
-def unloaded_conditioner(variant: str) -> VoiceConditioner:
-    """The conditioner as ``__init__`` builds it, short of the checkpoint weights and the S3 tokenizer."""
-    conditioner = object.__new__(VoiceConditioner)
-    config = ChatterboxConfig(variant)
-    conditioner.config = config
-    conditioner.device = torch.device("cpu")
-    conditioner.to_24k = MultiModalDataParser(
-        target_sr=config.sample_rate, audio_resample_method="soxr"
-    ).audio_resampler
-    conditioner.to_16k = MultiModalDataParser(
-        target_sr=config.s3_sample_rate, audio_resample_method="soxr"
-    ).audio_resampler
-    conditioner.voice_encoder = VoiceEncoder(VoiceEncConfig()).eval()
-    conditioner.campplus = CAMPPlus(feat_dim=80, embedding_size=192, memory_efficient=False).eval()
-    return conditioner
-
-
-def test_a_reference_that_is_not_mono_is_refused_by_its_shape() -> None:
+def test_a_reference_that_is_not_mono_is_refused_by_its_shape(conditioners: dict[str, VoiceConditioner]) -> None:
     with pytest.raises(ValueError, match=re.escape("got shape (2, 24000)")):
-        unloaded_conditioner("turbo").resample(np.zeros((2, 24000), dtype=np.float32), 24000)
+        conditioners["turbo"].resample(np.zeros((2, 24000), dtype=np.float32), 24000)
 
 
-def test_turbo_needs_a_reference_longer_than_five_seconds_and_normalizes_it() -> None:
+def test_turbo_needs_a_reference_longer_than_five_seconds_and_normalizes_it(
+    conditioners: dict[str, VoiceConditioner],
+) -> None:
     """Upstream asserts the bound and normalizes the clip to -27 LUFS before encoding it."""
-    conditioner = unloaded_conditioner("turbo")
+    conditioner = conditioners["turbo"]
     wav = (0.05 * np.random.default_rng(1).standard_normal(5 * 24000 + 1)).astype(np.float32)
     with pytest.raises(ValueError, match="longer than 5 s, got 5.00 s"):
         conditioner.resample(wav[:-1], 24000)
@@ -238,34 +261,49 @@ def test_turbo_needs_a_reference_longer_than_five_seconds_and_normalizes_it() ->
     assert wav16.shape == (round(wav24.shape[0] * 16000 / 24000),)
 
 
-def test_original_takes_a_short_reference_as_it_is() -> None:
+def test_original_takes_a_short_reference_as_it_is(conditioners: dict[str, VoiceConditioner]) -> None:
     """Upstream's Original neither bounds the clip's length nor normalizes its loudness."""
     wav = (0.05 * np.random.default_rng(2).standard_normal(24000)).astype(np.float32)
 
-    wav24, _ = unloaded_conditioner("original").resample(wav, 24000)
+    wav24, _ = conditioners["original"].resample(wav, 24000)
 
     assert np.array_equal(wav24, wav)
 
 
-@pytest.mark.parametrize("extra", [1, -1], ids=["one token more than the mel", "one token fewer"])
-def test_the_prompt_mel_is_cut_to_two_frames_per_prompt_token(extra: int) -> None:
+# 24 kHz samples: the tokenizer gives one token more than the mel's frames
+# hold at the first two lengths and as many at the third, which is past the
+# ten seconds both are cut to. It never gives fewer (measured over two
+# seconds of lengths in 37-sample steps).
+@pytest.mark.parametrize(
+    ("samples", "extra"),
+    [(144259, 1), (239999, 1), (264000, 0)],
+    ids=["one token more", "one token more at the ten-second cut", "as many, past the cut"],
+)
+def test_the_prompt_mel_is_cut_to_two_frames_per_prompt_token(
+    conditioners: dict[str, VoiceConditioner], samples: int, extra: int
+) -> None:
     """``flow_mels`` writes the prompt mel over the first ``2 * P`` frames, so the two must agree.
 
-    The encoders run with their initial weights; the mel is the real one. The
-    tokenizer gives one token more, or one fewer, than the mel's frames hold.
+    The tokenizer and the mel are the real ones on the clip's first ten
+    seconds; the prompt keeps whole token pairs of mel frames.
     """
-    conditioner = unloaded_conditioner("turbo")
+    conditioner = conditioners["turbo"]
     config = conditioner.config
     rng = np.random.default_rng(3)
-    wav24 = (0.1 * rng.standard_normal(6 * config.sample_rate)).astype(np.float32)
-    wav16 = (0.1 * rng.standard_normal(6 * config.s3_sample_rate)).astype(np.float32)
-    mel = mel_spectrogram(torch.from_numpy(wav24)[None], **config.mel).transpose(1, 2)
-    tokens = torch.arange(mel.shape[1] // config.token_mel_ratio + extra)[None]
-    conditioner.tokenize_batch = lambda wavs, max_tokens: [tokens[:, :max_tokens] for _ in wavs]
+    wav24 = (0.1 * rng.standard_normal(samples)).astype(np.float32)
+    wav16 = (0.1 * rng.standard_normal(samples * 2 // 3)).astype(np.float32)
+    clip = torch.from_numpy(wav24[: config.dec_cond_seconds * config.sample_rate])
+    mel = mel_spectrogram(clip[None], **config.mel).transpose(1, 2)
+    (tokens,) = conditioner.tokenize_batch([torchaudio.functional.resample(clip, 24000, 16000)], None)
+    assert tokens.shape[1] - mel.shape[1] // config.token_mel_ratio == extra
 
     conditioning = conditioner.from_resampled(wav24, wav16)
 
     kept = min(tokens.shape[1], mel.shape[1] // config.token_mel_ratio)
+    assert conditioning.prompt_feat.shape[1] == config.token_mel_ratio * conditioning.prompt_token.shape[1]
     assert torch.equal(conditioning.prompt_token, tokens[:, :kept])
     assert torch.equal(conditioning.prompt_feat, mel[:, : config.token_mel_ratio * kept])
-    assert torch.equal(conditioning.cond_tokens, tokens[:, : config.cond_prompt_len])
+    (cond_tokens,) = conditioner.tokenize_batch(
+        [torch.from_numpy(wav16[: config.enc_cond_seconds * config.s3_sample_rate])], config.cond_prompt_len
+    )
+    assert torch.equal(conditioning.cond_tokens, cond_tokens)
