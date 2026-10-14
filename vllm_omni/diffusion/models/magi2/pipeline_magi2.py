@@ -8,9 +8,8 @@ The model, packing, scheduler, checkpoint mapping, and decoder integration are
 owned by vLLM-Omni.  SandAI's Apache-2.0 implementation was used as the
 accuracy reference, but is neither imported nor required at runtime.
 
-This first native integration intentionally supports the released Preview
-stage (272p and 540p).  The separately checkpointed 1080p refiner is not
-silently routed through an external implementation.
+The Preview stage generates 272p and 540p directly.  1080p refines a 540p
+Preview latent with the separately checkpointed refiner transformer.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import os
 import random
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar
@@ -35,6 +34,7 @@ from diffusers.utils import load_image
 from diffusers.video_processor import VideoProcessor
 from PIL import Image
 
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -52,6 +52,7 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
+    wrap_methods_by_paths,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -62,16 +63,22 @@ from .conditioning import Magi2Qwen35TextEncoder
 from .configuration_magi2 import (
     MAGI2_GENERATION_CONFIG,
     MAGI2_PREVIEW_CONFIG,
+    MAGI2_REFINER_CONFIG,
+    MAGI2_REFINER_GENERATION_CONFIG,
+    Magi2RefinerConfig,
 )
-from .parallel import get_magi2_replica_group
+from .parallel import get_magi2_replica_group, get_magi2_ulysses_group
 from .preview_data_proxy import Magi2DataProxy
+from .refiner_data_proxy import Magi2RefinerDataProxy
 from .sampler_magi2 import (
     CFGConfig,
     Magi2PreviewSampler,
     SamplerInput,
     build_magi2_preview_schedulers,
 )
+from .sampler_magi2_refiner import Magi2RefinerSampler, refiner_latent_size, upsample_and_renoise
 from .turbo_vae import Magi2TurboVAEDecoder
+from .window_attention import prewarm_window_attention
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +86,21 @@ MAGI2_MODEL_ID = "sand-ai/MAGI-2-preview"
 MAGI2_MODEL_REVISION = "2dea51b64db47ee5b4402d36fd90829a0c58913b"
 MAGI2_AUDIO_SAMPLE_RATE = MAGI2_GENERATION_CONFIG.audio_sample_rate
 
+# Requested output (width, height) of each resolution preset.
 _RESOLUTION_PRESETS: dict[str, tuple[int, int]] = {
     "272p": (448, 256),
     "540p": (896, 512),
+    "1080p": (1920, 1088),
 }
 _PRESET_BY_SIZE = {size: name for name, size in _RESOLUTION_PRESETS.items()}
+# Presets the refiner produces, and the Preview size each one refines.
+_REFINER_PREVIEW_SIZES: dict[str, tuple[int, int]] = {
+    "1080p": (896, 512),
+}
+
+# Window-attention kernel configurations compiled by this process, keyed by
+# device, per-rank query and key/value heads, head size and dtype.
+_PREWARMED_WINDOW_ATTENTION: set[tuple[object, ...]] = set()
 
 _REQUIRED_CHECKPOINT_PATHS = (
     "preview/model.safetensors.index.json",
@@ -171,15 +188,21 @@ def _env_flag(value: object, *, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _resolve_native_resolution(sampling: object, extra: Mapping[str, object]) -> tuple[str, int, int]:
-    """Resolve MAGI-2 generation geometry from the shared sampling fields."""
+def _resolve_native_resolution(
+    sampling: object,
+    extra: Mapping[str, object],
+) -> tuple[str, tuple[int, int], tuple[int, int]]:
+    """Resolve MAGI-2 generation geometry from the shared sampling fields.
+
+    Returns the preset name, its output ``(width, height)`` and the
+    ``(width, height)`` the Preview stage generates, which differs from the
+    output size only for refined presets.
+    """
     resolution_value = extra.get("resolution")
     resolution = None if resolution_value is None else str(resolution_value).lower()
     if resolution is not None and resolution not in _RESOLUTION_PRESETS:
         raise OmniClientError(
-            f"Unsupported native MAGI-2 resolution {resolution!r}; choose "
-            f"from {sorted(_RESOLUTION_PRESETS)}. The 1080p refiner is not "
-            "part of the Preview-only native PR."
+            f"Unsupported native MAGI-2 resolution {resolution!r}; choose from {sorted(_RESOLUTION_PRESETS)}."
         )
 
     requested_width = getattr(sampling, "width", None)
@@ -213,8 +236,21 @@ def _resolve_native_resolution(sampling: object, extra: Mapping[str, object]) ->
             f"got {requested_size[0]}x{requested_size[1]}."
         )
 
-    width, height = _RESOLUTION_PRESETS[resolution]
-    return resolution, width, height
+    size = _RESOLUTION_PRESETS[resolution]
+    return resolution, size, _REFINER_PREVIEW_SIZES.get(resolution, size)
+
+
+def _positive_request_int(value: object, name: str) -> int:
+    message = f"MAGI-2 {name} must be a positive integer; got {value!r}."
+    if isinstance(value, bool):
+        raise OmniClientError(message)
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise OmniClientError(message) from exc
+    if number <= 0 or (isinstance(value, float) and value != number):
+        raise OmniClientError(message)
+    return number
 
 
 def _resolve_checkpoint_root(model: str, revision: str | None) -> str:
@@ -529,6 +565,21 @@ class Magi2Pipeline(
         )
     )
 
+    _PROFILER_TARGETS: ClassVar[list[str]] = [
+        "_encode_prompts",
+        "_encode_reference_image",
+        "_pool_figure_token",
+        "sampler.sample",
+        "_evaluate_refiner",
+        "_decode_video",
+        "_decode_audio",
+    ]
+    # Wrapped when the first refined request builds the refiner sampler.
+    _REFINER_PROFILER_TARGETS: ClassVar[list[str]] = [
+        "refiner_sampler.sample",
+        "refiner_sampler.denoise_step",
+    ]
+
     @staticmethod
     def _remap_ckpt_key(checkpoint_key: str) -> str | None:
         """Map released Preview keys to the native pipeline namespace.
@@ -670,6 +721,10 @@ class Magi2Pipeline(
             self.device_str,
             pin_memory=pin_memory,
         )
+        # The 1080p refiner stage is built by the first refined request.
+        self.refiner: _Magi2StagedComponent | None = None
+        self.refiner_data_proxy: Magi2RefinerDataProxy | None = None
+        self.refiner_sampler: Magi2RefinerSampler | None = None
 
         self.video_processor = VideoProcessor(vae_scale_factor=2 * MAGI2_GENERATION_CONFIG.video_vae_stride[1])
         self.weights_sources = [
@@ -682,14 +737,7 @@ class Magi2Pipeline(
             )
         ]
         self.setup_diffusion_pipeline_profiler(
-            profiler_targets=[
-                "_encode_prompts",
-                "_encode_reference_image",
-                "_pool_figure_token",
-                "sampler.sample",
-                "_decode_video",
-                "_decode_audio",
-            ],
+            profiler_targets=list(self._PROFILER_TARGETS),
             enable_diffusion_pipeline_profiler=bool(getattr(od_config, "enable_diffusion_pipeline_profiler", False)),
         )
 
@@ -734,6 +782,73 @@ class Magi2Pipeline(
         loaded = self.transformer.load_weights(stripped_weights())
         return {prefix + name for name in loaded}
 
+    def _validate_refiner_topology(self) -> None:
+        parallel = self.od_config.parallel_config
+        tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+        sp_size = int(getattr(parallel, "sequence_parallel_size", 1) or 1)
+        if tp_size != 1:
+            raise OmniClientError(
+                "MAGI-2 1080p replicates the refiner on every rank and needs tensor_parallel_size=1; "
+                f"got {tp_size}. Restart with tensor_parallel_size=1, or request 272p or 540p."
+            )
+        num_heads_kv = MAGI2_REFINER_CONFIG.num_heads_kv
+        if num_heads_kv % sp_size:
+            supported = [size for size in range(1, num_heads_kv + 1) if num_heads_kv % size == 0]
+            raise OmniClientError(
+                f"MAGI-2 1080p splits the refiner's {num_heads_kv} key/value heads across the sequence-parallel "
+                f"ranks; sequence_parallel_size={sp_size} does not divide them. Restart with one of {supported}, "
+                "or request 272p or 540p."
+            )
+        strategy = resolve_offload(self.od_config).strategy
+        if strategy in (OffloadStrategy.LAYER_WISE, OffloadStrategy.DISTRIBUTED_LAYER_WISE):
+            raise OmniClientError(
+                f"MAGI-2 1080p is not available with {strategy.value} offload of the Preview transformer. "
+                "Restart without layer offload, or request 272p or 540p."
+            )
+        if getattr(parallel, "use_hsdp", False):
+            raise OmniClientError(
+                "MAGI-2 1080p is not available with HSDP of the Preview transformer. "
+                "Restart without HSDP, or request 272p or 540p."
+            )
+
+    def _load_refiner(self) -> None:
+        """Build the refiner stage on the first refined request.
+
+        The refiner transformer is built on the host, strictly loaded from
+        ``<checkpoint>/refiner`` and staged like the auxiliary components;
+        its data proxy and sampler are built with it.  Later calls return
+        at once, and deployments that never refine hold none of it.
+        """
+
+        if getattr(self, "refiner", None) is not None:
+            return
+        self._validate_refiner_topology()
+        from .modeling_magi2_refiner import CHECKPOINT_INDEX_FILE, Magi2RefinerTransformer
+
+        refiner_root = Path(self.checkpoint_root) / "refiner"
+        if not (refiner_root / CHECKPOINT_INDEX_FILE).is_file():
+            raise OmniClientError(
+                f"MAGI-2 1080p needs the refiner checkpoint, and {refiner_root / CHECKPOINT_INDEX_FILE} "
+                "does not exist. Use the complete MAGI-2 snapshot, or request 272p or 540p."
+            )
+        # Requests run under inference mode; build the refiner with ordinary
+        # tensors, as the components built at startup are.
+        with torch.inference_mode(False):
+            with set_current_diffusion_config(self.od_config), torch.device("cpu"):
+                refiner = Magi2RefinerTransformer(MAGI2_REFINER_CONFIG)
+            refiner.load_checkpoint(refiner_root)
+            staged = _Magi2StagedComponent(
+                refiner,
+                self.device_str,
+                pin_memory=bool(getattr(self.od_config, "pin_cpu_memory", True)),
+            )
+        data_proxy = Magi2RefinerDataProxy(refiner.config)
+        self.refiner_data_proxy = data_proxy
+        self.refiner_sampler = Magi2RefinerSampler(refiner, data_proxy)
+        if getattr(self, "enable_diffusion_pipeline_profiler", False):
+            wrap_methods_by_paths(self, list(self._REFINER_PROFILER_TARGETS))
+        self.refiner = staged
+
     @contextmanager
     def _component_on_device(self, component: _Magi2StagedComponent):
         component.load_to_device()
@@ -742,6 +857,20 @@ class Magi2Pipeline(
         finally:
             if self._offload_aux_after_use:
                 component.offload_to_cpu()
+
+    @contextmanager
+    def _refiner_memory_window(self) -> Iterator[nn.Module]:
+        """Hold the refiner on the device for one refinement.
+
+        The Preview transformer stays resident.  The refiner is staged in
+        once on entry and staged out on exit; the window yields the refiner
+        transformer.
+        """
+
+        if self.refiner is None:
+            raise RuntimeError("the MAGI-2 refiner is not loaded")
+        with self._component_on_device(self.refiner) as refiner:
+            yield refiner
 
     @contextmanager
     def _conditioning_memory_window(self):
@@ -903,6 +1032,56 @@ class Magi2Pipeline(
         target_length = int(audio.shape[0] * 441 / 512)
         return resample(audio, target_length)
 
+    @staticmethod
+    def _prewarm_refiner_attention(config: Magi2RefinerConfig, device: torch.device) -> None:
+        """Compile the refiner's window-attention kernels for this rank once per process."""
+
+        ulysses_size = get_magi2_ulysses_group().world_size
+        key = (
+            torch.device(device),
+            config.num_heads_q // ulysses_size,
+            config.num_heads_kv // ulysses_size,
+            config.head_dim,
+            config.params_dtype,
+        )
+        if key in _PREWARMED_WINDOW_ATTENTION:
+            return
+        prewarm_window_attention(*key, window=config.window)
+        _PREWARMED_WINDOW_ATTENTION.add(key)
+
+    def _evaluate_refiner(
+        self,
+        latent: torch.Tensor,
+        context: torch.Tensor,
+        context_null: torch.Tensor,
+        *,
+        width: int,
+        height: int,
+        num_inference_steps: int,
+    ) -> torch.Tensor:
+        """Refine a Preview video latent to a ``width`` x ``height`` output.
+
+        The latent is upsampled to the refiner grid and renoised with the
+        next draw of its device's default generator, then refined in
+        ``num_inference_steps`` steps guided by ``context`` against
+        ``context_null``.  Returns the fp32 refined latent.
+        """
+
+        if self.refiner_sampler is None or self.refiner_data_proxy is None:
+            raise RuntimeError("the MAGI-2 refiner is not loaded")
+        grid = refiner_latent_size(latent.shape[2], height, width)
+        with self._refiner_memory_window() as refiner:
+            self._prewarm_refiner_attention(refiner.config, latent.device)
+            for text in (context, context_null):
+                self.refiner_data_proxy.window_plan(grid, text.shape[-2], latent.device)
+            renoised = upsample_and_renoise(latent, grid)
+            return self.refiner_sampler.sample(
+                renoised,
+                context,
+                context_null,
+                num_inference_steps=num_inference_steps,
+            )
+
     @torch.inference_mode()
     def _evaluate_preview(
         self,
@@ -912,7 +1091,15 @@ class Magi2Pipeline(
         width: int,
         height: int,
         num_inference_steps: int,
+        refiner_size: tuple[int, int] | None = None,
+        refiner_num_inference_steps: int = MAGI2_REFINER_GENERATION_CONFIG.num_inference_steps,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Generate a clip with the Preview at ``width`` x ``height``.
+
+        With ``refiner_size`` (output ``(width, height)``), the refiner then
+        refines the Preview video latent to that size in
+        ``refiner_num_inference_steps`` steps before decoding.
+        """
         ref_image_feat = None
         ref_image_feat_len = None
         if image is not None:
@@ -993,6 +1180,16 @@ class Magi2Pipeline(
             ref_image_special_token_embedding=special,
         )
         latent, audio_latent = self.sampler.sample(sampler_input)
+        if refiner_size is not None:
+            refiner_width, refiner_height = refiner_size
+            latent = self._evaluate_refiner(
+                latent,
+                context,
+                context_null,
+                width=refiner_width,
+                height=refiner_height,
+                num_inference_steps=refiner_num_inference_steps,
+            )
         video = self._decode_video(latent)
         audio = self._decode_audio(audio_latent)
         return video, audio
@@ -1035,32 +1232,51 @@ class Magi2Pipeline(
             image_value = extra.get("image_path")
         image = _single_image(image_value)
 
-        _, width, height = _resolve_native_resolution(sampling, extra)
-        if _env_flag(extra.get("use_refiner")):
+        resolution, (width, height), (preview_width, preview_height) = _resolve_native_resolution(sampling, extra)
+        refine = resolution in _REFINER_PREVIEW_SIZES
+        use_refiner = extra.get("use_refiner")
+        if use_refiner is not None and _env_flag(use_refiner) != refine:
             raise OmniClientError(
-                "The MAGI-2 1080p refiner is a separate model and is not yet enabled by the native Preview pipeline."
+                f"MAGI-2 runs the refiner for {', '.join(sorted(_REFINER_PREVIEW_SIZES))} only; "
+                f"use_refiner={use_refiner!r} conflicts with resolution {resolution!r}."
             )
         seconds = float(extra.get("seconds", extra.get("duration", 10.0)))
         if not math.isfinite(seconds) or seconds != 10.0:
-            raise OmniClientError("MAGI-2 Preview supports 10-second clips only")
+            raise OmniClientError("MAGI-2 supports 10-second clips only")
 
+        # The refiner doubles the Preview's frame rate over the same duration.
+        output_config = MAGI2_REFINER_GENERATION_CONFIG if refine else MAGI2_GENERATION_CONFIG
+        output_fps, output_frames = output_config.fps, output_config.output_frames
         requested_fps = getattr(sampling, "resolved_frame_rate", None)
         if requested_fps is None:
             requested_fps = getattr(sampling, "frame_rate", None)
         if requested_fps is None:
             requested_fps = getattr(sampling, "fps", None)
-        if requested_fps is not None and float(requested_fps) != 12.5:
-            raise OmniClientError(f"MAGI-2 Preview output is fixed at 12.5 fps; got {requested_fps}.")
+        if requested_fps is not None and float(requested_fps) != output_fps:
+            raise OmniClientError(f"MAGI-2 {resolution} output is fixed at {output_fps:g} fps; got {requested_fps}.")
         requested_frames = getattr(sampling, "num_frames", None)
         # ``1`` is the shared image-model engine default and therefore means
         # unset here. Serving validates an explicitly supplied frame count
         # before applying MAGI-2's model-owned default.
-        if requested_frames not in {None, 1, 125}:
-            raise OmniClientError(f"MAGI-2 Preview output is fixed at 125 frames; got {requested_frames}.")
+        if requested_frames not in {None, 1, output_frames}:
+            raise OmniClientError(
+                f"MAGI-2 {resolution} output is fixed at {output_frames} frames; got {requested_frames}."
+            )
         requested_steps = sampling.num_inference_steps
         steps = MAGI2_GENERATION_CONFIG.preview_steps if requested_steps is None else int(requested_steps)
         if steps <= 0:
             raise OmniClientError("MAGI-2 inference steps must be positive")
+        requested_refiner_steps = extra.get("refiner_num_inference_steps")
+        if requested_refiner_steps is not None and not refine:
+            raise OmniClientError(
+                f"MAGI-2 refiner_num_inference_steps applies to {', '.join(sorted(_REFINER_PREVIEW_SIZES))} only; "
+                f"got resolution {resolution!r}."
+            )
+        refiner_steps = (
+            MAGI2_REFINER_GENERATION_CONFIG.num_inference_steps
+            if requested_refiner_steps is None
+            else _positive_request_int(requested_refiner_steps, "refiner inference steps")
+        )
 
         output_width = extra.get("output_width")
         output_height = extra.get("output_height")
@@ -1081,6 +1297,11 @@ class Magi2Pipeline(
                 "MAGI-2 deterministic mode is fixed at worker startup; restart "
                 "with MAGI2_DETERMINISTIC set to the requested value."
             )
+        # The one-time refiner build draws its initial weights from the host
+        # generator; it precedes seeding so every generator starts the request
+        # from the request seed alone.
+        if refine:
+            self._load_refiner()
         seed = _resolve_request_seed(sampling)
         _seed_request(seed)
 
@@ -1105,9 +1326,11 @@ class Magi2Pipeline(
             video, audio = self._evaluate_preview(
                 prompt=prompt,
                 image=image,
-                width=width,
-                height=height,
+                width=preview_width,
+                height=preview_height,
                 num_inference_steps=steps,
+                refiner_size=(width, height) if refine else None,
+                refiner_num_inference_steps=refiner_steps,
             )
             if has_accelerator:
                 torch.accelerator.synchronize()
@@ -1137,7 +1360,7 @@ class Magi2Pipeline(
             output={
                 "payload": {"video": video, "audio": audio},
                 "metadata": {
-                    "video": {"fps": 12.5},
+                    "video": {"fps": output_fps},
                     "audio": {"sample_rate": MAGI2_AUDIO_SAMPLE_RATE},
                 },
             },
