@@ -118,6 +118,18 @@ def _default_result_dir() -> Path:
     return Path(__file__).resolve().parent / "results" / "qwen_omni_acc"
 
 
+def _store_accuracy_baseline(path: Path, data: dict[str, Any], baseline: dict[str, Any]) -> None:
+    """Write the gates used for this run into the bench result JSON.
+
+    ``vllm bench serve`` saves measured scores only. The thresholds from the
+    accuracy test (``--min-daily-omni-accuracy``, ``--max-seed-tts-mean-wer``, …)
+    are applied afterwards, so persist them under ``baseline`` before the check.
+    Unset optional gates (``None``) are omitted.
+    """
+    data["baseline"] = {key: value for key, value in baseline.items() if value is not None}
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
     errs: list[str] = []
     acc = result.get("daily_omni_accuracy")
@@ -671,6 +683,11 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_daily_omni(ns, vllm)
             print(f"\n[Daily-Omni] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
+            _store_accuracy_baseline(
+                path,
+                data,
+                {"min_daily_omni_accuracy": ns.min_daily_omni_accuracy},
+            )
             errs = _validate_daily_omni(data, min_accuracy=ns.min_daily_omni_accuracy)
             if errs:
                 failed.extend([f"[Daily-Omni] {e}" for e in errs])
@@ -685,6 +702,11 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_videomme(ns, vllm)
             print(f"\n[Video-MME] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
+            _store_accuracy_baseline(
+                path,
+                data,
+                {"min_videomme_accuracy": ns.min_videomme_accuracy},
+            )
             errs = _validate_videomme(data, min_accuracy=ns.min_videomme_accuracy)
             if errs:
                 failed.extend([f"[Video-MME] {e}" for e in errs])
@@ -700,6 +722,15 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_seed_tts(ns, vllm)
             print(f"\n[Seed-TTS] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
+            _store_accuracy_baseline(
+                path,
+                data,
+                {
+                    "max_seed_tts_mean_wer": ns.max_seed_tts_mean_wer,
+                    "min_seed_tts_mean_sim": ns.min_seed_tts_mean_sim,
+                    "min_seed_tts_mean_utmos": ns.min_seed_tts_mean_utmos,
+                },
+            )
             errs = _validate_seed_tts(
                 data,
                 max_mean_wer=ns.max_seed_tts_mean_wer,
