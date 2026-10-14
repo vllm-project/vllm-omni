@@ -66,29 +66,10 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         prewarmed = prewarmed_frames or {}
         if frame_indices is None:
-            frame_indices = self._sample_frame_indices(frame_buffer, config.num_frames, prewarmed)
-        user_content: list[dict] = []
-        for index in frame_indices:
-            frame_b64 = frame_buffer[index]
-            cached = prewarmed.get(frame_b64)
-            if cached is not None:
-                # The shared selector excludes failed decodes before this point.
-                assert isinstance(cached, tuple)
-                pil, pil_uuid = cached
-                user_content.append(
-                    {
-                        "type": "image_pil",
-                        "image_pil": pil,
-                        "uuid": pil_uuid,
-                    }
-                )
-            else:
-                user_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                    }
-                )
+            frame_indices = self._select_frame_indices(config, frame_buffer, prewarmed)
+        frames = [frame_buffer[index] for index in frame_indices]
+
+        user_content: list[dict] = self._build_frame_image_parts(frames, prewarmed)
 
         if len(audio_buffer) > 0:
             wav_b64 = self._pcm_to_wav_b64(bytes(audio_buffer))
@@ -107,14 +88,7 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         user_message: dict[str, Any] = {"role": "user", "content": user_content}
 
-        messages: list[dict[str, Any]] = []
-        if config.system_prompt:
-            messages.append({"role": "system", "content": config.system_prompt})
-
-        recent_history = message_history[-2:] if len(message_history) > 2 else message_history
-        for hist_msg in recent_history:
-            messages.append(self._text_only_message(hist_msg))
-
+        messages = self._history_prefix_messages(config, message_history)
         messages.append(user_message)
 
         return messages, user_message

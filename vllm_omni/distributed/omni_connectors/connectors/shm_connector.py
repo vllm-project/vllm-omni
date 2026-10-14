@@ -200,7 +200,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            self.reap_consumed()
+            # Keep per-send housekeeping small when unread chunks accumulate.
+            # Explicit sweeps retain a larger budget to drain stale records.
+            self.reap_consumed(max_keys=4)
             payload = self.serialize_obj(data)
             size = len(payload)
 
@@ -307,9 +309,13 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
         return result
 
-    def cleanup(self, request_id: str) -> None:
-        """Unlink the exact key passed to ``put()``, never a request-id prefix."""
+    def cleanup(self, request_id: str) -> bool:
+        """Unlink the exact key passed to ``put()``, never a request-id prefix.
+
+        Returns True when an unconsumed segment was actually unlinked.
+        """
         key = request_id
+        unlinked = False
         with self._pending_keys_lock:
             self._pending_keys.pop(key, None)
             try:
@@ -317,6 +323,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 seg.close()
                 seg.unlink()
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+                unlinked = True
             except FileNotFoundError:
                 pass
             except Exception as e:
@@ -327,6 +334,18 @@ class SharedMemoryConnector(OmniConnectorBase):
                     os.remove(lock_file)
                 except OSError:
                     pass
+        return unlinked
+
+    def cleanup_prefix(self, key_prefix: str) -> int:
+        """Unlink every tracked key of the form ``{key_prefix}{chunk_id}``.
+
+        Only keys still in ``_pending_keys`` are considered, and the suffix
+        must be a bare integer chunk id, so another request whose id merely
+        shares the prefix is never matched. Returns the unlinked count.
+        """
+        with self._pending_keys_lock:
+            keys = [k for k in self._pending_keys if k.startswith(key_prefix) and k[len(key_prefix) :].isdigit()]
+        return sum(self.cleanup(key) for key in keys)
 
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""
@@ -336,10 +355,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             self.cleanup(key)
         self._close_wakeups()
 
-    def reap_consumed(self) -> None:
+    def reap_consumed(self, *, max_keys: int = 64) -> None:
         """Bounded round-robin sweep; receivers unlink SHM in another process."""
         with self._pending_keys_lock:
-            for _ in range(min(64, len(self._pending_keys))):
+            for _ in range(min(max_keys, len(self._pending_keys))):
                 key, _ = self._pending_keys.popitem(last=False)
                 if os.path.exists(f"/dev/shm/{key}"):
                     self._pending_keys[key] = None

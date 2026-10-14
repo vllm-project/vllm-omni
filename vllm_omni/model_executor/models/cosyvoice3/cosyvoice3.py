@@ -28,7 +28,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -42,7 +41,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
-from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP_K, fused_ras_sample
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
@@ -68,10 +67,37 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
+# vLLM stacks these Qwen2 projections; the checkpoint carries one tensor per shard.
+_QWEN2_STACKED_SHARDS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
+
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
 # feat_extractor, campplus session/engine). The mm processor is re-created per
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
 _RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
+
+
+def _normalize_request_conditioning(payload: dict) -> dict:
+    """Unwrap singleton conditioning containers at the per-request boundary.
+
+    A processor/prefix-cache passthrough can retain a one-item tensor list.
+    The code2wav schema consumes one request, so that wrapper carries no
+    batch dimension. A multi-item list here is an unsplit batch and must
+    fail instead of silently choosing another request's voice.
+    """
+    embed = payload.get("embed")
+    if not isinstance(embed, Mapping):
+        return payload
+    normalized = dict(embed)
+    for key in ("speech_token", "speech_feat", "embedding", "speech_token_len"):
+        value = normalized.get(key)
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise ValueError(f"CosyVoice3 per-request {key} contains an unsplit batch of {len(value)} items")
+            normalized[key] = value[0]
+    return {**payload, "embed": normalized}
 
 
 def _cosyvoice3_trt_enabled() -> bool:
@@ -675,7 +701,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         ]
 
 
-class CosyVoice3DummyInputsBuilder(BaseDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):
+class CosyVoice3DummyInputsBuilder(OmniDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return "Hello, this is a test of the CosyVoice3 system capability."
 
@@ -725,6 +751,13 @@ class CosyVoice3Model(
     _sampling_eps = 1e-5
 
     @property
+    def owns_generation_output_storage(self) -> bool:
+        """Expose the codec's ownership contract on the model seen by the runner."""
+        return self.model_stage == "cosyvoice3_code2wav" and (
+            getattr(self.code2wav, "owns_generation_output_storage", False) is True
+        )
+
+    @property
     def logits_vocab_size(self) -> int | None:
         """Width of the logits ``compute_logits`` returns (the speech head).
 
@@ -752,6 +785,10 @@ class CosyVoice3Model(
         self.model_dir = model_dir
         self.model = None
         if self.model_stage == "cosyvoice3_talker":
+            # Code2Wav consumes sampled tokens and prompt conditioning, not
+            # hidden states. The processor opts into token-only chunk updates.
+            if getattr(vllm_config.model_config, "async_chunk", False):
+                self.omni_pooler_payload_include_hidden = False
             # Initialize talker stage (text to speech tokens)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import CosyVoice3LM, VLLMQwen2Encoder
 
@@ -769,6 +806,10 @@ class CosyVoice3Model(
             # KV cache is now managed externally by vLLM's PagedAttention
             # No need for self.llm_cache
             self.model = self.talker
+            # The talker consumes only llm.pt; without this override the
+            # default loader streams every *.pt in the model dir (flow.pt,
+            # hift.pt) into load_weights, whose keys belong to other stages.
+            self.allow_patterns_overrides = ["llm.pt"]
         elif self.model_stage == "cosyvoice3_code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
@@ -1501,9 +1542,10 @@ class CosyVoice3Model(
             # [total_tokens, hidden]
             hidden_states = self.model.llm(inputs_embeds, positions)
 
-            if getattr(self, "_mrv2_tensor_output", False) or cosyvoice3_packed_inference_enabled():
-                return hidden_states
-            return self.make_omni_output(hidden_states, **kwargs)
+            # Both runners attach the live step's conditioning after replay.
+            # Capturing an OmniOutput here would retain the dummy prefill lists
+            # and re-emit them during decode, replacing the real reference.
+            return hidden_states
         elif self.model_stage == "cosyvoice3_code2wav":
             # Lazily swap the flow-decoder estimator to a TensorRT engine on the
             # first code2wav step (after weights are loaded), gated by the same
@@ -1539,7 +1581,7 @@ class CosyVoice3Model(
 
             for idx, req_ids in enumerate(request_ids_list):
                 raw = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
-                payload = to_struct(raw)
+                payload = to_struct(_normalize_request_conditioning(raw))
                 meta = payload.meta
                 embed = payload.embed
 
@@ -1690,44 +1732,112 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str] | None:
         if self.model_stage == "cosyvoice3_talker":
-            # Load weights for text to speech LM stage using vLLM's weight loading
-            llm_weight_path = os.path.join(self.model_dir, "llm.pt")
-            device = next(self.parameters()).device
-            checkpoint = torch.load(llm_weight_path, map_location=device)
-
-            # 1. Load Qwen2 model weights into vLLM's Qwen2Model
-            # The checkpoint has prefix "llm.model.model." for the transformer weights
-            # vLLM's Qwen2Model expects just the model structure without extra prefixes
-            qwen_weights = []
-            for name, weight in checkpoint.items():
-                if name.startswith("llm.model.model."):
-                    # Strip prefix: llm.model.model.X -> X (for vLLM's Qwen2Model)
-                    vllm_name = name.replace("llm.model.model.", "")
-                    qwen_weights.append((vllm_name, weight))
-
-            # Use vLLM's built-in load_weights which handles stacked params
-            # (q_proj+k_proj+v_proj -> qkv_proj, gate_proj+up_proj -> gate_up_proj)
-            self.model.llm.model.load_weights(iter(qwen_weights))
-
-            # 2. Load CosyVoice3LM-specific weights (speech_embedding, llm_decoder)
-            speech_emb_state = {
-                k.replace("speech_embedding.", ""): v
-                for k, v in checkpoint.items()
-                if k.startswith("speech_embedding.")
-            }
-            self.model.speech_embedding.load_state_dict(speech_emb_state)
-
-            llm_decoder_state = {
-                k.replace("llm_decoder.", ""): v for k, v in checkpoint.items() if k.startswith("llm_decoder.")
-            }
-            self.model.llm_decoder.load_state_dict(llm_decoder_state)
-
-            self.model.to(device).eval()
+            # Consume the provided iterator when it yields tensors; fall back
+            # to reading llm.pt from the model dir when it is empty (e.g. the
+            # dummy load format). Previously the iterator was silently
+            # discarded and the file was re-read on every call, so runtime
+            # weight updates (RL training loops, in-place reloads) were
+            # reverted to the on-disk checkpoint without any error.
+            weights = list(weights)
+            # The first load must cover every talker-specific parameter, as
+            # the strict load_state_dict path did; later calls may carry any
+            # subset. The flag is set only once a load has succeeded.
+            first_load = not getattr(self, "_talker_weights_loaded", False)
+            if weights:
+                self._load_talker_weights(weights, require_complete=first_load)
+            elif first_load:
+                llm_weight_path = os.path.join(self.model_dir, "llm.pt")
+                device = next(self.parameters()).device
+                checkpoint = torch.load(llm_weight_path, map_location=device)
+                self._load_talker_weights(checkpoint.items(), require_complete=True)
+                self.model.to(device)
+            self._talker_weights_loaded = True
+            self.model.eval()
         elif self.model_stage == "cosyvoice3_code2wav":
             # Load weights for code2wav stage (flow + hift)
             device = next(self.parameters()).device
             self.code2wav.load_weights(self.model_dir, device)
         else:
             raise ValueError(f"{self.model_stage} not supported yet!")
+        # None keeps the loader's strict loaded-weights tracking off: the
+        # tracker compares module-path parameter names, while this model
+        # consumes checkpoint-schema names (and deliberately leaves the
+        # unused text lm_head uninitialized on the talker stage).
+        return None
+
+    def _load_talker_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        require_complete: bool = False,
+    ) -> None:
+        """Load checkpoint-schema tensors into the live talker modules.
+
+        Names follow the native ``llm.pt`` layout: ``llm.model.model.*`` for
+        the transformer (loaded via vLLM's Qwen2 loader, which handles the
+        qkv_proj/gate_up_proj stacked params), ``speech_embedding.*`` and
+        ``llm_decoder.*`` for the talker-specific modules, and
+        ``llm.model.lm_head.*`` (the text head), which the talker never uses
+        and is skipped. Accepts the full checkpoint or any subset, e.g.
+        buckets streamed by a weight-update loop, and loads in place so
+        CUDA graphs stay valid.
+
+        With ``require_complete`` every ``speech_embedding.*`` and
+        ``llm_decoder.*`` parameter and every transformer tensor must be
+        present, counting each shard of a stacked parameter separately.
+        Names and shapes are validated before anything is copied, so a
+        rejected call leaves the talker untouched.
+        """
+        talker_params = {
+            f"{module_name}.{attr}": param
+            for module_name in ("speech_embedding", "llm_decoder")
+            for attr, param in getattr(self.model, module_name).named_parameters()
+        }
+        qwen_weights: list[tuple[str, torch.Tensor]] = []
+        talker_updates: dict[str, torch.Tensor] = {}
+        for name, tensor in weights:
+            if name.startswith("llm.model.model."):
+                qwen_weights.append((name[len("llm.model.model.") :], tensor))
+            elif name in talker_params:
+                talker_updates[name] = tensor
+            elif name.startswith("llm.model.lm_head."):
+                continue
+            else:
+                raise ValueError(f"unexpected CosyVoice3 talker checkpoint tensor {name!r}")
+
+        if require_complete:
+            missing = sorted(talker_params.keys() - talker_updates.keys())
+            qwen_names = {name for name, _ in qwen_weights}
+            missing += sorted(
+                f"llm.model.model.{name}" for name in self._talker_transformer_tensor_names() - qwen_names
+            )
+            if missing:
+                raise ValueError(f"CosyVoice3 talker checkpoint is missing required tensors: {missing}")
+        # copy_ broadcasts, so compare shapes explicitly before copying.
+        mismatched = [
+            f"{name}: checkpoint {tuple(tensor.shape)} vs parameter {tuple(talker_params[name].shape)}"
+            for name, tensor in talker_updates.items()
+            if tensor.shape != talker_params[name].shape
+        ]
+        if mismatched:
+            raise ValueError(f"CosyVoice3 talker checkpoint tensor shape mismatch: {'; '.join(mismatched)}")
+
+        for name, tensor in talker_updates.items():
+            param = talker_params[name]
+            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+        if qwen_weights:
+            self.model.llm.model.load_weights(iter(qwen_weights))
+
+    def _talker_transformer_tensor_names(self) -> set[str]:
+        """Checkpoint names the talker transformer needs, one per stacked shard."""
+        names: set[str] = set()
+        for name, _ in self.model.llm.model.named_parameters():
+            for stacked, shards in _QWEN2_STACKED_SHARDS.items():
+                if f".{stacked}." in f".{name}":
+                    names.update(name.replace(stacked, shard) for shard in shards)
+                    break
+            else:
+                names.add(name)
+        return names

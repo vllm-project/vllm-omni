@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -93,6 +93,8 @@ class DistributedAutoencoderKLFlux2(DistributedAutoencoderKL_base, AutoencoderKL
         return enc
 
     def decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
+        if self.distributed_executor.parallel_mode == "batch":
+            return self._batch_parallel_decode(z, return_dict, *args, **kwargs)
         if not self.is_distributed_enabled():
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
 

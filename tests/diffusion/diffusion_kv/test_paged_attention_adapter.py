@@ -1253,14 +1253,15 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         speculative_config=None,
     )
 
-    def select_backend(*, backend, attn_selector_config, num_heads):
-        # Exercise the real 0.29 selector, replacing only platform resolution.
+    def select_backend(*, backend, attn_selector_config, num_heads, _run_kv_cache_dtype):
+        # Exercise the real upstream selector, replacing only platform resolution.
         # Ulysses has already gathered tokens and sharded heads before the
         # native kernel; the MoE PCP mapping must not request PCP attention.
         assert not attn_selector_config.use_pcp
         assert not attn_selector_config.use_dcp
         assert attn_selector_config.use_non_causal
         assert num_heads == 4
+        assert _run_kv_cache_dtype == config.cache_config.cache_dtype
         selected_backends.append((backend, config.attention_config.backend_per_kind))
         if selection_fails:
             raise ValueError("test backend unavailable")

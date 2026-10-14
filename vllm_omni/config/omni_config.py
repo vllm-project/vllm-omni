@@ -103,6 +103,10 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
 _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
 
 _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
+# Global CLI inputs that are not EngineArgs/deploy fields but still target the
+# stages that own them (``--no-guardrails`` rides on ``model_config``). Stages
+# that do not own them skip them silently instead of rejecting the flag.
+_OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS = frozenset({"model_config"})
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -367,7 +371,7 @@ def _stage_cli_overrides(
             **stage_scoped,
         }
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
-    global_stage_fields = _global_stage_cli_fields()
+    global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
@@ -482,6 +486,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
     final_output: bool = False
+    supports_running_prefix_cache_reset: bool = True
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
@@ -713,18 +718,24 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
 
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
-        self.sequence_parallel_size = (
-            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-        )
-        if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
-            raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
+        self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
+        if self.allgather_degree > 1 and self.ring_degree > 1:
+            raise ValueError(
+                "allgather_degree > 1 cannot be composed with ring_degree > 1: the supported "
+                "two-dimensional diffusion SP topology is Ulysses x AllGather-KV "
+                "(ulysses_degree > 1 together with allgather_degree > 1, ring_degree == 1)."
+            )
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
-        if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
+        if self.vae_parallel_mode not in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}:
             raise ValueError(
-                "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+                "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
                 f"but got {self.vae_parallel_mode!r}."
             )
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
 
         other_parallel_world_size = (
             self.pipeline_parallel_size
@@ -817,6 +828,7 @@ class _DiffusionConfigProjection:
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
+    hsdp_weight_load_strategy: str = "full"
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
@@ -839,10 +851,15 @@ class _DiffusionConfigProjection:
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
+    # Mirrors OmniDiffusionConfig.enable_cuda_graph_decode; enforced by the
+    # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
+    # shared engine config.
+    enable_cuda_graph_decode: bool = True
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
+    vae_encode_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0
@@ -1143,6 +1160,9 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "disable_autocast",
     }
 )
+# Runtime-populated OmniDiffusionConfig state (init=False) that is never
+# user-configurable and therefore not part of the projection.
+_DIFFUSION_INTERNAL_FIELDS = frozenset({"ray_worker_env"})
 
 
 _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
@@ -1324,6 +1344,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "model_arch",
         "model_stage",
         "retains_state_across_chunks",
+        "supports_running_prefix_cache_reset",
         "scheduler_cls",
         "stage_connector_spec",
         "worker_type",
@@ -1722,6 +1743,10 @@ class BaseVllmOmniStageConfig:
     def cfg_kv_collect_func(self) -> str | None:
         return self.stage_pipeline_config.cfg_kv_collect_func
 
+    @property
+    def async_chunk_prewarm_payload_func(self) -> str | None:
+        return self.stage_pipeline_config.async_chunk_prewarm_payload_func
+
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmOmniARStageConfig(BaseVllmOmniStageConfig):
@@ -1971,6 +1996,8 @@ def _build_model_config(
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     kwargs["final_output"] = topology.final_output
+    if not topology.supports_running_prefix_cache_reset:
+        kwargs["supports_running_prefix_cache_reset"] = False
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)

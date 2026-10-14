@@ -16,6 +16,9 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/model_executor/models/qwen3_tts/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+  - vllm_omni/model_executor/models/common/fused_sampling.py
+  - vllm_omni/model_executor/models/common/short_kv_attention.py
+  - vllm_omni/model_executor/models/common/talker_first_audio.py
   - vllm_omni/model_executor/models/common/snake_activation.py
   - vllm_omni/model_executor/models/common/alias_free_activation.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
@@ -48,6 +51,25 @@ x-minicpmo-4-5: &minicpmo_4_5
   - vllm_omni/model_executor/stage_input_processors/minicpmo_4_5_omni.py
   - vllm_omni/deploy/minicpmo_4_5.yaml
   - vllm_omni/transformers_utils/chat_templates/minicpmo45_native.jinja
+
+# Shared serving/runtime changes must exercise MiniCPM's basic functional
+# jobs. Keep these separate from model dependencies so they do not also select
+# every MiniCPM performance, accuracy, and documentation job.
+x-minicpmo-4-5-functional-runtime: &minicpmo_4_5_functional_runtime
+  - vllm_omni/config/
+  - vllm_omni/core/
+  - vllm_omni/engine/
+  - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/entrypoints/async_omni_base.py
+  - vllm_omni/entrypoints/openai/
+  - vllm_omni/inputs/
+  - vllm_omni/outputs/
+  - vllm_omni/data_entry_keys.py
+  - vllm_omni/distributed/omni_connectors/
+  - vllm_omni/worker/
+  - vllm_omni/worker_v2/
+  - vllm_omni/platforms/npu/worker/
+  - vllm_omni/model_executor/models/common/
 
 x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
   - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
@@ -85,11 +107,16 @@ x-qwen3-omni: &qwen3_omni
   - vllm_omni/entrypoints/openai/serving_chat.py
   - vllm_omni/model_executor/models/qwen3_omni/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+  - vllm_omni/model_executor/models/common/fused_sampling.py
+  - vllm_omni/model_executor/models/common/short_kv_attention.py
+  - vllm_omni/model_executor/models/common/talker_first_audio.py
   - vllm_omni/model_executor/models/common/snake_activation.py
   - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
   - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
   - vllm_omni/deploy/qwen3_omni_moe.yaml
+  - vllm_omni/deploy/qwen3_omni_moe_mrv2.yaml
+  - vllm_omni/deploy/qwen3_omni_moe_mrv2_h200.yaml
   - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
 
 x-wan22: &wan22
@@ -106,6 +133,10 @@ x-qwen-image: &qwen_image
   - vllm_omni/diffusion/models/qwen_image/
   - vllm_omni/diffusion/models/dmd2/
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
+
+x-joy-image: &joy_image
+  - vllm_omni/diffusion/models/joy_image/
+  - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py
 
 x-hunyuan-image3: &hunyuan_image3
   - vllm_omni/diffusion/models/hunyuan_image3/
@@ -140,6 +171,10 @@ x-lingbot-video: &lingbot_video
 
 x-lingbot-world: &lingbot_world
   - vllm_omni/diffusion/models/lingbot_world/
+
+x-kandinsky6: &kandinsky6
+  - vllm_omni/diffusion/models/kandinsky6/
+  - vllm_omni/model_extras/kandinsky6.py
 
 
 source_file_dependencies:
@@ -205,6 +240,7 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_omni.py
     - tests/e2e/online_serving/test_qwen3_omni_expansion.py
     - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+    - tests/e2e/online_serving/test_qwen3_omni_thinking.py
 
   omni_qwen3_omni_accuracy:
     - *qwen3_omni
@@ -217,6 +253,16 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
+
+  omni_qwen3_omni_seed_tts_perf:
+    - *qwen3_omni
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json
+    - vllm_omni/benchmarks/realtime_seed_tts.py
+    - vllm_omni/benchmarks/patch/patch.py
+    - vllm_omni/benchmarks/data_modules/seed_tts_dataset.py
+    - vllm_omni/clients/duplex.py
+    - vllm_omni/deploy/qwen3_omni_duplex.yaml
 
   omni_qwen3_omni_reliability:
     - *qwen3_omni
@@ -236,6 +282,7 @@ source_file_dependencies:
 
   omni_minicpmo_4_5_function:
     - *minicpmo_4_5
+    - *minicpmo_4_5_functional_runtime
     - tests/e2e/offline_inference/test_minicpmo_4_5.py
     - tests/e2e/online_serving/test_minicpmo_4_5.py
     - tests/e2e/online_serving/test_minicpmo_4_5_expansion.py
@@ -266,7 +313,7 @@ source_file_dependencies:
     - tests/examples/test_minicpmo_realtime_web_static.py
     - tests/examples/test_minicpmo_realtime_duplex_simple_demo.py
 
-  omni_minicpmo_4_5_duplex_function:
+  omni_minicpmo_4_5_duplex_function: &minicpmo_4_5_duplex_function
     - *minicpmo_4_5
     - *minicpmo_4_5_duplex
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex.py
@@ -290,6 +337,14 @@ source_file_dependencies:
     - tests/entrypoints/openai_api/test_duplex_api_server.py
     - tests/model_executor/models/minicpmo_4_5/duplex/
     - tests/protocol/
+
+  omni_minicpmo_4_5_duplex_mrv2_function:
+    - *minicpmo_4_5_duplex_function
+    - vllm_omni/worker_v2/
+    - vllm_omni/outputs/
+    - vllm_omni/deploy/minicpmo_4_5_duplex_mrv2.yaml
+    - tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py
+    - tests/worker_v2/
 
   omni_minicpmo_4_5_duplex_perf:
     - *minicpmo_4_5
@@ -375,6 +430,12 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
+  diffusion_joy_image_accuracy:
+    - *joy_image
+    - tests/diffusion/models/joy_image/
+    - tests/e2e/accuracy/test_joy_image_edit.py
+    - recipes/JD/JoyAI-Image-Edit.md
+
   diffusion_qwen_image_perf:
     - *qwen_image
     - tests/dfx/perf/scripts/run_diffusion_benchmark.py
@@ -422,6 +483,7 @@ source_file_dependencies:
 
   diffusion_minimax_h3_function:
     - *minimax_h3
+    - tests/helpers/assertions.py
     - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
     - tests/e2e/online_serving/minimax_h3/
     - tests/diffusion/models/minimax_h3/
@@ -481,6 +543,11 @@ source_file_dependencies:
     - *lingbot_video
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_lingbot_video_vllm_omni.json
+
+  diffusion_kandinsky6_function:
+    - *kandinsky6
+    - tests/e2e/offline_inference/test_kandinsky6.py
+    - tests/e2e/online_serving/test_kandinsky6.py
 
 
   # Invalid-param jobs: model business code only, plus the reliability scripts.

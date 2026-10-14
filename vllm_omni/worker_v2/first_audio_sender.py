@@ -18,11 +18,23 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
 
 logger = init_logger(__name__)
+
+
+def supports_in_process_first_audio(config: VllmConfig, executor_class: type | None = None) -> bool:
+    """Use the same executor requirements before loading and binding a decoder."""
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+    parallel = config.parallel_config
+    if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+        return False
+    return issubclass(executor_class or Executor.get_class(config), UniProcExecutor)
 
 
 class FirstAudioSink(Protocol):
@@ -130,15 +142,12 @@ class _EngineOutputSink:
         for request_id, pcm in zip(request_ids, pcm_rows, strict=True):
             if request_id not in routes:
                 continue
+            payload = {"model_outputs": pcm, "sr": sample_rate, FIRST_AUDIO_KEY: torch.tensor(True)}
             by_client.setdefault(routes[request_id], []).append(
                 OmniEngineCoreOutput(
                     request_id=request_id,
                     new_token_ids=[],
-                    multimodal_output={
-                        "model_outputs": pcm,
-                        "sr": sample_rate,
-                        FIRST_AUDIO_KEY: torch.tensor(True),
-                    },
+                    multimodal_output=payload,
                 )
             )
         for client_index, outputs in by_client.items():
@@ -164,4 +173,5 @@ class _EngineOutputSink:
 
 
 def engine_output_queue_sink(output_queue: Any, scheduler: Any) -> _EngineOutputSink:
+    """Route prepared first audio from an upstream stage."""
     return _EngineOutputSink(output_queue, scheduler)

@@ -57,6 +57,9 @@ class _CodecPool:
     def get_bound_replica_id(self, request_id):
         return self.bound_replica
 
+    def schedule_release_request_resources(self, request_ids):
+        pass
+
     async def process_llm_raw_outputs(self, replica_id, raw, **kwargs):
         assert replica_id == self.replica_id
         return self.output_processor.process_outputs(raw.outputs, raw.timestamp).request_outputs
@@ -64,7 +67,10 @@ class _CodecPool:
 
 def _orchestrator(output_kind=RequestOutputKind.DELTA, *, registered=True, replica_id=2, final_stage_id=1):
     obj = Orchestrator.__new__(Orchestrator)
-    obj.stage_pools = [SimpleNamespace(final_output=False), _CodecPool(output_kind, registered, replica_id)]
+    obj.stage_pools = [
+        SimpleNamespace(final_output=False, schedule_release_request_resources=lambda request_ids: None),
+        _CodecPool(output_kind, registered, replica_id),
+    ]
     obj.request_states = {"r": OrchestratorRequestState(request_id="r", final_stage_id=final_stage_id)}
     obj.output_async_queue = asyncio.Queue()
     obj._cfg_tracker = CfgCompanionTracker()
@@ -114,10 +120,10 @@ def _raw(*, first=False, required=False, terminal=False, samples=(1, 1, 1, 1)):
     )
 
 
-async def _codec_output(obj, raw):
-    replica = obj.stage_pools[1].replica_id
-    processed = await obj._process_llm_stage_outputs(1, replica, raw, set())
-    await obj._handle_processed_outputs(1, replica, processed)
+async def _codec_output(obj, raw, stage=1):
+    replica = obj.stage_pools[stage].replica_id
+    processed = await obj._process_llm_stage_outputs(stage, replica, raw, set())
+    await obj._handle_processed_outputs(stage, replica, processed)
 
 
 def _messages(obj):
@@ -130,6 +136,57 @@ def _messages(obj):
 def _audio(output):
     audio = output.outputs[0].multimodal_output["audio"]
     return torch.cat(audio) if isinstance(audio, list) else audio
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", list(RequestOutputKind))
+@pytest.mark.parametrize("suffix_overtook", [False, True])
+async def test_single_stage_first_audio_obeys_output_kind_and_terminal_order(kind, suffix_overtook):
+    obj = _orchestrator(kind, final_stage_id=0)
+    obj.stage_pools = [obj.stage_pools[1]]
+    suffix = _raw(required=True, samples=(20, 21))
+    terminal = _raw(required=True, terminal=True, samples=(30, 31))
+    if suffix_overtook:
+        await _codec_output(obj, suffix, stage=0)
+        await _codec_output(obj, terminal, stage=0)
+        assert obj.output_async_queue.empty()
+    await obj._route_upstream_first_audio(0, 2, _raw(first=True, samples=(10, 11)))
+    if not suffix_overtook:
+        await _codec_output(obj, suffix, stage=0)
+        await _codec_output(obj, terminal, stage=0)
+    messages = _messages(obj)
+    expected = {
+        RequestOutputKind.DELTA: [[10, 11], [20, 21], [30, 31]],
+        RequestOutputKind.CUMULATIVE: [[10, 11], [10, 11, 20, 21], [10, 11, 20, 21, 30, 31]],
+        RequestOutputKind.FINAL_ONLY: [[10, 11, 20, 21, 30, 31]],
+    }
+    assert [_audio(message.engine_outputs).tolist() for message in messages] == expected[kind]
+    assert all((message.stage_id, message.replica_id) == (0, 2) for message in messages)
+    assert messages[-1].finished
+    assert not obj.request_states["r"].pending_first_audio_outputs
+
+
+@pytest.mark.asyncio
+async def test_single_stage_cancellation_discards_overtaking_terminal_and_late_first_audio():
+    obj = _orchestrator(final_stage_id=0)
+    obj.stage_pools = [obj.stage_pools[1]]
+    await _codec_output(obj, _raw(required=True, terminal=True), stage=0)
+    assert obj.request_states["r"].pending_first_audio_outputs
+    await obj._cleanup_request_ids(["r"], abort=True)
+    await obj._route_upstream_first_audio(0, 2, _raw(first=True))
+    assert not obj.request_states and obj.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_single_stage_first_audio_processing_failure_releases_waiting_terminal():
+    obj = _orchestrator(final_stage_id=0)
+    obj.stage_pools = [obj.stage_pools[1]]
+    await _codec_output(obj, _raw(required=True, terminal=True), stage=0)
+    obj.stage_pools[0].process_llm_raw_outputs = AsyncMock(side_effect=RuntimeError("processing failed"))
+    await obj._route_upstream_first_audio(0, 2, _raw(first=True))
+    error = obj.output_async_queue.get_nowait()
+    assert isinstance(error, ErrorMessage) and error.stage_id == 0
+    assert not obj.request_states
 
 
 @pytest.mark.asyncio
@@ -209,7 +266,9 @@ async def test_prewarm_flushes_first_audio_after_successful_submission(mocker, p
     pool.submit_initial = submit
     if processing_failed:
         pool.process_llm_raw_outputs = AsyncMock(side_effect=RuntimeError("processing failed"))
-        later_pool = SimpleNamespace(submit_initial=AsyncMock())
+        later_pool = SimpleNamespace(
+            submit_initial=AsyncMock(), schedule_release_request_resources=lambda request_ids: None
+        )
         obj.stage_pools.append(later_pool)
     submitted = await obj._prewarm_async_chunk_stages("r", SimpleNamespace(prompt_token_ids=[0]), req_state)
     assert submitted is not processing_failed

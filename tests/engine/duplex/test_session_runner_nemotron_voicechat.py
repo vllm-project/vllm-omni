@@ -21,6 +21,7 @@ from tests.engine.duplex.test_session_runner import (
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import load_duplex_plugin
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -57,20 +58,36 @@ async def harness(monkeypatch):
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue = asyncio.Queue()
     results: asyncio.Queue = asyncio.Queue()
+    limits = DuplexSessionRuntimeConfig()
+    output_buffer = DuplexOutputBuffer(
+        max_bytes=limits.max_pending_output_bytes_per_session,
+        max_events=limits.max_pending_output_events_per_session,
+    )
     manager = DuplexSessionManager(
         plugin=plugin,
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=DuplexSessionRuntimeConfig(),
+        runtime_config=limits,
         model_config=SimpleNamespace(hf_config=SimpleNamespace(stt_cfg={}), max_model_len=8192),
     )
     try:
         config = DuplexSessionConfig(model="nemotron", instructions="hi", extra_body={"auto_response": True})
-        await manager.handle(OpenDuplexSessionMessage(control_id="open", session_id=SESSION_ID, session_config=config))
+        await manager.handle(
+            OpenDuplexSessionMessage(
+                control_id="open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
+            )
+        )
         result = await asyncio.wait_for(results.get(), timeout=2)
         assert result.ok, result
-        h = Harness(manager, port, output, results, manager.runners[SESSION_ID])
+        h = Harness(
+            manager=manager,
+            port=port,
+            output=output,
+            output_buffer=output_buffer,
+            results=results,
+            runner=manager.runners[SESSION_ID],
+        )
         await h.settle()
         yield h
     finally:

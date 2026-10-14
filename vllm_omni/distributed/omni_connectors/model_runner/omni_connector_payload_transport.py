@@ -25,6 +25,15 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
 from vllm_omni.outputs import OmniConnectorOutput
 
 
+def _is_full_payload_row_tensor(key: str, value: Any) -> bool:
+    # MiniCPM's validity mask has one entry per codec row. Unlike scalar
+    # status metadata, it must grow with codes.audio, including invalid/EOS
+    # rows, so the consumer can filter the accumulated utterance correctly.
+    return isinstance(value, torch.Tensor) and (
+        value.dim() >= 2 or (key == "meta.codec_frame_valid" and value.dim() == 1)
+    )
+
+
 # No-progress recheck for connectors without a change notification (SHM polls).
 def _recv_poll_seconds() -> float:
     """Resolve a finite positive poll interval, falling back for invalid input."""
@@ -578,7 +587,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         latest: dict[str, Any] = {}
         rows: dict[str, int] = {}
         for k, v in output.items():
-            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+            if _is_full_payload_row_tensor(k, v):
                 chunks[k] = [v]
                 rows[k] = int(v.shape[0])
             else:
@@ -656,9 +665,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
-        Per-token tensors (2-D+, matching trailing dims) are concatenated
-        along dim-0.  Scalar / global tensors (1-D or 0-D) are replaced
-        with the latest value.
+        Per-token tensors (2-D+, matching trailing dims) and the 1-D codec
+        validity mask are concatenated along dim-0. Scalar / global tensors
+        are replaced with the latest value.
 
         Note: codec rows are NOT filtered for zero placeholders here. The
         downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
@@ -691,7 +700,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 # prior chunks (e.g. `model_outputs` carries the full result
                 # so far, not an appendable per-step delta).
                 latest.pop(k, None)
-                if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                if _is_full_payload_row_tensor(k, v):
                     chunks[k] = [v]
                     rows[k] = int(v.shape[0])
                 else:
@@ -699,7 +708,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     rows.pop(k, None)
                     latest[k] = v
                 continue
-            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+            if _is_full_payload_row_tensor(k, v):
                 if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
                     chunks[k].append(v)
                     rows[k] += int(v.shape[0])
@@ -1169,7 +1178,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._payload_finished(payload_data),
             )
 
-        self._get_req_chunk[req_id] += 1
+        with self._lock:
+            if self._async_chunk and request is not None and req_id not in self._pending_load_reqs:
+                # A connector get can return after cancellation removed its
+                # receiver. Do not recreate delivery state for that request.
+                return False
+            self._get_req_chunk[req_id] += 1
 
         if self._async_chunk:
             is_finished = self._payload_finished(payload_data)
@@ -1182,6 +1196,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 payload_consumable = self._payload_is_consumable(payload_data)
 
             with self._lock:
+                if request is not None and req_id not in self._pending_load_reqs:
+                    # Receive may overlap cancellation; do not republish
+                    # readiness after the request was torn down.
+                    return False
                 if self._model_mode == "ar":
                     # Accumulation, staging, and model-side consume/ack share
                     # this lock. Keeping the transition atomic prevents the

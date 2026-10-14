@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+import queue
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
@@ -24,7 +26,6 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
-from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniModelRunnerOutput
 
@@ -58,6 +59,48 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._pending_finish_reqs: list[Request] = []
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        extra = (
+            connector_config.get("extra", connector_config)
+            if isinstance(connector_config, dict)
+            else getattr(connector_config, "extra", None)
+        ) or {}
+        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
+        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
+        self._generation_coalescing_policy = extra.get("generation_coalescing_policy", "fixed")
+        self._generation_max_regular_batch = int(extra.get("generation_max_regular_batch", 0) or 0)
+        if self._generation_max_regular_batch < 0:
+            raise ValueError("generation_max_regular_batch must be nonnegative")
+        if self._generation_coalescing_policy not in ("fixed", "idle_wait"):
+            raise ValueError("generation_coalescing_policy must be fixed or idle_wait")
+        if not 1 <= self._generation_min_batch_size <= self.max_num_running_reqs:
+            raise ValueError("generation_min_batch_size must be in [1, max_num_seqs]")
+        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
+            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
+        if self._generation_max_wait_s and self._generation_min_batch_size > 1:
+            parallel = self.vllm_config.parallel_config
+            if not self._native_data_plane:
+                # CUDA-oriented profiles can inherit a platform's V1 runner.
+                # Their connector extras survive that override, but batching
+                # must revert to the fallback runner's default scheduling.
+                logger.warning(
+                    "Generation batch waiting and regular-batch limit ignored: "
+                    "requires native MRV2; using default generation scheduling."
+                )
+                self._generation_min_batch_size = 1
+                self._generation_max_wait_s = 0.0
+                self._generation_max_regular_batch = 0
+            elif not (
+                self._retains_state_across_chunks
+                and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
+            ):
+                raise ValueError("Generation batch waiting requires a stateful native MRV2 TP1/PP1 stage")
+            else:
+                logger.info(
+                    "Generation input coalescing: target batch=%d, max wait=%.3f ms",
+                    self._generation_min_batch_size,
+                    self._generation_max_wait_s * 1000,
+                )
         self._first_chunk_express = os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS") == "1"
         self._last_step_express = False
         # Streams that already had a chunk scheduled; the rest await their first.
@@ -75,6 +118,101 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 "Generation scheduler decodes first chunks in express steps (min continuation slack %.2f s)",
                 self._express_min_slack_s,
             )
+
+    def _drain_omni_connector_outputs(self):
+        self._generation_defer_batch = False
+        outputs = super()._drain_omni_connector_outputs()
+        max_wait = getattr(self, "_generation_max_wait_s", 0)
+        target = getattr(self, "_generation_min_batch_size", 1)
+        coordinator = self.input_coordinator
+        if not max_wait or target <= 1 or coordinator is None or self._pause_state != PauseState.UNPAUSED:
+            return outputs
+
+        # Count distinct runnable streams, not notifications, padding rows, or
+        # chunks whose previous execution still owns their state. Waiting here
+        # precedes allocation and metadata replacement. Do not schedule a batch
+        # and then discard it to try to accumulate more input.
+        ready = set(coordinator.requests_with_ready_chunks)
+        terminal = set(coordinator.finished_requests) | set(coordinator.input_terminal_req_ids)
+        deadline = getattr(self, "_generation_batch_deadline", None)
+        if deadline is None:
+            deadline = time.monotonic() + max_wait
+        in_flight = any(
+            not request.is_finished() and request.num_in_flight_tokens > 0 for request in self.requests.values()
+        )
+        new_outputs = outputs
+        waited_without_input = False
+        while True:
+            for output in new_outputs:
+                ready.update(output.chunk_ready_req_ids)
+                terminal.update(output.chunk_finished_req_ids)
+                terminal.update(
+                    req_id for req_id, metadata in output.request_metadata.items() if metadata.get("input_terminal")
+                )
+            runnable = {
+                req_id
+                for req_id in ready | terminal
+                if (request := self.requests.get(req_id)) is not None
+                and not request.is_finished()
+                and request.num_in_flight_tokens == 0
+            }
+            if runnable and waited_without_input:
+                # Idle waiting must not eat the ready batch's coalescing budget.
+                # Start that budget at its first arrival, once only. The two
+                # bounded windows can delay control processing by at most 2W.
+                deadline = time.monotonic() + max_wait
+                waited_without_input = False
+            # A first/final chunk participates in the same bounded window.
+            # At high concurrency almost every batch contains one; bypassing
+            # the entire batch in that case defeats coalescing. Low concurrency
+            # still dispatches immediately, including single-request tails.
+            if not runnable:
+                # With no output to retire and all receivers already parked,
+                # a wakeable inbox wait avoids repeatedly executing empty steps.
+                # Admission/registration/terminal work must reach the runner
+                # first; waiting for a not-yet-registered receiver would stall it.
+                can_wait_idle = (
+                    getattr(self, "_generation_coalescing_policy", "fixed") == "idle_wait"
+                    and not in_flight
+                    and bool(self.requests)
+                    and not getattr(coordinator, "pending_chunk_registrations", ())
+                    and not getattr(coordinator, "pending_input_registrations", ())
+                    and not getattr(self, "_pending_data_plane_terminal_req_ids", ())
+                    and all(request.status == RequestStatus.WAITING_FOR_CHUNK for request in self.requests.values())
+                )
+                if not can_wait_idle:
+                    break
+                waited_without_input = True
+            elif len(runnable) >= target or len(self.requests) < target:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if in_flight:
+                # Let EngineCore retire the prior output before waiting for
+                # more input. Blocking this thread also blocks the in-flight
+                # fence that makes those streams eligible for the next batch.
+                # Emit a normal empty scheduler step (including connector and
+                # cancellation bookkeeping), never discard an allocated step.
+                self._generation_defer_batch = True
+                self._generation_batch_deadline = deadline
+                return outputs
+            try:
+                output = self._omni_connector_output_inbox.get(timeout=remaining)
+            except queue.Empty:
+                break
+            outputs.append(output)
+            new_outputs = [output]
+            # Drain a burst before re-evaluating, retaining notification order.
+            while True:
+                try:
+                    output = self._omni_connector_output_inbox.get_nowait()
+                except queue.Empty:
+                    break
+                outputs.append(output)
+                new_outputs.append(output)
+        self._generation_batch_deadline = None
+        return outputs
 
     def _build_generation_scheduler_output(
         self,
@@ -136,6 +274,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+        if self.aux_output_connector is not None:
+            scheduler_output.aux_output_connector_metadata = self.aux_output_connector.build_connector_meta(
+                scheduler_output, self.requests
+            )
         # EC Connector: package metadata
         if self.ec_connector is not None:
             ec_meta = self.ec_connector.build_connector_meta(scheduler_output)
@@ -191,7 +333,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             # Downstream async-chunk stages receive the next segment from the
             # connector, not from an API StreamingUpdate. Enqueue them as
-            # schedulable before the base class can park them in skipped_waiting.
+            # schedulable before the base class can defer a streaming-input wait.
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
             return False
@@ -203,7 +345,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         A generation batch slot belongs to one chunk, not the entire stream.
         Keep requests with outstanding output in ``running`` so their state
         cannot be reused before completion. Other live requests join the tail
-        of ``waiting`` without freeing their decoder state or KV blocks.
+        of the appropriate waiting queue without freeing decoder state or KV blocks.
         Preserve WAITING_FOR_CHUNK until the coordinator observes fresh input.
         Stateful codecs retain lifetime admission until their decoder state is
         released, even when no chunk is currently executing.
@@ -221,7 +363,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
             if request.status == RequestStatus.RUNNING:
                 request.status = RequestStatus.WAITING
-            self.waiting.add_request(request)
+            self._enqueue_waiting_request(request)
         self.running = in_flight
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -252,10 +394,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Temporary queue: preserve waiting order while requests await input.
         skipped_waiting_requests = create_request_queue(self.policy)
+        skipped_kv_holding_requests = create_request_queue(self.policy)
         req_index = 0
         self._drop_aborted_queued_requests()
         self._requeue_completed_native_chunks()
         self._process_pending_omni_inputs(model_mode="generation")
+        if getattr(self, "_generation_defer_batch", False):
+            token_budget = 0
+        max_regular = getattr(self, "_generation_max_regular_batch", 0)
+        if max_regular:
+            execution_batch_size = min(execution_batch_size, max_regular)
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
         async_chunk_transport = self._async_chunk_transport_enabled()
@@ -358,7 +506,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Fast path selection and scheduling (treat all as diffusion requests,
         # independent of pooling_params)
         while (
-            self.waiting
+            (self.kv_holding_waiting or self.waiting)
             and token_budget > 0
             and len(num_scheduled_tokens) < execution_batch_size
             and (
@@ -366,38 +514,47 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if native_chunks and not self._retains_state_across_chunks
                 else len(self.running) + reserved_running_slots
             )
-            < self.max_num_running_reqs
+            < self.max_num_active_reqs
             and self._pause_state == PauseState.UNPAUSED
         ):
-            request = self.waiting.peek_request()
+            request_queue = self.kv_holding_waiting or self.waiting
+            skipped_requests = (
+                skipped_kv_holding_requests if request_queue is self.kv_holding_waiting else skipped_waiting_requests
+            )
+            request = request_queue.peek_request()
             if express and request.request_id in self._chunk_started:
-                self.waiting.pop_request()
-                skipped_waiting_requests.add_request(request)
+                request_queue.pop_request()
+                self.deferred_waiting.add(request)
+                skipped_requests.add_request(request)
                 continue
             if native_chunks and request.num_in_flight_tokens > 0:
                 # A restored waiting entry can still own an outstanding batch.
                 # Do not let it block other ready streams or execute it twice.
-                self.waiting.pop_request()
-                skipped_waiting_requests.add_request(request)
+                request_queue.pop_request()
+                self.deferred_waiting.add(request)
+                skipped_requests.add_request(request)
                 continue
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
             ):
                 # Pop the finished request from waiting queue and don't schedule it
-                self.waiting.pop_request()
+                request_queue.pop_request()
+                self.deferred_waiting.discard(request)
                 continue
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if async_chunk_transport and len(request.prompt_token_ids) == 0:
                 if self._is_done_receiving_chunks(request.request_id):
                     if not _has_async_chunk_payload_to_run(request):
-                        self.waiting.pop_request()
+                        request_queue.pop_request()
+                        self.deferred_waiting.discard(request)
                         self._pending_finish_reqs.append(request)
                         continue
                 else:
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    request_queue.pop_request()
+                    self.deferred_waiting.add(request)
+                    skipped_requests.prepend_request(request)
                     continue
 
             # Allocate all input tokens for the request in one shot
@@ -413,11 +570,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     ):
                         required_tokens = 1
                     else:
-                        self.waiting.pop_request()
+                        request_queue.pop_request()
                         if self._is_done_receiving_chunks(request.request_id):
+                            self.deferred_waiting.discard(request)
                             self._pending_finish_reqs.append(request)
                         else:
-                            skipped_waiting_requests.add_request(request)
+                            self.deferred_waiting.add(request)
+                            skipped_requests.add_request(request)
                         continue
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
@@ -433,7 +592,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
 
             # Officially schedule this request
-            request = self.waiting.pop_request()
+            request = request_queue.pop_request()
+            self.deferred_waiting.discard(request)
             self.running.append(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
@@ -448,7 +608,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if first_chunk_express:
             self._chunk_started.update(num_scheduled_tokens)
 
-        # Return skipped waiting requests
+        # Return skipped requests to their original queue.
+        if skipped_kv_holding_requests:
+            self.kv_holding_waiting.prepend_requests(skipped_kv_holding_requests)
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
@@ -792,8 +954,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
 
             if stopped:
-                if model_runner_output.routed_experts is not None:
-                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
+                if (
+                    self.aux_output_connector is not None
+                    and (aux_output := model_runner_output.aux_output_connector_output) is not None
+                ):
+                    routed_experts = self.aux_output_connector.take_output(request, aux_output)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished

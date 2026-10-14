@@ -56,8 +56,8 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self, request_id: str) -> None:
-        """Clean up resources for a request."""
+    def cleanup(self, request_id: str) -> bool | None:
+        """Clean up resources, optionally reporting whether any were reclaimed."""
         pass
 
     def get_with_deadline(

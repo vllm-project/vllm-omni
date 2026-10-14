@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
     from vllm.v1.engine.input_processor import InputProcessor
+    from vllm.v1.kv_hints import KvHintsEnvelope
 
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
@@ -125,9 +126,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         session_id: str | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        submitted: asyncio.Future[None] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -277,6 +280,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
                     first_chunk_submitted=first_chunk_submitted,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
                 await first_chunk_submitted
             else:
@@ -288,6 +292,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
@@ -296,6 +301,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             if admitting:
                 await self._release_generate_admission()
                 admitting = False
+            # Callers wait on this before abort so Stage0 observes the sender cache.
+            if submitted is not None and not submitted.done():
+                submitted.set_result(None)
             # Refresh gauges on arrival.
             self._publish_request_gauges(len(self.request_states))
 
@@ -361,6 +369,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         arrival_time: float,
         lora_request: Any = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -422,6 +431,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
                                 resumable=True,
+                                **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
                         )
                         has_submitted_first_chunk = True
@@ -479,6 +489,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
                                     resumable=False,
+                                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
                             )
                             has_submitted_first_chunk = True
@@ -903,6 +914,28 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         )
         return all(self._coerce_stage_bool(result) for result in results)
 
+    async def release_kv_cache_memory(
+        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+    ) -> None:
+        """Discard AR-stage KV memory after a completed generation pause.
+
+        EngineCore checks that the scheduler is paused and all executor
+        memory is resident. Diffusion stages have no KV cache to release.
+        Restore KV memory with ``wake_up(tags=["kv_cache"])`` before resuming.
+        """
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if not ar_stage_ids:
+            return
+        async with self._pause_cond:
+            if not self._paused:
+                raise RuntimeError("release_kv_cache_memory() requires a completed pause first")
+            await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
+        if 0 in ar_stage_ids:
+            await asyncio.wait_for(self._clear_frontend_mm_cache(), timeout=timeout)
+        await self._engine_core_rpc("release_kv_cache_memory", stage_ids=ar_stage_ids, timeout=timeout)
+        self._record_stage_sleep(ar_stage_ids, [CuMemTag.KV_CACHE.value])
+        self._hold_admission_until_resume = True
+
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
     ) -> list[OmniACK]:
@@ -926,6 +959,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         engines have no EngineCore pause to hold, so ``wake_up`` restores
         admission and ``sleep → wake → generate`` keeps working.
         """
+        # Validate before touching admission state. Raising after
+        # ``_paused = True`` would wedge generate() for good: nothing was
+        # slept, so wake_up() has no tags to restore and never reaches the
+        # block that clears ``_paused``.
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()
         # coroutines that already passed the pause check have submitted (or
@@ -933,8 +972,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             self._paused = True
             await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
-
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         # EngineCore.sleep resets receiver caches itself; only clear P0 here.
         if 0 in ar_stage_ids:
             await self._clear_frontend_mm_cache()

@@ -440,6 +440,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={
                     "model_outputs": [empty] * num_req,
                     "sr": [sr_tensor] * num_req,
+                    "codec_frames": [empty.new_zeros((0, q), dtype=torch.long)] * num_req,
                 },
             )
 
@@ -527,6 +528,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                 first_audio_required[idx] = torch.tensor(bool(request_states[row].get("skip_first_audio", False)))
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
+        codes_out: list[torch.Tensor] = [empty.new_zeros((0, q), dtype=torch.long)] * num_req
+        for row, (_, codes_qf) in enumerate(valid_codes_qf):
+            start = 0 if request_states is not None else left_context_size[valid_indices[row]]
+            codes_out[valid_indices[row]] = codes_qf[:, start:].transpose(0, 1).to(torch.long)
 
         for j, idx in enumerate(valid_indices):
             wav = wav_tensors[j]
@@ -548,7 +553,12 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs, FIRST_AUDIO_REQUIRED_KEY: first_audio_required},
+            multimodal_outputs={
+                "model_outputs": audios,
+                "sr": srs,
+                FIRST_AUDIO_REQUIRED_KEY: first_audio_required,
+                "codec_frames": codes_out,
+            },
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:

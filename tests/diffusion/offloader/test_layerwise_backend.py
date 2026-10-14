@@ -542,6 +542,24 @@ class TestLayerwiseComponentSelection:
         for name, tensor in pipeline.state_dict().items():
             torch.testing.assert_close(tensor, expected[name])
 
+    def test_shutdown_skips_block_restore(self, patched_offload_runtime, monkeypatch):
+        # Restoring every block copies the whole DiT back onto the device, which
+        # outlived the executor's shutdown grace period (issue 7625).
+        pipeline = nn.Module()
+        pipeline.transformer = _SingleBlockModel(num_blocks=3)
+        backend = _layer_backend()
+        backend.enable(pipeline)
+        restores = Mock()
+        for hook in backend._dit_hooks:
+            monkeypatch.setattr(hook, "restore_next_block", restores)
+
+        backend.shutdown()
+
+        restores.assert_not_called()
+        assert not backend.enabled
+        assert not backend._dit_hooks
+        assert not backend._hooked_dit_blocks
+
     def test_encoder_disable_failure_keeps_host_masters_for_retry(
         self,
         patched_offload_runtime,

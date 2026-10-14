@@ -11,7 +11,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 from transformers.activations import ACT2FN
 from vllm.config import VllmConfig
@@ -26,7 +25,9 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -35,10 +36,11 @@ from vllm_omni.utils.speaker_cache import (
 )
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
-from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
+from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 from .first_audio import talker_first_audio_enabled
 from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
 
@@ -153,191 +155,6 @@ class Qwen3TTSTalkerResizeMLP(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
-# ---- Speaker encoder (ECAPA-TDNN) and helpers ----
-
-
-class TimeDelayNetBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation):
-        super().__init__()
-        self.conv = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            padding="same",
-            padding_mode="reflect",
-        )
-        self.activation = nn.ReLU()
-
-    def forward(self, hidden_states: torch.Tensor):
-        return self.activation(self.conv(hidden_states))
-
-
-class Res2NetBlock(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, scale=8, kernel_size=3, dilation=1):
-        super().__init__()
-        in_channel = in_channels // scale
-        hidden_channel = out_channels // scale
-        self.blocks = nn.ModuleList(
-            [
-                TimeDelayNetBlock(in_channel, hidden_channel, kernel_size=kernel_size, dilation=dilation)
-                for _ in range(scale - 1)
-            ]
-        )
-        self.scale = scale
-
-    def forward(self, hidden_states):
-        outputs = []
-        for i, hidden_part in enumerate(torch.chunk(hidden_states, self.scale, dim=1)):
-            if i == 0:
-                output_part = hidden_part
-            elif i == 1:
-                output_part = self.blocks[i - 1](hidden_part)
-            else:
-                output_part = self.blocks[i - 1](hidden_part + output_part)
-            outputs.append(output_part)
-        return torch.cat(outputs, dim=1)
-
-
-class SqueezeExcitationBlock(nn.Module):
-    def __init__(self, in_channels, se_channels, out_channels):
-        super().__init__()
-        self.conv1 = nn.Conv1d(in_channels, se_channels, kernel_size=1, padding="same", padding_mode="reflect")
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(se_channels, out_channels, kernel_size=1, padding="same", padding_mode="reflect")
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, hidden_states):
-        hidden_states_mean = hidden_states.mean(dim=2, keepdim=True)
-        hidden_states_mean = self.relu(self.conv1(hidden_states_mean))
-        hidden_states_mean = self.sigmoid(self.conv2(hidden_states_mean))
-        return hidden_states * hidden_states_mean
-
-
-class SqueezeExcitationRes2NetBlock(nn.Module):
-    """TDNN-Res2Net-TDNN-SE building block used in ECAPA-TDNN."""
-
-    def __init__(self, in_channels, out_channels, res2net_scale=8, se_channels=128, kernel_size=1, dilation=1):
-        super().__init__()
-        self.out_channels = out_channels
-        self.tdnn1 = TimeDelayNetBlock(in_channels, out_channels, kernel_size=1, dilation=1)
-        self.res2net_block = Res2NetBlock(out_channels, out_channels, res2net_scale, kernel_size, dilation)
-        self.tdnn2 = TimeDelayNetBlock(out_channels, out_channels, kernel_size=1, dilation=1)
-        self.se_block = SqueezeExcitationBlock(out_channels, se_channels, out_channels)
-
-    def forward(self, hidden_state):
-        residual = hidden_state
-        hidden_state = self.tdnn1(hidden_state)
-        hidden_state = self.res2net_block(hidden_state)
-        hidden_state = self.tdnn2(hidden_state)
-        hidden_state = self.se_block(hidden_state)
-        return hidden_state + residual
-
-
-class AttentiveStatisticsPooling(nn.Module):
-    """Attentive statistic pooling layer: returns concatenated mean and std."""
-
-    def __init__(self, channels, attention_channels=128):
-        super().__init__()
-        self.eps = 1e-12
-        self.tdnn = TimeDelayNetBlock(channels * 3, attention_channels, 1, 1)
-        self.tanh = nn.Tanh()
-        self.conv = nn.Conv1d(attention_channels, channels, kernel_size=1, padding="same", padding_mode="reflect")
-
-    @staticmethod
-    def _length_to_mask(length, max_len=None, dtype=None, device=None):
-        if max_len is None:
-            max_len = length.max().long().item()
-        mask = torch.arange(max_len, device=length.device, dtype=length.dtype).expand(
-            len(length), max_len
-        ) < length.unsqueeze(1)
-        return torch.as_tensor(mask, dtype=dtype, device=device)
-
-    @staticmethod
-    def _compute_statistics(x, m, dim=2, eps=1e-12):
-        mean = (m * x).sum(dim)
-        std = torch.sqrt((m * (x - mean.unsqueeze(dim)).pow(2)).sum(dim).clamp(eps))
-        return mean, std
-
-    def forward(self, hidden_states):
-        seq_length = hidden_states.shape[-1]
-        lengths = torch.ones(hidden_states.shape[0], device=hidden_states.device)
-        mask = self._length_to_mask(
-            lengths * seq_length, max_len=seq_length, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        mask = mask.unsqueeze(1)
-        total = mask.sum(dim=2, keepdim=True)
-        mean, std = self._compute_statistics(hidden_states, mask / total)
-        mean = mean.unsqueeze(2).repeat(1, 1, seq_length)
-        std = std.unsqueeze(2).repeat(1, 1, seq_length)
-        attention = torch.cat([hidden_states, mean, std], dim=1)
-        attention = self.conv(self.tanh(self.tdnn(attention)))
-        attention = attention.masked_fill(mask == 0, float("-inf"))
-        attention = F.softmax(attention, dim=2)
-        mean, std = self._compute_statistics(hidden_states, attention)
-        pooled_stats = torch.cat((mean, std), dim=1)
-        return pooled_stats.unsqueeze(2)
-
-
-class Qwen3TTSSpeakerEncoder(torch.nn.Module):
-    """ECAPA-TDNN speaker encoder.
-
-    Reference: "ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in
-    TDNN Based Speaker Verification" (https://huggingface.co/papers/2005.07143).
-    """
-
-    def __init__(self, config: Qwen3TTSSpeakerEncoderConfig):
-        super().__init__()
-        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(
-            config.enc_dilations
-        ):
-            raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have same length")
-        self.channels = config.enc_channels
-        self.blocks = nn.ModuleList()
-        self.blocks.append(
-            TimeDelayNetBlock(
-                config.mel_dim,
-                config.enc_channels[0],
-                config.enc_kernel_sizes[0],
-                config.enc_dilations[0],
-            )
-        )
-        for i in range(1, len(config.enc_channels) - 1):
-            self.blocks.append(
-                SqueezeExcitationRes2NetBlock(
-                    config.enc_channels[i - 1],
-                    config.enc_channels[i],
-                    res2net_scale=config.enc_res2net_scale,
-                    se_channels=config.enc_se_channels,
-                    kernel_size=config.enc_kernel_sizes[i],
-                    dilation=config.enc_dilations[i],
-                )
-            )
-        self.mfa = TimeDelayNetBlock(
-            config.enc_channels[-1], config.enc_channels[-1], config.enc_kernel_sizes[-1], config.enc_dilations[-1]
-        )
-        self.asp = AttentiveStatisticsPooling(config.enc_channels[-1], attention_channels=config.enc_attention_channels)
-        self.fc = nn.Conv1d(
-            config.enc_channels[-1] * 2,
-            config.enc_dim,
-            kernel_size=1,
-            padding="same",
-            padding_mode="reflect",
-        )
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.transpose(1, 2)
-        hidden_states_list = []
-        for layer in self.blocks:
-            hidden_states = layer(hidden_states)
-            hidden_states_list.append(hidden_states)
-        hidden_states = torch.cat(hidden_states_list[1:], dim=1)
-        hidden_states = self.mfa(hidden_states)
-        hidden_states = self.asp(hidden_states)
-        hidden_states = self.fc(hidden_states)
-        return hidden_states.squeeze(-1)
-
-
 # ---------------------------------------------------------------------------
 # Main AR Talker model
 # ---------------------------------------------------------------------------
@@ -411,7 +228,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # A frame's residual codebooks depend only on the Talker hidden and
         # CB0 of the step that sampled it, so MRV2 may complete the frame at
         # the end of that step instead of in the next step's preprocess.
-        self.mtp_eager_frames = talker_first_audio_enabled(vllm_config)
+        self.stream_decode = talker_stream_decode_enabled(vllm_config)
+        predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+        extra = predictor._stage_connector_extra_config(vllm_config)
+        self.stream_first_audio = self.stream_decode and predictor._parse_bool_config(
+            extra.get("talker_stream_first_audio")
+        )
+        # Model-local voice-clone priming boundary; each deployment selects
+        # its reference context independently of the two-stage codec profile.
+        self.stream_ref_context_frames = stream_ref_context_frames(vllm_config) if self.stream_decode else 0
+        self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
+        self.stream_decoder = None
+        self.stream_graphs = None
+        self.stream_prime_graphs = None
+        self.stream_sample_rate = 0
+        self.stream_chunk_frames = 25
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.
@@ -455,7 +286,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # paths work under load_format: dummy, which bypasses load_weights
         # entirely (DummyModelLoader fills existing params in-place and never
         # iterates a checkpoint).
-        self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
+        self.speaker_encoder = ECAPATimeDelayNet(self.config.speaker_encoder_config)
 
         # Code predictor uses an isolated vLLM config so its KV cache doesn't
         # pollute the main engine's static_forward_context (shallow-copy shares
@@ -718,6 +549,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
     # -------------------- Omni multimodal output plumbing --------------------
 
+    @property
+    def mm_outputs_fresh_per_step(self) -> bool:
+        """Stream-decode outputs come from :meth:`_make_eager_omni_output`, allocated per step."""
+        return self.stream_decoder is not None and self.eager_frames_active
+
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
@@ -895,6 +731,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 "first_audio": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device),
             },
         }
+        if self.stream_decoder is not None:
+            # Filled per sampled row by the runner's eager MTP; token-major so
+            # each request's slice is its frames of this step.
+            spf = int(self.stream_decoder.spf)
+            mm["model_outputs"] = torch.zeros((num_tokens, spf), dtype=torch.float32, device=hidden.device)
+            sr = torch.tensor(self.stream_sample_rate, dtype=torch.int32)
+            mm["sr"] = [sr] * len(info_dicts)
         ref_rows = [
             index
             for index, info in enumerate(info_dicts)
@@ -1442,7 +1285,71 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             self.first_frame_decoder = Qwen3TTSFirstFrameDecoder(self.model_path)
             decoder_loaded = self.first_frame_decoder.load(self.vllm_config)
             loaded = set(loaded) | {f"first_frame_decoder.{name}" for name in decoder_loaded}
+        elif self.stream_decode:
+            # The in-stage decoder owns every frame. Optional first-audio
+            # delivery uses its PCM; later chunks use regular step outputs.
+            from .first_frame_decoder import Qwen3TTSFirstFrameDecoder
+            from .tokenizer_12hz.streaming_decoder import StreamingCodecDecoder
+
+            holder = Qwen3TTSFirstFrameDecoder(self.model_path)
+            decoder_loaded = holder.load(self.vllm_config)
+            loaded = set(loaded) | {f"stream_decoder.{name}" for name in decoder_loaded}
+            slots = int(self.vllm_config.scheduler_config.max_num_seqs)
+            self.stream_decoder = StreamingCodecDecoder(holder.decoder, num_slots=slots, dtype=torch.bfloat16)
+            self.stream_sample_rate = int(holder.sample_rate)
+            logger.info("Qwen3-TTS Talker stream decode enabled (%d slots)", slots)
         return loaded
+
+    def capture_stream_decode_graphs(self, batch_sizes: list[int]) -> None:
+        if self.stream_decoder is None or self.stream_graphs is not None:
+            return
+        from .tokenizer_12hz.streaming_decoder import StreamingDecodeGraphs
+
+        with torch.inference_mode():
+            self.stream_graphs = StreamingDecodeGraphs(self.stream_decoder, batch_sizes)
+            frames = min(self.stream_ref_context_frames, self.stream_chunk_frames, self.stream_decoder.max_frames)
+            if self.config.tts_model_type == "base" and frames > 1:
+                # Bound the multi-frame graph workspace by the configured
+                # token budget; larger priming groups keep the eager path.
+                budget = max(1, self.vllm_config.scheduler_config.max_num_batched_tokens // frames)
+                prime_sizes = sorted({1, *(size for size in batch_sizes if size <= budget)})
+                self.stream_prime_graphs = StreamingDecodeGraphs(self.stream_decoder, prime_sizes, frames=frames)
+        logger.info("Captured Talker stream decode graphs for batch sizes %s", self.stream_graphs.sizes)
+        if self.stream_prime_graphs is not None:
+            logger.info(
+                "Captured Talker reference priming graphs for %d frames and batch sizes %s",
+                self.stream_prime_graphs.frames,
+                self.stream_prime_graphs.sizes,
+            )
+
+    def get_stream_ref_context(self, info: OmniPayload) -> torch.Tensor | None:
+        """Model-owned reference-code layout and context boundary for a PCM slot."""
+        codes = info.get("codes")
+        ref = codes.get("ref") if isinstance(codes, dict) else None
+        if not isinstance(ref, torch.Tensor) or not ref.numel():
+            return None
+        return ref.reshape(-1, int(self.talker_config.num_code_groups))[-self.stream_ref_context_frames :]
+
+    def prime_stream_decoder(self, primes: list[tuple[int, torch.Tensor]]) -> None:
+        """Prime equal-length reference groups without padding or aliasing live slots."""
+        if not primes:
+            return
+        stream = self.stream_decoder
+        if stream is None:
+            raise RuntimeError("Reference priming requires the single-stage PCM decoder")
+        groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
+        for req_idx, ref in primes:
+            groups.setdefault(int(ref.shape[0]), []).append((req_idx, ref))
+        for items in groups.values():
+            codes = to_device_nonblocking(torch.stack([ref for _idx, ref in items]), stream.device).to(torch.int32)
+            n = len(items)
+            slots = index_to_device([idx for idx, _ref in items], stream.device, dtype=torch.int32)
+            for t0 in range(0, int(codes.shape[1]), self.stream_chunk_frames):
+                pos = index_to_device([t0] * n, stream.device, dtype=torch.int32)
+                chunk = codes[:, t0 : t0 + self.stream_chunk_frames].contiguous()
+                graphs = self.stream_prime_graphs
+                decode = graphs if graphs is not None and chunk.shape[1] == graphs.frames else stream
+                decode(chunk, slots, pos)
 
     def _build_stacked_codec_embed(self) -> None:
         embeds = self.code_predictor.get_input_embeddings()

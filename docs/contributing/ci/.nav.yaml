@@ -4,3 +4,4 @@ nav:
   - test_writing_guide.md
   - failures.md
   - test_execution_guide.md
+  - pr_merge_loop.md

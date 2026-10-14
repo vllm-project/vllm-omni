@@ -124,6 +124,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     step_audio2,
     voxcpm2,
     voxtral,
+    yue2,
 )
 
 __all__ = [

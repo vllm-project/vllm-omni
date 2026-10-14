@@ -521,3 +521,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         self._disable(restore_weights=True)
+
+    def shutdown(self) -> None:
+        # Restoring every block copies the whole DiT back onto the device, which
+        # only matters for a later ``enable`` and can outlast the executor's
+        # shutdown grace period.
+        self._disable(restore_weights=False)

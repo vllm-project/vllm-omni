@@ -14,36 +14,6 @@ from typing import Any
 # =============================================================================
 
 
-def extract_speaker_from_runtime_info(
-    runtime_additional_information: list[dict[str, Any]] | None,
-) -> str | None:
-    """Extract speaker from per-request runtime info dicts.
-
-    Iterates through the list of per-request info dicts and returns the first
-    non-empty speaker string found, normalized to lowercase.
-
-    Args:
-        runtime_additional_information: List of per-request additional info
-            dicts, as passed to the model's forward() method.
-
-    Returns:
-        The speaker string (lowercase, stripped), or None if not present.
-    """
-    if not runtime_additional_information:
-        return None
-    for info in runtime_additional_information:
-        vt = info.get("speaker")
-        if vt is None:
-            continue
-        if isinstance(vt, (list, tuple)) and len(vt) > 0:
-            vt = vt[0]
-        if isinstance(vt, str) and vt.strip():
-            return vt.lower().strip()
-        if vt is not None:
-            return str(vt).lower().strip()
-    return None
-
-
 def extract_speaker_from_request(request: Any) -> str | None:
     """Extract speaker from a request's additional_information field.
 
@@ -137,30 +107,6 @@ def extract_full_utterance_decode_from_request(request: Any) -> bool | None:
 # =============================================================================
 # Language helpers
 # =============================================================================
-
-
-def extract_language_from_runtime_info(
-    runtime_additional_information: list[dict[str, Any]] | None,
-) -> str | None:
-    """Extract language from per-request runtime info dicts.
-    Args:
-        runtime_additional_information: List of per-request additional info
-            dicts, as passed to the model's forward() method.
-
-    Returns:
-        The language string (e.g. "Chinese", "English", "Auto"), or None.
-    """
-    if not runtime_additional_information:
-        return None
-    for info in runtime_additional_information:
-        lang = info.get("language")
-        if lang is None:
-            continue
-        if isinstance(lang, (list, tuple)) and len(lang) > 0:
-            return lang
-        if isinstance(lang, str) and lang.strip():
-            return [lang.strip()]
-    return None
 
 
 def extract_language_from_request(request: Any) -> str | None:

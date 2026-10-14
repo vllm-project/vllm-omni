@@ -415,7 +415,8 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
     )
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert calls == []
+    # The empty row set is still published: the model then skips its per-row prompt scan.
+    assert calls == ["prepare"]
 
 
 def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
@@ -442,7 +443,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert calls == [()]
+    assert calls == [(), ()]
 
 
 def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
@@ -1534,6 +1535,71 @@ def test_minicpmo_stage0_streaming_processor_is_isolated_per_session():
     assert observed == [1, 1, 2, 2]
     assert processor_a is not processor_b
     assert runtime.processor._streaming_mel_processor.counter == 0
+
+
+def test_minicpmo_stage0_feature_extractor_is_isolated_per_session():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    class _FeatureExtractor:
+        # Like MiniCPMAAudioProcessor: the log-mel floor mode lives on the extractor.
+        def __init__(self):
+            self.dynamic_log_norm = True
+            self.dynamic_range_db = 8.0
+            self.log_floor_db = -10.0
+
+        def set_spac_log_norm(self, dynamic_range_db=None, log_floor_db=None):
+            if dynamic_range_db is not None:
+                self.dynamic_log_norm, self.dynamic_range_db = True, dynamic_range_db
+            if log_floor_db is not None:
+                self.dynamic_log_norm, self.log_floor_db = False, log_floor_db
+
+    class _Mel:
+        # Like StreamingMelProcessorExact._extract_full below 5 s of buffer.
+        def __init__(self, feature_extractor: _FeatureExtractor):
+            self.feature_extractor = feature_extractor
+
+        def process(self) -> bool:
+            self.feature_extractor.set_spac_log_norm(log_floor_db=-10)
+            return self.feature_extractor.dynamic_log_norm
+
+    class _Processor:
+        # Like the remote MiniCPMOProcessor: set_streaming_mode() rebuilds the streaming
+        # mel processor on self.audio_processor, and process_audio() (the reference
+        # voice) reads whatever floor mode that extractor is in.
+        def __init__(self):
+            self.audio_processor = _FeatureExtractor()
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def set_streaming_mode(self, **_kwargs):
+            self._streaming_mel_processor = _Mel(self.audio_processor)
+
+        def reset_streaming(self):
+            return None
+
+        def process_audio_streaming(self, _audio, **_kwargs):
+            return self._streaming_mel_processor.process()
+
+        def process_audio(self, _audios):
+            return self.audio_processor.dynamic_log_norm
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.processor = _Processor()
+    runtime.stage_model = SimpleNamespace()
+    runtime.thinker = runtime.stage_model
+    processor_a = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="a"))
+    processor_b = runtime._configure_streaming_processor(_MiniCPMO45Stage0SessionState(session_id="b"))
+
+    assert runtime._process_streaming_audio([], 0, processor=processor_a) is False
+
+    # Session a's stream changed neither the processor that encodes reference voices
+    # nor session b.
+    assert runtime.processor.process_audio([]) is True
+    assert processor_b.audio_processor.dynamic_log_norm is True
+    assert processor_a._streaming_mel_processor.feature_extractor is processor_a.audio_processor
+    assert processor_a.audio_processor is not processor_b.audio_processor
 
 
 def test_minicpmo_stage0_data_plane_next_append_reinjects_previous_listen():
@@ -2890,6 +2956,7 @@ def test_minicpmo_stage0_native_sampler_forced_listen_yields_floor():
     )
 
     sampled = model.sample(logits, sampling_metadata)
+    model._commit_minicpmo45_duplex_pending_samples()  # the runner commits before the next step
 
     assert sampled is not None
     assert sampled.sampled_token_ids.tolist() == [[151705]]
@@ -3155,6 +3222,7 @@ def test_minicpmo_stage0_turn_eos_is_forwarded_not_pending():
     logits[0, 151717] = 30.0
 
     sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201]))
+    model._commit_minicpmo45_duplex_pending_samples()  # the runner commits before the next step
 
     assert sampled.sampled_token_ids.tolist() == [[151717]]
     assert state.pending_terminator_token is None
@@ -3166,6 +3234,7 @@ def test_minicpmo_stage0_turn_eos_is_forwarded_not_pending():
     logits = torch.full((1, 151723), -100.0)
     logits[0, 151718] = 30.0
     sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201, 151717]))
+    model._commit_minicpmo45_duplex_pending_samples()
 
     assert sampled.sampled_token_ids.tolist() == [[151718]]
     assert state.pending_terminator_token == 151718

@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from vllm_omni.engine.duplex.commands import (
-    AppendAudio,
     CancelResponse,
     ClearOutputAudio,
     Commit,
@@ -804,7 +803,9 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             "status": "in_progress",
             "content": [],
         }
-        state.conversation_items[item_id] = item
+        # Later deltas grow the state item. Keep creation events independent
+        # so their queued payloads retain the size measured at admission.
+        state.conversation_items[item_id] = {**item, "content": []}
         events = [
             _response_created_event(event),
             *_conversation_item_added_events(state, item),
@@ -1576,16 +1577,10 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     return ResolvedControl(payloads=[signal_payload], events=ack_events)
 
 
-def append_audio_payload(command: AppendAudio) -> dict[str, object]:
-    """Internal ``input_audio_buffer.append`` payload for a command (convenience for the runner)."""
-    return command.payload()
-
-
 __all__ = [
     "RealtimeProjectionState",
     "ResolvedCommit",
     "ResolvedControl",
-    "append_audio_payload",
     "clear_input_buffer",
     "discard_pending_input_audio",
     "emit_input_speech_started",

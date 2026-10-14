@@ -46,6 +46,8 @@ def _modality_to_type_string(modality: OutputModality) -> str:
             return "image"
         if OutputModality.LATENT in modality:
             return "latent"
+        if OutputModality.TOKEN_IDS in modality:
+            return "token_ids"
     except TypeError:
         # Flag identity mismatch (e.g. after module reload in tests).
         name = getattr(modality, "name", "") or ""
@@ -56,6 +58,8 @@ def _modality_to_type_string(modality: OutputModality) -> str:
             return "image"
         if "latent" in lowered:
             return "latent"
+        if "token_ids" in lowered:
+            return "token_ids"
     return "text"
 
 
@@ -410,7 +414,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats: Whether to log statistics
             stream_interval: Stream interval for output generation
             engine_core_output_type: Optional output type string (e.g.,
-                "image", "audio", "latent"). Converted to OutputModality
+                "image", "audio", "latent", "token_ids"). Converted to OutputModality
                 internally. Kept for backward compatibility with
                 stage_init_utils.
             output_modality: Type-safe output modality flag. Used to tag
@@ -828,6 +832,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if iteration_stats is None or engine_core_timestamp is None or native_stats is None:
             return
 
+        is_coalesced = getattr(engine_core_output, "is_coalesced", False) is True
+        num_itls_before = len(iteration_stats.inter_token_latencies_iter) if is_coalesced else 0
         iteration_stats.update_from_output(
             engine_core_output,
             engine_core_timestamp,
@@ -836,6 +842,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self.lora_states,
             req_state.lora_name,
         )
+        if is_coalesced:
+            # Keep all upstream state updates, but not the batched interval as one ITL.
+            del iteration_stats.inter_token_latencies_iter[num_itls_before:]
         record = self._native_text_metric_record(req_state.external_req_id)
         record["num_generation_tokens"] = (
             reported_count
@@ -848,9 +857,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
         if previous_last_token_ts > 0:
             itl_ms = max((engine_core_timestamp - previous_last_token_ts) * 1000.0, 0.0)
-            itls_ms = record.setdefault("vllm_itls_ms", [])
-            itls_ms.append(itl_ms)
-            record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
+            if not is_coalesced:
+                itls_ms = record.setdefault("vllm_itls_ms", [])
+                itls_ms.append(itl_ms)
+                record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
             _accumulate_segment_tpot(
                 record,
                 elapsed_ms=itl_ms,

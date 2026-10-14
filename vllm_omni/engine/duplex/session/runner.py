@@ -64,6 +64,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     InputCleared,
+    ResponseDone,
     SessionExpired,
     SessionHeartbeatAck,
 )
@@ -347,6 +348,15 @@ class DuplexSessionRunner:
         """Whether ``session.closed`` / ``session.expired`` already left this runner."""
         return self.run.closed_emitted
 
+    def fail_output(self, message: str, *, response_id: str | None, terminal: ResponseDone | None) -> list[DuplexEvent]:
+        """Experimental overflow policy: fail this response and close only its session."""
+        if self.closing:
+            return []
+        events = self.out.fail_output(message, response_id=response_id, terminal=terminal)
+        self._begin_close("output_backpressure")
+        self.manager.close_from_runner(self, "output_backpressure")
+        return events
+
     def mark_closed_emitted(self) -> None:
         """Claim the session's one terminal event for the caller.
 
@@ -520,9 +530,6 @@ class DuplexSessionRunner:
         if item.kind == "commit":
             await self._on_commit(dict(item.payload))
             return
-        if item.kind == "run_payload":
-            await self._run_internal_payload(dict(item.payload))
-            return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
 
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
@@ -691,9 +698,6 @@ class DuplexSessionRunner:
 
     def _require_projector(self) -> RealtimeProjectionState:
         return self.out.require_projector()
-
-    def _is_stale_model_output(self, payload: dict[str, object]) -> bool:
-        return self.out.is_stale_model_output(payload)
 
     def _promote_deferred_overlap_later(self, payload: dict[str, object], precreate_response: bool) -> None:
         """Re-enter the mailbox so the promoted turn is handled in command order."""
@@ -1474,6 +1478,9 @@ class DuplexSessionRunner:
         if older_abort_ids:
             session.release_resources_for_request_ids(older_abort_ids)
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        self.manager.invalidate_output(session.session_id, old_response_id, through_epoch=old_epoch)
+        for response_id, _, _ in draining_cancels:
+            self.manager.invalidate_output(session.session_id, response_id, through_epoch=old_epoch)
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
@@ -2007,36 +2014,26 @@ class DuplexSessionRunner:
             or model_state.committed_audio_payload is not None
             or realtime_validated_audio_commit
         )
-        committed = None
         if event_type in {"input_audio_buffer.commit", "input.commit"}:
             model_state.input_since_commit = False
             model_state.speech_since_commit = False
-        if event_type != "response.create":
-            committed = (
-                helpers.commit_audio_input(
-                    session,
-                    realtime_item_id=realtime_item_id,
-                    transcript=event.get("transcript"),
-                )
-                if had_uncommitted_audio
-                else None
+        committed = (
+            helpers.commit_audio_input(
+                session,
+                realtime_item_id=realtime_item_id,
+                transcript=event.get("transcript"),
             )
-            self.emit(
-                helpers.audio_committed_payload(
-                    session,
-                    committed=committed,
-                    realtime_item_id=realtime_item_id,
-                    transcript=event.get("transcript"),
-                )
+            if had_uncommitted_audio
+            else None
+        )
+        self.emit(
+            helpers.audio_committed_payload(
+                session,
+                committed=committed,
+                realtime_item_id=realtime_item_id,
+                transcript=event.get("transcript"),
             )
-            return
-        if committed is not None:
-            if isinstance(realtime_item_id, str):
-                session.register_history_item(realtime_item_id, committed.message)
-            self.emit(helpers.input_committed_payload(session, committed, realtime_item_id=realtime_item_id))
-        # NOTE(refactor): the old generic chat-completion fallback response
-        # (`_run_response`) is gone; a native session with a response already in
-        # progress only acknowledges the commit here.
+        )
 
     # ------------------------------------------------------------------ #
     # playback.ack (moved from OmniDuplexSessionHandler)                 #

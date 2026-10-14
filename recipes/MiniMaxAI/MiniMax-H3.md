@@ -271,8 +271,10 @@ For a combined service on four high-memory GPUs, use:
 - regional `torch.compile` for the repeated DiT blocks;
 - dense BF16 `TRTLLM_ATTN`, with Ring and TP left at 1.
 
-Both DiTs remain resident in this no-offload configuration. If they do not fit,
-use model-level CPU offload.
+Both DiTs remain resident, except that supported SM120 deployments offload
+AdaLN projection weights by default. Other GPU architectures keep those weights
+resident unless explicitly opted in. If the models do not fit, use model-level
+CPU offload.
 
 ```bash
 export MODEL=MiniMaxAI/MiniMax-H3
@@ -988,6 +990,42 @@ settings, and both videos with any comparison; the command alone is not quality
 evidence. A matching seed does not imply matching noise over differently sized
 full and windowed latents.
 
+## Request-scoped sampler
+
+H3 supports `euler` (the default) and `res_multistep`. Select the sampler per
+request; it applies to both video and audio, using their separate sigma schedules.
+For the HTTP examples above, set `num_inference_steps=20` and add
+`"sampler":"res_multistep"` to the existing `extra_params` object. For example,
+the T2VA fields become:
+
+```bash
+-F 'num_inference_steps=20' \
+-F 'extra_params={"task":"t2va","duration":8.7,"audio_flow_shift":3.0,"sampler":"res_multistep"}'
+```
+
+For the offline Python API, use `extra_args`:
+
+```python
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+sampling_params = OmniDiffusionSamplingParams(
+    num_inference_steps=20,
+    seed=42,
+    extra_args={"task": "t2va", "sampler": "res_multistep"},
+)
+```
+
+Both samplers use one DiT evaluation per step in request mode and step execution.
+`res_multistep` retains the previous denoised prediction independently for each
+request and each stream; its first and final updates use Euler. Omitting `sampler`
+or selecting `euler` preserves the existing Euler update. Reducing the step count
+reduces model evaluations, but quality depends on the prompt and configuration;
+20 RES steps are a candidate to compare against an Euler-50 reference.
+
+Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
+must keep `sampler="euler"`. RES sampling with those schedules has not been
+validated and is rejected with `ValueError`.
+
 ## Request-scoped quality
 
 Add one of these fields to any HTTP request above. No Cache-DiT startup option
@@ -1040,12 +1078,13 @@ normally, avoiding cyclic eviction on repeated original-H3 requests. All origina
 remain loaded so new schedules and adapters can compute normally. Adapter changes,
 weight reloads, and model device moves invalidate the cache; parameter versions
 also guard individual entries. TP ranks coordinate hits before skipping a
-projection collective. Gradient-enabled execution, compilation, custom linear
-hooks, and tensors without weight version counters use the original computation.
+projection collective. Gradient-enabled execution, custom linear hooks, and
+tensors without weight version counters use the original computation. Both
+eager and compiled execution support projection reuse.
 Offload paths that replace weight storage can therefore reduce the hit rate.
 
-The runtime cache uses the shared `ExactProjectionCache` implementation; H3 keeps
-only its optional sidecar adaptation. Other models can integrate the same
+The runtime cache uses the shared `ExactProjectionCache` implementation; H3 owns
+its sidecar adaptation and projection weight offload. Other models can use the same
 [projection cache interface](../../docs/design/module/diffusion/diffusion_model_integration.md#exact-conditioning-projection-reuse).
 This cache retains projection outputs, not offloaded weights, and does not skip
 block weight prefetch.
@@ -1056,15 +1095,46 @@ For an A/B comparison, disable only this reuse at server startup:
 --cache-config '{"minimax_h3_adaln_cache": false}'
 ```
 
+### Default AdaLN weight offload
+
+AdaLN weight offload is enabled automatically on **SM120** for unquantized BF16
+CUDA inference with the default exact result cache. The default uses each
+worker's device capability; other GPU architectures keep their existing weight
+placement. It reduces GPU memory usage by
+keeping projection weights in host memory and reusing exact cached results.
+Both compiled and eager execution are supported; no extra enable flag is needed.
+Allow additional host RAM for the offloaded weights and pinned staging copies.
+Cache misses, including a cold request or a new timestep schedule, transfer
+weights to the GPU and synchronize staging; warmed cache hits avoid that work.
+Measure both cold latency and warmed throughput for the intended workload.
+
+Other compatible CUDA deployments can opt in explicitly:
+
+```bash
+--cache-config '{"minimax_h3_adaln_offload": true}'
+```
+
+The automatic default is limited to the tested SM120 path and does not depend
+on the attention provider or require FlashInfer.
+
+To keep AdaLN weights on the GPU while retaining result caching:
+
+```bash
+--cache-config '{"minimax_h3_adaln_offload": false}'
+```
+
+Non-CUDA platforms, quantized models, DiT-wide offload and HSDP retain their
+existing weight placement. Disabling the result cache also disables automatic
+AdaLN offload. Explicitly enabling it in an incompatible configuration raises
+an error.
+
 ### Optional offline sidecar
 
 An offline sidecar can seed the first projection results; it is not required to
-enable the default cache. Sidecars require `--enforce-eager`, native BF16 TP1
-math, and the same numerical environment as the builder. With the default
-compiled execution, sidecars are rejected before reading their payloads: compiled
-H3 blocks bypass cached projections, so retaining those payloads would waste GPU
-memory. This applies to both the main and Ref2VA sidecars. Other serving
-configurations retain the default runtime-cache behavior described above.
+enable the default cache. Sidecars require native BF16 TP1 math and the same
+numerical environment as the builder. Both eager and compiled H3 execution
+consult sidecars through the host cache boundary. Uncovered or incompatible
+inputs use the original projection instead.
 From the repository root, for a fixed FastH3 adapter and its own four-step schedule:
 
 ```bash
@@ -1081,10 +1151,9 @@ The builder accepts a native transformer directory with `config.json` and indexe
 or single-file safetensors. It streams the required inputs and refuses to overwrite
 an existing output. It does not instantiate the full DiT.
 
-Pass the resulting local artifact at eager server startup:
+Pass the resulting local artifact at server startup:
 
 ```bash
---enforce-eager \
 --cache-config '{"minimax_h3_adaln_cache_path": "/path/to/h3-adaln.safetensors"}'
 ```
 
@@ -1097,8 +1166,8 @@ the runtime path. A request with different settings similarly falls back.
 Build sidecars from trusted local inputs: checksums verify identity and integrity,
 not the correctness of an untrusted generator.
 
-This implementation saves repeated projection work. It does not remove AdaLN
-weights or claim a GPU memory reduction. End-to-end gains depend on the workload,
+Caching and sidecars alone save repeated projection work; GPU residency changes
+with weight offload, which is enabled by default on supported SM120 configurations. Gains depend on the workload,
 offload behavior, embedding fingerprint cost, and TP coordination overhead.
 
 ## LoRA
@@ -1274,8 +1343,8 @@ hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
 export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 ```
 
-Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
-command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
+Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a server command without
+DiT-wide offload. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
 correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
 fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
 rejected rather than served without the adapter it asked for.
@@ -1296,18 +1365,29 @@ Only a release that identifies itself as FastH3 is fused; any other
 `fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
 is then held to its own metadata: one that misdeclares its tensor counts or
 leaves a transformer block unedited is refused at startup instead of serving
-mostly base H3 weights on a four-step schedule. Offload is refused for the same
+mostly base H3 weights on a four-step schedule. DiT-wide offload is refused for the same
 reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
 `--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
 
-The VSA variants are supported through FastVideo's external kernel. Install a
-`fastvideo-kernel` build that provides the `fastvideo_kernel` Python module,
-then add the following flags to the same command:
+For the VSA variants, add the following flags to the same command. H3 selects
+FlashInfer BF16 automatically on SM120/SM121 when the required tile64 API is
+installed; otherwise it uses FastVideo's external kernel, supplied by the
+`vllm-omni[vsa]` extra. The video request API is unchanged:
 
 ```bash
 --diffusion-attention-backend FASTVIDEO_VSA \
 --fastvideo-vsa-topk 64
 ```
+
+To use approximate Sage attention on SM120, replace those two flags with:
+
+```bash
+--diffusion-attention-config '{"default":{"backend":"FASTVIDEO_VSA","fastvideo_vsa_precision":"sage","fastvideo_vsa_topk":64},"per_role":{"minimax_h3.token_refiner":{"backend":"TORCH_SDPA"}}}'
+```
+
+Sage requires a compatible FlashInfer build; BF16 remains the default. See
+[provider selection](../../docs/user_guide/diffusion/attention_backends/fastvideo_vsa.md#automatic-provider-selection)
+for hardware requirements and provider overrides.
 
 FastH3 VSA applies its learned `.set_weight` compression gates to the complete
 packed `[text | cond | audio | video]` document using the official H3 geometry:
@@ -1398,6 +1478,87 @@ This release supports T2VA only, with local or pure Ulysses attention. Additiona
 LoRA adapters, Ref2VA and FL2VA conditioning are unsupported. The legacy
 four-step adapter keeps its original sampling and fixed-top-k behavior.
 
+### VDN-H3 checkpoint
+
+[VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) is an 8-step DMD student of
+the FL2VA partition. Each DiT block replaces dense self-attention with an exact
+softmax over a frame window plus a Video DeltaNet linear branch for the frames
+outside it. The `VDNH3_ATTN` backend runs the window; see
+[VDN-H3 Hybrid Attention](../../docs/user_guide/diffusion/attention_backends/vdnh3_attn.md)
+for the window layout. The release's two LoRA adapters are fused into the H3
+weights as they stream in, and the linear-branch weights are attached to the
+DiT blocks.
+
+Pass the release as `--lora-path`. Only its `stage-dmd-step-250/` directory
+(about 5 GB) is downloaded; a local copy of the release or of that directory
+also works:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve MiniMaxAI/MiniMax-H3 --omni \
+  --trust-remote-code \
+  --task-type fl2va \
+  --lora-path OpenVDN/vdn-minimax-h3 \
+  --diffusion-attention-backend VDNH3_ATTN \
+  --tensor-parallel-size 2 \
+  --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2
+```
+
+Requests use 8 steps and task `t2va` or `fl2va`:
+
+```bash
+-F 'num_inference_steps=8' \
+-F 'extra_params={"task":"t2va","duration":5}'
+```
+
+FL2VA takes a first frame, a last frame, or both, with the same
+`frame_indices` forms as
+[FL2VA for base H3](#2-fl2va-first-frame-to-video-and-audio).
+
+The student was distilled at 8 steps with H3's default video/audio shifts of
+12/3 and the Euler sampler. A request with another step count, a shift
+override, `sampler=res_multistep`, or a `lora=` field is rejected. Add
+`--quantization fp8` to run the DiT and text-encoder linears in FP8, including
+the linear branch's output projection.
+
+`VDNH3_ATTN` and the checkpoint must be selected together, and the server must
+use `--task-type fl2va`. VDN-H3 scales with tensor parallelism only: `--usp`
+and `--ring` are rejected. Distributed layerwise offload is rejected because it
+installs the DiT without the load-time fusion. The startup log confirms the
+fusion:
+
+```text
+VDN-H3 stage-dmd-step-250: fused 259 LoRA targets, loaded 800 branch tensors
+```
+
+Tensor-parallel sizes 1 (with `--enable-cpu-offload`), 2, and 8 were run end to
+end on NVIDIA H200 (141 GB, NVLink), with T2VA and with all three FL2VA
+keyframe forms at TP2. Cache acceleration, step execution, and
+latent upscale/refine have not been run with VDN-H3.
+
+Measured on H200 at 1344x768 and 14.375 s (345 frames, about 104k tokens) for
+one T2VA prompt with seed 1000, using the offline API and
+`--vae-patch-parallel-size` equal to the TP size. Compilation is on, the first
+request is excluded as warm-up, and one request was recorded per row. DiT time
+per step is the mean of steps 2-8:
+
+| GPUs | Configuration | DiT time per step | End-to-end |
+| ---: | --- | ---: | ---: |
+| 2 | VDN-H3, BF16 | 8.2 s | 74.6 s |
+| 2 | VDN-H3, FP8 | 7.2 s | 67.9 s |
+| 2 | Base H3, `FLASH_ATTN`, 8 steps, BF16 | 15.4 s | 132.4 s |
+| 8 | VDN-H3, BF16 | 2.9 s | 28.8 s |
+| 8 | VDN-H3, FP8 | 2.8 s | 27.9 s |
+| 8 | Base H3, `FLASH_ATTN`, 8 steps, BF16 | 4.4 s | 41.0 s |
+
+The base H3 rows only isolate the attention cost; base H3 is not distilled for
+8 steps. For correctness, the first eager DiT forward was replayed through the
+OpenVDN reference implementation on identical inputs. The relative L2 error
+was 1.6e-2 for video and 1.0e-2 for audio, against 1.2e-2 and 1.4e-2 for base
+H3 replayed the same way. Software: Ubuntu 22.04, driver 580.178.04, Python
+3.12, PyTorch 2.13.0+cu130, vLLM 0.30.0.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
@@ -1408,6 +1569,7 @@ four-step adapter keeps its original sampling and fixed-top-k behavior.
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
+| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
@@ -1515,9 +1677,184 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   --cache-config '{"rel_l1_thresh":0.17}'
 ```
 
+## Latent super-resolution
+
+H3's video VAE is a ~5B-parameter model, so the usual way to raise output
+resolution -- decode, upscale in pixel space, re-encode -- pays for that VAE
+twice. The community
+[Minimax H3 latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+is a learned 3D-convolutional resizer trained on H3's 24-channel latents: it
+runs between the denoise loop and the VAE, so the clip is decoded once, at the
+larger size. Unlike bilinear or bicubic interpolation of a latent, it does not
+introduce ghosting or double-image artifacts.
+
+The network runs one normalization below the pipeline latent: an H3 latent in
+vLLM-Omni is already normalized, and the upscaler was trained on that tensor
+normalized again by the VAE's `latents_mean` / `latents_std`. The stage applies
+and undoes that itself, so nothing about a request changes -- but a port that
+skips it inflates the latent about 5x and decodes as a magenta grid at one tile
+per latent cell.
+
+The checkpoint is optional and is not part of the H3 release. Download one file
+from that repository (`minimax_h3_latent_upscaler_3d_bf16.safetensors`, 691 MB)
+and name it at startup:
+
+```bash
+vllm serve "${MODEL_ROOT}/FL2VA" \
+  --omni \
+  --trust-remote-code \
+  --additional-config '{"latent_upscaler_path":"/models/minimax_h3_latent_upscaler_3d_bf16.safetensors"}'
+```
+
+A request then asks for a size. The three modes are mutually exclusive and all
+resolve to the same 16-pixel latent grid, so the three requests below are the
+same 960x544 -> 1920x1088 upscale:
+
+```bash
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=...' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0}' \
+  -o t2va_1080p.mp4
+
+# or name the output size in pixels
+#   "latent_upscale":{"width":1920,"height":1088}
+# or name a pixel budget and keep the aspect ratio
+#   "latent_upscale":{"megapixels":2.0}
+```
+
+Over HTTP the field is `extra_params`: the videos request model declares that
+name and nothing else, so an `extra_args` form field is dropped without an
+error and the request silently returns the un-upscaled size. Offline, the same
+value goes in `extra_args`:
+
+```python
+omni = Omni(
+    model=os.path.join(os.environ["MODEL_ROOT"], "FL2VA"),
+    trust_remote_code=True,
+    additional_config={"latent_upscaler_path": "/models/minimax_h3_latent_upscaler_3d_bf16.safetensors"},
+)
+outputs = omni.generate(
+    "A quiet cinematic night scene with matching ambient sound.",
+    OmniDiffusionSamplingParams(
+        height=544,
+        width=960,
+        fps=24,
+        num_inference_steps=50,
+        seed=42,
+        extra_args={"task": "t2va", "duration": 8.7, "latent_upscale": 2.0},
+    ),
+)
+```
+
+### The hi-res route: generate small, refine large
+
+Upscaling alone decodes the enlarged latent directly, which is fast but can
+only interpolate detail the first pass never generated. Adding `latent_refine`
+resumes the denoise schedule at the new size, so the DiT puts real detail back:
+
+1. generate at a cheap size -- far fewer DiT tokens,
+2. upscale the latent,
+3. re-noise it and run the tail of the schedule at the target size.
+
+```bash
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=...' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'num_inference_steps=50' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0,"latent_refine":0.4}' \
+  -o t2va_1080p.mp4
+```
+
+`latent_refine` is the fraction of the request's steps the second pass re-runs,
+the img2img convention, so it sets both how much the pass may change and what
+it costs: `0.4` of `num_inference_steps=50` is 50 cheap steps followed by 20
+expensive ones. Low values stay close to the first pass and mostly sharpen;
+high values re-generate and may drift from it. `1.0` re-runs the whole schedule
+from noise, which discards the first pass entirely.
+
+Detail does not keep climbing with strength. Measured on a 15s 2688x1536 clip,
+six frames apart, against the same seed and prompt: 0.5 returned 0.98x the
+high-frequency energy of 0.35 and 0.65 returned 0.92x, while the mean per-pixel
+drift from the 0.35 result rose from 6.3 to 12.6 (0-255). What caps detail is
+what the DiT can resolve at the target size, not how noisy a start it is given;
+past that, a higher strength only erases more of the first pass and re-imagines
+it from less. On this checkpoint 0.35 was the best of the three -- treat higher
+values as "re-generate", not as "sharpen".
+
+Why this is faster than generating at the target size: the DiT cost follows the
+video token count, which is quadratic in the latent area for attention. The
+example above is 31,620 video tokens at 960x544 against 126,480 at 1920x1088 --
+4x the tokens, so roughly 4x the linear cost and up to 16x the attention cost
+per step. Paying that on 20 steps instead of 50 is where the saving comes from.
+The gain therefore depends on the resolutions, the strength, and how
+attention-bound the shape is; measure it on your own workload.
+
+Audio is re-noised and refined alongside the video at the same schedule
+position. The two modalities are shifted apart (`flow_shift` 12.0 against
+`audio_flow_shift` 3.0), so each resumes at its own sigma for that position --
+the state the first pass actually passed through, which is what keeps the pass
+in distribution.
+
+`latent_refine` works without `latent_upscale` too, as a plain detail pass at
+the generated size. For FL2VA, the keyframe condition is pinned to the output
+latent size, so a refine after an upscale re-encodes the keyframes from the
+originals at the new size; REF2VA references carry their own shapes and are
+reused as they are.
+
+### Options
+
+| `--additional-config` key | Default | Meaning |
+| --- | --- | --- |
+| `latent_upscaler_path` | unset | Checkpoint file, or a directory holding exactly one. Unset disables the stage and loads no extra weights. |
+| `latent_upscaler_dtype` | the engine dtype | `bf16`, `fp16` or `fp32`. |
+| `latent_upscaler_chunk_frames` | `0` | `0` runs the whole clip in one pass; a positive value bounds activation memory with approximate temporal chunking. |
+| `latent_upscaler_resident` | `false` | Keep the ~700 MB of weights on the GPU between requests instead of in host memory. |
+| `latent_refine_max_tokens_per_rank` | `65536` | Reject larger refine layouts before denoising. Set `0` only after validating a larger deployment. |
+| `latent_upscale` | unset | A default target applied to every request, in the request's own format. A request overrides it, and `false` opts out. |
+| `latent_refine` | unset | A default refine strength applied to every request. A request overrides it, and `false` opts out. |
+
+The `latent_upscale` request value is a multiplier (`2.0`), `false`, or an
+object naming one mode: `{"scale": 2.0}`, `{"width": …, "height": …}` or
+`{"megapixels": …}`, each accepting an `align` (default `32` pixels). The
+checkpoint was trained between 1.0x and 4.0x and only upscales; a smaller
+target is rejected, and `scale` 1.0 is a no-op that skips the stage. The
+`latent_refine` value is a strength in `(0, 1]`, `false`, or
+`{"strength": 0.4}`; it needs no checkpoint of its own.
+
+When `latent_refine` is enabled, both resolved output dimensions must be
+divisible by 32 pixels for the DiT's spatial patches. A custom `align` that
+produces an incompatible target is rejected before denoising; upscale-only
+requests can still use the VAE's 16-pixel grid. Numeric upscale fields must be
+positive and finite, and `width`, `height`, and `align` must be integers.
+
+Temporal chunking can bound activation memory on long clips -- a 15-second clip is
+102 latent frames, more than three 32-frame chunks. It is an approximation rather than a
+partition: the network's GroupNorms pool statistics over whatever clip they are
+handed, so a chunked pass can differ from a single pass across the whole output
+and not only at the chunk seams. How much that costs in practice was not
+measured here; the default single pass buys the exact result for the
+memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
+2688x1536 for 15 seconds, measured on one B300). Set
+`latent_upscaler_chunk_frames: 32` explicitly if that memory cost is too high.
+
 ## Known limitations
 
 - TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
+- The latent upscaler is a community checkpoint, not part of the H3 release,
+  and is unavailable unless `latent_upscaler_path` names one. It runs
+  replicated on every DiT rank rather than sharded.
+- `latent_refine` is request-mode only. It is a second denoise loop with its
+  own resolution and its own truncated schedule, and the step contract carries
+  one schedule per request, so step execution rejects it. `latent_upscale`
+  without `latent_refine` works in both modes.
+- Large refine layouts can abort workers with `CUDA error: an illegal memory
+  access was encountered`. On B300, observed video token counts of 54,144 per
+  rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536
+  counts the full padded layout, including text, audio, and visual references,
+  per Ulysses rank. It rejects the observed failing sizes before the base pass.
+  This is an empirical B300 guard, not a proven kernel limit on every device;
+  deployments with different hardware can adjust the limit after validation.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - Request mode executes one generation request per diffusion batch. Use

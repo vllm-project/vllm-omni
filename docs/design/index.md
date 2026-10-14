@@ -68,6 +68,7 @@ guides list selectable backends, platform defaults, installation, and tuning.
 The design contracts separate selection mechanics from backend algorithms:
 
 - [Attention Backend Selection](feature/attention_backend_selection.md)
+- [Attention Execution Contract PoC](feature/attention_execution_contract_poc.md)
 - [Skip-Softmax](feature/skip_softmax.md)
 
 #### CPU offloading
@@ -116,4 +117,5 @@ The pre-#5137 pages are preserved in the
 [legacy module archive](module/archive/README.md) for historical reference and
 are not active design contracts.
 
+- [Qwen3-Omni MRv2 performance](qwen3_omni_mrv2_performance.md)
 - [MiniCPM-o 4.5 turn-mode MRv2 performance](minicpm_o45_mrv2_performance.md)

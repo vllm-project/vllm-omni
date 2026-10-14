@@ -574,6 +574,7 @@ class StageMetadata:
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    async_chunk_prewarm_payload_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -659,6 +660,12 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    async_chunk_prewarm_payload_func: Callable | None = None
+    _acp_path = _get_attr_or_item(stage_config, "async_chunk_prewarm_payload_func")
+    if _acp_path:
+        _mod, _fn = _acp_path.rsplit(".", 1)
+        async_chunk_prewarm_payload_func = getattr(importlib.import_module(_mod), _fn)
+
     model_stage = engine_args.get("model_stage")
 
     if stage_type == "diffusion":
@@ -698,6 +705,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         runtime_cfg=runtime_cfg,
         prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
+        async_chunk_prewarm_payload_func=async_chunk_prewarm_payload_func,
     )
 
 
@@ -761,6 +769,7 @@ def extract_stage_metadata_from_omni_stage_config(
         runtime_cfg=stage_config.runtime_config,
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
+        async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
     )
 
 
@@ -1994,6 +2003,10 @@ def build_diffusion_config(
         if isinstance(value, int) and value > 0:
             od_config.additional_config.setdefault(f"diffusion_kv_profile_{dimension}", value)
 
+    if od_config.distributed_executor_backend == "ray":
+        runtime_env = _to_dict(_get_attr_or_item(metadata.runtime_cfg, "env", {}) or {})
+        od_config.ray_worker_env = {str(key): str(value) for key, value in runtime_env.items()}
+
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
@@ -2003,7 +2016,10 @@ def build_diffusion_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    if len(physical_devices) < num_devices_per_stage:
+    # Ray validates cluster-wide GPU availability through its placement
+    # group. The stage driver only sees the GPUs on its own node, so a local
+    # device-count check would reject every valid multi-node configuration.
+    if od_config.distributed_executor_backend != "ray" and len(physical_devices) < num_devices_per_stage:
         raise ValueError(
             f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"

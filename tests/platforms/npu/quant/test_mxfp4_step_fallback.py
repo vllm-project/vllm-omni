@@ -5,7 +5,13 @@
 import pytest
 import torch
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion, pytest.mark.npu]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [
+    pytest.mark.advanced_model,
+    pytest.mark.diffusion,
+    *hardware_marks(res={"npu": "A5"}, num_cards=1),
+]
 
 torch_npu = pytest.importorskip("torch_npu")
 

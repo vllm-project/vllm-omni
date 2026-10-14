@@ -12,11 +12,54 @@ require new end-to-end performance measurements after the mainline integration.
 Previously reported numbers do not describe this revised codec backend.
 
 The generic MRv2 profile and the opt-in native V1 duplex H200 profile enable
-TF32 matmuls within Code2Wav forward/capture only; the previous process policy
-is restored afterwards. cuDNN's TF32 policy is independent. TF32 changes rounding.
-Duplex keeps the mainline V1 session path. Turn results do not establish duplex
-performance or interruption correctness.
+ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
+(`torch.backends.cuda.matmul.allow_tf32` on dense QKV/MLP, Triton
+`input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
+The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
+is independent. HiFT stays IEEE FP32. TF32 changes rounding.
+Duplex defaults to the V1 session path; `minicpmo_4_5_duplex_mrv2.yaml` is the
+opt-in CUDA overlay that runs all three duplex stages on MRv2. Turn results do
+not establish duplex performance or interruption correctness.
+
+The shared Code2Wav backend defaults to the existing fused CFM body on CUDA
+when TF32 is allowed, subject to architecture and FP32 attention-cache
+eligibility. Set `cfm_fused_body: false` in the stage connector extra to restore
+the original body. Disabling `token2wav_allow_tf32` or setting
+`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`cfm_fused_body` setting takes precedence. Startup precapture includes query
+buckets for final chunks with encoder lookahead, after steady-state buckets
+and within `cfm_max_graphs`. Capture logs report host warmup and capture times.
+With a reduced graph budget, steady-state graphs can consume all available
+entries before final-chunk buckets are captured. Uncached final-chunk shapes
+then execute eagerly, preserving correctness but losing the graph latency
+benefit. The required budget depends on the configured batch sizes, query
+widths and cache offsets; there is no universal minimum such as 30 graphs.
+Check the startup precapture budget warning when tuning `cfm_max_graphs` for
+memory-constrained deployments.
 
 The shared asynchronous output snapshot and batched Talker preprocessing also
 apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
+
+CFM graph execution defaults to the fused DiT body on CUDA when TF32 is
+allowed. NVIDIA SM80+ uses tiled TF32 attention; older CUDA devices use the
+fused body's SDPA fallback. Unsupported DiT layouts or non-FP32 attention
+caches retain the original body. Other platforms retain their existing default.
+Set `cfm_fused_body: false` in connector `extra` to restore the original body.
+Disabling TF32 with `token2wav_allow_tf32: false` or
+`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`cfm_fused_body: true` overrides that choice and may use TF32 attention.
+Slot pooling and row-offset merging remain opt-in. Fusion changes floating-point
+rounding and does not promise identical waveforms.
+
+## Full-duplex MRv2
+
+`minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2 and
+otherwise inherits the default duplex profile; non-CUDA platforms keep V1.
+Stage 0 keeps `async_chunk: false` because the Thinker has no async producer:
+as on V1, the orchestrator hands each finished segment to `llm2tts`.
+The Talker reuses the streaming prompt recipe (full attention extends its KV
+prefix until capacity; sliding recompute rebuilds the previous condition,
+confirmed codec ids and current condition) and keeps the 16-frame codec
+penalty history across conditions. A segment flushes only on an EOS sampled
+in the current output, never on `turn_end` alone.

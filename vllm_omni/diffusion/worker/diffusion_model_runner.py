@@ -84,6 +84,7 @@ from vllm_omni.diffusion.worker.utils import (
     merge_stage_durations,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -206,7 +207,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.kv_transfer_manager = (
             payload_transfer_manager if getattr(od_config, "kv_transfer_config", None) is None else None
         )
-        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)
+        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)  # type: ignore[arg-type]
         self._kv_connector = None
         from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
 
@@ -250,14 +251,25 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if model is None:
             return
 
+        compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        if getattr(model, "enable_cuda_graph_decode", False):
+            # Decode-graph models still compile their blocks: graph capture
+            # records the compiled (fused) kernels. Scope inductor cudagraphs
+            # to this compile so the two graph layers never stack, without
+            # changing torch.compile for every other model in the process.
+            compile_kwargs["options"] = {
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            }
+            logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
+
         compile_granularity = self.od_config.diffusion_compile_granularity
-        compile_dynamic = self.od_config.diffusion_compile_dynamic
         try:
             if compile_granularity == "full":
-                model.compile(dynamic=compile_dynamic)
+                model.compile(**compile_kwargs)
                 compiled_model = model
             else:
-                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+                compiled_model = regionally_compile(model, **compile_kwargs)
             setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
             logger.warning(
@@ -275,7 +287,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             "compilation errors may surface on the first request.",
             attr_name,
             compile_granularity,
-            compile_dynamic,
+            compile_kwargs["dynamic"],
         )
 
     def load_model(
@@ -966,6 +978,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output = runner_output.runner_outputs[0].result
             assert output is not None
             return output
+        except OmniClientError as exc:
+            # Preserve request errors before the worker RPC serializes them.
+            return DiffusionOutput.from_exception(exc)
         finally:
             if installed_request:
                 self.remove_diffusion_kv_requests([req.request_id])
@@ -1043,12 +1058,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 metadata=new_req.diffusion_kv_metadata,
             )
         installed_request_ids: list[str] = []
+        reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         try:
             for new_req in scheduler_output.scheduled_new_reqs:
                 if new_req.diffusion_kv_metadata is not None:
                     self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
                     installed_request_ids.append(new_req.request_id)
-            reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
             return self._execute_request_list(
                 reqs,
                 od_config=od_config,
@@ -1062,6 +1077,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 ]
                 or None,
             )
+        except OmniClientError as exc:
+            return self._runner_output_from_outputs(reqs, [DiffusionOutput.from_exception(exc) for _ in reqs])
         finally:
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
@@ -1074,11 +1091,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def release_step_requests(self, request_ids: Sequence[str]) -> None:
+        """Drop request-owned state after execution/output preparation has returned.
+
+        The cached batch also owns states, including model-private tensors in
+        ``extra``. Invalidate it when its composition contains a retired request;
+        surviving requests retain their own state and are repacked on the next step.
+        """
+        for request_id in request_ids:
+            self.state_cache.pop(request_id, None)
+        batch = getattr(self, "input_batch", None)
+        if batch is not None and any(request_id in batch.request_ids for request_id in request_ids):
+            self.input_batch = None
+
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
         finished_req_ids = scheduler_output.finished_req_ids
-        for request_id in finished_req_ids:
-            self.state_cache.pop(request_id, None)
+        self.release_step_requests(list(finished_req_ids))
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1244,9 +1273,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.input_batch = input_batch
         scatter_latents(states, input_batch)
 
-        for state in states:
-            if interrupted or state.request_denoise_completed:
-                self.state_cache.pop(state.request_id, None)
+        # Include per-request errors, whose cache entries were already removed.
+        self.release_step_requests(
+            [
+                state.request_id
+                for state in states
+                if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
+            ]
+        )
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1275,7 +1309,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     new_req.request_id,
                     exc_info=True,
                 )
-                result = DiffusionOutput(error=str(exc))
+                # Keep client-error metadata, matching the stepwise path below.
+                result = DiffusionOutput.from_exception(exc)
 
             step_index = getattr(new_req.req.sampling_params, "step_index", None)
             runner_outputs.append(
@@ -1350,6 +1385,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             )
         except Exception:
+            self.release_step_requests(scheduler_output.scheduled_request_ids)
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
@@ -1453,7 +1489,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 else req.denoise_completed
                             )
                             if finished and result is not None:
-                                self._maybe_send_stage_payload([req], [result])
+                                self._maybe_send_stage_payload([req], [result])  # type: ignore[list-item]
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,

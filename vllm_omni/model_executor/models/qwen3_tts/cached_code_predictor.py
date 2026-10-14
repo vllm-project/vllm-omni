@@ -18,8 +18,7 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorDecoderLayer,
     _rotate_half,
 )
-
-from .short_kv_attention import short_kv_attention
+from vllm_omni.model_executor.models.common.short_kv_attention import short_kv_attention
 
 
 def _attention_cached(
