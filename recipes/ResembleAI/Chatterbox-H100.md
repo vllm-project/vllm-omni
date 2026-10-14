@@ -37,31 +37,33 @@ evidence below for where each model keeps up with playback.
 - [A5000 recipe](Chatterbox-A5000.md): commands, offline use, limitations
 - [Online examples](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original)
 - [TTS benchmark README](../../benchmarks/tts/README.md): the shared `bench_tts.py` driver and `chatterbox_reference.py`
-- [Nightly perf configuration](../../tests/dfx/perf/tests/test_chatterbox.json)
+- [Nightly perf configuration](../../tests/dfx/perf/tests/test_tts.json)
 
 ## Hardware
 
 - Accelerator model and per-device memory: NVIDIA H100 SXM, 80 GB
 - Number of devices: 1; the API process and both stages share it (`conditioning_device: cuda:0`)
 - Device interconnect: none used
-- Host memory: not retained for these runs
+- Host: Intel Xeon Platinum 8470 with a 22-CPU container quota and a 251 GB
+  memory limit for the upstream comparison and nightly rows; not retained for
+  the 64-client runs
 - Qualification scope: CUDA only; the measurements below name their profile and revision
 
 ## Software environment
 
 | Field | Upstream comparison and nightly baselines | 64-client qualification |
 | --- | --- | --- |
-| OS | Ubuntu 24.04.3 | Ubuntu 24.04 |
+| OS | Ubuntu 24.04.4 | Ubuntu 24.04 |
 | Python | 3.12.3 | 3.12.3 |
-| Driver / runtime | 580.159.04; PyTorch 2.13.0+cu130, torchaudio 2.11.0+cu130 | 595.91.07; PyTorch 2.13.0+cu130, torchaudio 2.11.0 |
+| Driver / runtime | 580.126.09 (CUDA 13.0); PyTorch 2.13.0+cu130, torchaudio 2.11.0+cu130 | 595.91.07; PyTorch 2.13.0+cu130, torchaudio 2.11.0 |
 | vLLM | 0.31.0 | 0.31.0 |
-| Transformers | 5.14.1 | 5.14.1 |
-| vLLM-Omni | `cb4679038` (comparison), `0de536675` with `0a47e146a` (nightly) | `21bb93f10` |
+| Transformers / Diffusers | 5.14.1 / 0.40.0 | 5.14.1 / not recorded |
+| vLLM-Omni | `c6fff58b8` (comparison and nightly) | `21bb93f10` |
 | Checkpoints | Turbo `749d1c1a46eb10492095d68fbcf55691ccf137cd`; Original `5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18` | same |
 
-Upstream ran in its own environment: PyTorch and torchaudio 2.6.0+cu124,
-NumPy 1.26.4, Transformers 5.2.0, Diffusers 0.29.0, Perth
-`ff1c8ac55a976971245cdd53c18d6131ca00d993`. Both sides used four CPU threads.
+Upstream ran in its own environment: Python 3.11.15, `chatterbox-tts` 0.1.7,
+PyTorch and torchaudio 2.6.0+cu124, NumPy 1.26.4, Transformers 5.2.0,
+Diffusers 0.29.0, `resemble-perth` 1.0.1. Both sides used four CPU threads.
 
 ## Command
 
@@ -94,13 +96,13 @@ its commands are in the [TTS benchmark README](../../benchmarks/tts/README.md#ma
 ## Verification
 
 ```bash
-pytest tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_chatterbox.json \
-  -m "full_model and H100 and cards_1"
+pytest tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json \
+  -m "full_model and H100 and cards_1" -k chatterbox --run-level full_model
 ```
 
 Expected: every case completes with zero failed requests, and the median
-first-audio latency and real-time factor stay within the H100 baselines in
-that file (the graph-mode latency rows below). The shared driver's report
+first-audio latency and real-time factor stay near the H100 baselines in
+that file (the nightly rows below). The shared driver's report
 must show `audio_continuity_ok` for every request of a warm Turbo run at 64
 clients.
 
@@ -135,62 +137,80 @@ clients.
 
 ### Comparison with the canonical upstream implementation
 
-Measured 2026-10-13 with `benchmarks/tts/chatterbox_reference.py`: three
-fixed texts, seeds 0, 42 and 123, built-in and cloned voice (the same
-`clone_2.wav`), nine timed requests per mode after two warmup seeds per text,
-72 timed generations in all. FP32 with TF32 off on both sides, concurrency
-one, a 1000-token allowance; Omni in whole-utterance mode with stage 0
-eager; a fresh process per backend and model. Clone requests include fresh
-conditioning; model loading, warmup and WAV writes are excluded. Upstream's
-`generate` includes its CPU Perth watermark. Omni uses position-aligned flow
-noise, so equal seeds do not give identical token draws.
+Measured 2026-10-14 at `c6fff58b8` with `benchmarks/tts/chatterbox_reference.py`
+on the host above: three fixed texts, seeds 0, 42 and 123, built-in and
+cloned voice (the same `clone_2.wav`), nine timed requests per mode after two
+warmup seeds per text, 108 timed generations in all. FP32 with TF32 off on
+both sides, concurrency one, a 1000-token allowance; Omni in whole-utterance
+mode on the default Model Runner V2, once with stage 0 eager and once with
+stage 0 CUDA graphs (`--cuda-graphs`, still FP32); a fresh process per
+backend, model and mode. Clone requests include fresh conditioning; model
+loading, warmup and WAV writes are excluded. Upstream's `generate` includes
+its CPU Perth watermark. Omni uses position-aligned flow noise, so equal
+seeds do not give identical token draws.
 
 | Model | Backend | Voice | E2E mean ± SD (s) | E2E p95 (s) | RTF mean ± SD | RTF p95 | GPU used p95 (MiB) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Turbo | upstream | builtin | 1.130 ± 0.803 | 2.276 | 0.149 ± 0.007 | 0.158 | 4315 |
-| Turbo | upstream | clone | 1.340 ± 1.027 | 2.836 | 0.156 ± 0.008 | 0.166 | 4595 |
-| Turbo | omni | builtin | 2.107 ± 1.572 | 4.327 | 0.278 ± 0.012 | 0.292 | 32334 |
-| Turbo | omni | clone | 2.421 ± 1.430 | 4.511 | 0.320 ± 0.054 | 0.399 | 32524 |
-| Original | upstream | builtin | 1.907 ± 1.236 | 3.688 | 0.302 ± 0.024 | 0.330 | 4952 |
-| Original | upstream | clone | 2.718 ± 1.743 | 5.113 | 0.292 ± 0.019 | 0.315 | 5277 |
-| Original | omni | builtin | 2.887 ± 1.678 | 5.302 | 0.494 ± 0.117 | 0.632 | 31588 |
-| Original | omni | clone | 4.094 ± 2.955 | 8.780 | 0.443 ± 0.074 | 0.554 | 32332 |
+| Turbo | upstream | builtin | 1.243 ± 0.897 | 2.571 | 0.163 ± 0.010 | 0.174 | 4315 |
+| Turbo | upstream | clone | 1.436 ± 1.001 | 2.848 | 0.175 ± 0.020 | 0.202 | 4595 |
+| Turbo | omni | builtin | 2.132 ± 1.557 | 4.329 | 0.285 ± 0.019 | 0.310 | 32336 |
+| Turbo | omni | clone | 2.358 ± 1.535 | 4.592 | 0.299 ± 0.027 | 0.340 | 32526 |
+| Turbo | omni, CUDA graphs | builtin | 0.585 ± 0.354 | 1.086 | 0.085 ± 0.016 | 0.106 | 32330 |
+| Turbo | omni, CUDA graphs | clone | 0.689 ± 0.318 | 1.157 | 0.098 ± 0.025 | 0.128 | 32520 |
+| Original | upstream | builtin | 2.002 ± 1.202 | 3.628 | 0.326 ± 0.035 | 0.360 | 4670 |
+| Original | upstream | clone | 2.873 ± 1.786 | 5.376 | 0.313 ± 0.027 | 0.347 | 5277 |
+| Original | omni | builtin | 2.300 ± 1.448 | 4.299 | 0.382 ± 0.041 | 0.428 | 31610 |
+| Original | omni | clone | 3.400 ± 2.299 | 6.621 | 0.374 ± 0.024 | 0.403 | 32356 |
+| Original | omni, CUDA graphs | builtin | 1.119 ± 0.579 | 1.945 | 0.199 ± 0.039 | 0.233 | 31594 |
+| Original | omni, CUDA graphs | clone | 1.598 ± 0.932 | 2.931 | 0.189 ± 0.030 | 0.222 | 32340 |
 
 Memory is whole-device usage sampled every 100 ms, including Omni's workers,
-the resident encoders and the reserved KV cache. In this eager, FP32,
-single-request configuration Omni is slower than upstream; with the default
-profile (stage 0 CUDA graphs) the nightly latency row below reaches
-upstream's Turbo RTF.
+the resident encoders and the reserved KV cache. With stage 0 eager, Omni is
+slower than upstream (built-in RTF: Turbo 0.285 against 0.163, Original
+0.382 against 0.326). The CUDA-graph rows change only stage 0's
+`enforce_eager`; with graphs on, Omni is faster than upstream (Turbo 0.085,
+Original 0.199), so the eager gap is in stage 0 and CUDA graphs remove it.
+The default profiles turn stage 0 graphs on. A profile on a different host places
+the eager cost in vLLM's per-token host work, which depends on the host CPU;
+it was not profiled here. The E2E SD mostly reflects the three text
+lengths.
 
-Quality, scored at the time with `openai-whisper` large-v3 (FP32,
-temperature zero, English text normalizer; checkpoint SHA256
-`e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb`) and
-the checkpoint's voice encoder for both backends. Speaker cosine is to the
-reference embedding (clone) or the checkpoint speaker embedding (built-in).
-The script's quality mode now scores through the shared Seed-TTS evaluator
-(`transformers` Whisper large-v3 WER; WavLM SIM for cloned rows only); this
-table predates that change and has not been rerun with it:
+Quality, scored by the script's `quality` mode through the shared Seed-TTS
+evaluator (`vllm_omni.benchmarks.data_modules.seed_tts_eval`) on the eager
+pair: WER from `openai/whisper-large-v3` through `transformers` (revision
+`06f233fe06e710322aca913c1bc4249a0d71fce1`), and SIM, the WavLM
+(`microsoft/wavlm-base-plus`, `4c66d4806a428f2e922ccfa1a962776e232d487b`)
+speaker-embedding cosine to the cloned reference clip. The built-in voice
+ships as embeddings rather than a recording, so built-in rows have no SIM.
+A final phrase is complete when the transcript's last three normalized words
+match the text's.
 
-| Model | Backend | Voice | Aggregate WER | Mean speaker cosine | Final phrase complete |
+| Model | Backend | Voice | Mean WER | Mean SIM | Final phrase complete |
 | --- | --- | --- | --- | --- | --- |
-| Turbo | upstream | builtin | 0.0000 | 0.9389 | 9/9 |
-| Turbo | upstream | clone | 0.0000 | 0.8417 | 9/9 |
-| Turbo | omni | builtin | 0.0000 | 0.9362 | 9/9 |
-| Turbo | omni | clone | 0.0000 | 0.8296 | 9/9 |
-| Original | upstream | builtin | 0.0000 | 0.6241 | 9/9 |
-| Original | upstream | clone | 0.0000 | 0.9123 | 9/9 |
-| Original | omni | builtin | 0.0042 | 0.6411 | 9/9 |
-| Original | omni | clone | 0.0000 | 0.9075 | 9/9 |
+| Turbo | upstream | builtin | 0.0000 | — | 9/9 |
+| Turbo | upstream | clone | 0.0000 | 0.851 | 9/9 |
+| Turbo | omni | builtin | 0.0000 | — | 9/9 |
+| Turbo | omni | clone | 0.0000 | 0.849 | 9/9 |
+| Original | upstream | builtin | 0.0000 | — | 9/9 |
+| Original | upstream | clone | 0.0000 | 0.871 | 9/9 |
+| Original | omni | builtin | 0.0022 | — | 9/9 |
+| Original | omni | clone | 0.0000 | 0.870 | 9/9 |
 
-All 72 outputs were finite, nonempty mono 24 kHz PCM. The predeclared
-guards held: Omni's WER at most 0.05 above upstream, speaker cosine at most
+All 108 outputs were finite, nonempty mono 24 kHz PCM. Original's one
+built-in error is a single substituted article in the longest text. The
+predeclared guards held: Omni's WER at most 0.05 above upstream, SIM at most
 0.05 below, at most one extra missing final phrase per nine. Nine English
 sentences per row show automated agreement, not statistical equivalence or
-subjective parity.
+subjective parity, and these are not human listening scores.
 
 ### Nightly latency and throughput baselines, default profiles
 
-Built-in voice, the bundled `seed_tts_smoke` English texts, seed 42. Latency:
+Measured 2026-10-14 at `c6fff58b8` on the host above with the Verification
+command: one pytest session, the eight Chatterbox cases of
+`tests/dfx/perf/tests/test_tts.json`, all passed with zero failed requests.
+The default profiles run stage 0 in BF16 with async chunk streaming and
+stage 1 in FP32; requests go through `/v1/audio/speech` with the built-in
+voice, the bundled `seed_tts_smoke` English texts and seed 42. Latency:
 20 requests at concurrency one after two warmups; throughput: 80 requests at
 concurrency eight after eight warmups; stress: 100 requests at two per second
 after two warmups. Only stage 0's `enforce_eager` differs between a graph and
@@ -198,17 +218,21 @@ an eager row.
 
 | Variant / AR mode | Workload | Mean RTF | Mean first audio (ms) | Mean audio duration (s) |
 | --- | --- | --- | --- | --- |
-| Turbo / graph | Latency | 0.148 | 263 | 3.984 |
-| Turbo / eager | Latency | 0.325 | 436 | 3.984 |
-| Original / graph | Latency | 0.427 | 609 | 3.436 |
-| Original / eager | Latency | 0.596 | 934 | 3.482 |
-| Turbo / graph | Throughput, 8 clients | 0.286 | 592 | 4.026 |
-| Original / graph | Throughput, 8 clients | 0.913 | 1603 | 3.494 |
-| Turbo / graph | Stress, 2 requests/s | 0.187 | 371 | 4.063 |
-| Original / graph | Stress, 2 requests/s | 0.976 | 1602 | 3.513 |
+| Turbo / graph | Latency | 0.110 | 223 | 3.984 |
+| Turbo / eager | Latency | 0.283 | 419 | 3.984 |
+| Original / graph | Latency | 0.302 | 505 | 3.436 |
+| Original / eager | Latency | 0.398 | 685 | 3.482 |
+| Turbo / graph | Throughput, 8 clients | 0.249 | 571 | 4.047 |
+| Original / graph | Throughput, 8 clients | 0.839 | 1405 | 3.507 |
+| Turbo / graph | Stress, 2 requests/s | 0.137 | 305 | 4.060 |
+| Original / graph | Stress, 2 requests/s | 0.678 | 1138 | 3.517 |
 
-The nightly JSON stores the median first-audio latency and RTF of the graph
-rows under the H100 bucket; B200 runs the same cases with no baseline.
+The nightly JSON stores the median first-audio latency and median RTF of
+every row, and the audio throughput of the throughput rows, under the H100
+bucket from this run; B200 runs the same cases with no baseline. These rows
+come from one bounded run per case and are qualification evidence, not a
+benchmark: they cover English text of a few seconds and the built-in voice
+only.
 
 ### 64 concurrent HTTP clients, CUDA overlays
 

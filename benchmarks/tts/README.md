@@ -359,8 +359,8 @@ uv run python -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 ```
 
 Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
-H100 baselines come from the October 12 integration run documented in the
-[H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-workload-and-cuda-graph-comparison).
+H100 baselines come from the October 14 qualification run documented in the
+[H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-latency-and-throughput-baselines-default-profiles).
 B200 is routed as a CI mirror without an assigned performance baseline.
 The job measures the built-in voice over HTTP; cold-reference and WebSocket
 behaviour are qualified separately in the recipes.
