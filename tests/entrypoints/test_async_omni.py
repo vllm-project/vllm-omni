@@ -18,6 +18,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -905,3 +906,34 @@ async def test_omni_generate_request_id():
             assert output.request_id != ""
     finally:
         engine.shutdown()
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_paced_output_credit_waits_for_consumer(mocker):
+    submitted = []
+
+    async def add_request(**kwargs):
+        submitted.append(kwargs)
+
+    omni = get_async_omni_instance(fake_add_request=add_request)
+    omni.engine.get_stage_metadata = lambda _: SimpleNamespace(stage_type="diffusion")
+    rpc = mocker.patch.object(omni, "_engine_core_rpc", new=mocker.AsyncMock())
+
+    async def results(*args):
+        for index in range(2):
+            yield SimpleNamespace(multimodal_output={"metadata": {"stream": {"output_chunk_index": index}}})
+
+    omni._process_orchestrator_results = results
+    params = OmniDiffusionSamplingParams(streaming_buffer_seconds=1.5)
+    outputs = omni.generate(prompt={"prompt": "test"}, request_id="paced", sampling_params_list=[params])
+    await anext(outputs)
+    assert submitted[0]["sampling_params_list"][0].streaming_output_ack is True
+    assert params.streaming_output_ack is False
+    rpc.assert_not_awaited()
+    await anext(outputs)
+    rpc.assert_awaited_once_with("release_streaming_output", stage_ids=[0], args=(submitted[0]["request_id"], 0))
+    with pytest.raises(StopAsyncIteration):
+        await anext(outputs)
+    assert rpc.await_count == 2
+    assert rpc.call_args.kwargs["args"] == (submitted[0]["request_id"], 1)

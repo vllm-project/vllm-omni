@@ -359,6 +359,10 @@ class OmniDiffusionSamplingParams:
     # engine starts another chunk only while generated media is below this
     # many seconds ahead of the client's reported playback position.
     streaming_buffer_seconds: float | None = None
+    streaming_max_output_bytes: int = 64 * 1024 * 1024
+    streaming_idle_timeout_s: float = 30.0
+    # AsyncOmni releases each output only after its consumer resumes iteration.
+    streaming_output_ack: bool = False
 
     def __post_init__(self) -> None:
         buffer = self.streaming_buffer_seconds
@@ -369,6 +373,19 @@ class OmniDiffusionSamplingParams:
             or not 0 < buffer <= 10
         ):
             raise ValueError("streaming_buffer_seconds must be finite and in (0, 10]")
+        if (
+            isinstance(self.streaming_max_output_bytes, bool)
+            or not isinstance(self.streaming_max_output_bytes, int)
+            or not 0 < self.streaming_max_output_bytes <= 2**63 - 1
+        ):
+            raise ValueError("streaming_max_output_bytes must be a positive integer")
+        if (
+            isinstance(self.streaming_idle_timeout_s, bool)
+            or not isinstance(self.streaming_idle_timeout_s, (int, float))
+            or not math.isfinite(self.streaming_idle_timeout_s)
+            or self.streaming_idle_timeout_s <= 0
+        ):
+            raise ValueError("streaming_idle_timeout_s must be finite and positive")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
 

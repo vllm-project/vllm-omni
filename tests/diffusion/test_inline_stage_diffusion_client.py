@@ -315,7 +315,8 @@ def test_inline_client_requires_replica_id(mock_engine):
 
 
 @pytest.mark.asyncio
-async def test_playback_feedback_bypasses_a_waiting_worker_rpc(client, mock_engine):
+@pytest.mark.parametrize("method", ["update_streaming_playback", "release_streaming_output"])
+async def test_playback_feedback_bypasses_a_waiting_worker_rpc(client, mock_engine, method):
     entered = threading.Event()
     release = threading.Event()
     feedback = []
@@ -329,10 +330,11 @@ async def test_playback_feedback_bypasses_a_waiting_worker_rpc(client, mock_engi
 
     mock_engine.collective_rpc.side_effect = rpc
     mock_engine.update_streaming_playback.side_effect = lambda *args, **kwargs: feedback.append(args)
+    mock_engine.release_streaming_output.side_effect = lambda *args, **kwargs: feedback.append(args)
     interaction = asyncio.create_task(client.submit_interaction_async("video", {"event": {}}))
     try:
         assert await asyncio.to_thread(entered.wait, 1)
-        await asyncio.wait_for(client.collective_rpc_async("update_streaming_playback", args=("video", 0.5)), 1)
+        await asyncio.wait_for(client.collective_rpc_async(method, args=("video", 0.5)), 1)
         assert feedback == [("video", 0.5)]
         assert not interaction.done()
     finally:

@@ -263,9 +263,9 @@ class StageDiffusionProc:
         """
         # Feedback only changes condition-protected host state and must not
         # wait behind an executor RPC for the current GPU chunk.
-        if method == "update_streaming_playback":
+        if method in ("update_streaming_playback", "release_streaming_output"):
             assert self._engine is not None
-            return self._engine.update_streaming_playback(*args, **(kwargs or {}))
+            return getattr(self._engine, method)(*args, **(kwargs or {}))
 
         loop = asyncio.get_running_loop()
 
@@ -559,7 +559,10 @@ class StageDiffusionProc:
                         self._engine.abort(rid)
 
                 elif msg_type == "collective_rpc":
-                    if msg["method"] == "update_streaming_playback":
+                    if msg["method"] in (
+                        "update_streaming_playback",
+                        "release_streaming_output",
+                    ):
                         await _dispatch_rpc(msg)
                     else:
                         try:

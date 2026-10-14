@@ -1251,6 +1251,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 self._interaction_coordinator.maybe_prepare_initial_session(state, pipe)
                             )
                         pipe.prepare_next_chunk(state)
+                        buffer_seconds = getattr(state.sampling, "streaming_buffer_seconds", None)
+                        if buffer_seconds is not None and pipe.peek_chunk_media(state).duration_s > buffer_seconds:
+                            raise ValueError("streaming_buffer_seconds must fit a complete media chunk")
                     merge_stage_durations(
                         state,
                         consume_pipeline_stage_durations(pipeline),
@@ -1356,6 +1359,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # admits a full-forward fallback request. Do this before dispatch so
         # the fallback does not bypass normal state/KV retirement.
         self._cleanup_finished_step_requests(scheduler_output)
+        if not scheduler_output.scheduled_request_ids:
+            return BatchRunnerOutput.from_list([])
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
         non_step_requests = [
@@ -1484,6 +1489,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 should_decode = req.denoise_completed
 
                             streaming_media_duration = 0.0
+                            streaming_next_media_duration = 0.0
                             if should_decode:
                                 if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
                                     streaming_media_duration = (
@@ -1500,6 +1506,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
                                         if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
                                             req.pending_chunk_boundary = True
+                                            pipe = cast(SupportsInteractionApply, pipeline)
+                                            streaming_next_media_duration = pipe.peek_chunk_media(req).duration_s
                                         else:
                                             pipe = cast(SupportsInteractionApply, pipeline)
                                             pipe.apply_interaction_at_chunk_boundary(req)
@@ -1521,6 +1529,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     finished=finished,
                                     result=result,
                                     streaming_media_duration=streaming_media_duration,
+                                    streaming_next_media_duration=streaming_next_media_duration,
                                 )
                             )
                             offset = offset + row_num
