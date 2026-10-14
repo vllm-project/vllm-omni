@@ -248,6 +248,27 @@ def _preserve_benchmark_dataset_env() -> Any:
                 os.environ[key] = value
 
 
+def _acc_model_name(model: str) -> str:
+    """Checkpoint name safe for a result filename.
+
+    ``Qwen/Qwen3-Omni-30B-A3B-Instruct`` becomes ``Qwen3-Omni-30B-A3B-Instruct``.
+    """
+    name = str(model).strip().replace("\\", "/").rstrip("/")
+    name = name.rsplit("/", 1)[-1]
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name).strip("._-")
+    return safe or "model"
+
+
+def _acc_result_filename(model: str, suite: str, when: datetime | None = None) -> str:
+    """``result_acc_{model}_{suite}_{date}_{timestamp}.json``.
+
+    Daily-Omni on Qwen3-Omni and MiniCPM-o 4.5 both use this shape, for example
+    ``result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261014_164800.json``.
+    """
+    when = datetime.now() if when is None else when
+    return f"result_acc_{_acc_model_name(model)}_{suite}_{when.strftime('%Y%m%d')}_{when.strftime('%H%M%S')}.json"
+
+
 def _build_common_args(
     ns: argparse.Namespace,
     *,
@@ -276,8 +297,7 @@ def _build_common_args(
 
 def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
     ns.result_dir.mkdir(parents=True, exist_ok=True)
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"qwen_omni_acc_daily_omni_{tag}.json"
+    result_filename = _acc_result_filename(ns.model, "daily_omni")
     extra = json.loads(ns.daily_extra_body_json)
     argv = (
         _build_common_args(ns, result_filename=result_filename)
@@ -304,8 +324,7 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
 
 def run_videomme(ns: argparse.Namespace, vllm: str) -> Path:
     ns.result_dir.mkdir(parents=True, exist_ok=True)
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"omni_acc_videomme_{tag}.json"
+    result_filename = _acc_result_filename(ns.model, "videomme")
     extra = json.loads(ns.videomme_extra_body_json)
     argv = (
         _build_common_args(ns, result_filename=result_filename)
@@ -344,8 +363,7 @@ def run_videomme(ns: argparse.Namespace, vllm: str) -> Path:
 
 def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
     ns.result_dir.mkdir(parents=True, exist_ok=True)
-    tag = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"qwen_omni_acc_seed_tts_{tag}.json"
+    result_filename = _acc_result_filename(ns.model, "seed_tts")
     extra = json.loads(ns.seed_extra_body_json)
     argv = (
         _build_common_args(
