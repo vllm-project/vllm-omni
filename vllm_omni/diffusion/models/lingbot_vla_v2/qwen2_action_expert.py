@@ -16,33 +16,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen2 action expert of LingBot-VLA 2.0 with token-routed MoE layers."""
+
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
-from transformers.activations import ACT2FN  # noqa: E402
-from transformers.generation import GenerationMixin
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs  # noqa: E402
-from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.activations import ACT2FN
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.models.qwen2.modeling_qwen2 import (  # noqa: E402
-    PreTrainedModel,
-    Qwen2Attention,
-    Qwen2MLP,
-    Qwen2RMSNorm,
-    Qwen2RotaryEmbedding,
-)
-from transformers.models.qwen2.modeling_qwen2 import (
-    Qwen2ForCausalLM as _Qwen2ForCausalLM,
-)
-from transformers.models.qwen2.modeling_qwen2 import (
-    Qwen2Model as _Qwen2Model,
-)
-from transformers.processing_utils import Unpack  # noqa: E402
-from transformers.utils import (
-    logging,
-)
-
-logger = logging.get_logger(__name__)
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, Qwen2MLP, Qwen2RMSNorm
 
 
 class Qwen2MoeSharedExpertMLP(nn.Module):
@@ -94,11 +76,6 @@ class Qwen2FusedExperts(nn.Module):
 
     def _sparse_packed_weights(self):
         """Cache packed inference weights by parameter version."""
-        if torch.is_grad_enabled():
-            return (
-                torch.cat([self.gate_proj, self.up_proj], dim=1).transpose(1, 2),
-                self.down_proj.transpose(1, 2),
-            )
         cache_key = (self.gate_proj._version, self.up_proj._version, self.down_proj._version)
         if self._gate_up_proj_cache is None or self._sparse_cache_key != cache_key:
             with torch.no_grad():
@@ -207,7 +184,6 @@ class Qwen2TokenMoeBlock(nn.Module):
         hidden_flat = hidden_states.reshape(-1, hidden_dim)  # (B*T, D)
         # Gate in true fp32 (autocast disabled): bf16 gate logits can flip top-k
         # selection on near-equal scores -> routing jitter / rotating dead experts.
-        # cf. VideoPretrain lumos/moe/router.py TokenChoiceTopKRouter.
         with torch.amp.autocast(hidden_flat.device.type, enabled=False):
             router_logits = F.linear(hidden_flat.float(), self.gate.weight.float())  # (B*T, num_experts)
 
@@ -243,7 +219,7 @@ class Qwen2TokenMoeBlock(nn.Module):
         return final_hidden_states
 
 
-class Qwen2DecoderLayer(GradientCheckpointingLayer):
+class Qwen2DecoderLayer(nn.Module):
     def __init__(self, config: Qwen2Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -251,12 +227,6 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        if config.use_sliding_window and config._attn_implementation != "flash_attention_2":
-            logger.warning_once(
-                f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
-                "unexpected results may be encountered."
-            )
 
     def forward(
         self,
@@ -267,10 +237,8 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
         compute_kqv: bool = False,
         output_atten: bool = False,
         ada_cond: torch.Tensor | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Ensure input dtypes match weight dtype (needed for gradient checkpointing
-        # recomputation where autocast context is lost)
+        # Ensure input dtypes match weight dtype
         param_dtype = self.self_attn.q_proj.weight.dtype
         hidden_states = hidden_states.to(param_dtype)
         if att_output is not None:
@@ -297,16 +265,16 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
                 att_output = att_output.to(self.self_attn.o_proj.weight.dtype)
             out_emb = self.self_attn.o_proj(att_output[:, start:end])
 
-            # first residual
+            # first residual; the norm and MLP below do not write to their input
             out_emb += hidden_states
-            after_first_residual = out_emb.clone()
+            residual = out_emb
             if ada_cond is not None:
                 out_emb = self.post_attention_layernorm(out_emb, ada_cond)
             else:
                 out_emb = self.post_attention_layernorm(out_emb)
             out_emb = self.mlp(out_emb)
             # second residual
-            out_emb += after_first_residual
+            out_emb += residual
 
             return out_emb
 
@@ -317,91 +285,28 @@ class Qwen2DecoderLayer(GradientCheckpointingLayer):
 class Qwen2PreTrainedModel(PreTrainedModel):
     config: Qwen2Config
     base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen2DecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
 
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
-    _can_record_outputs = {
-        "hidden_states": Qwen2DecoderLayer,
-        "attentions": Qwen2Attention,
-    }
-
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, Qwen2FusedExperts):
-            module.initializer_range = std
-            module.reset_parameters()
+    def _init_weights(self, module) -> None:
+        """Weights come from the checkpoint; skip Hugging Face initialization."""
+        return
 
 
 class Qwen2Model(Qwen2PreTrainedModel):
-    """Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [Qwen2DecoderLayer]"""
-
-    get_input_embeddings = _Qwen2Model.get_input_embeddings
-    set_input_embeddings = _Qwen2Model.set_input_embeddings
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "This vendored Qwen2Model is only driven by LingBot-VLA internals "
-            "(QwenvlWithExpert calls its layers with the custom compute_kqv/"
-            "output_atten signature); the HF-native forward is intentionally "
-            "not supported."
-        )
+    """Expert decoder stack, driven layer by layer by the LingBot dual-stream attention."""
 
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = FixQwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
         self.post_init()
 
 
-class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
-    # transformers>=5.5 expects a dict {tied_key: source_key} (was a list in 4.57).
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-    get_input_embeddings = _Qwen2ForCausalLM.get_input_embeddings
-    set_input_embeddings = _Qwen2ForCausalLM.set_input_embeddings
-    get_output_embeddings = _Qwen2ForCausalLM.get_output_embeddings
-    set_output_embeddings = _Qwen2ForCausalLM.set_output_embeddings
-    set_decoder = _Qwen2ForCausalLM.set_decoder
-    get_decoder = _Qwen2ForCausalLM.get_decoder
+class Qwen2ActionExpert(Qwen2PreTrainedModel):
+    """Keeps the checkpoint layout (qwen_expert.model.*); the expert has no embeddings or LM head."""
 
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "This vendored Qwen2ForCausalLM is only driven by LingBot-VLA internals "
-            "(QwenvlWithExpert calls its layers with the custom compute_kqv/"
-            "output_atten signature); the HF-native forward is intentionally "
-            "not supported."
-        )
-
-    def __init__(self, config):
+    def __init__(self, config: Qwen2Config):
         super().__init__(config)
         self.model = Qwen2Model(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
         self.post_init()

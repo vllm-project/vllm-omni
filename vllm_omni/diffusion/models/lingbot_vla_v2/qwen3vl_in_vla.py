@@ -16,14 +16,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen3-VL backbone of LingBot-VLA 2.0: per-camera vision attention and split QKV/output text layers."""
+
 from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
-from transformers.generation import GenerationMixin
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig,
@@ -54,10 +53,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel as _Qwen3VLVisionModel,
 )
-from transformers.processing_utils import Unpack
-from transformers.utils import logging
-
-logger = logging.get_logger(__name__)
 
 
 class Qwen3VLPreTrainedModel(_Qwen3VLPreTrainedModel):
@@ -78,16 +73,13 @@ class Qwen3VLVisionAttention(nn.Module):
         self.proj = nn.Linear(self.dim, self.dim)
         self.scaling = self.head_dim**-0.5
         self.config = config
-        self.attention_dropout = 0.0
         self.is_causal = False
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
@@ -115,9 +107,8 @@ class Qwen3VLVisionAttention(nn.Module):
                 v,
                 attention_mask=None,
                 scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
+                dropout=0.0,
                 is_causal=False,
-                **kwargs,
             )[0]
             for q, k, v in zip(*splits, strict=False)
         ]
@@ -128,8 +119,8 @@ class Qwen3VLVisionAttention(nn.Module):
         return attn_output
 
 
-class Qwen3VLVisionBlock(GradientCheckpointingLayer):
-    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+class Qwen3VLVisionBlock(nn.Module):
+    def __init__(self, config) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -140,22 +131,18 @@ class Qwen3VLVisionBlock(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
-            **kwargs,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
 
-class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
+class Qwen3VLTextDecoderLayer(nn.Module):
     def __init__(self, config: Qwen3VLTextConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -172,7 +159,6 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         end: int | None = 0,
         compute_kqv: bool = False,
         output_atten: bool = False,
-        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor | tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         param_dtype = self.self_attn.q_proj.weight.dtype
         hidden_states = hidden_states.to(param_dtype)
@@ -193,10 +179,10 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
                 att_output = att_output.to(self.self_attn.o_proj.weight.dtype)
             out_emb = self.self_attn.o_proj(att_output[:, start:end])
             out_emb += hidden_states
-            after_first_residual = out_emb.clone()
+            residual = out_emb  # the norm and MLP below do not write to their input
             out_emb = self.post_attention_layernorm(out_emb)
             out_emb = self.mlp(out_emb)
-            out_emb += after_first_residual
+            out_emb += residual
             return out_emb
 
         raise ValueError(
@@ -223,7 +209,7 @@ def preprocess_grid_thw(self, grid_thw: torch.Tensor):
     return pos_embeds, position_embeddings, cu_seqlens
 
 
-def vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs):
+def vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor):
     hidden_states = self.patch_embed(hidden_states)
     pos_embeds, position_embeddings, cu_seqlens = self.preprocess_grid_thw(grid_thw)
 
@@ -237,7 +223,6 @@ def vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
-            **kwargs,
         )
         if layer_num in self.deepstack_visual_indexes:
             deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
@@ -274,7 +259,6 @@ class Qwen3VLTextModel(_Qwen3VLTextModel):
         )
         self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
         self.post_init()
 
 
@@ -287,14 +271,13 @@ class Qwen3VLModel(_Qwen3VLModel):
         self.post_init()
 
 
-class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration, GenerationMixin):
-    # transformers>=5.5 expects a dict {tied_key: source_key} (was a list in 4.57).
-    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+class Qwen3VLForConditionalGeneration(_Qwen3VLForConditionalGeneration):
+    """Keeps the checkpoint layout (qwenvl.model.*); the policy has no LM head, so nothing is tied."""
+
+    _tied_weights_keys = None
     config_class = Qwen3VLConfig
-    _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
     def __init__(self, config):
         Qwen3VLPreTrainedModel.__init__(self, config)
         self.model = Qwen3VLModel(config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.post_init()

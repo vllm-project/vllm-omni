@@ -552,6 +552,8 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
+    # LingBot-VLA 2.0 samples actions in its own flow-matching loop over a cached
+    # prefix; it has no DiT block list for cache_dit / tea_cache to wrap.
     "LingBotVLAV2Pipeline",
     "LTX2TextToAudioPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no

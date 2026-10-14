@@ -42,7 +42,6 @@ def test_registered_pipeline_contract():
         "pipeline_lingbot_vla_v2",
         "LingBotVLAV2Pipeline",
     )
-    assert _DIFFUSION_MODELS["Pi0Pipeline"] == ("pi0", "pipeline_pi0", "Pi0Pipeline")
     assert _DIFFUSION_POST_PROCESS_FUNCS["LingBotVLAV2Pipeline"] == "get_lingbot_vla_v2_post_process_func"
     assert "LingBotVLAV2Pipeline" in _NO_CACHE_ACCELERATION
     topology = OMNI_PIPELINES["lingbot_vla_v2"]
@@ -84,11 +83,8 @@ def test_pipeline_checkpoint_to_actions(assets, model, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("streamed_weights", "unreported_names", "error"),
-    [
-        ((("model.state_proj.weight", torch.zeros(1)),), set(), AssertionError),
-        ((), {"model.state_proj.weight"}, ValueError),
-    ],
+    ("streamed_weights", "unreported_names"),
+    [((("model.state_proj.weight", torch.zeros(1)),), set()), ((), {"model.state_proj.weight"})],
     ids=["streamed", "unreported"],
 )
 def test_loader_rejects_streamed_or_unreported_weights(
@@ -96,7 +92,6 @@ def test_loader_rejects_streamed_or_unreported_weights(
     monkeypatch: pytest.MonkeyPatch,
     streamed_weights: tuple[tuple[str, torch.Tensor], ...],
     unreported_names: set[str],
-    error: type[Exception],
 ) -> None:
     pytest.importorskip("vllm")
     from vllm.config.load import LoadConfig
@@ -113,7 +108,7 @@ def test_loader_rejects_streamed_or_unreported_weights(
     loader.counter_before_loading_weights = 0.0
     monkeypatch.setattr(loader, "get_all_weights", lambda pipeline: iter(streamed_weights))
 
-    with pytest.raises(error, match="model.state_proj.weight"):
+    with pytest.raises(ValueError, match="model.state_proj.weight"):
         loader.load_weights(pipeline)
 
 

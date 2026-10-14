@@ -16,9 +16,10 @@
 # limitations under the License.
 
 # Adapted for inference from huggingface/lerobot at f58f7fb9dbb241304df96e967aea0f5b42ff9a4d.
+"""LingBot-VLA 2.0 policy: Qwen3-VL prefix, MoE action expert and flow-matching action sampling."""
+
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 
 import einops
@@ -27,13 +28,14 @@ from torch import Tensor, nn
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
+from vllm.logger import init_logger
 
 from .modeling_lingbot_vla_v2_base import FlowMatching, replace_lnorm_with_adanorm
-from .qwen2_action_expert import Qwen2ForCausalLM, Qwen2TokenMoeBlock
+from .qwen2_action_expert import Qwen2ActionExpert, Qwen2TokenMoeBlock
 from .qwen3vl_in_vla import Qwen3VLForConditionalGeneration
 from .utils import make_att_2d_masks, our_eager_attention_forward, our_sdpa_attention_forward
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 class QwenvlWithExpertV2Config(PretrainedConfig):
@@ -42,7 +44,6 @@ class QwenvlWithExpertV2Config(PretrainedConfig):
     def __init__(
         self,
         vocab_size: int = 0,
-        use_lm_head: bool = False,
         attention_implementation: str = "sdpa",
         use_cache: bool = False,
         expert_hidden_size: int = 768,
@@ -55,7 +56,6 @@ class QwenvlWithExpertV2Config(PretrainedConfig):
     ):
         self.attention_implementation = attention_implementation
         self.vocab_size = vocab_size
-        self.use_lm_head = use_lm_head
         self.action_num_attention_heads = action_num_attention_heads
         self.action_num_key_value_heads = action_num_key_value_heads
         self.action_head_dim = action_head_dim
@@ -104,11 +104,9 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
         vlm_config.text_config._attn_implementation = hf_attn
         vlm_config.vision_config._attn_implementation = hf_vit_attn
         self.qwenvl = Qwen3VLForConditionalGeneration._from_config(vlm_config)
-        if self.config.use_lm_head:
-            self.qwenvl.tie_weights()
 
         self.config.qwen_expert_config._attn_implementation = hf_attn
-        self.qwen_expert = Qwen2ForCausalLM._from_config(self.config.qwen_expert_config)
+        self.qwen_expert = Qwen2ActionExpert._from_config(self.config.qwen_expert_config)
 
         if self.config.adanorm_time:
             replace_lnorm_with_adanorm(
@@ -119,7 +117,6 @@ class QwenvlWithExpertV2Model(PreTrainedModel):
             )
 
         self._install_moe_blocks()
-        del self.qwen_expert.model.embed_tokens
         self.attention_interface = self.get_attention_interface()
 
     def _install_moe_blocks(self):
@@ -366,7 +363,6 @@ class LingBotVLAV2ForActionPrediction(FlowMatching):
             vlm_config = AutoConfig.from_pretrained(config.tokenizer_path, revision=config.tokenizer_revision)
         qwenvl_with_export_config = QwenvlWithExpertV2Config(
             vocab_size=config.vocab_size,
-            use_lm_head=config.use_lm_head,
             attention_implementation=config.attention_implementation,
             use_cache=config.use_cache,
             expert_hidden_size=config.expert_hidden_size,
@@ -401,8 +397,6 @@ class LingBotVLAV2ForActionPrediction(FlowMatching):
         self.action_time_mlp_out = nn.Linear(width, width)
 
         self._init_align(config.align_params, vlm_config.text_config.hidden_size)
-        del self.qwenvl_with_expert.qwenvl.lm_head
-        del self.qwenvl_with_expert.qwen_expert.lm_head
 
     def _init_align(self, params: dict, llm_hidden_size: int):
         """Build the learned query tokens and projections used during action inference."""
@@ -605,8 +599,7 @@ class LingBotVLAV2ForActionPrediction(FlowMatching):
         # form fed transformers' _deepstack_process, whose bool indexing
         # (nonzero -> device/host sync) breaks CUDA-graph capture and graph-
         # breaks torch.compile. x + 0.0 == x keeps the injection numerically
-        # identical (only -0.0 can flip to +0.0), verified bitwise in
-        # bench/deepstack_dense_parity.py.
+        # identical (only -0.0 can flip to +0.0).
         img_visual_only = einops.repeat(img_masks, "b n -> b n l", l=num_patch)
         img_len = img_emb.shape[1]  # boundary-wrapped image part, [b, n*l, d]
         tail_len = embs.shape[1] - img_len

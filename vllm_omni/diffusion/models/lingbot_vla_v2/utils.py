@@ -16,6 +16,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Attention masks, sinusoidal time embedding and dual-stream attention kernels for LingBot-VLA 2.0."""
+
 import math
 
 import einops

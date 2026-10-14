@@ -16,6 +16,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Time-conditioned AdaRMSNorm and the flow-matching suffix embedding of the LingBot action expert."""
+
 import einops
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -27,48 +29,16 @@ from .utils import create_sinusoidal_pos_embedding
 
 
 class AdaRMSNorm(nn.Module):
+    """RMSNorm followed by a FiLM modulation from the flow-matching time embedding."""
+
     def __init__(self, hidden_size, cond_dim, eps=1e-6):
-        """
-        AdaRMSNorm: RMSNorm + FiLM
-        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.gamma = nn.Linear(cond_dim, hidden_size)
         self.beta = nn.Linear(cond_dim, hidden_size)
 
-        # DiT style init: gamma.weight=0, gamma.bias=1; beta.weight=0, beta.bias=0
-        nn.init.zeros_(self.gamma.weight)
-        nn.init.zeros_(self.gamma.bias)
-        nn.init.zeros_(self.beta.weight)
-        nn.init.zeros_(self.beta.bias)
-
-    def forward(self, hidden_states, cond):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-        hidden_states = self.weight * hidden_states
-        # cond = cond.to(torch.float32)
-        gamma = self.gamma(cond).unsqueeze(1)  # [B, 1, H]
-        beta = self.beta(cond).unsqueeze(1)  # [B, 1, H]
-        hidden_states = (1 + gamma.to(torch.float32)) * hidden_states + beta.to(torch.float32)
-        return hidden_states.to(input_dtype)
-
-
-class FixAdaRMSNorm(nn.Module):
-    def __init__(self, hidden_size, cond_dim, eps=1e-6):
-        """
-        AdaRMSNorm: RMSNorm + FiLM
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-        self.gamma = nn.Linear(cond_dim, hidden_size)
-        self.beta = nn.Linear(cond_dim, hidden_size)
-
-        # DiT style init: gamma.weight=0, gamma.bias=1; beta.weight=0, beta.bias=0
+        # Zero-initialized modulation starts as a plain RMSNorm.
         nn.init.zeros_(self.gamma.weight)
         nn.init.zeros_(self.gamma.bias)
         nn.init.zeros_(self.beta.weight)
@@ -89,22 +59,13 @@ class FixAdaRMSNorm(nn.Module):
 
 
 def replace_lnorm_with_adanorm(module, hidden_size, cond_dim, final_norm_adanorm):
+    """Swap the expert's layer RMSNorms, and its final norm when final_norm_adanorm is set, for AdaRMSNorm."""
+    norm_types = (Qwen2RMSNorm, FixQwen2RMSNorm) if final_norm_adanorm else (Qwen2RMSNorm,)
     for name, child in module.named_children():
-        if final_norm_adanorm:
-            if isinstance(child, Qwen2RMSNorm):
-                if "q_layernorm" not in name and "k_layernorm" not in name:
-                    setattr(module, name, AdaRMSNorm(hidden_size, cond_dim))
-            elif isinstance(child, FixQwen2RMSNorm):
-                if "q_layernorm" not in name and "k_layernorm" not in name:
-                    setattr(module, name, FixAdaRMSNorm(hidden_size, cond_dim))
-            else:
-                replace_lnorm_with_adanorm(child, hidden_size, cond_dim, final_norm_adanorm)
+        if isinstance(child, norm_types):
+            setattr(module, name, AdaRMSNorm(hidden_size, cond_dim))
         else:
-            if isinstance(child, Qwen2RMSNorm):
-                if "q_layernorm" not in name and "k_layernorm" not in name:
-                    setattr(module, name, AdaRMSNorm(hidden_size, cond_dim))
-            else:
-                replace_lnorm_with_adanorm(child, hidden_size, cond_dim, final_norm_adanorm)
+            replace_lnorm_with_adanorm(child, hidden_size, cond_dim, final_norm_adanorm)
 
 
 class FlowMatching(nn.Module):

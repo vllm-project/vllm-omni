@@ -12,6 +12,8 @@ from typing import Any
 
 @dataclass
 class LingBotVLAV2Config:
+    """Checkpoint fields used for inference; unsupported training or runtime features are rejected."""
+
     chunk_size: int = 50
     n_action_steps: int = 50
     max_state_dim: int = 55

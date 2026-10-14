@@ -23,11 +23,13 @@ CHECKPOINT_REVISIONS = {
 }
 
 
-def _action_postprocess(output):
+def _action_postprocess(output: DiffusionOutput) -> DiffusionOutput:
+    """Identity post-process; module level so it pickles across the orchestrator boundary."""
     return output
 
 
-def get_lingbot_vla_v2_post_process_func(od_config):
+def get_lingbot_vla_v2_post_process_func(od_config: OmniDiffusionConfig):
+    """The pipeline already returns calibrated robot actions."""
     return _action_postprocess
 
 
@@ -103,7 +105,8 @@ class LingBotVLAV2Pipeline(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]] = ()) -> set[str]:
         """Report the checkpoint loaded in __init__ to the loader's strict check; no weights_sources are exposed."""
         streamed = next(iter(weights), None)
-        assert streamed is None, f"LingBot loads model.safetensors itself; got framework weight {streamed[0]}"
+        if streamed is not None:
+            raise ValueError(f"LingBot loads model.safetensors itself; got framework weight {streamed[0]}")
         return self.loaded_weight_names
 
     @torch.inference_mode()

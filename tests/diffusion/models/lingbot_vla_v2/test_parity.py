@@ -18,7 +18,9 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cuda]
+from tests.helpers.mark import hardware_marks
+
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H100"})]
 
 
 @pytest.fixture(scope="module")

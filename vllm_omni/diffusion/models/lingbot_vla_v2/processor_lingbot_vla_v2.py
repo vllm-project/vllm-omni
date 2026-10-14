@@ -17,7 +17,8 @@ from transformers import AutoImageProcessor, AutoTokenizer
 from .config import LingBotVLAV2Config
 
 
-def image_tensor(image) -> torch.Tensor:
+def image_tensor(image: Image.Image | np.ndarray | torch.Tensor) -> torch.Tensor:
+    """Convert one RGB camera frame to a CHW float tensor in [0, 1]."""
     if isinstance(image, Image.Image):
         image = np.array(image.convert("RGB"))
     value = torch.as_tensor(np.array(image, copy=True) if isinstance(image, np.ndarray) else image)
@@ -39,7 +40,9 @@ def image_tensor(image) -> torch.Tensor:
 
 
 class LingBotVLAV2Processor:
-    def __init__(self, config: LingBotVLAV2Config, model_dir: str | Path, device="cpu"):
+    """Maps raw OpenPI observations to model inputs and canonical actions back to robot units."""
+
+    def __init__(self, config: LingBotVLAV2Config, model_dir: str | Path, device: torch.device | str = "cpu"):
         self.config = config
         self.device = torch.device(device)
         root = Path(model_dir)
@@ -87,7 +90,8 @@ class LingBotVLAV2Processor:
                         f"Missing or incompatible {key}.{name} statistics; normalized-space base use must be explicit"
                     )
 
-    def normalize(self, value: torch.Tensor, key: str, inverse=False) -> torch.Tensor:
+    def normalize(self, value: torch.Tensor, key: str, inverse: bool = False) -> torch.Tensor:
+        """Apply (or invert) the checkpoint normalization for state or action values."""
         mode = self.config.normalization_mapping["STATE" if key == "observation.state" else "ACTION"]
         if self.config.inputs_normalized or mode == "IDENTITY":
             return value
@@ -101,7 +105,8 @@ class LingBotVLAV2Processor:
         scale = torch.where(scale == 0, torch.full_like(scale, eps), scale)
         return (value + 1.0) * scale / 2.0 + low if inverse else 2.0 * (value - low) / scale - 1.0
 
-    def build_model_inputs(self, observation: dict) -> dict:
+    def build_model_inputs(self, observation: dict) -> dict[str, torch.Tensor]:
+        """Build one-observation model inputs; configured cameras that are absent are masked."""
         cfg = self.config
         obs = {cfg.image_key_map.get(k, k): v for k, v in observation.items()}
         state = obs.get("state", obs.get("observation.state"))
@@ -152,6 +157,7 @@ class LingBotVLAV2Processor:
         return {k: v.to(self.device) for k, v in values.items()}
 
     def build_model_outputs(self, actions: torch.Tensor) -> np.ndarray:
+        """Map a canonical action chunk back to calibrated robot actions."""
         cfg = self.config
         if tuple(actions.shape) != (1, cfg.chunk_size, cfg.max_action_dim):
             raise ValueError("LingBot returned an unexpected action chunk shape")
