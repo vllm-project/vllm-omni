@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from vllm.outputs import CompletionOutput
 
 from tests.engine.duplex.test_session_runner import (
     SESSION_ID,
@@ -39,7 +40,9 @@ from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, OpenDup
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.model_executor.models.personaplex.duplex import stage0
 from vllm_omni.model_executor.models.personaplex.duplex.config import FRAME_SIZE, SAMPLE_RATE
+from vllm_omni.model_executor.models.personaplex.duplex.data_plane import PersonaPlexDataPlaneSession
 from vllm_omni.model_executor.models.personaplex.duplex.plugin import PersonaPlexDuplexPlugin
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -49,6 +52,7 @@ PREFILL_SLOTS = 4
 @pytest.fixture(autouse=True)
 def _fake_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(stage0, "personaplex_prefill_slots", lambda model_path, voice, persona: PREFILL_SLOTS)
+    monkeypatch.setattr(PersonaPlexDataPlaneSession, "load_tokenizer", lambda self, path: None)
 
 
 async def open_personaplex_harness(*, extra_body: dict[str, object] | None = None) -> Harness:
@@ -225,6 +229,41 @@ async def test_cumulative_code2wav_output_becomes_24k_audio_and_text_deltas() ->
         assert delta_2.delta == f"wav-{FRAME_SIZE}"
         assert find(second, "response.output_audio_transcript.delta").delta == "llo"
         assert not [event for event in second if event.type == "response.created"]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_talker_captions_do_not_consume_stage0_or_close_the_audio_response() -> None:
+    h = await open_personaplex_harness()
+    try:
+        await h.run(frame())
+        request_id = h.stage0_request_id(epoch=0)
+        h.runner.plugin.data_plane._text_pieces = ("", " Hello", " world", "")
+
+        def talker_output(ids):
+            completion = CompletionOutput(index=0, text="", token_ids=ids[-1:], cumulative_logprob=None, logprobs=None)
+            completion.cumulative_token_ids = ids
+            return OmniRequestOutput(request_id=request_id, stage_id=0, finished=False, outputs=[completion])
+
+        assert h.deliver(talker_output([0, 1]), stage_id=0, segment_finished=True) is False
+        first = await h.settle()
+        response_id = h.session.active_response_id
+        assert response_id is not None
+        assert find(first, "response.output_audio_transcript.delta").delta == " Hello"
+        # Cumulative output repeats old tokens, including padding. Neither
+        # duplicate captions nor artificial response boundaries should appear.
+        repeated = await h.deliver_and_settle(talker_output([0, 1, 3]), stage_id=0)
+        assert "response.output_audio_transcript.delta" not in types(repeated)
+        second = await h.deliver_and_settle(talker_output([0, 1, 3, 2]), stage_id=0)
+        assert find(second, "response.output_audio_transcript.delta").delta == " world"
+        audio = await h.deliver_and_settle(code2wav_output(request_id, samples=FRAME_SIZE, text=""), stage_id=1)
+        assert find(audio, "response.output_audio.delta").response_id == response_id
+        assert "response.done" not in types(first + second + audio)
+        assert h.runner.plugin.project_intermediate_output(stage_id=0, output=None, context=None)
+        assert not h.runner.plugin.project_intermediate_output(stage_id=1, output=None, context=None)
+        h.runner.plugin.data_plane.close_session(SESSION_ID, active_request_id=request_id)
+        assert not h.runner.plugin.data_plane._text_offsets
     finally:
         await close_harness(h)
 

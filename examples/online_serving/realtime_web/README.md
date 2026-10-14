@@ -10,11 +10,37 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `qwen3-turn --manual` | Press **Send turn**; mic pauses while the reply plays | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
 | `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
+| `personaplex-native` | Model-controlled conversation, continuous audio input | No | No |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
 checkpoint still generates committed turns; this is not native streaming-input
 KV decoding.
+
+## PersonaPlex: native duplex with Assistant captions
+
+Start the PersonaPlex backend, then the shared WebUI in a second terminal:
+
+```bash
+vllm serve nvidia/personaplex-7b-v1 --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/personaplex.yaml
+
+python -m examples.online_serving.realtime_web --profile personaplex-native \
+    --ws-backend ws://127.0.0.1:8091 --port 7862
+```
+
+Open `http://localhost:7862`, set the role prompt, and start a session. The
+profile uses the bundled `NATF2.pt` voice. Microphone upload continues while
+the assistant speaks; muting sends silence to keep the model's input clock
+running. The client sends 80 ms frames of 24 kHz float32 PCM and plays PCM16.
+
+Assistant captions come from the model's native text tokens. User speech is
+not transcribed, and no separate ASR is added. The WebUI does not save audio.
+PersonaPlex keeps a continuous response ID, so the UI starts another
+**Assistant** row after a caption gap of at least two seconds on the output
+audio timeline. This is a display heuristic: short replies may share a row,
+and long pauses within a reply may split it. It does not cancel generation or
+clear playback, and network delays alone do not create rows.
 
 ## MiniCPM: existing command stays valid
 

@@ -13,13 +13,14 @@ from typing import cast
 
 import numpy as np
 import pytest
+from vllm.outputs import CompletionOutput
 from vllm.sampling_params import SamplingParams
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import (
     DefaultDuplexModelSessionState,
     DuplexDataPlaneContext,
@@ -38,6 +39,7 @@ from vllm_omni.model_executor.models.personaplex.duplex.plugin import (
     PersonaPlexSessionState,
 )
 from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIPELINE
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -198,6 +200,7 @@ async def test_prepare_runtime_config_resolves_voice_and_prefill_slots_once(monk
         return 42
 
     monkeypatch.setattr(stage0, "personaplex_prefill_slots", fake_prefill_slots)
+    monkeypatch.setattr(PersonaPlexDataPlaneSession, "load_tokenizer", lambda self, path: None)
     plugin = _plugin()
     model_config = SimpleNamespace(model="/models/personaplex")
 
@@ -233,6 +236,7 @@ async def test_prepare_runtime_config_reports_prefill_failures_as_runtime_config
         raise FileNotFoundError("voices.tgz missing")
 
     monkeypatch.setattr(stage0, "personaplex_prefill_slots", failing_prefill_slots)
+    monkeypatch.setattr(PersonaPlexDataPlaneSession, "load_tokenizer", lambda self, path: None)
 
     with pytest.raises(DuplexRuntimeConfigError, match="voices.tgz missing") as excinfo:
         await _plugin().prepare_runtime_config(DuplexSessionConfig(), model_config=SimpleNamespace(model="/m"))
@@ -277,6 +281,42 @@ def test_runtime_config_update_rejects_changed_voice() -> None:
 
     unchanged = plugin.runtime_config_for_update(DuplexSessionConfig(voice="NATF2.pt"), current)
     assert unchanged["personaplex_voice_prompt"] == "NATF2.pt"
+
+
+def test_caption_tokenizer_preserves_spaces_and_cleans_up_only_the_owning_session(tmp_path) -> None:
+    import sentencepiece
+
+    model_prefix = str(tmp_path / "tokenizer_spm_32k_3")
+    sentencepiece.SentencePieceTrainer.train(
+        sentence_iterator=iter(["Hello world!"]),
+        model_prefix=model_prefix,
+        model_type="char",
+        vocab_size=32,
+        hard_vocab_limit=False,
+        pad_id=3,
+        minloglevel=2,
+    )
+    tokenizer = sentencepiece.SentencePieceProcessor(model_prefix + ".model")
+    ids = tokenizer.encode("Hello world!")
+    plane = PersonaPlexDataPlaneSession(_encode_audio)
+    plane.load_tokenizer(str(tmp_path))
+
+    def project(request_id, tokens):
+        completion = CompletionOutput(index=0, text="", token_ids=tokens[-1:], cumulative_logprob=None, logprobs=None)
+        completion.cumulative_token_ids = tokens
+        output = OmniRequestOutput(stage_id=0, request_id=request_id, outputs=[completion], finished=False)
+        return list(plane.project({"data_plane_outputs": [output]}))
+
+    first_id = duplex_resource_request_id(DuplexFence("first"), "stage0")
+    second_id = duplex_resource_request_id(DuplexFence("second"), "stage0")
+    assert project(first_id, [0, *ids, 3])[0]["text"] == " Hello world!"
+    assert project(first_id, [0, *ids, 3]) == []
+    assert project(second_id, ids)[0]["text"] == " Hello world!"
+    plane.close_session("first")
+    assert project(second_id, ids) == []
+    assert project(first_id, ids)[0]["text"] == " Hello world!"
+    plane.close_stream(first_id)
+    assert project(first_id, ids)[0]["text"] == " Hello world!"
 
 
 def test_data_plane_context_is_the_framework_default() -> None:

@@ -38,6 +38,18 @@ def test_join_ws_url_preserves_realtime_query():
     )
 
 
+def test_personaplex_profile_serves_its_assets_and_default_model():
+    client = TestClient(build_app(profile="personaplex-native"))
+    index = client.get("/")
+    assert index.status_code == 200
+    assert '"model": "nvidia/personaplex-7b-v1"' in index.text
+    assert '"profile": "personaplex-native"' in index.text
+    assert "static/profiles/personaplex_native.js?v=" in index.text
+    assert client.get("/static/profiles/personaplex_native.js").status_code == 200
+    with pytest.raises(ValueError, match="bundled voice"):
+        build_app(profile="personaplex-native", ref_audio="voice.wav")
+
+
 def test_build_app_serves_health_and_injected_client_config():
     app = build_app(
         ws_backend="ws://127.0.0.1:9001",

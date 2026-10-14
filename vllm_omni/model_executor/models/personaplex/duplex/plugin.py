@@ -191,6 +191,11 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
     def create_session_state(self) -> PersonaPlexSessionState:
         return PersonaPlexSessionState()
 
+    def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
+        # The talker's text tokens belong to the assistant. Code2Wav only
+        # returns audio, so project Stage 0 while still forwarding it to Mimi.
+        return stage_id == 0
+
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return personaplex_capabilities(max_sessions=max_sessions)
 
@@ -224,6 +229,7 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
                 return cached
             try:
                 # Reads the voice bundle and the tokenizer: off the orchestrator loop.
+                await asyncio.to_thread(self.data_plane.load_tokenizer, model_path)
                 slots = await asyncio.to_thread(personaplex_prefill_slots, model_path, voice, persona)
             except Exception as exc:
                 raise DuplexRuntimeConfigError(

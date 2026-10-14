@@ -76,7 +76,7 @@ def build_app(
     profile: str = "minicpm-native",
     turn_mode: str = "manual",
 ) -> FastAPI:
-    if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt"}:
+    if profile not in {"minicpm-native", "qwen3-turn", "aura-ptt", "personaplex-native"}:
         raise ValueError(f"Unknown profile: {profile}")
     if turn_mode not in {"manual", "vad"}:
         raise ValueError(f"Unknown turn mode: {turn_mode}")
@@ -84,11 +84,19 @@ def build_app(
         raise ValueError("Qwen3 profile does not accept --ref-audio")
     if profile == "aura-ptt" and ref_audio:
         raise ValueError("AURA profile does not accept --ref-audio")
+    if profile == "personaplex-native" and ref_audio:
+        raise ValueError("PersonaPlex uses its bundled voice prompt")
     native = profile == "minicpm-native"
     aura = profile == "aura-ptt"
     ws_backend = ws_backend or ("ws://127.0.0.1:8099" if native or aura else "ws://127.0.0.1:8091")
     model = model or (
-        "openbmb/MiniCPM-o-4_5" if native else "aurateam/AURA" if aura else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        "openbmb/MiniCPM-o-4_5"
+        if native
+        else "aurateam/AURA"
+        if aura
+        else "nvidia/personaplex-7b-v1"
+        if profile == "personaplex-native"
+        else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     )
     app = FastAPI(title="Omni Realtime Web UI")
     index_path = APP_DIR / "index.html"
@@ -187,7 +195,9 @@ def main(default_profile: str = "minicpm-native") -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7862)
-    parser.add_argument("--profile", choices=("minicpm-native", "qwen3-turn", "aura-ptt"), default=default_profile)
+    parser.add_argument(
+        "--profile", choices=("minicpm-native", "qwen3-turn", "aura-ptt", "personaplex-native"), default=default_profile
+    )
     parser.add_argument("--ws-backend", "--backend", dest="ws_backend")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--manual", dest="turn_mode", action="store_const", const="manual")
@@ -211,7 +221,13 @@ def main(default_profile: str = "minicpm-native") -> None:
     if not native and args.ref_audio:
         parser.error("--ref-audio is only supported by minicpm-native")
     args.model = args.model or (
-        "openbmb/MiniCPM-o-4_5" if native else "aurateam/AURA" if aura else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        "openbmb/MiniCPM-o-4_5"
+        if native
+        else "aurateam/AURA"
+        if aura
+        else "nvidia/personaplex-7b-v1"
+        if args.profile == "personaplex-native"
+        else "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     )
     args.ws_backend = args.ws_backend or ("ws://127.0.0.1:8099" if native or aura else "ws://127.0.0.1:8091")
 

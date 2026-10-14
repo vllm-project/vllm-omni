@@ -403,7 +403,7 @@
     }
 
     if (pendingCapture.length === 0) return;
-    if (!microphoneUploadEnabled()) {
+    if (!microphoneUploadEnabled() && !(running && muted && profile.silenceWhenMuted)) {
       pendingCapture = [];
       return;
     }
@@ -416,6 +416,10 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE);
+    if (profile.appendMessages) {
+      for (const event of profile.appendMessages(pcm)) socket.send(JSON.stringify(event));
+      return;
+    }
     const frame = cameraPendingFrame || (profile.stickyCamera ? cameraLastFrame : null);
     cameraPendingFrame = null;
     const appendEvent = profile.pushToTalk
@@ -528,8 +532,9 @@
       if (profile.deduplicateTranscript && assistantTextChannel && action.channel !== assistantTextChannel) return;
       if (action.text) assistantTextChannel = action.channel || assistantTextChannel;
     }
-    const responseId = action.responseId || null;
-    const existing = responseId && action.role === 'assistant' ? assistantRowByResponse.get(responseId) : null;
+    if (action.role === 'assistant' && action.newTranscript) finishTranscript('assistant');
+    const transcriptId = action.transcriptId || action.responseId || null;
+    const existing = transcriptId && action.role === 'assistant' ? assistantRowByResponse.get(transcriptId) : null;
     if (existing) {
       if (action.kind === 'text') {
         if (!action.text) return;
@@ -543,6 +548,7 @@
     }
     if (
       action.role === 'assistant'
+      && !action.newTranscript
       && !liveAssistantTurn
       && action.text
       && action.text === lastClosedAssistantText
@@ -554,8 +560,8 @@
     }
     if (action.kind === 'text') {
       addTranscript(action.role, action.text);
-      if (action.role === 'assistant' && responseId && liveAssistantTurn) {
-        assistantRowByResponse.set(responseId, liveAssistantTurn);
+      if (action.role === 'assistant' && transcriptId && liveAssistantTurn) {
+        assistantRowByResponse.set(transcriptId, liveAssistantTurn);
       }
       return;
     }
@@ -564,7 +570,7 @@
         const turn = ensureTurn('assistant');
         turn.value = action.text;
         turn.text.textContent = action.text;
-        if (responseId) assistantRowByResponse.set(responseId, turn);
+        if (transcriptId) assistantRowByResponse.set(transcriptId, turn);
       }
     } else finishTranscript(action.role, action.text);
   }
@@ -691,11 +697,11 @@
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
-        sampleRate: { ideal: INPUT_RATE },
+        sampleRate: { ideal: profile.inputSampleRate || INPUT_RATE },
       },
     });
     try {
-      captureContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: INPUT_RATE });
+      captureContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: profile.inputSampleRate || INPUT_RATE });
     } catch (_error) {
       captureContext = new (window.AudioContext || window.webkitAudioContext)();
     }
@@ -707,6 +713,7 @@
       const pcm = new Int16Array(message.data);
       updateMeter(pcm);
       if (microphoneUploadEnabled()) pendingCapture.push(pcm);
+      else if (running && muted && profile.silenceWhenMuted) pendingCapture.push(new Int16Array(pcm.length));
     };
     const silentSink = captureContext.createGain();
     silentSink.gain.value = 0;

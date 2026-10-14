@@ -4,13 +4,54 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '../../examples/online_serving/realtime_web/app/static');
-const context = vm.createContext({ URL });
-for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
+const context = vm.createContext({ URL, btoa: value => Buffer.from(value, 'binary').toString('base64') });
+for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt', 'personaplex_native']) {
   vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), context);
 }
 const profiles = context.OmniRealtimeProfiles;
 const plain = (value) => JSON.parse(JSON.stringify(value));
 const config = { model: 'Qwen/Qwen3-Omni-30B-A3B-Instruct', realtimePath: 'v1/realtime' };
+
+test('PersonaPlex configures native duplex and sends exact float32 frames across capture chunks', () => {
+  const profile = profiles['personaplex-native']();
+  const url = new URL(profile.url({}, 'https://localhost/'));
+  assert.equal(url.searchParams.get('duplex'), '1');
+  assert.equal(url.searchParams.get('autostart'), '0');
+  const [update] = profile.initialMessages({}, 'Help plan a trip.');
+  assert.equal(update.session.model, 'nvidia/personaplex-7b-v1');
+  assert.equal(update.session.instructions, 'Help plan a trip.');
+  assert.equal(update.session.output_audio_format, 'pcm16');
+  assert.equal(update.session.turn_detection, null);
+  assert.equal(profile.appendMessages(new Int16Array(1000).fill(16384)).length, 0);
+  const events = profile.appendMessages(new Int16Array(3000).fill(-16384));
+  assert.equal(events.length, 2);
+  for (const event of events) {
+    assert.equal(event.format, 'pcm_f32le');
+    assert.equal(event.sample_rate_hz, 24000);
+    assert.equal(Buffer.from(event.audio, 'base64').length, 1920 * 4);
+  }
+  const first = Buffer.from(events[0].audio, 'base64');
+  assert.equal(first.readFloatLE(0), 0.5);
+  assert.equal(first.readFloatLE(1000 * 4), -0.5);
+  // A reconnect must not send the remainder of the previous session.
+  profile.initialMessages({}, 'New session.');
+  assert.equal(profile.appendMessages(new Int16Array(1760)).length, 0);
+  assert.equal(profile.appendMessages(new Int16Array(160)).length, 1);
+  assert.deepEqual(plain(profile.commitMessages()), []);
+});
+
+test('PersonaPlex caption grouping uses audio time and resets at a new response', () => {
+  const profile = profiles['personaplex-native']();
+  const text = (response_id, delta) => profile.mapEvent({ type: 'response.output_audio_transcript.delta', response_id, delta });
+  assert.equal(text('r1', 'Hello').newTranscript, true);
+  // Without output audio advancing, a later websocket delivery stays in the same row.
+  assert.equal(text('r1', ' there.').newTranscript, false);
+  profile.mapEvent({ type: 'response.created', response: { id: 'r2' } });
+  const next = text('r2', 'Hello');
+  assert.equal(next.newTranscript, true);
+  assert.equal(next.transcriptId, 'r2:caption-1');
+  assert.equal(profile.mapEvent({ type: 'response.output_audio_transcript.done', response_id: 'r2', transcript: 'Hello' }).text, 'Hello');
+});
 
 test('MiniCPM keeps native flags, reference voice, camera, acknowledgements and no commits', () => {
   const native = profiles['minicpm-native']();
@@ -167,7 +208,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
   });
   ctx.window = ctx;
-  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
+  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt', 'personaplex_native']) {
     vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), ctx);
   }
   // Expose closure controls only in the test VM; production has no test API.
@@ -338,6 +379,55 @@ test('Qwen does not duplicate text and audio-transcript channels', async () => {
   const turns = app.elements.get('conversation').children;
   assert.equal(turns.length, 1);
   assert.equal(turns[0].children[1].textContent, 'Hello');
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('PersonaPlex keeps input clocked while speaking and replaces muted capture with silence', async () => {
+  const app = shell('personaplex-native');
+  await app.ui.startSession();
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'r1' } });
+  assert.equal(app.ui.microphoneUploadEnabled(), true);
+  const capture = app.nodes.find(node => node.name === 'fullduplex-pcm-capture');
+  const sendFrame = () => {
+    capture.port.onmessage({ data: new Int16Array(1920).fill(16384).buffer });
+    app.ui.flushCapture();
+    return Buffer.from(app.sockets[0].sent.at(-1).audio, 'base64');
+  };
+  assert.equal(sendFrame().readFloatLE(0), 0.5);
+  app.elements.get('muteButton').listeners.click();
+  assert.equal(app.ui.microphoneUploadEnabled(), false);
+  assert.equal(sendFrame().every(byte => byte === 0), true);
+  app.elements.get('muteButton').listeners.click();
+  assert.equal(sendFrame().readFloatLE(0), 0.5);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('PersonaPlex opens Assistant rows within one response without clearing playback', async () => {
+  const app = shell('personaplex-native');
+  await app.ui.startSession();
+  const response_id = 'continuous-session-response';
+  await app.ui.handleEvent({ type: 'response.created', response: { id: response_id } });
+  const text = delta => app.ui.handleEvent({ type: 'response.output_audio_transcript.delta', response_id, delta });
+  const audio = ms => app.ui.handleEvent({ type: 'response.output_audio.delta', response_id,
+    format: 'pcm16', sample_rate_hz: 24000, delta: Buffer.alloc(ms * 24 * 2).toString('base64') });
+  await text('First answer.');
+  await audio(400);
+  await text(' More detail.');
+  await audio(2400);
+  await text('Yes.');
+  await audio(2400);
+  await text('Yes.');
+  // The server's final transcript is cumulative across the whole session.
+  await app.ui.handleEvent({ type: 'response.output_audio_transcript.done', response_id,
+    transcript: 'First answer. More detail.Yes.Yes.' });
+  const turns = app.elements.get('conversation').children;
+  assert.deepEqual(turns.map(row => row.children[0].textContent), ['Assistant', 'Assistant', 'Assistant']);
+  assert.deepEqual(turns.map(row => row.children[1].textContent), ['First answer. More detail.', 'Yes.', 'Yes.']);
+  assert.equal(app.sockets.length, 1);
+  assert.equal(app.sockets[0].sent.some(event => event.type === 'response.cancel'), false);
+  const playback = app.nodes.find(node => node.name === 'fullduplex-pcm-playback');
+  assert.equal(playback.sent.some(message => message.type === 'clear'), false);
+  assert.ok(playback.sent.filter(message => message.type === 'audio').every(message => message.responseId === response_id));
   await app.ui.stopSession({ terminal: false });
 });
 
