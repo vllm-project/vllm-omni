@@ -32,6 +32,8 @@ text-to-image.
   [`docs/models/supported_models.md`](../../docs/models/supported_models.md)
 - Feature compatibility matrix:
   [`docs/user_guide/diffusion_features.md`](../../docs/user_guide/diffusion_features.md)
+- Optional Ascend QKV preprocessing:
+  [configuration and validation](../../docs/user_guide/diffusion/qwen_image_21_ascend_qkv.md)
 - Sibling recipes: [`Qwen-Image.md`](./Qwen-Image.md),
   [`Qwen-Image-Edit.md`](./Qwen-Image-Edit.md)
 

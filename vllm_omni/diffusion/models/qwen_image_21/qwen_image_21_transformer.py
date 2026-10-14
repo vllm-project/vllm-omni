@@ -33,7 +33,9 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.fused_norm_rope import FusedNormRope, RopeTables, prepare_rope_tables
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.qkv_norm_rope import concat_prefix_bnsd, use_mindiesd_qkv
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
@@ -445,6 +447,7 @@ class QwenImage21Attention(nn.Module):
         super().__init__()
         self.head_dim = dim_head
         self.prefix_kv_cache_dtype = prefix_kv_cache_dtype
+        self.head_major_kv_concat = False
 
         self.to_qkv = QKVParallelLinear(
             hidden_size=dim,
@@ -461,6 +464,7 @@ class QwenImage21Attention(nn.Module):
         # Keep that rounding order for BF16 Q/K; TP shards whole heads.
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
+        self.fused_norm_rope = FusedNormRope()
 
         self.to_out = RowParallelLinear(
             heads * dim_head,
@@ -497,6 +501,7 @@ class QwenImage21Attention(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        qkv_rope_tables: RopeTables | None = None,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -529,11 +534,21 @@ class QwenImage21Attention(nn.Module):
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
 
-        query = self.norm_q(query).to(value.dtype)
-        key = self.norm_k(key).to(value.dtype)
-
-        query = self._apply_rotary_emb(query, freqs)
-        key = self._apply_rotary_emb(key, freqs)
+        if qkv_rope_tables is None:
+            query = self.norm_q(query).to(value.dtype)
+            key = self.norm_k(key).to(value.dtype)
+            query = self._apply_rotary_emb(query, freqs)
+            key = self._apply_rotary_emb(key, freqs)
+        else:
+            query, key, value = self.fused_norm_rope(
+                query,
+                key,
+                value,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                self.norm_q.eps,
+                qkv_rope_tables,
+            )
 
         cached_key = cached_value = None
         if kv_cache is not None:
@@ -593,8 +608,12 @@ class QwenImage21Attention(nn.Module):
                 attn_output = self.attn(query, key, value, metadata)
             else:
                 # Decode: the block-causal mask degenerates to full attention for target rows.
-                key = torch.cat([cached_key, key], dim=1)
-                value = torch.cat([cached_value, value], dim=1)
+                if self.head_major_kv_concat and qkv_rope_tables is not None:
+                    key = concat_prefix_bnsd(cached_key, key)
+                    value = concat_prefix_bnsd(cached_value, value)
+                else:
+                    key = torch.cat([cached_key, key], dim=1)
+                    value = torch.cat([cached_value, value], dim=1)
                 attn_output = self.attn(query, key, value, metadata)
         else:
             attn_output = self.attn(query, key, value, metadata)
@@ -662,6 +681,7 @@ class QwenImage21TransformerBlock(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        qkv_rope_tables: RopeTables | None = None,
     ) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
 
@@ -675,6 +695,7 @@ class QwenImage21TransformerBlock(nn.Module):
             kv_cache=kv_cache,
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
+            qkv_rope_tables=qkv_rope_tables,
         )
         hidden_states = hidden_states + img_gate1.tanh() * attn_output
 
@@ -847,6 +868,15 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # quantizes attention Q/K/V *compute* per forward on supported backends.
         extras = getattr(od_config, "extras", None) or {}
         self.prefix_kv_cache_dtype = _normalize_prefix_kv_cache_dtype(extras.get("prefix_kv_cache_dtype"))
+        self.mindiesd_qkv_fusion = use_mindiesd_qkv(
+            od_config,
+            native_cache=self.prefix_kv_cache_dtype is None,
+            unquantized=quant_config is None,
+        )
+        self.mindiesd_qkv_geometry = attention_head_dim == 128
+        head_major = (od_config.additional_config or {}).get("qwen21_head_major_kv_concat", False)
+        if not isinstance(head_major, bool):
+            raise ValueError("qwen21_head_major_kv_concat must be a bool")
 
         self.pos_embed = QwenImage21Rope(theta=10000, axes_dim=list(axes_dims_rope))
         self.time_text_embed = QwenImage21TimestepProjEmbeddings(
@@ -892,6 +922,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 for i in range(num_layers)
             ]
         )
+
+        for block in self.transformer_blocks:
+            block.attn.head_major_kv_concat = head_major and self.mindiesd_qkv_fusion
 
         self.norm_out = QwenImage21AdaLayerNormContinuous(
             self.inner_dim, self.inner_dim, eps=eps, prefix=f"{prefix}.norm_out"
@@ -1197,6 +1230,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
 
+        qkv_rope_tables = None
+        if self.mindiesd_qkv_fusion:
+            if (
+                joint_hidden_states.device.type == "npu"
+                and joint_hidden_states.dtype == torch.bfloat16
+                and batch_size == 1
+                and self.mindiesd_qkv_geometry
+            ):
+                qkv_rope_tables = prepare_rope_tables(freqs, joint_hidden_states.dtype)
+            else:
+                logger.warning_once("Qwen2.1 MindIE-SD QKV fusion requires NPU BF16, batch=1 and head_dim=128")
         for index_block, block in enumerate(self.transformer_blocks):
             block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
             joint_hidden_states = block(
@@ -1210,6 +1254,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
+                qkv_rope_tables=qkv_rope_tables,
             )
 
         if (

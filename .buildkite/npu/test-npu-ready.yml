@@ -40,10 +40,20 @@ steps:
       - label: "Diffusion NPU layer tests - A5"
         key: ready-diffusion-npu-layer-tests-a5
         mirror_hardwares: a5_npu_2
+        source_file_dependencies:
+          - .buildkite/npu/test-npu-ready.yml
+          - tests/diffusion/layers/test_activation.py
+          - tests/diffusion/models/qwen_image_21/test_mindiesd_qkv_npu.py
+          - tests/helpers/mark.py
+          - vllm_omni/diffusion/layers/activation.py
+          - vllm_omni/diffusion/layers/fused_norm_rope.py
+          - vllm_omni/diffusion/models/qwen_image_21/*
+          - vllm_omni/platforms/*
         commands:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/diffusion/models/qwen_image_21/test_mindiesd_qkv_npu.py
             -m 'core_model and npu and A5'
             --run-level 'core_model'
 
