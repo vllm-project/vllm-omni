@@ -541,6 +541,61 @@ class AsyncOmniEngine(OmniEngineBase):
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
+        msg, companions = self._prepare_add_request(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_text=prompt_text,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            reasoning_ended=reasoning_ended,
+            resumable=resumable,
+            kv_hints=kv_hints,
+        )
+        try:
+            self.request_queue.sync_q.put(msg)
+        except BaseException:
+            for artifact_dir in msg.request_artifact_dirs or ():
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+            raise
+        finally:
+            if isinstance(msg.original_prompt, dict):
+                msg.original_prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
+        for companion in companions:
+            self.request_queue.sync_q.put(companion)
+        if companions:
+            logger.info(
+                "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
+                request_id,
+                len(companions),
+            )
+
+    def _prepare_add_request(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
+        arrival_time: float | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
+        *,
+        kv_hints: KvHintsEnvelope | None = None,
+        resumable: bool = False,
+    ) -> tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]:
+        """Build the ADD message plus CFG companions without enqueueing."""
         try:
             msg = self._build_add_request_message(
                 request_id=request_id,
@@ -572,31 +627,12 @@ class AsyncOmniEngine(OmniEngineBase):
         # because a model whose guidance is mandatory cannot decode a request
         # whose companion never arrived.
         companions: list[AddCompanionRequestMessage] = []
-        try:
-            if self.prompt_expand_func is not None and final_stage_id > 0:
-                effective_spl = msg.sampling_params_list
-                stage0_params = effective_spl[0] if effective_spl else None
-                if stage0_params is not None:
-                    companions = self._build_cfg_companions(
-                        request_id, msg.original_prompt, stage0_params, effective_spl
-                    )
-
-            self.request_queue.sync_q.put(msg)
-        except BaseException:
-            for artifact_dir in msg.request_artifact_dirs or ():
-                shutil.rmtree(artifact_dir, ignore_errors=True)
-            raise
-        finally:
-            if isinstance(msg.original_prompt, dict):
-                msg.original_prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
-        for companion in companions:
-            self.request_queue.sync_q.put(companion)
-        if companions:
-            logger.info(
-                "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
-                request_id,
-                len(companions),
-            )
+        if self.prompt_expand_func is not None and final_stage_id > 0:
+            effective_spl = msg.sampling_params_list
+            stage0_params = effective_spl[0] if effective_spl else None
+            if stage0_params is not None:
+                companions = self._build_cfg_companions(request_id, msg.original_prompt, stage0_params, effective_spl)
+        return msg, companions
 
     async def add_request_async(
         self,
@@ -617,8 +653,15 @@ class AsyncOmniEngine(OmniEngineBase):
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
     ) -> None:
-        """Async add_request API."""
-        self.add_request(
+        """Async add_request API.
+
+        Same local input processing as ``add_request``, but the queue put is
+        awaited through the janus async facade: a full request queue suspends
+        this coroutine instead of blocking the event loop on ``sync_q.put``,
+        and the wait is cancellable (sleep/pause-abort cancel pending submits
+        so their admission slots release instead of deadlocking the loop).
+        """
+        msg, companions = self._prepare_add_request(
             request_id=request_id,
             prompt=prompt,
             prompt_text=prompt_text,
@@ -633,8 +676,25 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
-            **({"kv_hints": kv_hints} if kv_hints is not None else {}),
+            kv_hints=kv_hints,
         )
+        try:
+            await self.request_queue.async_q.put(msg)
+        except BaseException:
+            for artifact_dir in msg.request_artifact_dirs or ():
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+            raise
+        finally:
+            if isinstance(msg.original_prompt, dict):
+                msg.original_prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
+        for companion in companions:
+            await self.request_queue.async_q.put(companion)
+        if companions:
+            logger.info(
+                "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
+                request_id,
+                len(companions),
+            )
 
     def add_streaming_update(
         self,

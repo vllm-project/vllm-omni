@@ -96,6 +96,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # drain/offload. Streaming generate does not hold a slot while
         # waiting for the next client chunk.
         self._admitting: int = 0
+        # In-flight add_request_async tasks awaiting queue room. A full request
+        # queue against a paused engine used to wedge the event loop (sync_q.put
+        # blocks the calling thread), so sleep() could never observe
+        # _admitting==0. pause_generation(mode="abort")/sleep() cancel these so
+        # the admission slots release instead of pinning the loop (#8678).
+        self._pending_submits: set[asyncio.Task[None]] = set()
         # True after pause_generation() or AR EngineCore sleep; wake_up must
         # not reopen generate() until resume_generation(). Diffusion-only
         # sleep uses _paused as a temporary admission gate and clears it
@@ -177,9 +183,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # Streaming generate does **not** hold the slot while waiting for the
         # first client chunk; the input pump acquires it immediately before each
         # EngineCore ADD/update.
+        # The wait also covers partial wakes: after wake_up(tags=["weights"]) +
+        # resume_generation() the kv_cache tag can still be asleep, and a submit
+        # against a partially-asleep engine would only be rejected EngineCore
+        # side. Park here until the full wake instead of erroring (#8678).
         streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
-            await self._pause_cond.wait_for(lambda: not self._paused)
+            await self._pause_cond.wait_for(lambda: not self._paused and not self._sleeping_tags)
             if not streaming_input:
                 self._admitting = getattr(self, "_admitting", 0) + 1
         admitting = not streaming_input
@@ -188,6 +198,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         input_stream_task: asyncio.Task | None = None
         try:
+            # Backstop: the admission gate above waits out sleeping tags, so
+            # this only fires if tags appeared after the gate passed (e.g. a
+            # sleep() racing this submit) — fail fast rather than submit into
+            # an offloading engine.
             _sleeping_tags = getattr(self, "_sleeping_tags", None)
             if _sleeping_tags:
                 raise RuntimeError(
@@ -284,16 +298,26 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 await first_chunk_submitted
             else:
-                await self.engine.add_request_async(
-                    request_id=request_id,
-                    prompt=prompt,
-                    sampling_params_list=req_sp_list,
-                    final_stage_id=final_stage_id_for_e2e,
-                    final_output_stage_ids=final_output_stage_ids,
-                    arrival_time=wall_start_ts,
-                    lora_request=lora_request,
-                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
+                submit_task = asyncio.get_running_loop().create_task(
+                    self.engine.add_request_async(
+                        request_id=request_id,
+                        prompt=prompt,
+                        sampling_params_list=req_sp_list,
+                        final_stage_id=final_stage_id_for_e2e,
+                        final_output_stage_ids=final_output_stage_ids,
+                        arrival_time=wall_start_ts,
+                        lora_request=lora_request,
+                        **({"kv_hints": kv_hints} if kv_hints is not None else {}),
+                    )
                 )
+                pending = getattr(self, "_pending_submits", None)
+                if pending is None:
+                    pending = self._pending_submits = set()
+                pending.add(submit_task)
+                try:
+                    await submit_task
+                finally:
+                    pending.discard(submit_task)
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
             stage_first_ts[0] = submit_ts
@@ -348,10 +372,23 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._admitting = max(getattr(self, "_admitting", 1) - 1, 0)
             self._pause_cond.notify_all()
 
+    def _cancel_pending_submits(self) -> None:
+        """Cancel generate() coroutines still waiting for request-queue room.
+
+        Their queue puts suspend on a paused engine; without the cancel they
+        would hold their admission slots forever and sleep() would wait on
+        ``_admitting == 0`` indefinitely. Cancellation unwinds through
+        generate()'s normal abort handling, releasing the slot.
+        """
+        for task in list(getattr(self, "_pending_submits", ()) or ()):
+            task.cancel()
+
     async def _submit_with_admission(self, awaitable):
         """Wait for resume, hold one admission slot for a single EngineCore submit."""
         async with self._pause_cond:
-            await self._pause_cond.wait_for(lambda: not self._paused)
+            # Same full-wake condition as generate()'s gate: streaming ADDs
+            # must not race a partially-asleep engine either (#8678).
+            await self._pause_cond.wait_for(lambda: not self._paused and not self._sleeping_tags)
             self._admitting = getattr(self, "_admitting", 0) + 1
         try:
             return await awaitable
@@ -760,6 +797,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._paused = True
             self._hold_admission_until_resume = True
 
+        if mode == "abort":
+            self._cancel_pending_submits()
+
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         if mode != "keep":
             diffusion_stage_ids = []
@@ -964,6 +1004,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # slept, so wake_up() has no tags to restore and never reaches the
         # block that clears ``_paused``.
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        if mode == "abort":
+            self._cancel_pending_submits()
 
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()
@@ -1144,6 +1186,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._name,
             ar_stage_ids + diffusion_stage_ids,
         )
+        # generate() coroutines parked on the full wake (sleeping tags in the
+        # admission-gate predicate) may now pass the gate (#8678).
+        async with self._pause_cond:
+            self._pause_cond.notify_all()
         # Diffusion-only sleep uses `_paused` as a race guard. Restore
         # generate() admission after memory is back. AR/mixed sleep and
         # pause_generation keep the trainer hold until resume_generation.
