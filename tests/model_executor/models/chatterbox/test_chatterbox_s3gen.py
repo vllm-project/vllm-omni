@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import re
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from torch import nn
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -32,6 +34,8 @@ LOOKAHEAD = 3
 HOPS = [20, 30, 60]
 # Stage 1's context in the deploy file: the longest utterance a decoder is built for.
 CONTEXT = 2048
+# Batched against alone, CPU float32. Comparable models use 1e-5 on CPU.
+TOLERANCE = 1e-5
 
 
 def chunk_plan(total: int) -> list[tuple[int, int, bool]]:
@@ -93,6 +97,13 @@ def decoder() -> S3GenDecoder:
     return S3GenDecoder(ChatterboxConfig(), CONTEXT).eval()
 
 
+@pytest.fixture(autouse=True)
+def no_stream_left_behind(decoder: S3GenDecoder) -> Iterator[None]:
+    """A test that fails mid-stream must not leave its state to the next one."""
+    yield
+    decoder.streams.clear()
+
+
 @pytest.fixture(scope="module")
 def references() -> list[Reference]:
     torch.manual_seed(1)
@@ -102,10 +113,15 @@ def references() -> list[Reference]:
 
 
 def test_fade_in_out_blends_the_overlap() -> None:
-    win = torch.hamming_window(8, periodic=False)
-    blended = fade_in_out(torch.ones(1, 8), torch.zeros(1, 4), win)
-    assert torch.allclose(blended[0, :4], win[:4])
-    assert torch.equal(blended[0, 4:], torch.ones(4))
+    """The new audio rises over the window's first half while the tail's last samples fall over its second."""
+    win = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0, 0.75, 0.5, 0.25])
+    # A tail longer than the overlap: only its last four samples are faded out.
+    tail = torch.arange(6.0).reshape(1, 6)
+
+    blended = fade_in_out(torch.full((1, 8), 2.0), tail, win)
+
+    # 2 * win[i] + tail[0, 2 + i] * win[4 + i]
+    assert blended.tolist() == [[2.0, 2.75, 3.0, 2.75, 2.0, 2.0, 2.0, 2.0]]
 
 
 def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder, monkeypatch):
@@ -172,25 +188,129 @@ def test_batch_rows_match_single_rows_with_different_references(
         )
         frames = 2 * tokens[i].numel() - (0 if finalize[i] else 2 * LOOKAHEAD)
         assert batched[i].shape == alone.shape == (1, 80, frames)
-        assert torch.allclose(batched[i], alone, atol=1e-3, rtol=1e-3), (batched[i] - alone).abs().max()
+        # Measured on CPU float32: at most 5.3e-6 on values up to 5.1.
+        torch.testing.assert_close(batched[i], alone, atol=TOLERANCE, rtol=TOLERANCE)
 
     # Not vacuous: the same tokens and noise under another voice of the
-    # same length give another mel.
+    # same length give another mel (measured: 1.1 apart).
     (other_voice,) = flow_mels(
         decoder.flow, [tokens[0]], [reference(20)], [False], 2, True, noise[:1, :, : 2 * lengths[0]]
     )
     assert other_voice.shape == batched[0].shape
-    assert not torch.allclose(other_voice, batched[0], atol=1e-2)
+    assert (other_voice - batched[0]).abs().max() > 0.1
+
+
+def test_one_final_row_is_upstreams_flow_inference(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """For one row with nothing to pad, ``flow_mels`` is ``CausalMaskedDiffWithXvec.inference`` (0.1.7).
+
+    The reference is upstream's method written out over the same modules:
+    prompt and tokens embedded under an all-ones mask, encoded, projected;
+    the prompt's mel as the condition over its own frames; the generated
+    frames after them returned. The non-final case differs from upstream on
+    purpose (upstream crops the encoder output and keeps the uncropped mask)
+    and has no reference.
+    """
+    flow, ref = decoder.flow, references[1]
+    torch.manual_seed(12)
+    tokens = torch.randint(0, 6561, (17,))
+    length = ref.prompt_token.shape[1] + tokens.numel()
+    noise = torch.randn(1, 80, 2 * length)
+
+    with torch.inference_mode():
+        (mel,) = flow_mels(flow, [tokens], [ref], [True], 2, True, noise)
+
+        token = torch.cat([ref.prompt_token, tokens[None]], dim=1)
+        embedding = flow.spk_embed_affine_layer(nn.functional.normalize(ref.embedding, dim=1))
+        h = flow.encoder_proj(
+            flow.encoder(flow.input_embedding(token) * torch.ones(1, length, 1), torch.tensor([length]))
+        )
+        prompt_frames = ref.prompt_feat.shape[1]
+        conds = torch.zeros(1, 2 * length, 80)
+        conds[:, :prompt_frames] = ref.prompt_feat
+        feat, _ = flow.decoder(
+            mu=h.transpose(1, 2).contiguous(),
+            mask=torch.ones(1, 1, 2 * length),
+            spks=embedding,
+            cond=conds.transpose(1, 2),
+            n_timesteps=2,
+            noised_mels=noise,
+            meanflow=True,
+        )
+
+    assert mel.shape == (1, 80, 2 * tokens.numel())
+    assert torch.equal(mel, feat[:, :, prompt_frames:])
+
+
+def test_the_encoder_is_upstreams_when_nothing_is_padded(decoder: S3GenDecoder) -> None:
+    """``UpsampleConformerEncoder.forward`` zeroes padding after its input layer; without padding that is a no-op.
+
+    The reference is upstream's ``forward`` (0.1.7) for this configuration,
+    written out over the same layers: no padding zeroed, the padding masks
+    as chunk masks.
+    """
+    encoder = decoder.flow.encoder
+    torch.manual_seed(13)
+    xs, lengths = torch.randn(2, 30, 512), torch.tensor([30, 30])
+
+    with torch.inference_mode():
+        encoded = encoder(xs, lengths)
+
+        masks = torch.ones(2, 1, 30, dtype=torch.bool)
+        h, pos_emb, masks = encoder.embed(xs, masks)
+        h = encoder.pre_lookahead_layer(h)
+        for layer in encoder.encoders:
+            h, masks, _, _ = layer(h, masks, pos_emb, masks)
+        h, _ = encoder.up_layer(h.transpose(1, 2).contiguous(), lengths)
+        masks = torch.ones(2, 1, 60, dtype=torch.bool)
+        h, pos_emb, masks = encoder.up_embed(h.transpose(1, 2).contiguous(), masks)
+        for layer in encoder.up_encoders:
+            h, masks, _, _ = layer(h, masks, pos_emb, masks)
+        expected = encoder.after_norm(h)
+
+    assert encoded.shape == (2, 60, 512)
+    assert torch.equal(encoded, expected)
+
+
+def test_a_padded_encoder_row_is_encoded_as_it_is_alone(decoder: S3GenDecoder) -> None:
+    """The shorter rows' padding reaches none of their frames, through the look-ahead convolution included."""
+    encoder = decoder.flow.encoder
+    torch.manual_seed(14)
+    lengths = torch.tensor([40, 31, 17])
+    xs = torch.randn(3, 40, 512) * (torch.arange(40) < lengths[:, None]).unsqueeze(-1)
+
+    with torch.inference_mode():
+        batched = encoder(xs, lengths)
+        for row, length in enumerate(lengths.tolist()):
+            alone = encoder(xs[row : row + 1, :length], lengths[row : row + 1])
+            # Measured on CPU float32: at most 4.3e-6 on values up to 4.
+            torch.testing.assert_close(batched[row : row + 1, : 2 * length], alone, atol=TOLERANCE, rtol=TOLERANCE)
 
 
 def test_non_final_chunk_holds_back_the_overlap(decoder: S3GenDecoder, references: list[Reference]) -> None:
-    tokens = torch.randint(0, 6561, (23,))
-    ((piece, state),) = decoder.chunked_decode_streaming([Chunk(tokens, 0, references[0], None, False)])
-    assert piece.shape == (1, 40 * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES)
+    """The state is the chunk's last eight frames, their source and their samples, and they are not played.
+
+    The flow is deterministic and the vocoder's own draw is pinned, so the
+    chunk's mel and audio can be computed again and compared by value.
+    """
+    torch.manual_seed(4)
+    chunk = Chunk(torch.randint(0, 6561, (23,)), 0, references[0], None, False)
+
+    torch.manual_seed(5)
+    ((piece, state),) = decoder.chunked_decode_streaming([chunk])
+    torch.manual_seed(5)
+    (mel,) = decoder.chunk_mels([chunk])
+    (wav,), (source,) = decoder.vocode([mel], torch.zeros(1, 1, 0))
+
+    assert mel.shape == (1, 80, 40)
     assert state is not None
-    assert state.mel.shape == (1, 80, 8)
-    assert state.source.shape == (1, 1, SOURCE_CACHE_SAMPLES)
-    assert state.speech.shape == (1, SOURCE_CACHE_SAMPLES)
+    assert torch.equal(state.mel, mel[:, :, -8:])
+    assert torch.equal(state.source, source[:, :, -SOURCE_CACHE_SAMPLES:])
+    assert torch.equal(state.speech, wav[:, -SOURCE_CACHE_SAMPLES:])
+    # Played: everything before the held-back samples, with upstream's 20 ms trim and fade-in.
+    trim = decoder.trim_fade.numel()
+    assert piece.shape == (1, 40 * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES)
+    assert torch.equal(piece[:, :trim], wav[:, :trim] * decoder.trim_fade)
+    assert torch.equal(piece[:, trim:], wav[:, trim:-SOURCE_CACHE_SAMPLES])
 
 
 def test_chunked_and_one_shot_agree_in_length(decoder: S3GenDecoder, references: list[Reference]) -> None:
@@ -301,18 +421,58 @@ def test_abort_frees_stream_state(decoder: S3GenDecoder, references: list[Refere
     assert decoder.streams == {}
 
 
-def test_two_requests_in_one_step_keep_separate_state(decoder: S3GenDecoder, references: list[Reference]) -> None:
-    tokens = torch.randint(0, 6561, (23 + 30,))
-    audio = decoder.decode_step(
-        tokens,
+def test_two_requests_in_one_step_keep_separate_state(
+    decoder: S3GenDecoder, references: list[Reference], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each row of a step is decoded from its own tokens, offset, end flag and voice.
+
+    What ``decode_step`` hands the decoder is recorded instead of decoded, so
+    every field is compared by value; the second step shows a live stream
+    keeps the voice it began with beside a new request with another.
+    """
+    seen: list[list[Chunk]] = []
+
+    def record(chunks: list[Chunk]) -> list[tuple[torch.Tensor, StreamState | None]]:
+        seen.append(chunks)
+        return [
+            (torch.zeros(1, 1), None if chunk.finalize else StreamState(chunk.reference, *[torch.zeros(1)] * 3))
+            for chunk in chunks
+        ]
+
+    monkeypatch.setattr(decoder, "chunked_decode_streaming", record)
+    torch.manual_seed(9)
+    a, b, c = (torch.randint(0, 6561, (n,)) for n in (53, 30, 53))
+
+    decoder.decode_step(
+        torch.cat([a[:23], b]),
         [23, 30],
         [stream_payload(references[0], False, 0), stream_payload(references[1], True, 0)],
         ["a", "b"],
     )
-    assert audio[0].shape == (40 * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES,)
-    assert audio[1].shape == (2 * (30 + 3) * SAMPLES_PER_FRAME,)
-    assert set(decoder.streams) == {"a"}
-    decoder.on_requests_finished({"a"})
+    decoder.decode_step(
+        torch.cat([a, c]),
+        [53, 53],
+        [stream_payload(None, False, 20), stream_payload(references[1], False, 0)],
+        ["a", "c"],
+    )
+
+    def voice(ref: Reference) -> list:
+        return [ref.prompt_token.tolist(), ref.prompt_feat.tolist(), ref.embedding.tolist()]
+
+    def described(chunk: Chunk) -> tuple:
+        return (chunk.tokens.tolist(), chunk.token_offset, chunk.finalize, chunk.state is None, voice(chunk.reference))
+
+    first, second = seen
+    assert [described(chunk) for chunk in first] == [
+        (a[:23].tolist(), 0, False, True, voice(references[0])),
+        (b.tolist(), 0, True, True, voice(references[1])),
+    ]
+    assert [described(chunk) for chunk in second] == [
+        (a.tolist(), 20, False, False, voice(references[0])),
+        (c.tolist(), 0, False, True, voice(references[1])),
+    ]
+    assert set(decoder.streams) == {"a", "c"}
+    decoder.on_requests_finished({"a", "c"})
 
 
 def test_spans_without_a_payload_or_tokens_give_empty_audio(decoder: S3GenDecoder, references: list[Reference]) -> None:
@@ -324,24 +484,35 @@ def test_spans_without_a_payload_or_tokens_give_empty_audio(decoder: S3GenDecode
     )
     assert terminal.shape == (0,)
 
+    # A token-less row beside a live one, on either side: each gets its own audio.
+    tokens = torch.randint(0, 6561, (23,))
+    for order in ((0, 1), (1, 0)):
+        rows = [
+            ({"meta": {"finished": torch.tensor(True)}}, "done", 0),
+            (stream_payload(references[0], False, 0), "live", 23),
+        ]
+        payloads, ids, counts = zip(*[rows[i] for i in order], strict=True)
+        audio = decoder.decode_step(tokens, list(counts), list(payloads), list(ids))
+        assert [row.shape for row in audio] == [
+            (40 * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES,) if count else (0,) for count in counts
+        ]
+        assert set(decoder.streams) == {"live"}
+        decoder.on_requests_finished({"live"})
 
-def test_tokens_without_stream_metadata_are_refused(decoder: S3GenDecoder, references: list[Reference]) -> None:
-    """Decoding them as a whole utterance would play wrong audio with no error."""
-    payload = stream_payload(references[0], False, 0)
-    del payload["meta"]
-    with pytest.raises(RuntimeError, match="stream metadata"):
-        decoder.decode_step(torch.randint(0, 6561, (23,)), [23], [payload], ["x"])
 
+@pytest.mark.parametrize(
+    "payloads",
+    [[{"embed": {}}], [{}], None],
+    ids=["payload without stream metadata", "empty payload", "no payload list"],
+)
+def test_tokens_without_stream_metadata_are_refused(decoder: S3GenDecoder, payloads: list[dict] | None) -> None:
+    """Decoding them as a whole utterance would play wrong audio with no error.
 
-def test_batch_mode_payload_decodes_the_whole_utterance(decoder: S3GenDecoder, references: list[Reference]) -> None:
-    """What the batch-mode processor sends: a stream of one final chunk."""
-    payload = {
-        "embed": stream_payload(references[1], True, 0)["embed"],
-        "meta": {"stream_finished": torch.tensor(True), "left_context_size": 0},
-    }
-    (audio,) = decoder.decode_step(torch.randint(0, 6561, (40,)), [40], [payload], ["x"])
-    assert audio.shape == (2 * (40 + 3) * SAMPLES_PER_FRAME,)
-    assert decoder.streams == {}
+    The runner passes an empty payload for a request it holds none for, and
+    no list at all only on the profiling run, which has no request ids.
+    """
+    with pytest.raises(RuntimeError, match="23 tokens for request x without stream metadata"):
+        decoder.decode_step(torch.randint(0, 6561, (23,)), [23], payloads, ["x"])
 
 
 def test_decoding_a_chunk_twice_gives_the_same_mel(decoder: S3GenDecoder, references: list[Reference]) -> None:
@@ -366,6 +537,7 @@ def test_decoding_a_chunk_twice_gives_the_same_mel(decoder: S3GenDecoder, refere
 
 def test_a_row_does_not_depend_on_its_batch(decoder: S3GenDecoder, references: list[Reference]) -> None:
     """Nothing is pinned here: each row's noise is fixed by its own positions."""
+    torch.manual_seed(6)
     tokens = torch.randint(0, 6561, (113,))
     chunks = [
         Chunk(tokens[:53], 20, references[0], None, False),
@@ -376,7 +548,8 @@ def test_a_row_does_not_depend_on_its_batch(decoder: S3GenDecoder, references: l
     assert [mel.shape[2] for mel in batched] == [60, 2 * (63 + 3), 40]
     for chunk, mel in zip(chunks, batched, strict=True):
         (alone,) = decoder.chunk_mels([chunk])
-        assert torch.allclose(mel, alone, atol=1e-3, rtol=1e-3), (mel - alone).abs().max()
+        # Measured on CPU float32: at most 5.2e-6.
+        torch.testing.assert_close(mel, alone, atol=TOLERANCE, rtol=TOLERANCE)
 
 
 def test_noise_is_taken_by_position_for_every_prompt_length(decoder: S3GenDecoder, references: list[Reference]) -> None:
@@ -418,6 +591,7 @@ def test_chunked_mel_is_closer_to_one_chunk_than_a_noise_redraw(
     decoder: S3GenDecoder, references: list[Reference]
 ) -> None:
     """Chunks and one final chunk share noise, so they differ by context only."""
+    torch.manual_seed(8)
     tokens = torch.randint(0, 6561, (140,))
     (whole,) = decoder.chunk_mels([Chunk(tokens, 0, references[0], None, True)])
     stitched = torch.cat(
@@ -438,7 +612,9 @@ def test_chunked_mel_is_closer_to_one_chunk_than_a_noise_redraw(
         True,
         torch.randn(1, 80, 2 * (references[0].prompt_token.shape[1] + 140 + 3)),
     )
-    assert (stitched - whole).abs().mean() < (redrawn - whole).abs().mean()
+    # Measured: 0.10 against 1.17. Noise drawn per chunk would put the
+    # stitched mel as far from the one-chunk mel as a redraw is.
+    assert (stitched - whole).abs().mean() < 0.25 * (redrawn - whole).abs().mean()
 
 
 def test_a_non_final_chunk_shorter_than_the_mel_cache_is_refused(
@@ -531,16 +707,23 @@ def test_a_row_is_vocoded_as_it_is_alone_whatever_shares_the_step(decoder: S3Gen
     assert sources[1].shape == (1, 1, 68 * SAMPLES_PER_FRAME)
 
 
-def test_rows_of_equal_length_share_one_vocoder_call(decoder: S3GenDecoder) -> None:
+def test_rows_of_equal_length_share_one_vocoder_call(decoder: S3GenDecoder, monkeypatch: pytest.MonkeyPatch) -> None:
     """Nothing is padded between them, so batching them costs no independence."""
+    torch.manual_seed(10)
     mels = [torch.randn(1, 80, 68), torch.randn(1, 80, 40), torch.randn(1, 80, 68)]
     cache = torch.randn(3, 1, SOURCE_CACHE_SAMPLES)
-    torch.manual_seed(5)
+    inference = decoder.mel2wav.inference
+    calls: list[int] = []
+
+    def counted(speech_feat: torch.Tensor, cache_source: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(speech_feat.shape[0])
+        return inference(speech_feat=speech_feat, cache_source=cache_source)
+
+    monkeypatch.setattr(decoder.mel2wav, "inference", counted)
     wavs, sources = decoder.vocode(mels, cache)
-    torch.manual_seed(5)
-    speech, source = decoder.mel2wav.inference(speech_feat=torch.cat([mels[0], mels[2]]), cache_source=cache[[0, 2]])
-    assert torch.equal(torch.cat([wavs[0], wavs[2]]), speech)
-    assert torch.equal(torch.cat([sources[0], sources[2]]), source)
+
+    assert calls == [2, 1]
+    assert [wav.shape[1] for wav in wavs] == [68 * SAMPLES_PER_FRAME, 40 * SAMPLES_PER_FRAME, 68 * SAMPLES_PER_FRAME]
     # Each row keeps its own source cache.
     assert all(torch.equal(sources[i][:, :, :SOURCE_CACHE_SAMPLES], cache[i : i + 1]) for i in range(3))
 
@@ -599,18 +782,6 @@ def test_a_live_stream_and_a_first_chunk_in_one_step(decoder: S3GenDecoder, refe
     assert first_state.speech.shape == live_state.speech.shape == (1, SOURCE_CACHE_SAMPLES)
 
 
-def test_tokens_with_an_empty_payload_are_refused(decoder: S3GenDecoder) -> None:
-    """What the runner passes for a request it holds no payload for."""
-    with pytest.raises(RuntimeError, match="23 tokens for request x without stream metadata"):
-        decoder.decode_step(torch.randint(0, 6561, (23,)), [23], [{}], ["x"])
-
-
-def test_tokens_without_a_payload_list_are_refused(decoder: S3GenDecoder) -> None:
-    """Only the profiling run, which has no request ids, comes without payloads."""
-    with pytest.raises(RuntimeError, match="23 tokens for request x without stream metadata"):
-        decoder.decode_step(torch.randint(0, 6561, (23,)), [23], None, ["x"])
-
-
 def stage_config(
     max_num_seqs: int, max_num_batched_tokens: int, max_num_scheduled_tokens: int | None = None
 ) -> SimpleNamespace:
@@ -649,14 +820,78 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
         ChatterboxS3Gen(vllm_config=stage_config(8, max_num_batched_tokens, max_num_scheduled_tokens))
 
 
-def test_the_stage_builds_with_the_deploy_files_budget() -> None:
+@pytest.fixture(scope="module")
+def stage() -> ChatterboxS3Gen:
+    """Stage 1 as the engine builds it with the deploy file's numbers."""
     decoder = yaml.safe_load(Path(get_deploy_config_path("chatterbox_turbo.yaml")).read_text())["stages"][1]
     config = stage_config(decoder["max_num_seqs"], decoder["max_num_batched_tokens"])
     config.model_config.max_model_len = decoder["max_model_len"]
+    return ChatterboxS3Gen(vllm_config=config).eval()
 
-    stage = ChatterboxS3Gen(vllm_config=config)
 
+def test_the_stage_builds_with_the_deploy_files_budget(stage: ChatterboxS3Gen, decoder: S3GenDecoder) -> None:
+    """The deploy file passes the startup check, and every process draws the same flow noise."""
     assert stage.allow_patterns_overrides == [ChatterboxConfig().s3gen_weights]
+    assert torch.equal(stage.flow_noise, decoder.flow_noise)
+
+
+def test_forward_returns_each_requests_new_audio_and_rate(stage: ChatterboxS3Gen, references: list[Reference]) -> None:
+    """The runner's contract: per request, 1-D float32 delta audio and an int32 rate, in batch order."""
+    torch.manual_seed(11)
+    tokens = torch.randint(0, 6561, (23,))
+
+    output = stage(
+        tokens,
+        torch.arange(23),
+        seq_token_counts=[23, 0],
+        model_intermediate_buffer=[
+            stream_payload(references[0], False, 0),
+            {"meta": {"finished": torch.tensor(True)}},
+        ],
+        request_ids=["live", "done"],
+        sampling_metadata=None,
+    )
+
+    assert output.text_hidden_states is None
+    assert set(output.multimodal_outputs) == {"audio", "sr"}
+    live, done = output.multimodal_outputs["audio"]
+    assert live.shape == (40 * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES,) and live.dtype == torch.float32
+    assert done.shape == (0,)
+    rates = output.multimodal_outputs["sr"]
+    assert [(rate.dtype, rate.shape, int(rate)) for rate in rates] == [(torch.int32, (), 24000)] * 2
+    assert set(stage.streams) == {"live"}
+    stage.on_requests_finished({"live"})
+
+
+def test_load_weights_fills_every_parameter_and_skips_the_reference_encoders(
+    stage: ChatterboxS3Gen, decoder: S3GenDecoder
+) -> None:
+    """The checkpoint also holds the tokenizer and speaker encoder, which run in the API process."""
+    checkpoint = decoder.state_dict()
+    encoders = {"tokenizer.conv1.weight": torch.zeros(1), "speaker_encoder.head.weight": torch.zeros(1)}
+
+    loaded = stage.load_weights([*checkpoint.items(), *encoders.items()])
+
+    assert loaded == set(checkpoint) == set(stage.state_dict())
+    assert all(torch.equal(stage.state_dict()[name], tensor) for name, tensor in checkpoint.items())
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [("foreign", "Unexpected key"), ("missing", "Missing key")],
+    ids=["a key the stage does not own", "a parameter the file does not fill"],
+)
+def test_load_weights_refuses_a_checkpoint_of_another_layout(
+    stage: ChatterboxS3Gen, decoder: S3GenDecoder, change: str, match: str
+) -> None:
+    """Strict: a partial load would leave random weights behind with no error."""
+    checkpoint = dict(decoder.state_dict())
+    if change == "foreign":
+        checkpoint["flow.extra.weight"] = torch.zeros(1)
+    else:
+        del checkpoint["mel2wav.conv_pre.bias"]
+    with pytest.raises(RuntimeError, match=match):
+        stage.load_weights(checkpoint.items())
 
 
 def test_flow_batches_all_scheduled_rows_and_keeps_distinct_voices(decoder, monkeypatch):
