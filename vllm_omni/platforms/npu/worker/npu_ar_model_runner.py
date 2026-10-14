@@ -304,9 +304,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 # them must fold until it drains (see the note above).
                 drafted_reqs.update(req_ids)
             if not any(drafts):
-                # Dump the rows as they were seen. An all-empty batch here is
-                # the stall signature: name WHICH request and what shape the
-                # step returned instead of leaving one log line to reason from.
+                # An all-empty batch is the fold, not a fault. `constant_drafts`
+                # returns empty for three expected reasons -- a request that
+                # sampled nothing, a *live* multi-frame request whose codec stop
+                # fired mid-span, or a batch mixing drafted with undrafted rows
+                # -- and each of those already reports itself once through
+                # `_log_block_once`. The one genuine degradation, the
+                # padded-drafter tensor path, names itself above. What is left
+                # here is the per-step dump of WHICH row folded and at what
+                # shape, so it rides at debug.
                 # Type-safe throughout: the padded-drafter branch passes a
                 # tensor, and `tensor or []` raises the ambiguous-truth error.
                 if isinstance(valid_sampled_token_ids, list):
@@ -322,7 +328,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     seen = valid_sampled_token_ids
                     shape = tuple(seen.shape) if hasattr(seen, "shape") else "?"
                     _desc = f"rows=<{type(seen).__name__} shape={shape}>"
-                logger.error(
+                logger.debug(
                     "[kstep] no drafts emitted: frames=%s num_reqs=%s %s",
                     frames,
                     self.input_batch.num_reqs,
