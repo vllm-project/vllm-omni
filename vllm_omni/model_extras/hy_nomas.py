@@ -24,7 +24,16 @@ HY_NOMAS_EXTRA_BODY_PARAMS = frozenset(
 
 def get_hy_nomas_video_generation_defaults(
     extra_body: Mapping[str, object] | None = None,
+    *,
+    requested_size: tuple[int, int] | None = None,
 ) -> VideoGenerationDefaults:
+    """Hy-Nomas production geometry: 1280x704, 24 fps, 8 steps.
+
+    ``requested_size`` is accepted for the shared builder protocol and ignored:
+    Hy-Nomas serves a single geometry, so a request's size cannot change it.
+    Only ``duration`` moves ``num_frames``.
+    """
+    del requested_size
     num_frames = 121
     duration = None if extra_body is None else extra_body.get("duration")
     if duration is not None:

@@ -1,6 +1,7 @@
 # MAGI-2 Preview — NVIDIA L20X
 
-> Native text/image-to-video-and-audio generation with the released Preview stage
+> Native text/image-to-video-and-audio generation with the released Preview stage,
+> plus an experimental 1080p refiner stage
 
 ## Summary
 
@@ -27,14 +28,14 @@ per-rank request batches are not supported.
 
 ### Output
 
-| Category | Supported Preview specification |
+| Category | Supported specification |
 | --- | --- |
 | Duration | Exactly 10 seconds |
-| Video | 125 frames at 12.5 fps |
+| Video | 125 frames at 12.5 fps for `272p` and `540p`; 249 frames at 25 fps for `1080p` |
 | Native tiers | `272p` (448x256) and `540p` (896x512) |
+| Refined tier | `1080p` (1920x1088), experimental; see [1080p refiner](#1080p-refiner-experimental) |
 | Optional final resize | `output_width` and `output_height` must be supplied together |
-| Audio | 44.1 kHz stereo, generated with the video |
-| Refiner | The separate 1080p refiner is not included in this integration |
+| Audio | 44.1 kHz stereo, generated with the video by the Preview stage |
 
 ### Profiles provided by this recipe
 
@@ -55,14 +56,20 @@ per-rank request batches are not supported.
 
 ## Prepare the checkpoint
 
-The native Preview path uses approximately 274 GiB on disk. The separate
-refiner is not required.
+The native Preview path uses approximately 274 GiB on disk. The refiner
+checkpoint under `refiner/` is read only by `1080p` requests; download it as
+well to serve that tier.
 
 ```bash
 export MAGI2_CKPT_ROOT=/path/to/MAGI-2-preview
 
 hf download sand-ai/MAGI-2-preview \
   preview/ text_encoder/ vae/ turbo_vae/ stable-audio-open-1.0/ \
+  --revision 2dea51b64db47ee5b4402d36fd90829a0c58913b \
+  --local-dir "$MAGI2_CKPT_ROOT"
+
+# Only for the experimental 1080p tier.
+hf download sand-ai/MAGI-2-preview refiner/ \
   --revision 2dea51b64db47ee5b4402d36fd90829a0c58913b \
   --local-dir "$MAGI2_CKPT_ROOT"
 ```
@@ -176,12 +183,44 @@ does not make the complete Preview DiT fit on one qualified GPU. When both
 flags are supplied, the shared offloader selects layerwise mode and MAGI's
 native auxiliary staging remains active.
 
+### 1080p refiner (experimental)
+
+A `1080p` request runs the `540p` Preview, upsamples and renoises its
+video latent to the 1920x1088 grid, refines it with the separate refiner DiT in
+`refiner_num_inference_steps` guided steps (default `5`), and decodes 249
+frames at 25 fps. The audio is the Preview's. A request with only
+`--width 1920 --height 1088` selects the same tier.
+
+The refiner is built and loaded on the first `1080p` request and kept in
+pinned host memory; each refinement stages a full replica onto every device
+while the Preview transformer stays resident, so each device must hold its
+Preview shard, the refiner and the refiner's activations. A `1080p` request is
+rejected before generation unless the deployment uses `TP=1`, a
+sequence-parallel size that divides 8 (the refiner's key/value heads), no
+layerwise or distributed layerwise offload, and no HSDP. This tier has not been
+qualified on the hardware of this recipe; no quality, latency, or memory claim
+is made for it.
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model "$MAGI2_CKPT_ROOT" \
+  --model-class-name Magi2Pipeline \
+  --prompt "A red fox walks through fresh snow while wind moves the pine branches." \
+  --height 1088 --width 1920 --num-frames 249 \
+  --num-inference-steps 100 --fps 25 \
+  --tensor-parallel-size 1 --ulysses-degree 4 \
+  --extra-body '{"seconds":10,"resolution":"1080p","refiner_num_inference_steps":5}' \
+  --output magi2_1080p_t2va.mp4
+```
+
 ## Online serving
 
 The OpenAI-compatible serving defaults are the full `540p` preset and `100`
-denoising steps. The model always generates a 10-second, 125-frame clip at
-12.5 fps; pass `resolution=272p` and `num_inference_steps=1` for a low-cost
-load smoke. Requests with another duration are rejected before generation.
+denoising steps. The model generates a 10-second clip: 125 frames at 12.5 fps
+for `272p` and `540p`, and 249 frames at 25 fps for the experimental `1080p`
+tier, which serving fills in for `resolution=1080p` or `size=1920x1088`. Pass
+`resolution=272p` and `num_inference_steps=1` for a low-cost load smoke.
+Requests with another duration are rejected before generation.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -239,7 +278,8 @@ Preview pipeline accepts these model-specific `--extra-body` fields:
 | Field | Meaning |
 | --- | --- |
 | `seconds` | Must be `10`. |
-| `resolution` | `272p` or `540p`; default `540p`. |
+| `resolution` | `272p`, `540p`, or the experimental `1080p`; without it, the preset of the requested size, else `540p`. |
+| `refiner_num_inference_steps` | `1080p` only: refiner denoising steps, a positive integer; default `5`. |
 | `output_width`, `output_height` | Optional final resize; supply both. |
 | `deterministic` | Must match `MAGI2_DETERMINISTIC` at worker startup. |
 
@@ -256,7 +296,8 @@ ffprobe -v error \
 
 A 540p result contains 125 896x512 frames at 12.5 fps and stereo 44.1 kHz
 audio. A 272p result contains 125 448x256 frames with the same duration, rate,
-and audio contract.
+and audio contract. A 1080p result contains 249 1920x1088 frames at 25 fps with
+the same audio contract.
 
 ## Local qualification evidence
 

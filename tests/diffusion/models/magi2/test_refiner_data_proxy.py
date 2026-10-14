@@ -156,6 +156,21 @@ def test_pack_reuses_the_window_plan_per_grid_and_text_length() -> None:
     assert other.window_plan.text_len == 8
 
 
+def test_window_plan_is_built_once_and_reused_by_pack() -> None:
+    grid = (9, 4, 8)
+    proxy = Magi2RefinerDataProxy()
+    with torch.inference_mode():
+        plan = proxy.window_plan(grid, 7)
+
+    assert plan.grid == grid and plan.text_len == 7
+    assert not plan.page_table.is_inference()
+    assert proxy.window_plan(list(grid), 7, torch.device("cpu")) is plan
+    assert proxy.pack(_latent(grid), _text(7)).window_plan is plan
+    empty = proxy.window_plan(grid, 0)
+    assert empty is not plan and empty.text_len == 0
+    assert proxy.pack(_latent(grid), _text(0)).window_plan is empty
+
+
 def test_caches_belong_to_the_proxy_and_hold_at_most_eight_plans() -> None:
     grid = (9, 4, 8)
     latent = _latent(grid)
