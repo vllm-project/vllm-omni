@@ -73,6 +73,18 @@ def test_single_gap_above_threshold_breaks_continuity() -> None:
     assert stats.is_continuous is False
 
 
+def test_recovered_playback_does_not_count_the_previous_stall_again() -> None:
+    # The first chunk runs out at 0.1s. Playback resumes at 0.5s and the next
+    # chunk arrives exactly when that resumed chunk ends, at 0.6s.
+    stats = compute_continuity_stats(
+        chunk_arrival_times_s=[0.0, 0.5, 0.6],
+        chunk_bytes=[_BPS // 10] * 3,
+        sample_rate=_SR,
+    )
+    assert stats.max_underrun_s == pytest.approx(0.4)
+    assert stats.underrun_event_count == 1
+
+
 def test_single_stall_is_separate_from_legacy_cumulative_deficit() -> None:
     # Actual stalls are 200ms and 50ms; maximum=200ms, total=250ms.
     stats = compute_continuity_stats(

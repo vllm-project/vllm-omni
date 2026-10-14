@@ -1048,8 +1048,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     tpot_measured: bool = True
     #: Legacy cumulative playback deficit, in seconds. None means unmeasured.
     audio_underrun_s: float | None = None
-    #: Cumulative playback stall time (the former audio_underrun definition).
+    #: Largest individual playback stall, in seconds.
     audio_max_single_underrun_s: float | None = None
+    #: Cumulative playback stall time (the legacy audio_underrun definition).
     total_underrun_s: float | None = None
     audio_underrun_ratio: float | None = None
     audio_underrun_events_per_minute: float | None = None

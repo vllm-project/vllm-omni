@@ -8,7 +8,7 @@ import base64
 import io
 import json
 import wave
-from types import SimpleNamespace
+from collections.abc import Callable
 
 import pytest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
@@ -55,6 +55,13 @@ class Response:
             yield chunk
 
 
+class Session:
+    """Minimal HTTP transport fake; every post returns a Response context manager."""
+
+    def __init__(self, post: Callable[..., Response]) -> None:
+        self.post = post
+
+
 @pytest.mark.parametrize("gap,expected", [(0.05, 0.0), (0.5, 0.4)])
 def test_chat_measures_decoded_audio_not_wav_headers(monkeypatch, gap, expected):
     clock = [0.0]
@@ -62,7 +69,7 @@ def test_chat_measures_decoded_audio_not_wav_headers(monkeypatch, gap, expected)
     encoded = sse_audio(wav_chunk())
     # First SSE event spans two network reads; arrival is its final byte.
     chunks = [(10.0, encoded[:20]), (10.1, encoded[20:]), (10.1 + gap, encoded), (20.0, b"data: [DONE]\n\n")]
-    session = SimpleNamespace(post=lambda **kwargs: Response(clock, chunks))
+    session = Session(post=lambda **kwargs: Response(clock, chunks))
     request = RequestFuncInput(
         model="test",
         model_name="test",
@@ -86,7 +93,7 @@ def test_chat_no_audio_or_invalid_wav_has_no_continuity_sample(monkeypatch, chun
     monkeypatch.setattr(patch.time, "perf_counter", lambda: clock[0])
     events = [(i + 1.0, sse_audio(chunk)) for i, chunk in enumerate(chunks)]
     events.append((10.0, b"data: [DONE]\n\n"))
-    session = SimpleNamespace(post=lambda **kwargs: Response(clock, events))
+    session = Session(post=lambda **kwargs: Response(clock, events))
     request = RequestFuncInput(
         model="test",
         model_name="test",
@@ -162,7 +169,7 @@ def test_chat_retry_discards_previous_attempt_audio(monkeypatch):
             ),
         ]
     )
-    session = SimpleNamespace(post=lambda **kwargs: next(responses))
+    session = Session(post=lambda **kwargs: next(responses))
     request = RequestFuncInput(
         model="test",
         model_name="test",
@@ -207,7 +214,7 @@ def test_speech_pcm_timeline_format_and_rollup(monkeypatch, rate, channels, gap,
         posted.update(kwargs)
         return Response(clock, chunks)
 
-    output = asyncio.run(patch.async_request_openai_audio_speech(speech_request(), SimpleNamespace(post=post)))
+    output = asyncio.run(patch.async_request_openai_audio_speech(speech_request(), Session(post=post)))
     assert output.success, output.error
     assert posted["json"]["stream"] is True
     assert posted["json"]["response_format"] == "pcm"
@@ -243,7 +250,7 @@ def test_speech_empty_or_failed_stream_has_no_continuity_sample(monkeypatch, fai
         response.reason = "server error"
     elif failure == "disconnect":
         response = BrokenResponse(clock, [(1.0, bytes(4800))])
-    session = SimpleNamespace(post=lambda **kwargs: response)
+    session = Session(post=lambda **kwargs: response)
     output = asyncio.run(patch.async_request_openai_audio_speech(speech_request(), session))
     assert output.success is (failure == "empty")
     assert not output.audio_continuity_samples
@@ -332,7 +339,7 @@ def test_multiple_stalls_transport_and_all_rollups(monkeypatch, backend):
             api_url="http://unused/v1/chat/completions",
         )
         func = patch.async_request_openai_chat_omni_completions
-    output = asyncio.run(func(request, SimpleNamespace(post=lambda **kwargs: Response(clock, chunks))))
+    output = asyncio.run(func(request, Session(post=lambda **kwargs: Response(clock, chunks))))
     assert output.success, output.error
     (sample,) = output.audio_continuity_samples
     expected = {
