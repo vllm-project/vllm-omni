@@ -450,7 +450,6 @@ steps:
         mirror_hardwares: h100_1
 
       - label: "Diffusion · Kandinsky6 · H100 · Single-GPU"
-        source_file_dependencies: diffusion_kandinsky6_function
         timeout_in_minutes: 40
         commands:
           - >-
