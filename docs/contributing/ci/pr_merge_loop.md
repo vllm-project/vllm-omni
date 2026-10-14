@@ -114,6 +114,9 @@ Near-misses are often tip-stale after rebase. Propose a request to the relevant 
 
 ## LESSONS → code regulation + skills
 
+Record reusable findings in [Review and issue lessons](./lessons.md). Check the
+linked evidence and current code before applying a historical lesson.
+
 | Pattern ≥3 days (or same-area twice on main) | Where it lands |
 |---------------------------------------------|----------------|
 | CI / precheck mechanics | Auto → this tree + `.claude/skills/precheck-pr` (+ bot precheck sync); **≤1 regulation PR/day** |
