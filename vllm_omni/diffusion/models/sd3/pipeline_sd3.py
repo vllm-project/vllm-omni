@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import inspect
 import json
 import logging
@@ -24,12 +27,14 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
+    quant_config_is_fp8,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +240,10 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             local_files_only=local_files_only,
             torch_dtype=dtype,
         )
-        self.transformer = SD3Transformer2DModel(od_config=od_config)
+        self.transformer = SD3Transformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+        )
 
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKL.from_pretrained,
@@ -258,6 +266,22 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+        self._sd3_fp8_vram_extras = quant_config_is_fp8(od_config.quantization_config)
+
+    def _sd3_fp8_maybe_empty_cuda_cache(self) -> None:
+        if self._sd3_fp8_vram_extras and torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
+
+    def _ensure_text_encoders_on_device(self) -> None:
+        dev = self.device
+        self.text_encoder.to(dev)
+        self.text_encoder_2.to(dev)
+        self.text_encoder_3.to(dev)
+
+    def _offload_text_encoders_to_cpu_after_encode(self) -> None:
+        self.text_encoder.cpu()
+        self.text_encoder_2.cpu()
+        self.text_encoder_3.cpu()
 
     def check_inputs(
         self,
@@ -589,7 +613,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         """
         self.scheduler.set_begin_index(0)
 
-        for _, t in enumerate(timesteps):
+        for t in timesteps:
             if self.interrupt:
                 continue
             self._current_timestep = t
@@ -704,6 +728,10 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         else:
             batch_size = prompt_embeds.shape[0]
 
+        need_pos_encode = prompt_embeds is None
+        if self._sd3_fp8_vram_extras and need_pos_encode:
+            self._ensure_text_encoders_on_device()
+
         prompt_embeds, pooled_prompt_embeds = self.encode_prompt(
             prompt=prompt,
             prompt_2=prompt_2,
@@ -714,6 +742,10 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         )
 
         do_cfg = self.guidance_scale > 1
+        need_neg_encode = do_cfg and negative_prompt_embeds is None
+        if self._sd3_fp8_vram_extras and need_neg_encode:
+            self._ensure_text_encoders_on_device()
+
         if do_cfg:
             negative_prompt_embeds, negative_pooled_prompt_embeds = self.encode_prompt(
                 prompt=negative_prompt,
@@ -723,6 +755,19 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 pooled_prompt_embeds=negative_pooled_prompt_embeds,
                 max_sequence_length=max_sequence_length,
             )
+
+        if self._sd3_fp8_vram_extras and (need_pos_encode or need_neg_encode):
+            self._offload_text_encoders_to_cpu_after_encode()
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
+            self._sd3_fp8_maybe_empty_cuda_cache()
+
+        compute_dtype = self.od_config.dtype
+        prompt_embeds = prompt_embeds.to(dtype=compute_dtype)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=compute_dtype)
+        if do_cfg:
+            negative_prompt_embeds = negative_prompt_embeds.to(dtype=compute_dtype)
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(dtype=compute_dtype)
 
         num_channels_latents = self.transformer.in_channels
         latents = self.prepare_latents(
@@ -751,6 +796,14 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         )
 
         self._current_timestep = None
+        del prompt_embeds, pooled_prompt_embeds
+        if do_cfg:
+            del negative_prompt_embeds, negative_pooled_prompt_embeds
+        if self._sd3_fp8_vram_extras:
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
+            self._sd3_fp8_maybe_empty_cuda_cache()
+
         if output_type == "latent":
             image = latents
         else:
@@ -759,6 +812,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
+            if self._sd3_fp8_vram_extras:
+                del latents
+                self._sd3_fp8_maybe_empty_cuda_cache()
 
         return split_diffusion_output_by_request(
             DiffusionOutput(

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +37,8 @@ def _make_sd3_pipeline():
     pipeline.patch_size = 2
     pipeline.default_sample_size = 128
     pipeline.transformer = SimpleNamespace(in_channels=1)
+    pipeline._sd3_fp8_vram_extras = False
+    pipeline.od_config = SimpleNamespace(dtype=torch.float32)
     return pipeline
 
 
