@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import base64
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -72,7 +73,7 @@ def test_buffer_refuses_video_frames_and_points_at_the_openai_interface():
     committed.commit()
 
 
-async def open_qwen():
+async def open_qwen(*, initial_user_text=None):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
     port = RecordingStagePort(stage_count=3)
@@ -87,7 +88,12 @@ async def open_qwen():
         runtime_config=DuplexSessionRuntimeConfig(),
         model_config=None,
     )
-    config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
+    config = DuplexSessionConfig(
+        model="qwen",
+        modalities=["text", "audio"],
+        overlap_policy="barge_in_on_speech",
+        initial_user_text=initial_user_text,
+    )
     await manager.handle(
         OpenDuplexSessionMessage(
             control_id="open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
@@ -105,6 +111,36 @@ async def open_qwen():
     )
     await harness.settle()
     return harness
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed_on_update", [False, True])
+async def test_native_first_audio_prompt_includes_the_seed_once(seed_on_update):
+    h = await open_qwen(initial_user_text=None if seed_on_update else "opening question")
+    try:
+        if seed_on_update:
+            config = replace(h.session.config, initial_user_text="opening question")
+            h.session.replace_config(config)
+            h.session.replace_runtime_config(
+                h.runner.plugin.runtime_config_for_update(config, h.session.runtime_config)
+            )
+        await h.run(append_audio())
+        await h.run(Commit(create_response=True))
+
+        [submission] = h.port.submissions
+        messages = ast.literal_eval(submission.prompt["prompt"])
+        text = [
+            part["text"]
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("type") == "text"
+        ]
+        assert text.count("opening question") == 1
+        assert {"role": "user", "content": "opening question"} not in h.session.history
+        assert h.session.runtime_config["initial_user_text"] == "opening question"
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio

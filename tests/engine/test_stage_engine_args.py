@@ -480,6 +480,24 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
     assert typed_args["profiler_config"].profiler == "cuda"
 
 
+@pytest.mark.parametrize("stage_id", [0, 1], ids=["ar", "generation"])
+def test_typed_llm_cpu_weight_offload_reaches_engine_args(tmp_path, stage_id):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    deploy.stages[stage_id].engine_extras["cpu_offload_gb"] = 40.0
+
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline, user_deploy_config=deploy, cli_overrides={"model": model}
+    )
+    stage = omni_config.stage_by_id(stage_id)
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model)
+
+    assert stage.load_config.cpu_offload_gb == 40.0
+    assert engine_args["cpu_offload_gb"] == 40.0
+    assert "cpu_offload_gb" not in build_engine_args_dict_from_omni_stage_config(
+        omni_config.stage_by_id(1 - stage_id), model
+    )
+
+
 def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)

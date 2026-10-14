@@ -63,6 +63,8 @@ from vllm_omni.engine.duplex.events import (
     RateLimitsUpdated,
     ResponseCreated,
     ResponseDone,
+    ResponseTextDelta,
+    ResponseTextDone,
     SessionClosed,
     SessionCreated,
     SessionReplaced,
@@ -72,8 +74,6 @@ from vllm_omni.engine.duplex.events import (
     Speak,
     SpeechStarted,
     SpeechStopped,
-    TextDelta,
-    TextDone,
     TranscriptDelta,
     TranscriptDone,
     error_event,
@@ -608,7 +608,7 @@ def _realtime_response_terminal_events(
     if projection is not None and projection.text_parts and not projection.output_text_done:
         projection.output_text_done = True
         events.append(
-            TextDone(
+            ResponseTextDone(
                 response_id=rid,
                 item_id=item_id,
                 content_index=1 if projection.audio_part_added else 0,
@@ -876,7 +876,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             _refresh_in_progress_response_item(state, response_id)
         events = _ensure_response_text_part_added(state, response_id)
         events.append(
-            TextDelta(
+            ResponseTextDelta(
                 response_id=_str_or_none(response_id),
                 item_id=_response_item_id(state, response_id),
                 content_index=1 if projection is not None and projection.audio_part_added else 0,
@@ -1327,8 +1327,9 @@ def resolve_commit(state: RealtimeProjectionState, command: Commit) -> ResolvedC
         "type": "input_audio_buffer.commit",
         "final": command.final,
         "realtime_item_id": item_id,
-        "response_create": bool(command.create_response) if command.create_response is not None else False,
     }
+    if command.create_response is not None:
+        payload["response_create"] = command.create_response
     if command.is_speech is not None:
         payload["is_speech"] = command.is_speech
     if transcript:

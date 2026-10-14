@@ -58,10 +58,18 @@ class DuplexRunState:
     runtime_closed: bool = False
     #: Request id of the resumable data-plane stream currently bound to the session.
     stream_request_id: str | None = None
+    #: API-side cancellation identity, independent of the visible response.
+    #: Output failure may end that response before the producer is cancelled.
+    fallback_request_identity: tuple[str, str, int] | None = None
     #: Plugin signaled that the next user commit may start while the current
     #: assistant audio is still draining. Cleared on barge-in/cancel, or when
     #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
     concurrent_turn_requests_released: bool = False
+
+    @property
+    def fallback_request_id(self) -> str | None:
+        identity = self.fallback_request_identity
+        return identity[0] if identity is not None else None
 
 
 class RunnerServices(Protocol):

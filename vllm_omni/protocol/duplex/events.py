@@ -193,6 +193,20 @@ class ErrorEvent(realtime_events.ErrorEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ResponseTextDelta(TextDelta):
+    """Text-only fallback delta under the duplex extension event name."""
+
+    wire_type = "response.text.delta"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ResponseTextDone(TextDone):
+    """Text-only fallback completion under the duplex extension event name."""
+
+    wire_type = "response.text.done"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SessionResumed(SessionCreated):
     wire_type = "session.resumed"
 
@@ -366,7 +380,7 @@ def error_event(
 
 
 #: The complete event vocabulary a duplex client may receive: 21 Tier 1
-#: classes re-exported unchanged, the 9 Tier 2 ones defined above, and 12
+#: classes re-exported unchanged, the 9 Tier 2 ones defined above, and 14
 #: Tier 3 ones. A duplex consumer imports from here and never reaches past
 #: this module into ``vllm_omni.protocol.realtime``.
 __all__ = [
@@ -407,6 +421,8 @@ __all__ = [
     "Listen",
     "OverlapDecision",
     "PlaybackAcknowledged",
+    "ResponseTextDelta",
+    "ResponseTextDone",
     "SessionClosed",
     "SessionExpired",
     "SessionHeartbeatAck",

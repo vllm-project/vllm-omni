@@ -443,6 +443,61 @@ class ModelChannel:
         )
 
     # ------------------------------------------------------------------ #
+    # API-side fallback outputs                                           #
+    # ------------------------------------------------------------------ #
+
+    def begin_fallback_request(self, request_id: str) -> None:
+        """Mark an API-side fallback request active in the compatibility data plane."""
+        self._ctx.session.touch_lease(DuplexLeaseActivity.MODEL_OUTPUT)
+        self._ctx.plugin.data_plane.begin_request(request_id)
+
+    async def apply_fallback_output(
+        self,
+        output: Mapping[str, object],
+        *,
+        request_id: str,
+        expected_epoch: int,
+    ) -> tuple[str | None, bool]:
+        """Project one API-side model-neutral output through the normal response path."""
+        session = self._ctx.session
+        if session.epoch != expected_epoch or session.active_request_id != request_id:
+            return None, False
+        session.touch_lease(DuplexLeaseActivity.MODEL_OUTPUT)
+        model_result = dict(output)
+        # The API-side producer cannot change the engine-owned request identity.
+        model_result["data_plane_request_id"] = request_id
+        if session.capabilities.supports_chat_fallback and "audio" in session.response_config.modalities:
+            # No alignment can be inferred from separately streamed text/audio.
+            # Only the API's [DONE] boundary establishes complete generation.
+            model_result["audio_text_mark"] = False
+            model_result["text_requires_complete_audio"] = True
+            model_result["audio_complete"] = model_result.get("end_of_turn") is True and not isinstance(
+                model_result.get("error_code"), str
+            )
+        close_reason, emitted_response = await self._send_one_model_output_event(
+            model_result,
+            expected_epoch=expected_epoch,
+        )
+        terminal = isinstance(model_result.get("error_code"), str) or model_result.get("end_of_turn") is True
+        if terminal:
+            self._ctx.plugin.data_plane.close_stream(request_id)
+            session.clear_request(request_id)
+        return close_reason, terminal and emitted_response
+
+    def fail_fallback_response(self, *, request_id: str, error: str, error_code: str) -> None:
+        """Apply an API-side fallback failure using the native response error sequence."""
+        session = self._ctx.session
+        self._ctx.plugin.data_plane.close_stream(request_id)
+        session.clear_request(request_id)
+        self._fail_response_from_model_error(
+            {
+                "data_plane_request_id": request_id,
+                "error": error,
+                "error_code": error_code,
+            }
+        )
+
+    # ------------------------------------------------------------------ #
     # Stage outputs                                                      #
     # ------------------------------------------------------------------ #
 
@@ -698,6 +753,9 @@ class ModelChannel:
         draining TTS request) does. ``whole_turn`` also drops the other stage
         ids of this turn. A request still marked draining is left registered.
         """
+        if self._ctx.session.capabilities.supports_chat_fallback:
+            # API-side fallback requests never own native stage resources.
+            return
         if not isinstance(request_id, str) or not request_id:
             return
         session = self._ctx.session
@@ -1024,14 +1082,19 @@ class ModelChannel:
                 0 if model_result.get("audio_text_marks_are_cumulative") is True else text_chars_before_append
             ),
         )
-        session.mark_audio_sent(
-            mark_duration_ms,
-            text_chars=mark_text_chars if mark_duration_ms is not None else None,
-            audio_text_marks=audio_text_marks,
-            text_requires_complete_audio=model_result.get("text_requires_complete_audio") is True,
-            audio_complete=model_result.get("audio_complete") is True,
-            response_id=target_id,
-        )
+        if has_audio or not session.capabilities.supports_chat_fallback:
+            session.mark_audio_sent(
+                mark_duration_ms,
+                text_chars=mark_text_chars if mark_duration_ms is not None else None,
+                audio_text_marks=audio_text_marks,
+                text_requires_complete_audio=model_result.get("text_requires_complete_audio") is True,
+                audio_complete=model_result.get("audio_complete") is True,
+                response_id=target_id,
+            )
+        elif model_result.get("audio_complete") is True:
+            # Fallback [DONE] has no waveform or duration. Record completion
+            # before end_response without advancing the playback counters.
+            session.mark_audio_sent(audio_complete=True, response_id=target_id)
         payload = {
             "type": "response.output_audio.delta",
             "session_id": session.session_id,
@@ -1059,13 +1122,23 @@ class ModelChannel:
         sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
-        self._attach_runtime_metadata(
-            payload,
-            model_result,
-            stage_metrics=response_stage_metrics,
-            response_request_metrics=response_request_metrics,
-        )
-        self._out.emit(payload)
+        if session.capabilities.supports_chat_fallback and not has_audio:
+            payload = {
+                "type": "response.text.delta",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "delta": text if isinstance(text, str) else "",
+                "end_of_turn": end_of_turn,
+            }
+        if has_text or has_audio or not session.capabilities.supports_chat_fallback:
+            self._attach_runtime_metadata(
+                payload,
+                model_result,
+                stage_metrics=response_stage_metrics,
+                response_request_metrics=response_request_metrics,
+            )
+            self._out.emit(payload)
         if self._ctx.run.closing:
             return close_reason, emitted_response
         if (

@@ -13,6 +13,8 @@ Everything about a duplex *session* lives inside the engine (see
   arrival order;
 * pump the session's typed events to the wire, journaling them for resume;
 * manage attachments: resume tokens, replay, takeover, detach on disconnect.
+* execute engine-issued chat-fallback requests and return model-neutral output
+  to the session runner, which owns history, playback and cancellation fences.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import TYPE_CHECKING
 
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
@@ -36,7 +39,21 @@ from vllm_omni.engine.duplex.events import (
     SessionResumed,
     SessionResyncRequired,
 )
-from vllm_omni.engine.duplex.messages import DuplexSessionError
+from vllm_omni.engine.duplex.fallback import DuplexFallbackRequest
+from vllm_omni.engine.duplex.messages import (
+    DuplexSessionError,
+    DuplexSessionFallbackCancelMessage,
+    DuplexSessionFallbackRequestMessage,
+)
+from vllm_omni.entrypoints.duplex.chat_fallback import (
+    _TOOL_CALL_FRAGMENT_KEY,
+    _TOOL_CALL_INDEX_KEY,
+    ChatFallbackStreamError,
+    _fallback_output_sample_rate,
+    build_chat_request,
+    parse_sse_payloads,
+    project_chat_payload,
+)
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, ResumeRequest, parse_resume_request
 from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexDetachedAttachment,
@@ -53,8 +70,10 @@ from vllm_omni.entrypoints.duplex.websocket import (
     attachment_callbacks,
     receive_text_with_timeout,
 )
-from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
 from vllm_omni.protocol.duplex import RealtimeInputDefaults
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
 
 logger = init_logger(__name__)
 
@@ -99,10 +118,12 @@ class OmniDuplexSessionHandler:
         self,
         *,
         duplex_omni: DuplexOmni,
+        chat_service: object | None = None,
         config_timeout_s: float = _DEFAULT_CONFIG_TIMEOUT_S,
         idle_timeout_s: float = _DEFAULT_IDLE_TIMEOUT_S,
     ) -> None:
         self._omni = duplex_omni
+        self._chat_service = chat_service
         self._config_timeout_s = config_timeout_s
         self._idle_timeout_s = idle_timeout_s
         runtime_config = duplex_omni.duplex_session_config
@@ -116,6 +137,226 @@ class OmniDuplexSessionHandler:
         #: envelope, so a reconnect has to be handed them back.
         self._input_defaults: dict[str, RealtimeInputDefaults] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
+        self._fallback_tasks: dict[str, asyncio.Task[None]] = {}
+        self._fallback_identities: dict[str, tuple[str, str, int]] = {}
+        self._closed = False
+        duplex_omni.set_fallback_sink(self._on_fallback_message)
+
+    # ------------------------------------------------------------------ #
+    # API-side chat fallback                                               #
+    # ------------------------------------------------------------------ #
+
+    def _on_fallback_message(
+        self,
+        message: DuplexSessionFallbackRequestMessage | DuplexSessionFallbackCancelMessage,
+    ) -> None:
+        if self._closed:
+            return
+        if isinstance(message, DuplexSessionFallbackCancelMessage):
+            identity = self._fallback_identities.get(message.session_id)
+            if identity != (message.request_id, message.response_id, message.epoch):
+                return
+            task = self._fallback_tasks.get(message.session_id)
+            if task is not None and not task.done():
+                task.cancel()
+            return
+        previous = self._fallback_tasks.get(message.session_id)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        task = asyncio.create_task(
+            self._run_fallback(message.request),
+            name=f"duplex-fallback-{message.request.request_id}",
+        )
+        self._fallback_tasks[message.session_id] = task
+        self._fallback_identities[message.session_id] = (
+            message.request.request_id,
+            message.request.response_id,
+            message.request.epoch,
+        )
+
+        def remove(completed: asyncio.Task[None]) -> None:
+            if self._fallback_tasks.get(message.session_id) is completed:
+                self._fallback_tasks.pop(message.session_id, None)
+                self._fallback_identities.pop(message.session_id, None)
+
+        task.add_done_callback(remove)
+
+    @staticmethod
+    def _error_details(value: object) -> tuple[str, str] | None:
+        error = value.get("error") if isinstance(value, Mapping) else getattr(value, "error", None)
+        if error is None:
+            return None
+        if isinstance(error, Mapping):
+            message = error.get("message") or error.get("detail") or error
+            code = error.get("type") or error.get("code") or "chat_error"
+        else:
+            message = getattr(error, "message", None) or str(error)
+            code = getattr(error, "type", None) or getattr(error, "code", None) or "chat_error"
+        return str(message), str(code)
+
+    async def _submit_fallback_failure(self, request: DuplexFallbackRequest, error: str, code: str) -> None:
+        with suppress(Exception):
+            await self._omni.engine.submit_fallback_failed_async(
+                request.session_id,
+                request.request_id,
+                request.response_id,
+                request.epoch,
+                error,
+                code,
+            )
+
+    async def _run_fallback(self, request: DuplexFallbackRequest) -> None:
+        if self._chat_service is None:
+            await self._submit_fallback_failure(request, "chat fallback is unavailable", "fallback_unavailable")
+            return
+        try:
+            chat_request = build_chat_request(request, model=self._omni.model)
+            create_chat_completion = getattr(self._chat_service, "create_chat_completion")
+            result = await create_chat_completion(chat_request, raw_request=None)
+            error_details = self._error_details(result)
+            if error_details is not None:
+                await self._submit_fallback_failure(request, *error_details)
+                return
+            if not hasattr(result, "__aiter__"):
+                await self._submit_fallback_failure(
+                    request,
+                    "chat fallback returned a non-streaming response",
+                    "fallback_non_streaming_response",
+                )
+                return
+
+            await self._omni.engine.submit_fallback_started_async(
+                request.session_id,
+                request.request_id,
+                request.response_id,
+                request.epoch,
+            )
+            saw_terminal = False
+            response_config = request.response_config
+            response_format = str(response_config.get("response_format") or "wav")
+            sample_rate_hz = _fallback_output_sample_rate(response_config)
+            modalities = response_config.get("modalities")
+            audio_requested = isinstance(modalities, (list, tuple)) and "audio" in modalities
+            tool_call_buffers: dict[int | str, dict[str, object]] = {}
+
+            def buffer_tool_call(fragment: Mapping[str, object]) -> None:
+                tool_call_key = fragment.get(_TOOL_CALL_INDEX_KEY)
+                if not isinstance(tool_call_key, int | str) or isinstance(tool_call_key, bool):
+                    tool_call_key = fragment.get("call_id")
+                if not isinstance(tool_call_key, int | str) or isinstance(tool_call_key, bool):
+                    tool_call_key = len(tool_call_buffers)
+                buffered = tool_call_buffers.get(tool_call_key)
+                if buffered is None:
+                    buffered = {
+                        "function_call": True,
+                        "arguments": "",
+                        "data_plane_request_id": request.request_id,
+                    }
+                    tool_call_buffers[tool_call_key] = buffered
+                for field in ("call_id", "name"):
+                    value = fragment.get(field)
+                    if isinstance(value, str) and value:
+                        buffered[field] = value
+                arguments = fragment.get("arguments")
+                if isinstance(arguments, str):
+                    buffered["arguments"] = f"{buffered['arguments']}{arguments}"
+
+            async def submit_buffered_tool_calls() -> None:
+                buffered_calls = list(tool_call_buffers.values())
+                for output in buffered_calls:
+                    call_id = output.get("call_id")
+                    name = output.get("name")
+                    arguments = output.get("arguments")
+                    if (
+                        not isinstance(call_id, str)
+                        or not call_id
+                        or not isinstance(name, str)
+                        or not name
+                        or not isinstance(arguments, str)
+                    ):
+                        raise ChatFallbackStreamError("chat fallback tool call was incomplete")
+                for output in buffered_calls:
+                    await self._omni.engine.submit_fallback_output_async(
+                        request.session_id,
+                        request.request_id,
+                        request.response_id,
+                        request.epoch,
+                        output,
+                    )
+                tool_call_buffers.clear()
+
+            async for chunk in result:
+                if not isinstance(chunk, str):
+                    raise ChatFallbackStreamError("malformed chat fallback SSE payload")
+                for payload in parse_sse_payloads(chunk):
+                    if saw_terminal:
+                        break
+                    outputs = project_chat_payload(
+                        payload,
+                        request_id=request.request_id,
+                        response_format=response_format,
+                        sample_rate_hz=sample_rate_hz,
+                    )
+                    for output in outputs:
+                        error = output.get("error")
+                        if isinstance(error, str):
+                            await self._submit_fallback_failure(
+                                request,
+                                error,
+                                str(output.get("error_code") or "chat_error"),
+                            )
+                            return
+                        if output.get(_TOOL_CALL_FRAGMENT_KEY) is True:
+                            buffer_tool_call(output)
+                            continue
+                        if audio_requested:
+                            # Thinker tokens and audio chunks are independent,
+                            # unaligned streams. Forward each as soon as it arrives.
+                            output = {**output, "audio_text_mark": False, "text_requires_complete_audio": True}
+                            if payload == "[DONE]":
+                                output["audio_complete"] = True
+                        if output.get("end_of_turn") is True:
+                            await submit_buffered_tool_calls()
+                        await self._omni.engine.submit_fallback_output_async(
+                            request.session_id,
+                            request.request_id,
+                            request.response_id,
+                            request.epoch,
+                            output,
+                        )
+                        if output.get("end_of_turn") is True:
+                            saw_terminal = True
+                if saw_terminal:
+                    break
+            if not saw_terminal:
+                tool_call_buffers.clear()
+                await self._submit_fallback_failure(
+                    request,
+                    "chat fallback stream ended before [DONE]",
+                    "fallback_stream_incomplete",
+                )
+        except asyncio.CancelledError:
+            raise
+        except ChatFallbackStreamError as exc:
+            await self._submit_fallback_failure(request, str(exc), "fallback_malformed_chunk")
+        except Exception as exc:
+            logger.exception("Duplex chat fallback failed for %s", request.request_id)
+            await self._submit_fallback_failure(request, str(exc), "fallback_exception")
+
+    async def close(self) -> None:
+        """Cancel API-side fallback tasks owned by this handler."""
+        if self._closed:
+            return
+        self._closed = True
+        tasks = list(self._fallback_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._fallback_tasks.clear()
+        self._fallback_identities.clear()
+        self._omni.set_fallback_sink(None)
 
     # ------------------------------------------------------------------ #
     # Entry point                                                         #
@@ -502,17 +743,16 @@ class OmniDuplexSessionHandler:
         """Let the pump deliver ``session.closed`` before the endpoint returns.
 
         ``DuplexSessionHandle._deliver`` queues ``SessionClosed`` on the outbox
-        and marks the handle closed in the same synchronous step, so
-        ``handle.closed`` is already true while that event is still sitting in
-        the queue. ``_read_loop`` stops on exactly that flag: if the engine
-        closes the session between two reads, the loop returns, this endpoint
-        returns, and the ASGI server tears the socket down with the terminal
-        event unsent -- the client sees an abrupt close instead of
-        ``session.closed``. Waiting for the pump keeps the two in order; it is
-        the pump that sends the event and then closes with code 1000.
+        and marks the handle closed in the same synchronous step, so ``handle.closed``
+        is already true while that event is still sitting in the queue. ``_read_loop``
+        stops on exactly that flag: if the engine closes the session between two
+        reads, the loop returns, this endpoint returns, and the ASGI server tears
+        the socket down with the terminal event unsent -- the client sees an abrupt
+        close instead of ``session.closed``. Waiting for the pump keeps the two in
+        order; it is the pump that sends the event and then closes with code 1000.
 
-        Only for a closed session. A takeover or a resumable disconnect leaves
-        the pump running for the next attachment, and must not be waited on.
+        Only for a closed session. A takeover or a resumable disconnect leaves the
+        pump running for the next attachment, and must not be waited on.
         """
         if not attachment.handle.closed:
             return

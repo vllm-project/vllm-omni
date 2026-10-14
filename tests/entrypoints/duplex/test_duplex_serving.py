@@ -10,6 +10,7 @@ import base64
 import json
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -20,7 +21,12 @@ from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated
-from vllm_omni.engine.duplex.messages import DuplexSessionError
+from vllm_omni.engine.duplex.fallback import DuplexFallbackRequest
+from vllm_omni.engine.duplex.messages import (
+    DuplexSessionError,
+    DuplexSessionFallbackCancelMessage,
+    DuplexSessionFallbackRequestMessage,
+)
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.websocket import MAX_EVENT_BYTES
@@ -137,6 +143,8 @@ class FakeOmni:
     def __init__(
         self, *, resumable: bool = True, replay_max_bytes: int = 64 * 1024, idle_timeout_s: float = 300
     ) -> None:
+        self.engine = self
+        self.model = "test-model"
         self.duplex_session_config = DuplexSessionRuntimeConfig(
             resume_replay_ttl_s=60.0, resume_replay_max_bytes_per_session=replay_max_bytes
         )
@@ -150,12 +158,43 @@ class FakeOmni:
         self.detach_refused: list[tuple[str, int]] = []
         self.open_error: DuplexSessionError | None = None
         self.hold_events: asyncio.Event | None = None
-        #: When set, ``resume_session`` parks on it once the engine applied the
-        #: resume: the lease generation is bumped, the result is still in flight.
+        #: Gate a resume after the engine applies it, before the result arrives.
         self.resume_gate: asyncio.Event | None = None
         self.resume_started = asyncio.Event()
-        #: Settlements of resumes whose caller was cancelled mid-RPC (DuplexOmni's contract).
         self.compensations: list[asyncio.Task[None]] = []
+        self.fallback_sink = None
+        self.fallback_started: list[tuple[str, str, str, int]] = []
+        self.fallback_outputs: list[tuple[str, str, str, int, dict[str, object]]] = []
+        self.fallback_failures: list[tuple[str, str, str, int, str, str]] = []
+
+    def set_fallback_sink(self, sink) -> None:
+        self.fallback_sink = sink
+
+    async def submit_fallback_started_async(
+        self, session_id: str, request_id: str, response_id: str, epoch: int
+    ) -> None:
+        self.fallback_started.append((session_id, request_id, response_id, epoch))
+
+    async def submit_fallback_output_async(
+        self,
+        session_id: str,
+        request_id: str,
+        response_id: str,
+        epoch: int,
+        output: dict[str, object],
+    ) -> None:
+        self.fallback_outputs.append((session_id, request_id, response_id, epoch, output))
+
+    async def submit_fallback_failed_async(
+        self,
+        session_id: str,
+        request_id: str,
+        response_id: str,
+        epoch: int,
+        error: str,
+        error_code: str,
+    ) -> None:
+        self.fallback_failures.append((session_id, request_id, response_id, epoch, error, error_code))
 
     async def open_session(self, config: Any) -> FakeHandle:
         self.opened.append(dict(config))
@@ -220,8 +259,511 @@ def _handler(omni: FakeOmni, **kwargs: Any) -> OmniDuplexSessionHandler:
     return OmniDuplexSessionHandler(duplex_omni=omni, **kwargs)
 
 
+class FakeChatService:
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = chunks
+        self.requests: list[Any] = []
+
+    async def create_chat_completion(self, request: Any, raw_request: Any = None):
+        del raw_request
+        self.requests.append(request)
+
+        async def stream():
+            for chunk in self.chunks:
+                yield chunk
+
+        return stream()
+
+
+class BlockingChatService(FakeChatService):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create_chat_completion(self, request: Any, raw_request: Any = None):
+        del raw_request
+        self.requests.append(request)
+
+        async def stream():
+            self.started.set()
+            try:
+                await self.release.wait()
+            finally:
+                self.cancelled.set()
+            if self.release.is_set():
+                yield "data: [DONE]\n\n"
+
+        return stream()
+
+
+def _fallback_request() -> DuplexFallbackRequest:
+    return DuplexFallbackRequest(
+        session_id="sid",
+        request_id="duplex-fallback-sid-0-1",
+        response_id="resp-sid-0-1",
+        epoch=0,
+        history=({"role": "user", "content": "hello"},),
+        response_config={"model": "qwen", "modalities": ["text"]},
+        input_payload=None,
+        policy_messages=(),
+    )
+
+
 def _session_update(**session: Any) -> dict[str, Any]:
     return {"type": "session.update", "session": {"model": "test-model", "modalities": ["audio", "text"], **session}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_sink_runs_chat_stream_and_keeps_internal_messages_off_wire() -> None:
+    omni = FakeOmni()
+    chat_service = FakeChatService(
+        [
+            'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n',
+            "data: [DONE]\n\n",
+        ]
+    )
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(chat_service.requests) == 1
+    assert chat_service.requests[0].request_id == request.request_id
+    assert omni.fallback_started == [(request.session_id, request.request_id, request.response_id, request.epoch)]
+    assert [output[4]["text"] for output in omni.fallback_outputs if "text" in output[4]] == ["hello"]
+    assert omni.fallback_outputs[-1][4]["end_of_turn"] is True
+    assert omni.fallback_failures == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_streams_text_and_audio_independently_without_claiming_alignment() -> None:
+    omni = FakeOmni()
+    audio = base64.b64encode(b"\x00\x00" * 240).decode()
+    chat_service = FakeChatService(
+        [
+            'data: {"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}], "modality": "text"}\n\n',
+            f'data: {{"choices": [{{"delta": {{"content": "{audio}"}}, "finish_reason": "stop"}}], "modality": "audio", "sample_rate_hz": 24000}}\n\n',
+            "data: [DONE]\n\n",
+        ]
+    )
+    handler = _handler(omni, chat_service=chat_service)
+    request = replace(
+        _fallback_request(),
+        response_config={"model": "qwen", "modalities": ["text", "audio"], "response_format": "pcm"},
+    )
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert omni.fallback_outputs == [
+        (
+            request.session_id,
+            request.request_id,
+            request.response_id,
+            request.epoch,
+            {
+                "text": "hello",
+                "data_plane_request_id": request.request_id,
+                "audio_text_mark": False,
+                "text_requires_complete_audio": True,
+            },
+        ),
+        (
+            request.session_id,
+            request.request_id,
+            request.response_id,
+            request.epoch,
+            {
+                "audio": audio,
+                "audio_format": "pcm",
+                "data_plane_request_id": request.request_id,
+                "sample_rate_hz": 24000,
+                "audio_duration_ms": 10,
+                "audio_text_mark": False,
+                "text_requires_complete_audio": True,
+            },
+        ),
+        (
+            request.session_id,
+            request.request_id,
+            request.response_id,
+            request.epoch,
+            {
+                "data_plane_request_id": request.request_id,
+                "end_of_turn": True,
+                "audio_text_mark": False,
+                "text_requires_complete_audio": True,
+                "audio_complete": True,
+            },
+        ),
+    ]
+    assert omni.fallback_failures == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_submits_text_before_waiting_for_audio_and_audio_before_done() -> None:
+    waiting_for_audio = asyncio.Event()
+    release_audio = asyncio.Event()
+    waiting_for_done = asyncio.Event()
+    release_done = asyncio.Event()
+    audio = base64.b64encode(b"\0\0" * 240).decode()
+
+    class GatedChatService(FakeChatService):
+        async def create_chat_completion(self, request: Any, raw_request: Any = None):
+            del raw_request
+            self.requests.append(request)
+
+            async def stream():
+                yield 'data: {"choices": [{"delta": {"content": "hello"}}], "modality": "text"}\n\n'
+                yield 'data: {"choices": [{"delta": {"content": " world"}, "finish_reason": "stop"}], "modality": "text"}\n\n'
+                waiting_for_audio.set()
+                await release_audio.wait()
+                yield f'data: {{"choices": [{{"delta": {{"content": "{audio}"}}, "finish_reason": "stop"}}], "modality": "audio", "sample_rate_hz": 24000}}\n\n'
+                waiting_for_done.set()
+                await release_done.wait()
+                yield "data: [DONE]\n\n"
+
+            return stream()
+
+    omni = FakeOmni()
+    handler = _handler(omni, chat_service=GatedChatService([]))
+    request = replace(
+        _fallback_request(),
+        response_config={"model": "qwen", "modalities": ["text", "audio"], "response_format": "pcm"},
+    )
+    try:
+        assert omni.fallback_sink is not None
+        omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+        task = handler._fallback_tasks[request.session_id]
+        await asyncio.wait_for(waiting_for_audio.wait(), timeout=2.0)
+
+        assert [output[4]["text"] for output in omni.fallback_outputs] == ["hello", " world"]
+        assert not task.done()
+        assert not any(output[4].get("audio_complete") for output in omni.fallback_outputs)
+        release_audio.set()
+        await asyncio.wait_for(waiting_for_done.wait(), timeout=2.0)
+
+        assert omni.fallback_outputs[-1][4]["audio"] == audio
+        assert "text" not in omni.fallback_outputs[-1][4]
+        assert not task.done()
+        assert not any(output[4].get("end_of_turn") for output in omni.fallback_outputs)
+        assert not any(output[4].get("audio_complete") for output in omni.fallback_outputs)
+        release_done.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+        assert omni.fallback_outputs[-1][4]["audio_complete"] is True
+        assert omni.fallback_failures == []
+    finally:
+        await handler.close()
+
+
+@pytest.mark.asyncio
+async def test_fallback_buffers_multiple_tool_call_fragments_until_done() -> None:
+    omni = FakeOmni()
+    first_chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"city":"'},
+                        },
+                        {
+                            "index": 1,
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {"name": "convert", "arguments": '{"unit":"'},
+                        },
+                    ]
+                }
+            }
+        ]
+    }
+    second_chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {"index": 1, "function": {"arguments": 'c"}'}},
+                        {"index": 0, "function": {"arguments": 'Paris"}'}},
+                    ]
+                }
+            }
+        ]
+    }
+    chat_service = FakeChatService(
+        [f"data: {json.dumps(first_chunk)}\n\n", f"data: {json.dumps(second_chunk)}\n\n", "data: [DONE]\n\n"]
+    )
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    function_outputs = [output[4] for output in omni.fallback_outputs if output[4].get("function_call") is True]
+    assert function_outputs == [
+        {
+            "function_call": True,
+            "call_id": "call-1",
+            "name": "lookup",
+            "arguments": '{"city":"Paris"}',
+            "data_plane_request_id": request.request_id,
+        },
+        {
+            "function_call": True,
+            "call_id": "call-2",
+            "name": "convert",
+            "arguments": '{"unit":"c"}',
+            "data_plane_request_id": request.request_id,
+        },
+    ]
+    assert omni.fallback_outputs[-1][4] == {
+        "data_plane_request_id": request.request_id,
+        "end_of_turn": True,
+    }
+    assert omni.fallback_failures == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_discards_buffered_tool_calls_without_done() -> None:
+    omni = FakeOmni()
+    chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    chat_service = FakeChatService([f"data: {json.dumps(chunk)}\n\n"])
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert not [output for output in omni.fallback_outputs if output[4].get("function_call") is True]
+    assert not any(output[4].get("end_of_turn") is True for output in omni.fallback_outputs)
+    assert omni.fallback_failures == [
+        (
+            request.session_id,
+            request.request_id,
+            request.response_id,
+            request.epoch,
+            "chat fallback stream ended before [DONE]",
+            "fallback_stream_incomplete",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fallback_pcm_output_uses_negotiated_rate_for_duration() -> None:
+    omni = FakeOmni()
+    request = replace(
+        _fallback_request(),
+        response_config={
+            "model": "qwen",
+            "modalities": ["audio"],
+            "response_format": "pcm",
+            "extra_body": {
+                "realtime_session_payload": {
+                    "audio": {"output": {"format": "pcm16", "rate": 24_000}},
+                },
+            },
+        },
+    )
+    audio = base64.b64encode(b"\x00\x00" * 240).decode()
+    chat_service = FakeChatService(
+        [
+            f'data: {{"choices": [{{"delta": {{"audio": "{audio}"}}}}]}}\n\n',
+            "data: [DONE]\n\n",
+        ]
+    )
+    handler = _handler(omni, chat_service=chat_service)
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    audio_output = next(output[4] for output in omni.fallback_outputs if "audio" in output[4])
+    assert audio_output["sample_rate_hz"] == 24_000
+    assert audio_output["audio_duration_ms"] == 10
+
+
+@pytest.mark.asyncio
+async def test_fallback_ignores_records_after_done_marker() -> None:
+    omni = FakeOmni()
+    chat_service = FakeChatService(['data: [DONE]\n\ndata: {"choices": [{"delta": {"content": "late"}}]}\n\n'])
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert omni.fallback_outputs == [
+        (
+            request.session_id,
+            request.request_id,
+            request.response_id,
+            request.epoch,
+            {"data_plane_request_id": request.request_id, "end_of_turn": True},
+        )
+    ]
+    assert omni.fallback_failures == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_stream_without_done_fails_instead_of_synthesizing_success() -> None:
+    omni = FakeOmni()
+    chat_service = FakeChatService(['data: {"choices": [{"delta": {"content": "partial"}}]}\n\n'])
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert [output[4]["text"] for output in omni.fallback_outputs if "text" in output[4]] == ["partial"]
+    assert not any(output[4].get("end_of_turn") for output in omni.fallback_outputs)
+    assert omni.fallback_failures == [
+        (
+            request.session_id,
+            request.request_id,
+            request.response_id,
+            request.epoch,
+            "chat fallback stream ended before [DONE]",
+            "fallback_stream_incomplete",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_malformed_fallback_sse_fails_without_synthesizing_success() -> None:
+    omni = FakeOmni()
+    chat_service = FakeChatService(["data: {not-json}\n\n"])
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert omni.fallback_outputs == []
+    assert omni.fallback_failures == [
+        (
+            request.session_id,
+            request.request_id,
+            request.response_id,
+            request.epoch,
+            "malformed chat fallback SSE payload",
+            "fallback_malformed_chunk",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fallback_cancel_stops_chat_stream_without_sending_late_output() -> None:
+    omni = FakeOmni()
+    chat_service = BlockingChatService()
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(chat_service.started.wait(), timeout=2.0)
+
+    omni.fallback_sink(
+        DuplexSessionFallbackCancelMessage(
+            session_id=request.session_id,
+            request_id=request.request_id,
+            response_id=request.response_id,
+            epoch=request.epoch,
+        )
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert task.cancelled()
+    assert chat_service.cancelled.is_set()
+    assert omni.fallback_started == [(request.session_id, request.request_id, request.response_id, request.epoch)]
+    assert omni.fallback_outputs == []
+    assert omni.fallback_failures == []
+
+
+@pytest.mark.asyncio
+async def test_handler_close_is_idempotent_and_ignores_late_fallback_messages() -> None:
+    omni = FakeOmni()
+    handler = _handler(omni)
+    request = _fallback_request()
+    sink = omni.fallback_sink
+
+    assert sink is not None
+    await handler.close()
+    await handler.close()
+    sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    await asyncio.sleep(0)
+
+    assert handler._fallback_tasks == {}
+    assert omni.fallback_failures == []
+
+
+@pytest.mark.asyncio
+async def test_stale_fallback_cancel_does_not_cancel_a_replacement_task() -> None:
+    omni = FakeOmni()
+    chat_service = BlockingChatService()
+    handler = _handler(omni, chat_service=chat_service)
+    request = _fallback_request()
+    replacement = replace(request, request_id="duplex-fallback-sid-0-2", response_id="resp-sid-0-2")
+
+    assert omni.fallback_sink is not None
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=request.session_id, request=request))
+    first_task = handler._fallback_tasks[request.session_id]
+    await asyncio.wait_for(chat_service.started.wait(), timeout=2.0)
+    omni.fallback_sink(DuplexSessionFallbackRequestMessage(session_id=replacement.session_id, request=replacement))
+    replacement_task = handler._fallback_tasks[request.session_id]
+    await asyncio.sleep(0)
+
+    omni.fallback_sink(
+        DuplexSessionFallbackCancelMessage(
+            session_id=request.session_id,
+            request_id=request.request_id,
+            response_id=request.response_id,
+            epoch=request.epoch,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert first_task.cancelled() or first_task.done()
+    assert not replacement_task.done()
+    await handler.close()
 
 
 async def _open(

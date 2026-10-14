@@ -6,7 +6,7 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -1078,7 +1078,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         await self._attach_minicpmo45_reference_audio(engine_prompt, request)
 
-        speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
+        speaker = self._resolve_chat_speaker(request)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
             prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
@@ -1107,6 +1107,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             additional_information = {}
             engine_prompt["additional_information"] = additional_information
         return additional_information
+
+    @staticmethod
+    def _resolve_chat_speaker(request: ChatLikeRequest | ResponsesRequest) -> Any:
+        """Resolve root speaker fields before the nested chat-audio voice."""
+        speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
+        if speaker is not None:
+            return speaker
+
+        audio_params = getattr(request, "audio", None)
+        if isinstance(audio_params, Mapping):
+            return audio_params.get("voice")
+        return getattr(audio_params, "voice", None)
 
     def _input_modalities(self, messages: list[ChatCompletionMessageParam]) -> set[str]:
         """Return the modalities of the media parts in ``messages``."""
@@ -2313,6 +2325,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices_data.error.message,
                         )
                         continue
+                    sample_rate_hz = audio_chunk_sample_rate(omni_res)
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2332,7 +2345,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
                             req_state.audio_chunk_bytes.append(chunk_bytes)
                             if req_state.audio_sample_rate is None:
-                                req_state.audio_sample_rate = audio_chunk_sample_rate(omni_res)
+                                req_state.audio_sample_rate = sample_rate_hz
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -2340,6 +2353,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         choices=choices_data,
                         model=model_name,
                         modality=final_output_type,
+                        sample_rate_hz=sample_rate_hz,
                         metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                     )
                     chunk.usage = UsageInfo(
@@ -2806,7 +2820,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # the fields of FunctionDefinition are a superset of the
                 # tool call outputs and can be used for parsing
                 assert content is not None
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
+                tool_calls: list[FunctionDefinition] = TypeAdapter(list[FunctionDefinition]).validate_json(content)
                 tool_call_ids = []
                 for tool_call in tool_calls:
                     tool_call_ids.append(
@@ -3011,18 +3025,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
 
-        # Prefer the talker-reported sample rate when present. Qwen3-Omni
-        # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
-        # AudioVAE rate via multimodal_output["sr"].
-        sr_raw = mm_output.get("sr")
-        if isinstance(sr_raw, (list, tuple)):
-            sr_raw = next((item for item in sr_raw if item is not None), None)
-        if sr_raw is None:
-            sample_rate = 24000
-        elif hasattr(sr_raw, "item"):
-            sample_rate = int(sr_raw.item())
-        else:
-            sample_rate = int(sr_raw)
+        sample_rate = audio_chunk_sample_rate(omni_outputs)
 
         audio_format = self._resolve_audio_format(request)
         if isinstance(audio_format, ErrorResponse):
@@ -3032,7 +3035,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             audio_tensor=audio_tensor,
             sample_rate=sample_rate,
             response_format=audio_format,
-            speed=1.0,
+            speed=self._resolve_audio_speed(request),
             base64_encode=True,
         )
 
@@ -4066,7 +4069,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     audio_tensor=audio_array,
                     sample_rate=sample_rate,
                     response_format=audio_format,
-                    speed=1.0,
+                    speed=self._resolve_audio_speed(request),
                     base64_encode=True,
                 )
                 audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -4296,6 +4299,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_format == "pcm16":
             audio_format = "pcm"
         return audio_format
+
+    @staticmethod
+    def _resolve_audio_speed(request: ChatCompletionRequest) -> float:
+        """Read the optional speed extension from chat's nested audio params."""
+        audio_params = getattr(request, "audio", None)
+        speed = audio_params.get("speed") if isinstance(audio_params, Mapping) else getattr(audio_params, "speed", None)
+        return float(speed) if isinstance(speed, int | float) else 1.0
 
     def _create_error_response(
         self,

@@ -539,12 +539,28 @@ async def test_text_append_is_not_supported_by_the_native_runtime() -> None:
 async def test_clear_input_drops_buffered_audio() -> None:
     h = await open_harness()
     try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
         await h.run(append_audio(samples=8000))
         assert h.runner.model_state.audio_buffer.has_pending()
         events = await h.run(commands.ClearInput())
         assert types(events) == ["input_audio_buffer.cleared"]
         assert not h.runner.model_state.audio_buffer.has_pending()
         assert h.session.pending_input_bytes == 0
+        assert vad_resets == [True]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_overlap_barge_in_resets_server_vad_state() -> None:
+    h = await open_harness()
+    try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
+
+        assert await h.runner._barge_in_for_overlap({}, {"cancel_reason": "barge_in"}) is True
+        assert vad_resets == [True]
     finally:
         await close_harness(h)
 
@@ -711,6 +727,8 @@ async def test_playback_ack_for_an_unknown_response_is_rejected() -> None:
 async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
     h = await open_harness()
     try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
@@ -720,6 +738,7 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         assert h.session.active_response_id is None
         assert h.port.aborts == [[request_id]]
         assert h.port.cleanups == [([request_id], True)]
+        assert vad_resets == [True]
         done = find(events, "response.done")
         assert done.status == "cancelled"
         assert types(events)[: types(events).index("response.done")] == [
@@ -841,6 +860,8 @@ async def test_cancel_response_without_active_response_is_rejected() -> None:
 async def test_cancel_response_aborts_the_stage_request_and_reports_playback() -> None:
     h = await open_harness()
     try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
@@ -852,6 +873,7 @@ async def test_cancel_response_aborts_the_stage_request_and_reports_playback() -
         assert done.response["status_details"]["reason"] == "client_cancelled"
         assert h.port.aborts == [[request_id]]
         assert h.session.epoch == 1
+        assert vad_resets == [True]
         # Only the played prefix of the cancelled answer is kept in history.
         assert h.session.history == ({"role": "assistant", "content": "he"},)
     finally:
@@ -1558,7 +1580,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
         await orchestrator.session_manager.shutdown()
 
 
-def _response_request_metrics_of(event: object) -> dict[str, object]:
+def _response_request_metrics_of(event: DuplexEvent) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")

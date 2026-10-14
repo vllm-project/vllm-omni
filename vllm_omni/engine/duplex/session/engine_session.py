@@ -38,6 +38,7 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
+from vllm_omni.engine.duplex.fallback import FALLBACK_AUDIO_PAYLOAD_KEY
 from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseActivity,
     DuplexLeaseConfig,
@@ -137,6 +138,7 @@ class ConversationHistory:
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
+    fallback_audio_payloads: dict[int, dict[str, object]] = field(default_factory=dict)
     pending_item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     pending_item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
     pending_item_input_commit_seqs: dict[str, int] = field(default_factory=dict)
@@ -234,9 +236,10 @@ class DuplexEngineSession:
             self.accepted_fence = self.fence
         else:
             self.accept_fence(self.fence)
-        if self.config.initial_user_text:
-            # Seeded text is user input like any other: it waits for a response.
-            self.notify_new_user_item()
+        # Fallback seeds are canonical user input. Native plugins own their
+        # opening prompt through runtime_config and must not see it twice.
+        if self.capabilities.supports_chat_fallback:
+            self._add_initial_user_text(self.config.initial_user_text)
 
     # ---- identity / fence ----
 
@@ -466,6 +469,21 @@ class DuplexEngineSession:
         return tuple(dict(message) for message in self._conversation.messages if id(message) not in placeholders)
 
     @property
+    def fallback_history(self) -> tuple[dict[str, object], ...]:
+        """Return the native history plus engine-only audio payload snapshots."""
+        placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
+        history: list[dict[str, object]] = []
+        for message in self._conversation.messages:
+            if id(message) in placeholders:
+                continue
+            snapshot = copy.deepcopy(message)
+            audio_payload = self._conversation.fallback_audio_payloads.get(id(message))
+            if audio_payload is not None:
+                snapshot[FALLBACK_AUDIO_PAYLOAD_KEY] = copy.deepcopy(audio_payload)
+            history.append(snapshot)
+        return tuple(history)
+
+    @property
     def active_request_id(self) -> str | None:
         return self._response.active_request_id
 
@@ -593,8 +611,12 @@ class DuplexEngineSession:
         previous_seed = self.config.initial_user_text
         self.config = config
         self.config_generation += 1
-        if config.initial_user_text and config.initial_user_text != previous_seed:
-            self.notify_new_user_item()
+        if (
+            self.capabilities.supports_chat_fallback
+            and config.initial_user_text
+            and config.initial_user_text != previous_seed
+        ):
+            self._add_initial_user_text(config.initial_user_text)
 
     def transition_turn(self, state: DuplexTurnState) -> None:
         self.turn_state = state
@@ -668,6 +690,12 @@ class DuplexEngineSession:
     def append_history_message(self, message: dict[str, object]) -> None:
         self._conversation.messages.append(message)
 
+    def _add_initial_user_text(self, text: str | None) -> None:
+        if not text:
+            return
+        self._conversation.messages.append({"role": "user", "content": text})
+        self.notify_new_user_item()
+
     def notify_new_user_item(self) -> None:
         """Record a user item that a later ``response.create`` may answer."""
         self._conversation.unanswered_user_items += 1
@@ -726,6 +754,7 @@ class DuplexEngineSession:
         *,
         transcript: str | None = None,
         turn_id: int | None = None,
+        fallback_audio_payload: Mapping[str, object] | None = None,
     ) -> DuplexCommittedInput:
         input_audio_part: dict[str, object] = {
             "type": "audio_url",
@@ -739,6 +768,8 @@ class DuplexEngineSession:
         if transcript:
             message["transcript"] = transcript
         self._conversation.messages.append(message)
+        if fallback_audio_payload is not None:
+            self._conversation.fallback_audio_payloads[id(message)] = copy.deepcopy(dict(fallback_audio_payload))
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
             message=message,
@@ -856,7 +887,13 @@ class DuplexEngineSession:
         self._clear_response_metrics()
         self._conversation.last_assistant_full_message = None
         self._conversation.last_assistant_audio_text_marks.clear()
-        self._playback.current = DuplexPlaybackCursor()
+        self._playback.current = DuplexPlaybackCursor(
+            # Early fallback text is visible but has no heard prefix, even
+            # before the first audio chunk arrives.
+            text_requires_complete_audio=(
+                self.capabilities.supports_chat_fallback and "audio" in self.response_config.modalities
+            ),
+        )
         self._playback.by_response[response_id] = self._playback.current
         self.turn_state = DuplexTurnState.ASSISTANT_GENERATING
         self._start_response_aggregator()
@@ -1399,6 +1436,7 @@ class DuplexEngineSession:
             self._conversation.assistant_response_snapshots.pop(response_id, None)
         if message is None:
             return pending is not None or removed_placeholder
+        self._conversation.fallback_audio_payloads.pop(id(message), None)
         # Distinct response items can have identical (including empty) content.
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not message

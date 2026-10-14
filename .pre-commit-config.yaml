@@ -89,6 +89,7 @@ repos:
           - types-requests
           - types-torch
           - pydantic
+          - msgspec
     - id: mypy-3.11
       name: Run mypy for Python 3.11
       entry: python tools/pre_commit/mypy.py "3.11"

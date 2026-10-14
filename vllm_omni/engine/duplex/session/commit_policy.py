@@ -28,6 +28,11 @@ class CommitSnapshot:
 def decide_commit_action(snapshot: CommitSnapshot) -> CommitAction:
     """Choose response scheduling from an immutable session snapshot."""
     if snapshot.auto_responds:
+        # Native auto-response may have an append in flight without an engine
+        # response id. An engine-owned response must finish before another
+        # committed response can start.
+        if snapshot.active_response_id is not None:
+            return CommitAction.DEFER_ACTIVE_RESPONSE
         if snapshot.speech_since_commit:
             return CommitAction.START_AUTO_RESPONSE
         return CommitAction.COMMIT_ONLY

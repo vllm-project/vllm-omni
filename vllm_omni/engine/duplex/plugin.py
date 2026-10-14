@@ -292,6 +292,8 @@ class DuplexModelPlugin(ABC):
     projects_intermediate_outputs: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
+    #: Whether a commit starts a chat-completion fallback response by default.
+    default_auto_response: bool = False
     #: Samples per silence unit the runner appends to keep a model turn going.
     silence_continuation_samples: int = 16000
     #: Sample rate of that unit: the runner submits it through ``plan_append``
@@ -520,6 +522,19 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object] | None:
         del config, current, item
         return None
+
+    def fallback_policy_messages(self, state: DuplexModelSessionState) -> tuple[Mapping[str, object], ...]:
+        """Return policy messages to prepend to an API-side fallback request."""
+        del state
+        return ()
+
+    def on_fallback_started(self, state: DuplexModelSessionState) -> None:
+        """Notify the model policy that the fallback request has started."""
+        del state
+
+    def on_barge_in(self, state: DuplexModelSessionState) -> None:
+        """Notify the model policy that an active response was interrupted."""
+        del state
 
     def runtime_config_after_model_output(
         self,

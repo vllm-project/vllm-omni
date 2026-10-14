@@ -73,6 +73,57 @@ profile. This selects `AsyncOmni` and the ordinary API initialization instead
 of the duplex handler. See [Full Duplex](full_duplex_api.md#enable-full-duplex)
 for the command and configuration requirements.
 
+### Qwen3-Omni chat fallback
+
+The opt-in fallback uses ordinary chat completions for each committed audio or
+text turn. Start it with:
+
+```bash
+vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --deploy-config vllm_omni/deploy/qwen3_omni_chat_fallback.yaml \
+    --host 0.0.0.0 --port 8091
+```
+
+Connect to `ws://localhost:8091/v1/duplex` or
+`ws://localhost:8091/v1/realtime?duplex=1`. This profile selects
+`qwen3_omni_moe_chat_fallback`, explicitly disables `async_chunk`, and limits
+admission to one session. Its capabilities report
+`implementation_level: chat_fallback`, `supports_chat_fallback: true`, and
+`supports_input_append: false`. It accepts streaming audio appends but starts
+inference only after a committed turn; it does not append to a native model
+request or use listen/speak tokens. Images, reference voices, session resume,
+and tool calls are not supported by this profile. Non-empty `tools` and
+`tool_choice` values are rejected at session admission, session updates, and
+`response.create` with `unsupported_tools`; function-call outputs are also
+rejected rather than acknowledged as executable input.
+
+The engine's `DuplexEngineSession.history` is the conversation ledger. Private
+per-item audio payloads are restored as WAV `audio_url` parts when constructing
+the chat request. Its model-input view retains at most four audio parts, pruning
+complete old turns and their replies to an 8 MiB encoded-audio budget while
+keeping the newest audio-bearing turn. The canonical ledger is retained.
+Multiple deferred commits contribute each item's audio once. Float PCM keeps
+its capture rate on the wire and is normalized to the plugin's 16 kHz native
+rate by the runner. Output playback
+duration accumulates across chunks using the model's reported sample rate.
+
+By default, `input_audio_buffer.commit` starts a response. Set
+`response_create: false` on a commit to defer it until `response.create`, or
+set `session.extra_body.auto_response: false` to disable automatic responses.
+Barge-in cancels the active fallback request and retains a one-shot interruption
+note until the next chat request is accepted. Text deltas use
+`response.text.delta`; audio uses `response.output_audio.delta`. Text is forwarded
+as soon as the Thinker emits it. For incremental audio output, select
+`vllm_omni/deploy/qwen3_omni_chat_fallback_streaming.yaml`, which enables async
+chunking on the ordinary chat pipeline. The duplex input still starts inference
+only after commit. These independent text/audio streams have no word alignment;
+ACK-gated history includes assistant text only after complete audio generation
+and playback.
+
+`qwen3_omni_duplex.yaml` continues to select the engine-managed Qwen plugin,
+including its image input and history grouping described above. The fallback
+plugin is specific to its dedicated Qwen3 pipeline.
+
 ### Run the Example Client
 
 `examples/online_serving/barge_in_client.py` asks a question, interrupts the

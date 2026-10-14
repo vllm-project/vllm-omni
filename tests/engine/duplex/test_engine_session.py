@@ -137,6 +137,32 @@ def test_response_options_apply_to_one_response_without_mutating_session_default
     assert session.config.max_tokens == 64
 
 
+def test_response_options_from_realtime_reject_native_overrides_by_default():
+    with pytest.raises(DuplexConfigError) as excinfo:
+        ResponseCreateOptions.from_realtime({"instructions": "fallback prompt"})
+
+    assert excinfo.value.code == "unsupported_native_response_options"
+
+
+def test_response_options_from_realtime_accepts_the_fallback_scope():
+    options = ResponseCreateOptions.from_realtime(
+        {
+            "instructions": "fallback prompt",
+            "voice": "alloy",
+            "temperature": 0.2,
+            "max_tokens": 12,
+            "tools": [{"type": "function", "name": "lookup"}],
+        },
+        allow_response_options=True,
+    )
+
+    assert options.instructions == "fallback prompt"
+    assert options.voice == "alloy"
+    assert options.temperature == 0.2
+    assert options.max_tokens == 12
+    assert options.extra_body["realtime_response_tools"] == [{"type": "function", "name": "lookup"}]
+
+
 def test_response_options_cannot_overwrite_an_unconsumed_reservation():
     session = _session(config=DuplexSessionConfig(instructions="base"))
     session.reserve_response_options(ResponseCreateOptions(instructions="first"))
@@ -609,9 +635,30 @@ def test_from_realtime_validates_turn_detection():
     assert server_vad.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
     assert server_vad.extra_body["realtime_turn_detection"]["threshold"] == 0.5
 
+    with pytest.raises(DuplexConfigError) as excinfo:
+        DuplexSessionConfig.from_realtime({"turn_detection": {"type": "server_vad", "interrupt_response": False}})
+    assert str(excinfo.value) == (
+        "turn_detection.interrupt_response=false is unsupported; use turn_detection=null for model-owned listen/speak"
+    )
+
     model_owned = DuplexSessionConfig.from_realtime({"turn_detection": None})
     assert model_owned.overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
     assert model_owned.extra_body["realtime_turn_detection"] is None
+
+
+def test_from_realtime_can_normalize_turn_based_server_vad_defaults():
+    config = DuplexSessionConfig.from_realtime(
+        {
+            "audio": {"input": {"turn_detection": {"type": "server_vad"}}},
+        },
+        supports_model_native_turn_policy=False,
+    )
+
+    assert config.overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
+    assert config.extra_body["realtime_turn_detection"]["interrupt_response"] is False
+    assert (
+        config.extra_body["realtime_session_payload"]["audio"]["input"]["turn_detection"]["interrupt_response"] is False
+    )
 
 
 def test_from_realtime_maps_wire_fields_and_stores_realtime_keys_in_extra_body():
@@ -895,7 +942,12 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def capture_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", capture_summary)
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -965,7 +1017,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     wall = {"t": 1_000.0}
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def capture_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", capture_summary)
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -985,7 +1042,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def capture_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", capture_summary)
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))

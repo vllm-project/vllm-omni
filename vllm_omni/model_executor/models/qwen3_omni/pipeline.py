@@ -7,6 +7,8 @@ Stage 1: Talker  — text embeddings → RVQ codec codes
 Stage 2: Code2Wav — RVQ codes → audio waveform
 """
 
+from dataclasses import replace
+
 from transformers import Qwen3OmniMoeConfig
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
@@ -80,6 +82,16 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
         ),
+    ),
+)
+
+QWEN3_OMNI_CHAT_FALLBACK_PIPELINE = replace(
+    QWEN3_OMNI_PIPELINE,
+    model_type="qwen3_omni_moe_chat_fallback",
+    default_session_mode="duplex",
+    default_deploy_config_name="qwen3_omni_chat_fallback.yaml",
+    duplex_plugin=(
+        "vllm_omni.model_executor.models.qwen3_omni.duplex.chat_fallback_plugin.Qwen3OmniChatFallbackPlugin"
     ),
 )
 

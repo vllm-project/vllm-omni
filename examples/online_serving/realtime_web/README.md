@@ -141,6 +141,14 @@ voices and tool calls are not supported by this plugin.
 
 ### Using the Qwen3 web UI
 
+To use the chat-fallback profile, change the overlay's `base_config` to
+`vllm_omni/deploy/qwen3_omni_chat_fallback.yaml`. Keep the VAD artifact setting
+and launch the UI with `--vad`. This profile reports
+`implementation_level: chat_fallback`, supports one session, and does not
+support images. The browser sends camera items only when the server advertises
+`supports_image_input: true`; it accepts both `response.text.*` fallback events
+and the engine-managed `response.output_text.*` events.
+
 The shared UI supports both explicit turns and Server VAD. Use the manual UI
 command above with the turn-based deployment, or start the VAD deployment above
 and launch the UI with `--vad`.

@@ -68,9 +68,16 @@ from vllm_omni.engine.duplex.events import (
     SessionExpired,
     SessionHeartbeatAck,
 )
+from vllm_omni.engine.duplex.fallback import DuplexFallbackRequest
+from vllm_omni.engine.duplex.messages import (
+    DuplexSessionFallbackFailedMessage,
+    DuplexSessionFallbackOutputMessage,
+    DuplexSessionFallbackStartedMessage,
+)
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
+    DuplexRuntimeConfigError,
     PcmAppendReservation,
 )
 from vllm_omni.engine.duplex.realtime_events import (
@@ -424,13 +431,8 @@ class DuplexSessionRunner:
                 self.run.closed_deferred = True
         await self.tasks.cancel_append_tasks()
         self.model.cancel_data_plane_stream()
-        active_response_task = self.tasks.active_response_task
-        if active_response_task is not None and not active_response_task.done():
-            active_response_task.cancel()
-            await asyncio.gather(active_response_task, return_exceptions=True)
+        await self._cancel_active_response(self.tasks.active_response_task, reason=reason, notify=False)
         self.tasks.active_response_task = None
-        if session.active_response_id is not None:
-            session.end_response(commit_text=False)
         self._cleanup_duplex_session_state()
         session.close()
         await self._stop_worker()
@@ -440,10 +442,8 @@ class DuplexSessionRunner:
         self.run.closed_emitted = True
         await self.tasks.cancel_append_tasks()
         self.model.cancel_data_plane_stream()
-        active_response_task = self.tasks.active_response_task
-        if active_response_task is not None and not active_response_task.done():
-            active_response_task.cancel()
-            await asyncio.gather(active_response_task, return_exceptions=True)
+        await self._cancel_active_response(self.tasks.active_response_task, reason="shutdown", notify=False)
+        self.tasks.active_response_task = None
         self.session.close()
         await self._stop_worker()
 
@@ -508,6 +508,21 @@ class DuplexSessionRunner:
         await self._on_command(item)
 
     async def _on_internal(self, item: _Internal) -> None:
+        if item.kind == "fallback_started":
+            message = item.payload.get("message")
+            if isinstance(message, DuplexSessionFallbackStartedMessage):
+                self._on_fallback_started(message)
+            return
+        if item.kind == "fallback_output":
+            message = item.payload.get("message")
+            if isinstance(message, DuplexSessionFallbackOutputMessage):
+                await self._on_fallback_output(message)
+            return
+        if item.kind == "fallback_failed":
+            message = item.payload.get("message")
+            if isinstance(message, DuplexSessionFallbackFailedMessage):
+                await self._on_fallback_failed(message)
+            return
         if item.kind == "stage_metrics":
             stage_metrics = item.payload.get("stage_metrics")
             if isinstance(stage_metrics, Mapping):
@@ -518,6 +533,15 @@ class DuplexSessionRunner:
                 return
             payload = item.payload.get("payload")
             if not isinstance(payload, dict):
+                return
+            if self._supports_chat_fallback():
+                # Earlier mailbox commands may have consumed or cleared the
+                # promoted input, or started another response already.
+                if self.model_state.committed_audio_payload is None or helpers.response_in_progress(
+                    self.session, self.tasks
+                ):
+                    return
+                self._start_chat_fallback(self.model_state.committed_audio_payload)
                 return
             await self._start_append(
                 payload,
@@ -531,6 +555,20 @@ class DuplexSessionRunner:
             await self._on_commit(dict(item.payload))
             return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
+
+    def submit_fallback_message(
+        self,
+        message: DuplexSessionFallbackStartedMessage
+        | DuplexSessionFallbackOutputMessage
+        | DuplexSessionFallbackFailedMessage,
+    ) -> None:
+        """Queue one API-side fallback message behind existing session work."""
+        kind = {
+            DuplexSessionFallbackStartedMessage: "fallback_started",
+            DuplexSessionFallbackOutputMessage: "fallback_output",
+            DuplexSessionFallbackFailedMessage: "fallback_failed",
+        }[type(message)]
+        self._mailbox.put_nowait(_Internal(kind, {"message": message}))
 
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
         """Run one internal event dictionary through the matching handler."""
@@ -547,6 +585,59 @@ class DuplexSessionRunner:
             await self.control.on_turn_signal(payload)
         else:
             self._emit_error("unknown_event", f"Unknown duplex event: {event_type}")
+
+    def _fallback_message_matches(self, *, request_id: str, response_id: str, epoch: int) -> bool:
+        session = self.session
+        return (
+            self.run.fallback_request_id == request_id
+            and session.active_request_id == request_id
+            and session.active_response_id == response_id
+            and session.epoch == epoch
+            and session.state == DuplexSessionState.OPEN
+        )
+
+    def _on_fallback_started(self, message: DuplexSessionFallbackStartedMessage) -> None:
+        if not self._fallback_message_matches(
+            request_id=message.request_id,
+            response_id=message.response_id,
+            epoch=message.epoch,
+        ):
+            return
+        self.model.begin_fallback_request(message.request_id)
+        self.plugin.on_fallback_started(self.model_state)
+
+    async def _on_fallback_output(self, message: DuplexSessionFallbackOutputMessage) -> None:
+        if not self._fallback_message_matches(
+            request_id=message.request_id,
+            response_id=message.response_id,
+            epoch=message.epoch,
+        ):
+            return
+        close_reason, finished = await self.model.apply_fallback_output(
+            message.output,
+            request_id=message.request_id,
+            expected_epoch=message.epoch,
+        )
+        if close_reason is not None:
+            await self._close_from_runtime(close_reason)
+            return
+        if finished and not self.closing:
+            self.run.fallback_request_identity = None
+
+    async def _on_fallback_failed(self, message: DuplexSessionFallbackFailedMessage) -> None:
+        if not self._fallback_message_matches(
+            request_id=message.request_id,
+            response_id=message.response_id,
+            epoch=message.epoch,
+        ):
+            return
+        self.model.fail_fallback_response(
+            request_id=message.request_id,
+            error=message.error,
+            error_code=message.error_code,
+        )
+        if not self.closing:
+            self.run.fallback_request_identity = None
 
     # ------------------------------------------------------------------ #
     # Commands                                                           #
@@ -668,6 +759,7 @@ class DuplexSessionRunner:
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
         session.cancel_pending_input()
+        self.control.reset_vad()
         projector = self.out.projector
         if projector is not None:
             from vllm_omni.engine.duplex.realtime_events import clear_input_buffer
@@ -718,12 +810,15 @@ class DuplexSessionRunner:
         self.session.mark_closing()
 
     def _session_auto_responds(self) -> bool:
-        return self.out.auto_responds()
+        if self.plugin.default_auto_response and self.session.config.extra_body.get("auto_response") is False:
+            return False
+        return self.out.auto_responds() or self.plugin.default_auto_response
 
     def _cleanup_duplex_session_state(self) -> None:
         session = self.session
         self.plugin.data_plane.close_session(session.session_id, active_request_id=session.active_request_id)
         self.run.stream_request_id = None
+        self.run.fallback_request_identity = None
 
     # ------------------------------------------------------------------ #
     # Append path (was the audio-append branch + start_native_append)    #
@@ -740,6 +835,7 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         event["force_barge_in"] = True
+        self.control.reset_vad()
         cancelled_fence = session.fence
         playback_was_active = helpers.assistant_playback_active(self.session)
         model_state.audio_buffer.clear_force_listen()
@@ -845,6 +941,7 @@ class DuplexSessionRunner:
                     audio,
                     fmt,
                     sample_rate_hz=sample_rate_hz,
+                    target_sample_rate_hz=self.plugin.silence_continuation_sample_rate_hz,
                 )
             except ValueError as exc:
                 self._emit_error("bad_event", str(exc))
@@ -897,7 +994,10 @@ class DuplexSessionRunner:
         payload["is_speech"] = (
             False if video_only else overlap_policy.input_looks_like_speech(self.session, event, payload)
         )
-        auto_responds = self._session_auto_responds()
+        # Continuous native decoding and commit-triggered fallback responses
+        # have different overlap policies. Count/defer fallback speech even
+        # when commits start responses automatically.
+        auto_responds = self.out.auto_responds() and session.capabilities.supports_input_append
         defer_append = False
         buffer_overlap_audio = True
         self._mark_pending_silence_superseded()
@@ -917,7 +1017,14 @@ class DuplexSessionRunner:
             action = decision.get("action")
             if action == "drop":
                 duration_ms = overlap_policy.input_audio_duration_ms(event, payload)
-                self._emit_events(discard_pending_input_audio(projector, duration_ms))
+                # Drop this packet, not the earlier fallback speech still
+                # waiting for commit. Native overlap keeps its existing reset.
+                if not (
+                    self._supports_chat_fallback()
+                    and model_state.speech_since_commit
+                    and model_state.audio_buffer.has_pending()
+                ):
+                    self._emit_events(discard_pending_input_audio(projector, duration_ms))
                 self._maybe_schedule_vad_commit(vad_result)
                 return
             if action == "listen":
@@ -1012,7 +1119,7 @@ class DuplexSessionRunner:
         """Server VAD ended the user turn: run the same commit the old translator synthesized."""
         if vad_result is None or not vad_result.should_commit:
             return
-        if self._session_auto_responds():
+        if not self._supports_chat_fallback() and self.out.auto_responds():
             # A model-native session decides its own turns; server VAD is there
             # to hear the user (speech_started / speech_stopped, barge-in), not
             # to end the turn. Committing at the detector's stop cuts the
@@ -1271,6 +1378,8 @@ class DuplexSessionRunner:
             return
         self.run.runtime_closed = True
         self._begin_close(reason)
+        if self.run.fallback_request_identity is not None:
+            await self._cancel_active_response(None, reason=reason, notify=False)
         self._cleanup_duplex_session_state()
         # ``closed_deferred`` means a manager-driven close already promised the
         # terminal after its stage cleanup. Emitting here too would give the
@@ -1327,6 +1436,7 @@ class DuplexSessionRunner:
                     event_id=event.get("realtime_event_id"),
                 )
                 return
+        self.control.reset_vad()
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
         playback_was_active = helpers.assistant_playback_active(self.session)
         if event_type in {"input.cancel", "barge_in"}:
@@ -1436,7 +1546,13 @@ class DuplexSessionRunner:
         draining_ids = [
             request_id for request_id in session.draining_request_ids() if request_id and request_id != old_request_id
         ]
-        if not has_running_task and old_request_id is None and session.active_response_id is None and not draining_ids:
+        if (
+            not has_running_task
+            and old_request_id is None
+            and session.active_response_id is None
+            and not draining_ids
+            and self.run.fallback_request_identity is None
+        ):
             return False
 
         old_epoch = session.epoch
@@ -1472,7 +1588,11 @@ class DuplexSessionRunner:
         # what tells the orchestrator to cleanup(abort=True). Releasing those
         # ids here first leaves the stage request in ``request_states``.
         # Draining output stages sit on an older turn fence, so drop only those.
-        abort_ids = [request_id for request_id in (old_request_id, *draining_ids) if request_id]
+        abort_ids = [
+            request_id
+            for request_id in (old_request_id, *draining_ids)
+            if request_id and request_id != self.run.fallback_request_id
+        ]
         cancelled_ids = set(session.resource_request_ids(session.fence))
         older_abort_ids = [request_id for request_id in abort_ids if request_id not in cancelled_ids]
         if older_abort_ids:
@@ -1481,7 +1601,21 @@ class DuplexSessionRunner:
         self.manager.invalidate_output(session.session_id, old_response_id, through_epoch=old_epoch)
         for response_id, _, _ in draining_cancels:
             self.manager.invalidate_output(session.session_id, response_id, through_epoch=old_epoch)
-        if old_request_id is not None:
+        fallback_identity = self.run.fallback_request_identity
+        if fallback_identity is not None:
+            fallback_request_id, fallback_response_id, fallback_epoch = fallback_identity
+            self.manager.emit_fallback_cancel(
+                session_id=session.session_id,
+                request_id=fallback_request_id,
+                response_id=fallback_response_id,
+                epoch=fallback_epoch,
+                reason=reason,
+            )
+            self.plugin.data_plane.close_stream(fallback_request_id)
+            self.run.fallback_request_identity = None
+            if reason in {"barge_in", "turn_detected"}:
+                self.plugin.on_barge_in(self.model_state)
+        elif old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
             self.plugin.data_plane.close_stream(old_request_id)
@@ -1559,14 +1693,61 @@ class DuplexSessionRunner:
             options = ResponseCreateOptions.from_realtime(
                 response_payload,
                 private_runtime_config_keys=self.plugin.private_runtime_config_keys,
+                allow_response_options=self._supports_chat_fallback(),
             )
-        except DuplexConfigError as exc:
+            if self._supports_chat_fallback():
+                self.plugin.validate_client_extra_body(options.extra_body)
+        except (DuplexConfigError, DuplexRuntimeConfigError) as exc:
             return exc.code
         try:
             session.reserve_response_options(options)
         except Exception:
             return "response_already_active"
         return None
+
+    def _supports_chat_fallback(self) -> bool:
+        return self.session.capabilities.supports_chat_fallback
+
+    def _start_chat_fallback(self, input_payload: Mapping[str, object] | None) -> None:
+        """Start one engine-owned response backed by the API-side chat service."""
+        session = self.session
+        session.touch_lease(DuplexLeaseActivity.APPEND)
+        session.reset_unanswered_user_items()
+        response_id = session.begin_response()
+        request_id = f"duplex-fallback-{session.session_id}-{session.epoch}-{session.input_commit_seq}"
+        session.bind_request(request_id)
+        self.run.fallback_request_identity = (request_id, response_id, session.epoch)
+        self.emit(self.model.response_created_payload(response_id, epoch=session.epoch, request_id=request_id))
+
+        history = session.fallback_history
+        initial_user_text = session.config.initial_user_text
+        if initial_user_text:
+            initial_message = {"role": "user", "content": initial_user_text}
+            for index, message in enumerate(history):
+                if message == initial_message:
+                    # The fallback request carries the seed separately so the
+                    # API builder can place it exactly once without changing
+                    # native session history semantics.
+                    history = history[:index] + history[index + 1 :]
+                    break
+
+        request = DuplexFallbackRequest(
+            session_id=session.session_id,
+            request_id=request_id,
+            response_id=response_id,
+            epoch=session.epoch,
+            history=history,
+            response_config=session.response_config.as_dict(),
+            input_payload=dict(input_payload) if input_payload is not None else None,
+            policy_messages=self.plugin.fallback_policy_messages(self.model_state),
+            input_in_history=input_payload is not None,
+        )
+        self.manager.emit_fallback_request(request)
+        if self.model_state.committed_audio_payload is not None:
+            session.release_input_bytes(self.model_state.clear_committed_audio())
+        self.model_state.input_since_commit = False
+        self.model_state.speech_since_commit = False
+        self.model_state.deferred_response_create = False
 
     async def _flush_and_submit_committed_turn(
         self,
@@ -1597,6 +1778,7 @@ class DuplexSessionRunner:
             if commit_reservation is not None
             else model_state.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
         )
+        history_audio_payload = flushed
         if model_state.committed_audio_payload is not None:
             if flushed is not None:
                 flushed = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, flushed)
@@ -1626,6 +1808,7 @@ class DuplexSessionRunner:
             session,
             realtime_item_id=realtime_item_id,
             transcript=event.get("transcript"),
+            fallback_audio_payload=history_audio_payload if self._supports_chat_fallback() else None,
         )
         self.emit(
             helpers.audio_committed_payload(
@@ -1641,6 +1824,9 @@ class DuplexSessionRunner:
         )
         model_state.retain_committed_audio(flushed, operation_id=operation_id, reserved_bytes=reserved_bytes)
         if should_create_response:
+            if self._supports_chat_fallback():
+                self._start_chat_fallback(flushed)
+                return True
             await self._start_append(
                 flushed,
                 final=True,
@@ -1691,6 +1877,9 @@ class DuplexSessionRunner:
                 operation_id = uuid.uuid4().hex
                 model_state.committed_audio_operation_id = operation_id
             session.reset_unanswered_user_items()
+            if self._supports_chat_fallback():
+                self._start_chat_fallback(committed_payload)
+                return
             await self._start_append(
                 committed_payload,
                 final=True,
@@ -1704,6 +1893,10 @@ class DuplexSessionRunner:
             await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
             return
         if session.unanswered_user_items():
+            if self._supports_chat_fallback():
+                session.reset_unanswered_user_items()
+                self._start_chat_fallback(None)
+                return
             # Conversation items are context, not a turn. A model-native model
             # decides to speak from the audio it hears, and there is no audio
             # here: opening a response anyway produces one the model never
@@ -1806,6 +1999,7 @@ class DuplexSessionRunner:
             session,
             realtime_item_id=realtime_item_id,
             transcript=event.get("transcript"),
+            fallback_audio_payload=deferred_payload if self._supports_chat_fallback() else None,
         )
         committed_payload = helpers.audio_committed_payload(
             session,
@@ -1827,6 +2021,7 @@ class DuplexSessionRunner:
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
         )
         final_payload = commit_reservation.payload
+        history_audio_payload = final_payload
         if model_state.committed_audio_payload is not None:
             if final_payload is not None:
                 final_payload = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, final_payload)
@@ -1848,6 +2043,7 @@ class DuplexSessionRunner:
             realtime_item_id=realtime_item_id,
             transcript=event.get("transcript"),
             turn_id=data_plane_turn_id,
+            fallback_audio_payload=history_audio_payload if self._supports_chat_fallback() else None,
         )
         self.emit(
             helpers.audio_committed_payload(
@@ -1858,6 +2054,9 @@ class DuplexSessionRunner:
             )
         )
         if final_payload is not None:
+            if self._supports_chat_fallback():
+                self._start_chat_fallback(final_payload)
+                return
             if isinstance(realtime_item_id, str) and realtime_item_id:
                 final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
             await self._start_append(
@@ -1917,10 +2116,11 @@ class DuplexSessionRunner:
                 event_id=event.get("realtime_event_id"),
             )
             return
+        commit_auto_response = self._session_auto_responds() and event.get("response_create") is not False
         should_create_response = (
             event_type == "response.create"
             or bool(event.get("response_create", event_type == "input.commit"))
-            or (event_type == "input_audio_buffer.commit" and self._session_auto_responds())
+            or (event_type == "input_audio_buffer.commit" and commit_auto_response)
         )
         # Pure silence with nothing buffered: drop and keep listening.
         # Pending silent+video (or an explicit create_response) must flush.
@@ -1946,6 +2146,8 @@ class DuplexSessionRunner:
                         "overrides for instructions, voice, temperature, max tokens, tools, or "
                         "tool_choice."
                         if response_options_error == "unsupported_native_response_options"
+                        else "The selected duplex model does not support tool calls."
+                        if response_options_error == "unsupported_tools"
                         else "response.create cannot reserve options while another response is active."
                     )
                     self._emit_error(response_options_error, error_message, event_id=event.get("realtime_event_id"))
@@ -1964,7 +2166,7 @@ class DuplexSessionRunner:
                 return
             commit_action = decide_commit_action(
                 CommitSnapshot(
-                    auto_responds=self._session_auto_responds(),
+                    auto_responds=commit_auto_response,
                     speech_since_commit=model_state.speech_since_commit,
                     active_response_id=session.active_response_id,
                     overlap_speech_ms=session.overlap_speech_ms,
@@ -2017,11 +2219,13 @@ class DuplexSessionRunner:
         if event_type in {"input_audio_buffer.commit", "input.commit"}:
             model_state.input_since_commit = False
             model_state.speech_since_commit = False
+        fallback_audio_payload = model_state.committed_audio_payload
         committed = (
             helpers.commit_audio_input(
                 session,
                 realtime_item_id=realtime_item_id,
                 transcript=event.get("transcript"),
+                fallback_audio_payload=(fallback_audio_payload if self._supports_chat_fallback() else None),
             )
             if had_uncommitted_audio
             else None

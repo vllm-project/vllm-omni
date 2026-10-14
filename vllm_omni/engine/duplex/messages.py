@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
     from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
     from vllm_omni.engine.duplex.events import DuplexEvent
+    from vllm_omni.engine.duplex.fallback import DuplexFallbackRequest
 
 
 class DuplexSessionError(RuntimeError):
@@ -111,12 +112,61 @@ class DuplexSessionEventMessage(EngineQueueMessage, kw_only=True):
     event: DuplexEvent
 
 
+class DuplexSessionFallbackRequestMessage(EngineQueueMessage, kw_only=True):
+    """Internal request from the engine to the API-side chat service."""
+
+    type: Literal["duplex_session_fallback_request"] = "duplex_session_fallback_request"
+    session_id: str
+    request: DuplexFallbackRequest
+
+
+class DuplexSessionFallbackStartedMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["duplex_session_fallback_started"] = "duplex_session_fallback_started"
+    session_id: str
+    request_id: str
+    response_id: str
+    epoch: int
+
+
+class DuplexSessionFallbackOutputMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["duplex_session_fallback_output"] = "duplex_session_fallback_output"
+    session_id: str
+    request_id: str
+    response_id: str
+    epoch: int
+    output: dict[str, object]
+
+
+class DuplexSessionFallbackFailedMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["duplex_session_fallback_failed"] = "duplex_session_fallback_failed"
+    session_id: str
+    request_id: str
+    response_id: str
+    epoch: int
+    error: str
+    error_code: str
+
+
+class DuplexSessionFallbackCancelMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["duplex_session_fallback_cancel"] = "duplex_session_fallback_cancel"
+    session_id: str
+    request_id: str
+    response_id: str
+    epoch: int
+    reason: str = "cancelled"
+
+
 __all__ = [
     "CloseDuplexSessionMessage",
     "DuplexControlResultMessage",
     "DuplexSessionCommandMessage",
     "DuplexSessionError",
     "DuplexSessionEventMessage",
+    "DuplexSessionFallbackCancelMessage",
+    "DuplexSessionFallbackFailedMessage",
+    "DuplexSessionFallbackOutputMessage",
+    "DuplexSessionFallbackRequestMessage",
+    "DuplexSessionFallbackStartedMessage",
     "OpenDuplexSessionMessage",
     "ResumeDuplexSessionMessage",
     "TouchDuplexSessionMessage",

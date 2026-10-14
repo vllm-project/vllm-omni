@@ -1,0 +1,12 @@
+# Opt-in Qwen3 turn-based duplex through ordinary chat completions.
+# The default qwen3_omni_duplex.yaml retains the engine-managed Qwen plugin.
+base_config: qwen3_omni_moe.yaml
+pipeline: qwen3_omni_moe_chat_fallback
+session_mode: duplex
+async_chunk: false
+duplex_session:
+  max_sessions: 1
+stages:
+  - stage_id: 0
+    limit_mm_per_prompt:
+      audio: 4

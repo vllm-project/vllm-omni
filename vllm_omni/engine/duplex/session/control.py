@@ -38,6 +38,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionConfig,
     TurnDetectionResult,
     apply_turn_detection_result,
+    validate_realtime_turn_detection,
 )
 
 logger = init_logger(__name__)
@@ -206,9 +207,20 @@ class SessionControl:
             if pending_turn_detection is not None:
                 pending_turn_detection.reject()
 
+        supports_native_turn_policy = session.capabilities.supports_model_native_turn_policy
+        turn_detection_error = validate_realtime_turn_detection(
+            payload,
+            allow_interrupt_response_false=not supports_native_turn_policy,
+            default_interrupt_response=supports_native_turn_policy,
+        )
+        if turn_detection_error is not None:
+            self._out.emit_error("unsupported_turn_detection", turn_detection_error, event_id=realtime_event_id)
+            return
         try:
             pending_turn_detection = PendingTurnDetectionUpdate.prepare(
-                payload, backend_provider=self._vad_backend_provider()
+                payload,
+                backend_provider=self._vad_backend_provider(),
+                default_interrupt_response=supports_native_turn_policy,
             )
         except Exception as exc:
             self._out.emit_error("unsupported_turn_detection", str(exc), event_id=realtime_event_id)

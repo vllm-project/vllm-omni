@@ -121,6 +121,8 @@ class DuplexCapabilities:
     supports_image_input: bool = False
     supports_text_only_turn: bool = False
     supports_chat_completions: bool = False
+    #: Whether chat completions are used as the model's duplex response path.
+    supports_chat_fallback: bool = False
     text_turn_priming_units: int = 0
     requires_model_runner_kv: bool = False
     requires_native_stage_role: bool = False
@@ -129,6 +131,8 @@ class DuplexCapabilities:
     stage_handoff_transport: str | None = None
     chunk_period_ms: int | None = 1000
     target_barge_in_latency_ms: int | None = 1000
+    implementation_level: str | None = None
+    input_modes: list[str] = field(default_factory=lambda: ["append_audio_chunk"])
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -163,14 +167,16 @@ class DuplexCapabilities:
             "supports_audio_truncate": self.supports_audio_truncate,
             "supports_image_input": self.supports_image_input,
             "supports_text_only_turn": self.supports_text_only_turn,
+            "supports_chat_completions": self.supports_chat_completions,
+            "supports_chat_fallback": self.supports_chat_fallback,
+            "text_turn_priming_units": self.text_turn_priming_units,
             "requires_model_runner_kv": self.requires_model_runner_kv,
             "requires_native_stage_role": self.requires_native_stage_role,
-            "implementation_level": (
-                "model_native_duplex" if self.supports_model_native_turn_policy else "turn_based_duplex"
-            ),
-            "adapter_patterns": self.adapter_patterns,
-            "input_modes": ["append_audio_chunk"],
-            "signal_sources": self.signal_sources,
+            "implementation_level": self.implementation_level
+            or ("model_native_duplex" if self.supports_model_native_turn_policy else "turn_based_duplex"),
+            "adapter_patterns": list(self.adapter_patterns),
+            "input_modes": list(self.input_modes),
+            "signal_sources": list(self.signal_sources),
             "stage_handoff_transport": self.stage_handoff_transport,
             "chunk_period_ms": self.chunk_period_ms,
             "target_barge_in_latency_ms": self.target_barge_in_latency_ms,
@@ -371,6 +377,7 @@ class DuplexSessionConfig:
         session_payload: Mapping[str, object],
         *,
         model: str | None = None,
+        supports_model_native_turn_policy: bool = True,
     ) -> DuplexSessionConfig:
         """Build a config from an OpenAI Realtime ``session`` object (session.update / open_session).
 
@@ -381,28 +388,35 @@ class DuplexSessionConfig:
         ``realtime_*`` keys of ``extra_body`` exactly like the old
         ``_session_create_from_realtime``.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
-            DUPLEX_REALTIME_CAPABILITIES,
-            duplex_response_format,
+        from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
+        from vllm_omni.engine.duplex.turn_detection import (
+            normalize_turn_detection_session_payload,
+            validate_realtime_turn_detection,
         )
-        from vllm_omni.engine.duplex.turn_detection import normalize_turn_detection_session_payload
         from vllm_omni.protocol.duplex import (
             RealtimeInputDefaults,
             input_audio_transcription_config,
             json_safe_realtime_payload,
             realtime_max_output_tokens,
             realtime_overlap_fields,
-            validate_session_payload,
+            validate_realtime_session_audio_formats,
         )
 
         payload: dict[str, object] = dict(session_payload)
-        # One session check for every consumer (ENTRY-INV-002): the same
-        # capability object ``translate_realtime_command`` uses, so a session
-        # object is accepted or refused identically whichever door it came in.
-        rejection = validate_session_payload(payload, capabilities=DUPLEX_REALTIME_CAPABILITIES)
-        if rejection is not None:
-            raise DuplexConfigError(rejection.message, code=rejection.code, param=rejection.param)
-        normalize_turn_detection_session_payload(payload)
+        format_error = validate_realtime_session_audio_formats(payload)
+        if format_error is not None:
+            raise DuplexConfigError(format_error, code="unsupported_audio_format")
+        turn_detection_error = validate_realtime_turn_detection(
+            payload,
+            allow_interrupt_response_false=not supports_model_native_turn_policy,
+            default_interrupt_response=supports_model_native_turn_policy,
+        )
+        if turn_detection_error is not None:
+            raise DuplexConfigError(turn_detection_error, code="unsupported_turn_detection", param="turn_detection")
+        normalize_turn_detection_session_payload(
+            payload,
+            default_interrupt_response=supports_model_native_turn_policy,
+        )
         defaults = RealtimeInputDefaults().with_session_payload(payload)
         payload.update(realtime_overlap_fields(payload))
 
@@ -665,11 +679,13 @@ class ResponseCreateOptions:
         response_payload: Mapping[str, object],
         *,
         private_runtime_config_keys: frozenset[str] = frozenset(),
+        allow_response_options: bool = False,
     ) -> ResponseCreateOptions:
         """Parse an OpenAI Realtime ``response`` object into response-scoped options.
 
         Raises :class:`DuplexConfigError` (``code="unsupported_native_response_options"``)
-        for options a model-native duplex session cannot apply per response.
+        for options a model-native duplex session cannot apply per response unless
+        the caller explicitly enables response options for its fallback runtime.
         Private runtime keys in ``extra_body`` are dropped.
         """
         from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
@@ -694,7 +710,7 @@ class ResponseCreateOptions:
             or payload.get("tools") is not None
             or payload.get("tool_choice") is not None
         )
-        if unsupported:
+        if unsupported and not allow_response_options:
             raise DuplexConfigError(
                 "response.create options are not supported by a model-native duplex session",
                 code="unsupported_native_response_options",

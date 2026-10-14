@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 
@@ -78,7 +79,12 @@ _SERVER_VAD_FIELDS = frozenset(
 )
 
 
-def validate_realtime_turn_detection(session_payload: Mapping[str, object]) -> str | None:
+def validate_realtime_turn_detection(
+    session_payload: Mapping[str, object],
+    *,
+    allow_interrupt_response_false: bool = False,
+    default_interrupt_response: bool = True,
+) -> str | None:
     """Validate the ``turn_detection`` object of a Realtime session payload (None when valid)."""
     field, turn_detection = configured_realtime_turn_detection(session_payload)
     if field is None:
@@ -102,11 +108,23 @@ def validate_realtime_turn_detection(session_payload: Mapping[str, object]) -> s
             value = turn_detection.get(name)
             if value is not None and not _valid_vad_number(value, minimum=0):
                 return f"{field}.{name} must be a non-negative number"
-        if turn_detection.get("interrupt_response", True) is not True:
+        interrupt_response = turn_detection.get("interrupt_response", default_interrupt_response)
+        if not isinstance(interrupt_response, bool):
+            return f"{field}.interrupt_response must be a boolean"
+        if not interrupt_response and not allow_interrupt_response_false:
             return (
                 f"{field}.interrupt_response=false is unsupported; use turn_detection=null for model-owned listen/speak"
             )
-    desired_policy = "barge_in_on_speech" if turn_detection is not None else "listen_only"
+    desired_policy = (
+        "barge_in_on_speech"
+        if turn_detection is not None
+        and (
+            turn_detection.get("interrupt_response", default_interrupt_response)
+            if isinstance(turn_detection, dict)
+            else default_interrupt_response
+        )
+        else "listen_only"
+    )
     overlap_policy = session_payload.get("overlap_policy")
     if isinstance(overlap_policy, str) and overlap_policy != desired_policy:
         return f"overlap_policy={overlap_policy!r} conflicts with turn_detection; expected {desired_policy!r}"
@@ -127,17 +145,17 @@ class TurnDetectionConfig:
     @classmethod
     def from_realtime(cls, turn_detection: Mapping[str, object]) -> TurnDetectionConfig:
         return cls(
-            threshold=float(turn_detection.get("threshold", 0.5)),
-            prefix_padding_ms=int(turn_detection.get("prefix_padding_ms", 300)),
-            silence_duration_ms=int(turn_detection.get("silence_duration_ms", 500)),
-            min_speech_duration_ms=int(turn_detection.get("min_speech_duration_ms", 96)),
+            threshold=float(cast("int | float", turn_detection.get("threshold", 0.5))),
+            prefix_padding_ms=int(cast("int | float", turn_detection.get("prefix_padding_ms", 300))),
+            silence_duration_ms=int(cast("int | float", turn_detection.get("silence_duration_ms", 500))),
+            min_speech_duration_ms=int(cast("int | float", turn_detection.get("min_speech_duration_ms", 96))),
             create_response=bool(turn_detection.get("create_response", True)),
             interrupt_response=bool(turn_detection.get("interrupt_response", True)),
         )
 
     @property
     def overlap_policy(self) -> str:
-        return "barge_in_on_speech"
+        return "barge_in_on_speech" if self.interrupt_response else "listen_only"
 
     def build_detector(self, backend_provider: SileroVADBackendProvider | None = None) -> ServerTurnDetector:
         return ServerTurnDetector(self, backend_provider=backend_provider)
@@ -145,6 +163,8 @@ class TurnDetectionConfig:
 
 def normalize_turn_detection_session_payload(
     session_payload: dict[str, object],
+    *,
+    default_interrupt_response: bool = True,
 ) -> tuple[bool, TurnDetectionConfig | None]:
     """Fill ``turn_detection`` defaults and derive ``overlap_policy`` in place.
 
@@ -158,11 +178,22 @@ def normalize_turn_detection_session_payload(
         return False, None
     if configured is None:
         session_payload["overlap_policy"] = "listen_only"
+        session_payload["turn_detection"] = None
+        if field == "audio.input.turn_detection":
+            audio_config = session_payload.get("audio")
+            if isinstance(audio_config, dict):
+                audio_payload = dict(audio_config)
+                audio_input = audio_payload.get("input")
+                if isinstance(audio_input, dict):
+                    input_payload = dict(audio_input)
+                    input_payload["turn_detection"] = None
+                    audio_payload["input"] = input_payload
+                    session_payload["audio"] = audio_payload
         return True, None
     assert isinstance(configured, dict)
     merged = {
         "type": "server_vad",
-        "interrupt_response": True,
+        "interrupt_response": default_interrupt_response,
         "threshold": 0.5,
         "prefix_padding_ms": 300,
         "silence_duration_ms": 500,
@@ -171,6 +202,16 @@ def normalize_turn_detection_session_payload(
     }
     config = TurnDetectionConfig.from_realtime(merged)
     session_payload["turn_detection"] = dict(merged)
+    if field == "audio.input.turn_detection":
+        audio_config = session_payload.get("audio")
+        if isinstance(audio_config, dict):
+            audio_payload = dict(audio_config)
+            audio_input = audio_payload.get("input")
+            if isinstance(audio_input, dict):
+                input_payload = dict(audio_input)
+                input_payload["turn_detection"] = dict(merged)
+                audio_payload["input"] = input_payload
+                session_payload["audio"] = audio_payload
     session_payload["overlap_policy"] = config.overlap_policy
     return True, config
 
@@ -280,9 +321,13 @@ class PendingTurnDetectionUpdate:
         session_payload: dict[str, object],
         *,
         backend_provider: SileroVADBackendProvider | None = None,
+        default_interrupt_response: bool = True,
     ) -> PendingTurnDetectionUpdate | None:
         """Normalize the payload in place and stage the new detector; None when not configured."""
-        configured, config = normalize_turn_detection_session_payload(session_payload)
+        configured, config = normalize_turn_detection_session_payload(
+            session_payload,
+            default_interrupt_response=default_interrupt_response,
+        )
         if not configured:
             return None
         detector = config.build_detector(backend_provider) if config is not None else None

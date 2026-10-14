@@ -11,7 +11,7 @@ import inspect
 import pytest
 
 from vllm_omni.engine.duplex import events as events_module
-from vllm_omni.engine.duplex.commands import ClearOutputAudio, TruncateItem
+from vllm_omni.engine.duplex.commands import ClearOutputAudio, Commit, TruncateItem
 from vllm_omni.engine.duplex.events import (
     REALTIME_ERROR_TYPES_BY_CODE,
     AudioDelta,
@@ -44,6 +44,7 @@ from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     project_internal_event,
     resolve_clear_output_audio,
+    resolve_commit,
     resolve_truncate_item,
     retrieve_item_events,
 )
@@ -142,6 +143,22 @@ def test_optional_wire_fields_are_omitted_when_none():
     bound_listen = Listen(session_id="sid", epoch=0, response_id="resp_1").to_realtime()
     assert bound_listen["response_id"] == "resp_1"
     assert bound_listen["response"]["id"] == "resp_1"
+
+
+def test_resolve_commit_preserves_omitted_response_create_for_runner_defaults():
+    state = RealtimeProjectionState(session_id="duplex-commit", model="qwen3-omni")
+    state.input_audio_buffer_has_audio = True
+
+    omitted = resolve_commit(state, Commit())
+
+    assert omitted.payload is not None
+    assert "response_create" not in omitted.payload
+
+    state.input_audio_buffer_has_audio = True
+    explicit_false = resolve_commit(state, Commit(create_response=False))
+
+    assert explicit_false.payload is not None
+    assert explicit_false.payload["response_create"] is False
 
 
 def test_error_event_maps_codes_to_openai_error_types_and_echoes_client_event_id():

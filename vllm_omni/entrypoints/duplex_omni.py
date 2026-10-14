@@ -43,6 +43,8 @@ from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionError,
     DuplexSessionEventMessage,
+    DuplexSessionFallbackCancelMessage,
+    DuplexSessionFallbackRequestMessage,
 )
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -281,8 +283,8 @@ class DuplexOmni(AsyncOmni):
 
     Construct it like ``AsyncOmni``. The pipeline must declare
     ``duplex_plugin`` and the deploy config ``session_mode: duplex``; the
-    engine raises at startup otherwise. There is no ``generate()``: duplex
-    serving is session-only.
+    engine raises at startup otherwise. Session commands and events remain
+    separate from ordinary chat requests on the inherited ``AsyncOmni`` API.
     """
 
     engine: DuplexOmniEngine
@@ -297,9 +299,18 @@ class DuplexOmni(AsyncOmni):
         self._handles: dict[str, DuplexSessionHandle] = {}
         #: Rollbacks of resumes whose caller was cancelled mid-RPC (see ``resume_session``).
         self._resume_compensations: set[asyncio.Task[None]] = set()
-        #: Initial and maximum delay between replays of an abandoned resume
-        #: whose answers keep timing out.
+        #: Initial and maximum delay between replays of an abandoned resume.
         self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
+        self._fallback_sink: (
+            Callable[[DuplexSessionFallbackRequestMessage | DuplexSessionFallbackCancelMessage], None] | None
+        ) = None
+
+    def set_fallback_sink(
+        self,
+        sink: Callable[[DuplexSessionFallbackRequestMessage | DuplexSessionFallbackCancelMessage], None] | None,
+    ) -> None:
+        """Register the API-side consumer for internal fallback messages."""
+        self._fallback_sink = sink
 
     # ---- deployment facts ----
 
@@ -320,8 +331,8 @@ class DuplexOmni(AsyncOmni):
 
     # ---- session lifecycle ----
 
-    @staticmethod
     def _resolve_session_config(
+        self,
         config: DuplexSessionConfig | Mapping[str, object] | None,
         *,
         model: str,
@@ -337,7 +348,11 @@ class DuplexOmni(AsyncOmni):
         elif isinstance(config, DuplexSessionConfig):
             resolved = config
         elif isinstance(config, Mapping):
-            resolved = DuplexSessionConfig.from_realtime(config, model=model)
+            resolved = DuplexSessionConfig.from_realtime(
+                config,
+                model=model,
+                supports_model_native_turn_policy=self.duplex_capabilities.supports_model_native_turn_policy,
+            )
         else:
             raise TypeError(f"unsupported duplex session config: {type(config).__name__}")
         if resolved.model is None:
@@ -599,6 +614,12 @@ class DuplexOmni(AsyncOmni):
     # ---- engine output routing ----
 
     def _route_engine_message(self, msg: object) -> bool:
+        if isinstance(msg, (DuplexSessionFallbackRequestMessage, DuplexSessionFallbackCancelMessage)):
+            if self._fallback_sink is None:
+                logger.warning("[DuplexOmni] dropping fallback message without an API sink")
+            else:
+                self._fallback_sink(msg)
+            return True
         if not isinstance(msg, DuplexSessionEventMessage):
             return False
         handle = self._handles.get(msg.session_id)
