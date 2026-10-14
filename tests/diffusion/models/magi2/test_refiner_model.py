@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.models.magi2 import common_layers as magi2_layers
 from vllm_omni.diffusion.models.magi2.common_layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.configuration_magi2 import Magi2RefinerConfig
 from vllm_omni.diffusion.models.magi2.modeling_magi2_refiner import Magi2RefinerTransformer
@@ -422,6 +423,35 @@ def test_layer_matches_reference_transcription_bitwise(layer_index: int, input_d
 
     assert actual.dtype == torch.float32
     assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)
+
+
+def test_cat_rows_copy_path_matches_torch_cat(monkeypatch: pytest.MonkeyPatch) -> None:
+    generator = torch.Generator().manual_seed(9)
+    parts = [torch.randn(rows, 6, generator=generator).to(_BF16) for rows in (3, 0, 5)]
+    monkeypatch.setattr(magi2_layers, "_CAT_ROWS_MAX_NUMEL", 1)
+    copied = magi2_layers.cat_rows(parts)
+    assert torch.equal(copied, torch.cat(parts, dim=0))
+    assert copied.dtype == _BF16
+
+
+def test_layer_is_bitwise_unchanged_when_concatenations_take_the_copy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _tiny_model()
+    grid, text_len = (9, 4, 8), 21
+    plan = build_window_attention_plan(grid, text_len)
+    generator = torch.Generator().manual_seed(5)
+    modality = torch.randint(0, 3, (plan.num_tokens,), generator=generator)
+    hidden = torch.randn(plan.num_tokens, model.config.hidden_size, generator=generator)
+    rope = model.pre_adapter.rope(torch.cat((_video_coords(grid), _text_coords(text_len))))
+    dispatcher = ModalityDispatcher(modality, 3)
+    metadata = AttentionMetadata(extra={"magi2_window_plan": plan, "magi2_split_sizes": [plan.num_tokens]})
+    permuted = dispatcher.permute(hidden)
+
+    with torch.no_grad():
+        expected = model.layers[0](permuted, rope, dispatcher, metadata)
+        monkeypatch.setattr(magi2_layers, "_CAT_ROWS_MAX_NUMEL", 1)
+        actual = model.layers[0](permuted, rope, dispatcher, metadata)
+
     assert torch.equal(actual, expected)
 
 
