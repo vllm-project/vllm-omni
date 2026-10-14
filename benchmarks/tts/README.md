@@ -344,17 +344,18 @@ benchmarks/tts/
 
 ### Chatterbox nightly and CUDA graph comparison
 
-`tests/dfx/perf/tests/test_chatterbox.json` is a separate H100 nightly matrix
-for Turbo and Original: default-voice latency, throughput and stress, plus a
-latency-only eager ablation. The paired servers differ only in stage 0's
-`enforce_eager`; stage 1 remains eager and FP32. Use the same dataset, seed,
-request count and hardware when comparing graph and eager results. These are
-end-to-end serving measurements, not isolated AR graph timings.
+The Chatterbox rows in `tests/dfx/perf/tests/test_tts.json`
+(`test_chatterbox_{turbo,original}_{graph,eager}`) run with the other TTS
+models' nightly perf cases: default-voice latency for Turbo and Original,
+each paired with a server that differs only in stage 0's `enforce_eager`;
+stage 1 remains eager and FP32. Use the same dataset, seed, request count
+and hardware when comparing graph and eager results. These are end-to-end
+serving measurements, not isolated AR graph timings.
 
 ```bash
 uv run python -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_chatterbox.json \
-  -m "full_model and H100 and cards_1"
+  --test-config-file tests/dfx/perf/tests/test_tts.json \
+  -m "full_model and H100 and cards_1" -k chatterbox
 ```
 
 Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
