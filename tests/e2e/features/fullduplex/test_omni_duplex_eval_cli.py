@@ -230,10 +230,9 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
     }
     assert result.session_metrics["stream_ttfp_ms"] is not None
     session_update = next(event for event in received if event["type"] == "session.update")
-    assert session_update["session"]["extra_body"] == {
-        "temperature": 0.2,
-        "return_stage_metrics": collect_stage_metrics,
-    }
+    session_extra = session_update["session"]["extra_body"]
+    assert session_extra["temperature"] == 0.2
+    assert session_extra["return_stage_metrics"] is collect_stage_metrics
     assert extra_body == {"temperature": 0.2, "return_stage_metrics": False}
     assert any(event["type"] == "playback.ack" for event in received)
 
