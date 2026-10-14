@@ -165,44 +165,72 @@ def _paced_overrides() -> dict[str, Any]:
     }
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", lingbot_world_v2_stepwise_server_params, indirect=True)
-def test_lingbot_world_v2_stepwise_paced_playback_bounds_lead(omni_server) -> None:
-    """Paced playback keeps the emitted lead within the window and gates chunks."""
+async def _paced_bounds_session(url: str, model: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Hold the playhead through the first chunk, then keep it caught up."""
+    import websockets
 
-    async def run() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        import websockets
+    events: list[dict[str, Any]] = []
+    media = bytearray()
+    received_seconds = 0.0
+    caught_up = False
+    async with websockets.connect(url, max_size=None, ping_interval=None) as websocket:
+        await websocket.send(json.dumps(_session_start(model, _first_frame(), _paced_overrides())))
+        while True:
+            message = await asyncio.wait_for(websocket.recv(), timeout=900)
+            if isinstance(message, bytes):
+                media.extend(message)
+                continue
+            event = json.loads(message)
+            events.append(event)
+            if event["type"] == "error":
+                pytest.fail(f"server returned an error event: {event}")
+            if event["type"] == "video.chunk_metadata" and event["kind"] == "media":
+                received_seconds += event["num_frames"] / 16.0
+                if not caught_up:
+                    # Let the engine hold the gated chunk for a while, then
+                    # report the playhead as fully caught up and keep it
+                    # there for the rest of the session.
+                    await asyncio.sleep(_PACED_HOLD_S)
+                    caught_up = True
+                await websocket.send(json.dumps({"type": "session.playback", "position_seconds": received_seconds}))
+            if event["type"] == "session.done":
+                return events, event
+    raise AssertionError("unreachable")
 
-        events: list[dict[str, Any]] = []
-        media = bytearray()
-        received_seconds = 0.0
-        caught_up = False
-        url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
-        async with websockets.connect(url, max_size=None, ping_interval=None) as websocket:
-            await websocket.send(json.dumps(_session_start(omni_server.model, _first_frame(), _paced_overrides())))
-            while True:
-                message = await asyncio.wait_for(websocket.recv(), timeout=900)
-                if isinstance(message, bytes):
-                    media.extend(message)
-                    continue
-                event = json.loads(message)
-                events.append(event)
-                if event["type"] == "error":
-                    pytest.fail(f"server returned an error event: {event}")
-                if event["type"] == "video.chunk_metadata" and event["kind"] == "media":
-                    received_seconds += event["num_frames"] / 16.0
-                    if not caught_up:
-                        # Let the engine hold the gated chunk for a while, then
-                        # report the playhead as fully caught up and keep it
-                        # there for the rest of the session.
-                        await asyncio.sleep(_PACED_HOLD_S)
-                        caught_up = True
-                    await websocket.send(json.dumps({"type": "session.playback", "position_seconds": received_seconds}))
-                if event["type"] == "session.done":
-                    return events, event
 
-    events, done = asyncio.run(run())
+async def _paced_stop_session(url: str, model: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Never report playback; stop while the engine holds the second chunk."""
+    import websockets
 
+    events: list[dict[str, Any]] = []
+    media = bytearray()
+    received_seconds = 0.0
+    stop_sent = False
+    async with websockets.connect(url, max_size=None, ping_interval=None) as websocket:
+        await websocket.send(json.dumps(_session_start(model, _first_frame(), _paced_overrides())))
+        while True:
+            message = await asyncio.wait_for(websocket.recv(), timeout=900)
+            if isinstance(message, bytes):
+                media.extend(message)
+                continue
+            event = json.loads(message)
+            events.append(event)
+            if event["type"] == "error":
+                pytest.fail(f"server returned an error event: {event}")
+            if event["type"] == "video.chunk_metadata" and event["kind"] == "media":
+                received_seconds += event["num_frames"] / 16.0
+                if not stop_sent and received_seconds > 0:
+                    # The engine is now gating the second chunk on a playhead
+                    # this client never reports; stop mid-wait instead.
+                    await websocket.send(json.dumps({"type": "session.stop"}))
+                    stop_sent = True
+            if event["type"] == "session.done":
+                assert stop_sent, "session finished before the paced wait engaged"
+                return events, event
+    raise AssertionError("unreachable")
+
+
+def _assert_paced_bounds_contract(events: list[dict[str, Any]], done: dict[str, Any]) -> None:
     media_chunks = [event for event in events if event["type"] == "video.chunk_metadata" and event["kind"] == "media"]
     assert [event["output_chunk_index"] for event in media_chunks] == list(range(_PACED_NUM_CHUNKS))
     for event in media_chunks:
@@ -215,51 +243,78 @@ def test_lingbot_world_v2_stepwise_paced_playback_bounds_lead(omni_server) -> No
     assert done["chunks"] >= _PACED_NUM_CHUNKS
 
 
+def _assert_paced_stop_contract(events: list[dict[str, Any]], done: dict[str, Any], url: str, model: str) -> None:
+    media_chunks = [event for event in events if event["type"] == "video.chunk_metadata" and event["kind"] == "media"]
+    assert 0 < len(media_chunks) < _PACED_NUM_CHUNKS
+    assert done["stopped"] is True
+    # Stop must not wait for the gated chunk or the idle timeout; the server
+    # reports the cancellation response latency on the stop terminal.
+    assert 0 <= done["stop_latency_s"] < 30.0
+    # An aborted paced session must not leave the engine paused for the next one.
+    followup_events, _media, followup_done = asyncio.run(_stream_session(url, model, _first_frame()))
+    assert followup_done["stopped"] is False
+    assert any(event["type"] == "video.chunk_metadata" for event in followup_events)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", lingbot_world_v2_stepwise_server_params, indirect=True)
+def test_lingbot_world_v2_stepwise_paced_playback_bounds_lead(omni_server) -> None:
+    """Paced playback keeps the emitted lead within the window and gates chunks."""
+
+    url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
+    events, done = asyncio.run(_paced_bounds_session(url, omni_server.model))
+    _assert_paced_bounds_contract(events, done)
+
+
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", lingbot_world_v2_stepwise_server_params, indirect=True)
 def test_lingbot_world_v2_stepwise_stop_during_paced_wait_releases_session(omni_server) -> None:
     """Stop during a backpressure wait aborts promptly and leaves the server usable."""
 
-    async def run() -> tuple[list[dict[str, Any]], dict[str, Any], float]:
-        import websockets
-
-        events: list[dict[str, Any]] = []
-        media = bytearray()
-        received_seconds = 0.0
-        stop_sent_at: float | None = None
-        url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
-        async with websockets.connect(url, max_size=None, ping_interval=None) as websocket:
-            await websocket.send(json.dumps(_session_start(omni_server.model, _first_frame(), _paced_overrides())))
-            while True:
-                message = await asyncio.wait_for(websocket.recv(), timeout=900)
-                if isinstance(message, bytes):
-                    media.extend(message)
-                    continue
-                event = json.loads(message)
-                events.append(event)
-                if event["type"] == "error":
-                    pytest.fail(f"server returned an error event: {event}")
-                if event["type"] == "video.chunk_metadata" and event["kind"] == "media":
-                    received_seconds += event["num_frames"] / 16.0
-                    if stop_sent_at is None and received_seconds > 0:
-                        # The engine is now gating the second chunk on a playhead
-                        # this client never reports; stop mid-wait instead.
-                        await websocket.send(json.dumps({"type": "session.stop"}))
-                        stop_sent_at = asyncio.get_running_loop().time()
-                if event["type"] == "session.done":
-                    assert stop_sent_at is not None, "session finished before the paced wait engaged"
-                    return events, event, asyncio.get_running_loop().time() - stop_sent_at
-
-    events, done, stop_latency = asyncio.run(run())
-
-    media_chunks = [event for event in events if event["type"] == "video.chunk_metadata" and event["kind"] == "media"]
-    assert 0 < len(media_chunks) < _PACED_NUM_CHUNKS
-    assert done["stopped"] is True
-    # Stop must not wait for the gated chunk or the idle timeout.
-    assert stop_latency < 30.0
-
-    # An aborted paced session must not leave the engine paused for the next one.
     url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
-    followup_events, _media, followup_done = asyncio.run(_stream_session(url, omni_server.model, _first_frame()))
-    assert followup_done["stopped"] is False
-    assert any(event["type"] == "video.chunk_metadata" for event in followup_events)
+    events, done = asyncio.run(_paced_stop_session(url, omni_server.model))
+    _assert_paced_stop_contract(events, done, url, omni_server.model)
+
+
+lingbot_world_v2_stepwise_tp2_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("lingbot_world_v2_stepwise_tp2.yaml"),
+        ),
+        id="lingbot_world_v2_stepwise_tp2",
+    )
+]
+
+lingbot_world_v2_stepwise_sp2_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("lingbot_world_v2_stepwise_sp2.yaml"),
+        ),
+        id="lingbot_world_v2_stepwise_sp2",
+    )
+]
+
+
+def _run_paced_contract(omni_server) -> None:
+    """Admission gating and mid-wait cancellation on the served topology."""
+    url = f"ws://{omni_server.host}:{omni_server.port}/v1/realtime/video"
+    _assert_paced_bounds_contract(*asyncio.run(_paced_bounds_session(url, omni_server.model)))
+    _assert_paced_stop_contract(*asyncio.run(_paced_stop_session(url, omni_server.model)), url, omni_server.model)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", lingbot_world_v2_stepwise_tp2_server_params, indirect=True)
+def test_lingbot_world_v2_stepwise_paced_contract_tp2(omni_server) -> None:
+    """The paced admission and cancellation contract holds across a TP=2 rank pair."""
+
+    _run_paced_contract(omni_server)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", lingbot_world_v2_stepwise_sp2_server_params, indirect=True)
+def test_lingbot_world_v2_stepwise_paced_contract_sp2(omni_server) -> None:
+    """The paced admission and cancellation contract holds across an SP=2 rank pair."""
+
+    _run_paced_contract(omni_server)

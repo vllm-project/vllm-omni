@@ -1,0 +1,42 @@
+# LingBot-World 2.0 stepwise deploy, ulysses sequence-parallel rank pair.
+#
+# Same contract as lingbot_world_v2_stepwise.yaml, with the DiT sequence
+# dimension sharded across two ranks (ulysses degree 2) and replicated
+# weights. The paced-session contract must hold unchanged on both ranks.
+
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: LingBotWorldCausalDMDPipeline
+    # LingBot runs on the AR-Diffusion engine (engine-level paged KV cache).
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    # One request, many streamed chunks. streaming_output implies step_execution,
+    # but both are stated here so the topology is readable on its own.
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 2
+      ulysses_degree: 2
+      ring_degree: 1
+    default_sampling_params:
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      # Multi-rank width sharding changes floating-point numerics at shard borders.
+      # Set false for full-frame VAE decode while keeping DiT sequence parallelism.
+      lingbot_vae_spatial_sharding: true
+      ar_diffusion_height: 480
+      ar_diffusion_width: 832
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: true
