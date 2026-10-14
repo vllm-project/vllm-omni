@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniSchedulingCoordinator.
 
-These tests use mock request objects and mock queues.  They do not require
-GPU, vLLM runtime, or any connector.
+These tests use real request objects and mock queues. They do not require
+a GPU, a model, or any connector.
 
 Chunk waiting (WAITING_FOR_CHUNK / process_pending_chunks) lives on
 OmniChunkTransferAdapter — see tests/distributed/omni_connectors/.
@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.v1.request import Request
 
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
@@ -53,20 +54,18 @@ if not hasattr(RequestStatus, "WAITING_FOR_INPUT"):
     RequestStatus = _RequestStatus  # type: ignore[misc,assignment]
 
 
-def _make_request(req_id: str, status: str = "waiting") -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_request(req_id: str, status: str = "waiting") -> Request:
+    request = Request(
         request_id=req_id,
-        external_req_id=req_id,
-        status=status,
-        additional_information=None,
         prompt_token_ids=[],
-        num_prompt_tokens=0,
-        num_computed_tokens=0,
-        num_output_placeholders=0,
-        _all_token_ids=[],
-        _output_token_ids=[],
-        payload_sender_info=None,
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
     )
+    request.external_req_id = req_id
+    request.status = status
+    request.additional_information = None
+    request.payload_sender_info = None
+    return request
 
 
 class MockQueue:
@@ -231,6 +230,291 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req.num_prompt_tokens, 4)
         self.assertEqual(req._all_token_ids, [1, 2, 3, 4])
         self.assertEqual(req._output_token_ids, [])
+
+
+@pytest.mark.parametrize("codes", [[], torch.empty((0, 16), dtype=torch.long)])
+@pytest.mark.parametrize("prompt_len", [None, 4])
+def test_empty_generation_snapshot_clears_previous_input(codes, prompt_len, mocker):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    init_none_hash(sha256)
+    request = Request(
+        request_id="r1",
+        prompt_token_ids=[1] * 8,
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+    request.append_output_token_ids([99])
+    request.num_computed_tokens = 8
+    old_ids = request.all_token_ids
+    prepare = mocker.spy(coord_mod, "prepare_request_input")
+    coordinator = OmniSchedulingCoordinator(stage_id=2)
+
+    coordinator.update_request_metadata(
+        {"r1": request},
+        {"r1": {"code_predictor_codes": codes, "next_stage_prompt_len": prompt_len}},
+        model_mode="generation",
+    )
+
+    assert prepare.call_count == 1
+    assert prepare.call_args.kwargs["prompt_token_ids"] == []
+    assert request.prompt_token_ids == []
+    assert request.num_prompt_tokens == request.num_computed_tokens == 0
+    assert list(request.all_token_ids) == list(request.output_token_ids) == []
+    assert request.block_hashes == []
+    assert list(old_ids) == [1] * 8 + [99]
+
+
+@pytest.mark.parametrize("metadata", [{}, {"code_predictor_codes": None}])
+def test_missing_generation_snapshot_preserves_input(metadata, mocker):
+    request = _make_request("r1")
+    request.append_output_token_ids([99])
+    request.num_computed_tokens = 1
+    old_ids = request.all_token_ids
+    prepare = mocker.spy(coord_mod, "prepare_request_input")
+
+    OmniSchedulingCoordinator(stage_id=2).update_request_metadata(
+        {"r1": request}, {"r1": metadata}, model_mode="generation"
+    )
+
+    prepare.assert_not_called()
+    assert request.all_token_ids is old_ids
+    assert list(request.output_token_ids) == [99]
+    assert request.num_computed_tokens == 1
+
+
+@pytest.mark.parametrize("prompt_len", [None, 4, 12])
+@pytest.mark.parametrize("codes", [[1, 2, 3, 4], [[1, 2], [3, 4]], torch.tensor([[1, 2], [3, 4]])])
+def test_generation_notice_hashes_actual_codec_input_once(prompt_len, codes, mocker):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    request = Request(
+        request_id="r1",
+        prompt_token_ids=[0] * 8,
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=hasher,
+    )
+    old_ids = request.all_token_ids
+    prepare = mocker.spy(coord_mod, "prepare_request_input")
+    coordinator = OmniSchedulingCoordinator(stage_id=2)
+    coordinator.update_request_metadata(
+        {"r1": request},
+        {
+            "r1": {
+                "next_stage_prompt_len": prompt_len,
+                "code_predictor_codes": codes,
+                "left_context_size": 2,
+                "input_terminal": True,
+            }
+        },
+        model_mode="generation",
+    )
+    fresh = Request(
+        request_id="fresh",
+        prompt_token_ids=[1, 2, 3, 4],
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        block_hasher=hasher,
+    )
+    assert prepare.call_count == 1
+    assert prepare.call_args.kwargs["prompt_token_ids"] == [1, 2, 3, 4]
+    assert list(request.all_token_ids) == [1, 2, 3, 4]
+    assert list(old_ids) == [0] * 8
+    assert request.block_hashes == fresh.block_hashes
+    assert request._omni_initial_model_buffer == {"meta": {"left_context_size": 2}}
+    assert coordinator.input_terminal_req_ids == {"r1"}
+
+
+@pytest.mark.parametrize(
+    "codes",
+    [[-1], [1.5], [True], ["1"], [float("inf")], [{}], [[[1]]], torch.tensor([[1.5]])],
+    ids=["negative", "float", "bool", "string", "infinity", "mapping", "extra-dimension", "float-tensor"],
+)
+def test_invalid_generation_codes_do_not_install_length_only_input(codes):
+    request = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
+    coordinator = OmniSchedulingCoordinator(stage_id=2)
+    before = dict(request.__dict__)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        coordinator.update_request_metadata(
+            {"r1": request},
+            {"r1": {"next_stage_prompt_len": 4, "code_predictor_codes": codes, "input_terminal": True}},
+            model_mode="generation",
+        )
+    assert request.__dict__ == before
+    assert not coordinator.input_terminal_req_ids
+
+
+@pytest.mark.parametrize("new_length", [4, 12])
+def test_initial_length_finalization_rebuilds_real_block_hashes(new_length):
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    request = Request(
+        request_id="r1",
+        prompt_token_ids=[0] * 8,
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller",
+    )
+    old_ids = request.all_token_ids
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    coordinator.update_request_metadata({"r1": request}, {"r1": {"next_stage_prompt_len": new_length}})
+    fresh = Request(
+        request_id="fresh",
+        prompt_token_ids=[0] * new_length,
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller",
+    )
+    assert request.block_hashes == fresh.block_hashes
+    assert list(request.all_token_ids) == [0] * new_length
+    assert list(old_ids) == [0] * 8
+    assert getattr(request, "_omni_segment_generation", 0) == 0
+    finalized_hashes = request.block_hashes
+    coordinator.update_request_metadata({"r1": request}, {"r1": {"next_stage_prompt_len": new_length}})
+    assert request.block_hashes is finalized_hashes
+    with pytest.raises(ValueError, match="finalized prompt length"):
+        coordinator.update_request_metadata({"r1": request}, {"r1": {"next_stage_prompt_len": new_length + 4}})
+    assert request.block_hashes is finalized_hashes
+    assert request.num_prompt_tokens == new_length
+
+
+@pytest.mark.parametrize("new_ids", [[11, 12, 13, 14], list(range(12))])
+def test_received_prompt_ids_finalize_hashes_once_and_reject_late_changes(new_ids):
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    request = Request(
+        request_id="r1",
+        prompt_token_ids=[0] * len(new_ids),
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller",
+    )
+    old_ids, old_hashes = request.all_token_ids, request.block_hashes
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    metadata = {"next_stage_prompt_ids": new_ids, "next_stage_prompt_len": len(new_ids)}
+    coordinator.update_request_metadata({"r1": request}, {"r1": metadata})
+    fresh = Request(
+        request_id="fresh",
+        prompt_token_ids=new_ids,
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller",
+    )
+    assert list(request.all_token_ids) == new_ids
+    assert request.block_hashes == fresh.block_hashes != old_hashes
+    assert list(old_ids) == [0] * len(new_ids)
+    hashes = request.block_hashes
+    request.num_computed_tokens = 3
+    coordinator.update_request_metadata({"r1": request}, {"r1": metadata})
+    assert request.block_hashes is hashes
+    assert request.num_computed_tokens == 3
+    with pytest.raises(ValueError, match="conflicting finalized prompt IDs"):
+        coordinator.update_request_metadata({"r1": request}, {"r1": {"next_stage_prompt_ids": [999] * len(new_ids)}})
+    assert request.block_hashes is hashes
+    assert request.num_computed_tokens == 3
+
+
+@pytest.mark.parametrize("bad_ids", [[], [True], [-1], [1.5], "1", [None], [1]])
+def test_invalid_received_prompt_ids_do_not_resize_or_release_input(bad_ids):
+    request = _make_request("r1", status=RequestStatus.WAITING_FOR_INPUT)
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    old_ids, old_hashes = request.all_token_ids, request.block_hashes
+    with pytest.raises(ValueError):
+        coordinator.update_request_metadata(
+            {"r1": request},
+            {
+                "r1": {
+                    "next_stage_prompt_ids": bad_ids,
+                    "next_stage_prompt_len": 3,
+                    "input_terminal": True,
+                }
+            },
+        )
+    assert request.all_token_ids is old_ids
+    assert request.block_hashes is old_hashes
+    assert "r1" not in coordinator.input_terminal_req_ids
+
+
+def test_conditioning_notice_installs_salt_once_and_rejects_late_conflict():
+    from tests.core.sched.test_input_finalization import _request
+    from vllm_omni.core.sched.input_finalization import compose_conditioning_cache_salt
+
+    request = _request(None, [0] * 4, None)
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    metadata = {
+        "next_stage_prompt_ids": [11, 12, 13, 14],
+        "next_stage_prompt_len": 4,
+        "next_stage_conditioning_digest": "ab" * 32,
+    }
+    old_ids, old_hashes = request.all_token_ids, request.block_hashes
+    coordinator.update_request_metadata({"r1": request}, {"r1": metadata})
+    expected_salt = compose_conditioning_cache_salt("caller", "ab" * 32)
+    assert request.cache_salt == expected_salt
+    assert request._omni_original_cache_salt == "caller"
+    assert request._omni_conditioning_digest == "ab" * 32
+    assert request.block_hashes is not old_hashes
+    assert list(old_ids) == [0] * 4
+    final_hashes = request.block_hashes
+    request.num_computed_tokens = 2
+    coordinator.update_request_metadata({"r1": request}, {"r1": metadata})
+    coordinator.update_request_metadata({"r1": request}, {"r1": {"next_stage_prompt_len": 4}})
+    assert request.cache_salt == expected_salt
+    assert request.block_hashes is final_hashes
+    assert request.num_computed_tokens == 2
+    with pytest.raises(ValueError, match="conflicting finalized conditioning"):
+        coordinator.update_request_metadata(
+            {"r1": request},
+            {
+                "r1": {
+                    **metadata,
+                    "next_stage_conditioning_digest": "cd" * 32,
+                }
+            },
+        )
+    assert request.cache_salt == expected_salt
+    assert request.block_hashes is final_hashes
+    assert request.num_computed_tokens == 2
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"next_stage_conditioning_digest": "ab" * 32},
+        {"next_stage_conditioning_digest": "ab" * 32, "next_stage_prompt_len": 4},
+        {"next_stage_conditioning_digest": "ab" * 32, "next_stage_prompt_ids": [1, 2, 3, 4]},
+        {"next_stage_conditioning_digest": "bad", "next_stage_prompt_ids": [1, 2, 3, 4], "next_stage_prompt_len": 4},
+    ],
+)
+def test_partial_or_invalid_conditioning_notice_has_no_visible_effect(metadata):
+    from tests.core.sched.test_input_finalization import _request
+
+    request = _request(None, [0] * 8, None)
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    before = dict(request.__dict__)
+    with pytest.raises(ValueError):
+        coordinator.update_request_metadata({"r1": request}, {"r1": {**metadata, "input_terminal": True}})
+    assert request.__dict__ == before
+    assert not coordinator.input_terminal_req_ids
 
 
 class TestWaitingForInputTransition(unittest.TestCase):

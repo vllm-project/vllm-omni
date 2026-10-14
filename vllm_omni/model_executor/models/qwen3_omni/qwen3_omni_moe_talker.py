@@ -194,6 +194,34 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
         return result_codes, summed_embeddings
 
+    def replay_codec_embeddings(self, codes: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        """Embed complete, already validated RVQ rows without sampling again.
+
+        Match ``code_predictor_forward``'s buffer dtype, layout and reduction:
+        sum in predictor precision, then convert to the Talker input dtype.
+        In particular, adding group embeddings one by one in the destination
+        dtype is not equivalent. No previous Talker hidden state is needed.
+        """
+        if codes.ndim != 2 or codes.shape[1] != self.num_code_groups or codes.dtype != torch.long:
+            raise ValueError("Talker replay requires complete int64 codec rows")
+        predictor = self.code_predictor
+        model_dtype = next(predictor.model.parameters()).dtype
+        projection = predictor.small_to_mtp_projection
+        residual_embeddings = predictor.get_input_embeddings()
+        if len(residual_embeddings) != self.num_code_groups - 1:
+            raise ValueError("Talker replay codebook count does not match the predictor")
+        batch_size = codes.shape[0]
+        proj_buf = torch.empty(
+            (batch_size, self.num_code_groups + 1, self.config.code_predictor_config.hidden_size),
+            device=codes.device,
+            dtype=model_dtype,
+        )
+        primary = self.language_model.model.codec_embedding(codes[:, :1])
+        proj_buf[:, 1, :] = projection(primary.to(model_dtype)).reshape(batch_size, -1)
+        for group, embed in enumerate(residual_embeddings, start=1):
+            proj_buf[:, group + 1, :] = projection(embed(codes[:, group : group + 1])).reshape(batch_size, -1)
+        return proj_buf[:, 1:, :].sum(dim=1).to(dtype=dtype)
+
     def project_thinker_outputs(
         self,
         thinker_embeds: torch.Tensor | None = None,

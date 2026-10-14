@@ -38,6 +38,11 @@ class FullAttentionGroupView:
     def batch_req_ids(self) -> list[str]:
         return list(self._input_batch.req_ids)
 
+    def token_range(self, req_id: str, num_scheduled: int) -> tuple[int, int]:
+        index = self._input_batch.req_id_to_index[req_id]
+        start = int(self._input_batch.num_computed_tokens_cpu[index])
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor:
         """This step's slot mapping, computed on CPU from the block table.
 
@@ -157,6 +162,65 @@ def check_prefix_cache_token_accounting(cache_config: object, speculative_config
         )
 
 
+def is_qwen3_omni_talker_model(model_config: object) -> bool:
+    architecture = getattr(model_config, "model_arch", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = getattr(model_config, "architectures", None) or getattr(hf_config, "architectures", ()) or ()
+    return (
+        architecture == "Qwen3OmniMoeTalkerForConditionalGeneration"
+        or ("Qwen3OmniMoeTalkerForConditionalGeneration" in architectures)
+        or (
+            getattr(model_config, "model_stage", None) == "talker"
+            and (
+                architecture == "Qwen3OmniMoeForConditionalGeneration"
+                or "Qwen3OmniMoeForConditionalGeneration" in architectures
+            )
+        )
+    )
+
+
+def check_qwen3_omni_talker_request_local_scope(
+    *,
+    cache_config: object,
+    scheduler_config: object,
+    model_config: object,
+    parallel_config: object = None,
+    speculative_config: object = None,
+    kv_transfer_config: object = None,
+) -> None:
+    """Reject request-local Talker cache modes outside the qualified scope."""
+    if not getattr(cache_config, "enable_prefix_caching", False) or not is_qwen3_omni_talker_model(model_config):
+        return
+    if kv_transfer_config is not None:
+        raise OmniPrefixCacheUnmatchError(
+            "Qwen3-Omni Talker request-local replay does not support external KV transfer"
+        )
+    if getattr(model_config, "async_chunk", False):
+        raise OmniPrefixCacheUnmatchError("Qwen3-Omni Talker request-local replay requires a full payload")
+    if speculative_config is not None:
+        raise OmniPrefixCacheUnmatchError(
+            "Qwen3-Omni Talker prefix caching is request-local and does not support speculative decoding"
+        )
+    if bool(getattr(scheduler_config, "async_scheduling", False)):
+        raise OmniPrefixCacheUnmatchError(
+            "Qwen3-Omni Talker prefix caching is request-local and requires sync scheduling"
+        )
+    if parallel_config is not None:
+        if (
+            getattr(parallel_config, "prefill_context_parallel_size", 1) != 1
+            or getattr(parallel_config, "decode_context_parallel_size", 1) != 1
+        ):
+            raise OmniPrefixCacheUnmatchError(
+                "Qwen3-Omni Talker request-local replay does not support context parallel"
+            )
+        tensor_parallel_size = int(getattr(parallel_config, "tensor_parallel_size", 1))
+        pipeline_parallel_size = int(getattr(parallel_config, "pipeline_parallel_size", 1))
+        if tensor_parallel_size != 1 or pipeline_parallel_size != 1:
+            raise OmniPrefixCacheUnmatchError(
+                "Qwen3-Omni Talker prefix caching is request-local and requires TP=1 and PP=1"
+            )
+
+
 def stage_prefix_cache_config(
     *,
     kv_cache_config: object,
@@ -178,6 +242,21 @@ def stage_prefix_cache_config(
     """
     if not getattr(cache_config, "enable_prefix_caching", False) or is_pooling_model:
         return None
+    check_qwen3_omni_talker_request_local_scope(
+        cache_config=cache_config,
+        scheduler_config=scheduler_config,
+        model_config=model_config,
+        speculative_config=speculative_config,
+        kv_transfer_config=kv_transfer_config,
+    )
+    if is_qwen3_omni_talker_model(model_config):
+        # Request-local generated history is still an isolated candidate.
+        # Keep the public gate closed until checkpoint, pipeline, accuracy and
+        # performance qualification is complete for the declared sync scope.
+        raise OmniPrefixCacheUnmatchError(
+            "Qwen3-Omni Talker prefix caching is not yet publicly supported; "
+            "request-local generated replay is still under qualification"
+        )
     check_prefix_cache_kv_transfer(kv_transfer_config)
     check_prefix_cache_token_accounting(cache_config, speculative_config)
     check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))

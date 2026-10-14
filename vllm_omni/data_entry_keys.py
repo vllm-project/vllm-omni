@@ -13,7 +13,7 @@ Categories under ``OmniPayload``:
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 import msgspec
 import numpy as np
@@ -100,6 +100,10 @@ class OmniPayloadMeta(TypedDict, total=False):
     next_stage_generation_tokens: int
     replace_streaming_prompt: bool
     next_stage_prompt_ids: list[int]
+    next_stage_conditioning_digest: str
+    next_stage_source_digest: str
+    next_stage_source_identity_error: str
+    talker_prefill_plan: list[tuple[Literal["user", "assistant"], int, int]]
     streaming_prompt_recompute: bool
     streaming_condition_seq: int
     replace_runtime_additional_information: bool
@@ -216,6 +220,10 @@ class MetaStruct(_StructBase):
     next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None
     next_stage_prompt_ids: list[int] | None = None
+    next_stage_conditioning_digest: str | None = None
+    next_stage_source_digest: str | None = None
+    next_stage_source_identity_error: str | None = None
+    talker_prefill_plan: list[tuple[Literal["user", "assistant"], int, int]] | None = None
     streaming_prompt_recompute: bool | None = None
     streaming_condition_seq: int | None = None
     replace_runtime_additional_information: bool | None = None

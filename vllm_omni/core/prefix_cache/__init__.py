@@ -33,7 +33,9 @@ from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
     check_prefix_cache_kv_transfer,
+    check_qwen3_omni_talker_request_local_scope,
     get_prefix_cache_group_view,
+    is_qwen3_omni_talker_model,
     stage_prefix_cache_config,
 )
 from vllm_omni.core.prefix_cache.interface import (
@@ -67,6 +69,8 @@ __all__ = [
     "WriteSchedule",
     "check_prefix_cache_kv_groups",
     "check_prefix_cache_kv_transfer",
+    "check_qwen3_omni_talker_request_local_scope",
     "get_prefix_cache_group_view",
+    "is_qwen3_omni_talker_model",
     "stage_prefix_cache_config",
 ]
