@@ -143,7 +143,8 @@ def test_v2_payload_identity_commits_codes_before_the_next_timeline_step(monkeyp
 
     talker, session = _make_talker(step=1, rows_through_step=0)
     talker._hidden, talker._vocab = HID, 8
-    talker._mog_graph = SimpleNamespace(run=lambda hidden: torch.full((1, 1, Q), float(hidden.sum())))
+    talker._native_guidance = False
+    talker._mog_graphs = {1: SimpleNamespace(run=lambda hidden: torch.full((1, 1, Q), float(hidden.sum())))}
     session.update(prompt_len=0, generation_config={}, codec_request_id="req")
     monkeypatch.setattr(talker, "_refresh_native_timeline", lambda *_: None)
     buffer = OmniIntermediateBuffer(2)
