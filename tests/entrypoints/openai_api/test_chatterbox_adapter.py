@@ -118,8 +118,14 @@ def serving(client: SimpleNamespace) -> OmniOpenAIServingSpeech:
 
 
 @pytest.fixture
-def server(model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[OmniOpenAIServingSpeech]:
-    """The speech server for Turbo's deploy file; uploaded voices are kept under the test's directory."""
+def server(
+    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
+) -> Iterator[OmniOpenAIServingSpeech]:
+    """The speech server for Turbo's deploy file; uploaded voices are kept under the test's directory.
+
+    Every server shares the process-wide speaker cache, which the repository's
+    ``clean_speaker_cache`` fixture resets around the test.
+    """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
     speech = serving(engine_client(model_dir, DEPLOY["turbo"]))
     yield speech
@@ -374,7 +380,7 @@ async def test_shutdown_cancels_encoder_waiters(adapter):
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["runtime_config", "engine_args"])
 def test_conditioning_device_is_explicit_in_stage_config(
-    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy: bool
+    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None, legacy: bool
 ) -> None:
     """The high-concurrency deploy file puts the reference encoders on the GPU, in either stage config form."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
@@ -385,7 +391,9 @@ def test_conditioning_device_is_explicit_in_stage_config(
         speech.shutdown()
 
 
-def test_unsupported_conditioning_device_is_rejected(model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_unsupported_conditioning_device_is_rejected(
+    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
+):
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
     high_concurrency = Path(get_deploy_config_path("chatterbox_turbo_high_concurrency.yaml"))
     deploy = modify_stage_config(
