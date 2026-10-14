@@ -24,7 +24,10 @@ from vllm_omni.diffusion.media import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -413,7 +416,16 @@ def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypa
     runner = _make_runner(cache_backend=None, cache_backend_name="none")
     runner.pipeline = _SingleRequestDiffusionOutputPipeline()
     runner.state_cache = {"aborted-step-request": object()}
-    old_step_batch = object()
+    old_step_batch = InputBatch.make_batch(
+        [
+            StepRequestState(
+                request_id="aborted-step-request",
+                sampling=OmniDiffusionSamplingParams(),
+                latents=torch.zeros(1, 1),
+                timesteps=torch.ones(1),
+            )
+        ]
+    )
     runner.input_batch = old_step_batch
     runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
     runner.remove_diffusion_kv_requests = Mock()
@@ -1445,7 +1457,11 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
 @pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize("cancel_all", [False, True])
-def test_execute_model_batch_cancellation_preserves_live_peer(monkeypatch, cancel_all):
+@pytest.mark.parametrize("stage_dispatch", [False, True])
+@pytest.mark.parametrize("cancel_during_execution", [False, True])
+def test_execute_model_batch_cancellation_preserves_live_peer(
+    monkeypatch, cancel_all, stage_dispatch, cancel_during_execution
+):
     from vllm_omni.diffusion.cancellation import (
         RequestCancellationRegistry,
         check_request_cancellation,
@@ -1458,20 +1474,31 @@ def test_execute_model_batch_cancellation_preserves_live_peer(monkeypatch, cance
         supports_request_cancellation = True
 
         def forward(self, batch):
+            if cancel_during_execution:
+                registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
             check_request_cancellation()
             return super().forward(batch)
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     pipeline = CancellableBatchPipeline(outputs=[DiffusionOutput(output="a"), DiffusionOutput(output="b")])
+    if stage_dispatch:
+        stage_call = Mock(side_effect=pipeline.forward)
+        forward_call = Mock(side_effect=AssertionError("Stage dispatch must not call forward"))
+        monkeypatch.setattr(pipeline, "run_stage", stage_call, raising=False)
+        monkeypatch.setattr(pipeline, "forward", forward_call)
     runner = _make_batch_runner(pipeline)
     sched = _make_scheduler_output(num_reqs=2)
     registry = RequestCancellationRegistry()
     try:
         for entry in sched.scheduled_new_reqs:
             entry.req.cancellation_signal = registry.create(entry.request_id)
-        registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
+        if not cancel_during_execution:
+            registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
         result = runner.execute_model_batch(sched, runner.od_config)
+        if stage_dispatch:
+            assert stage_call.call_count == int(cancel_during_execution or not cancel_all)
+            forward_call.assert_not_called()
         assert len(result.runner_outputs) == 2
         assert [output.result.aborted for output in result.runner_outputs] == [cancel_all, cancel_all]
         if not cancel_all:
@@ -1505,3 +1532,40 @@ def test_non_step_fallback_keeps_client_error_status():
     assert output.result.error == "bad request option"
     assert output.result.error_status_code == 400
     assert output.result.error_type == "BadRequestError"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("status_code", [400, 422])
+def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_size, status_code):
+    error = OmniClientError("request rejected", status_code=status_code, error_type="ScheduleError")
+
+    class RejectingPipeline:
+        supports_request_batch = True
+
+        def forward(self, batch):
+            raise error
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = RejectingPipeline()
+    sched = _make_scheduler_output(batch_size)
+
+    if batch_size == 1:
+        outputs = [runner.execute_model(sched.scheduled_new_reqs[0].req)]
+    else:
+        result = runner.execute_model_batch(sched, runner.od_config)
+        assert [item.request_id for item in result.runner_outputs] == ["req-0", "req-1"]
+        outputs = [item.result for item in result.runner_outputs]
+
+    assert len({id(output) for output in outputs}) == batch_size
+    for output in outputs:
+        assert output.error == "request rejected"
+        assert output.error_status_code == status_code
+        assert output.error_type == "ScheduleError"
+        assert output.aborted is False
+
+    runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
+    assert runner.execute_model(_make_request()).output == "next request"

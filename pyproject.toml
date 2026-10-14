@@ -302,6 +302,7 @@ markers = [
     "H200: [hardware-resource] [cuda] Tests that require H200 GPU",
     "L4: [hardware-resource] [cuda] Tests that require L4 GPU",
     "B200: [hardware-resource] [cuda] Tests that require B200 GPU",
+    "RTX5090: [hardware-resource] [cuda] Tests that require an RTX 5090 GPU (SM120, compute capability 12.0)",
     "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
     "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",
     "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",

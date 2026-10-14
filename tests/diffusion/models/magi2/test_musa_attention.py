@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tests.diffusion.models.magi2.test_native_preview import _initialize_tiny_model, _tiny_config
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.magi2 import attention
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer, Modality
@@ -218,7 +219,7 @@ def test_cuda_still_uses_bundled_version_selection(monkeypatch):
     assert bundled.call_args.kwargs["fa_version"] == 2
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim,kv_heads,sink_count,softcap", [(64, 4, 0, -1.0), (128, 2, 1, -1.0), (64, 2, 2, 2.0)])
 def test_real_musa_fa3_matches_sink_oracle(monkeypatch, dtype, head_dim, kv_heads, sink_count, softcap):
@@ -260,7 +261,7 @@ def test_real_musa_fa3_matches_sink_oracle(monkeypatch, dtype, head_dim, kv_head
     torch.testing.assert_close(actual.cpu(), expected, **tolerance)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sink_count", [1, 2])
 def test_real_musa_fa3_matches_sink_oracle_across_tiles(monkeypatch, dtype, sink_count):
@@ -287,7 +288,7 @@ def test_real_musa_fa3_matches_sink_oracle_across_tiles(monkeypatch, dtype, sink
     torch.testing.assert_close(actual.cpu(), expected, **tolerance)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_real_musa_tiny_transformer_uses_exact_short_sequence_fallback(monkeypatch):
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")

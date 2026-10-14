@@ -53,8 +53,6 @@ def load_codec(
     load_config: LoadConfig,
     num_quantizers: int,
     attention_backend: str = "sdpa",
-    skip_empty_tiles: bool = False,
-    fused_slots: bool = False,
 ) -> tuple[PretrainedConfig, nn.Module]:
     """Load and prepare a codec without creating stream state or CUDA graphs."""
     logger.info("Loading MOSS Audio Tokenizer from %s directly on %s", codec_path, device)
@@ -160,19 +158,16 @@ def load_codec(
                 slot_ring_attention_rows,
             )
 
-            if skip_empty_tiles and fused_slots:
-                raise ValueError("codec_skip_empty_attention_tiles requires unfused slot attention")
-            if skip_empty_tiles:
-                slot_ring_attention = partial(slot_ring_attention, skip_empty_tiles=True)
-                logger.info("MOSS codec slot attention: skipping empty tiles for T <= 32")
+            slot_ring_attention = partial(slot_ring_attention, skip_empty_tiles=True)
+            slot_ring_attention_rows = partial(slot_ring_attention_rows, skip_empty_tiles=True)
+            logger.info("MOSS codec slot attention: skipping empty tiles for T <= 32")
 
         for module in codec.decoder.modules():
             if isinstance(module, MossAudioTokenizerMultiheadAttention):
                 module._streaming_attention = masked_attention
                 if attention_backend == "triton_slot":
                     module._slot_attention = slot_ring_attention
-                    if fused_slots:
-                        module._slot_attention_rows = slot_ring_attention_rows
+                    module._slot_attention_rows = slot_ring_attention_rows
         logger.info("Enabled codec attention backend=%s", attention_backend)
     build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
     if callable(build_decode_lut):
@@ -193,15 +188,10 @@ def _build_codec(codec_path: str) -> tuple[PretrainedConfig, nn.Module]:
     is_v2 = config_dict.get("number_channels", 1) >= 2
 
     if is_v2:
-        try:
-            codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
-            codec = MossAudioTokenizerV2Model(codec_cfg)
-            logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
-            return codec_cfg, codec
-        except Exception:
-            logger.exception(
-                "Failed to instantiate vendored MOSS Audio Tokenizer v2; falling back to legacy vendored codec."
-            )
+        codec_cfg = MossAudioTokenizerV2Config.from_pretrained(codec_path)
+        codec = MossAudioTokenizerV2Model(codec_cfg)
+        logger.info("Using vendored MOSS Audio Tokenizer v2 classes from %s", codec_path)
+        return codec_cfg, codec
 
     codec_cfg = MossAudioTokenizerConfig.from_pretrained(codec_path)
     codec = MossAudioTokenizerModel(codec_cfg)
@@ -250,6 +240,8 @@ class _MossCodecStreamSession:
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
         scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
+        if isinstance(codec, MossAudioTokenizerV2Model):
+            scratch_capacity = 1
         self._total_state_capacity = self._state_capacity + scratch_capacity
         self._state_slot_ids = torch.arange(
             self._total_state_capacity,
@@ -269,6 +261,12 @@ class _MossCodecStreamSession:
                 initialize_state_pool(self._state_capacity, scratch_capacity, chunk_frames=self._chunk_frames)
             else:
                 initialize_state_pool(self._state_capacity, scratch_capacity)
+        logger.info(
+            "MOSS codec decoder state pool: live=%d padding=%d shared_metadata=%s",
+            self._state_capacity,
+            scratch_capacity,
+            getattr(codec, "_decoder_null_slot", None) is not None,
+        )
         if batch_sizes and frame_sizes and self._device.type in ("cuda", "npu"):
             if self._device.type == "npu":
                 from vllm_omni.platforms.npu.models.moss_tts_streaming_decode_wrapper import (
@@ -294,8 +292,6 @@ class _MossCodecStreamSession:
                 )
             self._cudagraph_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
-            if not self._cudagraph_wrapper.is_ready:
-                self._cudagraph_wrapper = None
 
     def acquire(self) -> int | None:
         if not self._free_stream_slots:
@@ -1134,9 +1130,16 @@ class MossTTSCodecDecoder(nn.Module):
             load_config=self.vllm_config.load_config,
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
-            skip_empty_tiles=bool(self._connector_int("codec_skip_empty_attention_tiles", default=0)),
-            fused_slots=bool(self._connector_int("codec_fused_slot_attention", default=0)),
         )
+        if device.type in ("cuda", "npu"):
+            from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
+
+            shared = 0
+            for module in codec.decoder.modules():
+                if isinstance(module, MossAudioTokenizerTransformer) and module.rope is not None:
+                    module._shared_rope = True
+                    shared += 1
+            logger.info("MOSS codec shared RoPE table: %d decoder transformers", shared)
         self._codec = codec
         inferred_channels = 2 if "v2" in self._codec_path.lower() else 1
         self._n_channels = int(

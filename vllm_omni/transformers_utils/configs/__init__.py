@@ -18,6 +18,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Mammothmoda2Qwen2_5_VLConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLTextConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLVisionConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
+    "FishOmniConfig": "vllm_omni.transformers_utils.configs.fish_omni",
     "FishSpeechConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechSlowARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechFastARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
@@ -49,6 +50,7 @@ __all__ = [
     "Mammothmoda2Qwen2_5_VLConfig",
     "Mammothmoda2Qwen2_5_VLTextConfig",
     "Mammothmoda2Qwen2_5_VLVisionConfig",
+    "FishOmniConfig",
     "FishSpeechConfig",
     "FishSpeechSlowARConfig",
     "FishSpeechFastARConfig",
@@ -88,6 +90,7 @@ def __dir__():
 from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import fish_omni as _fish_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402

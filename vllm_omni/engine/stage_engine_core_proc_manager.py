@@ -76,6 +76,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
         omni_parallel_stage_init: bool = False,
+        omni_handshake_timeout_s: float | None = None,
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
@@ -101,6 +102,8 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
             "omni_coordinator_address": omni_coordinator_address,
             "omni_parallel_stage_init": bool(omni_parallel_stage_init),
         }
+        if omni_handshake_timeout_s is not None:
+            common_kwargs["omni_handshake_timeout_s"] = omni_handshake_timeout_s
 
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address

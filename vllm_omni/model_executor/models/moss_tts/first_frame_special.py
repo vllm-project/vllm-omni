@@ -11,18 +11,28 @@ from torch import nn
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as libdevice
 
+from vllm_omni.platforms import current_omni_platform
+
 from .audio_tokenizer_v2 import MossAudioTokenizerMultiheadAttention
+
+_CUDA_RN_OPS = current_omni_platform.is_cuda()
 
 
 @triton.jit
-def _rotate(value, partner, dim, position, scale: tl.constexpr):
+def _rotate(value, partner, dim, position, scale: tl.constexpr, cuda_rn_ops: tl.constexpr = _CUDA_RN_OPS):
     angle = libdevice.exp((dim // 2).to(tl.float32) * scale) * position.to(tl.float32)
     cosine = libdevice.cos(angle)
     sine = libdevice.sin(angle)
+    value_fp32 = value.to(tl.float32)
     signed_partner = tl.where(dim % 2 == 0, -partner.to(tl.float32), partner.to(tl.float32))
-    return libdevice.add_rn(libdevice.mul_rn(value.to(tl.float32), cosine), libdevice.mul_rn(signed_partner, sine)).to(
-        value.dtype
-    )
+    if cuda_rn_ops:
+        rotated = libdevice.add_rn(
+            libdevice.mul_rn(value_fp32, cosine),
+            libdevice.mul_rn(signed_partner, sine),
+        )
+    else:
+        rotated = value_fp32 * cosine + signed_partner * sine
+    return rotated.to(value.dtype)
 
 
 @triton.jit

@@ -136,6 +136,18 @@ def test_config_cannot_close_its_script_element():
     assert "\\u003c/script>" in page
 
 
+def test_joyai_profile_defaults_and_static_asset():
+    client = TestClient(build_app(profile="joyai-turn"))
+    page = client.get("/").text
+    assert '"profile": "joyai-turn"' in page
+    assert '"model": "jdopensource/JoyAI-VL-Interaction-Preview"' in page
+    assert '"refAudio": null' in page
+    assert "joyai_turn.js" in page
+    assert client.get("/static/profiles/joyai_turn.js").status_code == 200
+    with pytest.raises(ValueError, match="ref-audio"):
+        build_app(profile="joyai-turn", ref_audio="unused.wav")
+
+
 def test_proxy_reports_unreachable_backend(monkeypatch):
     from examples.online_serving.realtime_web import server as shared_server
 

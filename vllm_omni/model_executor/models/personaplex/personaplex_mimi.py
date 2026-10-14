@@ -19,8 +19,8 @@ provided that; this module removes the dependency by combining:
   * transformer: the encoder/decoder transformers use a 250-position sliding
     context over a ring KV with absolute-offset RoPE. Hugging Face's cache path
     diverges once the window engages (position 250), so the transformers are
-    reimplemented here on the same ring-KV design as
-    ``personaplex_temporal.py`` and loaded directly from the PersonaPlex
+    reimplemented here on the ring KV from ``personaplex_temporal.py``
+    and loaded directly from the PersonaPlex
     checkpoint's fused layout (LayerNorm + per-layer LayerScale + GELU FFN).
 
 All per-stream state is ``[B, ...]`` with per-row reset (``reset_slot``), so the

@@ -38,7 +38,7 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-SERVER_STARTUP_TIMEOUT_S = 1200
+SERVER_STARTUP_TIMEOUT_S = 2400
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
