@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
+from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import (
+    HEAD_KEYS,
     ChatterboxT3ForConditionalGeneration,
     T3Heads,
     prefill_embeds,
-    prefill_slice,
     speech_logits,
     split_t3_weights,
 )
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
+from vllm_omni.model_executor.models.chatterbox.original_heads import OriginalHeads
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -63,63 +67,61 @@ def test_prefill_layout_follows_the_conditioning_length(
     assert torch.equal(embeds[-1], heads.speech_emb.weight[config.start_speech_token])
 
 
-def test_prefill_split_with_one_token_tail_matches_one_call(heads: T3Heads, config: ChatterboxConfig) -> None:
-    """However the scheduler splits the prompt, each span gets its own rows."""
-    text_ids = torch.tensor([5, 6, 7])
-    cond_tokens = torch.randint(0, 6561, (375,))
-    speaker = torch.randn(1, 256)
-    whole = prefill_embeds(heads, text_ids, cond_tokens, speaker, config.start_speech_token)
-    total = whole.shape[0]
-
-    head = prefill_slice(heads, config, text_ids, cond_tokens, speaker, 0, total - 1)
-    tail = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total - 1, 1)
-
-    assert torch.equal(torch.cat([head, tail]), whole)
-    # The one-token tail is the prompt's last row, not the embedding a decode
-    # step would give the same placeholder id.
-    assert torch.equal(tail[0], heads.speech_emb.weight[config.start_speech_token])
-
-
-def test_prefill_span_past_the_prompt_returns_only_the_prompt_rows(heads: T3Heads, config: ChatterboxConfig) -> None:
-    """A preempted request is recomputed from zero with its generated tokens in the span."""
-    text_ids = torch.tensor([5, 6, 7])
-    cond_tokens = torch.randint(0, 6561, (375,))
-    speaker = torch.randn(1, 256)
-    whole = prefill_embeds(heads, text_ids, cond_tokens, speaker, config.start_speech_token)
-    total = whole.shape[0]
-
-    from_zero = prefill_slice(heads, config, text_ids, cond_tokens, speaker, 0, total + 2)
-    inside = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total - 3, 5)
-
-    assert torch.equal(from_zero, whole)
-    assert torch.equal(inside, whole[-3:])
-
-
-def test_preprocess_embeds_the_generated_tokens_after_the_prompt(
-    talker: ChatterboxT3ForConditionalGeneration, heads: T3Heads, config: ChatterboxConfig
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        lambda total: (0, total),
+        lambda total: (0, total - 1),
+        lambda total: (total - 1, 1),
+        lambda total: (0, total + 2),
+        lambda total: (total - 3, 5),
+        lambda total: (10, total - 8),
+    ],
+    ids=[
+        "whole prompt",
+        "all but the last row",
+        "one-row tail",
+        "recomputed past the prompt",
+        "across the end",
+        "middle",
+    ],
+)
+def test_preprocess_embeds_each_scheduled_span_as_one_call_would(
+    talker: ChatterboxT3ForConditionalGeneration,
+    heads: T3Heads,
+    config: ChatterboxConfig,
+    schedule: Callable[[int], tuple[int, int]],
 ) -> None:
-    """The rows past the prompt are speech ids, embedded as a decode step would."""
+    """However the scheduler splits or recomputes the prompt, a span gets exactly its own rows.
+
+    Rows inside the prompt are the prompt's embedding; rows past it are the
+    speech ids a preempted request had generated, embedded as a decode step
+    would. ``schedule`` gives the tokens computed before the step and the
+    step's span from the prompt's length.
+    """
+    torch.manual_seed(0)
     text_ids = [5, 6, 7]
     cond_tokens = torch.randint(0, 6561, (375,))
     speaker = torch.randn(1, 256)
     whole = prefill_embeds(heads, torch.tensor(text_ids), cond_tokens, speaker, config.start_speech_token)
     total = whole.shape[0]
+    num_computed, span = schedule(total)
     generated = torch.tensor([11, 12])
-    input_ids = torch.cat([torch.full((total,), config.start_speech_token), generated])
+    every_id = torch.cat([torch.full((total,), config.start_speech_token), generated])
 
-    _, embeds, _ = talker.preprocess(
-        input_ids,
+    _, embeds, update = talker.preprocess(
+        every_id[num_computed : num_computed + span],
         None,
         _omni_is_prefill=True,
         _omni_prompt_len=total,
-        _omni_num_computed_tokens=0,
+        _omni_num_computed_tokens=num_computed,
         ids={"prompt": text_ids, "speech_token": cond_tokens.tolist()},
         embed={"voice": speaker},
     )
 
-    assert embeds.shape == (total + 2, config.hidden_size)
-    assert torch.equal(embeds[:total], whole)
-    assert torch.equal(embeds[total:], heads.speech_emb(generated))
+    assert embeds.shape == (span, config.hidden_size)
+    assert torch.equal(embeds, torch.cat([whole, heads.speech_emb(generated)])[num_computed : num_computed + span])
+    assert update == {}
 
 
 @pytest.mark.parametrize("text_len", [1, 3, 671])
@@ -178,6 +180,8 @@ def test_batched_decode_embedding_matches_per_request_preprocess(
     assert ids is input_ids
     assert embeds.shape == (3, config.hidden_size)
     assert torch.equal(embeds, torch.cat([row_embeds for _, row_embeds, _ in each]))
+    # Both are the speech table's rows: a decode row is a sampled speech id.
+    assert torch.equal(embeds, talker.heads.speech_emb.weight[input_ids])
     assert updates == [update for _, _, update in each] == [{}, {}, {}]
 
 
@@ -301,31 +305,31 @@ def test_logits_are_the_speech_heads_with_the_start_token_masked(heads: T3Heads,
     assert torch.isfinite(logits[:, config.stop_speech_token]).all()
 
 
-def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads() -> None:
-    weights = [
-        ("tfmr.h.0.attn.c_attn.weight", torch.zeros(1)),
-        ("tfmr.wte.weight", torch.zeros(1)),
-        ("tfmr.wpe.weight", torch.zeros(1)),
-        ("text_head.weight", torch.zeros(1)),
-        ("text_emb.weight", torch.zeros(1)),
-        ("speech_emb.weight", torch.zeros(1)),
-        ("speech_head.weight", torch.zeros(1)),
-        ("speech_head.bias", torch.zeros(1)),
-        ("cond_enc.spkr_enc.weight", torch.zeros(1)),
-        ("cond_enc.spkr_enc.bias", torch.zeros(1)),
+def test_the_key_map_fills_every_head_parameter_and_nothing_else(config: ChatterboxConfig) -> None:
+    assert sorted(HEAD_KEYS.values()) == sorted(T3Heads(config).state_dict())
+
+
+def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads(config: ChatterboxConfig) -> None:
+    """Every head tensor reaches its own parameter, by value; the backbone keeps its own."""
+    torch.manual_seed(1)
+    state = T3Heads(config).state_dict()
+    checkpoint = {name: state[parameter] for name, parameter in HEAD_KEYS.items()}
+    backbone_keys = ["tfmr.h.0.attn.c_attn.weight", "tfmr.wte.weight", "tfmr.wpe.weight"]
+    weights = [(name, torch.full((1,), float(i))) for i, name in enumerate(backbone_keys)]
+    weights += [("text_head.weight", torch.zeros(1)), *checkpoint.items()]
+
+    backbone, routed = split_t3_weights(iter(weights))
+
+    assert [(name, float(tensor)) for name, tensor in backbone] == [
+        ("h.0.attn.c_attn.weight", 0.0),
+        ("wte.weight", 1.0),
+        ("wpe.weight", 2.0),
     ]
-
-    backbone, heads = split_t3_weights(iter(weights))
-
-    assert [name for name, _ in backbone] == ["h.0.attn.c_attn.weight", "wte.weight", "wpe.weight"]
-    assert set(heads) == {
-        "text_emb.weight",
-        "speech_emb.weight",
-        "speech_head.weight",
-        "speech_head.bias",
-        "spkr_enc.weight",
-        "spkr_enc.bias",
-    }
+    heads = T3Heads(config)
+    heads.load_state_dict(routed, strict=True)
+    assert torch.equal(heads.speech_head.bias, checkpoint["speech_head.bias"])
+    assert torch.equal(heads.spkr_enc.weight, checkpoint["cond_enc.spkr_enc.weight"])
+    assert all(torch.equal(heads.state_dict()[parameter], state[parameter]) for parameter in HEAD_KEYS.values())
 
 
 def test_weight_routing_rejects_a_key_it_does_not_know() -> None:
@@ -338,3 +342,71 @@ def test_prefix_caching_is_refused_at_startup() -> None:
     vllm_config = SimpleNamespace(cache_config=SimpleNamespace(enable_prefix_caching=True))
     with pytest.raises(ValueError, match="enable_prefix_caching=False"):
         ChatterboxT3ForConditionalGeneration(vllm_config=vllm_config)
+
+
+class RecordingBackbone(nn.Module):
+    """vLLM's backbone loader as the stage sees it: it returns the names it loaded."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loaded: list[tuple[str, torch.Tensor]] = []
+
+    def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
+        self.loaded = list(weights)
+        return {name for name, _ in self.loaded}
+
+
+@pytest.mark.parametrize("variant", ["turbo", "original"])
+def test_load_weights_fills_the_heads_and_names_every_parameter(variant: str) -> None:
+    """vLLM fails the load on a parameter the returned set does not name.
+
+    The heads are loaded strictly, from the checkpoint's own names and
+    values; the backbone gets its keys without the ``tfmr.`` prefix.
+    """
+    config = ChatterboxConfig(variant)
+    config.hidden_size = 8
+    stage_cls, heads_cls = (
+        (ChatterboxT3ForConditionalGeneration, T3Heads) if variant == "turbo" else (ChatterboxOriginalT3, OriginalHeads)
+    )
+    stage = object.__new__(stage_cls)
+    nn.Module.__init__(stage)
+    stage.heads = heads_cls(config)
+    stage.tfmr = RecordingBackbone()
+    torch.manual_seed(2)
+    state = heads_cls(config).state_dict()
+    checkpoint = {name: state[parameter] for name, parameter in HEAD_KEYS.items()} if variant == "turbo" else state
+
+    loaded = stage.load_weights(
+        [("tfmr.layers.0.weight", torch.ones(1)), ("text_head.weight", torch.zeros(1)), *checkpoint.items()]
+    )
+
+    assert loaded == {"tfmr.layers.0.weight"} | {f"heads.{name}" for name in state}
+    assert [name for name, _ in stage.tfmr.loaded] == ["layers.0.weight"]
+    assert all(torch.equal(stage.heads.state_dict()[name], tensor) for name, tensor in state.items())
+
+
+def test_preprocess_embeds_in_the_heads_dtype_whatever_the_voices() -> None:
+    """Stage 0 runs in bfloat16 while the request's voice arrives as float32."""
+    config = ChatterboxConfig()
+    config.hidden_size = 16
+    torch.manual_seed(3)
+    stage = object.__new__(ChatterboxT3ForConditionalGeneration)
+    nn.Module.__init__(stage)
+    stage.config, stage.heads = config, T3Heads(config).to(torch.bfloat16)
+    speaker = torch.randn(1, 256)
+    cond_tokens = [1, 2, 3]
+    total = 1 + len(cond_tokens) + 2 + 1
+
+    _, embeds, _ = stage.preprocess(
+        torch.full((total,), config.start_speech_token),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=total,
+        _omni_num_computed_tokens=0,
+        ids={"prompt": [5, 6], "speech_token": cond_tokens},
+        embed={"voice": speaker},
+    )
+
+    assert embeds.dtype == torch.bfloat16
+    assert embeds.shape == (total, config.hidden_size)
+    assert torch.equal(embeds[0], stage.heads.spkr_enc(speaker.to(torch.bfloat16))[0])
