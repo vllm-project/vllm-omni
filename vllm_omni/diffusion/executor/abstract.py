@@ -193,6 +193,16 @@ class DiffusionExecutor(ABC):
             args=(unique_request_ids,),
         )
 
+    def release_step_requests(self, request_ids: list[str]) -> None:
+        """Retire request-local step state on every Worker at a wave boundary.
+
+        The default control RPC executes on all ranks and aggregates failures.
+        Native KV rows and Scheduler-owned allocations have separate lifetimes.
+        """
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        if unique_request_ids:
+            self.collective_rpc("release_step_requests", args=(unique_request_ids,))
+
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
         if scheduler_output.kv_prefetch_connector_metadata is not None:
             current = replace(
