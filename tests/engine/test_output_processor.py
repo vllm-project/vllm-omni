@@ -593,6 +593,25 @@ def test_final_only_consolidates_drainable_keys(mm_type):
     assert audio.shape == (800,)
 
 
+def test_final_only_audio_exposes_concatenated_public_waveform():
+    """Tensor-only model payloads become one public audio tensor, not a chunk list."""
+    state = _make_state(RequestOutputKind.FINAL_ONLY)
+    chunks = [torch.arange(4, dtype=torch.float32), torch.arange(4, 7, dtype=torch.float32)]
+    for chunk in chunks:
+        state.add_multimodal_tensor({"model_outputs": chunk, "sr": torch.tensor(24000)}, mm_type=AUDIO)
+        assert state.make_request_output([1], None, None, None) is None
+
+    result = state.make_request_output([2], None, FinishReason.STOP, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    mm = result.outputs[0].multimodal_output
+    assert "model_outputs" not in mm
+    audio = mm["audio"]
+    assert isinstance(audio, torch.Tensor) and audio.dtype == torch.float32
+    assert audio.shape == (7,)
+    torch.testing.assert_close(audio, torch.cat(chunks), atol=0, rtol=0)
+    assert mm["sr"].item() == 24000
+
+
 def test_cumulative_token_ids_always_set():
     """cumulative_token_ids is set for all output kinds."""
     for kind in (RequestOutputKind.DELTA, RequestOutputKind.CUMULATIVE, RequestOutputKind.FINAL_ONLY):
