@@ -86,9 +86,7 @@ def test_two_ready_stage1_requests_build_per_request_semantic_embedding():
     assert mel_codes.shape == (2, 9)
     assert latent.shape == (2, 9, GPT_DIM)
 
-    batched = decoder._build_semantic_embedding(
-        codec=codec, mel_codes=mel_codes, latent=latent, dtype=torch.float32
-    )
+    batched = decoder._build_semantic_embedding(codec=codec, mel_codes=mel_codes, latent=latent, dtype=torch.float32)
     assert batched.shape == (2, 9, HIDDEN)
 
     # Each row must equal that request decoded alone (single-request path).
