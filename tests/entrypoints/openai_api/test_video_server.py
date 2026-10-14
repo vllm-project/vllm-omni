@@ -2635,8 +2635,11 @@ def test_video_request_validation():
     )
     assert isinstance(paced.streaming_pacing, StreamingPacingConfig)
     assert paced.streaming_buffer_seconds == 1.5
-    assert paced.streaming_max_output_bytes == 1024
-    assert paced.streaming_idle_timeout_s == 5
+    assert paced.streaming_pacing.max_output_bytes == 1024
+    assert paced.streaming_pacing.idle_timeout_s == 5
+    # The PR 6 scalar alias canonicalizes into the pacing object.
+    aliased = VideoGenerationRequest(prompt="test", streaming_buffer_seconds=0.75)
+    assert aliased.streaming_pacing is not None and aliased.streaming_pacing.max_lead_ms == 750.0
     assert VideoGenerationRequest(prompt="test", streaming_pacing={"enabled": False}).streaming_buffer_seconds is None
     with pytest.raises(ValueError, match="streaming_pacing or streaming_buffer_seconds"):
         VideoGenerationRequest(prompt="test", streaming_pacing={}, streaming_buffer_seconds=1.0)
@@ -3663,20 +3666,3 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("streaming_max_output_bytes", 0),
-        ("streaming_max_output_bytes", True),
-        ("streaming_max_output_bytes", 1.5),
-        ("streaming_idle_timeout_s", 0),
-        ("streaming_idle_timeout_s", True),
-        ("streaming_idle_timeout_s", float("inf")),
-        ("streaming_idle_timeout_s", float("nan")),
-    ],
-)
-def test_video_request_rejects_invalid_streaming_resource_limits(field, value):
-    with pytest.raises(ValueError, match=field):
-        VideoGenerationRequest(prompt="test", **{field: value})

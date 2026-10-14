@@ -228,11 +228,9 @@ async def _consume_final_output(generator):
     return final_output
 
 
-@pytest.mark.asyncio
-async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_cleans_up():
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
+def _start_paced_engine(execute_fn) -> DiffusionEngine:
+    """Start a stepwise streaming engine whose busy loop runs ``execute_fn``."""
     from vllm_omni.diffusion.sched import StepScheduler
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     scheduler = StepScheduler()
     scheduler.initialize(SimpleNamespace(max_num_seqs=1))
@@ -241,6 +239,18 @@ async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_clean
     engine.od_config.streaming_output = True
     engine.od_config.max_num_seqs = 1
     engine._streaming_playback = {}
+    engine.execute_fn = execute_fn
+    engine._loop_started = True
+    engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
+    engine.worker_thread.start()
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_cleans_up():
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
     calls = []
 
     def execute(output):
@@ -256,10 +266,7 @@ async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_clean
             streaming_next_media_duration=1.0,
         )
 
-    engine.execute_fn = execute
-    engine._loop_started = True
-    engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
-    engine.worker_thread.start()
+    engine = _start_paced_engine(execute)
     try:
         request = OmniDiffusionRequest(
             request_id="paced",
@@ -315,16 +322,8 @@ async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_clean
 @pytest.mark.parametrize("explicit_ack", [False, True])
 async def test_streaming_credit_covers_downstream_consumer_and_final_chunk(explicit_ack):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.sched import StepScheduler
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
-    engine = _make_engine_with_loop(asyncio.get_running_loop(), scheduler=scheduler, start_loop=False)
-    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
-    engine.od_config.streaming_output = True
-    engine.od_config.max_num_seqs = 1
-    engine._streaming_playback = {}
     calls = []
 
     def execute(output):
@@ -338,10 +337,7 @@ async def test_streaming_credit_covers_downstream_consumer_and_final_chunk(expli
             streaming_media_duration=0.01,
         )
 
-    engine.execute_fn = execute
-    engine._loop_started = True
-    engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
-    engine.worker_thread.start()
+    engine = _start_paced_engine(execute)
     try:
         for request_id in ("one", "two"):
             engine.add_request(
@@ -383,16 +379,8 @@ async def test_streaming_credit_covers_downstream_consumer_and_final_chunk(expli
 @pytest.mark.parametrize("over_limit", [False, True])
 async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.sched import StepScheduler
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    scheduler = StepScheduler()
-    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
-    engine = _make_engine_with_loop(asyncio.get_running_loop(), scheduler=scheduler, start_loop=False)
-    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
-    engine.od_config.streaming_output = True
-    engine.od_config.max_num_seqs = 1
-    engine._streaming_playback = {}
     calls = []
 
     def execute(output):
@@ -408,10 +396,7 @@ async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit)
             streaming_next_media_duration=0.01,
         )
 
-    engine.execute_fn = execute
-    engine._loop_started = True
-    engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
-    engine.worker_thread.start()
+    engine = _start_paced_engine(execute)
     try:
         engine.add_request(
             OmniDiffusionRequest(

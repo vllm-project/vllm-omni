@@ -229,20 +229,6 @@ class VideoGenerationRequest(BaseModel):
         allow_inf_nan=False,
         description="Maximum generated media lead, including the next chunk; requires session.playback updates.",
     )
-    streaming_max_output_bytes: int = Field(
-        default=64 * 1024 * 1024,
-        gt=0,
-        le=_INT64_MAX,
-        strict=True,
-        description="Maximum retained decoded chunk bytes for paced realtime video.",
-    )
-    streaming_idle_timeout_s: float = Field(
-        default=30.0,
-        gt=0,
-        strict=True,
-        allow_inf_nan=False,
-        description="Abort a paced request blocked without consumption progress for this many seconds.",
-    )
     aspect_ratio: str | None = Field(
         default=None,
         description=(
@@ -289,22 +275,15 @@ class VideoGenerationRequest(BaseModel):
 
     @model_validator(mode="after")
     def normalize_streaming_pacing(self) -> "VideoGenerationRequest":
-        """Normalize the roadmap policy while accepting the PR 6 scalar alias."""
+        """Canonicalize pacing into ``streaming_pacing``; derive the lead alias."""
         if self.streaming_pacing is not None and self.streaming_buffer_seconds is not None:
             raise ValueError("use streaming_pacing or streaming_buffer_seconds, not both")
-        if self.streaming_pacing is not None:
-            if not self.streaming_pacing.enabled:
-                self.streaming_buffer_seconds = None
-                return self
+        if self.streaming_buffer_seconds is not None:
+            self.streaming_pacing = StreamingPacingConfig(max_lead_ms=self.streaming_buffer_seconds * 1000.0)
+        if self.streaming_pacing is not None and self.streaming_pacing.enabled:
             self.streaming_buffer_seconds = self.streaming_pacing.max_lead_ms / 1000.0
-            self.streaming_max_output_bytes = self.streaming_pacing.max_output_bytes
-            self.streaming_idle_timeout_s = self.streaming_pacing.idle_timeout_s
-        elif self.streaming_buffer_seconds is not None:
-            self.streaming_pacing = StreamingPacingConfig(
-                max_lead_ms=self.streaming_buffer_seconds * 1000.0,
-                max_output_bytes=self.streaming_max_output_bytes,
-                idle_timeout_s=self.streaming_idle_timeout_s,
-            )
+        else:
+            self.streaming_buffer_seconds = None
         return self
 
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")

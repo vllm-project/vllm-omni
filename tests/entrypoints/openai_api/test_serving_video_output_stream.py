@@ -1107,9 +1107,6 @@ class TestStreamingVideoOutputPromptUpdate:
             streaming_buffer_seconds=0.75,
         )
 
-        engine_client.reserve_streaming_interaction = mocker.AsyncMock(return_value=12.5)
-        engine_client.release_streaming_interaction = mocker.AsyncMock()
-
         async def submit(request_id, *, interaction):
             del request_id
             delivered_ids.append(interaction["event_id"])
@@ -1415,7 +1412,6 @@ async def test_interaction_event_id_is_bounded_before_queueing(mocker: MockerFix
         response_queue=responses,
     )
     assert "at most 128" in responses.get_nowait()["message"]
-    engine.reserve_streaming_interaction.assert_not_called()
     engine.submit_interaction_async.assert_not_called()
 
 

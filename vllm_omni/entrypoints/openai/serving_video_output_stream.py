@@ -36,7 +36,6 @@ import math
 import time
 import uuid
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -94,12 +93,6 @@ class _SessionProgress:
         return time.monotonic() - self._last_at > stall_timeout
 
 
-@dataclass(frozen=True)
-class _QueuedInteraction:
-    event_id: str
-    payload: OmniInteractionPrompt
-
-
 class OmniStreamingVideoOutputHandler:
     """Handles `/v1/realtime/video` sessions for generated video output."""
 
@@ -127,7 +120,7 @@ class OmniStreamingVideoOutputHandler:
         interaction_delivery_task: asyncio.Task[None] | None = None
         response_task: asyncio.Task[None] | None = None
         response_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=_MAX_CONTROL_RESPONSE_QUEUE_SIZE)
-        interaction_queue: asyncio.Queue[_QueuedInteraction] = asyncio.Queue(maxsize=_MAX_INTERACTION_QUEUE_SIZE)
+        interaction_queue: asyncio.Queue[OmniInteractionPrompt] = asyncio.Queue(maxsize=_MAX_INTERACTION_QUEUE_SIZE)
         stopped = False
         chunks_sent = 0
         generation_done = False
@@ -139,6 +132,9 @@ class OmniStreamingVideoOutputHandler:
             if start is None:
                 return
             request, output_format = start
+            pacing = request.streaming_pacing
+            # Unpaced sessions keep the pre-backpressure unbounded sends.
+            idle_timeout = pacing.idle_timeout_s if pacing is not None and pacing.enabled else None
             if request.streaming_buffer_seconds is not None:
                 validate_pacing = getattr(self._engine_client, "validate_streaming_playback_request", None)
                 if callable(validate_pacing):
@@ -161,14 +157,12 @@ class OmniStreamingVideoOutputHandler:
                     },
                     send_lock,
                 ),
-                timeout=request.streaming_idle_timeout_s,
+                timeout=idle_timeout,
             )
             progress.touch()
 
             response_task = asyncio.create_task(
-                self._control_response_loop(
-                    websocket, response_queue, send_lock, stop_event, request_id, request.streaming_idle_timeout_s
-                )
+                self._control_response_loop(websocket, response_queue, send_lock, stop_event, request_id, idle_timeout)
             )
             interaction_delivery_task = asyncio.create_task(
                 self._interaction_delivery_loop(
@@ -205,7 +199,7 @@ class OmniStreamingVideoOutputHandler:
                         await websocket.send_json(metadata)
                         await websocket.send_bytes(chunk)
 
-                await asyncio.wait_for(send_chunk(), timeout=request.streaming_idle_timeout_s)
+                await asyncio.wait_for(send_chunk(), timeout=idle_timeout)
                 chunks_sent += 1
                 progress.touch()
 
@@ -220,7 +214,7 @@ class OmniStreamingVideoOutputHandler:
                 try:
                     done, _ = await asyncio.wait(
                         {drain_task, stop_task},
-                        timeout=request.streaming_idle_timeout_s,
+                        timeout=idle_timeout,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if not done:
@@ -243,7 +237,7 @@ class OmniStreamingVideoOutputHandler:
                     },
                     send_lock,
                 ),
-                timeout=request.streaming_idle_timeout_s,
+                timeout=idle_timeout,
             )
         except WebSocketDisconnect:
             logger.info("Streaming video output: client disconnected")
@@ -271,11 +265,6 @@ class OmniStreamingVideoOutputHandler:
             if interaction_delivery_task is not None and request_id is not None:
                 interaction_delivery_task.cancel()
                 await asyncio.gather(interaction_delivery_task, return_exceptions=True)
-                await self._release_queued_interactions(
-                    interaction_queue,
-                    request_id=request_id,
-                    interaction_event_ids=interaction_event_ids,
-                )
             if response_task is not None:
                 response_task.cancel()
                 await asyncio.gather(response_task, return_exceptions=True)
@@ -387,7 +376,7 @@ class OmniStreamingVideoOutputHandler:
         send_lock: asyncio.Lock,
         progress: _SessionProgress,
         interaction_event_ids: set[str],
-        interaction_queue: asyncio.Queue[_QueuedInteraction],
+        interaction_queue: asyncio.Queue[OmniInteractionPrompt],
         *,
         response_queue: asyncio.Queue[dict[str, Any]],
     ) -> None:
@@ -506,7 +495,7 @@ class OmniStreamingVideoOutputHandler:
 
     async def _interaction_delivery_loop(
         self,
-        interaction_queue: asyncio.Queue[_QueuedInteraction],
+        interaction_queue: asyncio.Queue[OmniInteractionPrompt],
         *,
         websocket: WebSocket,
         response_queue: asyncio.Queue[dict[str, Any]],
@@ -519,25 +508,25 @@ class OmniStreamingVideoOutputHandler:
         """Deliver accepted interactions in ingress order without blocking the reader."""
         try:
             while True:
-                queued = await interaction_queue.get()
+                interaction = await interaction_queue.get()
                 try:
                     try:
                         await self._engine_client.submit_interaction_async(
                             request_id,
-                            interaction=queued.payload,
+                            interaction=interaction,
                         )
                         progress.touch()
                     except asyncio.CancelledError:
                         raise
                     except Exception:
                         logger.exception("Failed to apply interaction for request %s", request_id, exc_info=True)
-                        interaction_event_ids.discard(queued.event_id)
+                        interaction_event_ids.discard(interaction["event_id"])
                         await self._send_error(
                             websocket,
                             "Failed to apply interaction",
                             code="interaction_failed",
                             request_id=request_id,
-                            event_id=queued.event_id,
+                            event_id=interaction["event_id"],
                             send_lock=send_lock,
                             response_queue=response_queue,
                         )
@@ -547,21 +536,6 @@ class OmniStreamingVideoOutputHandler:
         except asyncio.QueueFull:
             stop_event.set()
             await self._abort_request(request_id)
-
-    async def _release_queued_interactions(
-        self,
-        interaction_queue: asyncio.Queue[_QueuedInteraction],
-        *,
-        request_id: str,
-        interaction_event_ids: set[str],
-    ) -> None:
-        while True:
-            try:
-                queued = interaction_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            interaction_event_ids.discard(queued.event_id)
-            interaction_queue.task_done()
 
     async def _abort_request(self, request_id: str) -> None:
         try:
@@ -577,7 +551,7 @@ class OmniStreamingVideoOutputHandler:
         request_id: str,
         send_lock: asyncio.Lock,
         interaction_event_ids: set[str],
-        interaction_queue: asyncio.Queue[_QueuedInteraction],
+        interaction_queue: asyncio.Queue[OmniInteractionPrompt],
         stop_event: asyncio.Event,
         progress: _SessionProgress,
         response_queue: asyncio.Queue[dict[str, Any]],
@@ -736,7 +710,7 @@ class OmniStreamingVideoOutputHandler:
                     "event_id": event_id,
                 }
             )
-            interaction_queue.put_nowait(_QueuedInteraction(event_id=event_id, payload=normalized))
+            interaction_queue.put_nowait(normalized)
         except asyncio.QueueFull:
             interaction_event_ids.discard(event_id)
             stop_event.set()
@@ -789,6 +763,8 @@ class OmniStreamingVideoOutputHandler:
             fps=output_fps,
             video_codec_options=video_codec_options,
         )
+        pacing = request.streaming_pacing
+        max_output_bytes = pacing.max_output_bytes if pacing is not None and pacing.enabled else None
         completed = False
         try:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
@@ -797,11 +773,8 @@ class OmniStreamingVideoOutputHandler:
                 videos = self._extract_video_outputs(result)
                 for video in videos:
                     chunk = encoder.encode(video)
-                    if (
-                        request.streaming_buffer_seconds is not None
-                        and len(chunk or b"") > request.streaming_max_output_bytes
-                    ):
-                        raise ValueError("encoded streaming chunk exceeds streaming_max_output_bytes")
+                    if max_output_bytes is not None and len(chunk or b"") > max_output_bytes:
+                        raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
                     if chunk:
                         yield (
                             chunk,
@@ -816,11 +789,8 @@ class OmniStreamingVideoOutputHandler:
 
             completed = True
             final_chunk = encoder.close()
-            if (
-                request.streaming_buffer_seconds is not None
-                and len(final_chunk or b"") > request.streaming_max_output_bytes
-            ):
-                raise ValueError("encoded streaming trailer exceeds streaming_max_output_bytes")
+            if max_output_bytes is not None and len(final_chunk or b"") > max_output_bytes:
+                raise ValueError("encoded streaming trailer exceeds streaming_pacing.max_output_bytes")
             if final_chunk:
                 yield (
                     final_chunk,
@@ -847,8 +817,9 @@ class OmniStreamingVideoOutputHandler:
 
         gen_params = self._resolve_default_sampling_params()
         gen_params.streaming_buffer_seconds = request.streaming_buffer_seconds
-        gen_params.streaming_max_output_bytes = request.streaming_max_output_bytes
-        gen_params.streaming_idle_timeout_s = request.streaming_idle_timeout_s
+        if request.streaming_pacing is not None and request.streaming_pacing.enabled:
+            gen_params.streaming_max_output_bytes = request.streaming_pacing.max_output_bytes
+            gen_params.streaming_idle_timeout_s = request.streaming_pacing.idle_timeout_s
         vp = request.resolve_video_params()
         input_image = await self._decode_image_reference(request)
         if input_image is not None:
