@@ -52,7 +52,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     videomme_bench_argv,
 )
 from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import (
-    _store_accuracy_baseline,
+    _write_accuracy_result_metadata,
     sync_dataset_env_from_ns,
 )
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
@@ -79,12 +79,15 @@ def test_videomme_bench_argv_uses_local_directory(monkeypatch, tmp_path: Path):
     assert argv[argv.index("--dataset-path") + 1] == str(tmp_path.resolve())
 
 
-def test_store_accuracy_baseline_writes_configured_gates(tmp_path: Path):
+def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import tests.dfx.conftest as dfx_conftest
+
+    monkeypatch.setattr(dfx_conftest, "get_runtime_resource_label", lambda: "H100")
     path = tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json"
     path.write_text(json.dumps({"daily_omni_accuracy": 0.8}), encoding="utf-8")
     data = json.loads(path.read_text(encoding="utf-8"))
 
-    _store_accuracy_baseline(
+    _write_accuracy_result_metadata(
         path,
         data,
         {"min_daily_omni_accuracy": 0.77, "min_seed_tts_mean_sim": None},
@@ -93,6 +96,7 @@ def test_store_accuracy_baseline_writes_configured_gates(tmp_path: Path):
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["daily_omni_accuracy"] == 0.8
     assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
+    assert saved["Hardware"] == "H100"
 
 
 def test_sync_dataset_env_preserves_videomme_hf_repo_id(monkeypatch):

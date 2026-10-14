@@ -118,15 +118,21 @@ def _default_result_dir() -> Path:
     return Path(__file__).resolve().parent / "results" / "qwen_omni_acc"
 
 
-def _store_accuracy_baseline(path: Path, data: dict[str, Any], baseline: dict[str, Any]) -> None:
-    """Write the gates used for this run into the bench result JSON.
+def _write_accuracy_result_metadata(path: Path, data: dict[str, Any], baseline: dict[str, Any]) -> None:
+    """Write the gates and runtime hardware into the bench result JSON.
 
     ``vllm bench serve`` saves measured scores only. The thresholds from the
     accuracy test (``--min-daily-omni-accuracy``, ``--max-seed-tts-mean-wer``, …)
     are applied afterwards, so persist them under ``baseline`` before the check.
     Unset optional gates (``None``) are omitted.
+
+    ``Hardware`` uses the same runtime label as ``tests/dfx/perf/scripts/run_benchmark.py``
+    (``H100``, ``A3``, …; empty when the device is unknown).
     """
+    from tests.dfx.conftest import get_runtime_resource_label, hardware_json_value
+
     data["baseline"] = {key: value for key, value in baseline.items() if value is not None}
+    data["Hardware"] = hardware_json_value(get_runtime_resource_label())
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -683,7 +689,7 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_daily_omni(ns, vllm)
             print(f"\n[Daily-Omni] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
-            _store_accuracy_baseline(
+            _write_accuracy_result_metadata(
                 path,
                 data,
                 {"min_daily_omni_accuracy": ns.min_daily_omni_accuracy},
@@ -702,7 +708,7 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_videomme(ns, vllm)
             print(f"\n[Video-MME] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
-            _store_accuracy_baseline(
+            _write_accuracy_result_metadata(
                 path,
                 data,
                 {"min_videomme_accuracy": ns.min_videomme_accuracy},
@@ -722,7 +728,7 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_seed_tts(ns, vllm)
             print(f"\n[Seed-TTS] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
-            _store_accuracy_baseline(
+            _write_accuracy_result_metadata(
                 path,
                 data,
                 {
