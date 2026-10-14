@@ -50,11 +50,13 @@ def test_compile_regions_fullgraph_matches_eager_bitwise() -> None:
     assert graphs == 7
 
 
-def test_pipeline_setup_compile_forwards_config_dynamic() -> None:
+def test_pipeline_setup_compile_forwards_config_dynamic(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.magi2.pipeline_magi2 import Magi2Pipeline
 
     calls: list[dict[str, object]] = []
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
+    monkeypatch.setattr(torch._dynamo.config, "accumulated_recompile_limit", 256)
 
     class _Transformer(torch.nn.Module):
         def compile_regions(self, **compile_kwargs: object) -> None:
@@ -72,6 +74,34 @@ def test_pipeline_setup_compile_forwards_config_dynamic() -> None:
     pipeline.setup_compile()
 
     assert calls == [{"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}]
+
+
+def test_pipeline_setup_compile_uses_static_shapes_on_musa(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.magi2 import pipeline_magi2
+    from vllm_omni.diffusion.models.magi2.pipeline_magi2 import Magi2Pipeline
+
+    calls: list[dict[str, object]] = []
+
+    class _Transformer(torch.nn.Module):
+        def compile_regions(self, **compile_kwargs: object) -> None:
+            calls.append(compile_kwargs)
+
+    monkeypatch.setattr(pipeline_magi2.current_omni_platform, "is_musa", lambda: True)
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
+    monkeypatch.setattr(torch._dynamo.config, "accumulated_recompile_limit", 256)
+    pipeline = object.__new__(Magi2Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = OmniDiffusionConfig(model="sand-ai/MAGI-2-preview", model_class_name="Magi2Pipeline")
+    pipeline.transformer = _Transformer()
+
+    assert pipeline.od_config.diffusion_compile_dynamic is True
+    pipeline.setup_compile()
+
+    assert calls == [{"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}]
+    limit = pipeline_magi2._STATIC_REGION_VARIANTS_PER_PROMPT_LENGTH * pipeline_magi2._STATIC_PROMPT_LENGTHS
+    assert torch._dynamo.config.recompile_limit == limit
+    assert torch._dynamo.config.accumulated_recompile_limit == max(256, limit)
 
 
 def test_pipeline_setup_compile_warns_when_granularity_is_not_regional(caplog: pytest.LogCaptureFixture) -> None:

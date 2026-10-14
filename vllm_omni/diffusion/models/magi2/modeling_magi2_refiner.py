@@ -21,6 +21,7 @@ import json
 import os
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -100,14 +101,13 @@ class Magi2RefinerAttention(nn.Module):
             custom_attention=Magi2WindowAttentionKernel(self.head_dim**-0.5),
         )
 
-    def forward(
+    def project(
         self,
         hidden_states: torch.Tensor,
         rope: torch.Tensor,
         modality_dispatcher: ModalityDispatcher,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        """Attend over modality-ordered ``hidden_states``; ``rope`` is in sequence order."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the sequence-ordered bf16 ``q``, ``k``, ``v`` and the modality-ordered gate logits."""
 
         normalized = self.pre_norm(hidden_states, modality_dispatcher)
         qkv = self.linear_qkv(normalized, modality_dispatcher)
@@ -122,11 +122,31 @@ class Magi2RefinerAttention(nn.Module):
         sin, cos = rope.tensor_split(2, dim=-1)
         q = apply_rotary_emb(q, cos, sin).to(self.config.params_dtype)
         k = apply_rotary_emb(k, cos, sin).to(self.config.params_dtype)
-        attention = self.window_attention(q, k, v.to(self.config.params_dtype), attn_metadata)
+        return q, k, v.to(self.config.params_dtype), gate
+
+    def output(
+        self,
+        attention: torch.Tensor,
+        gate: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
         # The bf16 attention output is gated in fp32 and rounded once for the projection.
         output = modality_dispatcher.permute(attention) * torch.sigmoid(gate.float()).unsqueeze(-1)
         output = output.reshape(-1, self.q_size).to(self.config.params_dtype)
         return self.linear_proj(output, modality_dispatcher)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rope: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Attend over modality-ordered ``hidden_states``; ``rope`` is in sequence order."""
+
+        q, k, v, gate = self.project(hidden_states, rope, modality_dispatcher)
+        attention = self.window_attention(q, k, v, attn_metadata)
+        return self.output(attention, gate, modality_dispatcher)
 
 
 class Magi2RefinerMLP(nn.Module):
@@ -170,11 +190,32 @@ class Magi2RefinerMLP(nn.Module):
 class Magi2RefinerLayer(nn.Module):
     """Pre-norm residual layer: ``h + attention(h)``, then ``h + mlp(h)``."""
 
+    # The layer is split into compile regions around the eager window attention.
+    region_methods = ("_attention_input", "_attention_output")
+
     def __init__(self, config: Magi2RefinerConfig, layer_index: int) -> None:
         super().__init__()
         num_modality = config.num_modalities(layer_index)
         self.attention = Magi2RefinerAttention(config, num_modality=num_modality)
         self.mlp = Magi2RefinerMLP(config, num_modality=num_modality)
+
+    def _attention_input(
+        self,
+        hidden_states: torch.Tensor,
+        rope: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.attention.project(hidden_states, rope, modality_dispatcher)
+
+    def _attention_output(
+        self,
+        hidden_states: torch.Tensor,
+        attention: torch.Tensor,
+        gate: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attention.output(attention, gate, modality_dispatcher)
+        return hidden_states + self.mlp(hidden_states, modality_dispatcher)
 
     def forward(
         self,
@@ -183,8 +224,9 @@ class Magi2RefinerLayer(nn.Module):
         modality_dispatcher: ModalityDispatcher,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attention(hidden_states, rope, modality_dispatcher, attn_metadata)
-        return hidden_states + self.mlp(hidden_states, modality_dispatcher)
+        q, k, v, gate = self._attention_input(hidden_states, rope, modality_dispatcher)
+        attention = self.attention.window_attention(q, k, v, attn_metadata)
+        return self._attention_output(hidden_states, attention, gate, modality_dispatcher)
 
 
 class Magi2RefinerBlock(nn.Module):
@@ -265,6 +307,13 @@ class Magi2RefinerTransformer(nn.Module):
     @property
     def layers(self) -> nn.ModuleList:
         return self.block.layers
+
+    def compile_regions(self, **compile_kwargs: Any) -> None:
+        """Compile the dense compute around the eager window attention of every layer."""
+
+        for layer in self.block.layers:
+            for name in layer.region_methods:
+                setattr(layer, name, torch.compile(getattr(layer, name), **compile_kwargs))
 
     def forward(
         self,
