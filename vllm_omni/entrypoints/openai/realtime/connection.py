@@ -56,6 +56,9 @@ MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
 AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
 
+# OpenAI's error code for a cancel when no matching response is in progress.
+RESPONSE_CANCEL_NOT_ACTIVE = "response_cancel_not_active"
+
 
 def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
     return exc.parameter in {"input_text", "input_tokens"}
@@ -1274,7 +1277,7 @@ class OpenAIFullDuplexConnection:
         if active is None:
             await self._send_error(
                 "No response is in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return
@@ -1282,7 +1285,7 @@ class OpenAIFullDuplexConnection:
         if response_id is not None and response_id != active.response_id:
             await self._send_error(
                 f"Response '{response_id}' is not in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return

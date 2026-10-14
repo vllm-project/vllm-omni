@@ -25,7 +25,12 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
-from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.contracts import (
+    DuplexFence,
+    DuplexStageRequestContext,
+    DuplexStageSubmission,
+    duplex_resource_request_id,
+)
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
@@ -35,7 +40,7 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
 from vllm_omni.engine.messages import AbortRequestMessage, ShutdownRequestMessage
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import Orchestrator, build_engine_core_request_from_tokens
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
@@ -314,6 +319,121 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     await _close(orchestrator, rpc_q)
     assert clients[0].abort_calls == [[request_id]]
     assert counter.value == 0
+
+
+@pytest.fixture
+def ephemeral_submissions(mocker):
+    orchestrator, clients, _, _ = _build(stages=2)
+    submissions = []
+    for request_id in ("first", "second"):
+        context = DuplexStageRequestContext(
+            request_id=request_id,
+            session_id=request_id,
+            fence=DuplexFence(request_id),
+            stage_id=0,
+            final_stage_id=1,
+            config_generation=0,
+            sampling_params=orchestrator.sampling_defaults(),
+        )
+        orchestrator.ensure_request(context)
+        submissions.append(
+            DuplexStageSubmission(
+                context=context, prompt={"prompt_token_ids": [1]}, already_submitted=False, resumable=False
+            )
+        )
+
+    async def build_request(request_id, stage_id, prompt, params, *, resumable):
+        return build_engine_core_request_from_tokens(request_id, prompt, params, resumable=resumable)
+
+    builder = mocker.patch.object(orchestrator, "_build_next_stage_request", side_effect=build_request)
+    return orchestrator, clients, submissions, builder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_ephemeral_prewarm_does_not_hold_stage_input_lock(ephemeral_submissions, mocker, outcome):
+    orchestrator, clients, submissions, _ = ephemeral_submissions
+    orchestrator.async_chunk = True
+    prewarming = asyncio.Event()
+    release = asyncio.Event()
+    clear_cache = mocker.spy(orchestrator, "_clear_stage_input_cache")
+
+    async def prewarm(request_id, request, request_state):
+        if request_id == "first":
+            prewarming.set()
+            await release.wait()
+            return outcome != "failure"
+        return True
+
+    mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", side_effect=prewarm)
+    first = asyncio.create_task(orchestrator.submit(submissions[0]))
+    try:
+        await asyncio.wait_for(prewarming.wait(), timeout=2)
+        # A different session can finish admission while the first waits downstream.
+        second = await asyncio.wait_for(orchestrator.submit(submissions[1]), timeout=2)
+        assert second.request_id == "second"
+        assert not first.done()
+        assert [args[0].request_id for args in clients[0].add_request_calls] == ["first", "second"]
+        if outcome == "cancel":
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        else:
+            release.set()
+            if outcome == "failure":
+                with pytest.raises(RuntimeError, match="async-chunk prewarm failed"):
+                    await first
+            else:
+                assert (await first).request_id == "first"
+        # A downstream failure must not invalidate a later session's sender cache.
+        clear_cache.assert_not_called()
+    finally:
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_send", [False, True])
+async def test_ephemeral_submission_preserves_send_order_and_failure_cleanup(ephemeral_submissions, mocker, fail_send):
+    orchestrator, clients, submissions, builder = ephemeral_submissions
+    sending = asyncio.Event()
+    release = asyncio.Event()
+    add_request = clients[0].add_request_async
+    clear_cache = mocker.spy(orchestrator, "_clear_stage_input_cache")
+
+    async def send(request, **kwargs):
+        if request.request_id == "first":
+            sending.set()
+            await release.wait()
+            if fail_send:
+                raise RuntimeError("send failed")
+        else:
+            assert clear_cache.call_count == int(fail_send)
+        await add_request(request, **kwargs)
+
+    mocker.patch.object(clients[0], "add_request_async", side_effect=send)
+    first = asyncio.create_task(orchestrator.submit(submissions[0]))
+    second = None
+    try:
+        await asyncio.wait_for(sending.wait(), timeout=2)
+        second = asyncio.create_task(orchestrator.submit(submissions[1]))
+        await asyncio.sleep(0)
+        assert builder.await_count == 1
+        assert orchestrator._stage_input_submission_locks[0].locked()
+        release.set()
+        if fail_send:
+            with pytest.raises(RuntimeError, match="send failed"):
+                await first
+        else:
+            await first
+        await asyncio.wait_for(second, timeout=2)
+        expected = ["second"] if fail_send else ["first", "second"]
+        assert [args[0].request_id for args in clients[0].add_request_calls] == expected
+    finally:
+        tasks = [first] if second is None else [first, second]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

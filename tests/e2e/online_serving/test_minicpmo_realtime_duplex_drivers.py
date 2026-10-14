@@ -229,6 +229,46 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
         assert len(session["audio_delta_timings"]) == 2
 
 
+def test_realtime_duplex_demo_pair_omits_ref_audio_for_model_default(monkeypatch):
+    demo = _load_pair_demo_module()
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_exec(*command, **kwargs):
+        captured["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(demo.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(demo, "_summarize_session", lambda **kwargs: {"ok": True})
+
+    result = asyncio.run(
+        demo._run_demo_process(
+            label="a",
+            args=SimpleNamespace(
+                url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
+                model="openbmb/MiniCPM-o-4_5",
+                chunk_ms=200,
+                timeout_s=5.0,
+                no_realtime_pacing=False,
+                require_audio=False,
+                ref_audio=None,
+            ),
+            input_wav="input.wav",
+            output_dir="out",
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--ref-audio" not in command
+    assert result["ok"] is True
+
+
 def test_realtime_duplex_demo_pair_rejects_false_green_audio_contract(tmp_path):
     demo = _load_pair_demo_module()
     output = tmp_path / "session"
@@ -289,7 +329,7 @@ def test_realtime_duplex_demo_pair_default_requires_multiple_audio_deltas(monkey
     assert args.min_audio_deltas_per_session == 2
 
 
-def test_realtime_duplex_demo_pair_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_demo_pair_allows_model_default_ref_audio(monkeypatch):
     demo = _load_pair_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -307,11 +347,12 @@ def test_realtime_duplex_demo_pair_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
-def test_realtime_duplex_soft_interrupt_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_soft_interrupt_allows_model_default_ref_audio(monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -325,8 +366,9 @@ def test_realtime_duplex_soft_interrupt_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
 def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
@@ -360,8 +402,6 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
         wav_file.setsampwidth(2)
         wav_file.setframerate(16_000)
         wav_file.writeframes(b"\x00\x00" * 320)
-    ref_audio = tmp_path / "ref.wav"
-    ref_audio.write_bytes(b"ref")
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     captured: dict[str, object] = {}
@@ -392,7 +432,7 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
                 url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
                 model="openbmb/MiniCPM-o-4_5",
                 input_wav=str(input_wav),
-                ref_audio=str(ref_audio),
+                ref_audio=None,
                 output_dir=str(output_dir),
                 summary_output=None,
                 chunk_ms=200,
@@ -411,6 +451,7 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
 
     command = captured["command"]
     assert isinstance(command, list)
+    assert "--ref-audio" not in command
     assert "--temperature" in command
     assert command[command.index("--temperature") + 1] == "0.0"
     assert result["ok"] is True

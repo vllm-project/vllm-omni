@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_DEFAULT_PROMPT_WAV = Path("assets") / "HT_ref_audio.wav"
+
+
+@lru_cache(maxsize=8)
 def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     """Resolve ``model_ref`` to a local directory containing the repo assets.
 
@@ -96,6 +100,11 @@ def _stage_matmul_policy(extra: Mapping[str, Any]) -> Iterator[None]:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
 
+def default_prompt_wav(model_path: str) -> str:
+    """Return the model-bundled MiniCPM prompt WAV path."""
+    return str(Path(model_path) / _DEFAULT_PROMPT_WAV)
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -142,6 +151,15 @@ def _read_reference_wav(path: str) -> tuple[Any, int]:
     if getattr(waveform, "ndim", 1) > 1:
         waveform = waveform.T
     return waveform, int(sample_rate_hz)
+
+
+def load_default_prompt_audio(model_ref: str, revision: str | None = None) -> tuple[Any, int] | None:
+    """Load the model-bundled prompt WAV, returning ``None`` when it is absent."""
+    model_dir = _resolve_model_dir(model_ref, revision=revision)
+    prompt_path = Path(default_prompt_wav(model_dir))
+    if not prompt_path.is_file():
+        return None
+    return _read_reference_wav(str(prompt_path))
 
 
 def _normalize_reference(
@@ -462,7 +480,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     def _default_prompt_wav(self) -> str:
         if self._prompt_wav_override is not None:
             return str(self._prompt_wav_override)
-        return str(Path(self.model_path) / "assets" / "HT_ref_audio.wav")
+        return default_prompt_wav(self.model_path)
 
     def _normalized_default_prompt(self) -> tuple[str, str]:
         """Fold the shipped default prompt onto the request-reference grid.

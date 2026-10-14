@@ -13,6 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
+AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
@@ -535,11 +536,67 @@ def test_diffusion_slow_cpu_cases_stay_off_nightly() -> None:
     assert DIFFUSION_SLOW_CPU_LABEL not in labels
 
 
+AITER_MHA_CACHE_PREPARE = 'eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"'
+AITER_MHA_CACHE_PUBLISH = "python .buildkite/amd/scripts/aiter_mha_cache.py publish"
+STABLE_AUDIO_LAYERWISE_NODE = (
+    "tests/diffusion/offloader/test_diffusion_layerwise_offload.py"
+    "::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]"
+)
+
+
+def _assert_publish_follows_successful_pytest(command: str, pytest_marker: str) -> None:
+    then_at = command.index("; then\n")
+    else_at = command.index("\nelse\n")
+    publish_at = command.index(AITER_MHA_CACHE_PUBLISH)
+
+    assert command.startswith("if ")
+    assert pytest_marker in command[:then_at]
+    assert then_at < publish_at < else_at
+    assert "pytest_status=$$?" in command[else_at:]
+    assert 'exit "$${pytest_status}"' in command[else_at:]
+    assert "&&" not in command
+
+
+def _assert_build_scoped_aiter_mha_cache(step: dict, pytest_marker: str, *, publishes: bool) -> None:
+    commands = step["commands"]
+    prepare_at = commands.index(AITER_MHA_CACHE_PREPARE)
+    pytest_at = next(index for index, command in enumerate(commands) if pytest_marker in command)
+
+    assert prepare_at < pytest_at
+    assert not any(command.strip() == AITER_MHA_CACHE_PUBLISH for command in commands)
+    if publishes:
+        _assert_publish_follows_successful_pytest(commands[pytest_at], pytest_marker)
+    else:
+        assert AITER_MHA_CACHE_PUBLISH not in "\n".join(commands)
+    assert "AITER_JIT_DIR=" not in "\n".join(commands)
+    assert "HF_HOME" not in "\n".join(commands)
+    assert "GPU_ARCHS=" not in "\n".join(commands)
+    assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in commands)
+
+
 def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:
     step = _find_step("Diffusion Model Test")
     pytest_command = next(command for command in step["commands"] if "test_z_image.py" in command)
+    condition = pytest_command.split("; then", 1)[0]
 
-    assert split(pytest_command)[:2] == ["timeout", "55m"]
+    assert split(condition)[1:3] == ["timeout", "55m"]
+    _assert_build_scoped_aiter_mha_cache(
+        step,
+        "tests/e2e/offline_inference/test_z_image.py",
+        publishes=True,
+    )
+
+
+def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
+    step = _find_step("Diffusion Stable Audio Layerwise Offload Test (quarantined)")
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    _assert_build_scoped_aiter_mha_cache(step, STABLE_AUDIO_LAYERWISE_NODE, publishes=False)
+
+    blocking = _find_step("Diffusion Model CPU offloading Test")
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in blocking["commands"]
+    assert AITER_MHA_CACHE_PREPARE not in blocking["commands"]
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
@@ -572,6 +629,16 @@ def test_amd_template_preserves_step_retry_policy() -> None:
     # policy when the source suite is rendered into the uploaded pipeline.
     assert template.count("{% if step.retry %}") == 2
     assert template.count("{% for retry_rule in step.retry.automatic %}") == 2
+
+
+def test_amd_template_supplies_a_server_verified_aiter_artifact_source() -> None:
+    template = AMD_TEMPLATE.read_text(encoding="utf-8")
+    bootstrap = AMD_BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert template.count("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT") == 2
+    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)" in bootstrap
+    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)" in bootstrap
+    assert '-D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT"' in bootstrap
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
