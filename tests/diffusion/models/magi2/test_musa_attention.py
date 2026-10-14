@@ -63,7 +63,7 @@ def test_musa_dispatch_reuses_fp32_sink_correction(monkeypatch, sink_count):
     provider = Mock(return_value=(out, lse))
     monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     monkeypatch.setattr(
-        cuda_attention, "_resolve_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
+        cuda_attention, "resolve_magi2_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
     )
     monkeypatch.setattr(
         musa_attention, "torch_varlen_attention_with_sink", Mock(side_effect=AssertionError("fallback used"))
@@ -98,7 +98,7 @@ def test_musa_cuda_alias_does_not_select_cuda_resolver(monkeypatch):
     provider = Mock(return_value=(q, torch.zeros(4, 9)))
     monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", provider)
     monkeypatch.setattr(
-        cuda_attention, "_resolve_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
+        cuda_attention, "resolve_magi2_flash_attn_version", Mock(side_effect=AssertionError("CUDA resolver used"))
     )
     assert attention.packed_attention_with_sink(alias_q, k, v, varlen) is q
     provider.assert_called_once()
@@ -217,7 +217,7 @@ def test_cuda_still_uses_bundled_version_selection(monkeypatch):
     q, k, v, varlen = _inputs()
     cuda_q = SimpleNamespace(shape=q.shape, dtype=q.dtype, device=q.device, is_cuda=True)
     resolver, bundled = Mock(return_value=2), Mock(return_value=(q, torch.zeros(4, 9)))
-    monkeypatch.setattr(cuda_attention, "_resolve_flash_attn_version", resolver)
+    monkeypatch.setattr(cuda_attention, "resolve_magi2_flash_attn_version", resolver)
     monkeypatch.setattr(cuda_attention, "vllm_flash_attn_varlen_with_lse", bundled)
     monkeypatch.setattr(musa_attention, "flash_attn_3_varlen", Mock(side_effect=AssertionError("standalone path used")))
     assert attention.packed_attention_with_sink(cuda_q, k, v, varlen, softcap=2) is q

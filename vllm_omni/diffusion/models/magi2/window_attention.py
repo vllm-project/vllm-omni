@@ -13,7 +13,9 @@ radius plus all text tokens; text queries attend every token.
 layout of SandAI's Apache-2.0 MAGI-2 refiner data proxy.
 ``build_window_attention_plan`` expresses the same key sets as a paged-KV plan
 for varlen FlashAttention kernels, and ``torch_window_attention_reference``
-evaluates a plan exactly in PyTorch for small inputs.
+evaluates a plan exactly in PyTorch for small inputs.  ``window_attention``
+runs a plan with paged FlashAttention on CUDA (vLLM's kernels) and MUSA
+(standalone FlashAttention-3), and with the reference on CPU.
 ``Magi2WindowAttentionKernel`` runs a plan behind the shared diffusion
 ``Attention`` layer.
 """
@@ -22,18 +24,30 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_3_varlen, vllm_flash_attn_paged_varlen
+from vllm_omni.platforms import current_omni_platform
 
 from .configuration_magi2 import MAGI2_REFINER_CONFIG, Magi2RefinerWindowConfig
-from .parallel import Magi2ParallelGroup, get_magi2_ulysses_group
+from .parallel import (
+    Magi2ParallelGroup,
+    get_magi2_ulysses_group,
+    scatter_heads_gather_seqlen,
+    scatter_seqlen_gather_heads,
+)
 
 PAGE_SIZE = 16
+# The paged kernels split the keys of every text query into this many runs of
+# pages and merge the partial results by LSE: a single row per text query chunk
+# over every key leaves the kernel little parallelism.
+TEXT_KEY_SPLITS = 32
 TORCH_REFERENCE_MAX_TOKENS = 65_536
 
 
@@ -82,6 +96,16 @@ class Magi2WindowAttentionPlan:
     row's last page are zero.  The text queries ``[num_video_tokens,
     num_tokens)`` form one row over every page (``text_page_table``,
     ``text_seqused_k``); there is no text row without text.
+
+    The paged kernels run the text queries as ``text_split_*`` rows instead.
+    The text queries are repeated ``text_key_splits`` times; copy ``s`` is cut
+    into chunks of at most ``query_chunk`` queries, and its rows read the
+    ``s``-th of ``text_key_splits`` disjoint runs of whole pages, which
+    together hold every token.  Row ``s * num_chunks + c`` is chunk ``c`` of
+    copy ``s``, and ``text_split_cu_seqlens_q`` bounds the rows in the repeated
+    queries.  Merging a query's partial results by LSE gives its attention over
+    the whole sequence.  No row of either layout has more than ``query_chunk``
+    queries.
     """
 
     grid: tuple[int, int, int]
@@ -96,6 +120,12 @@ class Magi2WindowAttentionPlan:
     text_cu_seqlens_q: torch.Tensor
     text_page_table: torch.Tensor
     text_seqused_k: torch.Tensor
+    query_chunk: int
+    text_key_splits: int
+    text_split_cu_seqlens_q: torch.Tensor
+    text_split_page_table: torch.Tensor
+    text_split_seqused_k: torch.Tensor
+    text_split_max_seqlen_k: int
 
     @property
     def num_video_tokens(self) -> int:
@@ -126,12 +156,17 @@ class Magi2WindowAttentionPlan:
         return dataclasses.replace(self, **tensors)
 
     def pad_to_pages(self, x: torch.Tensor) -> torch.Tensor:
-        """Return ``x`` (``[num_tokens, ...]``) as zero-padded ``[num_pages, page_size, ...]`` pages."""
+        """Return ``x`` (``[num_tokens, ...]``) as zero-padded ``[num_pages, page_size, ...]`` pages.
+
+        Paged kernels read the whole last page before masking, so its padding
+        is written with zeros whatever the allocation held.
+        """
 
         if x.shape[0] != self.num_tokens:
             raise ValueError(f"expected {self.num_tokens} tokens, got {x.shape[0]}")
-        padded = x.new_zeros((self.num_padded_tokens, *x.shape[1:]))
+        padded = x.new_empty((self.num_padded_tokens, *x.shape[1:]))
         padded[: self.num_tokens].copy_(x)
+        padded[self.num_tokens :].zero_()
         return padded.view(self.num_pages, self.page_size, *x.shape[1:])
 
 
@@ -261,17 +296,51 @@ def build_reference_window_ranges(
     )
 
 
+def _text_split_rows(
+    num_tokens: int, text_len: int, page_size: int, query_chunk: int, key_splits: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Return the paged text rows as ``(cu_seqlens_q, page_table, seqused_k, num_splits)``.
+
+    Every run of pages holds at least one page, so there are at most
+    ``key_splits`` runs; the last one may be shorter.
+    """
+
+    if not text_len:
+        empty = torch.zeros(0, dtype=torch.int32)
+        return torch.zeros(1, dtype=torch.int32), empty.view(0, 0), empty, 0
+    num_pages = -(-num_tokens // page_size)
+    pages_per_split = -(-num_pages // key_splits)
+    num_splits = -(-num_pages // pages_per_split)
+    first_page = torch.arange(num_splits) * pages_per_split
+    column = torch.arange(pages_per_split)
+    in_split = column[None, :] < (num_pages - first_page)[:, None]
+    page_table = torch.where(in_split, first_page[:, None] + column[None, :], 0)
+    seqused_k = torch.clamp(num_tokens - first_page * page_size, max=pages_per_split * page_size)
+    chunk_starts = torch.arange(0, text_len, query_chunk)
+    row_starts = (torch.arange(num_splits)[:, None] * text_len + chunk_starts[None, :]).flatten()
+    cu_seqlens_q = torch.cat((row_starts, torch.tensor([num_splits * text_len])))
+    chunks = chunk_starts.numel()
+    return (
+        cu_seqlens_q.to(torch.int32),
+        page_table.repeat_interleave(chunks, dim=0).to(torch.int32).contiguous(),
+        seqused_k.repeat_interleave(chunks).to(torch.int32),
+        num_splits,
+    )
+
+
 def build_window_attention_plan(
     grid: Sequence[int],
     text_len: int,
     window: Magi2RefinerWindowConfig = MAGI2_REFINER_CONFIG.window,
     page_size: int = PAGE_SIZE,
+    text_key_splits: int = TEXT_KEY_SPLITS,
 ) -> Magi2WindowAttentionPlan:
     """Build the paged-KV window-attention plan for a ``(T, H, W)`` latent grid.
 
     Every video block must cover whole pages, so H and W must be multiples of
     the block's h and w sizes and one block frame (``bh * bw`` tokens) a
-    multiple of ``page_size``.
+    multiple of ``page_size``.  ``text_key_splits`` bounds the number of key
+    runs of the paged text rows.
     """
 
     grid, text_len = _validate_grid(grid, text_len)
@@ -281,6 +350,8 @@ def build_window_attention_plan(
             f"MAGI-2 refiner paged window attention needs H % {bh} == 0, W % {bw} == 0 and "
             f"{bh * bw}-token block frames divisible by page_size={page_size}; got grid={grid}"
         )
+    if text_key_splits <= 0:
+        raise ValueError(f"text_key_splits must be positive, got {text_key_splits}")
     num_video = math.prod(grid)
     num_tokens = num_video + text_len
     block_grid, starts, sizes = _block_layout(grid, window)
@@ -311,6 +382,10 @@ def build_window_attention_plan(
     seqused_k = video_pages * page_size + text_len
 
     num_pages = -(-num_tokens // page_size)
+    query_chunk = window.dense_query_chunk
+    split_cu_seqlens_q, split_page_table, split_seqused_k, num_splits = _text_split_rows(
+        num_tokens, text_len, page_size, query_chunk, text_key_splits
+    )
     return Magi2WindowAttentionPlan(
         grid=grid,
         text_len=text_len,
@@ -324,7 +399,26 @@ def build_window_attention_plan(
         text_cu_seqlens_q=torch.tensor([0, text_len], dtype=torch.int32),
         text_page_table=torch.arange(num_pages, dtype=torch.int32)[None, :],
         text_seqused_k=torch.tensor([num_tokens], dtype=torch.int32),
+        query_chunk=query_chunk,
+        text_key_splits=num_splits,
+        text_split_cu_seqlens_q=split_cu_seqlens_q,
+        text_split_page_table=split_page_table,
+        text_split_seqused_k=split_seqused_k,
+        text_split_max_seqlen_k=int(split_seqused_k.max()) if num_splits else 0,
     )
+
+
+def _check_inputs(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, plan: Magi2WindowAttentionPlan) -> None:
+    if query.ndim != 3 or key.ndim != 3 or key.shape != value.shape:
+        raise ValueError("expected query [N, Hq, D] and key/value [N, Hkv, D]")
+    num_tokens, num_heads_q, head_dim = query.shape
+    if num_tokens != plan.num_tokens or key.shape[0] != num_tokens or key.shape[2] != head_dim:
+        raise ValueError(
+            f"window attention inputs do not match the plan: query {tuple(query.shape)}, "
+            f"key {tuple(key.shape)}, plan tokens {plan.num_tokens}"
+        )
+    if num_heads_q % key.shape[1]:
+        raise ValueError("query heads must be a multiple of key/value heads")
 
 
 def torch_window_attention_reference(
@@ -344,17 +438,9 @@ def torch_window_attention_reference(
     as a paged kernel reads them.  The output has the query's dtype.
     """
 
-    if query.ndim != 3 or key.ndim != 3 or key.shape != value.shape:
-        raise ValueError("expected query [N, Hq, D] and key/value [N, Hkv, D]")
+    _check_inputs(query, key, value, plan)
     num_tokens, num_heads_q, head_dim = query.shape
     num_heads_kv = key.shape[1]
-    if num_tokens != plan.num_tokens or key.shape[0] != num_tokens or key.shape[2] != head_dim:
-        raise ValueError(
-            f"window attention inputs do not match the plan: query {tuple(query.shape)}, "
-            f"key {tuple(key.shape)}, plan tokens {plan.num_tokens}"
-        )
-    if num_heads_q % num_heads_kv:
-        raise ValueError("query heads must be a multiple of key/value heads")
     if num_tokens > max_tokens:
         raise ValueError(
             f"the PyTorch window-attention reference is limited to {max_tokens} tokens "
@@ -381,6 +467,102 @@ def torch_window_attention_reference(
     return out
 
 
+def merge_attention_partials(partials: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """Merge attention results over disjoint key sets into the attention over their union.
+
+    ``partials`` is ``[S, T, H, D]`` and ``lse`` its ``[S, T, H]`` log-sum-exp
+    over each key set; the result is fp32 ``[T, H, D]``.
+    """
+
+    lse = lse.float()
+    weights = torch.exp(lse - lse.amax(dim=0))
+    return (partials.float() * weights.unsqueeze(-1)).sum(dim=0) / weights.sum(dim=0).unsqueeze(-1)
+
+
+PagedAttention = Callable[..., Any]
+
+
+def resolve_magi2_flash_attn_version() -> int:
+    """Follow the Preview's FlashAttention choice, resolved once by the CUDA attention backend."""
+
+    # Deferred to call time, not module scope: importing this pulls in the CUDA layer
+    # package (layers/cuda/__init__.py imports .mh_moe), so keep it off the import path
+    # of the MUSA/NPU builds that never resolve a FlashAttention version.
+    from .layers.cuda.attention_ops import resolve_magi2_flash_attn_version as resolve_cuda_version
+
+    return resolve_cuda_version()
+
+
+def _flash_attn_3_paged(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: Any) -> Any:
+    return flash_attn_3_varlen(query, key, value, cu_seqlens_k=None, **kwargs)
+
+
+def _vllm_flash_attn_paged(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: Any) -> Any:
+    return vllm_flash_attn_paged_varlen(query, key, value, fa_version=resolve_magi2_flash_attn_version(), **kwargs)
+
+
+def _paged_kernel(device: torch.device) -> PagedAttention | None:
+    """Return the paged FlashAttention adapter for tensors on ``device``, or ``None`` without one."""
+
+    if device.type != current_omni_platform.device_type:
+        return None
+    if current_omni_platform.is_cuda():
+        return _vllm_flash_attn_paged
+    if current_omni_platform.is_musa():
+        return _flash_attn_3_paged
+    return None
+
+
+def _paged_window_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: Magi2WindowAttentionPlan,
+    softmax_scale: float,
+    kernel: PagedAttention,
+) -> torch.Tensor:
+    if plan.page_table.device != query.device:
+        raise ValueError(
+            f"the window plan is on {plan.page_table.device} and the query on {query.device}; "
+            "build or move the plan for the query's device once and reuse it"
+        )
+    num_video, text_len = plan.num_video_tokens, plan.text_len
+    key_pages, value_pages = plan.pad_to_pages(key), plan.pad_to_pages(value)
+    # Every call passes the same max_seqlen_q, so one kernel configuration serves every grid and text length.
+    rows: dict[str, Any] = {"max_seqlen_q": plan.query_chunk, "softmax_scale": softmax_scale}
+    output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+    kernel(
+        query[:num_video],
+        key_pages,
+        value_pages,
+        cu_seqlens_q=plan.cu_seqlens_q,
+        max_seqlen_k=plan.max_seqlen_k,
+        seqused_k=plan.seqused_k,
+        block_table=plan.page_table,
+        out=output[:num_video],
+        **rows,
+    )
+    if text_len:
+        splits, num_heads = plan.text_key_splits, query.shape[1]
+        partials, lse = kernel(
+            query[num_video:].repeat(splits, 1, 1),
+            key_pages,
+            value_pages,
+            cu_seqlens_q=plan.text_split_cu_seqlens_q,
+            max_seqlen_k=plan.text_split_max_seqlen_k,
+            seqused_k=plan.text_split_seqused_k,
+            block_table=plan.text_split_page_table,
+            return_softmax_lse=True,
+            **rows,
+        )
+        merged = merge_attention_partials(
+            partials.reshape(splits, text_len, num_heads, -1),
+            lse.reshape(num_heads, splits, text_len).permute(1, 2, 0),
+        )
+        output[num_video:].copy_(merged)
+    return output
+
+
 def window_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -391,16 +573,50 @@ def window_attention(
 ) -> torch.Tensor:
     """Run a plan's window attention over its full token sequence.
 
-    CPU tensors run ``torch_window_attention_reference``.  Device tensors need a
-    paged FlashAttention kernel, which this function does not provide, so they
-    are refused instead of being routed to the host-bound reference.
+    CUDA tensors run vLLM's paged FlashAttention and MUSA tensors the
+    standalone FlashAttention-3 paged kernel; the plan must be on the same
+    device.  The video blocks take one call into the output; the text queries
+    take one more over the plan's key-split rows, whose partial results are
+    merged by LSE in fp32 and rounded once.  A kernel without paged support
+    raises instead of falling back.  CPU tensors run
+    ``torch_window_attention_reference``.
     """
 
-    if query.device.type != "cpu":
-        raise NotImplementedError(
-            f"MAGI-2 refiner window attention has no paged kernel for {query.device.type} tensors"
-        )
-    return torch_window_attention_reference(query, key, value, plan, softmax_scale=softmax_scale)
+    kernel = _paged_kernel(query.device)
+    if kernel is not None:
+        _check_inputs(query, key, value, plan)
+        scale = query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        return _paged_window_attention(query, key, value, plan, scale, kernel)
+    if query.device.type == "cpu":
+        return torch_window_attention_reference(query, key, value, plan, softmax_scale=softmax_scale)
+    raise NotImplementedError(f"MAGI-2 refiner window attention has no paged kernel for {query.device.type} tensors")
+
+
+def prewarm_window_attention(
+    device: torch.device | str,
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    window: Magi2RefinerWindowConfig = MAGI2_REFINER_CONFIG.window,
+) -> None:
+    """Run the paged window-attention calls once for these per-rank head counts.
+
+    A one-block grid with one text token issues the video and the text call
+    with the production arguments, so kernels that compile on first use
+    compile here, outside any compiled region.  Devices without a paged
+    kernel have nothing to compile.
+    """
+
+    device = torch.device(device)
+    if _paged_kernel(device) is None:
+        return
+    _, bh, bw = window.block_size
+    plan = build_window_attention_plan((1, bh, bw), 1, window).to(device)
+    query = torch.zeros(plan.num_tokens, num_heads_q, head_dim, dtype=dtype, device=device)
+    key_value = torch.zeros(plan.num_tokens, num_heads_kv, head_dim, dtype=dtype, device=device)
+    with torch.no_grad():
+        window_attention(query, key_value, key_value, plan)
 
 
 def ulysses_window_attention(
@@ -415,10 +631,11 @@ def ulysses_window_attention(
 ) -> torch.Tensor:
     """Run window attention for one Ulysses rank's contiguous token slice.
 
-    ``split_sizes`` holds every rank's token count of the plan's sequence.  The
-    plan is global, so a sliced sequence needs the Ulysses sequence/head
-    exchange around the kernel; this function does not perform it and refuses
-    more than one rank.
+    ``split_sizes`` holds every rank's token count of the plan's sequence.
+    The plan is global: with more than one rank, the Ulysses exchange gives
+    each rank the whole sequence for its share of the query and key/value
+    heads, the plan runs on it, and the inverse exchange returns this rank's
+    tokens with every head.  Both head counts must divide by the world size.
     """
 
     group = group or get_magi2_ulysses_group()
@@ -430,9 +647,16 @@ def ulysses_window_attention(
         )
     if query.shape[0] != split_sizes[group.rank]:
         raise ValueError(f"Ulysses rank {group.rank} owns {split_sizes[group.rank]} tokens, got {query.shape[0]}")
-    if group.world_size > 1:
-        raise NotImplementedError("MAGI-2 refiner window attention does not implement the Ulysses exchange")
-    return window_attention(query, key, value, plan, softmax_scale=softmax_scale)
+    if group.world_size == 1:
+        return window_attention(query, key, value, plan, softmax_scale=softmax_scale)
+    if query.shape[1] % group.world_size or key.shape[1] % group.world_size:
+        raise ValueError(
+            f"MAGI-2 refiner Ulysses attention needs the {query.shape[1]} query and {key.shape[1]} key/value "
+            f"heads to divide by the Ulysses size {group.world_size}"
+        )
+    query, key, value = scatter_heads_gather_seqlen((query, key, value), split_sizes, group)
+    output = window_attention(query, key, value, plan, softmax_scale=softmax_scale)
+    return scatter_seqlen_gather_heads(output.contiguous(), split_sizes, group)
 
 
 class Magi2WindowAttentionKernel(nn.Module):

@@ -393,6 +393,7 @@ def test_plan_pads_pages_with_zeros_and_moves_devices() -> None:
     moved = plan.to("meta")
     assert moved.page_table.device.type == "meta"
     assert moved.text_page_table.device.type == "meta"
+    assert moved.text_split_page_table.device.type == moved.text_split_seqused_k.device.type == "meta"
     assert plan.page_table.device.type == "cpu"
     assert (moved.grid, moved.text_len, moved.max_seqlen_k) == (plan.grid, plan.text_len, plan.max_seqlen_k)
 
@@ -407,6 +408,82 @@ def test_plan_without_text_has_no_text_pages() -> None:
         torch.randn(plan.num_tokens, 2, 8), torch.randn(plan.num_tokens, 1, 8), torch.randn(plan.num_tokens, 1, 8), plan
     )
     assert torch.isfinite(out).all()
+
+
+def _text_split_keys(plan: Magi2WindowAttentionPlan) -> list[np.ndarray]:
+    """Every text query's key tokens, concatenated over the paged text rows that hold it."""
+
+    cu = plan.text_split_cu_seqlens_q.long().numpy()
+    table = plan.text_split_page_table.long().numpy()
+    used = plan.text_split_seqused_k.long().numpy()
+    keys: list[list[np.ndarray]] = [[] for _ in range(plan.text_len)]
+    for row in range(table.shape[0]):
+        pages = table[row, : -(-used[row] // plan.page_size)]
+        tokens = (pages[:, None] * plan.page_size + np.arange(plan.page_size)).ravel()[: used[row]]
+        for position in range(cu[row], cu[row + 1]):
+            keys[position % plan.text_len].append(tokens)
+    return [np.concatenate(query_keys) for query_keys in keys]
+
+
+@pytest.mark.parametrize(
+    ("grid", "text_len", "key_splits"),
+    [
+        ((1, 4, 4), 1, 32),  # more splits than pages
+        ((9, 4, 8), 1, 32),
+        ((9, 4, 8), 37, 4),  # a shorter last run of pages
+        ((1, 4, 4), 120, 4),  # 9 pages: 3 runs of 3, not 4 runs
+        ((9, 4, 8), 128, 32),
+        ((9, 4, 8), 130, 7),  # two query chunks per run
+        ((11, 8, 12), 300, 32),  # three query chunks per run
+        ((11, 8, 12), 300, 1),
+    ],
+)
+def test_text_split_rows_attend_every_key_once_per_query(
+    grid: tuple[int, int, int], text_len: int, key_splits: int
+) -> None:
+    plan = build_window_attention_plan(grid, text_len, text_key_splits=key_splits)
+    cu = plan.text_split_cu_seqlens_q.long()
+    num_rows = plan.text_split_page_table.shape[0]
+    splits = plan.text_key_splits
+
+    for tensor in (plan.text_split_cu_seqlens_q, plan.text_split_page_table, plan.text_split_seqused_k):
+        assert tensor.dtype == torch.int32 and tensor.is_contiguous()
+    assert plan.query_chunk == 128
+    assert 1 <= splits <= min(key_splits, plan.num_pages)
+    assert num_rows == splits * -(-text_len // plan.query_chunk) == cu.numel() - 1
+    assert plan.text_split_seqused_k.shape == (num_rows,)
+    assert (int(cu[0]), int(cu[-1])) == (0, splits * text_len)
+    assert 0 < int(cu.diff().min()) and int(cu.diff().max()) <= plan.query_chunk
+    # A row holds queries of one copy only, so the partial results reshape to [splits, text_len].
+    assert torch.equal(cu[:-1] // text_len, (cu[1:] - 1) // text_len)
+    assert int(plan.text_split_seqused_k.min()) > 0
+    assert int(plan.text_split_page_table.max()) < plan.num_pages
+    assert plan.text_split_max_seqlen_k == int(plan.text_split_seqused_k.max())
+    for keys in _text_split_keys(plan):
+        assert np.array_equal(np.sort(keys), np.arange(plan.num_tokens))
+
+
+def test_text_split_rows_at_production_size() -> None:
+    plan = _plan(_PRODUCTION_GRID, 512)
+
+    assert (plan.query_chunk, plan.text_key_splits) == (128, 32)
+    assert plan.text_split_page_table.shape == (4 * 32, 1006)
+    assert plan.text_split_cu_seqlens_q[:6].tolist() == [0, 128, 256, 384, 512, 640]
+    assert int(plan.text_split_cu_seqlens_q[-1]) == 32 * 512
+    assert plan.text_split_seqused_k[:4].tolist() == 4 * [1006 * 16]
+    assert plan.text_split_seqused_k[-4:].tolist() == 4 * [514_592 - 31 * 1006 * 16]
+    assert plan.text_split_max_seqlen_k == 1006 * 16
+
+    without_text = _plan(_PRODUCTION_GRID, 0)
+    assert without_text.text_key_splits == 0
+    assert without_text.text_split_cu_seqlens_q.tolist() == [0]
+    assert without_text.text_split_page_table.shape == (0, 0)
+    assert without_text.text_split_seqused_k.numel() == 0 and without_text.text_split_max_seqlen_k == 0
+
+
+def test_plan_refuses_non_positive_text_key_splits() -> None:
+    with pytest.raises(ValueError, match="text_key_splits"):
+        build_window_attention_plan((9, 4, 8), 3, text_key_splits=0)
 
 
 @pytest.mark.parametrize("builder", [build_reference_window_ranges, build_window_attention_plan])
@@ -464,7 +541,7 @@ def test_window_attention_kernel_requires_plan_and_split_metadata() -> None:
         kernel(q, k, v, AttentionMetadata(extra={"magi2_window_plan": plan}))
 
 
-def test_ulysses_window_attention_refuses_sliced_sequences() -> None:
+def test_ulysses_window_attention_checks_the_split_sizes() -> None:
     plan = _plan((9, 4, 8), 3)
     q, k, v = _qkv(plan)
     single = Magi2ParallelGroup(None, 1, 0)
@@ -477,8 +554,6 @@ def test_ulysses_window_attention_refuses_sliced_sequences() -> None:
         ulysses_window_attention(q, k, v, plan, [plan.num_tokens], group=pair)
     with pytest.raises(ValueError, match="owns"):
         ulysses_window_attention(q, k, v, plan, half, group=pair)
-    with pytest.raises(NotImplementedError, match="Ulysses exchange"):
-        ulysses_window_attention(q[: half[1]], k[: half[1]], v[: half[1]], plan, half, group=pair)
 
 
 def test_window_attention_refuses_device_tensors_without_a_paged_kernel() -> None:

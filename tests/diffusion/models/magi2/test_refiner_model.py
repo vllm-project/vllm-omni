@@ -14,8 +14,8 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.models.magi2.common_layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.configuration_magi2 import Magi2RefinerConfig
-from vllm_omni.diffusion.models.magi2.layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.modeling_magi2_refiner import Magi2RefinerTransformer
 from vllm_omni.diffusion.models.magi2.window_attention import (
     build_reference_window_ranges,

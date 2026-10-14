@@ -24,8 +24,8 @@ logger = init_logger(__name__)
 
 
 @cache
-def _resolve_flash_attn_version() -> int:
-    """Apply MAGI-2's operator override to the shared FA2/FA3/FA4 resolver."""
+def resolve_magi2_flash_attn_version() -> int:
+    """Resolve the FA2/FA3/FA4 version of MAGI-2's CUDA attention once, with the operator override."""
 
     requested = os.environ.get("MAGI2_FLASH_ATTN_VERSION")
     version = resolve_vllm_flash_attn_version(requested)
@@ -71,9 +71,9 @@ def varlen_attention_with_sink(
         max_seqlen_k=max_seqlen_k,
         softcap=softcap,
         deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1",
-        fa_version=_resolve_flash_attn_version(),
+        fa_version=resolve_magi2_flash_attn_version(),
     )
     return correct_out_lse_with_sink(out, lse, sink)[0]
 
 
-__all__ = ["varlen_attention_with_sink"]
+__all__ = ["resolve_magi2_flash_attn_version", "varlen_attention_with_sink"]
