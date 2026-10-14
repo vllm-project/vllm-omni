@@ -119,6 +119,8 @@ def test_seed_tts_text_chat_messages_do_not_add_reference_audio() -> None:
 class MockResponse:
     """Mock aiohttp response for testing"""
 
+    headers: dict[str, str]
+
     def __init__(self, status, chunks, delay_between_chunks=0):
         self.status = status
         self.reason = "OK" if status == 200 else "Error"

@@ -604,7 +604,8 @@ def test_response_ledger_rejects_identity_errors(events, match: str):
 
 class _CompletionClient:
     def __init__(self, collector: EventCollector):
-        self.events, self.acks = collector, []
+        self.events = collector
+        self.acks: list[tuple[str, int]] = []
 
     def raise_if_reader_stopped(self) -> None:
         return None
