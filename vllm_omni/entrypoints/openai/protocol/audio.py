@@ -5,13 +5,26 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 import numpy as np
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 # Bound int request fields to avoid overflow issues.
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
 _MAX_EMBEDDING_DIM = 8192
+# Structural bounds for pre-computed reference codes ([codebooks, frames]);
+# the adapter checks the deployed model's exact codebook count and lengths.
+_MAX_REF_AUDIO_CODEBOOKS = 64
+_MAX_REF_AUDIO_CODE_FRAMES = 1 << 16
 
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
@@ -164,6 +177,15 @@ class OpenAICreateSpeechRequest(BaseModel):
         "2048-dim for 1.7B). Skips speaker encoder extraction from ref_audio. "
         "Implies x_vector_only_mode=True. Mutually exclusive with ref_audio.",
     )
+    ref_audio_codes: list[list[StrictInt]] | None = Field(
+        default=None,
+        description=(
+            "Pre-computed codec codes of the reference audio, shaped [codebooks, frames]: the raw "
+            "codebook indices from the deployed model's own codec. Skips reference encoding. "
+            "Requires ref_text; mutually exclusive with ref_audio, speaker_embedding and an "
+            "uploaded voice. Supported by Fish Audio Drama 3."
+        ),
+    )
     max_new_tokens: int | None = Field(
         default=None,
         ge=1,
@@ -211,6 +233,27 @@ class OpenAICreateSpeechRequest(BaseModel):
     @classmethod
     def normalize_ref_audio(cls, v):
         return _normalize_ref_audio_value(v)
+
+    @field_validator("ref_audio_codes")
+    @classmethod
+    def validate_ref_audio_codes(cls, v: list[list[int]] | None) -> list[list[int]] | None:
+        """A non-empty rectangular grid; the adapter checks its values against the model's
+        codec (each codebook's size) before anything converts them."""
+        if v is None:
+            return None
+        if not v or not v[0]:
+            raise ValueError("'ref_audio_codes' must be a non-empty [codebooks, frames] array")
+        if len(v) > _MAX_REF_AUDIO_CODEBOOKS:
+            raise ValueError(
+                f"'ref_audio_codes' has {len(v)} rows; it is shaped [codebooks, frames] "
+                f"(at most {_MAX_REF_AUDIO_CODEBOOKS} codebooks)"
+            )
+        frames = len(v[0])
+        if any(len(row) != frames for row in v):
+            raise ValueError("'ref_audio_codes' rows (codebooks) must all have the same number of frames")
+        if frames > _MAX_REF_AUDIO_CODE_FRAMES:
+            raise ValueError(f"'ref_audio_codes' has {frames} frames; at most {_MAX_REF_AUDIO_CODE_FRAMES}")
+        return v
 
     @field_validator("speaker_embedding")
     @classmethod
@@ -330,6 +373,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         if self.speaker_embedding is not None:
             if self.ref_audio is not None and not isinstance(self.ref_audio, list):
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
+        if self.ref_audio_codes is not None:
+            if self.ref_audio is not None:
+                raise ValueError("'ref_audio_codes' and 'ref_audio' are mutually exclusive")
+            if self.speaker_embedding is not None:
+                raise ValueError("'ref_audio_codes' and 'speaker_embedding' are mutually exclusive")
+            if not self.ref_text or not self.ref_text.strip():
+                raise ValueError("'ref_audio_codes' requires 'ref_text' (transcript of the reference audio)")
         return self
 
     def is_raw_audio_stream(self) -> bool:

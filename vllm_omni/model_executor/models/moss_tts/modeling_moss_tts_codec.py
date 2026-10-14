@@ -1131,7 +1131,7 @@ class MossTTSCodecDecoder(nn.Module):
             num_quantizers=self._n_vq,
             attention_backend=getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa"),
         )
-        if device.type == "cuda":
+        if device.type in ("cuda", "npu"):
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformer
 
             shared = 0

@@ -1945,7 +1945,6 @@ class TestPreferModelSamplerNoneFallback:
         expected = {
             "audio8_tts",
             "cosyvoice3",
-            "fish_omni",  # Returns None only for an empty batch.
             "glm_tts",
             "higgs_audio_v2",
             "higgs_audio_v3",

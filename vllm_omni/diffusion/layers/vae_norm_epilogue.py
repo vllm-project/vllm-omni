@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803
-"""Bit-exact fused RMSNorm epilogue for the diffusers Wan VAE decoder.
+"""Bit-exact fused RMSNorm epilogue for channel-first diffusion VAE normalization.
 
 ``WanRMS_norm.forward`` evaluates, for fp16/bf16 activations::
 

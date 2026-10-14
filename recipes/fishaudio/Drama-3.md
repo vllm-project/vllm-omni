@@ -21,12 +21,12 @@ same Fish DAC codec as Fish Speech S2 Pro.
 ## Pipeline
 
 ```text
-text + reference (wav, transcript)
+text + reference (wav or pre-encoded codes, transcript)
   │
   ▼
-Stage 0  fish_omni (LLM AR)
+Stage 0  fish_omni (LLM AR, Model Runner V2; one forward samples a whole frame)
   ├─ backbone (Qwen3.5 MoE) samples the frame's main token
-  └─ codebook tower (13 layers, own KV history) samples codes 1..9
+  └─ codebook tower (13 layers, paged KV beside the backbone's) samples codes 1..9
   │   10-codebook frames, streamed in chunks (shared-memory connector)
   ▼
 Stage 1  dac_decoder (FishSpeechDACDecoder) → 44.1 kHz audio
@@ -41,7 +41,7 @@ Stage 1  dac_decoder (FishSpeechDACDecoder) → 44.1 kHz audio
 
 ## GPU
 
-### 1x H100 80GB
+### 1x H200 141GB
 
 #### Environment
 
@@ -60,7 +60,9 @@ Notes:
 
 - `--omni` is required.
 - The default deploy config `vllm_omni/deploy/fish_omni.yaml` is loaded
-  automatically (HF `model_type=fish_omni`). Both stages share one GPU.
+  automatically (HF `model_type=fish_omni`). Both stages share one GPU
+  through a private MPS daemon; stage 0 runs on Model Runner V2 with CUDA
+  graphs (FULL for decode steps, PIECEWISE for steps with prompt rows).
 - The checkpoint's `bsgemm-moe` quantization maps to vLLM's block-FP8 MoE
   kernels for the routed experts; all other weights stay bf16.
 
@@ -78,6 +80,20 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "ref_text": "We asked over twenty different people, and they all said it was his.",
         "response_format": "wav"
     }' --output cloned.wav
+```
+
+#### Pre-encoded reference
+
+A reference can be sent already encoded, as in the model card's production
+serving setup: `ref_audio_codes` holds `[codebooks, frames]` raw codebook
+indices of the checkpoint's codec (`codec.pth`), with `ref_text`. Nothing is
+fetched or encoded per request; the prompt is the same as for the audio.
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"input": "...", "ref_audio_codes": [[...], ...], "ref_text": "...", "response_format": "wav"}' \
+    --output cloned.wav
 ```
 
 #### Event and emotion tags
@@ -112,38 +128,46 @@ which returns the exact prompt row count.
 #### Notes
 
 - Memory: stage 0 weights take 36.9 GiB; the default deploy config uses
-  0.75 of the GPU for stage 0 and 0.1 for the codec stage.
+  0.78 of the GPU for stage 0 and 0.1 for the codec stage.
 - Default sampling (model card): temperature 1.0, top_p 0.9, top_k 30,
-  max_tokens 500. The codebook heads use the same values.
+  max_tokens 500. The codebook heads use the same values. Sampling runs in
+  fused kernels that cap top_k at 64 (`hf_overrides`
+  `fish_omni_max_top_k`, a power of two from 32 to 4096, raises it). A request's
+  `seed` drives every draw of its frames, the codebook heads included.
 - The main token uses repetition-aware sampling: a semantic token that
   repeats one of the last 16 main tokens is re-drawn with temperature 1.0,
-  top_k 30, top_p 0.95 (`FishOmniForConditionalGeneration.sample`).
-- The gated-delta-net state is kept in float32, as the checkpoint's
-  `mamba_ssm_dtype` asks.
+  top_k 30, top_p 0.95.
+- The default deploy keeps the gated-delta-net state in bfloat16 (the
+  checkpoint's `mamba_ssm_dtype` is float32): +7% / +13% audio-s/s at 64 /
+  128 streams with the same Seed-TTS-Eval WER and speaker similarity. Set
+  `mamba_ssm_cache_dtype: float32` to keep the checkpoint's dtype.
+- On CUDA the codec stage decodes channels-last from its own CUDA graphs
+  (`fish_speech_dac_cuda_graphs`) and keeps each stream's convolution history
+  and window transformer keys / values between windows
+  (`fish_speech_dac_stateful`), so a window decodes only its new frames and
+  windows splice as in decoding the whole utterance. Elsewhere it uses the
+  module decoder, re-decoding each window's left context.
 
-#### Measured performance (1x H100 80GB, both stages on one GPU)
+#### Measured performance (1x H200, both stages on one GPU)
 
-Default `vllm_omni/deploy/fish_omni.yaml` at revision 13389ee7 of this PR
-(vLLM 0.31.0), fresh environment and model download. Streaming
-`/v1/audio/speech` (SSE, pcm), one voice-clone reference, the sampling above,
-warm server, warmup at each concurrency excluded.
+Default `vllm_omni/deploy/fish_omni.yaml` (vLLM 0.31.0). Seed-TTS-Eval en
+(1088 lines, each cloning its own reference, sent pre-encoded as
+`ref_audio_codes`), streaming `/v1/audio/speech` (raw pcm), the sampling
+above, a fresh server per concurrency, 8 warmup requests excluded.
+Throughput is seconds of audio generated per wall-clock second.
 
-| Concurrency | TTFA p50 | TTFA p95 | RTF (mean) |
-| ---: | ---: | ---: | ---: |
-| 1 | 126 ms | 141 ms | 0.28 |
-| 4 | 246 ms | 300 ms | 0.40 |
-| 8 | 360 ms | 518 ms | 0.51 |
+| Concurrency | Audio s/s | TTFA p50 | TTFA p95 | RTF (mean) | Streams that stall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 163.8 | 195 ms | 382 ms | 0.374 | 0% |
+| 128 | 232.5 | 252 ms | 649 ms | 0.515 | 0% |
 
 #### Known limitations
 
-- The codebook tower decode step replays CUDA graphs (one per batch-size
-  bucket; eager with `enforce_eager`); its teacher-forced prompt pass runs
-  eagerly, batched across requests that start in the same step. With the
-  codec on the same GPU, codec calls share the GPU with decode steps at
-  higher concurrency.
+- One tensor and pipeline rank only.
+- Prefix caching is off: prompt rows carry ten codes per audio row that
+  token-id hashing does not see.
 - Some takes stop speaking after the first word or event and emit silence
   until `max_tokens`. This is model behaviour; it is more frequent for lines
   that start with a filler word or a tag, and with pause-heavy references.
 - `previous_takes` (editing as continuation) and long-text chunking are not
-  exposed by the speech API yet. Per-request seeds do not apply to the
-  codebook heads.
+  exposed by the speech API yet.

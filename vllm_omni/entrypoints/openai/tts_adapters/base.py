@@ -120,7 +120,23 @@ def conditioning_cache_salt(
         value = tts_params.get(key) if tts_params is not None else None
         if value is not None:
             h.update(repr(value).encode("utf-8"))
+    # Pre-computed reference codes: their digest (folded only when present,
+    # so other requests keep their salts).
+    codes_key = tts_params.get("ref_codes_cache_key") if tts_params is not None else None
+    if codes_key is not None:
+        h.update(b"\x00ref_codes\x00" + str(codes_key).encode("utf-8"))
     return h.hexdigest()[:32]
+
+
+def validate_tts_request(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> str | None:
+    """``adapter.validate`` after the checks every adapter shares: ``ref_audio_codes``
+    only where supported, rather than silently dropped."""
+    if getattr(request, "ref_audio_codes", None) is not None and not getattr(
+        adapter, "supports_reference_codes", False
+    ):
+        name = getattr(adapter, "name", None) or "this model"
+        return f"'ref_audio_codes' (pre-computed reference codes) is not supported by {name}"
+    return adapter.validate(request)
 
 
 def apply_max_new_tokens(
@@ -232,6 +248,9 @@ class TTSModelAdapter(ABC):
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Whether ``request.ref_audio_codes`` (pre-computed reference codes) is
+    #: accepted; other adapters get a 4xx instead of silently dropping it.
+    supports_reference_codes: ClassVar[bool] = False
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
