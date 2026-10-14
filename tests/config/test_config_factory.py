@@ -235,6 +235,42 @@ class TestPipelineDiscovery:
         assert p.hf_architectures == ("SomeCollidingArch",)
 
 
+class TestHunyuanImage3DeployPipeline:
+    def test_mooncake_profile_resolves_typed_topology_and_kv_transfer(self):
+        pipeline = resolve_pipeline_config("hunyuan_image_3_moe")
+        config = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            deploy_config_path=get_deploy_config_path("hunyuan-image-3-mooncakeconnector.yaml"),
+        )
+        ar, dit = config.stage_configs
+
+        assert ar.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
+        assert ar.is_comprehension is True
+        assert ar.final_output is True
+        assert ar.final_output_type == "text"
+        assert dit.stage_pipeline_config.execution_type == StageExecutionType.DIFFUSION
+        assert dit.input_sources == [0]
+        assert dit.final_output is True
+        assert dit.final_output_type == "image"
+
+        for stage, devices, role, engine_id in (
+            (ar, "0,1,2,3", "kv_producer", "hunyuan-image3-ar"),
+            (dit, "4,5,6,7", "kv_consumer", "hunyuan-image3-dit"),
+        ):
+            assert stage.runtime_config.devices == devices
+            assert stage.runtime_config.num_replicas == 2
+            assert stage.parallel_config.tensor_parallel_size == 2
+            kv_transfer = stage.connector_config.kv_transfer_config
+            assert kv_transfer.kv_connector == "MooncakeConnector"
+            assert kv_transfer.kv_role == role
+            assert kv_transfer.engine_id == engine_id
+            assert kv_transfer.kv_connector_extra_config["mooncake_protocol"] == "tcp"
+
+        assert ar.connector_config.kv_transfer_config.kv_connector_extra_config["bootstrap_port"] == 8998
+        assert dit.diffusion_config.kv_transfer_config.kv_connector_extra_config["transfer_timeout"] == 60.0
+        assert dit.parallel_config.enable_expert_parallel is True
+
+
 class TestCosmos3PolicyPipeline:
     """Cosmos3 policy serving resolves via deploy yaml selection (π0 precedent)."""
 
