@@ -10,6 +10,10 @@
 - Mode: Offline inference and online serving with optional step-wise execution
 - Maintainer: Community
 
+Optional [shared residual gates](../../docs/user_guide/diffusion/qwen_image_21_shared_gates.md)
+reuse gate activation within each Transformer forward. The setting is disabled
+by default and independent of hardware-specific QKV fusion.
+
 > **Model id:** `Qwen/Qwen-Image-2.1` follows the reference diffusers
 > documentation and may change before the official release — the final
 > checkpoint name is subject to the official release.

@@ -644,10 +644,11 @@ class QwenImage21TransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         mod_params: torch.Tensor,
         target_token_mask: torch.Tensor | None,
+        shared_gate: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         scale, gate = mod_params.chunk(2, dim=-1)
         scale = _select_modulation_rows(scale, target_token_mask)
-        gate = _select_modulation_rows(gate, target_token_mask)
+        gate = _select_modulation_rows(gate, target_token_mask) if shared_gate is None else shared_gate
         return hidden_states * (1 + scale), gate
 
     def forward(
@@ -662,10 +663,16 @@ class QwenImage21TransformerBlock(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        shared_gates: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
 
-        img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+        img_modulated, img_gate1 = self._modulate(
+            self.img_norm1(hidden_states),
+            mod1,
+            target_token_mask,
+            shared_gate=shared_gates[0] if shared_gates is not None else None,
+        )
         attn_output = self.attn(
             img_modulated,
             freqs,
@@ -676,10 +683,17 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        hidden_states = hidden_states + img_gate1.tanh() * attn_output
+        hidden_states = hidden_states + (img_gate1.tanh() if shared_gates is None else img_gate1) * attn_output
 
-        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
-        hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
+        img_modulated2, img_gate2 = self._modulate(
+            self.img_norm2(hidden_states),
+            mod2,
+            target_token_mask,
+            shared_gate=shared_gates[1] if shared_gates is not None else None,
+        )
+        hidden_states = hidden_states + (img_gate2.tanh() if shared_gates is None else img_gate2) * self.img_mlp(
+            img_modulated2
+        )
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -847,6 +861,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # quantizes attention Q/K/V *compute* per forward on supported backends.
         extras = getattr(od_config, "extras", None) or {}
         self.prefix_kv_cache_dtype = _normalize_prefix_kv_cache_dtype(extras.get("prefix_kv_cache_dtype"))
+        self.share_residual_gates = (od_config.additional_config or {}).get("qwen21_share_residual_gates", False)
+        if not isinstance(self.share_residual_gates, bool):
+            raise ValueError("qwen21_share_residual_gates must be a bool")
 
         self.pos_embed = QwenImage21Rope(theta=10000, axes_dim=list(axes_dims_rope))
         self.time_text_embed = QwenImage21TimestepProjEmbeddings(
@@ -1197,6 +1214,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
 
+        shared_gates = self._prepare_shared_gates(modulation, local_mask)
         for index_block, block in enumerate(self.transformer_blocks):
             block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
             joint_hidden_states = block(
@@ -1210,6 +1228,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
+                shared_gates=shared_gates,
             )
 
         if (
@@ -1244,6 +1263,18 @@ class QwenImage21Transformer2DModel(CachedTransformer):
 
         return Transformer2DModelOutput(sample=output)
 
+    def _prepare_shared_gates(
+        self, modulation: torch.Tensor, target_token_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Prepare gates once per eager forward or captured decode computation."""
+        if not self.share_residual_gates:
+            return None
+        _, gate1, _, gate2 = modulation.chunk(4, dim=-1)
+        return (
+            _select_modulation_rows(gate1.tanh(), target_token_mask),
+            _select_modulation_rows(gate2.tanh(), target_token_mask),
+        )
+
     def _decode_graph_forward(self, entry) -> torch.Tensor:
         """The exact decode-step computation, captured into a CUDA graph.
 
@@ -1256,6 +1287,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         timestep = torch.cat([entry.timestep, entry.timestep.new_zeros(1)], dim=0)
         temb = self.time_text_embed(timestep, hidden_states)
         modulation = self.modulation(temb)
+        shared_gates = self._prepare_shared_gates(modulation, entry.target_token_mask)
         for index_block, block in enumerate(self.transformer_blocks):
             hidden_states = block(
                 hidden_states=hidden_states,
@@ -1268,6 +1300,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=entry.block_caches[index_block],
                 cache_branch=entry.branch,
                 cache_write_len=None,
+                shared_gates=shared_gates,
             )
         hidden_states = self.norm_out(hidden_states, temb, entry.target_token_mask)
         return self.proj_out(hidden_states)
