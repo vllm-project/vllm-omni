@@ -39,6 +39,7 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.interaction.types import MAX_PENDING_INTERACTION_EVENTS, InteractionBoundaryContext
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
     get_dummy_run_num_image_inputs,
@@ -238,6 +239,7 @@ class _StreamingPlayback:
     boundary_at: float | None = None
     next_ready_at: float = 0.0
     pending_boundary: bool = True
+    pending_actions: dict[str, float] = field(default_factory=dict)
     next_media_duration: float = 0.0
     max_output_bytes: int = 64 * 1024 * 1024
     idle_timeout_s: float = 30.0
@@ -734,6 +736,11 @@ class DiffusionEngine:
                         playback = (self._streaming_playback or {}).get(request_id)
                         if playback is not None and playback.pending_boundary:
                             now = time.monotonic()
+                            sched_output.interaction_boundaries[request_id] = InteractionBoundaryContext(
+                                boundary_at=now,
+                                window_opened_at=playback.boundary_at,
+                                window_end_at=playback.next_ready_at if playback.boundary_at is not None else None,
+                            )
                             playback.boundary_at = now
                             playback.next_ready_at = 0.0
                             playback.pending_boundary = False
@@ -877,13 +884,14 @@ class DiffusionEngine:
                         > state.buffer_seconds + 1e-9
                     )
                     or (state.pending_boundary and now < state.next_ready_at)
+                    or bool(state.pending_actions)
                 )
                 if waiting:
                     blocked = True
                     if state.wait_started_at is None:
                         state.wait_started_at = now
                     # Only client-controlled progress can expire a request.
-                    # A media deadline is internal
+                    # A media deadline or ordered control delivery is internal
                     # pacing and must not look like an idle consumer.
                     client_blocked = state.outstanding_chunk is not None or (
                         state.pending_boundary
@@ -936,6 +944,26 @@ class DiffusionEngine:
             if expired:
                 self._cv.notify_all()
 
+    def track_streaming_interaction(self, request_id: str, event_id: str, pending: bool = True) -> float | None:
+        """Stamp ingress before ordered worker delivery in the engine's clock domain."""
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("interaction event_id must be a non-empty string")
+        with self._cv:
+            state = (self._streaming_playback or {}).get(request_id)
+            if state is None:
+                return None
+            if pending:
+                if event_id in state.pending_actions:
+                    return state.pending_actions[event_id]
+                if len(state.pending_actions) >= MAX_PENDING_INTERACTION_EVENTS:
+                    raise ValueError("Too many pending interactions")
+                stamp = time.monotonic()
+                state.pending_actions[event_id] = stamp
+                return stamp
+            state.pending_actions.pop(event_id, None)
+            self._cv.notify_all()
+            return None
+
     def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
         if (
             isinstance(position_seconds, bool)
@@ -967,7 +995,13 @@ class DiffusionEngine:
             except queue.Empty:
                 return
 
-            self._run_rpc_task(task)
+            try:
+                self._run_rpc_task(task)
+            finally:
+                if task.method == "submit_interaction" and len(task.args) >= 2:
+                    interaction = task.args[1]
+                    if isinstance(interaction, dict) and isinstance(interaction.get("event_id"), str):
+                        self.track_streaming_interaction(task.args[0], interaction["event_id"], pending=False)
 
             if task.method == "pause_scheduler":
                 # A dequeued pause ends this drain whatever became of it, so
@@ -1762,6 +1796,9 @@ class DiffusionEngine:
                 self.release_streaming_output(*args, **(kwargs or {}))
                 task.future.set_result(None)
                 return task
+            if method == "track_streaming_interaction":
+                task.future.set_result(self.track_streaming_interaction(*args, **(kwargs or {})))
+                return task
             if method == "pause_scheduler":
                 self._check_pause_request(kwargs)
                 self._scheduling_paused = True
@@ -1813,6 +1850,8 @@ class DiffusionEngine:
                         return self.update_streaming_playback(*args, **(kwargs or {}))
                     if method == "release_streaming_output":
                         return self.release_streaming_output(*args, **(kwargs or {}))
+                    if method == "track_streaming_interaction":
+                        return self.track_streaming_interaction(*args, **(kwargs or {}))
                     return self.executor.collective_rpc(
                         method=method,
                         timeout=timeout,

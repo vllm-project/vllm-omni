@@ -1109,8 +1109,12 @@ class TestStreamingVideoOutputPromptUpdate:
             streaming_buffer_seconds=0.75,
         )
 
-        async def submit(request_id, *, interaction):
+        engine_client.reserve_streaming_interaction = mocker.AsyncMock(return_value=12.5)
+        engine_client.release_streaming_interaction = mocker.AsyncMock()
+
+        async def submit(request_id, *, interaction, track_playback):
             del request_id
+            assert track_playback is True
             delivered_ids.append(interaction["event_id"])
             delivery_started.set()
             await release_delivery.wait()
@@ -1143,6 +1147,7 @@ class TestStreamingVideoOutputPromptUpdate:
 
         queued = [m["event_id"] for m in ws.sent_json if m.get("type") == "session.interaction.queued"]
         assert queued == ["first", "second"]
+        assert next(m for m in ws.sent_json if m.get("event_id") == "first")["received_at"] == 12.5
         assert any(m.get("type") == "session.pong" for m in ws.sent_json)
         assert delivered_ids == ["first"]
 
@@ -1411,6 +1416,7 @@ async def test_interaction_event_id_is_bounded_before_queueing(mocker: MockerFix
         interaction_queue=asyncio.Queue(maxsize=64),
         stop_event=asyncio.Event(),
         progress=_SessionProgress(),
+        track_playback=True,
         response_queue=responses,
     )
     assert "at most 128" in responses.get_nowait()["message"]

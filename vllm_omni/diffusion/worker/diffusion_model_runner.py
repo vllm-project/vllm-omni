@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import math
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -940,6 +941,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output.started_event_ids = list(meta.started_event_ids)
             output.active_event_ids = list(meta.active_event_ids)
             output.completed_event_ids = list(meta.completed_event_ids)
+            output.coalesced_event_ids = list(meta.coalesced_event_ids)
 
     def execute_model(
         self,
@@ -1166,6 +1168,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if state is None:
                     raise ValueError(f"Missing cached state for request {request_id}.")
                 resolved.append(state)
+            for state in resolved:
+                context = scheduler_output.interaction_boundaries.get(state.request_id)
+                if context is not None:
+                    state.interaction_boundary = context
         except Exception:
             for request_id in new_request_ids:
                 self.state_cache.pop(request_id, None)
@@ -1615,10 +1621,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 (str(modality), cast(InteractionPayload, payload)) for modality, payload in multi_modal_data.items()
             )
 
+        received_at = interaction.get("received_at", time.monotonic())
+        if (
+            isinstance(received_at, bool)
+            or not isinstance(received_at, (int, float))
+            or not math.isfinite(received_at)
+            or received_at < 0
+        ):
+            raise ValueError("interaction received_at must be finite and non-negative")
         self._interaction_coordinator.enqueue_parts(
             state,
             parts=parts,
             event_id=interaction["event_id"],
-            received_at=time.monotonic(),
+            received_at=float(received_at),
             transition_chunks=interaction.get("transition_chunks"),
         )
