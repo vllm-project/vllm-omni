@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from transformers import AutoConfig, PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
@@ -28,9 +28,10 @@ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
 from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.model import OmniModelConfig
-from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.arg_utils import _ARCH_TO_MODEL_TYPE, OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -646,11 +647,18 @@ def test_config_less_chatterbox_gets_a_config_written(monkeypatch, tmp_path, mod
     monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: False)
     args = _config_less_args(model)
     try:
-        args._patch_empty_hf_config("chatterbox")
+        # As create_model_config calls it: the model type comes from the architecture.
+        args._patch_empty_hf_config(_ARCH_TO_MODEL_TYPE[args.model_arch])
         assert _patched_config(args) == {
             "model_type": "chatterbox",
             "architectures": ["ChatterboxForConditionalGeneration"],
         }
+        # The engine then loads the written directory through AutoConfig.
+        monkeypatch.undo()
+        config = AutoConfig.from_pretrained(args.hf_config_path)
+        assert isinstance(config, ChatterboxConfig)
+        assert config.architectures == ["ChatterboxForConditionalGeneration"]
+        assert (config.variant, config.vocab_size) == ("turbo", 6563)
     finally:
         if hasattr(args, "_temp_config_dir"):
             shutil.rmtree(args._temp_config_dir, ignore_errors=True)

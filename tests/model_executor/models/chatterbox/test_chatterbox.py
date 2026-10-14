@@ -1,26 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-import importlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from vllm.model_executor.models.interfaces import supports_pp
+from vllm.model_executor.models.interfaces_base import is_text_generation_model
 
 from vllm_omni.model_executor.models.chatterbox import chatterbox
 from vllm_omni.model_executor.models.chatterbox.chatterbox import STAGES, ChatterboxForConditionalGeneration
+from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import ChatterboxS3Gen
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import ChatterboxT3ForConditionalGeneration
-from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE, CHATTERBOX_TURBO_PIPELINE
+from vllm_omni.model_executor.models.registry import _OMNI_MODELS, OmniModelRegistry
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class StubStage(nn.Module):
-    """A stage with one parameter, two runner flags and two hooks."""
-
-    has_preprocess = True
-    omni_pooler_payload_include_hidden = False
+    """A stage with one parameter, a forward and a loader."""
 
     def __init__(self, *, vllm_config: SimpleNamespace, prefix: str = "") -> None:
         super().__init__()
@@ -29,9 +29,6 @@ class StubStage(nn.Module):
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **runner_kwargs):
         return runner_kwargs
-
-    def preprocess_decode_batch(self, *, input_ids, req_infos):
-        return input_ids, input_ids, req_infos
 
     def load_weights(self, weights):
         return {"weight"}
@@ -44,45 +41,50 @@ def unified(monkeypatch: pytest.MonkeyPatch) -> ChatterboxForConditionalGenerati
     return ChatterboxForConditionalGeneration(vllm_config=config)
 
 
-def test_stage_attributes_resolve_on_the_stage(unified: ChatterboxForConditionalGeneration) -> None:
-    """The runner probes the registered class for flags and hooks the stage owns."""
-    assert unified.has_preprocess is True
-    assert unified.model.prefix == "model"
-    # The runner reads both of these on the registered class, and without
-    # them falls back to shipping hidden states and to one embedding call per row.
-    assert getattr(unified, "omni_pooler_payload_include_hidden", True) is False
-    assert getattr(unified, "preprocess_decode_batch", None) == unified.model.preprocess_decode_batch
-    # What a stage does not define stays undefined, so runner defaults apply.
-    assert not hasattr(unified, "on_requests_finished")
-
-
 @pytest.mark.parametrize(
-    ("stage", "defined", "undefined"),
+    ("stage", "flags", "hooks", "undefined"),
     [
         (
             ChatterboxT3ForConditionalGeneration,
-            [
-                "has_preprocess",
-                "have_multimodal_outputs",
-                "omni_pooler_payload_include_hidden",
-                "preprocess",
-                "preprocess_decode_batch",
-                "preprocess_decode_batch_mrv2",
-                "make_omni_output",
-            ],
+            # Without the first the runner never calls preprocess; without the
+            # second it drops make_omni_output's payload; with the third true it
+            # ships every hidden state to stage 1, which reads none.
+            {"has_preprocess": True, "have_multimodal_outputs": True, "omni_pooler_payload_include_hidden": False},
+            ["preprocess", "preprocess_decode_batch", "preprocess_decode_batch_mrv2", "make_omni_output"],
             # Either would change which of the hooks above Model Runner V2 calls.
             ["mrv2_decode_preprocess_is_identity", "make_omni_output_mrv2", "on_requests_finished"],
         ),
         (
+            ChatterboxOriginalT3,
+            # The last two have the runner sample through the stage's guidance
+            # sampler and hand it each request's guidance pair.
+            {
+                "has_preprocess": True,
+                "have_multimodal_outputs": True,
+                "omni_pooler_payload_include_hidden": False,
+                "prefer_model_sampler": True,
+                "model_sampler_wants_extra_args": True,
+            },
+            ["preprocess", "preprocess_decode_batch", "preprocess_decode_batch_mrv2", "sample", "on_requests_finished"],
+            ["mrv2_decode_preprocess_is_identity", "make_omni_output_mrv2"],
+        ),
+        (
             ChatterboxS3Gen,
-            ["have_multimodal_outputs", "requires_request_ids", "on_requests_finished", "decode_step"],
+            # Without requires_request_ids the runner passes no ids, and
+            # decode_step returns empty audio for every request with no error.
+            {
+                "have_multimodal_outputs": True,
+                "requires_request_ids": True,
+                "enable_update_additional_information": True,
+            },
+            ["on_requests_finished"],
             ["has_preprocess", "make_omni_output"],
         ),
     ],
-    ids=["chatterbox_t3", "chatterbox_s3gen"],
+    ids=["chatterbox_t3", "chatterbox_original_t3", "chatterbox_s3gen"],
 )
 def test_the_runners_find_each_stages_hooks_on_the_registered_class(
-    stage: type[nn.Module], defined: list[str], undefined: list[str]
+    stage: type[nn.Module], flags: dict[str, bool], hooks: list[str], undefined: list[str]
 ) -> None:
     """Both runners look hooks up on the class the registry names, with ``getattr`` and ``hasattr``."""
     unified = object.__new__(ChatterboxForConditionalGeneration)
@@ -90,7 +92,8 @@ def test_the_runners_find_each_stages_hooks_on_the_registered_class(
     unified.model = object.__new__(stage)
     nn.Module.__init__(unified.model)
 
-    for name in defined:
+    assert {name: getattr(unified, name) for name in flags} == flags
+    for name in hooks:
         assert getattr(unified, name) == getattr(unified.model, name), name
     for name in undefined:
         assert not hasattr(unified, name), name
@@ -98,6 +101,7 @@ def test_the_runners_find_each_stages_hooks_on_the_registered_class(
 
 def test_loaded_names_carry_the_wrapper_prefix(unified: ChatterboxForConditionalGeneration) -> None:
     """vLLM fails the load on any parameter the returned set does not name."""
+    assert unified.model.prefix == "model"
     assert unified.load_weights(iter(())) == {name for name, _ in unified.named_parameters()} == {"model.weight"}
 
 
@@ -112,9 +116,21 @@ def test_unknown_stage_is_refused_by_name() -> None:
 
 
 def test_one_registered_architecture_wraps_every_stage() -> None:
-    """The pipeline names the wrapper for every stage; the stage classes are not architectures."""
-    assert set(STAGES) == {"chatterbox_t3", "chatterbox_original_t3", "chatterbox_s3gen"}
+    """The pipelines name the wrapper for every stage; the stage classes are not architectures."""
+    pipelines = (CHATTERBOX_TURBO_PIPELINE, CHATTERBOX_ORIGINAL_PIPELINE)
+    assert {stage.model_stage for pipeline in pipelines for stage in pipeline.stages} == set(STAGES)
+    assert {pipeline.model_arch for pipeline in pipelines} == {"ChatterboxForConditionalGeneration"}
     assert [name for name in _OMNI_MODELS if name.startswith("Chatterbox")] == ["ChatterboxForConditionalGeneration"]
-    package, module, class_name = _OMNI_MODELS["ChatterboxForConditionalGeneration"]
-    loaded = importlib.import_module(f"vllm_omni.model_executor.models.{package}.{module}")
-    assert loaded.ChatterboxForConditionalGeneration is getattr(loaded, class_name)
+    model_cls = OmniModelRegistry._try_load_model_cls("ChatterboxForConditionalGeneration")
+    assert model_cls is ChatterboxForConditionalGeneration
+
+
+def test_vllm_gives_the_registered_class_the_generate_runner() -> None:
+    """vLLM inspects the class, not an instance, so ``__getattr__`` cannot answer for it.
+
+    ``embed_input_ids``, ``forward`` and ``compute_logits`` on the class make
+    it a text-generation model; ``make_empty_intermediate_tensors`` makes it
+    pipeline-parallel.
+    """
+    assert is_text_generation_model(ChatterboxForConditionalGeneration)
+    assert supports_pp(ChatterboxForConditionalGeneration)

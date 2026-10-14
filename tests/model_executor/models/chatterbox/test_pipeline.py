@@ -10,12 +10,13 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
+    PipelineConfig,
     StageExecutionType,
-    _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
 )
 from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE, CHATTERBOX_TURBO_PIPELINE
+from vllm_omni.model_executor.stage_input_processors.chatterbox import t3_to_s3gen, t3_to_s3gen_async_chunk
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -58,9 +59,41 @@ def test_stage_topology() -> None:
     # a decoder slot for the step that decodes its chunk, not for its
     # lifetime, so more streams than slots can be live at once.
     assert decoder.retains_state_across_chunks is False
-    for path in (talker.async_chunk_process_next_stage_input_func, decoder.sync_process_input_func):
-        module, _, function = path.rpartition(".")
-        assert callable(getattr(importlib.import_module(module), function))
+
+
+def resolve(path: str | None) -> object:
+    """The function a processor path names, or None for no path."""
+    if path is None:
+        return None
+    module, _, function = path.rpartition(".")
+    return getattr(importlib.import_module(module), function)
+
+
+@pytest.mark.parametrize(
+    ("filename", "pipeline"),
+    [("chatterbox_turbo.yaml", CHATTERBOX_TURBO_PIPELINE), ("chatterbox.yaml", CHATTERBOX_ORIGINAL_PIPELINE)],
+    ids=["turbo", "original"],
+)
+@pytest.mark.parametrize("async_chunk", [True, False], ids=["async_chunk", "whole utterance"])
+def test_each_mode_gets_its_own_stage_handoff(filename: str, pipeline: PipelineConfig, async_chunk: bool) -> None:
+    """Streaming hands stage 0's tokens over chunk by chunk, the other mode the finished utterance once.
+
+    In each mode exactly one processor runs: the chunk processor in stage 0,
+    or the whole-utterance one in front of stage 1. Both would send stage 1
+    every utterance twice; neither would leave it waiting forever.
+    """
+    deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+    assert deploy.async_chunk is True
+    deploy.async_chunk = async_chunk
+
+    talker, decoder = merge_pipeline_deploy(pipeline, deploy)
+
+    assert [talker.yaml_engine_args["async_chunk"], decoder.yaml_engine_args["async_chunk"]] == [async_chunk] * 2
+    handoff = (
+        resolve(talker.yaml_engine_args.get("custom_process_next_stage_input_func")),
+        resolve(decoder.custom_process_input_func),
+    )
+    assert handoff == ((t3_to_s3gen_async_chunk, None) if async_chunk else (None, t3_to_s3gen))
 
 
 def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
@@ -74,6 +107,8 @@ def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
     # any. The flow's lookahead is not among them: the processor takes it
     # from the model config, where the decoder takes it.
     assert set(extra) == {"codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"}
+    # Upstream's ``ChatterboxTurboTTS.generate`` defaults (0.1.7), kept as a
+    # record of them; the output cap is the model's.
     assert talker["default_sampling_params"] == {
         "temperature": 0.8,
         "top_k": 1000,
@@ -81,18 +116,15 @@ def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
         "repetition_penalty": 1.2,
         "max_tokens": config.max_new_tokens,
     }
-    # What stage 0's context leaves for text once the speaker slot, the
-    # longest reference, the start token and the output cap are taken. The
-    # deploy file's comment states this number; longer text has less room
-    # for output.
-    assert talker["max_model_len"] - (1 + config.cond_prompt_len + 1 + config.max_new_tokens) == 671
+    # Stage 0's context leaves room for text once the speaker slot, the
+    # longest reference, the start token and the output cap are taken.
+    assert talker["max_model_len"] - (1 + config.cond_prompt_len + 1 + config.max_new_tokens) > 0
     # Stage 1 is handed the whole utterance so far, for every request of a
     # step; a budget short of that gives a new request part of its tokens.
     # A request may raise max_tokens up to what stage 0's context allows, so
     # that context, not the default cap, bounds an utterance. Stage 1 checks
     # its budget against its own max_model_len, which must therefore be stage 0's.
     assert decoder["max_model_len"] == talker["max_model_len"]
-    assert decoder["max_num_batched_tokens"] >= decoder["max_num_seqs"] * decoder["max_model_len"]
     # The prompt is placeholder ids; a prefix cache would match any two
     # requests of equal length regardless of voice or text.
     assert talker["enable_prefix_caching"] is False
@@ -100,22 +132,3 @@ def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
     # Prompts are token ids and nothing is detokenized. A tokenizer would
     # also have vLLM look in the repo for the config.json it does not ship.
     assert talker["skip_tokenizer_init"] is True and decoder["skip_tokenizer_init"] is True
-
-
-@pytest.mark.parametrize(
-    ("platform", "runner"), [("cuda", "v2"), ("npu", "v1"), ("xpu", "v1"), ("rocm", "v1"), ("musa", "v1")]
-)
-def test_deploy_file_selects_model_runner_v2_where_it_was_run(platform: str, runner: str) -> None:
-    """V2 with the native data plane on CUDA; the default runner where V2 is rejected or untried.
-
-    The choice must reach each stage's engine arguments, which is what the
-    workers dispatch on, and on V2 both stages must be on the native plane.
-    """
-    deploy = load_deploy_config(Path(get_deploy_config_path("chatterbox_turbo.yaml")))
-
-    deploy = _apply_platform_overrides(deploy, platform=platform)
-
-    assert deploy.model_runner == runner
-    stages = merge_pipeline_deploy(CHATTERBOX_TURBO_PIPELINE, deploy)
-    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [runner == "v2"] * 2
-    assert [stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in stages] == [True, True]

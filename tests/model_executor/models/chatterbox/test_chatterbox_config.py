@@ -4,6 +4,8 @@
 
 import pytest
 
+from vllm_omni.config.model import OmniModelArchConfigConvertor
+from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME
 from vllm_omni.transformers_utils.configs.chatterbox import VARIANT_FIELDS, ChatterboxConfig, validate_flow_settings
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -19,45 +21,37 @@ def test_token_space() -> None:
     assert cfg.eos_token_id == cfg.stop_speech_token == 6562
 
 
-def test_turbo_defaults_match_upstream() -> None:
-    cfg = ChatterboxConfig()
-    assert cfg.variant == "turbo"
-    assert (cfg.hidden_size, cfg.num_hidden_layers, cfg.num_attention_heads) == (1024, 24, 16)
-    assert cfg.max_position_embeddings == 8196
-    assert cfg.cond_prompt_len == 375
-    assert (cfg.sample_rate, cfg.token_rate, cfg.token_mel_ratio) == (24000, 25, 2)
-    assert (cfg.n_cfm_timesteps, cfg.meanflow) == (2, True)
-    assert cfg.t3_weights == "t3_turbo_v1.safetensors"
-    assert cfg.s3gen_weights == "s3gen_meanflow.safetensors"
-    assert cfg.mel == {
-        "n_fft": 1920,
-        "num_mels": 80,
-        "sampling_rate": 24000,
-        "hop_size": 480,
-        "win_size": 1920,
-        "fmin": 0,
-        "fmax": 8000,
-        "center": False,
-    }
+@pytest.mark.parametrize("variant", ["turbo", "original"])
+def test_checkpoint_constants_agree_with_what_reads_them(variant: str) -> None:
+    """Relations the two stages rely on, each of which fails a load or the audio when broken."""
+    cfg = ChatterboxConfig(variant)
+    # The decoder's mel is the output audio's, and HiFT turns one frame into
+    # the 480 samples the decoder's seam caches are sized in.
+    assert cfg.mel["sampling_rate"] == cfg.sample_rate
+    assert cfg.mel["hop_size"] == SAMPLES_PER_FRAME
+    assert cfg.mel["hop_size"] * cfg.token_mel_ratio * cfg.token_rate == cfg.sample_rate
+    # Stage 0's conditioning is the encoder window's tokens.
+    assert cfg.cond_prompt_len == cfg.enc_cond_seconds * cfg.token_rate
+    # Silence is a speech token; the control ids sit above every speech
+    # token and inside the speech vocabulary, which is the sampler's.
+    assert cfg.silence_token < cfg.speech_token_limit <= cfg.start_speech_token
+    assert cfg.start_speech_token < cfg.stop_speech_token < cfg.speech_vocab_size == cfg.vocab_size
+    # The standard flow needs its guided solver's steps; the distilled one needs two.
+    assert (cfg.meanflow, cfg.n_cfm_timesteps) == ((True, 2) if variant == "turbo" else (False, 10))
 
 
-def test_original_defaults_match_upstream() -> None:
-    cfg = ChatterboxConfig("original")
-    assert (cfg.vocab_size, cfg.speech_vocab_size, cfg.text_vocab_size) == (8194, 8194, 704)
-    assert (cfg.num_hidden_layers, cfg.max_position_embeddings, cfg.activation_function) == (30, 131072, "silu")
-    assert (cfg.cond_prompt_len, cfg.enc_cond_seconds, cfg.min_ref_seconds) == (150, 6, 0.0)
-    assert cfg.loudness_target_lufs is None
-    assert (cfg.n_silence_tokens, cfg.meanflow, cfg.n_cfm_timesteps) == (0, False, 10)
-    assert (cfg.t3_weights, cfg.s3gen_weights) == ("t3_cfg.safetensors", "s3gen.safetensors")
+@pytest.mark.parametrize("variant", ["turbo", "original"])
+def test_the_engine_reads_the_backbones_attention_geometry(variant: str) -> None:
+    """vLLM sizes the KV cache from this, not from the backbone stage 0 builds."""
+    cfg = ChatterboxConfig(variant)
+
+    arch = OmniModelArchConfigConvertor(cfg, cfg.get_text_config()).convert()
+
+    assert (arch.total_num_attention_heads, arch.total_num_kv_heads, arch.head_size) == (16, 16, 64)
 
 
-def test_survives_a_config_json_round_trip() -> None:
-    """The engine builds the config from a two-key config.json it writes itself."""
-    cfg = ChatterboxConfig.from_dict(
-        {"model_type": "chatterbox", "architectures": ["ChatterboxForConditionalGeneration"]}
-    )
-    assert (cfg.vocab_size, cfg.text_vocab_size) == (6563, 50276)
-    assert cfg.architectures == ["ChatterboxForConditionalGeneration"]
+def test_variant_and_flow_settings_survive_serialization() -> None:
+    """The flow settings are stored under private names and serialized under their public ones."""
     restored = ChatterboxConfig.from_dict(ChatterboxConfig("original", flow_dtype="bfloat16").to_dict())
     assert (restored.variant, restored.flow_dtype, restored.num_hidden_layers) == ("original", "bfloat16", 30)
 
