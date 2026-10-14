@@ -197,6 +197,13 @@ class MultimodalPayload(Mapping):
 
         for key, value in list(self.tensors.items()):
             if _is_tensor_list(value):
+                # 0-d tensors have no dimension to concatenate along: they are
+                # per-step scalar snapshots (e.g. flattened ``meta.*`` flags or
+                # counters), so keep the latest as metadata.
+                if all(t.ndim == 0 for t in value):
+                    del self.tensors[key]
+                    self.metadata[key] = value[-1]
+                    continue
                 strategy = get_accumulation_strategy(modality, key)
                 self.tensors[key] = _consolidate_tensor_list(key, value, strategy)
 
