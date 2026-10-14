@@ -5,13 +5,11 @@
 # utterance once instead.
 #
 # Runner: both stages run on Model Runner V2 with its native data plane on
-# CUDA, where it was measured: streaming is within a few percent of the
-# default runner at 1 and at 8 concurrent streams. Set ``model_runner: v1``
-# to use the default runner; both are supported. Without streaming
-# (``--no-async-chunk``) V2 is slower, about 0.2 against 0.15 real-time
-# factor on a 24 GB card, because it copies stage 0's hidden states to the
-# host on every step. The ``platforms:`` section at the end keeps V1 where
-# V2 is rejected (NPU, XPU) or has not been run (ROCm, MUSA).
+# CUDA, where it was measured: with and without streaming, at 1 and at 8
+# concurrent streams, V2 and the default runner are within run-to-run
+# variation of each other. Set ``model_runner: v1`` to use the default
+# runner; both are supported. The ``platforms:`` section at the end keeps
+# V1 where V2 is rejected (NPU, XPU) or has not been run (ROCm, MUSA).
 #
 # Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 runs in float32 (the
 # vocoder is not half-precision safe) and eagerly (its convolutions see a
