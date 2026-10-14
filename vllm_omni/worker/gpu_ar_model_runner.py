@@ -546,7 +546,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # first call (memoizing here pinned the request to True forever,
             # never refreshing once the marker landed).
             return True
-        needs_payload = final_stage_id > 0
+        # A stage that is the request's final stage has no downstream consumer.
+        needs_payload = final_stage_id > getattr(self.vllm_config.model_config, "stage_id", 0)
         self._downstream_payload_cache[req_id] = needs_payload
         return needs_payload
 
@@ -623,10 +624,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         # 6. Stop the prefix-cache committer before the CUDA context and the
         # tensors it copies from are torn down.
-        cache = self.omni_prefix_cache
-        if cache is not None:
-            cache.shutdown()
-            self.omni_prefix_cache = None
+        self._shutdown_omni_prefix_cache()
 
         # 7. Delegate to upstream shutdown (model = None, KV caches, workspace).
         super().shutdown()

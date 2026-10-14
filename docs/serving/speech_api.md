@@ -4,6 +4,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Native output: 24 kHz; API output can be resampled to 8 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
+- **Fish Audio Drama 3** (`fishaudio/drama-3`) -- Qwen3.5 MoE backbone with a codebook tower and the Fish Speech DAC codec. Supports text-to-speech, voice cloning via reference audio, speaker tags and inline event tags. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
 - **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
 - **Gepard-1.0** (`nineninesix/gepard-1.0`) -- single-stage native-AR TTS with a 22.05 kHz NanoCodec. Zero-shot default voice only.
@@ -34,6 +35,9 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 
 # Fish Speech S2 Pro
 vllm serve fishaudio/s2-pro --omni --port 8091
+
+# Fish Audio Drama 3
+vllm serve fishaudio/drama-3 --omni --port 8091
 
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
@@ -809,6 +813,14 @@ The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only th
 
 Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
 
+### Fish Audio Drama 3
+
+| Model | Description |
+| ------- | ------------- |
+| `fishaudio/drama-3` | 35B-total / 3B-active MoE TTS with a codebook tower and the DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
+
+Drama 3 uses `ref_audio` and `ref_text` for voice cloning, like Fish Speech S2 Pro. Speaker tags (`<|speaker:N|>`) and event tags (for example `[sighs]`) go in `input`; event tags are free-form bracketed text, not a fixed list (see the [Drama 3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/fishaudio/Drama-3.md#event-and-emotion-tags)). See the [Drama 3 section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-audio-drama-3) for details.
+
 ### Voxtral TTS
 
 | Model | Description |
@@ -987,20 +999,20 @@ Use `/v1/audio/voices` to list available voices for the loaded model.
 Multi-stage omni deployments route stage outputs through a single orchestrator
 loop. The legacy loop polls every stage replica on a 1 ms cadence. The
 event-driven mode replaces the poll with one reader task per live stage
-replica awaiting its client directly. Qwen3-TTS uses this mode by default;
-other pipelines keep the legacy poll unless enabled. The serving-side
-final-output loop is independent of this setting: it is always woken when the
-orchestrator queues output.
+replica awaiting its client directly. Every pipeline uses the event-driven
+mode by default; the legacy poll remains available as an opt-out. The
+serving-side final-output loop is independent of this setting: it is always
+woken when the orchestrator queues output.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On | Selects between event-driven wakeups and the legacy 1 ms poll for the orchestration loop. The value is resolved at orchestrator construction. `1`, `true`, `yes`, or `on` keeps event-driven mode, ignoring case and surrounding whitespace; any other value, such as `0`, selects the legacy poll loop. |
 
 Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
-before starting the server when overriding the pipeline default. For example,
-explicitly disable event-driven orchestration for Qwen3-TTS:
+before starting the server when overriding the default. For example,
+select the legacy poll loop for Qwen3-TTS:
 
 ```bash
 VLLM_OMNI_EVENT_DRIVEN_ORCH=0 \
@@ -1013,9 +1025,8 @@ The server logs the selected loop mode and its reader/poller counts once at
 startup, so you can confirm which loop is live.
 
 Routing, output ordering, and terminal-state behavior are identical on both
-loops; only the poll cadence changes. Leaving the variable unset selects the
-pipeline default: event-driven for Qwen3-TTS, and legacy polling for other
-pipelines, including Qwen3-Omni.
+loops; only the poll cadence changes. Leaving the variable unset selects
+event-driven orchestration for every pipeline.
 
 **Known limitations:**
 
@@ -1025,9 +1036,6 @@ pipelines, including Qwen3-Omni.
   changed dead-replica handling and reader/poller lifecycle rather than the
   steady-state output path, and the parity suite covers it, but the serving
   A/B has not been re-run on the current head.
-- The diffusion-poller branch is covered by unit tests only. Deployments whose
-  stages all run as standard engine cores never exercise it, including GLM-TTS,
-  which deploys its DiT without `stage_type: diffusion`.
 - Concurrency 1 and 32 measured at parity with the legacy loop. At 32 the
   latency is admission-bound, which this mode does not address.
 

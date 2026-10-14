@@ -1798,6 +1798,7 @@ class TestDownstreamPayloadMemoization:
 
     def _runner(self, stages):
         runner = object.__new__(GPUARModelRunner)
+        runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
         runner._downstream_payload_cache = {}
         runner._request_final_stage_id = lambda rid: stages[rid]
         return runner
@@ -1944,6 +1945,7 @@ class TestPreferModelSamplerNoneFallback:
         expected = {
             "audio8_tts",
             "cosyvoice3",
+            "fish_omni",  # Returns None only for an empty batch.
             "glm_tts",
             "higgs_audio_v2",
             "higgs_audio_v3",

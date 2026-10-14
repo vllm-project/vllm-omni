@@ -9,6 +9,10 @@ Self-review your branch before creating a PR against `vllm-project/vllm-omni`. T
 
 ## Contributor intent gate
 
+Before self-checking, read the relevant entries in
+[Review and issue lessons](../../../docs/contributing/ci/lessons.md). Verify their
+linked evidence against the current change; apply only relevant checks.
+
 Run this gate before implementing a contribution and again before submission
 if its intent or scope has changed. It applies to contributor self-review,
 not independent review of somebody else's PR or automated review selection.

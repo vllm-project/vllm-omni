@@ -243,7 +243,7 @@ vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
 With `modalities: ["text", "audio"]`, its behavior is:
 
 | JoyAI action | Native output |
-|---|---|
+| --- | --- |
 | `</response> <text>` | action text + speech for `<text>` |
 | `</silence>` | action text + empty audio output (zero samples) |
 | `</response> <note> </delegation> <question>` | action text + speech for `<note>` only |
@@ -257,7 +257,7 @@ This experimental native multi-stage pipeline is request-scoped, stateless, and
 all-sync. It currently does not include:
 
 - continuous frame sessions, persistent standing instructions, or session memory;
-- audio input / ASR, full-duplex interaction, or barge-in;
+- full-duplex interaction or barge-in;
 - background Agent execution for delegated questions;
 - async-chunk support from Talker to Code2Wav;
 - integration with the existing WebUI.
@@ -267,3 +267,44 @@ available, and Code2Wav starts only after the Talker completes. Silence actions 
 TTS stages and return an empty audio output with zero samples. All three stages are placed
 on GPU 0 by the provided
 [`deploy config`](../../vllm_omni/deploy/joyai_vl_interaction.yaml).
+
+### Audio input: opt-in native ASR profile
+
+A second deploy profile takes spoken input natively, without the external ASR bridge, and
+still serves the text/video requests above from the same deployment:
+
+```text
+with audio:    Qwen3-ASR transcript -> JoyAI action -> Qwen3-TTS Talker -> Code2Wav
+without audio: JoyAI action -> Qwen3-TTS Talker -> Code2Wav   (the ASR stage is skipped)
+```
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction_asr.yaml \
+  --port 8092
+```
+
+Send the spoken query as an `input_audio` / `audio_url` part next to the frames or video:
+
+```bash
+curl -s http://127.0.0.1:8092/v1/chat/completions -H 'content-type: application/json' -d '{
+    "model": "jdopensource/JoyAI-VL-Interaction-Preview",
+    "modalities": ["text", "audio"],
+    "messages": [{"role": "user", "content": [
+      {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+    ]}]
+  }'
+```
+
+- With audio, JoyAI sees the transcript under the Day-0 `[User Query ...]` header, followed
+  by the images/video, so `silence` / `response` / `delegate` behave as above. A `system`
+  message and text parts go to Qwen3-ASR as transcription context; set
+  `additional_information.joyai_system_prompt` to replace JoyAI's default system prompt.
+- Without audio, the request never reaches the ASR stage and is rendered for JoyAI exactly
+  as in the text/video profile.
+- In both cases, sampling parameters and the `voice` / `language` fields apply as in the
+  text/video profile.
+
+The first request that reaches JoyAI pays a one-off setup of about 22 s, because its input
+processor is built lazily; send a warm-up request after startup.

@@ -13,6 +13,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
+AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
@@ -34,6 +35,21 @@ DIFFUSION_CPU_MARKERS = (
     "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 )
 DIFFUSION_CPU_ARTIFACTS = "artifacts/amd-diffusion-cpu-shards/*.xml"
+DIFFUSION_SLOW_CPU_LABEL = "Simple · Diffusion Slow CPU Test"
+DIFFUSION_SLOW_CPU_ARTIFACTS = "artifacts/amd-diffusion-slow-cpu/pytest.xml"
+DIFFUSION_SLOW_CPU_NODES = [
+    "tests/diffusion/distributed/test_wan_vae_fastpath_install.py"
+    "::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]",
+    "tests/diffusion/distributed/test_wan_vae_fastpath_install.py"
+    "::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]",
+    "tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]",
+    "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
+    "::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]",
+    "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
+    "::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]",
+    "tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py"
+    "::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session",
+]
 OMNI_PROCESSOR_FULL_LABEL = "Simple · Omni Processor Test"
 OMNI_PROCESSOR_SMOKE_LABEL = "Simple · Omni Processor Snapshot Smoke"
 OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
@@ -462,6 +478,9 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
     assert "--ignore=tests/diffusion/cache/test_teacache_extractors.py" in argv
     assert "--ignore=tests/diffusion/models/pi05/test_pi05_units.py" in argv
+    assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
+        DIFFUSION_SLOW_CPU_NODES
+    )
     assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in pytest_command
     assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in pytest_command
     assert "--durations=50" in argv
@@ -472,11 +491,112 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     assert "|| true" not in pytest_command
 
 
+@pytest.mark.parametrize(
+    "pipeline_path",
+    [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE],
+    ids=["ready", "merge"],
+)
+def test_diffusion_slow_cpu_cases_have_one_blocking_owner(pipeline_path: Path) -> None:
+    step = _find_step(DIFFUSION_SLOW_CPU_LABEL, pipeline_path)
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+    option_at = next(index for index, arg in enumerate(argv) if arg.startswith("-") and arg != "-sv")
+    nodes = argv[2:option_at]
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == [DIFFUSION_SLOW_CPU_ARTIFACTS]
+    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
+    assert "export VLLM_ROCM_USE_AITER=0" in step["commands"]
+    assert (
+        'export DIFFUSION_SLOW_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-slow-cpu"'
+        in step["commands"]
+    )
+    assert 'mkdir -p "$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR"' in step["commands"]
+    assert argv[:2] == ["pytest", "-sv"]
+    assert nodes == DIFFUSION_SLOW_CPU_NODES
+    assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
+    assert "--durations=20" in argv
+    assert "--junitxml=$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR/pytest.xml" in argv
+    assert "--num-shards" not in pytest_command
+    assert "|| true" not in pytest_command
+
+    shard = _find_diffusion_cpu_shard_step(pipeline_path)
+    shard_argv = split(next(command for command in shard["commands"] if "pytest" in command))
+    shard_nodes = [arg.removeprefix("--deselect=") for arg in shard_argv if arg.startswith("--deselect=")]
+    assert shard_nodes == nodes
+
+
+def test_diffusion_slow_cpu_cases_stay_off_nightly() -> None:
+    pipeline = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    labels = [step.get("label") for step in _walk_steps(pipeline["steps"])]
+    assert DIFFUSION_SLOW_CPU_LABEL not in labels
+
+
+AITER_MHA_CACHE_PREPARE = 'eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"'
+AITER_MHA_CACHE_PUBLISH = "python .buildkite/amd/scripts/aiter_mha_cache.py publish"
+STABLE_AUDIO_LAYERWISE_NODE = (
+    "tests/diffusion/offloader/test_diffusion_layerwise_offload.py"
+    "::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]"
+)
+
+
+def _assert_publish_follows_successful_pytest(command: str, pytest_marker: str) -> None:
+    then_at = command.index("; then\n")
+    else_at = command.index("\nelse\n")
+    publish_at = command.index(AITER_MHA_CACHE_PUBLISH)
+
+    assert command.startswith("if ")
+    assert pytest_marker in command[:then_at]
+    assert then_at < publish_at < else_at
+    assert "pytest_status=$$?" in command[else_at:]
+    assert 'exit "$${pytest_status}"' in command[else_at:]
+    assert "&&" not in command
+
+
+def _assert_build_scoped_aiter_mha_cache(step: dict, pytest_marker: str, *, publishes: bool) -> None:
+    commands = step["commands"]
+    prepare_at = commands.index(AITER_MHA_CACHE_PREPARE)
+    pytest_at = next(index for index, command in enumerate(commands) if pytest_marker in command)
+
+    assert prepare_at < pytest_at
+    assert not any(command.strip() == AITER_MHA_CACHE_PUBLISH for command in commands)
+    if publishes:
+        _assert_publish_follows_successful_pytest(commands[pytest_at], pytest_marker)
+    else:
+        assert AITER_MHA_CACHE_PUBLISH not in "\n".join(commands)
+    assert "AITER_JIT_DIR=" not in "\n".join(commands)
+    assert "HF_HOME" not in "\n".join(commands)
+    assert "GPU_ARCHS=" not in "\n".join(commands)
+    assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in commands)
+
+
 def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:
     step = _find_step("Diffusion Model Test")
     pytest_command = next(command for command in step["commands"] if "test_z_image.py" in command)
+    condition = pytest_command.split("; then", 1)[0]
 
-    assert split(pytest_command)[:2] == ["timeout", "55m"]
+    assert split(condition)[1:3] == ["timeout", "55m"]
+    _assert_build_scoped_aiter_mha_cache(
+        step,
+        "tests/e2e/offline_inference/test_z_image.py",
+        publishes=True,
+    )
+
+
+def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
+    step = _find_step("Diffusion Stable Audio Layerwise Offload Test (quarantined)")
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    _assert_build_scoped_aiter_mha_cache(step, STABLE_AUDIO_LAYERWISE_NODE, publishes=False)
+
+    blocking = _find_step("Diffusion Model CPU offloading Test")
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in blocking["commands"]
+    assert AITER_MHA_CACHE_PREPARE not in blocking["commands"]
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
@@ -509,6 +629,16 @@ def test_amd_template_preserves_step_retry_policy() -> None:
     # policy when the source suite is rendered into the uploaded pipeline.
     assert template.count("{% if step.retry %}") == 2
     assert template.count("{% for retry_rule in step.retry.automatic %}") == 2
+
+
+def test_amd_template_supplies_a_server_verified_aiter_artifact_source() -> None:
+    template = AMD_TEMPLATE.read_text(encoding="utf-8")
+    bootstrap = AMD_BOOTSTRAP.read_text(encoding="utf-8")
+
+    assert template.count("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT") == 2
+    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)" in bootstrap
+    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)" in bootstrap
+    assert '-D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT"' in bootstrap
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:

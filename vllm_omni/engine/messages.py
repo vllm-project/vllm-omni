@@ -7,6 +7,7 @@ from typing import Literal, Protocol
 
 import msgspec
 from vllm.inputs import PromptType
+from vllm.lora.request import LoRARequest
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
@@ -39,6 +40,8 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    entry_stage_id: int = 0
+    lora_request: LoRARequest | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

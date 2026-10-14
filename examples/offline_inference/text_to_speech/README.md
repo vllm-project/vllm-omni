@@ -18,6 +18,7 @@ list of supported architectures across all modalities, see
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
+| Fish Audio Drama 3 | `fishaudio/drama-3` | 2 (AR + DAC codec) | ✓ | ✓ (online) | speaker and event tags; no example script | 44.1 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning later) | ✓ (online) | zero-shot | 22.05 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
@@ -196,6 +197,50 @@ Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24
 - First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
 - Default sampling: temperature=1.0, top_k=25, top_p=0.8 (RAS method).
 - The `--model` path should point to the repository root (not `llm/` subdirectory).
+
+---
+
+## Fish Audio Drama 3
+
+35B-total / 3B-active MoE TTS at 44.1 kHz with the same DAC codec stage as
+Fish Speech S2 Pro. There is no separate example script: build the request
+with `additional_information` and size the placeholder prompt with
+`estimate_prompt_len_from_additional_information`, which returns the exact
+prompt row count. See the [Drama 3 recipe](../../../recipes/fishaudio/Drama-3.md) for details.
+
+```python
+import soundfile as sf
+import torch
+from transformers import AutoTokenizer
+
+from vllm_omni import Omni
+from vllm_omni.model_executor.models.fish_omni.fish_omni_model import FishOmniForConditionalGeneration
+
+
+def main() -> None:
+    model = "fishaudio/drama-3"
+    wav, sample_rate = sf.read("reference.wav", dtype="float32")
+    info = {
+        "text": "The quarterly report is due on Thursday, so please finish it by noon.",
+        "ref_text": "Transcript of the reference audio.",
+        "ref_audio_wav": torch.from_numpy(wav),
+        "ref_audio_sr": sample_rate,
+    }
+    prompt_len = FishOmniForConditionalGeneration.estimate_prompt_len_from_additional_information(
+        info, tokenizer=AutoTokenizer.from_pretrained(model)
+    )
+    omni = Omni(model=model)
+    for output in omni.generate([{"prompt_token_ids": [1] * prompt_len, "additional_information": info}]):
+        audio = output.outputs[0].multimodal_output["audio"]
+        audio = torch.cat(audio, dim=-1) if isinstance(audio, list) else audio
+        sf.write("output.wav", audio.float().cpu().numpy().reshape(-1), samplerate=44100)
+
+
+if __name__ == "__main__":  # Omni starts its stages in subprocesses.
+    main()
+```
+
+Leave out `ref_text`, `ref_audio_wav` and `ref_audio_sr` for synthesis without a reference voice.
 
 ---
 
