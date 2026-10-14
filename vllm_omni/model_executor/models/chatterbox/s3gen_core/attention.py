@@ -34,6 +34,15 @@ class EspnetRelPositionMultiHeadedAttention(RelPositionMultiHeadedAttention):
     B). Projections, biases and the masked softmax are the parent's.
     """
 
+    def __init__(self, n_head: int, n_feat: int, dropout_rate: float):
+        super().__init__(n_head, n_feat, dropout_rate)
+        # The parent creates both biases with the legacy ``torch.Tensor``
+        # constructor, which ignores the default device vLLM builds the stage
+        # under; every other parameter is created there.
+        device = torch.empty(0).device
+        self.pos_bias_u = torch.nn.Parameter(self.pos_bias_u.to(device))
+        self.pos_bias_v = torch.nn.Parameter(self.pos_bias_v.to(device))
+
     def rel_shift(self, x: torch.Tensor) -> torch.Tensor:
         """Align position scores with key positions.
 
@@ -89,13 +98,10 @@ class EspnetRelPositionMultiHeadedAttention(RelPositionMultiHeadedAttention):
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
-        # The parent creates both biases with the legacy ``torch.Tensor``
-        # constructor, which ignores the default device vLLM builds the stage
-        # under, so they stay on the CPU and move here.
         # (batch, head, time1, d_k)
-        q_with_bias_u = (q + self.pos_bias_u.to(q.device)).transpose(1, 2)
+        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
         # (batch, head, time1, d_k)
-        q_with_bias_v = (q + self.pos_bias_v.to(q.device)).transpose(1, 2)
+        q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
 
         # compute attention score
         # first compute matrix a and matrix c
