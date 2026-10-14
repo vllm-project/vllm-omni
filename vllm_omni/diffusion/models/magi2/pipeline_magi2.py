@@ -865,6 +865,16 @@ class Magi2Pipeline(
             refiner.load_checkpoint(refiner_root)
             compile_kwargs = getattr(self, "_region_compile_kwargs", None)
             if compile_kwargs is not None:
+                if current_omni_platform.is_musa():
+                    # MUSA: mm copies operands with padded row strides to a dense
+                    # layout and back, so keep the MLP activations unpadded, and
+                    # skip the benchmark-chosen pad_mm with them.
+                    options = {
+                        **compile_kwargs.get("options", {}),
+                        "comprehensive_padding": False,
+                        "shape_padding": False,
+                    }
+                    compile_kwargs = {**compile_kwargs, "options": options}
                 refiner.compile_regions(**compile_kwargs)
             staged = _Magi2StagedComponent(
                 refiner,

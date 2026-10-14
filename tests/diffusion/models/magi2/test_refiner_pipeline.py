@@ -258,15 +258,25 @@ def test_preview_is_released_and_reloaded_from_one_host_snapshot(monkeypatch, ev
     ]
 
 
-def test_refiner_is_compiled_with_the_preview_region_options(monkeypatch, tmp_path, events, stagers, refiner_factory):
+@pytest.mark.parametrize("musa", [False, True], ids=["cuda", "musa"])
+def test_refiner_is_compiled_with_the_preview_region_options(
+    monkeypatch, tmp_path, events, stagers, refiner_factory, musa
+):
     _write_refiner_index(tmp_path)
     pipe, _ = _refined_pipeline(monkeypatch, tmp_path, events)
-    options = {"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}
+    options: dict[str, Any] = {"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}
     pipe._region_compile_kwargs = dict(options)
+    monkeypatch.setattr(pipeline.current_omni_platform, "is_musa", lambda: musa)
 
     pipe(_refined_request())
 
-    assert events[:4] == ["build", "load_checkpoint", ("compile_regions", options), ("stager", "_FakeRefiner")]
+    expected = dict(options)
+    if musa:
+        # MUSA keeps the refiner's MLP activations unpadded; the Preview options are untouched.
+        padding = {"comprehensive_padding": False, "shape_padding": False}
+        expected["options"] = {**options["options"], **padding}
+    assert events[:4] == ["build", "load_checkpoint", ("compile_regions", expected), ("stager", "_FakeRefiner")]
+    assert pipe._region_compile_kwargs == options
 
 
 def test_refiner_is_built_outside_inference_mode_under_the_pipeline_config(
