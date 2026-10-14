@@ -102,6 +102,12 @@ _REFINER_PREVIEW_SIZES: dict[str, tuple[int, int]] = {
 # device, per-rank query and key/value heads, head size and dtype.
 _PREWARMED_WINDOW_ATTENTION: set[tuple[object, ...]] = set()
 
+# Static-shape regions compile again for every new prompt length, at most this
+# many variants per region and length; Dynamo's recompile limit leaves room for
+# this many distinct prompt lengths per process.
+_STATIC_REGION_VARIANTS_PER_PROMPT_LENGTH = 3
+_STATIC_PROMPT_LENGTHS = 64
+
 _REQUIRED_CHECKPOINT_PATHS = (
     "preview/model.safetensors.index.json",
     "text_encoder/model.safetensors.index.json",
@@ -721,7 +727,9 @@ class Magi2Pipeline(
             self.device_str,
             pin_memory=pin_memory,
         )
-        # The 1080p refiner stage is built by the first refined request.
+        # The 1080p refiner stage is built by the first refined request, and
+        # compiled with the Preview's region options when setup_compile ran.
+        self._region_compile_kwargs: dict[str, Any] | None = None
         self.refiner: _Magi2StagedComponent | None = None
         self.refiner_data_proxy: Magi2RefinerDataProxy | None = None
         self.refiner_sampler: Magi2RefinerSampler | None = None
@@ -756,14 +764,28 @@ class Magi2Pipeline(
                 "MAGI-2 compiles the transformer regions itself; diffusion_compile_granularity=%r is ignored.",
                 granularity,
             )
+        dynamic = self.od_config.diffusion_compile_dynamic
+        if dynamic and current_omni_platform.is_musa():
+            # MUSA: the Triton toolchain miscompiles a fused kernel of the dynamic-shape
+            # regions; static shapes compile correctly and run faster.
+            logger.info("MAGI-2 on MUSA compiles its transformer regions with static shapes.")
+            dynamic = False
+        if not dynamic:
+            # Under fullgraph, a region past the recompile limit fails the request.
+            import torch._dynamo.config as dynamo_config
+
+            limit = _STATIC_REGION_VARIANTS_PER_PROMPT_LENGTH * _STATIC_PROMPT_LENGTHS
+            dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, limit)
+            dynamo_config.accumulated_recompile_limit = max(dynamo_config.accumulated_recompile_limit, limit)
 
         # The mHC connections chain bf16 ops that eager rounds after every op.
         # Emulating those casts keeps the compiled rounding boundaries equal.
-        self.transformer.compile_regions(
-            fullgraph=True,
-            dynamic=self.od_config.diffusion_compile_dynamic,
-            options={"emulate_precision_casts": True},
-        )
+        self._region_compile_kwargs = {
+            "fullgraph": True,
+            "dynamic": dynamic,
+            "options": {"emulate_precision_casts": True},
+        }
+        self.transformer.compile_regions(**self._region_compile_kwargs)
 
     def load_weights(
         self,
@@ -837,6 +859,9 @@ class Magi2Pipeline(
             with set_current_diffusion_config(self.od_config), torch.device("cpu"):
                 refiner = Magi2RefinerTransformer(MAGI2_REFINER_CONFIG)
             refiner.load_checkpoint(refiner_root)
+            compile_kwargs = getattr(self, "_region_compile_kwargs", None)
+            if compile_kwargs is not None:
+                refiner.compile_regions(**compile_kwargs)
             staged = _Magi2StagedComponent(
                 refiner,
                 self.device_str,

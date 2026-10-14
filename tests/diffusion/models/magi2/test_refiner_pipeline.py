@@ -65,6 +65,9 @@ class _FakeRefiner(nn.Module):
         self.events.append("load_checkpoint")
         return set()
 
+    def compile_regions(self, **compile_kwargs: Any) -> None:
+        self.events.append(("compile_regions", compile_kwargs))
+
     def forward(self, *, video, text, coords, modality, window_plan, split_sizes) -> torch.Tensor:
         self.calls.append({"video": video, "text": text, "window_plan": window_plan})
         del coords, modality, split_sizes
@@ -203,6 +206,17 @@ def test_first_refined_request_builds_and_loads_the_refiner_once(
     assert pipe.refiner_sampler.data_proxy is pipe.refiner_data_proxy
     assert pipe.refiner_data_proxy.config is model.config
     assert pipe.refiner_sampler.guidance_scale == 2.0
+
+
+def test_refiner_is_compiled_with_the_preview_region_options(monkeypatch, tmp_path, events, stagers, refiner_factory):
+    _write_refiner_index(tmp_path)
+    pipe, _ = _refined_pipeline(monkeypatch, tmp_path, events)
+    options = {"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}
+    pipe._region_compile_kwargs = dict(options)
+
+    pipe(_refined_request())
+
+    assert events[:4] == ["build", "load_checkpoint", ("compile_regions", options), ("stager", "_FakeRefiner")]
 
 
 def test_refiner_is_built_outside_inference_mode_under_the_pipeline_config(

@@ -426,6 +426,61 @@ def test_layer_matches_reference_transcription_bitwise(layer_index: int, input_d
     assert torch.equal(actual, expected)
 
 
+def test_layer_regions_bracket_the_window_attention() -> None:
+    assert all(layer.region_methods == ("_attention_input", "_attention_output") for layer in _tiny_model().layers)
+
+
+@pytest.mark.parametrize("text_len", [21, 0])
+def test_compiled_regions_match_eager_forward_bitwise(text_len: int) -> None:
+    eager = _tiny_model()
+    compiled = _tiny_model()
+    compiled.compile_regions(fullgraph=True, backend="eager", dynamic=False)
+    video, text, coords, modality, plan = _forward_inputs(eager.config, (9, 4, 8), text_len)
+
+    with torch.no_grad():
+        expected = eager(video, text, coords, modality, plan)
+        actual = compiled(video, text, coords, modality, plan)
+
+    assert all(
+        hasattr(getattr(layer, name), "_torchdynamo_orig_callable")
+        for layer in compiled.layers
+        for name in layer.region_methods
+    )
+    assert torch.equal(actual, expected)
+
+
+def test_static_regions_compile_every_prompt_length_under_the_pipeline_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.magi2 import pipeline_magi2
+
+    class _Transformer(torch.nn.Module):
+        def compile_regions(self, **compile_kwargs: Any) -> None:
+            pass
+
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
+    monkeypatch.setattr(torch._dynamo.config, "accumulated_recompile_limit", 256)
+    pipeline = object.__new__(pipeline_magi2.Magi2Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = OmniDiffusionConfig(model="sand-ai/MAGI-2-preview", model_class_name="Magi2Pipeline")
+    pipeline.transformer = _Transformer()
+    with monkeypatch.context() as musa:
+        musa.setattr(pipeline_magi2.current_omni_platform, "is_musa", lambda: True)
+        pipeline.setup_compile()
+    compile_kwargs = {name: value for name, value in pipeline._region_compile_kwargs.items() if name != "options"}
+
+    model = _tiny_model()
+    model.compile_regions(backend="eager", **compile_kwargs)
+    torch._dynamo.reset()
+    try:
+        with torch.no_grad():
+            # Each length compiles three variants of both regions: the bf16 first
+            # layer, then fp32 inputs with one and with three modality experts.
+            for text_len in (5, 6, 7, 8):
+                model(*_forward_inputs(model.config, (9, 4, 8), text_len))
+    finally:
+        torch._dynamo.reset()
+
+
 def test_cat_rows_copy_path_matches_torch_cat(monkeypatch: pytest.MonkeyPatch) -> None:
     generator = torch.Generator().manual_seed(9)
     parts = [torch.randn(rows, 6, generator=generator).to(_BF16) for rows in (3, 0, 5)]
@@ -466,7 +521,6 @@ def test_dtype_chain_gate_and_swiglu_layout() -> None:
 
     hooks = [
         layer.register_forward_hook(keep("layer")),
-        layer.attention.register_forward_hook(keep("attention")),
         layer.mlp.register_forward_hook(keep("mlp")),
         layer.attention.linear_g.register_forward_hook(keep("gate")),
         layer.attention.window_attention.register_forward_hook(keep("kernel")),
@@ -485,7 +539,7 @@ def test_dtype_chain_gate_and_swiglu_layout() -> None:
     (layer_input, *_), layer_output = captured["layer"]
     (mlp_input, *_), mlp_output = captured["mlp"]
     assert layer_input.dtype == torch.bfloat16
-    assert captured["attention"][1].dtype == torch.bfloat16
+    assert captured["proj"][1].dtype == torch.bfloat16
     assert mlp_input.dtype == torch.bfloat16
     assert mlp_output.dtype == torch.float32
     assert layer_output.dtype == torch.float32
