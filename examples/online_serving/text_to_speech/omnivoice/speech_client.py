@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Client for OmniVoice TTS via /v1/audio/speech endpoint.
 
 Examples:
@@ -47,8 +50,7 @@ def run_tts(args) -> None:
         "response_format": args.response_format,
     }
     if args.seed is not None:
-        payload["extra_params"] = {}
-        payload["extra_params"]["seed"] = args.seed
+        payload["seed"] = args.seed
 
     if args.voice:
         payload["voice"] = args.voice
