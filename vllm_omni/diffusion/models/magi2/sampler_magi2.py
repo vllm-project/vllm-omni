@@ -101,6 +101,27 @@ class SamplerInput:
     ref_image_special_token_embedding: torch.Tensor | None = None  # [B,M,D]
 
 
+def build_flow_unipc_scheduler(
+    num_inference_steps: int,
+    *,
+    shift: float,
+    device: torch.device | str | None,
+) -> FlowUniPCMultistepScheduler:
+    """Create a FlowUniPC scheduler with ``num_inference_steps`` timesteps.
+
+    The scheduler is constructed with its default (unshifted) training sigmas
+    and ``shift`` is applied once, when the timesteps are set.
+    """
+
+    if num_inference_steps <= 0:
+        raise ValueError("num_inference_steps must be positive")
+    if not math.isfinite(shift) or shift <= 0:
+        raise ValueError(f"shift must be positive and finite, got {shift}")
+    scheduler = FlowUniPCMultistepScheduler()
+    scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
+    return scheduler
+
+
 def build_magi2_preview_schedulers(
     num_inference_steps: int,
     *,
@@ -109,14 +130,8 @@ def build_magi2_preview_schedulers(
 ) -> tuple[FlowUniPCMultistepScheduler, FlowUniPCMultistepScheduler]:
     """Create independent, identically configured video/audio schedulers."""
 
-    if num_inference_steps <= 0:
-        raise ValueError("num_inference_steps must be positive")
-    if not math.isfinite(shift) or shift <= 0:
-        raise ValueError(f"shift must be positive and finite, got {shift}")
-    video_scheduler = FlowUniPCMultistepScheduler()
-    audio_scheduler = FlowUniPCMultistepScheduler()
-    video_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
-    audio_scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
+    video_scheduler = build_flow_unipc_scheduler(num_inference_steps, shift=shift, device=device)
+    audio_scheduler = build_flow_unipc_scheduler(num_inference_steps, shift=shift, device=device)
     return video_scheduler, audio_scheduler
 
 
@@ -660,5 +675,6 @@ __all__ = [
     "CFGConfig",
     "Magi2PreviewSampler",
     "SamplerInput",
+    "build_flow_unipc_scheduler",
     "build_magi2_preview_schedulers",
 ]
