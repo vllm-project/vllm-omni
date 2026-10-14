@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.models.magi2 import turbo_vae
 from vllm_omni.diffusion.models.magi2.turbo_vae import (
     Magi2TurboVAEDecoder,
     extract_turbo_decoder_state_dict,
@@ -64,3 +65,14 @@ def test_turbo_temporal_tiles_preserve_chunk_overlap_contract():
     decoder.latent_std = torch.ones(1, device="meta")
     prepared, _ = decoder._prepare_latent(latent)
     assert prepared.device.type == "meta"
+
+
+@pytest.mark.parametrize("shape,pad", [((1, 4, 5, 3, 7), 1), ((2, 3, 1, 2, 2), 1), ((1, 2, 6, 4, 4), 2)])
+def test_turbo_time_edge_pad_copies_match_cat(monkeypatch, shape, pad):
+    x = torch.randn(shape, dtype=torch.bfloat16)
+    expected = torch.cat([x[:, :, :1].repeat(1, 1, pad, 1, 1), x, x[:, :, -1:].repeat(1, 1, pad, 1, 1)], dim=2)
+    assert torch.equal(turbo_vae._pad_time_edges(x, pad), expected)
+
+    # Force the per-channel copies used for outputs past 2**31 elements.
+    monkeypatch.setattr(turbo_vae, "_PAD_TIME_EDGES_MAX_NUMEL", 0)
+    assert torch.equal(turbo_vae._pad_time_edges(x, pad), expected)
