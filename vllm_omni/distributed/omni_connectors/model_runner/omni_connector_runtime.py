@@ -28,6 +28,7 @@ logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
 if TYPE_CHECKING:
     from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
@@ -128,6 +129,7 @@ class _OmniConnectorRuntimeMixin:
     _cached_ic: dict[str, int]
     _request_ids_mapping: dict[str, str]
     _pending_load_reqs: dict[str, Any]
+    _recv_request_owners: dict[str, PrefixCacheRequestOwner | None]
     _finished_load_reqs: set[str]
     _pending_save_reqs: dict[str, deque[Any]]
     _pending_save_counts: dict[str, int]
@@ -266,6 +268,7 @@ class _OmniConnectorRuntimeMixin:
 
         # -- async I/O state (shared by chunk + full_payload_mode) --
         self._pending_load_reqs: dict[str, Any] = {}
+        self._recv_request_owners: dict[str, PrefixCacheRequestOwner | None] = {}
         self._finished_load_reqs: set[str] = set()
         self._pending_save_reqs: dict[str, deque] = {}
         self._pending_save_counts: dict[str, int] = defaultdict(int)
@@ -458,6 +461,7 @@ class _OmniConnectorRuntimeMixin:
             self._clear_recv_delivery_state(req_id)
 
     def _clear_recv_delivery_state(self, req_id: str) -> None:
+        self._recv_request_owners.pop(req_id, None)
         self._get_req_chunk.pop(req_id, None)
         self._pending_load_reqs.pop(req_id, None)
         self._finished_load_reqs.discard(req_id)
@@ -521,6 +525,7 @@ class _OmniConnectorRuntimeMixin:
         # ultimately triggers cleanup_finished_request() here.
         for attr_name in (
             "_request_ids_mapping",
+            "_recv_request_owners",
             "_get_req_chunk",
             "_finished_load_reqs",
             "_chunk_ready_req_ids",

@@ -609,6 +609,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if req_id in self.requests:
                 self._update_streaming_input_additional_info(new_req_data, req_id)
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                setattr(
+                    req_state, "processed_media_provenance", getattr(new_req_data, "processed_media_provenance", None)
+                )
                 reqs_to_add.append(req_state)
                 continue
 
@@ -644,6 +647,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            setattr(req_state, "processed_media_provenance", getattr(new_req_data, "processed_media_provenance", None))
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # If prompt embeddings are provided, decode and attach to inter_data

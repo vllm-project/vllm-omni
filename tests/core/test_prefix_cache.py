@@ -46,6 +46,7 @@ from vllm_omni.core.prefix_cache.controller import StagingBufferHolder, WriteTas
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
+    check_qwen3_omni_talker_request_local_scope,
     stage_prefix_cache_config,
 )
 from vllm_omni.core.prefix_cache.interface import (
@@ -89,6 +90,10 @@ class FakeView:
 
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
+
+    def token_range(self, req_id, num_scheduled):
+        start = self.computed.get(req_id, 0)
+        return start, start + num_scheduled
 
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []
@@ -397,7 +402,7 @@ def test_save_requires_slot_snapshot_with_cache_contract_error():
                 {},
                 num_tokens_unpadded=1,
                 num_tokens_padded=1,
-                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1),), 1),
+                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1, 0, 1),), 1),
             )
     finally:
         mgr.shutdown()
@@ -799,13 +804,15 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([object(), object()])
 
 
-def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None):
+def _stage_cfg(
+    *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, model=None
+):
     return stage_prefix_cache_config(
         kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
         cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE, prefix_match_unit=match_unit),
         kv_transfer_config=kv_transfer,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_model_len=128),
-        model_config=None,
+        model_config=model,
         is_pooling_model=pooling,
         speculative_config=spec,
     )
@@ -830,6 +837,93 @@ def test_stage_prefix_cache_config_gate():
         _stage_cfg(match_unit=BLOCK_SIZE, groups=())
     with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
         _stage_cfg(groups=(object(), object()))
+
+
+@pytest.mark.parametrize("architecture_source", ["model_arch", "architectures", "hf_config"])
+@pytest.mark.parametrize("standalone", [False, True])
+def test_talker_cache_refuses_before_use_until_history_identity_is_safe(architecture_source, standalone):
+    architecture = (
+        "Qwen3OmniMoeTalkerForConditionalGeneration" if standalone else "Qwen3OmniMoeForConditionalGeneration"
+    )
+    model = SimpleNamespace(model_stage="talker")
+    if architecture_source == "hf_config":
+        model.hf_config = SimpleNamespace(architectures=[architecture])
+    else:
+        setattr(model, architecture_source, architecture if architecture_source == "model_arch" else [architecture])
+    # The named unsafe combination wins over later layout checks during
+    # runner initialization. Cache-off execution is unaffected.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="not yet publicly supported|qualification"):
+        _stage_cfg(model=model, groups=())
+    assert _stage_cfg(model=model, enable=False, groups=()) is None
+    if not standalone:
+        model.model_stage = "thinker"
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
+            _stage_cfg(model=model, groups=())
+
+
+@pytest.mark.parametrize(
+    ("scheduler", "parallel", "spec", "message"),
+    [
+        (SimpleNamespace(async_scheduling=True), None, None, "sync scheduling"),
+        (
+            SimpleNamespace(async_scheduling=False),
+            SimpleNamespace(tensor_parallel_size=2, pipeline_parallel_size=1),
+            None,
+            "TP=1",
+        ),
+        (
+            SimpleNamespace(async_scheduling=False),
+            SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=2),
+            None,
+            "PP=1",
+        ),
+        (SimpleNamespace(async_scheduling=False), None, SimpleNamespace(method="ngram"), "speculative"),
+    ],
+)
+def test_talker_request_local_scope_guard_rejects_unqualified_modes(scheduler, parallel, spec, message):
+    model = SimpleNamespace(model_stage="talker", model_arch="Qwen3OmniMoeForConditionalGeneration")
+    cache = SimpleNamespace(enable_prefix_caching=True)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match=message):
+        check_qwen3_omni_talker_request_local_scope(
+            cache_config=cache,
+            scheduler_config=scheduler,
+            model_config=model,
+            parallel_config=parallel,
+            speculative_config=spec,
+        )
+
+
+@pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_both", "kv_producer"])
+def test_talker_request_local_scope_rejects_external_kv(kv_role):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="external KV"):
+        check_qwen3_omni_talker_request_local_scope(
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            model_config=SimpleNamespace(model_stage="talker", model_arch="Qwen3OmniMoeForConditionalGeneration"),
+            kv_transfer_config=SimpleNamespace(kv_role=kv_role),
+        )
+
+
+def test_talker_request_local_scope_rejects_async_chunk():
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="full payload"):
+        check_qwen3_omni_talker_request_local_scope(
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            model_config=SimpleNamespace(
+                model_stage="talker", model_arch="Qwen3OmniMoeForConditionalGeneration", async_chunk=True
+            ),
+        )
+
+
+@pytest.mark.parametrize("kind", ["prefill_context_parallel_size", "decode_context_parallel_size"])
+def test_talker_request_local_scope_rejects_context_parallel(kind):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="context parallel"):
+        check_qwen3_omni_talker_request_local_scope(
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            model_config=SimpleNamespace(model_stage="talker", model_arch="Qwen3OmniMoeForConditionalGeneration"),
+            parallel_config=SimpleNamespace(**{kind: 2}),
+        )
 
 
 def test_npu_runner_uses_shared_prefix_cache_gate():
