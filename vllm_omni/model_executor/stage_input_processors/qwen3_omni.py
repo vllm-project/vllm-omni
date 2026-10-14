@@ -23,6 +23,16 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
+from vllm_omni.model_executor.models.qwen3_omni.talker_conditioning import thinker_conditioning_digest
+from vllm_omni.model_executor.models.qwen3_omni.talker_identity import (
+    adapter_conditioning_namespace,
+    stage_conditioning_namespace,
+)
+from vllm_omni.model_executor.models.qwen3_omni.talker_input_plan import (
+    plan_talker_prefill,
+    talker_prefill_token_ids,
+)
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import compute_ramp_emit, parse_chunk_ramp
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -68,13 +78,17 @@ def _get_embedding_layer_index() -> int:
     return 0
 
 
-def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
-    """Read accept_hidden_layer index from model config."""
+def _get_model_hf_config(transfer_manager: Any) -> Any:
     if hasattr(transfer_manager, "_get_model_config"):
         mc = transfer_manager._get_model_config()
     else:
         mc = getattr(transfer_manager, "config", None)
-    return int(mc.hf_config.talker_config.accept_hidden_layer)
+    return mc.hf_config
+
+
+def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
+    """Read accept_hidden_layer index from model config."""
+    return int(_get_model_hf_config(transfer_manager).talker_config.accept_hidden_layer)
 
 
 # Set once chunk 0 carried the first generated token taken from the prefill
@@ -115,40 +129,8 @@ def _sampled_token_embed(thinker_embed: Mapping[str, Any], request: Any) -> torc
 
 
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
-    im_start_token_id = 151644
-    system_token_id = 8948
-    user_token_id = 872
-    assistant_token_id = 77091
-
     ids = info.get("ids", {})
-    thinker_sequences = torch.tensor(ids["all"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-
-    input_ids = torch.tensor(ids["prompt"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-
-    im_start_indexes = torch.cat(
-        [
-            torch.nonzero(input_ids[0] == im_start_token_id).squeeze(1),
-            torch.tensor([thinker_sequences.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
-        ],
-        dim=0,
-    )
-
-    sum_user_len = 0
-    assistant_len = 0
-    for i in range(len(im_start_indexes) - 1):
-        s = int(im_start_indexes[i].item())
-        e = int(im_start_indexes[i + 1].item())
-        role = int(input_ids[0, s + 1].item())
-        if role == system_token_id:
-            continue
-        elif role == user_token_id:
-            sum_user_len += e - s
-        elif role == assistant_token_id and i == len(im_start_indexes) - 2:
-            assistant_len += 9  # 3 + 4 + 1 + 1
-        else:
-            pass
-
-    return sum_user_len + assistant_len
+    return sum(part.num_rows for part in plan_talker_prefill(ids["prompt"], len(ids["all"])))
 
 
 # =========================
@@ -614,6 +596,23 @@ def thinker2talker_full_payload(
         )
         return None
 
+    config = _get_model_hf_config(transfer_manager)
+    row_plan = plan_talker_prefill(
+        prompt_token_ids,
+        len(all_token_ids),
+        im_start_token_id=config.im_start_token_id,
+        system_token_id=config.system_token_id,
+        user_token_id=config.user_token_id,
+        assistant_token_id=config.assistant_token_id,
+        embedding_rows=emb_rows,
+        hidden_rows=hid_rows,
+    )
+    talker_ids = talker_prefill_token_ids(
+        row_plan,
+        all_token_ids,
+        tts_pad_token_id=config.tts_pad_token_id,
+        tts_bos_token_id=config.tts_bos_token_id,
+    )
     payload: OmniPayload = {
         "embed": {
             "prefill": thinker_emb_prefill.detach().cpu(),
@@ -623,7 +622,12 @@ def thinker2talker_full_payload(
         },
         "hidden_states": {"output": thinker_hid_prefill.detach().cpu()},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
-        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+        "meta": {
+            "finished": torch.tensor(True, dtype=torch.bool),
+            "next_stage_prompt_ids": talker_ids,
+            "next_stage_prompt_len": len(talker_ids),
+            "talker_prefill_plan": [(part.kind, part.start, part.end) for part in row_plan],
+        },
     }
     speaker = extract_speaker_from_request(request)
     if speaker is not None:
@@ -631,7 +635,58 @@ def thinker2talker_full_payload(
     language = extract_language_from_request(request)
     if language is not None:
         payload["language"] = language
+    source_digest, identity_error = _full_payload_source_identity(transfer_manager, request, payload, row_plan)
+    if source_digest is not None:
+        payload["meta"]["next_stage_source_digest"] = source_digest
+    else:
+        payload["meta"]["next_stage_source_identity_error"] = identity_error
     return payload
+
+
+def _full_payload_source_identity(transfer_manager, request, payload, row_plan) -> tuple[str | None, str]:
+    """Bind metadata to this retained payload, not to producer/request labels.
+
+    Unverified inputs stay executable with caching off. The consumer requires a
+    digest for the cache-enabled mode; it never substitutes an empty identity.
+    """
+    vllm_config = getattr(transfer_manager, "vllm_config", None)
+    if vllm_config is None:
+        return None, "resolved source runtime configuration is unavailable"
+    if getattr(request, "prompt_embeds", None) is not None:
+        return None, "arbitrary source prompt embeddings have no trusted provenance"
+    embeddings = payload["embed"]
+    if any(not isinstance(embeddings.get(key), torch.Tensor) for key in ("tts_pad", "tts_bos", "tts_eos")):
+        return None, "source TTS conditioning is incomplete"
+    proof = getattr(request, "processed_media_provenance", None)
+    features = getattr(request, "mm_features", None)
+    if features and not isinstance(proof, ProcessedMediaProvenance):
+        return None, "source media has no processor-owned provenance"
+    try:
+        if proof is not None:
+            if not isinstance(proof, ProcessedMediaProvenance):
+                raise ValueError("untrusted media provenance record")
+            proof.validate(payload["ids"]["prompt"], features)
+        namespace = getattr(transfer_manager, "_qwen3_source_conditioning_namespace", None)
+        if namespace is None:
+            namespace = stage_conditioning_namespace(vllm_config)
+            transfer_manager._qwen3_source_conditioning_namespace = namespace
+        config = vllm_config.model_config.hf_config
+        thinker = config.thinker_config
+        digest = thinker_conditioning_digest(
+            prompt_ids=payload["ids"]["prompt"],
+            sequence_ids=payload["ids"]["all"],
+            row_plan=row_plan,
+            embedding_rows=embeddings["prefill"].shape[0],
+            hidden_rows=payload["hidden_states"]["output"].shape[0],
+            text_controls=(config.tts_pad_token_id, config.tts_bos_token_id, config.tts_eos_token_id),
+            media_token_ids=(thinker.image_token_id, thinker.audio_token_id, thinker.video_token_id),
+            source_model=namespace,
+            source_adapter=adapter_conditioning_namespace(request),
+            processed_media=proof.media if proof is not None else (),
+        )
+        return digest, ""
+    except (TypeError, ValueError):
+        return None, "source conditioning failed provenance or namespace validation"
 
 
 def thinker2talker_token_only(
@@ -644,8 +699,10 @@ def thinker2talker_token_only(
     ``async_chunk=False``.
 
     After the communication-layer refactor, this function only allocates a
-    placeholder ``prompt_token_ids`` of the correct length so the scheduler can
-    reserve KV-cache slots. It does **not** forward bulk tensors.
+    placeholder ``prompt_token_ids`` of the expected length. The full payload
+    finalizes row-aligned identity IDs on the scheduler before admission;
+    tensor trimming can shorten the actual retained rows. It does **not**
+    forward bulk tensors.
 
     Bulk talker conditioning is sent through the connector. Speaker and
     language are also copied from the original prompt so they survive when
@@ -687,6 +744,7 @@ def thinker2talker_token_only(
                 additional_information=additional_information or None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
+                cache_salt=prompt.get("cache_salt") if isinstance(prompt, Mapping) else None,
             )
         )
     return talker_inputs

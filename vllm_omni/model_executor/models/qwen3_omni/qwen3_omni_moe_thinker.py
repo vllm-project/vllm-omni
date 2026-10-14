@@ -24,7 +24,8 @@
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
-from functools import partial
+from functools import cached_property, partial
+from importlib.metadata import version
 from typing import Any, cast
 
 import numpy as np
@@ -44,7 +45,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.inputs import PromptType
+from vllm.inputs import MultiModalInput, PromptType, mm_input
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
@@ -106,6 +107,8 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+from vllm.multimodal.processing.context import TimingContext
+from vllm.multimodal.processing.inputs import ProcessorInputs
 from vllm.multimodal.processing.processor import (
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
@@ -126,6 +129,11 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor,
     _get_request_video_use_audio_in_video,
     _get_video_second_per_grid_t,
+)
+from vllm_omni.model_executor.models.qwen3_omni.processed_media import (
+    bind_processed_media_updates,
+    processed_media_provenance,
+    processor_value_digest,
 )
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
@@ -735,6 +743,71 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
 ):
     # Preserve Omni's per-video overrides while inheriting upstream Qwen3's
     # audio processing through the shared, cooperative Qwen2.5 base.
+
+    @cached_property
+    def _media_preprocessing_namespace(self) -> str:
+        processor = self.info.get_hf_processor()
+        components = {
+            name: component.to_dict()
+            for name in ("image_processor", "video_processor", "feature_extractor")
+            if (component := getattr(processor, name, None)) is not None
+        }
+        return processor_value_digest(
+            {
+                "schema": "qwen3-omni.processed-media.v1",
+                "processor": f"{type(self).__module__}.{type(self).__qualname__}",
+                "hf_processor": processor.to_dict(),
+                "components": components,
+                "transformers": version("transformers"),
+                "vllm": version("vllm"),
+            }
+        )
+
+    def _get_mm_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> MultiModalPromptUpdates:
+        updates = super()._get_mm_prompt_updates(mm_items, hf_processor_mm_kwargs, out_mm_kwargs)
+        if not any(updates.values()):
+            return updates
+        try:
+            preprocessing_digest = processor_value_digest(
+                {"namespace": self._media_preprocessing_namespace, "options": dict(hf_processor_mm_kwargs)}
+            )
+            return bind_processed_media_updates(
+                updates,
+                out_mm_kwargs,
+                preprocessing_digest=preprocessing_digest,
+                unverified_modalities={key for key, items in mm_items.items() if items.get_passthrough_data()},
+            )
+        except ValueError:
+            # Unsupported values remain executable without a provenance claim.
+            # A cache-enabled consumer must reject missing proof, not invent it.
+            return updates
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx: TimingContext) -> MultiModalInput:
+        # Keep upstream's processing and prompt-update order. The extra record
+        # comes from the SAME cached result, including when kwargs are omitted
+        # by the sender cache. No mutable processor-wide request capture.
+        mm_info = self._cached_apply_hf_processor(inputs, timing_ctx)
+        with timing_ctx.record("apply_prompt_updates"):
+            prompt_ids, placeholders = self._maybe_apply_prompt_updates(
+                mm_items=inputs.mm_data_items,
+                mm_res=mm_info,
+            )
+        ranges = {key: [item.to_range() for item in values] for key, values in placeholders.items()}
+        result = mm_input(
+            prompt_token_ids=prompt_ids,
+            mm_kwargs=mm_info.kwargs,
+            mm_hashes=mm_info.hashes,
+            mm_placeholders=ranges,
+        )
+        cast(dict[str, Any], result)["_omni_processed_media"] = processed_media_provenance(
+            prompt_ids, ranges, mm_info.hashes, mm_info.prompt_updates
+        )
+        return result
 
     def get_updates_use_audio_in_video(
         self,
