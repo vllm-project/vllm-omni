@@ -919,7 +919,10 @@ session) gives that contract:
   marks as the end of the unit's output; a model whose last stage streams
   across units can emit the end of a unit's audio later, as it does in
   real-time operation. That lag is model-specific: each model documents
-  its own in its entry under *Input-clocked sessions*.
+  its own in its entry under *Input-clocked sessions*. A unit settled
+  without waiting for its output (`cancelled`, `aborted`, `timed_out`; see
+  below) is the one exception: its acknowledgement does not wait for that
+  output.
 - So the outputs of an input are bracketed by acknowledgements, up to that
   model-specific lag: they come after the acknowledgement of an earlier
   input and before the input's own.
@@ -992,6 +995,15 @@ response, which is dropped). This includes a unit settled before the model had e
 deferred committed turn whose slot timed out before the response it waited
 for ended and submitted it.
 
+Settling does not cancel or fence the unit: a timeout leaves the model
+running it, and only a cancel stops it. So the output of a unit settled as
+`timed_out` can arrive after the acknowledgement that reported it. This is
+the only case in which output follows the acknowledgement of the input that
+caused it. The unit's entry in `units` (`decision: "timed_out"` with its
+`reason`) tells the client that the acknowledgement abandoned the unit rather
+than following its completion: the client should expect that output may still
+come, attributed to that unit.
+
 Input clocking is available only for models whose plugin declares it
 (`DuplexModelPlugin.supports_input_clock`), because the engine needs the
 model's real unit boundaries to know when a unit's output is complete. On any
@@ -1006,6 +1018,26 @@ that sets it.
   submits nothing, creates no unit: it is acknowledged as soon as the
   acknowledgements of the inputs before it are out (its `units` lists
   whatever settled since the previous acknowledgement, often nothing).
+- **A unit built from several appends.** A unit belongs to the input that
+  completes it: the append whose audio fills it, or the commit that flushes
+  it. The appends that only buffered its earlier audio are acknowledged as
+  inputs that only buffer audio. Their audio counts in `audio_end_ms` at
+  once and in `unit_end_ms` only once the unit settles, so it is reported on
+  the acknowledgement of the completing input. For example, with 1 s units,
+  appends of 600 ms and 600 ms followed by a commit are acknowledged with
+  `audio_end_ms` / `unit_end_ms` = 600 / 0 (no unit), 1200 / 1000 (the unit
+  the second append completed, `end_ms: 1000`) and 1200 / 1200 (the
+  committed rest, `end_ms: 1200`).
+- **A commit with audio short of a unit.** A commit submits the audio still
+  buffered as the turn's final unit, owned by the commit. The server never
+  adds silence of its own; if the model needs whole units, its input buffer
+  pads that final submission to its unit boundary (MiniCPM-o pads with
+  zeros), as in a session without the clock. The padding is not client
+  input: it counts in neither `audio_end_ms` nor `unit_end_ms`, and the
+  final unit's `end_ms` is the end of the client's audio. A commit with
+  nothing buffered submits nothing and is acknowledged as an input that only
+  buffers audio. When a model ends a turn without speech by discarding its
+  audio, that audio counts as discarded (see the field table).
 - **An input that submits several units.** An append longer than one unit
   submits every whole unit it completes, and a commit that flushes a backlog
   may submit more than one unit. So may an append in which server
