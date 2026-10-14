@@ -2,19 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
-import queue
-from types import SimpleNamespace
+from collections.abc import Iterator
+from pathlib import Path
 
+import janus
 import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
+from tests.model_executor.models.chatterbox.helpers import DEPLOY, stage_vllm_config, write_model_dir
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
 from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE
@@ -25,20 +28,27 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
-def original_admission_engine():
-    """Use real admission and pipeline hooks without starting GPU workers."""
+def original_admission_engine(tmp_path: Path) -> Iterator[AsyncOmniEngine]:
+    """Admission as the engine runs it, short of the engine's processes.
+
+    ``AsyncOmniEngine.__init__`` launches the orchestrator and every stage, so
+    the engine gets what that sets up for admission instead: the input
+    processor built from the deploy file's stage 0 config, the deploy file's
+    default budget, the pipeline's admission hooks, and the request queue.
+    """
     engine = object.__new__(AsyncOmniEngine)
     engine.default_sampling_params_list = [SamplingParams(max_tokens=1000)]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
-    engine.input_processor = SimpleNamespace(
-        process_inputs=lambda **kwargs: _make_engine_core_request(kwargs["request_id"])
+    engine.input_processor = build_stage0_input_processor(
+        stage_vllm_config(write_model_dir(tmp_path), DEPLOY["original"], 0)
     )
-    engine.request_queue = SimpleNamespace(sync_q=queue.SimpleQueue())
+    engine.request_queue = janus.Queue()
     for name in ("prompt_transform_func", "prompt_expand_func"):
         module, function = getattr(CHATTERBOX_ORIGINAL_PIPELINE.stages[0], name).rsplit(".", 1)
         setattr(engine, name, getattr(importlib.import_module(module), function))
-    return engine
+    yield engine
+    engine.request_queue.close()
 
 
 def original_admission_prompt(weight: float) -> dict:
@@ -80,13 +90,19 @@ def test_original_offline_admission_preserves_supported_budget(
         assert companion.companion_id == "original__cfg_uncond"
 
 
-def test_unguided_stage0_only_request_is_not_expanded(mocker: MockerFixture, original_admission_engine):
-    """Without a cfg_group the stage-0-only gate still keeps the expansion hook idle."""
+def test_unguided_stage0_only_request_is_not_expanded(original_admission_engine):
+    """Without a cfg_group the stage-0-only gate keeps the expansion hook idle.
+
+    The prompt carries a guidance weight, so the pipeline's expansion hook
+    would add a companion if it were called.
+    """
     engine = original_admission_engine
-    engine.prompt_expand_func = mocker.Mock(side_effect=AssertionError("downstream CFG must stay idle"))
-    engine.add_request("plain", original_admission_prompt(0.0), final_stage_id=0)
-    engine.prompt_expand_func.assert_not_called()
-    assert engine.request_queue.sync_q.qsize() == 1
+    prompt = original_admission_prompt(0.5)
+    del prompt["additional_information"]["cfg_group"]
+    engine.add_request("plain", prompt, final_stage_id=0)
+    message = engine.request_queue.sync_q.get_nowait()
+    assert message.request_id == "plain"
+    assert engine.request_queue.sync_q.empty()
 
 
 @pytest.mark.parametrize("weight", [0.0, 0.5])

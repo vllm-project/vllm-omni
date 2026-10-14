@@ -618,16 +618,11 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
     assert parallel_config["text_encoder_tp_size"] == 2
 
 
-# Chatterbox's Hub repository ships no config.json, so its Hub id is patched
-# like a config-less local directory; a config.json that exists but fails to
-# load stays on vLLM's error path.
-def _config_less_args(model: str) -> OmniEngineArgs:
-    args = object.__new__(OmniEngineArgs)
-    args.model = model
-    args.model_arch = "ChatterboxForConditionalGeneration"
-    args.revision = None
-    args.hf_config_path = None
-    return args
+# Chatterbox's Hub repository ships no config.json, so a config-less
+# directory or Hub id gets one written; a config.json that exists but fails
+# to load stays on vLLM's error path.
+def chatterbox_args(model: str, model_arch: str = "ChatterboxForConditionalGeneration") -> OmniEngineArgs:
+    return OmniEngineArgs(model=model, model_arch=model_arch, skip_tokenizer_init=True)
 
 
 def _patched_config(args: OmniEngineArgs) -> dict:
@@ -635,17 +630,30 @@ def _patched_config(args: OmniEngineArgs) -> dict:
         return json.load(config_file)
 
 
-@pytest.mark.parametrize("model", ["ResembleAI/chatterbox-turbo", "local-directory"])
-def test_config_less_chatterbox_gets_a_config_written(monkeypatch, tmp_path, model):
-    if model == "local-directory":
-        model = str(tmp_path)
+def test_config_less_chatterbox_directory_gets_a_config_written(tmp_path):
+    """The engine writes a config.json naming the model type, loads the directory through it, and removes it."""
+    args = chatterbox_args(str(tmp_path))
+
+    model_config = args.create_model_config()
+
+    config = model_config.hf_config
+    assert isinstance(config, ChatterboxConfig)
+    assert (config.model_type, config.architectures) == ("chatterbox", ["ChatterboxForConditionalGeneration"])
+    assert (config.variant, config.vocab_size) == ("turbo", 6563)
+    assert model_config.architectures == ["ChatterboxForConditionalGeneration"]
+    assert not os.path.exists(args.hf_config_path) and not hasattr(args, "_temp_config_dir")
+
+
+# The Hub is a remote service: its answers for the Hub id (no config.json, or
+# one that exists but cannot be fetched) are stood in for here.
+def test_config_less_chatterbox_hub_id_gets_a_config_written(monkeypatch):
     monkeypatch.setattr(
         PretrainedConfig,
         "get_config_dict",
         classmethod(lambda cls, m, **kw: (_ for _ in ()).throw(OSError("no config"))),
     )
     monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: False)
-    args = _config_less_args(model)
+    args = chatterbox_args("ResembleAI/chatterbox-turbo")
     try:
         # As create_model_config calls it: the model type comes from the architecture.
         args._patch_empty_hf_config(_ARCH_TO_MODEL_TYPE[args.model_arch])
@@ -664,24 +672,28 @@ def test_config_less_chatterbox_gets_a_config_written(monkeypatch, tmp_path, mod
             shutil.rmtree(args._temp_config_dir, ignore_errors=True)
 
 
-def test_chatterbox_config_that_exists_but_fails_to_load_is_left_alone(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("model_arch", "model_type"),
+    [("ChatterboxForConditionalGeneration", "chatterbox"), ("CosyVoice3Model", "cosyvoice3")],
+)
+def test_a_config_that_exists_but_fails_to_load_is_left_alone(tmp_path, model_arch, model_type):
+    """The engine writes no config over a broken one; loading the directory fails on the file itself."""
     (tmp_path / "config.json").write_text("{")
-    args = _config_less_args(str(tmp_path))
-    args._patch_empty_hf_config("chatterbox")
+    args = chatterbox_args(str(tmp_path), model_arch)
+    assert _ARCH_TO_MODEL_TYPE[model_arch] == model_type
+
+    with pytest.raises((OSError, ValueError)):
+        args.create_model_config()
+
     assert args.hf_config_path is None
     assert not hasattr(args, "_temp_config_dir")
+
+
+def test_chatterbox_hub_config_that_exists_but_fails_to_load_is_left_alone(monkeypatch):
     monkeypatch.setattr(
         PretrainedConfig, "get_config_dict", classmethod(lambda cls, m, **kw: (_ for _ in ()).throw(OSError("gated")))
     )
     monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: True)
-    hub = _config_less_args("ResembleAI/chatterbox-turbo")
+    hub = chatterbox_args("ResembleAI/chatterbox-turbo")
     hub._patch_empty_hf_config("chatterbox")
     assert hub.hf_config_path is None
-
-
-def test_unlisted_model_type_without_a_loadable_config_is_left_alone(tmp_path):
-    (tmp_path / "config.json").write_text("{")
-    args = _config_less_args(str(tmp_path))
-    args.model_arch = "CosyVoice3Model"
-    args._patch_empty_hf_config("cosyvoice3")
-    assert args.hf_config_path is None
