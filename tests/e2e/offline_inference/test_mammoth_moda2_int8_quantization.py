@@ -391,22 +391,24 @@ def _format_t2i_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
     )
 
 
-def _t2i_stage_config(quantization: str | None) -> str:
-    """Patch the AR→DiT deploy config: quantization + memory budget on AR stage 0.
+def _t2i_stage_config(model: str, quantization: str | None, baseline_model: str) -> str:
+    """Use the selected AR checkpoint and the matching BF16 DiT checkpoint.
 
     The DiT stage (stage 1) keeps its deploy default (0.3); the AR stage takes
     0.6 so both fit on a single 48 GiB device.
+    Loading DiT from the BF16 baseline avoids auto-detecting the AR-only
+    quantization recipe stored in the INT8 checkpoint's root config.json.
     """
     from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
     base = get_deploy_config_path("mammoth_moda2.yaml")
     stage_updates = dict(_AR_STAGE_OVERRIDES)
+    stage_updates["model"] = model
+    updates = {"stages": {0: stage_updates, 1: {"model": baseline_model}}}
     if quantization is None:
-        return modify_stage_config(
-            base, updates={"stages": {0: stage_updates}}, deletes={"stages": {0: ["quantization"]}}
-        )
+        return modify_stage_config(base, updates=updates, deletes={"stages": {0: ["quantization"]}})
     stage_updates["quantization"] = quantization
-    return modify_stage_config(base, updates={"stages": {0: stage_updates}})
+    return modify_stage_config(base, updates=updates)
 
 
 def _generate_t2i_image(model: str, quantization: str | None, baseline_model: str) -> torch.Tensor:
@@ -432,9 +434,9 @@ def _generate_t2i_image(model: str, quantization: str | None, baseline_model: st
         max_tokens=max(1, expected_grid_tokens + 1),
         detokenize=False,
     )
-    dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False, seed=42)
 
-    with OmniRunner(model, seed=42, deploy_config=_t2i_stage_config(quantization)) as runner:
+    with OmniRunner(model, seed=42, deploy_config=_t2i_stage_config(model, quantization, baseline_model)) as runner:
         outputs = list(
             runner.omni.generate(
                 [
