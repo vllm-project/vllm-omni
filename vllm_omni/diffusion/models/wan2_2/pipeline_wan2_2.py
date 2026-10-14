@@ -54,6 +54,7 @@ from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
+from vllm_omni.diffusion.utils.param_utils import parse_guidance_interval
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -128,6 +129,13 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         return float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+
+
+def resolve_wan_guidance_interval(req: OmniDiffusionRequest) -> tuple[float, float] | None:
+    """``extra_args["guidance_interval"] = [lo, hi]`` in scheduler timesteps; CFG runs only while lo <= t <= hi."""
+    extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+    raw = extra_args.get("guidance_interval")
+    return None if raw is None else parse_guidance_interval(raw)
 
 
 def resolve_wan_guidance_scales(
@@ -308,7 +316,10 @@ def get_wan22_pre_process_func(
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
         has_image = raw_image is not None and (not isinstance(raw_image, list) or bool(raw_image))
-        request.batch_compatibility_key = ("wan22_image_condition", has_image)
+        # Parsed at admission so a malformed value is rejected here. Carried in the batch key so requests
+        # with different intervals never share a request batch.
+        guidance_interval = resolve_wan_guidance_interval(request)
+        request.batch_compatibility_key = ("wan22_image_condition", has_image, guidance_interval)
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
         if "additional_information" not in prompt:
@@ -534,6 +545,8 @@ class Wan22Pipeline(
         self._guidance_scale_2 = None
         self._num_timesteps = None
         self._current_timestep = None
+        # Set by the cache-dit enabler: its adapter tells the CFG passes apart by forward parity.
+        self._cache_dit_requires_paired_cfg = False
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -581,9 +594,16 @@ class Wan22Pipeline(
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
+        guidance_interval: tuple[float, float] | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+        # Decide CFG per step from the schedule once, with one host transfer, instead of syncing on
+        # float(t) every step. A Python bool also keeps CFG-parallel ranks on the same branch.
+        guided_steps = None
+        if guidance_interval is not None:
+            lo, hi = guidance_interval
+            guided_steps = [lo <= t <= hi for t in timesteps.tolist()]
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
@@ -634,6 +654,11 @@ class Wan22Pipeline(
                     timestep = t.expand(latents.shape[0])
 
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                if guided_steps is not None and not guided_steps[step_idx]:
+                    # Unguided step. cache-dit tells the cond/uncond passes apart by parity, so with it active
+                    # keep both passes and neutralize guidance instead of skipping the negative one.
+                    current_guidance_scale = 1.0
+                    do_true_cfg = do_true_cfg and self._cache_dit_requires_paired_cfg
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
@@ -731,6 +756,9 @@ class Wan22Pipeline(
             common,
             default_guidance_scale=1.0 if self.is_dmd else 4.0,
         )
+        guidance_interval = resolve_wan_guidance_interval(req.requests[0])
+        if guidance_interval is not None and self.expand_timesteps:
+            raise ValueError("guidance_interval is not supported on expand_timesteps (TI2V) Wan checkpoints")
 
         # record guidance for properties
         self._guidance_scale = guidance_low
@@ -947,6 +975,7 @@ class Wan22Pipeline(
             latent_condition=latent_condition,
             first_frame_mask=first_frame_mask,
             generator=generator,
+            guidance_interval=guidance_interval,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos

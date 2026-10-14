@@ -177,6 +177,15 @@ def test_i2v_preprocess_rejects_unsupported_last_image_type() -> None:
         preprocess(_make_i2v_preprocess_request({"not": "an image"}))
 
 
+def test_i2v_preprocess_rejects_guidance_interval() -> None:
+    preprocess = get_wan22_i2v_pre_process_func(SimpleNamespace())
+    request = _make_i2v_preprocess_request(None)
+    request.sampling_params.extra_args = {"guidance_interval": [600, 1000]}
+
+    with pytest.raises(ValueError, match="guidance_interval"):
+        preprocess(request)
+
+
 def test_i2v_diffuse_selects_stage_guidance_and_expands_timesteps() -> None:
     pipeline = _make_i2v_pipeline(expand_timesteps=True)
     latents = torch.zeros(1, 4, 2, 4, 4)
