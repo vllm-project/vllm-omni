@@ -1184,20 +1184,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             raise ValueError(f"MiniCPM-o Talker batched decode needs one id per row: {input_ids.numel()} != {num_rows}")
         weight = self.emb_code[0].weight
         codes = input_ids.reshape(-1).to(device=weight.device, dtype=torch.long)
-        embeds = self.emb_code[0](codes)
         # The runner and connector consume CPU codec ids.
         empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
         request_states = self._request_audio_states
         updates: list[dict[str, Any]] = []
         live_rows: list[tuple[int, str]] = []
         zero_rows: list[int] = []
+        prefill_embeds: list[tuple[int, torch.Tensor]] = []
+        k_last_rows: list[tuple[int, int]] = []
         for row, info in enumerate(req_infos):
             request_id = str(info.get("request_id", "0"))
             state = info.get("audio_state")
             if info.get("_omni_is_prefill", False) or not isinstance(state, dict):
                 # A row without Talker state builds its condition like a prefill.
                 _, row_embeds, update = self.preprocess(input_ids=input_ids[row : row + 1], input_embeds=None, **info)
-                embeds[row : row + 1] = row_embeds
+                prefill_embeds.append((row, row_embeds))
                 updates.append(update)
                 continue
             stored = request_states.get(request_id)
@@ -1212,22 +1213,32 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # K-step: the rows vLLM schedules carry placeholder continue ids,
             # not the real previous frame's codec id -- the true sample lives
             # in the request state (make_omni_output sets last_code every
-            # emitted frame). Re-embed the row from it, mirroring the scalar
-            # decode hook's k_last branch. Without this the model conditions
-            # on the placeholder id and its codec stream drifts (WER tail vs
+            # emitted frame). Overwrite those ids before the single batched
+            # embedding below, mirroring the scalar decode hook's k_last
+            # branch; each row is then embedded exactly once and the owned
+            # snapshot that make_omni_output reads back for the codec payload
+            # carries the real ids too. Without this the model conditions on
+            # the placeholder id and its codec stream drifts (WER tail vs
             # main at identical weights). The single-frame path never sets
             # last_code, so it keeps embedding the scheduled id unchanged.
             k_last = state.get("last_code") if isinstance(state, dict) else None
             if isinstance(k_last, int) and k_last >= 0:
-                code = torch.tensor(
-                    [k_last],
-                    dtype=torch.long,
-                    device=weight.device,
-                )
-                embeds[row : row + 1] = self.emb_code[0](code)
+                k_last_rows.append((row, k_last))
             # Output construction owns the codec snapshot. An empty buffer
             # update avoids retaining the preceding step's delta.
             updates.append({"codes": {"audio": empty_codes}})
+        if k_last_rows:
+            # One host-to-device copy, one embedding launch and one row
+            # scatter, instead of a 1-element tensor, an embedding launch and
+            # a slice write per live row.
+            codes.index_copy_(
+                0,
+                index_to_device([row for row, _ in k_last_rows], codes.device),
+                torch.tensor([k for _, k in k_last_rows], dtype=torch.long, device=weight.device),
+            )
+        embeds = self.emb_code[0](codes)
+        for row, row_embeds in prefill_embeds:
+            embeds[row : row + 1] = row_embeds
         if zero_rows:
             embeds.index_fill_(0, index_to_device(zero_rows, embeds.device), 0.0)
         codec_state = getattr(self, "_device_codec_state", None)
