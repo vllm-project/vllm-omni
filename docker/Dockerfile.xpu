@@ -1,0 +1,53 @@
+# Target vLLM version: v0.31.0. Keep VLLM_VERSION aligned with the target vLLM
+# release on every rebase.
+#
+# This file layers vLLM-Omni on top of the published upstream XPU image, which
+# already ships a self-consistent XPU runtime (torch-xpu, oneCCL/UCX+NIXL, the
+# pinned UMD/compute-runtime stack, and vLLM itself) built from
+# https://github.com/vllm-project/vllm/blob/main/docker/Dockerfile.xpu. Docker
+# pulls that base automatically, so there is nothing to build here beyond the
+# Omni layers. Mirrors how docker/Dockerfile.ci consumes vllm/vllm-openai.
+#
+# If the tag does not exist yet (targeting an unreleased vLLM commit), build the
+# base from upstream's own Dockerfile and point VLLM_BASE at the result:
+#
+#   git clone --depth 1 --branch $VLLM_VERSION https://github.com/vllm-project/vllm /tmp/vllm
+#   docker build -t vllm-openai-xpu:local --target vllm-openai \
+#       -f /tmp/vllm/docker/Dockerfile.xpu /tmp/vllm
+#   docker build -f docker/Dockerfile.xpu --build-arg VLLM_BASE=vllm-openai-xpu:local .
+#
+# .buildkite/intel/scripts/run-xpu-test.sh automates that pull-then-build fallback.
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai-xpu
+ARG VLLM_VERSION=v0.31.0
+ARG VLLM_BASE=${VLLM_BASE_IMAGE}:${VLLM_VERSION}
+
+FROM ${VLLM_BASE} AS vllm-omni
+
+# The base image ships ENTRYPOINT ["vllm", "serve"]; clear it so this stage stays
+# usable as a plain shell/test container regardless of which VLLM_BASE was used.
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+RUN apt-get update && \
+    apt-get install -y espeak-ng ffmpeg git jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/vllm-omni
+COPY . .
+
+ENV VLLM_OMNI_TARGET_DEVICE=xpu
+# Keep the upstream oneCCL packages paired with the XPU torch runtime.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-build-isolation \
+    ".[dev]" && \
+    uv pip uninstall triton && \
+    uv pip install triton-xpu==3.7.2 --reinstall
+
+FROM vllm-omni AS vllm-omni-openai
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+ENTRYPOINT ["vllm", "serve", "--omni"]

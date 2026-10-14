@@ -1,0 +1,178 @@
+# --8<-- [start:requirements]
+
+- GPU: compute capability 7.5 or higher (e.g., T4, RTX20xx, A100, L4, H100, etc.)
+
+# --8<-- [end:requirements]
+# --8<-- [start:set-up-using-python]
+
+vLLM-Omni depends on the matching major/minor release of vLLM. This source
+checkout targets vLLM 0.31.0. The pre-built Omni wheel instructions below install
+the published 0.30.0 release with its matching vLLM dependency.
+
+!!! note
+    PyTorch installed via `conda` will statically link `NCCL` library, which can cause issues when vLLM tries to use `NCCL`. See <gh-issue:8420> for more details.
+
+In order to be performant, vLLM has to compile many cuda kernels. The compilation unfortunately introduces binary incompatibility with other CUDA versions and PyTorch versions, even for the same PyTorch version with different building configurations.
+
+Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** environment. If either you have a different CUDA version or you want to use an existing PyTorch installation, you need to build vLLM from source. See [build-from-source-vllm](https://docs.vllm.ai/en/stable/getting_started/installation/gpu/#build-wheel-from-source) for more details.
+
+# --8<-- [start:pre-built-wheels]
+
+#### Installation of vLLM
+
+These pre-built wheel instructions install the published vLLM-Omni 0.30.0 release.
+
+vLLM-Omni is built based on vLLM. Please install it with command below.
+```bash
+uv pip install vllm==0.30.0 --torch-backend=auto
+```
+
+#### Installation of vLLM-Omni
+
+```bash
+uv pip install vllm-omni==0.30.0
+```
+
+To run Gradio demos, also install the optional extras:
+```bash
+uv pip install 'vllm-omni[demo]==0.30.0'
+```
+
+# --8<-- [end:pre-built-wheels]
+
+# --8<-- [start:build-wheel-from-source]
+
+#### Installation of vLLM
+If you do not need to modify source code of vLLM, install the final 0.31.0
+release wheel from its commit-pinned index:
+
+```bash
+uv pip install vllm==0.31.0 --torch-backend=auto \
+  --extra-index-url https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6
+```
+
+The default 0.31.0 wheel contains CUDA 12.9 binaries. If you need a different
+CUDA variant or want to reuse an existing PyTorch installation, build vLLM
+from source instead.
+
+#### Installation of vLLM-Omni
+Since vllm-omni is rapidly evolving, it's recommended to install it from source
+```bash
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+uv pip install -e .
+```
+
+To run Gradio demos, install with optional extras:
+```bash
+uv pip install -e '.[demo]'
+```
+
+<details><summary>(Optional) Installation of vLLM from source</summary>
+If you want to check, modify or debug with source code of vLLM, install the library from source with the following instructions:
+
+```bash
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git checkout v0.31.0
+```
+Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
+```bash
+# Default CUDA 12.9 wheel for v0.31.0 on x86_64
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm-0.31.0-cp38-abi3-manylinux_2_28_x86_64.whl
+```
+Install vllm with command below (If you have no existing PyTorch).
+```bash
+VLLM_USE_PRECOMPILED=1 uv pip install --editable . --torch-backend=auto
+```
+Install vllm with command below (If you already have PyTorch).
+```bash
+python use_existing_torch.py
+uv pip install -r requirements/build/cuda.txt
+uv pip install --no-build-isolation --editable .
+```
+</details>
+
+# --8<-- [end:build-wheel-from-source]
+
+# --8<-- [start:build-wheel-from-source-in-docker]
+
+# --8<-- [end:build-wheel-from-source-in-docker]
+
+# --8<-- [start:pre-built-images]
+
+vLLM-Omni offers an official docker image for deployment. These images are built on top of vLLM docker images and available on Docker Hub as [vllm/vllm-omni](https://hub.docker.com/r/vllm/vllm-omni/tags). The version of vLLM-Omni indicates which release of vLLM it is based on.
+
+Nightly CUDA images built from the latest `main` are also available:
+
+- [`vllm/vllm-omni:nightly`](https://hub.docker.com/r/vllm/vllm-omni/tags?name=nightly) is the rolling multi-architecture tag.
+- [`vllm/vllm-omni:nightly-<commit>`](https://hub.docker.com/r/vllm/vllm-omni/tags?name=nightly-) provides commit-pinned multi-architecture tags. The newest 14 are retained.
+
+Use a commit-pinned tag when you need a reproducible nightly environment.
+
+Here's an example deployment command that has been verified on 2 x H100's:
+```bash
+docker run --runtime nvidia --gpus 2 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    -p 8091:8091 \
+    --ipc=host \
+    vllm/vllm-omni:v0.30.0 \
+    vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+!!! tip
+    The CUDA image does not define a default entrypoint, so include `vllm serve ... --omni` after the image name.
+
+# --8<-- [end:pre-built-images]
+
+# --8<-- [start:build-docker]
+
+#### Build docker image
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda -t vllm-omni-cuda .
+```
+
+The source build defaults to `vllm/vllm-openai:v0.31.0`. To select that
+upstream release image explicitly:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.cuda \
+  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.31.0 \
+  -t vllm-omni-cuda .
+```
+
+#### Launch the docker image
+
+##### Launch with OpenAI API Server
+
+!!! note
+    The model `Qwen/Qwen3-Omni-30B-A3B-Instruct` requires significant GPU memory. The example below has been verified on 2 x H100's.
+
+```bash
+docker run --runtime nvidia --gpus 2 \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  -p 8091:8091 \
+  --ipc=host \
+  vllm-omni-cuda \
+  vllm serve --omni --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
+```
+
+By default, this mounts `$HOME/.cache/huggingface` as the model cache directory. To use a custom location, set the `HF_HOME` environment variable before running the command (e.g., `export HF_HOME=/data/models`).
+
+##### Launch with interactive session for development
+
+```bash
+docker run --runtime nvidia --gpus all -it --rm \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  -p 8091:8091 \
+  --ipc=host \
+  --entrypoint bash \
+  vllm-omni-cuda
+```
+
+# --8<-- [end:build-docker]

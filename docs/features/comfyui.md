@@ -1,0 +1,99 @@
+# vLLM-Omni ComfyUI Integration
+
+vLLM-Omni offers a ComfyUI integration on top of its online serving API.
+It can send model inference requests to either a locally running vLLM-Omni service or a remote one.
+
+## Requirement
+
+- Python 3.12 or above
+- [ComfyUI installed](https://docs.comfy.org/installation/system_requirements)
+- [vLLM-Omni installed](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/) on either the same device or another device discoverable via the internet.
+- No need to install additional packages apart from those already required by ComfyUI.
+
+!!! tip
+    If you run both ComfyUI and vLLM-Omni on the same device, you can create separate virtual environments and use different Python versions for them.
+
+## Installation
+
+Copy the `apps/ComfyUI-vLLM-Omni` folder to the `custom_nodes` subfolder of your ComfyUI installation. Your directory should look like `ComfyUI/custom_nodes/ComfyUI-vLLM-Omni`.
+
+If you are running ComfyUI during copying, you should restart ComfyUI to load this extension.
+
+!!! tip
+    You can use utility websites such as <https://download-directory.github.io/> to download a subdirectory of a repo. Also checkout community discussions (e.g., <https://stackoverflow.com/questions/7106012/download-a-single-folder-or-directory-from-a-github-repository>) for more info.
+
+On the device and virtual environment you run ComfyUI, launch ComfyUI with
+
+```bash
+cd ComfyUI
+
+# The regular way
+python main.py
+
+# If you are mainly using this node, launch it faster with
+python main.py --cpu
+```
+
+On the device and virtual environment you run vLLM-Omni, start a model service with
+
+```bash
+vllm serve The_Model_ID_to_Serve --omni --port 8000
+```
+
+Check **ComfyUI's sidebar -> Node Library**. There should be a new folder named **vLLM-Omni**.
+If no, check your shell running the ComfyUI process. There may be some error messages before the line `Import times for custom nodes:` and the line `To see the GUI go to: http://127.0.0.1:8188`.
+
+## Quickstart
+
+This extension offers the following nodes based on the output modalities:
+
+- **Generate Image** for text-to-image and image-to-image tasks
+- **Generate Video** for text-to-video and image-to-video tasks
+- **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
+- **TTS** and **TTS Voice Clone** for TTS tasks
+- **Generate Music** for text-to-music tasks
+
+This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
+
+!!! info
+    The node UI and feature designs are intended to match vLLM-Omni online serving interfaces. It cannot offer more than what the interfaces support.
+
+Every node carries the vLLM-Omni mark in its title bar and is tinted by what it outputs, so a graph is readable at a glance:
+
+| Colour | Nodes | What they produce |
+| --- | --- | --- |
+| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
+| Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
+| Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
+| Teal | Video References | Reference media |
+
+Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
+
+**Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
+
+To build a simple workflow yourself,
+
+- Drag a generation node onto the canvas.
+- Depending on your need, grab built-in multimedia file loader nodes, such as **image->Load Image**, **image->video->Load Video**, **audio->Load Audio**
+- Depending on your need, grab built-in multimedia file preview nodes, such as **image->Preview Image**, **image->video->Save Video**, **audio->Preview Audio**, **utils->Preview as Text**.
+- If you want to tune sampling parameters, grab corresponding nodes from **vLLM-Omni-> Sampling Params**.
+    - For multi-stage models, you can connect multiple **AR Sampling Params** and **Diffusion Sampling Params** nodes to a **Multi-Stage Sampling Params List** node, and connect this node to the generation node.
+    - For some multi-stage models like BAGEL, [only one stage's sampling parameters are exposed and tunable via vLLM-Omni's online serving API](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/bagel/). Thus, these models are treated as single-stage ones. Please check the vLLM-Omni documentation on how to correctly set each model's sampling parameters.
+    - For multi-stage models where all stages are either autoregression or diffusion, you can also connect only a single Sampling Params node, indicating that this set of sampling parameters will be used for all stages.
+
+## MiniMax H3 text-to-video workflow
+
+The **MiniMax H3 Text to Video** template uses the existing remote Generate Video,
+H3 Params, sampling, and Remote LoRA nodes. It includes Base settings and an
+optional Turbo preset, with native resolution, 24 FPS, and `17k+5` frame counts.
+ComfyUI receives the generated video and audio from the server; it does not load
+H3 weights locally. Configure the server-side LoRA path before enabling Turbo.
+
+See the [H3 workflow guide](https://github.com/vllm-project/vllm-omni/blob/main/apps/ComfyUI-vLLM-Omni/docs/minimax-h3-t2v.md)
+for server setup, template import, Turbo configuration, recorded validation,
+and saved-video/audio checks.
+
+## Examples & Screenshots
+
+Please read the [ComfyUI integration's README](https://github.com/vllm-project/vllm-omni/tree/main/apps/ComfyUI-vLLM-Omni) for more info.

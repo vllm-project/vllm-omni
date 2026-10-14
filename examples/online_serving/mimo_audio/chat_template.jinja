@@ -1,0 +1,86 @@
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0]['role'] == 'system' %}
+        {{- messages[0]['content'] }}
+    {%- else %}
+        {{- 'You are a helpful assistant.' }}
+    {%- endif %}
+    {{- "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0]['role'] == 'system' %}
+        {%- set _m = '<|sosp|><|empty|><|eosp|>' -%}
+        {%- set _raw0 = messages[0]['content'] if messages[0]['content'] is string else '' -%}
+        {%- if _m in _raw0 %}
+            {%- set _t0 = (_raw0 | replace(_m ~ '\n', '') | replace(_m, '') | trim) -%}
+            {{- '<|im_start|>system\n' + (_t0 ~ _m if _t0 else _m) + '<|im_end|>\n' }}
+        {%- else %}
+            {{- '<|im_start|>system\n' + _raw0 + '<|im_end|>\n' }}
+        {%- endif %}
+    {%- else %}
+        {{- '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+
+{%- for message in messages %}
+    {%- if message['role'] == 'assistant' %}
+        {{- '<|im_start|>assistant' }}
+        {%- set _sosp = '<|sosp|><|empty|><|eosp|>' -%}
+        {%- set _text = message['content'] if message['content'] is string else '' -%}
+        {%- if _sosp in _text %}
+            {%- set _clean = _text | replace(_sosp, '') -%}
+            {%- set _body = _clean[1:] if (_clean and _clean[0] == '\n') else _clean -%}
+            {{- '\n<|sostm|>' + _body + '<|eot|><|empty|><|eostm|>' }}
+        {%- else %}
+            {%- set _body = _text[1:] if (_text and _text[0] == '\n') else _text -%}
+            {{- '\n<|sostm|>' + _body + '<|eot|><|eostm|>' }}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+
+    {%- elif message['role'] == 'user' %}
+        {%- set _m = '<|sosp|><|empty|><|eosp|>' -%}
+        {%- set _raw = message['content'] if message['content'] is string else '' -%}
+        {%- if _m in _raw %}
+            {%- set _t = (_raw | replace(_m ~ '\n', '') | replace(_m, '') | trim) -%}
+            {{- '<|im_start|>user\n' + (_t ~ _m if _t else _m) + '<|im_end|>\n' }}
+        {%- else %}
+            {{- '<|im_start|>user\n' + _raw + '<|im_end|>\n' }}
+        {%- endif %}
+
+    {%- elif message['role'] == 'system' %}
+        {%- if not loop.first %}
+            {%- set _m = '<|sosp|><|empty|><|eosp|>' -%}
+            {%- set _raw = message['content'] if message['content'] is string else '' -%}
+            {%- if _m in _raw %}
+                {%- set _t = (_raw | replace(_m ~ '\n', '') | replace(_m, '') | trim) -%}
+                {{- '<|im_start|>system\n' + (_t ~ _m if _t else _m) + '<|im_end|>\n' }}
+            {%- else %}
+                {{- '<|im_start|>system\n' + _raw + '<|im_end|>\n' }}
+            {%- endif %}
+        {%- endif %}
+
+    {%- elif message['role'] == 'tool' %}
+        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1]['role'] != 'tool') %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {%- set _m = '<|sosp|><|empty|><|eosp|>' -%}
+        {%- set _raw = message['content'] if message['content'] is string else '' -%}
+        {%- if _m in _raw %}
+            {%- set _t = (_raw | replace(_m ~ '\n', '') | replace(_m, '') | trim) -%}
+            {{- '\n<tool_response>\n' + (_t ~ _m if _t else _m) + '\n</tool_response>' }}
+        {%- else %}
+            {{- '\n<tool_response>\n' + _raw + '\n</tool_response>' }}
+        {%- endif %}
+        {%- if loop.last or (messages[loop.index0 + 1]['role'] != 'tool') %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<|sostm|>' }}
+{%- endif %}

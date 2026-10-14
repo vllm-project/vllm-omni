@@ -1,0 +1,935 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import importlib
+
+import torch.nn as nn
+from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import configure_quant_config
+from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
+
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL_base
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
+from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
+from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
+
+_NATIVE_SINGLE_FILE_MODELS = {
+    "AnimaPipeline": ("AnimaModularPipeline",),
+}
+
+
+def resolve_native_single_file(model_class_name: str | None) -> str | None:
+    """Return the canonical native pipeline for a single-file model class."""
+    for canonical, aliases in _NATIVE_SINGLE_FILE_MODELS.items():
+        if model_class_name == canonical or model_class_name in aliases:
+            return canonical
+    return None
+
+
+_DIFFUSION_MODELS = {
+    # arch:(mod_folder, mod_relname, cls_name)
+    "SeedVR2Pipeline": ("seedvr2", "pipeline_seedvr2", "SeedVR2Pipeline"),
+    "QwenImagePipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImagePipeline",
+    ),
+    "QwenImageEditPipeline": (
+        "qwen_image",
+        "pipeline_qwen_image_edit",
+        "QwenImageEditPipeline",
+    ),
+    "QwenImageEditPlusPipeline": (
+        "qwen_image",
+        "pipeline_qwen_image_edit_plus",
+        "QwenImageEditPlusPipeline",
+    ),
+    "JoyImageEditPipeline": (
+        "joy_image",
+        "pipeline_joy_image_edit",
+        "JoyImageEditPipeline",
+    ),
+    "QwenImageLayeredPipeline": (
+        "qwen_image",
+        "pipeline_qwen_image_layered",
+        "QwenImageLayeredPipeline",
+    ),
+    "QwenImage21Pipeline": (
+        "qwen_image_21",
+        "pipeline_qwen_image_21",
+        "QwenImage21Pipeline",
+    ),
+    "GlmImagePipeline": (
+        "glm_image",
+        "pipeline_glm_image",
+        "GlmImagePipeline",
+    ),
+    "ZImagePipeline": (
+        "z_image",
+        "pipeline_z_image",
+        "ZImagePipeline",
+    ),
+    "OvisImagePipeline": (
+        "ovis_image",
+        "pipeline_ovis_image",
+        "OvisImagePipeline",
+    ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
+    "WanPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "Wan22Pipeline",
+    ),
+    "WanDMDPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "Wan22Pipeline",
+    ),
+    "WanVACEPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_vace",
+        "Wan22VACEPipeline",
+    ),
+    "LTX2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2Pipeline",
+    ),
+    "LTX2TwoStagePipeline": (
+        "ltx2",
+        "pipeline_ltx2_two_stage",
+        "LTX2TwoStagePipeline",
+    ),
+    "LTX2DistilledOneStagePipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2DistilledOneStagePipeline",
+    ),
+    "LTX2DistilledTwoStagePipeline": (
+        "ltx2",
+        "pipeline_ltx2_two_stage",
+        "LTX2DistilledTwoStagePipeline",
+    ),
+    "LTX2DistilledPipeline": (
+        "ltx2",
+        "pipeline_ltx2_two_stage",
+        "LTX2DistilledPipeline",
+    ),
+    "LTX2T2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2T2VDMD2Pipeline",
+    ),
+    "LTX2I2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2I2VDMD2Pipeline",
+    ),
+    "MiniMaxH3Pipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3",
+        "MiniMaxH3Pipeline",
+    ),
+    "MiniMaxH3ModularPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3",
+        "MiniMaxH3Pipeline",
+    ),
+    "MiniMaxH3DecoderPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_decoder",
+        "MiniMaxH3DecoderPipeline",
+    ),
+    "AuKPipeline": (
+        "auk",
+        "pipeline_auk",
+        "AuKPipeline",
+    ),
+    "StableAudioPipeline": (
+        "stable_audio",
+        "pipeline_stable_audio",
+        "StableAudioPipeline",
+    ),
+    "WanImageToVideoPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "Wan22I2VPipeline",
+    ),
+    "WanS2VPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_s2v",
+        "Wan22S2VPipeline",
+    ),
+    "WanT2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "WanT2VDMD2Pipeline",
+    ),
+    "WanI2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "WanI2VDMD2Pipeline",
+    ),
+    "LingBotWorldCausalDMDPipeline": (
+        "lingbot_world",
+        "pipeline",
+        "LingBotWorldCausalDMDPipeline",
+    ),
+    "ABotWorldCausalPipeline": (
+        "abot_world",
+        "pipeline_abot_world",
+        "ABotWorldCausalPipeline",
+    ),
+    "LongCatImagePipeline": (
+        "longcat_image",
+        "pipeline_longcat_image",
+        "LongCatImagePipeline",
+    ),
+    "LongCatVideoAvatarPipeline": (
+        "longcat_video",
+        "pipeline_longcat_video_avatar",
+        "LongCatVideoAvatarPipeline",
+    ),
+    "BagelPipeline": (
+        "bagel",
+        "pipeline_bagel",
+        "BagelPipeline",
+    ),
+    "BooguImagePipeline": (
+        "boogu_image",
+        "pipeline_boogu_image",
+        "BooguImagePipeline",
+    ),
+    "BooguImageTurboPipeline": (
+        "boogu_image",
+        "pipeline_boogu_image",
+        "BooguImageTurboPipeline",
+    ),
+    "LancePipeline": (
+        "lance",
+        "pipeline_lance",
+        "LancePipeline",
+    ),
+    "MingImagePipeline": (
+        "ming_flash_omni",
+        "pipeline_ming_imagegen",
+        "MingImagePipeline",
+    ),
+    "MingImageDiffusionPipeline": (
+        "ming_image",
+        "pipeline",
+        "MingImageDiffusionPipeline",
+    ),
+    "SanaWmPipeline": (
+        "sana_wm",
+        "pipeline_sana_wm",
+        "SanaWmPipeline",
+    ),
+    "InternVLAA1Pipeline": (
+        "internvla_a1",
+        "pipeline_internvla_a1",
+        "InternVLAA1Pipeline",
+    ),
+    "Gr00tN1d7Pipeline": (
+        "gr00t",
+        "pipeline_gr00t",
+        "Gr00tN1d7Pipeline",
+    ),
+    "Pi0Pipeline": (
+        "pi0",
+        "pipeline_pi0",
+        "Pi0Pipeline",
+    ),
+    "Pi05Pipeline": (
+        "pi05",
+        "pipeline_pi05",
+        "Pi05Pipeline",
+    ),
+    "LongCatImageEditPipeline": (
+        "longcat_image",
+        "pipeline_longcat_image_edit",
+        "LongCatImageEditPipeline",
+    ),
+    "StableDiffusion3Pipeline": (
+        "sd3",
+        "pipeline_sd3",
+        "StableDiffusion3Pipeline",
+    ),
+    "FluxKontextPipeline": (
+        "flux",
+        "pipeline_flux_kontext",
+        "FluxKontextPipeline",
+    ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image3",
+        "pipeline_hunyuan_image3",
+        "HunyuanImage3Pipeline",
+    ),
+    "Flux2KleinPipeline": (
+        "flux2_klein",
+        "pipeline_flux2_klein",
+        "Flux2KleinPipeline",
+    ),
+    "ErnieImagePipeline": (
+        "ernie_image",
+        "pipeline_ernie_image",
+        "ErnieImagePipeline",
+    ),
+    "NextStep11Pipeline": (
+        "nextstep_1_1",
+        "pipeline_nextstep_1_1",
+        "NextStep11Pipeline",
+    ),
+    "FluxPipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxPipeline",
+    ),
+    "FluxDMD2Pipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxDMD2Pipeline",
+    ),
+    "QwenImageDMD2Pipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageDMD2Pipeline",
+    ),
+    "OmniGen2Pipeline": (
+        "omnigen2",
+        "pipeline_omnigen2",
+        "OmniGen2Pipeline",
+    ),
+    "HeliosPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "HeliosPyramidPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "Flux2Pipeline": (
+        "flux2",
+        "pipeline_flux2",
+        "Flux2Pipeline",
+    ),
+    "SenseNovaU1Pipeline": (
+        "sensenova_u1",
+        "pipeline_sensenova_u1",
+        "SenseNovaU1Pipeline",
+    ),
+    "HunyuanVideo15Pipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5",
+        "HunyuanVideo15Pipeline",
+    ),
+    "HunyuanVideo15ImageToVideoPipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5_i2v",
+        "HunyuanVideo15I2VPipeline",
+    ),
+    "LingBotVideoPipeline": (
+        "lingbot_video",
+        "pipeline_lingbot_video",
+        "LingBotVideoPipeline",
+    ),
+    "SanaVideoPipeline": (
+        "sana_video",
+        "pipeline_sana_video",
+        "SanaVideoPipeline",
+    ),
+    "SanaImageToVideoPipeline": (
+        "sana_video",
+        "pipeline_sana_video_i2v",
+        "SanaImageToVideoPipeline",
+    ),
+    "Magi2Pipeline": (
+        "magi2",
+        "pipeline_magi2",
+        "Magi2Pipeline",
+    ),
+    "OmniVoicePipeline": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
+    ),
+    "OmniVoice": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
+    ),
+    "Cosmos3OmniDiffusersPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
+    "Cosmos3OmniPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
+    "DiffusersAdapterPipeline": (
+        "diffusers_adapter",
+        "pipeline_diffusers_adapter",
+        "DiffusersAdapterPipeline",
+    ),
+    "HiDreamImagePipeline": (
+        "hidream_image",
+        "pipeline_hidream_image",
+        "HiDreamImagePipeline",
+    ),
+    "HiDreamO1ImagePipeline": (
+        "hidream_o1_image",
+        "pipeline_hidream_o1_image",
+        "HiDreamO1ImagePipeline",
+    ),
+    "DreamZeroPipeline": (
+        "dreamzero",
+        "pipeline_dreamzero",
+        "DreamZeroPipeline",
+    ),
+    "AnimaPipeline": (
+        "anima",
+        "pipeline_anima",
+        "AnimaPipeline",
+    ),
+    "StableDiffusionXLPipeline": (
+        "sdxl",
+        "pipeline_sdxl",
+        "StableDiffusionXLPipeline",
+    ),
+    "Krea2Pipeline": (
+        "krea2",
+        "pipeline_krea2",
+        "Krea2Pipeline",
+    ),
+    "Kandinsky6TI2VAPipeline": (
+        "kandinsky6",
+        "pipeline_kandinsky6",
+        "Kandinsky6TI2VAPipeline",
+    ),
+}
+_DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
+
+
+DiffusionModelRegistry = _ModelRegistry(
+    {
+        model_arch: _LazyRegisteredModel(
+            module_name=f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}",
+            class_name=cls_name,
+        )
+        for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
+    }
+)
+
+_NO_CACHE_ACCELERATION = {
+    # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
+    "NextStep11Pipeline",
+    "AnimaPipeline",
+    # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
+    # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
+    # to it; list it here so a stray cache_backend override disables gracefully
+    # instead of erroring.
+    "Pi0Pipeline",
+    "Pi05Pipeline",
+    "LingBotWorldCausalDMDPipeline",
+    "ABotWorldCausalPipeline",
+    # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
+    # branch) across denoising steps, which conflicts with cache_dit / tea_cache
+    # step-skipping hooks.
+    "QwenImage21Pipeline",
+}
+
+
+def _prepare_diffusion_quant_config(
+    od_config: OmniDiffusionConfig,
+    model_class: type[nn.Module],
+) -> None:
+    """Prepare diffusion quant config using vLLM-style model bindings."""
+    quant_config = getattr(od_config, "quantization_config", None)
+    if quant_config is None:
+        return
+    if hasattr(quant_config, "maybe_update_config"):
+        quant_config.maybe_update_config(od_config.model)
+    diffusion_packed_modules_mapping = current_omni_platform.get_diffusion_packed_modules_mapping(model_class)
+    if diffusion_packed_modules_mapping is not None:
+        model_class.packed_modules_mapping = diffusion_packed_modules_mapping
+    configure_quant_config(quant_config, model_class)
+
+
+def initialize_model(
+    od_config: OmniDiffusionConfig,
+) -> nn.Module:
+    """Initialize a diffusion model from the registry.
+
+    This function:
+    1. Loads the model class from the registry
+    2. Instantiates the model with the config
+    3. Configures VAE optimization settings
+    4. Applies sequence parallelism if enabled (similar to diffusers' enable_parallelism)
+
+    Args:
+        od_config: The OmniDiffusion configuration.
+
+    Returns:
+        The initialized pipeline model.
+
+    Raises:
+        ValueError: If the model class is not found in the registry.
+    """
+    model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    if model_class is not None:
+        _prepare_diffusion_quant_config(od_config, model_class)
+        with set_current_diffusion_config(od_config):
+            model = model_class(od_config=od_config)
+
+        vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
+        vae_mode = od_config.parallel_config.vae_parallel_mode
+        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
+        if vae_mode == "batch" and not isinstance(getattr(model, "vae", None), DistributedAutoencoderKL_base):
+            raise ValueError(
+                "VAE batch parallel decode requires DistributedAutoencoderKL or DistributedAutoencoderKLFlux2"
+            )
+        if vae_pp_size > 1 and not is_distributed_vae:
+            logger.warning(
+                "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
+                vae_pp_size,
+                od_config.model_class_name,
+            )
+        if vae_pp_size > 1 and is_distributed_vae and vae_mode != "batch" and not od_config.vae_use_tiling:
+            logger.info(
+                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                vae_pp_size,
+            )
+            od_config.vae_use_tiling = True
+
+        # Configure VAE memory optimization settings from config
+        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
+            model.vae.use_slicing = od_config.vae_use_slicing
+        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
+            model.vae.use_tiling = od_config.vae_use_tiling
+
+        if is_distributed_vae:
+            model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
+
+        # Apply sequence parallelism if enabled
+        # This follows diffusers' pattern where enable_parallelism() is called
+        # at model loading time, not inside individual model files
+        _apply_sequence_parallel_if_enabled(model, od_config)
+
+        # Install the Wan VAE decoder fast path once the VAE parallel mode is
+        # known. This runs inside the weight-loading memory pool, so any weight
+        # re-layout it performs stays offloadable by sleep mode.
+        _apply_wan_vae_fastpath_if_enabled(model, od_config)
+
+        return model
+    else:
+        raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
+
+
+def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
+
+    Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
+    ``lossless`` / ``channels_last``). Only CUDA is supported; other platforms
+    keep the reference implementation. Failures never abort model loading.
+    """
+    level = getattr(od_config, "vae_fast_path", "lossless")
+    encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
+    if level == "off" and encode_level == "off":
+        return
+    if not current_omni_platform.is_cuda():
+        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
+        return
+
+    from diffusers.models.autoencoders import AutoencoderKLWan
+
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
+        install_wan_vae_encoder_fastpath,
+        install_wan_vae_fastpath,
+    )
+    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+    candidates: list[tuple[str, nn.Module]] = []
+    try:
+        discovered = ModuleDiscovery.discover(model)
+        candidates = list(zip(discovered.vae_names, discovered.vaes, strict=True))
+    except Exception:
+        logger.debug("Wan VAE fast path: component discovery failed; falling back to `vae`", exc_info=True)
+    if not candidates and isinstance(getattr(model, "vae", None), nn.Module):
+        candidates = [("vae", model.vae)]
+
+    for name, vae in candidates:
+        if not isinstance(vae, AutoencoderKLWan):
+            continue
+        for component, component_level, install in (
+            ("decoder", level, install_wan_vae_fastpath),
+            ("encoder", encode_level, install_wan_vae_encoder_fastpath),
+        ):
+            if component_level == "off":
+                continue
+            try:
+                report = install(vae, level=component_level)
+            except Exception:
+                logger.warning(
+                    "Failed to install the Wan VAE %s fast path on %s; using the reference %s",
+                    component,
+                    name,
+                    component,
+                    exc_info=True,
+                )
+                continue
+            if report.installed:
+                logger.info("Wan VAE %s fast path (%s) active on %s", component, component_level, name)
+
+
+def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Apply sequence parallelism hooks if SP is enabled.
+
+    This is the centralized location for enabling SP, similar to diffusers'
+    ModelMixin.enable_parallelism() method. It applies _sp_plan hooks to
+    transformer models that define them.
+
+    Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+    We use _sp_plan instead of diffusers' _cp_plan.
+
+    Args:
+        model: The pipeline model (e.g., ZImagePipeline).
+        od_config: The OmniDiffusion configuration.
+    """
+
+    try:
+        sp_size = od_config.parallel_config.sequence_parallel_size
+        assert sp_size is not None
+        if sp_size <= 1:
+            return
+
+        # Prefer the pipeline's declared DiT components so custom component
+        # names receive the same SP hooks as conventional transformer names.
+        transformer_attrs = getattr(model, "_dit_modules", None)
+        if not transformer_attrs:
+            transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
+        applied_count = 0
+
+        for attr in transformer_attrs:
+            if not hasattr(model, attr):
+                # Some pipelines have recursive
+                # modules that have the transformer
+                module = find_module_with_attr(model, attr)
+                if module is None:
+                    continue
+                model = module
+
+            transformer = getattr(model, attr)
+            if transformer is None:
+                continue
+
+            plan = get_sp_plan_from_model(transformer)
+            if plan is None:
+                continue
+
+            # The SP hooks shard by `sequence_parallel_size`, so carry the full
+            # degree triple; AllGather-KV and the composed topology reuse them as-is.
+            parallel_config = od_config.parallel_config
+            sp_config = SequenceParallelConfig(
+                ulysses_degree=parallel_config.ulysses_degree,
+                ring_degree=parallel_config.ring_degree,
+                allgather_degree=parallel_config.allgather_degree,
+            )
+
+            logger.info(
+                f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
+                f"(sp_size={sp_size}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree}, "
+                f"allgather={sp_config.allgather_degree})"
+            )
+            apply_sequence_parallel(transformer, sp_config, plan)
+            applied_count += 1
+
+        # update forward context sp_plan_hooks_applied
+        ctx = get_forward_context()
+        ctx.sp_plan_hooks_applied = applied_count > 0
+        logger.debug(f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!")
+
+        if applied_count == 0:
+            logger.warning(
+                f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
+                "SP hooks not applied. Consider adding _sp_plan to your transformer model."
+            )
+
+    except Exception as e:
+        logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
+
+
+_DIFFUSION_POST_PROCESS_FUNCS = {
+    # arch: post_process_func
+    # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "QwenImagePipeline": "get_qwen_image_post_process_func",
+    "AnimaPipeline": "get_anima_post_process_func",
+    "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
+    "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
+    "GlmImagePipeline": "get_glm_image_post_process_func",
+    "ZImagePipeline": "get_post_process_func",
+    "OvisImagePipeline": "get_ovis_image_post_process_func",
+    "MammothModa2DiTPipeline": "get_mammoth_moda2_post_process_func",
+    "BooguImagePipeline": "get_boogu_image_post_process_func",
+    "BooguImageTurboPipeline": "get_boogu_image_post_process_func",
+    "WanPipeline": "get_wan22_post_process_func",
+    "WanDMDPipeline": "get_wan22_post_process_func",
+    "WanVACEPipeline": "get_wan22_vace_post_process_func",
+    "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",
+    "LTX2DistilledPipeline": "get_ltx2_post_process_func",
+    "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
+    "AuKPipeline": "get_auk_post_process_func",
+    "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_post_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
+    "ABotWorldCausalPipeline": "get_abot_world_post_process_func",
+    "LongCatImagePipeline": "get_longcat_image_post_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
+    "BagelPipeline": "get_bagel_post_process_func",
+    "LancePipeline": "get_lance_post_process_func",
+    "MingImagePipeline": "get_ming_image_post_process_func",
+    "MingImageDiffusionPipeline": "get_ming_image_post_process_func",
+    "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
+    "Pi0Pipeline": "get_pi0_post_process_func",
+    "Pi05Pipeline": "get_pi05_post_process_func",
+    "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
+    "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
+    "FluxKontextPipeline": "get_flux_kontext_post_process_func",
+    "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "ErnieImagePipeline": "get_ernie_image_post_process_func",
+    "NextStep11Pipeline": "get_nextstep11_post_process_func",
+    "FluxPipeline": "get_flux_post_process_func",
+    "FluxDMD2Pipeline": "get_flux_post_process_func",
+    "QwenImageDMD2Pipeline": "get_qwen_image_post_process_func",
+    "OmniGen2Pipeline": "get_omnigen2_post_process_func",
+    "HeliosPipeline": "get_helios_post_process_func",
+    "HeliosPyramidPipeline": "get_helios_post_process_func",
+    "Flux2Pipeline": "get_flux2_post_process_func",
+    "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
+    "SanaVideoPipeline": "get_sana_video_post_process_func",
+    "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
+    "Magi2Pipeline": "get_magi2_post_process_func",
+    "SeedVR2Pipeline": "get_seedvr2_post_process_func",
+    "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
+    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
+    "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
+    "Krea2Pipeline": "get_krea2_post_process_func",
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
+}
+_DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
+    "MingImageDiffusionPipeline"
+]
+
+_DIFFUSION_IR_OP_PRIORITY_FUNCS = {
+    # arch: ir_op_priority_func
+    # `ir_op_priority_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
+}
+
+_DIFFUSION_PRE_PROCESS_FUNCS = {
+    "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
+    # arch: pre_process_func
+    # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "BagelPipeline": "get_bagel_pre_process_func",
+    "GlmImagePipeline": "get_glm_image_pre_process_func",
+    "BooguImagePipeline": "get_boogu_image_pre_process_func",
+    "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
+    "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
+    "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
+    "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
+    "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
+    "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
+    "WanPipeline": "get_wan22_pre_process_func",
+    "WanDMDPipeline": "get_wan22_pre_process_func",
+    "WanVACEPipeline": "get_wan22_vace_pre_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_pre_process_func",
+    "ABotWorldCausalPipeline": "get_abot_world_pre_process_func",
+    "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
+    "HeliosPipeline": "get_helios_pre_process_func",
+    "HeliosPyramidPipeline": "get_helios_pre_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
+    "SanaImageToVideoPipeline": "get_sana_video_i2v_pre_process_func",
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
+    "SanaWmPipeline": "get_sana_wm_pre_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
+    "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
+    "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
+}
+
+
+_DIFFUSION_PREFIX_CACHE_FUNCS = {
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_prefix_cache_func",
+}
+
+
+def register_diffusion_model(
+    model_arch: str,
+    module_name: str,
+    class_name: str,
+    pre_process_func_name: str | None = None,
+    post_process_func_name: str | None = None,
+    ir_op_priority_func_name: str | None = None,
+    action_post_process_func_name: str | None = None,
+    prefix_cache_func_name: str | None = None,
+) -> None:
+    """Register a diffusion model pipeline from an out-of-tree plugin.
+
+    This can be used to add new model architectures or to replace an
+    existing built-in pipeline with a platform-optimised implementation
+    (same ``model_arch`` key).
+
+    Args:
+        model_arch: Architecture name (e.g. ``"WanPipeline"``).
+        module_name: Fully qualified module path
+            (e.g. ``"my_plugin.diffusion.pipeline_wan"``).
+        class_name: Class name within *module_name*.
+        pre_process_func_name: Optional name of the pre-process function
+            located in *module_name*.  Pass ``None`` to keep the existing
+            entry when replacing a built-in model.
+        post_process_func_name: Optional name of the post-process function
+            located in *module_name*.  Pass ``None`` to keep the existing
+            entry when replacing a built-in model.
+        ir_op_priority_func_name: Optional name of the IR op priority merge
+            function located in *module_name*. Pass ``None`` to keep the
+            existing entry when replacing a built-in model.
+        action_post_process_func_name: Deprecated compatibility-only keyword
+            for out-of-tree plugins. Action postprocess hooks are no longer
+            registered separately; move action handling into
+            ``post_process_func_name`` and return a payload/metadata envelope.
+        prefix_cache_func_name: Optional factory for a CPU cache-input hook,
+            called after preprocessing only when paged prefix caching is
+            enabled. It fills existing DiffusionKVRequest cache inputs in place.
+    """
+    if action_post_process_func_name is not None:
+        logger.warning(
+            "Ignoring deprecated action_post_process_func_name=%r for diffusion "
+            "model %s. Move action postprocess logic into post_process_func_name "
+            "and return payload/metadata output.",
+            action_post_process_func_name,
+            model_arch,
+        )
+
+    # Register model class in DiffusionModelRegistry
+    DiffusionModelRegistry.register_model(
+        model_arch,
+        f"{module_name}:{class_name}",
+    )
+
+    # Store in _DIFFUSION_MODELS so _load_process_func can resolve the
+    # module.  Convention: when mod_relname is empty the mod_folder field
+    # stores a *full* module path instead of a relative folder.
+    _DIFFUSION_MODELS[model_arch] = (module_name, "", class_name)
+
+    # Optionally register pre/post process funcs.
+    if pre_process_func_name is not None:
+        _DIFFUSION_PRE_PROCESS_FUNCS[model_arch] = pre_process_func_name
+    if post_process_func_name is not None:
+        _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
+    if ir_op_priority_func_name is not None:
+        _DIFFUSION_IR_OP_PRIORITY_FUNCS[model_arch] = ir_op_priority_func_name
+    if prefix_cache_func_name is not None:
+        _DIFFUSION_PREFIX_CACHE_FUNCS[model_arch] = prefix_cache_func_name
+
+    logger.info(
+        "Registered diffusion model %s -> %s.%s",
+        model_arch,
+        module_name,
+        class_name,
+    )
+
+
+def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
+    """Load and return a process function from the appropriate module."""
+    assert od_config.model_class_name is not None
+    mod_folder, mod_relname, _ = _DIFFUSION_MODELS[od_config.model_class_name]
+    if mod_relname == "":
+        # Full module path (registered via register_diffusion_model)
+        module_name = mod_folder
+    else:
+        # Built-in model (relative path convention)
+        module_name = f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
+    module = importlib.import_module(module_name)
+    func = getattr(module, func_name)
+    return func(od_config)
+
+
+def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
+    # Keep the checkpoint's native class name for modality/capability metadata,
+    # but do not run its tensor postprocessor on Diffusers' decoded outputs.
+    if uses_diffusers_adapter(od_config):
+        return None
+    if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
+        return None
+    func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_ir_op_priority_func(od_config: OmniDiffusionConfig):
+    if od_config.model_class_name not in _DIFFUSION_IR_OP_PRIORITY_FUNCS:
+        return None
+    func_name = _DIFFUSION_IR_OP_PRIORITY_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
+    # The adapter translates requests to Diffusers call arguments itself.
+    if uses_diffusers_adapter(od_config):
+        return None
+    if od_config.model_class_name not in _DIFFUSION_PRE_PROCESS_FUNCS:
+        return None  # Return None if no pre-processing function is registered (for backward compatibility)
+    func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_prefix_cache_func(od_config: OmniDiffusionConfig):
+    """Load optional model preparation for native multimodal KV identities."""
+    if uses_diffusers_adapter(od_config) or od_config.model_class_name is None:
+        return None
+    func_name = _DIFFUSION_PREFIX_CACHE_FUNCS.get(od_config.model_class_name)
+    return None if func_name is None else _load_process_func(od_config, func_name)

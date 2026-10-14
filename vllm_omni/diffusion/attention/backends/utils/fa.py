@@ -1,0 +1,610 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+# Copyright 2025 The Fairseq Authors and the HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
+import inspect
+from collections.abc import Callable
+from functools import cache, lru_cache
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from vllm.logger import init_logger
+
+from vllm_omni.platforms import current_omni_platform
+
+FlashAttnFn = Callable[..., Any]
+
+logger = init_logger(__name__)
+
+
+def _is_blackwell() -> bool:
+    try:
+        capability = current_omni_platform.get_device_capability()
+    except Exception:
+        return False
+    return capability is not None and capability.major >= 10
+
+
+@lru_cache(maxsize=1)
+def is_flash_attn_4_available() -> bool:
+    """Return whether CuTe FlashAttention-4 (``flash_attn.cute``) can be imported.
+
+    FA2/FA3 wheels are often importable on Blackwell but only ship Hopper kernels.
+    Those must not be treated as a runnable FLASH_ATTN implementation here.
+    """
+    try:
+        from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+
+        return True
+    except Exception as exc:
+        logger.debug("CuTe FlashAttention-4 is unavailable: %s", exc)
+        return False
+
+
+# Flash Attention implementation discovery. All candidates implement the same
+# logical FLASH_ATTN backend; this never substitutes SDPA at runtime.
+# Bind via aliases so mypy does not treat each candidate import as a redefinition.
+flash_attn_func: FlashAttnFn | None = None
+flash_attn_varlen_func: FlashAttnFn | None = None
+IS_FLASH_ATTN_4 = False
+IS_AITER = False
+
+if current_omni_platform.is_rocm():
+    # ROCm: try Aiter first
+    try:
+        from vllm._aiter_ops import is_aiter_found_and_supported
+
+        if is_aiter_found_and_supported():
+            from aiter import flash_attn_func as _fa_func
+            from aiter import flash_attn_varlen_func as _fa_varlen
+
+            flash_attn_func = _fa_func
+            flash_attn_varlen_func = _fa_varlen
+            IS_AITER = True
+    except (ImportError, ModuleNotFoundError):
+        pass
+elif current_omni_platform.is_xpu():
+    try:
+        from vllm._xpu_ops import xpu_ops  # noqa: F401
+
+        flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
+    except (ImportError, ModuleNotFoundError):
+        pass
+elif current_omni_platform.is_musa():
+    try:
+        from flash_attn_interface import flash_attn_func as _fa_func
+        from flash_attn_interface import flash_attn_varlen_func as _fa_varlen
+
+        flash_attn_func = _fa_func
+        flash_attn_varlen_func = _fa_varlen
+    except (ImportError, ModuleNotFoundError):
+        pass
+else:
+    # CUDA implementation candidates, ordered by preference.
+    # Candidate 1: CuTe-based FA4. This matters on Blackwell, where an
+    # importable Hopper-only FA3 wheel may otherwise be selected and fail
+    # at launch with "no kernel image is available".
+    if _is_blackwell():
+        if is_flash_attn_4_available():
+            try:
+                from flash_attn.cute import flash_attn_func as _fa_func
+                from flash_attn.cute import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+                IS_FLASH_ATTN_4 = True
+                logger.info("Using CuTe FlashAttention-4 on Blackwell")
+            except Exception as exc:
+                # Optional FA4 dependencies may be present but ABI-incompatible
+                # (for example, mismatched CUTLASS DSL and Quack builds). Treat
+                # that as unavailable so backend discovery can continue.
+                logger.debug("CuTe FlashAttention-4 is unavailable: %s", exc)
+    else:
+        # Candidate 2: FA3 from fa3-fwd PyPI package.
+        if flash_attn_func is None:
+            try:
+                from fa3_fwd_interface import flash_attn_func as _fa_func
+                from fa3_fwd_interface import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+        # Candidate 3: FA3 from a flash-attention source build.
+        if flash_attn_func is None:
+            try:
+                from flash_attn_interface import flash_attn_func as _fa_func
+                from flash_attn_interface import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+        # Candidate 4: FA2 from the flash-attn package (multiple import paths).
+        if flash_attn_func is None:
+            try:
+                from flash_attn import flash_attn_func as _fa_func
+                from flash_attn import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+        if flash_attn_func is None:
+            try:
+                from flash_attn.flash_attn_interface import flash_attn_func as _fa_func
+                from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_func = _fa_func
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+        # Candidate 5: vLLM's encapsulated Flash Attention dispatcher.
+        if flash_attn_varlen_func is None:
+            try:
+                from vllm.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
+
+                flash_attn_varlen_func = _fa_varlen
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+# If no FA backend available, SDPA backend will be selected at the platform level
+# flash_attn_func and flash_attn_varlen_func will be None
+HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+
+
+def validate_fa4_head_dims(head_dim: int, head_dim_v: int, alignment: int) -> bool:
+    """Use the selected FA4 implementation's constraints during path resolution.
+
+    Return False when its validator is unavailable; propagate kernel validation
+    errors for the backend to report. Keep the private FA4 API dependency here,
+    rather than duplicating architecture/version-specific dimension rules.
+    This is a planning-time call, never part of compiled tensor execution.
+    """
+    try:
+        from flash_attn.cute.interface import _get_device_arch, _validate_head_dims
+    except ImportError:
+        return False
+
+    arch = _get_device_arch() // 10
+    # FA4 routes SM80/SM120 through separate kernels and bypasses this validator.
+    if arch not in (9, 10, 11):
+        return False
+    _validate_head_dims(head_dim, head_dim_v, arch, alignment)
+    return True
+
+
+def _choose_vllm_flash_attn_version(
+    device_major: int,
+    requested: str | int | None,
+    supported_versions: frozenset[int],
+) -> int:
+    """Choose a vLLM-bundled FA kernel without model-specific policy."""
+
+    if requested is not None:
+        try:
+            version = int(requested)
+        except (TypeError, ValueError) as error:
+            raise ValueError("FlashAttention version must be 2, 3, or 4") from error
+        if version not in (2, 3, 4):
+            raise ValueError("FlashAttention version must be 2, 3, or 4")
+        if version not in supported_versions:
+            raise RuntimeError(f"FlashAttention {version} is unavailable on this device")
+        return version
+
+    if device_major >= 10 and 4 in supported_versions:
+        return 4
+    if device_major >= 9 and 3 in supported_versions:
+        return 3
+    if 2 in supported_versions:
+        return 2
+    raise RuntimeError("No vLLM-bundled FlashAttention 2/3/4 kernel is available")
+
+
+@cache
+def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
+    """Resolve an available vLLM-bundled FA2/FA3/FA4 implementation."""
+
+    if not current_omni_platform.is_cuda():
+        raise RuntimeError("vLLM-bundled versioned FlashAttention requires CUDA")
+
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    capability = current_omni_platform.get_device_capability()
+    if capability is None:
+        raise RuntimeError("Cannot resolve FlashAttention without a CUDA device capability")
+    supported_versions = frozenset(version for version in (2, 3, 4) if is_fa_version_supported(version))
+    return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
+
+
+_FA3_MISSING = "A standalone FlashAttention-3 varlen interface (flash_attn_interface) is required"
+
+
+@cache
+def _external_fa3_varlen() -> tuple[FlashAttnFn, frozenset[str] | None] | None:
+    """Return the standalone FlashAttention-3 varlen function and its parameter names, if installed.
+
+    The names are ``None`` when the function's signature cannot be inspected.
+    """
+    try:
+        from flash_attn_interface import flash_attn_varlen_func as func
+    except ImportError:
+        return None
+    try:
+        return func, frozenset(inspect.signature(func).parameters)
+    except (TypeError, ValueError):
+        return func, None
+
+
+@cache
+def flash_attn_3_varlen_unsupported(softcap: bool = False, return_softmax_lse: bool = False) -> str | None:
+    """Return why ``flash_attn_3_varlen`` cannot run with these options, or ``None`` when it can."""
+    provider = _external_fa3_varlen()
+    if provider is None:
+        return _FA3_MISSING
+    parameters = provider[1]
+    if parameters is None:
+        return "The FlashAttention-3 provider's signature cannot be inspected"
+    if softcap and "softcap" not in parameters:
+        return "This FlashAttention-3 provider does not support softcap"
+    if return_softmax_lse and not parameters & {"return_attn_probs", "return_softmax_lse"}:
+        return "This FlashAttention-3 provider does not expose an LSE return option"
+    return None
+
+
+def flash_attn_3_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Call standalone FA3 and return the output, or ``(output, LSE)`` with LSE packed as ``[heads, tokens]``.
+
+    Providers name the LSE request either ``return_attn_probs`` or ``return_softmax_lse``.
+    """
+    softcap = max(float(softcap), 0.0)
+    unsupported = flash_attn_3_varlen_unsupported(softcap > 0, return_softmax_lse)
+    if unsupported is not None:
+        raise (ImportError if unsupported == _FA3_MISSING else NotImplementedError)(unsupported)
+    provider = _external_fa3_varlen()
+    assert provider is not None  # flash_attn_3_varlen_unsupported reports a missing provider
+    func, parameters = provider
+    assert parameters is not None  # and an uninspectable signature
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": int(max_seqlen_q),
+        "max_seqlen_k": int(max_seqlen_k),
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+    }
+    if "softcap" in parameters:
+        kwargs["softcap"] = softcap
+    if return_softmax_lse:
+        kwargs["return_attn_probs" if "return_attn_probs" in parameters else "return_softmax_lse"] = True
+    result = func(**kwargs)
+    if not return_softmax_lse:
+        out = result[0] if isinstance(result, tuple) and result else result
+        if not isinstance(out, torch.Tensor):
+            raise RuntimeError("FlashAttention-3 must return an output tensor")
+        return out
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise RuntimeError("FlashAttention-3 must return (output, softmax_lse) when LSE is requested")
+    out, lse = result[:2]
+    if not isinstance(out, torch.Tensor) or not isinstance(lse, torch.Tensor):
+        raise RuntimeError("FlashAttention-3 output and softmax_lse must be tensors")
+    expected_shape = (q.shape[1], q.shape[0])
+    if lse.shape != expected_shape:
+        raise RuntimeError(f"Expected packed softmax_lse shape {expected_shape}, got {tuple(lse.shape)}")
+    return out, lse
+
+
+def vllm_flash_attn_varlen_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    deterministic: bool = False,
+    fa_version: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run packed vLLM FlashAttention and retain LSE for post-processing."""
+
+    from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
+
+    version = resolve_vllm_flash_attn_version(fa_version)
+    out, lse = vllm_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        int(max_seqlen_q),
+        cu_seqlens_q,
+        int(max_seqlen_k),
+        cu_seqlens_k=cu_seqlens_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=None,
+        softcap=max(float(softcap), 0.0),
+        deterministic=deterministic,
+        return_softmax_lse=True,
+        fa_version=version,
+    )
+    return out, lse
+
+
+@lru_cache(maxsize=1)
+def is_flash_attn_installed() -> bool:
+    """Return whether a Flash Attention backend package is importable.
+
+    Shared by CUDA/ROCm/MUSA platforms.
+    """
+    try:
+        # Check for any FA backend: FA4 (flash_attn.cute), FA3
+        # (fa3_fwd_interface, flash_attn_interface), or FA2 (flash_attn).
+        if _is_blackwell():
+            return is_flash_attn_4_available()
+
+        # Try FA3 from fa3-fwd PyPI package
+        try:
+            import fa3_fwd_interface  # noqa: F401
+
+            return True
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        # Try FA3 from flash-attention source build
+        try:
+            import flash_attn_interface  # noqa: F401
+
+            return True
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        # Try FA2 from flash-attn package
+        from flash_attn import __version__
+
+        if __version__ < "2.6.0":
+            raise ImportError("install flash_attn >= 2.6.0")
+        return True
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    # Try vLLM's flash attention wrapper
+    try:
+        from vllm.vllm_flash_attn import (  # noqa: F401
+            flash_attn_varlen_func,
+        )
+
+        return True
+    except (ImportError, ModuleNotFoundError):
+        logger.warning("No Flash Attention implementation found")
+        return False
+
+
+def _index_first_axis(tensor, indices):
+    """
+    A local implementation of the PyTorch indexing operation `tensor[indices]` on the first axis,
+    after flattening the first two dimensions of the tensor. This is functionally equivalent to
+    FA2's `index_first_axis` and replaces the need to import it.
+    """
+    # The input tensor is expected to be of shape (batch, seq_len, ...). We flatten the first
+    # two dimensions to get (total_tokens, ...) before indexing.
+    reshaped_tensor = tensor.reshape(-1, *tensor.shape[2:])
+    return reshaped_tensor[indices]
+
+
+def _unpad_input(hidden_states, attention_mask, unused_mask=None):
+    """
+    unpad_input function for flash attention variants that do not have them within their pkg themselves, e.g. fa3.
+
+    Arguments:
+        hidden_states: (batch, seqlen, ...)
+        attention_mask: (batch, seqlen), bool / int, 1 means valid and 0 means not valid.
+        unused_mask: (batch, seqlen), bool / int, 1 means the element is allocated but unused.
+
+    Return:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens selected in attention_mask + unused_mask.
+        indices: (total_nnz), the indices of masked tokens from the flattened input sequence.
+        cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        max_seqlen_in_batch: int
+        seqused: (batch), returns the number of tokens selected in attention_mask + unused_mask.
+    """
+    all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
+    seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
+    used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+
+    return (
+        _index_first_axis(hidden_states, indices),
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+        used_seqlens_in_batch,
+    )
+
+
+def _pad_input(hidden_states, indices, batch, seqlen):
+    """
+    pad_input function for flash attention variants that do not have them within their pkg themselves, e.g. fa3.
+
+    Arguments:
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens in selected in attention_mask.
+        indices: (total_nnz), the indices that represent the non-masked tokens of the original padded input sequence.
+        batch: int, batch size for the padded sequence.
+        seqlen: int, maximum sequence length for the padded sequence.
+
+    Return:
+        hidden_states: (batch, seqlen, ...)
+    """
+    dim = hidden_states.shape[1:]
+    output = torch.zeros((batch * seqlen), *dim, device=hidden_states.device, dtype=hidden_states.dtype)
+    output[indices] = hidden_states
+    return output.view(batch, seqlen, *dim)
+
+
+def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Retrieves indexing data required to repad unpadded (ragged) tensors.
+
+    Arguments:
+        attention_mask (`torch.Tensor`):
+            Boolean or int tensor of shape (batch_size, sequence_length), 1 means valid and 0 means not valid.
+
+    Return:
+        indices (`torch.Tensor`):
+            The indices of non-masked tokens from the flattened input sequence.
+        cu_seqlens (`torch.Tensor`):
+            The cumulative sequence lengths, used to index into ragged (unpadded) tensors.
+             `cu_seqlens` shape is (batch_size + 1,).
+        max_seqlen_in_batch (`int`):
+            Maximum sequence length in batch.
+    """
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    # NOTE: Similar to the `.item()` in prepare_fa2_from_position_ids, with torch compile,
+    # this might cause a graph break
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
+
+def _upad_input(
+    query_layer: torch.Tensor,
+    key_layer: torch.Tensor,
+    value_layer: torch.Tensor,
+    attention_mask: torch.Tensor,
+    query_length: int,
+    unpad_input_func,
+):
+    """
+    Unpads query, key, and values tensors, using a single dimension for all tokens even though they belong
+    to different batches. This function is used instead of `flash_attn.bert_padding.unpad_input` in
+    order to avoid the recomputation of the same intermediary tensors for query, key, value tensors.
+
+    Arguments:
+        query_layer (`torch.Tensor`):
+            Query state with padding. Shape: (batch_size, query_length, num_heads, head_dim).
+        key_layer (`torch.Tensor`):
+            Key state with padding. Shape: (batch_size, kv_seq_len, num_key_value_heads, head_dim).
+        value_layer (`torch.Tensor`):
+            Value state with padding. Shape: (batch_size, kv_seq_len, num_key_value_heads, head_dim).
+        attention_mask (`torch.Tensor`):
+            Boolean or int tensor of shape (batch_size, sequence_length), 1 means valid and 0 means not valid.
+        query_length (`int`):
+            Target length.
+        unpad_input_func:
+            The function to use for unpadding the input tensors.
+
+    Return:
+        query_layer (`torch.Tensor`):
+            Query state without padding. Shape: (total_target_length, num_heads, head_dim).
+        key_layer (`torch.Tensor`):
+            Key state with padding. Shape: (total_source_length, num_key_value_heads, head_dim).
+        value_layer (`torch.Tensor`):
+            Value state with padding. Shape: (total_source_length, num_key_value_heads, head_dim).
+        indices_q (`torch.Tensor`):
+            The indices of non-masked tokens from the flattened input target sequence.
+        (cu_seqlens_q, cu_seqlens_k) (`tuple[int]`):
+            The cumulative sequence lengths for the target (query) and source (key, value), used to index into
+             ragged (unpadded) tensors. `cu_seqlens` shape is (batch_size + 1,).
+        (max_seqlen_in_batch_q, max_seqlen_in_batch_k) (`tuple[int]`):
+            Maximum sequence length in batch (`max_seqlen_in_batch_q` for the target sequence i.e. query,
+            `max_seqlen_in_batch_k` for the source sequence i.e. key/value).
+    """
+    if torch.compiler.is_compiling():
+        # allow PyTorch compiler to include operations that return scalar values (like .item()
+        torch._dynamo.config.capture_scalar_outputs = True
+    indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+
+    # With static caches, the k/v states may be larger than the mask ->
+    # we need to slice them to avoid generating garbage
+    # It's a bit of an anti-pattern, but otherwise we silently compute wrong attentions scores
+    if key_layer.shape[1] > (seq_len := attention_mask.shape[-1]):
+        key_layer, value_layer = key_layer[:, :seq_len, :, :], value_layer[:, :seq_len, :, :]
+
+    batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+    key_layer = _index_first_axis(key_layer, indices_k)
+    value_layer = _index_first_axis(value_layer, indices_k)
+    if query_length == kv_seq_len:
+        query_layer = _index_first_axis(query_layer, indices_k)
+        cu_seqlens_q = cu_seqlens_k
+        max_seqlen_in_batch_q = max_seqlen_in_batch_k
+        indices_q = indices_k
+    elif query_length == 1:
+        max_seqlen_in_batch_q = 1
+        cu_seqlens_q = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=query_layer.device
+        )  # There is a memcpy here, that is very bad.
+        indices_q = cu_seqlens_q[:-1]
+        query_layer = query_layer.squeeze(1)
+    else:
+        # The -q_len: slice assumes left padding.
+        attention_mask = attention_mask[:, -query_length:]
+        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, *_ = unpad_input_func(query_layer, attention_mask)
+
+    return (
+        query_layer,
+        key_layer,
+        value_layer,
+        indices_q,
+        (cu_seqlens_q, cu_seqlens_k),
+        (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+    )
+
+
+def _is_packed_sequence(position_ids, batch_size):
+    """
+    Check the position ids whether packed sequences are indicated or not
+        1. Position ids exist
+        2. Flattened sequences only are supported
+        3. Compile-friendly `not (torch.diff(position_ids, dim=-1) >= 0).all()`, i.e.
+        we have multiple increasing sequences
+    """
+    if position_ids is None:
+        return False
+
+    increasing_position_sequences = torch.arange(position_ids.shape[1], device=position_ids.device) + position_ids.min()
+    return batch_size == 1 and (increasing_position_sequences - position_ids).abs().sum().bool()

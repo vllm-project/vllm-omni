@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""
+Analogous to test_common_offline, but for server tests. Validates the full
+online serving stack (CLI arg parsing, subprocess, API routing, response
+encoding) using tiny models.
+"""
+
+from pathlib import Path
+
+import pytest
+from xdist import is_xdist_worker
+
+from tests.helpers.runtime import OmniServer, OnlineOmniClient
+from tests.model_tests.diffusion.case_filtering import get_parametrized_options
+from tests.model_tests.diffusion.config_types import (
+    DiffusionAccs,
+    DiffusionTasks,
+    build_server_args_from_diff_accelerations,
+)
+from tests.model_tests.diffusion.model_settings import DIFFUSION_TEST_SETTINGS
+from tests.model_tests.diffusion.task_runners import (
+    run_and_validate_online_determinism,
+    run_and_validate_online_image_edits,
+    run_and_validate_online_image_to_image_request,
+    run_and_validate_online_image_to_video_request,
+    run_and_validate_online_multi_output,
+    run_and_validate_online_text_to_image_request,
+    run_and_validate_online_text_to_video_request,
+)
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+# NOTE: Hardware and model type marks are added dynamically based on test requirements and model type
+pytestmark = [pytest.mark.xdist]
+
+
+@pytest.fixture(autouse=True)
+def _disable_global_gpu_cleanup_for_parallel_workers(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not wait on total GPU usage while sibling xdist workers are active.
+
+    ``cleanup_test_environment`` observes the whole device, not allocations
+    owned by the current worker.  Waiting for the device to fall below its
+    global threshold therefore turns server teardown into a cross-worker
+    barrier when online tests run with xdist.  ``OmniServer`` still tears down
+    its own subprocess tree; retain the broader cleanup for non-xdist runs.
+    """
+    if is_xdist_worker(request):
+        monkeypatch.setattr("tests.helpers.runtime.cleanup_test_environment", lambda: None)
+
+
+@pytest.mark.parametrize(
+    "model_name,accelerations,supported_tasks,check_multioutput,check_determinism",
+    get_parametrized_options(DIFFUSION_TEST_SETTINGS, online=True),
+)
+def test_online_on_supported_tasks(
+    model_name: str,
+    accelerations: list[DiffusionAccs] | None,
+    supported_tasks: list[DiffusionTasks],
+    check_multioutput: bool,
+    check_determinism: bool,
+    tiny_model_paths: dict[str, str],
+    run_level: str,
+    subtests,
+):
+    """Smoke test: start a tiny model server and run each supported task via the API."""
+    model_path = tiny_model_paths[model_name]
+    server_args = build_server_args_from_diff_accelerations(accelerations)
+    server_args.append("--enforce-eager")
+    settings = DIFFUSION_TEST_SETTINGS[model_name]
+    if settings.checkpoint_filename is not None:
+        model_path = str(Path(model_path) / settings.checkpoint_filename)
+        server_args.extend(["--model-class-name", model_name])
+
+    with OmniServer(model_path, server_args) as server:
+        # TODO: We may want to revisit run_level validation here,
+        # because checks for things like image size etc should not
+        # depend on whether or not the weights are real or random
+        client = OnlineOmniClient(
+            host=server.host,
+            port=server.port,
+            api_key="EMPTY",
+            run_level=run_level,
+            log_stats=server.log_stats,
+        )
+        for task_type in supported_tasks:
+            with subtests.test(msg=task_type.value):
+                if task_type == DiffusionTasks.TEXT_TO_IMAGE:
+                    run_and_validate_online_text_to_image_request(server, client)
+                elif task_type == DiffusionTasks.IMAGE_TO_IMAGE:
+                    run_and_validate_online_image_to_image_request(server, client)
+                    max_multimodal_image_inputs = (
+                        get_diffusion_model_metadata(model_name).max_multimodal_image_inputs or 1
+                    )
+                    image_counts = [1]
+                    if max_multimodal_image_inputs != 1:
+                        image_counts.append(max_multimodal_image_inputs)
+                    image_counts.append(max_multimodal_image_inputs + 1)
+                    for num_images in image_counts:
+                        with subtests.test(api="/v1/images/edits", num_images=num_images):
+                            run_and_validate_online_image_edits(
+                                server,
+                                client,
+                                num_images=num_images,
+                                max_multimodal_image_inputs=max_multimodal_image_inputs,
+                            )
+                elif task_type == DiffusionTasks.TEXT_TO_VIDEO:
+                    run_and_validate_online_text_to_video_request(server, client)
+                elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
+                    run_and_validate_online_image_to_video_request(server, client)
+                else:
+                    raise ValueError(f"Task type {task_type} is not yet supported")
+
+        # NOTE: For now, we only check determinism + multi output for the base case,
+        # since checking it on every extra acceleration configuration is redundant
+        # (see case_filtering).
+        if check_determinism:
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"determinism[{task_type}]"):
+                    run_and_validate_online_determinism(server, client, task_type)
+        if check_multioutput:
+            for task_type in supported_tasks:
+                with subtests.test(msg=f"multi_output[{task_type}]"):
+                    run_and_validate_online_multi_output(server, client, task_type)

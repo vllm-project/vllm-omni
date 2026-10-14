@@ -1,0 +1,541 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""
+Stage Engine Core Client for vLLM-Omni multi-stage runtime.
+
+Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
+"""
+
+from __future__ import annotations
+
+import inspect
+import os
+import socket
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+
+import vllm.v1.engine as _vllm_engine_module
+import vllm.v1.engine.core_client as _vllm_core_client_module
+from vllm.logger import init_logger
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient, MPClient
+from vllm.v1.engine.exceptions import EngineDeadError
+
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    TRANSFER_ENGINE_CONNECTOR_NAMES,
+)
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    KV_TRANSFER_PORT_OFFSET,
+)
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine.stage_client import StageClientBase
+from vllm_omni.engine.stage_init_utils import StageMetadata
+
+if TYPE_CHECKING:
+    from vllm.renderers import BaseRenderer
+    from vllm.v1.engine import EngineCoreOutput
+
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = init_logger(__name__)
+
+
+def _default_process_engine_inputs(
+    source_outputs: list[Any],
+    prompt: Any,
+    requires_multimodal_data: bool,
+) -> list[OmniTokensPrompt]:
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+    if not isinstance(prompt, list):
+        prompt = [prompt]
+
+    mm_data = {so.request_id: p.get("multi_modal_data") for so, p in zip(source_outputs, prompt)}
+
+    return [
+        OmniTokensPrompt(
+            prompt_token_ids=so.outputs[0].token_ids,
+            multi_modal_data=(mm_data[so.request_id] if requires_multimodal_data else None),
+        )
+        for so in source_outputs
+    ]
+
+
+class StageEngineCoreClientBase(StageClientBase):
+    """Shared stage-aware behavior for async EngineCore clients.
+
+    The concrete transport/load-balancing behavior is supplied by the
+    multiprocessing client subclass in the MRO.
+
+    Fully reuses the underlying vLLM async MP client ``__init__`` for:
+    - ZMQ setup, sockets
+    - outputs_queue, output_queue_task
+    - All utility methods (get_output_async, abort_requests_async, etc.)
+
+    The stage engine subprocesses are owned by vLLM-style engine managers
+    (`resources.engine_manager`), matching `MPClient` ownership.
+    """
+
+    replica_id: int = 0
+
+    @staticmethod
+    def make_async_mp_client(
+        vllm_config: Any,
+        executor_class: type,
+        log_stats: bool = False,
+        metadata: StageMetadata | None = None,
+        client_addresses: dict[str, str] | None = None,
+        engine_manager: Any = None,
+        coordinator: Any = None,
+        client_count: int = 1,
+        client_index: int = 0,
+        renderer: BaseRenderer | None = None,
+    ) -> StageEngineCoreClient | DPLBStageEngineCoreClient:
+        """Create the appropriate stage async client for the DP mode."""
+        parallel_config = vllm_config.parallel_config
+        client_args = dict(
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=log_stats,
+            metadata=metadata,
+            client_addresses=client_addresses,
+            engine_manager=engine_manager,
+            coordinator=coordinator,
+            client_count=client_count,
+            client_index=client_index,
+            renderer=renderer,
+        )
+
+        if parallel_config.data_parallel_size > 1 and not parallel_config.data_parallel_external_lb:
+            return DPLBStageEngineCoreClient(**client_args)
+
+        return StageEngineCoreClient(**client_args)
+
+    def __init__(
+        self,
+        vllm_config: Any,
+        executor_class: type,
+        log_stats: bool = False,
+        client_addresses: dict[str, str] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+        renderer: BaseRenderer | None = None,
+        *,
+        metadata: StageMetadata | None = None,
+        engine_manager: Any = None,
+        coordinator: Any = None,
+    ):
+        """Create an async EngineCore client for a single stage.
+
+        All heavy init (config extraction, plugin loading, device setup,
+        engine args building, device locking) is done by the Orchestrator
+        via helpers in stage_init_utils.py. This constructor just stores metadata
+        and calls super().__init__().
+
+        The subprocess lifecycle is owned by the engine manager attached to
+        vLLM's background resources, not by this client directly.
+        """
+        # -------- Stage metadata (public fields used at runtime) --------
+        self.replica_id = 0
+        if metadata is not None:
+            self.stage_id = metadata.stage_id
+            self.replica_id = getattr(metadata, "replica_id", 0)
+            self.stage_type = metadata.stage_type
+            self.model_stage = metadata.model_stage
+            self.is_comprehension = metadata.is_comprehension
+            self.requires_multimodal_data = metadata.requires_multimodal_data
+            self.engine_input_source = metadata.engine_input_source
+            self.final_output = metadata.final_output
+            self.final_output_type = metadata.final_output_type
+            self.default_sampling_params = metadata.default_sampling_params
+            self.prompt_transform_func = metadata.prompt_transform_func
+            self.prompt_expand_func = metadata.prompt_expand_func
+            self.custom_process_input_func = metadata.custom_process_input_func
+            self.async_chunk_prewarm_payload_func = getattr(metadata, "async_chunk_prewarm_payload_func", None)
+
+        self.engine_outputs: Any = None
+        self.client_addresses = dict(client_addresses or {})
+        self.vllm_config = vllm_config
+        self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
+        self._stage_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        self._kv_sender_host = self._resolve_contact_host()
+        self._kv_sender_info: dict[str, Any] | None = None
+        self._kv_sender_initialized = False
+        self._payload_sender_info: dict[str, Any] | None = None
+
+        client_name = self.__class__.__name__
+        logger.info(
+            "[%s] stage-%s [rep-%s] initializing EngineCore",
+            client_name,
+            self.stage_id,
+            self.replica_id,
+        )
+
+        # Patch the output decoder type so the client decodes
+        # OmniEngineCoreOutputs (which carries multimodal_output per
+        # EngineCoreOutput) instead of the base EngineCoreOutputs.
+        # Must happen BEFORE super().__init__() which creates the decoder.
+        # TODO: Add a defensive assertion after super().__init__() to verify
+        # the decoder uses OmniEngineCoreOutputs, catching import-order regressions.
+        _vllm_engine_module.EngineCoreOutput = OmniEngineCoreOutput
+        _vllm_engine_module.EngineCoreOutputs = OmniEngineCoreOutputs
+        _vllm_core_client_module.EngineCoreOutputs = OmniEngineCoreOutputs
+        logger.debug(
+            "[StageEngineCoreClient] Patched EngineCoreOutputs -> %s",
+            _vllm_core_client_module.EngineCoreOutputs,
+        )
+
+        try:
+            # Concrete clients place AsyncMPClient next in the cooperative MRO;
+            # the mixin's declared base exposes only object.__init__ to mypy.
+            super().__init__(  # type: ignore[call-arg]
+                vllm_config,
+                executor_class,
+                log_stats=log_stats,
+                client_addresses=client_addresses,
+                client_count=client_count,
+                client_index=client_index,
+                renderer=renderer,
+            )
+            if engine_manager is not None:
+                self.resources.engine_manager = engine_manager
+                self.start_engine_core_monitor()
+            if coordinator is not None:
+                self.resources.coordinator = coordinator
+        except Exception:
+            logger.exception(
+                "[%s] stage-%s [rep-%s] EngineCore init failed",
+                client_name,
+                self.stage_id,
+                self.replica_id,
+            )
+            try:
+                self.shutdown()
+            except Exception as shutdown_error:
+                logger.warning(
+                    "[%s] stage-%s [rep-%s] cleanup after init failure failed: %s",
+                    client_name,
+                    self.stage_id,
+                    self.replica_id,
+                    shutdown_error,
+                )
+            raise
+
+        self._initialize_kv_sender_endpoint()
+        self._payload_sender_info = self._build_payload_sender_info()
+
+        logger.info(
+            "[%s] stage-%s [rep-%s] EngineCore running",
+            client_name,
+            self.stage_id,
+            self.replica_id,
+        )
+
+    def check_health(self) -> None:
+        """Raise ``EngineDeadError`` if the stage subprocess is dead.
+
+        Called by ``OmniBase.check_health()`` and transitively by the
+        ``/health`` HTTP endpoint.
+        """
+        if self.resources.engine_dead:
+            raise EngineDeadError(f"Stage-{self.stage_id} engine core is dead")
+
+    def _apply_ready_response(self, payload: bytes) -> None:
+        MPClient._apply_ready_response(self, payload)
+
+    # ==================== Overrides ====================
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        """Add request to the stage engine core."""
+        logger.debug(
+            "[%s] stage-%s [rep-%s] add request: %s",
+            self.__class__.__name__,
+            self.stage_id,
+            self.replica_id,
+            request.request_id,
+        )
+        await super().add_request_async(request)
+
+    # ==================== Stage Methods ====================
+
+    @staticmethod
+    def _detect_local_ip() -> str | None:
+        """Best-effort local IP detection for cross-node connector bootstrap."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                return sock.getsockname()[0]
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                return None
+
+    def _resolve_contact_host(self) -> str | None:
+        """Resolve a routable host for this stage from its client addresses.
+
+        For remote LLM replicas the ZMQ sockets are bound on the head node,
+        so the ZMQ addresses contain the head's IP. The ``replica_host`` key
+        (injected by DistStageRuntime) carries the actual replica IP where
+        the KV connector binds — prefer it when available.
+        """
+        replica_host = self.client_addresses.get("replica_host")
+        if replica_host:
+            return replica_host
+        for key in ("input_address", "output_address", "stats_update_address"):
+            address = self.client_addresses.get(key)
+            if not address:
+                continue
+            host = urlparse(address).hostname
+            if host in {None, "", "*", "0.0.0.0", "::"}:
+                continue
+            if host in {"localhost", "127.0.0.1"}:
+                detected = self._detect_local_ip()
+                if detected:
+                    return detected
+                continue
+            return host
+        return self._detect_local_ip()
+
+    def _get_kv_connector_config(self) -> dict[str, Any] | None:
+        omni_kv_config = getattr(self, "_omni_kv_config", None)
+        if not isinstance(omni_kv_config, dict):
+            return None
+        connector_config = omni_kv_config.get("connector_config")
+        if not isinstance(connector_config, dict):
+            return None
+        return connector_config
+
+    def _build_payload_sender_info(self) -> dict[str, Any] | None:
+        model_config = getattr(self.vllm_config, "model_config", None)
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        extra = connector_config.get("extra") if isinstance(connector_config, dict) else None
+        outgoing = extra.get("outgoing") if isinstance(extra, dict) else None
+
+        # An intermediate stage's outgoing listener is independent of its
+        # incoming KV endpoint. Never advertise the upstream sender here.
+        sender_info = getattr(self, "_kv_sender_info", None)
+        if not isinstance(outgoing, dict) and isinstance(sender_info, dict):
+            sender_host = sender_info.get("host")
+            sender_port = sender_info.get("zmq_port")
+            if sender_host is not None and sender_port is not None:
+                return {
+                    "host": str(sender_host),
+                    "zmq_port": int(sender_port) - KV_TRANSFER_PORT_OFFSET,
+                }
+
+        kv_connector_config = self._get_kv_connector_config()
+        if isinstance(outgoing, dict):
+            extra = outgoing
+            base_port = extra.get("zmq_port", 50051)
+        else:
+            if not isinstance(extra, dict) or extra.get("role") != "sender":
+                extra = kv_connector_config
+            if not isinstance(extra, dict) or extra.get("role") != "sender":
+                return None
+            base_port = extra.get("zmq_port", 50051)
+            kv_port = kv_connector_config.get("zmq_port") if isinstance(kv_connector_config, dict) else None
+            if kv_port is not None:
+                base_port = int(os.path.expandvars(str(kv_port))) - KV_TRANSFER_PORT_OFFSET
+        if base_port is None:
+            return None
+        sender_host = self._resolve_sender_host_from_config(extra)
+        if sender_host is None:
+            return None
+        from vllm_omni.distributed.omni_connectors.utils.initialization import compute_connector_zmq_port
+
+        return {
+            "host": sender_host,
+            "zmq_port": compute_connector_zmq_port(
+                int(os.path.expandvars(str(base_port))),
+                purpose="request_forwarding",
+                from_stage=int(extra.get("from_stage", self.stage_id)),
+                replica_id=self.replica_id,
+            ),
+        }
+
+    def get_payload_sender_info(self) -> dict[str, Any] | None:
+        return dict(self._payload_sender_info) if self._payload_sender_info is not None else None
+
+    def _resolve_sender_host_from_config(self, connector_config: dict[str, Any]) -> str | None:
+        host = connector_config.get("sender_host") or connector_config.get("host")
+        if host in {None, "", "auto", "*", "0.0.0.0", "::"}:
+            return self._resolve_contact_host()
+        return str(host)
+
+    def _initialize_kv_sender_endpoint(self) -> None:
+        if self._kv_sender_initialized:
+            return
+        self._kv_sender_initialized = True
+        connector_config = self._get_kv_connector_config()
+        if connector_config is None or connector_config.get("role") != "sender":
+            return
+
+        sender_host = self._resolve_sender_host_from_config(connector_config)
+        if sender_host is not None:
+            self._kv_sender_host = sender_host
+
+        connector_type = connector_config.get("type")
+        sender_port = connector_config.get("sender_zmq_port")
+        if connector_type in TRANSFER_ENGINE_CONNECTOR_NAMES or sender_port is None:
+            base_port = connector_config.get("zmq_port")
+            if base_port is None:
+                return
+            base_port = os.path.expandvars(str(base_port))
+
+            omni_kv_config = getattr(self, "_omni_kv_config", None)
+            from_stage = self.stage_id
+            if isinstance(omni_kv_config, dict):
+                from_stage = omni_kv_config.get("omni_from_stage", from_stage)
+
+            try:
+                # Orchestrator always reports rank-0's port; receiver
+                # workers add their own local_rank * KV_RANK_PORT_STRIDE.
+                sender_port = kv_zmq_port(
+                    int(base_port),
+                    int(from_stage),
+                    local_rank=0,
+                    replica_id=self.replica_id,
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve sender_zmq_port "
+                    "from base_port=%s and from_stage=%s",
+                    self.stage_id,
+                    self.replica_id,
+                    base_port,
+                    from_stage,
+                )
+                return
+
+        if self._kv_sender_host is None:
+            return
+
+        self._kv_sender_info = {
+            "host": str(self._kv_sender_host),
+            "zmq_port": int(sender_port),
+        }
+
+    def get_kv_sender_info(
+        self,
+        *,
+        base_port: int = 50051,
+        kv_transfer_port_offset: int = KV_TRANSFER_PORT_OFFSET,
+    ) -> dict[str, Any] | None:
+        """Build sender bootstrap info for diffusion KV transfer receivers.
+
+        ``base_port`` and ``kv_transfer_port_offset`` are only used by the
+        legacy fallback path when no connector-level sender endpoint is
+        configured in ``omni_kv_config``.
+        """
+        if self._kv_sender_info is not None:
+            return dict(self._kv_sender_info)
+
+        if self._kv_sender_host is None:
+            self._kv_sender_host = self._resolve_contact_host()
+        if self._kv_sender_host is None:
+            return None
+        # rank-0 base port; receiver workers adjust per KV_RANK_PORT_STRIDE.
+        return {
+            "host": self._kv_sender_host,
+            "zmq_port": kv_zmq_port(
+                base_port - KV_TRANSFER_PORT_OFFSET + kv_transfer_port_offset,
+                int(self.stage_id),
+                local_rank=0,
+                replica_id=self.replica_id,
+            ),
+        }
+
+    def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
+        """Set engine outputs (called by orchestrator)."""
+        self.engine_outputs = engine_outputs
+
+    def process_engine_inputs(
+        self,
+        source_outputs: list[Any],
+        prompt: Any = None,
+        streaming_context: Any | None = None,
+    ) -> list[OmniTokensPrompt]:
+        """Process inputs from upstream stages.
+
+        Transition planning is expressed in terms of the upstream outputs
+        and the original prompt.
+        """
+        if self.custom_process_input_func is not None:
+            return self._call_custom_process_input(source_outputs, prompt, streaming_context)
+
+        if not self.engine_input_source:
+            raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
+        return _default_process_engine_inputs(source_outputs, prompt, self.requires_multimodal_data)
+
+    def _call_custom_process_input(
+        self,
+        source_outputs: list[Any],
+        prompt: Any,
+        streaming_context: Any | None,
+    ) -> list[OmniTokensPrompt]:
+        """Call a stage input processor with its explicitly requested context."""
+        processor = self.custom_process_input_func
+        assert processor is not None
+        signature = inspect.signature(processor)
+        extra_kwargs: dict[str, Any] = {}
+        if "next_stage_hf_config" in signature.parameters:
+            # Let a processor size the next stage's prompt from that
+            # stage's model config (e.g. a talker whose engine positions
+            # must cover a speaker-prompt prefill).
+            extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
+        target_model_config = signature.parameters.get("target_model_config")
+        if target_model_config is not None:
+            # The JoyAI bridge needs the Talker tokenizer and model config
+            # to calculate the exact prompt length.
+            if target_model_config.kind is not inspect.Parameter.KEYWORD_ONLY:
+                raise TypeError("target_model_config must be a keyword-only parameter")
+            extra_kwargs["target_model_config"] = self.vllm_config.model_config
+        # Match the context parameter by name, including the
+        # underscore-prefixed spelling some processors use (e.g.
+        # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge
+        # state keeps flowing to them.
+        if "streaming_context" in signature.parameters or "_streaming_context" in signature.parameters:
+            return processor(
+                source_outputs,
+                prompt,
+                self.requires_multimodal_data,
+                streaming_context,
+                **extra_kwargs,
+            )
+        return processor(
+            source_outputs,
+            prompt,
+            self.requires_multimodal_data,
+            **extra_kwargs,
+        )
+
+    async def collective_rpc_async(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Forward control RPCs to the underlying AsyncMPClient stage engine.
+
+        Each stage client already represents one logical stage, so stage-scoped
+        control operations should be executed here and then fanned in-core
+        across the workers managed by this EngineCore client.
+        """
+        return await super().collective_rpc_async(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+        )
+
+
+class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):
+    """Stage async client backed by vLLM's ``AsyncMPClient``."""
+
+
+class DPLBStageEngineCoreClient(StageEngineCoreClientBase, DPLBAsyncMPClient):
+    """Stage async client backed by vLLM's ``DPLBAsyncMPClient``."""

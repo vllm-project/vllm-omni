@@ -1,0 +1,15 @@
+apiVersion: v2
+name: chart-vllm-omni
+description: A Helm chart for deploying vLLM-Omni on Kubernetes for omni-modality model serving
+
+# Application chart that can be packaged and deployed
+type: application
+
+# Chart version - increment on each change to the chart
+version: 0.1.0
+
+# vllm-omni application version — keep in sync with image.tag in values.yaml
+appVersion: "0.16.0"
+
+maintainers:
+  - name: vllm-omni-team

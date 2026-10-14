@@ -1,0 +1,468 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
+
+import torch
+from torch import nn
+from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
+from vllm.logger import init_logger
+
+from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
+from vllm_omni.platforms import current_omni_platform
+
+from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
+from .module_residency import PinnedModuleStager
+from .plan_resolver import resolve_offload_plan
+
+logger = init_logger(__name__)
+
+
+def _capture_tensor_devices(modules: Collection[nn.Module]) -> list[tuple[torch.Tensor, torch.device]]:
+    seen: set[int] = set()
+    devices: list[tuple[torch.Tensor, torch.device]] = []
+    for module in modules:
+        for tensor in (*module.parameters(), *module.buffers()):
+            if id(tensor) in seen:
+                continue
+            seen.add(id(tensor))
+            devices.append((tensor, tensor.device))
+    return devices
+
+
+def _restore_tensor_devices(devices: list[tuple[torch.Tensor, torch.device]]) -> None:
+    first_error: BaseException | None = None
+    for tensor, device in devices:
+        try:
+            if tensor.device != device:
+                tensor.data = tensor.data.to(device)
+        except BaseException as exc:
+            logger.exception("Failed to restore tensor placement to %s", device)
+            first_error = first_error or exc
+    if first_error is not None:
+        raise RuntimeError("Failed to restore one or more tensor placements") from first_error
+
+
+class SequentialOffloadHook(ModelHook):
+    """Hook for sequential offloading with mutual exclusion on encoder and DiT modules.
+
+    To be used as a model-level (or "component-level") of CPU offloading method;
+    When a module's forward is called, this hook offloads target modules to CPU
+    and loads the current module to GPU.
+    """
+
+    _HOOK_NAME = "sequential_offload"
+
+    def __init__(
+        self,
+        offload_targets: list[nn.Module],
+        device: torch.device,
+        pin_memory: bool = True,
+        use_hsdp: bool = False,
+        offload_after_context: bool = True,
+        persistent_staging: bool = False,
+    ):
+        # Modules to offload to CPU before this module runs
+        self.offload_targets = offload_targets
+        self.device = device
+        self.pin_memory = pin_memory
+        self.use_hsdp = use_hsdp
+        self.offload_after_context = offload_after_context
+        self.persistent_staging = persistent_staging
+        self._stager: PinnedModuleStager | None = None
+
+    def initialize_hook(self, module: nn.Module) -> nn.Module:
+        if self.persistent_staging and not self.use_hsdp:
+            # Fixed staging storage keeps CUDA-graph-captured weight pointers
+            # valid across offload/load swaps. HSDP keeps the plain move
+            # semantics (decode graphs refuse HSDP anyway).
+            self._stager = PinnedModuleStager(
+                module,
+                self.device,
+                pin_memory=self.pin_memory,
+                retain_device_storage=True,
+            )
+        return module
+
+    @staticmethod
+    def _move_params(
+        module: nn.Module,
+        target_device: torch.device,
+        *,
+        non_blocking: bool = False,
+        pin_memory: bool = False,
+    ) -> bool:
+        """Move module parameters and buffers to device.
+
+        This cls method specifically prevents recursion device movement,
+        E.g., Cache-DiT CachedBlocks has attr `transformer` as a ref to original
+        transformer blocks, thus `module.to(device)` will fail for recursion calling,
+        refer to
+        https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
+        """
+        moved = False
+        for p in module.parameters():
+            if p.data.device != target_device:
+                data = p.data.to(target_device, non_blocking=non_blocking)
+                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                    data = data.pin_memory()
+                p.data = data
+                moved = True
+        for b in module.buffers():
+            if b.device != target_device:
+                data = b.data.to(target_device, non_blocking=non_blocking)
+                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                    data = data.pin_memory()
+                b.data = data
+                moved = True
+        return moved
+
+    @staticmethod
+    def _module_stager(module: nn.Module) -> PinnedModuleStager | None:
+        """The persistent stager owned by ``module``'s own sequential hook, if any.
+
+        Cross-module swaps call ``_to_cpu(target)`` through the *running*
+        module's hook, so staging state must be resolved on the target's hook
+        to keep its ``loaded`` bookkeeping consistent.
+        """
+        registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+        hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
+        return hook._stager if isinstance(hook, SequentialOffloadHook) else None
+
+    def _to_cpu(self, module: nn.Module) -> None:
+        stager = self._module_stager(module)
+        if stager is not None:
+            stager.offload()
+            return
+        # XPU's allocator doesn't respect stream dependencies in empty_cache,
+        # so non-blocking copies can race with cache eviction. Use blocking
+        # copies on XPU to avoid NULL pointer errors during DMA.
+        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
+        moved = self._move_params(
+            module,
+            torch.device("cpu"),
+            non_blocking=non_blocking,
+            pin_memory=self.pin_memory,
+        )
+        if moved:
+            current_omni_platform.empty_cache()
+
+    def _to_gpu(self, module: nn.Module) -> None:
+        stager = self._module_stager(module)
+        if stager is not None:
+            stager.load()
+            return
+        self._move_params(module, self.device, non_blocking=False)
+
+    def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
+        # Offload target modules to CPU
+        for target in self.offload_targets:
+            self._to_cpu(target)
+
+        # Load current module to GPU
+        self._to_gpu(module)
+        current_omni_platform.synchronize()
+
+        logger.debug(
+            "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
+            [t.__class__.__name__ for t in self.offload_targets],
+            module.__class__.__name__,
+            f"{self.device.type}:{self.device.index}",
+            current_omni_platform.get_free_memory() / 1024 / 1024 / 1024,
+        )
+
+        return args, kwargs
+
+
+def apply_sequential_offload(
+    dit_modules: list[nn.Module],
+    encoder_modules: list[nn.Module],
+    device: torch.device,
+    pin_memory: bool = True,
+    use_hsdp: bool = False,
+    offload_initial_dits: bool = False,
+    offload_dit_modules: Collection[nn.Module] | None = None,
+    offload_encoder_modules: Collection[nn.Module] | None = None,
+    persistent_dit_staging: bool = False,
+) -> None:
+    """Apply sequential offloading hooks to DiT and encoder modules.
+
+    Registers hooks on modules to implement mutual-exclusion GPU allocation.
+        - Before DiT runs, encoders are offloaded to CPU.
+        - Before encoders run, DiT is offloaded to CPU.
+
+    Args:
+        dit_modules: DiT/transformer modules to register hooks on
+        encoder_modules: Encoder modules to register hooks on
+        device: Target GPU device for loading
+        pin_memory: Whether to pin CPU memory for faster transfers
+        use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
+        offload_initial_dits: Whether to begin with all DiT modules on CPU.
+        offload_dit_modules: DiT modules allowed to move to CPU. None selects
+            every DiT for backward compatibility.
+        offload_encoder_modules: Encoder/stage modules allowed to move to CPU.
+            None selects every supplied module for backward compatibility.
+        persistent_dit_staging: Keep DiT weights on fixed device staging
+            storage across swaps, so CUDA-graph-captured weight pointers stay
+            valid. Encoders keep plain move semantics so their memory is
+            actually freed while the DiT runs.
+
+    Example:
+        >>> apply_sequential_offload(
+        ...     dit_modules=[pipeline.transformer],
+        ...     encoder_modules=[pipeline.text_encoder, pipeline.vae],
+        ...     device=torch.device("cuda:0"),
+        ... )
+        >>> # Modules of pipeline now automatically swap between CPU and GPU
+    """
+    selected_dit_ids = {id(module) for module in (dit_modules if offload_dit_modules is None else offload_dit_modules)}
+    selected_encoder_ids = {
+        id(module) for module in (encoder_modules if offload_encoder_modules is None else offload_encoder_modules)
+    }
+
+    all_modules = [*dit_modules, *encoder_modules]
+    initial_devices = _capture_tensor_devices(dit_modules) if offload_initial_dits else []
+    try:
+        selected_encoders = [encoder for encoder in encoder_modules if id(encoder) in selected_encoder_ids]
+        # Register hooks on DiT modules (offload selected encoders and other selected DiTs).
+        for i, dit_mod in enumerate(dit_modules):
+            other_dits = [d for j, d in enumerate(dit_modules) if j != i and id(d) in selected_dit_ids]
+            registry = HookRegistry.get_or_create(dit_mod)
+            hook = SequentialOffloadHook(
+                offload_targets=selected_encoders + other_dits,
+                device=device,
+                pin_memory=pin_memory,
+                use_hsdp=use_hsdp,
+                offload_after_context=id(dit_mod) in selected_dit_ids,
+                persistent_staging=persistent_dit_staging,
+            )
+            registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
+            logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
+
+        # Register hooks on all execution stages so unselected resident modules can
+        # still evict selected DiTs before they run.
+        selected_dits = [dit for dit in dit_modules if id(dit) in selected_dit_ids]
+        for enc in encoder_modules:
+            registry = HookRegistry.get_or_create(enc)
+            hook = SequentialOffloadHook(
+                offload_targets=selected_dits,
+                device=device,
+                pin_memory=pin_memory,
+                use_hsdp=use_hsdp,
+                offload_after_context=id(enc) in selected_encoder_ids,
+            )
+            registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
+            logger.debug("Registered offload hook for %s", enc.__class__.__name__)
+
+        if offload_initial_dits:
+            for dit_mod in dit_modules:
+                if id(dit_mod) not in selected_dit_ids:
+                    continue
+                _get_sequential_offload_hook(dit_mod)._to_cpu(dit_mod)
+    except BaseException:
+        try:
+            remove_sequential_offload(all_modules)
+        except BaseException:
+            logger.exception("Failed to remove every sequential hook during rollback")
+        try:
+            _restore_tensor_devices(initial_devices)
+        except BaseException:
+            logger.exception("Failed to restore initial DiT placement during rollback")
+        raise
+
+
+def remove_sequential_offload(modules: list[nn.Module]) -> None:
+    """Remove sequential offloading hooks from modules.
+
+    Args:
+        modules: Modules to remove hooks from
+
+    Example:
+        >>> all_modules = [*dit_modules, *encoder_modules]
+        >>> remove_sequential_offload(all_modules)
+    """
+    first_error: BaseException | None = None
+    for module in modules:
+        try:
+            registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+            if registry is not None:
+                registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
+                logger.debug("Removed offload hook from %s", module.__class__.__name__)
+        except BaseException as exc:
+            logger.exception("Failed to remove offload hook from %s", module.__class__.__name__)
+            first_error = first_error or exc
+    if first_error is not None:
+        raise RuntimeError("Failed to remove one or more sequential offload hooks") from first_error
+
+
+def _get_sequential_offload_hook(module: nn.Module) -> SequentialOffloadHook:
+    registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+    hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
+    if not isinstance(hook, SequentialOffloadHook):
+        raise RuntimeError(f"{module.__class__.__name__} has no sequential offload hook")
+    return hook
+
+
+def sequential_offload_staging_active(module: nn.Module) -> bool:
+    """True when the module's sequential offload hook serves fixed device storage.
+
+    Fixed staging storage keeps CUDA-graph-captured weight pointers valid
+    across offload/load swaps.
+    """
+    return SequentialOffloadHook._module_stager(module) is not None
+
+
+@contextmanager
+def sequential_offload_component(module: nn.Module) -> Iterator[None]:
+    """Activate and release a hooked component called outside ``forward``."""
+    hook = _get_sequential_offload_hook(module)
+    try:
+        hook.pre_forward(module)
+        yield
+    except BaseException:
+        try:
+            if hook.offload_after_context:
+                hook._to_cpu(module)
+        except Exception:
+            logger.exception("Failed to release %s after component failure", module.__class__.__name__)
+        raise
+    else:
+        if hook.offload_after_context:
+            hook._to_cpu(module)
+
+
+class ModelLevelOffloadBackend(OffloadBackend):
+    """Model-level (sequential) offloading backend.
+
+    Uses SequentialOffloadHook registered via HookRegistry for automatic module swapping.
+    """
+
+    def __init__(self, config: OffloadConfig, device: torch.device):
+        super().__init__(config, device)
+        self._offload_modules: list[nn.Module] = []  # Track modules with hooks
+        self._custom_pipeline: SupportsModelCpuOffload | None = None
+
+    def enable(self, pipeline: nn.Module) -> None:
+        if self.enabled:
+            logger.warning("ModelLevelOffloadBackend already enabled")
+            return
+
+        # Pipelines with non-forward component entry points own their complete
+        # mutual-exclusion lifecycle. Delegate through the explicit protocol.
+        if isinstance(pipeline, SupportsModelCpuOffload):
+            try:
+                if self.config.components is not None:
+                    pipeline.enable_omni_model_cpu_offload(
+                        device=self.device,
+                        pin_memory=self.config.pin_cpu_memory,
+                        use_hsdp=self.config.use_hsdp,
+                        offload_components=self.config.components,
+                    )
+                else:
+                    pipeline.enable_omni_model_cpu_offload(
+                        device=self.device,
+                        pin_memory=self.config.pin_cpu_memory,
+                        use_hsdp=self.config.use_hsdp,
+                    )
+            except BaseException:
+                try:
+                    pipeline.disable_omni_model_cpu_offload()
+                except BaseException:
+                    logger.exception("Model-level cleanup failed while handling an enable failure")
+                raise
+            self._custom_pipeline = pipeline
+            self.enabled = True
+            logger.info(
+                "Model-level offloading enabled through %s.enable_omni_model_cpu_offload",
+                pipeline.__class__.__name__,
+            )
+            return
+
+        resolved = resolve_offload_plan(pipeline, self.config)
+        dits = [component.module for component in resolved.dits]
+        encoders = [component.module for component in resolved.encoders]
+        vaes = [component.module for component in resolved.vaes]
+        residents = [component.module for component in resolved.residents]
+        selected_dits = [component.module for component in resolved.dits if component.selected]
+        selected_encoders = [component.module for component in resolved.encoders if component.selected]
+
+        all_modules = [*dits, *encoders, *vaes, *residents]
+        initial_devices = _capture_tensor_devices(all_modules)
+        try:
+            for encoder in encoders:
+                encoder.to(self.device)
+            for vae in vaes:
+                vae.to(self.device, non_blocking=True)
+            for resident in residents:
+                resident.to(self.device)
+
+            if not dits:
+                logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+                return
+            if not encoders:
+                for dit in dits:
+                    dit.to(self.device)
+                logger.warning("No encoder modules found, skipping model-level offloading")
+                return
+
+            apply_sequential_offload(
+                dit_modules=dits,
+                encoder_modules=encoders,
+                device=self.device,
+                pin_memory=self.config.pin_cpu_memory,
+                use_hsdp=self.config.use_hsdp,
+                offload_dit_modules=selected_dits,
+                offload_encoder_modules=selected_encoders,
+                # Fixed DiT staging keeps decode-graph weight pointers valid;
+                # only models that capture weight pointers (Qwen-Image-2.1's
+                # CUDA-graph decode) pay for it — every other model keeps
+                # plain move semantics so offloading actually frees DiT VRAM
+                # while the encoders run.
+                persistent_dit_staging=(
+                    self.device.type == "cuda" and any(getattr(dit, "enable_cuda_graph_decode", False) for dit in dits)
+                ),
+            )
+        except BaseException:
+            try:
+                remove_sequential_offload([*dits, *encoders])
+            except BaseException:
+                logger.exception("Failed to remove every model-level hook during rollback")
+            try:
+                _restore_tensor_devices(initial_devices)
+            except BaseException:
+                logger.exception("Failed to restore model placement during rollback")
+            raise
+
+        # Track modules for cleanup
+        self._offload_modules = [*dits, *encoders]
+
+        self.enabled = True
+
+        logger.info(
+            "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
+            ", ".join(component.path for component in resolved.dits),
+            ", ".join(component.path for component in resolved.encoders),
+            (
+                f"; resident on GPU: {', '.join(component.path for component in resolved.residents)}"
+                if resolved.residents
+                else ""
+            ),
+        )
+
+    def disable(self) -> None:
+        if not self.enabled:
+            return
+
+        if self._custom_pipeline is not None:
+            self._custom_pipeline.disable_omni_model_cpu_offload()
+            self._custom_pipeline = None
+            self.enabled = False
+            logger.info("Model-level offloading disabled")
+            return
+
+        remove_sequential_offload(self._offload_modules)
+
+        self._offload_modules.clear()
+        self.enabled = False
+        logger.info("Model-level offloading disabled")

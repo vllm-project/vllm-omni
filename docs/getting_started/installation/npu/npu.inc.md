@@ -1,0 +1,242 @@
+# --8<-- [start:requirements]
+
+For detailed hardware and software requirements, please refer to the [vLLM-Ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
+
+# --8<-- [end:requirements]
+# --8<-- [start:installation-release]
+
+The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built Docker images:
+
+=== "A2"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0
+    ```
+
+=== "A3"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-a3
+    ```
+
+=== "A5"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-a5
+    ```
+
+=== "310P (Experimental)"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-310p
+    ```
+
+```bash
+docker run --rm \
+    --name vllm-omni-npu \
+    --shm-size=64g \
+    --device /dev/davinci0 \
+    --device /dev/davinci1 \
+    --device /dev/davinci2 \
+    --device /dev/davinci3 \
+    --device /dev/davinci_manager \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /root/.cache:/root/.cache \
+    -p 8091:8091 \
+    -it "$IMAGE" bash
+
+# Inside the container, install vLLM-Omni from source
+cd /vllm-workspace
+git clone -b v0.30.0 https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+pip install -v -e . --no-build-isolation
+# or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+```
+
+The default workdir is `/workspace`, with vLLM, vLLM-Ascend and vLLM-Omni code placed in `/vllm-workspace` installed in development mode.
+
+For other installation methods (pip installation, building from source, custom Docker builds), please refer to the [vllm-ascend installation guide](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
+
+We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) up to date with the aligned versions of vLLM, vLLM-Ascend, and vLLM-Omni, and also outlining the Q1 roadmap there.
+
+# --8<-- [end:installation-release]
+
+# --8<-- [start:installation-main]
+
+You can also install vLLM-Omni from source if you want to use the latest features
+or bug fixes. This source checkout targets vLLM 0.31.0 and needs a matching
+vLLM-Ascend runtime. The v0.30.0 images above are for the published Omni v0.30.0
+release. Check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886)
+for aligned versions and NPU validation before selecting a development image.
+
+```bash
+# Inside a container with matching vLLM and vLLM-Ascend, install Omni from source
+cd /vllm-workspace
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+pip install -v -e . --no-build-isolation
+# or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+```
+
+# --8<-- [end:installation-main]
+
+# --8<-- [start:pre-built-images]
+
+vLLM-Omni offers Docker images for Ascend NPU deployment. You can just pull the **prebuilt image** from the image repository [ascend/vllm-omni](https://quay.io/repository/ascend/vllm-omni?tab=tags) and run it with bash.
+
+Supported images as following.
+
+| image name | Hardware | OS |
+|-|-|-|
+| image-tag | A2 | Ubuntu |
+| image-tag-a3 | A3 | Ubuntu |
+| image-tag-a5 | A5 | Ubuntu |
+| image-tag-310p | 310P (experimental) | Ubuntu |
+
+Here's an example deployment command that has been verified on 4 x NPUs:
+
+=== "A2"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0
+    docker run --rm \
+        --name vllm-omni-a2 \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
+
+=== "A3"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0-a3
+    docker run --rm \
+        --name vllm-omni-a3 \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
+
+=== "A5"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0-a5
+    docker run --rm \
+        --name vllm-omni-a5 \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
+
+=== "310P (Experimental)"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.30.0-310p
+    docker run --rm \
+        --name vllm-omni-310p \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
+
+!!! tip
+    You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
+
+Or build the image from **source code**:
+
+```bash
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+```
+
+All hardware variants use `docker/Dockerfile.npu`. Choose the device suffix for your hardware:
+
+=== "A2"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu .
+    ```
+
+=== "A3"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a3 .
+    ```
+
+=== "A5"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-a5 .
+    ```
+
+=== "310P (Experimental)"
+
+    ```bash
+    docker build -t vllm-omni-dev-image:latest -f docker/Dockerfile.npu \
+        --build-arg VLLM_ASCEND_DEVICE_SUFFIX=-310p .
+    ```
+
+# --8<-- [end:pre-built-images]

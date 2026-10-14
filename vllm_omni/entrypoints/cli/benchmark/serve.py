@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Online serving benchmark subcommand for vLLM-Omni.
+
+``OmniBenchmarkServingSubcommand`` starts from vLLM's serving benchmark
+arguments, adds Omni-specific options and adaptations, then preprocesses the
+parsed namespace and delegates execution to ``vllm_omni.benchmarks.serve``.
+This keeps CLI integration separate from the multimodal benchmark runtime.
+"""
+
+import argparse
+
+from vllm.benchmarks.serve import add_cli_args
+
+from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
+from vllm_omni.entrypoints.cli.benchmark.cli_args import (
+    add_omni_args,
+    extend_omni_choices,
+    preprocess_serve_args,
+    update_omni_help,
+)
+
+
+class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
+    """The `serve` subcommand for vllm bench."""
+
+    name = "serve"
+    help = "Benchmark online serving. Supports Daily-Omni, OmniInteract, Omni-DuplexEval, and Seed-TTS datasets."
+
+    @classmethod
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
+        add_cli_args(parser)
+        add_omni_args(parser)
+        extend_omni_choices(parser)
+        update_omni_help(parser)
+
+    @staticmethod
+    def cmd(args: argparse.Namespace) -> None:
+        # Deferred: the benchmark runtime imports the duplex client library
+        # (vllm_omni.clients), which must stay out of the CLI import graph —
+        # this module is imported by `vllm-omni serve` as well
+        # (tests/engine/test_duplex_import_boundary.py enforces the boundary).
+        from vllm_omni.benchmarks.serve import main
+
+        preprocess_serve_args(args)
+        main(args)
