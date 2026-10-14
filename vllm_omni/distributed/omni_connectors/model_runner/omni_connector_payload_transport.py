@@ -10,12 +10,13 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
@@ -51,6 +52,7 @@ def _recv_poll_seconds() -> float:
 _RECV_POLL_S = _recv_poll_seconds()
 
 if TYPE_CHECKING:
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
@@ -95,6 +97,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         extracted: dict[str, Any] = {}
         meta = payload.get("meta") if isinstance(payload, dict) else None
         meta = meta if isinstance(meta, dict) else {}
+        if "next_stage_prompt_ids" in meta:
+            extracted["next_stage_prompt_ids"] = meta["next_stage_prompt_ids"]
+        if "next_stage_conditioning_digest" in meta:
+            extracted["next_stage_conditioning_digest"] = meta["next_stage_conditioning_digest"]
         if "next_stage_prompt_len" in meta:
             extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
         else:
@@ -123,6 +129,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         ("meta", "finished"),
         ("meta", "override_keys"),
         ("meta", "next_stage_prompt_len"),
+        ("meta", "next_stage_prompt_ids"),
+        ("meta", "next_stage_conditioning_digest"),
         ("meta", "left_context_size"),
         ("ids", "output"),
         ("embed", "decode_token_start"),
@@ -391,6 +399,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         }
         packet = {
             "staged_payloads": staged_payloads,
+            "input_owners": self._snapshot_input_owners_locked(payload_req_ids),
             "request_metadata": dict(self._local_request_metadata),
             "newly_finished": set(self._finished_load_reqs),
             "chunk_finished": set(self._chunk_finished_req_ids),
@@ -415,7 +424,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         staged_payloads = packet.get("staged_payloads", {})
         chunk_finished = set(packet.get("chunk_finished", ()))
         with self._lock:
-            self._apply_staged_payloads_locked(staged_payloads)
+            owners = packet.get("input_owners", {})
+            current_ids = {
+                req_id
+                for req_id in staged_payloads.keys() | chunk_finished
+                if owners.get(req_id) == self._recv_request_owners.get(req_id)
+            }
+            self._apply_staged_payloads_locked({r: p for r, p in staged_payloads.items() if r in current_ids})
+            chunk_finished.intersection_update(current_ids)
             for req_id in chunk_finished:
                 self._pending_load_reqs.pop(req_id, None)
                 self._chunk_stream_completed.add(req_id)
@@ -502,6 +518,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         that has arrived, or ``None`` if nothing is ready.  Stores full
         payloads in the local cache and extracts scheduling metadata.
         """
+        # Control-only replacements must fence pending receives too. This runs
+        # before the runner's zero-token return, even when no payload arrived.
+        replacements = getattr(scheduler_output, "prefix_cache_replacements", ())
+        if replacements:
+            with self._lock:
+                for event in replacements:
+                    if event.req_id in self._recv_request_owners:
+                        self._record_recv_owner_locked(event.req_id, event.owner)
         # Fast path: when TP is trivial (no peer ranks waiting on a broadcast)
         # and the bg recv thread has not staged anything, skip the lock + TP
         # broadcast cycle entirely. _broadcast_tp_payload_packet already
@@ -514,10 +538,21 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return None
         with self._lock:
             results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
-        results = self._broadcast_tp_payload_packet(results)
-        if not results:
+            packet = (
+                {"staged_payloads": results, "input_owners": self._snapshot_input_owners_locked(results)}
+                if results
+                else None
+            )
+        packet = self._broadcast_tp_payload_packet(packet)
+        if not packet:
             return None
         with self._lock:
+            owners = packet["input_owners"]
+            results = {
+                req_id: payload
+                for req_id, payload in packet["staged_payloads"].items()
+                if owners.get(req_id) == self._recv_request_owners.get(req_id)
+            }
             self._stage_recv_req_ids.update(results.keys())
             for req_id in results:
                 self._pending_load_reqs.pop(req_id, None)
@@ -531,7 +566,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             list(results.keys()),
             self._stage_recv_req_ids,
         )
-        return results
+        return results or None
 
     def _get_model_config(self) -> Any:
         model_config = getattr(self, "model_config", None)
@@ -598,7 +633,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     def _materialize_full_payload_entry(entry):
         if len(entry) == 2:
             return entry
-        chunks, latest, _rows, request = entry
+        chunks, latest, _rows, request = entry[:4]
         output = dict(latest)
         for k, tensors in chunks.items():
             if tensors:
@@ -662,6 +697,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         req_id: str,
         pooler_output: Any,
         request: Any,
+        *,
+        owner: PrefixCacheRequestProgress | None = None,
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
@@ -678,19 +715,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
+
+        The optional captured prefix-cache progress binds this local entry to
+        content, not just a reusable request ID. A new owner starts a fresh
+        accumulator; retired entries are dropped at flush. No tensors are
+        copied or concatenated here, only chunk references are appended.
         """
+        if owner is not None and owner.retired:
+            return
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
+        existing_owner = existing[4] if existing is not None and len(existing) > 4 else None
+        if existing_owner is not owner:
+            existing = None
 
         if existing is None:
             chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
-            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
+            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request, owner)
             return
 
         if len(existing) == 2:
             chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
         else:
-            chunks, latest, rows, _ = existing
+            chunks, latest, rows, _ = existing[:4]
 
         for k, v in pooler_output.items():
             if v is None:
@@ -721,7 +768,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 rows.pop(k, None)
                 latest[k] = v
 
-        self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
+        self._pending_full_payload_send[req_id] = (chunks, latest, rows, request, owner)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -739,6 +786,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
+                owner = entry[4] if len(entry) > 4 else None
+                if owner is not None and owner.retired:
+                    continue
                 to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.debug("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
@@ -840,6 +890,26 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     #  Streaming chunk mode  (recv_chunk / send_chunk)
     # ------------------------------------------------------------------ #
 
+    def _snapshot_input_owners_locked(self, req_ids: Iterable[str]) -> dict[str, PrefixCacheRequestOwner]:
+        return {req_id: owner for req_id in req_ids if (owner := self._recv_request_owners.get(req_id)) is not None}
+
+    def _record_recv_owner_locked(self, req_id: str, owner: PrefixCacheRequestOwner | None) -> bool:
+        """Bind bounded receive state to its local scheduler admission."""
+        previous = self._recv_request_owners.get(req_id)
+        if previous is not None and (owner is None or owner < previous):
+            return False
+        if req_id in self._recv_request_owners and previous != owner:
+            # Transport chunk numbers are not content generations. Retain the
+            # stream position for an in-admission replacement, but reset it
+            # for a new admission using the same request ID.
+            chunk = self._get_req_chunk.get(req_id, 0)
+            self._drop_send_side_payload_state(req_id, self._request_ids_mapping.get(req_id))
+            self._clear_recv_delivery_state(req_id)
+            if previous is not None and owner is not None and previous.admission_id == owner.admission_id:
+                self._get_req_chunk[req_id] = chunk
+        self._recv_request_owners[req_id] = owner
+        return True
+
     def register_chunk_recv(self, request: Any) -> None:
         """Register a request for async chunk retrieval by the bg thread.
 
@@ -854,12 +924,17 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         # otherwise recv keys become `None_<stage>_<chunk>` and collide
         # across requests.
         ext = getattr(request, "external_req_id", None)
-        self._request_ids_mapping[request_id] = ext if ext is not None else request_id
         with self._lock:
+            owner = getattr(request, "input_owner", getattr(request, "_omni_prefix_cache_owner", None))
+            if not self._record_recv_owner_locked(request_id, owner):
+                return
+            self._request_ids_mapping[request_id] = ext if ext is not None else request_id
             if request_id in self._stage_recv_req_ids:
                 return
             # Don't re-register if the finish sentinel was already received
             if request_id in self._chunk_stream_completed:
+                return
+            if request_id in self._pending_load_reqs:
                 return
             self._pending_load_reqs[request_id] = request
         self._work_available.set()
@@ -1133,9 +1208,13 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 return False
 
         target_stage_id = self._stage_id - 1
-        chunk_id = self._get_req_chunk[req_id]
-        external_req_id = self._request_ids_mapping.get(req_id, req_id)
-        request = self._pending_load_reqs.get(req_id)
+        with self._lock:
+            request = self._pending_load_reqs.get(req_id)
+            if request is None:
+                return False
+            owner = self._recv_request_owners.get(req_id)
+            chunk_id = self._get_req_chunk[req_id]
+            external_req_id = self._request_ids_mapping.get(req_id, req_id)
         from_stage, to_stage, connector_get_key, metadata = self._stage_payload_recv_spec(
             external_req_id,
             str(target_stage_id),
@@ -1178,13 +1257,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._payload_finished(payload_data),
             )
 
-        with self._lock:
-            if self._async_chunk and request is not None and req_id not in self._pending_load_reqs:
-                # A connector get can return after cancellation removed its
-                # receiver. Do not recreate delivery state for that request.
-                return False
-            self._get_req_chunk[req_id] += 1
-
         if self._async_chunk:
             is_finished = self._payload_finished(payload_data)
             incoming_payload_consumable = self._payload_is_consumable(payload_data)
@@ -1192,14 +1264,19 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if self._model_mode != "ar":
                 new_ids = self._payload_audio_codes(payload_data)
                 if not self._payload_value_has_content(new_ids) and not is_finished:
+                    with self._lock:
+                        if (
+                            self._pending_load_reqs.get(req_id) is request
+                            and self._recv_request_owners.get(req_id) == owner
+                        ):
+                            self._get_req_chunk[req_id] += 1
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
 
             with self._lock:
-                if request is not None and req_id not in self._pending_load_reqs:
-                    # Receive may overlap cancellation; do not republish
-                    # readiness after the request was torn down.
+                if self._pending_load_reqs.get(req_id) is not request or self._recv_request_owners.get(req_id) != owner:
                     return False
+                self._get_req_chunk[req_id] += 1
                 if self._model_mode == "ar":
                     # Accumulation, staging, and model-side consume/ack share
                     # this lock. Keeping the transition atomic prevents the
@@ -1249,6 +1326,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             else:
                 engine_inputs = payload_data
             with self._lock:
+                if self._pending_load_reqs.get(req_id) is not request or self._recv_request_owners.get(req_id) != owner:
+                    return False
+                self._get_req_chunk[req_id] += 1
                 self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
                 # Publish full-payload readiness only after the aligned TP broadcast
                 # path in recv_full_payload_inputs() has materialized the payload on all
@@ -1491,32 +1571,50 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         return cast(OmniPayload, dict(merged))
 
     def _drain_omni_connector_output(self) -> OmniConnectorOutput:
+        input_owners: dict[str, PrefixCacheRequestOwner] = {}
         tp_group = self._get_local_tp_group()
-        if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+        tp_chunk = self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1
+        fanout_packet = None
+        if tp_chunk:
             if self.is_data_transfer_rank():
                 with self._lock:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()
-            else:
-                fanout_packet = None
             fanout_packet = self._broadcast_tp_payload_packet(fanout_packet)
-            if fanout_packet is None:
-                newly_finished = set()
-                chunk_finished = set()
-                request_metadata = {}
+            if fanout_packet is not None and not self.is_data_transfer_rank():
+                self._apply_async_chunk_fanout_packet(fanout_packet)
+        # Drain metadata, all readiness flags and their owners in one snapshot.
+        # A receive/re-registration between separate drains could otherwise
+        # relabel old metadata with the new owner or consume a new ready flag.
+        with self._lock:
+            if tp_chunk:
+                packet = fanout_packet or {}
+                input_owners = dict(packet.get("input_owners", {}))
+                request_metadata = dict(packet.get("request_metadata", {}))
+                newly_finished = set(packet.get("newly_finished", ()))
+                chunk_finished = set(packet.get("chunk_finished", ()))
+                current_ids = {
+                    req_id
+                    for req_id in request_metadata.keys() | newly_finished | chunk_finished
+                    if input_owners.get(req_id) == self._recv_request_owners.get(req_id)
+                }
+                request_metadata = {r: m for r, m in request_metadata.items() if r in current_ids}
+                newly_finished.intersection_update(current_ids)
+                chunk_finished.intersection_update(current_ids)
+                input_owners = {r: o for r, o in input_owners.items() if r in current_ids}
             else:
-                if not self.is_data_transfer_rank():
-                    self._apply_async_chunk_fanout_packet(fanout_packet)
-                newly_finished = set(fanout_packet["newly_finished"])
-                chunk_finished = set(fanout_packet["chunk_finished"])
-                request_metadata = dict(fanout_packet["request_metadata"])
-        else:
-            with self._lock:
                 newly_finished = set(self._finished_load_reqs)
                 self._finished_load_reqs.clear()
                 chunk_finished = set(self._chunk_finished_req_ids)
                 self._chunk_finished_req_ids.clear()
                 request_metadata = dict(self._local_request_metadata)
                 self._local_request_metadata.clear()
+                input_owners = self._snapshot_input_owners_locked(
+                    request_metadata.keys()
+                    | newly_finished
+                    | chunk_finished
+                    | self._chunk_ready_req_ids
+                    | self._stage_recv_req_ids
+                )
                 # _send_side_request_payload is the async accumulation buffer for
                 # future recv chunks. Clearing it on every consumable wake-up drops
                 # intermediate
@@ -1529,16 +1627,22 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     self._send_side_request_payload.pop(ext_req_id, None)
                     if ext_req_id != req_id:
                         self._send_side_request_payload.pop(req_id, None)
-        self._chunk_ready_req_ids.update(newly_finished)
-
-        output = OmniConnectorOutput(
-            chunk_ready_req_ids=set(self._chunk_ready_req_ids),
-            chunk_finished_req_ids=chunk_finished,
-            request_metadata=request_metadata,
-            kv_sent_req_ids=list(self._kv_sent_req_ids),
-            stage_recv_req_ids=set(self._stage_recv_req_ids),
-            has_pending_kv_work=self.has_pending_kv_work(),
-        )
+            self._chunk_ready_req_ids.update(newly_finished)
+            input_owners.update(
+                self._snapshot_input_owners_locked(self._chunk_ready_req_ids | self._stage_recv_req_ids)
+            )
+            output = OmniConnectorOutput(
+                chunk_ready_req_ids=set(self._chunk_ready_req_ids),
+                chunk_finished_req_ids=chunk_finished,
+                request_metadata=request_metadata,
+                kv_sent_req_ids=list(self._kv_sent_req_ids),
+                stage_recv_req_ids=set(self._stage_recv_req_ids),
+                has_pending_kv_work=self.has_pending_kv_work(),
+                input_owners=input_owners,
+            )
+            self._chunk_ready_req_ids.clear()
+            self._kv_sent_req_ids.clear()
+            self._stage_recv_req_ids.clear()
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
                 "[Stage-%s] get_omni_connector_output: stage_recv=%s, chunk_finished=%s, chunk_ready=%s",
@@ -1547,9 +1651,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 chunk_finished,
                 output.chunk_ready_req_ids,
             )
-        self._chunk_ready_req_ids.clear()
-        self._kv_sent_req_ids.clear()
-        self._stage_recv_req_ids.clear()
         return output
 
     def _enqueue_chunk_payload(

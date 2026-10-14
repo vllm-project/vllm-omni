@@ -6,6 +6,7 @@ from typing import Any
 
 from vllm.v1.request import Request
 
+from vllm_omni.core.sched.input_finalization import install_request_input, prepare_request_input
 from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
@@ -292,6 +293,8 @@ def construct_next_stage_streaming_input_prompt(
                 "fresh streaming prompt plus generation reserve exceeds max_model_len: "
                 f"prompt={managed_prompt_len}, reserve={generation_reserve}, limit={capacity_limit}"
             )
+    if next_stage_prompt_len is not None and (type(next_stage_prompt_len) is not int or next_stage_prompt_len <= 0):
+        raise ValueError("next_stage_prompt_len must be a positive integer")
     explicit_replacement = meta.get("replace_streaming_prompt") is True
     if isinstance(recompute_previous_chunks, bool) or recompute_previous_chunks not in (0, 1):
         raise ValueError("streaming prompt recompute supports exactly one previous chunk")
@@ -387,14 +390,14 @@ def construct_next_stage_streaming_input_prompt(
         # Some downstream stages consume complete, independently conditioned
         # segments instead of extending an existing KV prefix. The producer
         # declares that transport behavior explicitly in payload metadata.
-        new_prompt = [0] * replacement_prompt_len
-        request._output_token_ids.clear()
-        request._all_token_ids.clear()
-        request._all_token_ids.extend(new_prompt)
-        request.prompt_token_ids = new_prompt
-        request.num_computed_tokens = 0
-        request.num_prompt_tokens = replacement_prompt_len
-        request.update_block_hashes()
+        candidate = prepare_request_input(
+            request,
+            prompt_token_ids=[0] * replacement_prompt_len,
+            mm_features=[],
+            cache_salt=getattr(request, "_omni_original_cache_salt", request.cache_salt),
+            sampling_params=request.sampling_params,
+        )
+        install_request_input(request, candidate)
         return True
     prompt_token_ids = ids.get("prompt", None)
     has_declared_prompt_len = (
@@ -412,6 +415,7 @@ def construct_next_stage_streaming_input_prompt(
     # Extend prompt with kept output tokens.
     request.prompt_token_ids.extend(kept_output_tokens)
     if has_declared_prompt_len:
+        assert next_stage_prompt_len is not None
         next_prompt_len = next_stage_prompt_len
     else:
         next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))

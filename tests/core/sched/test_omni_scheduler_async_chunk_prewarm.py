@@ -81,6 +81,10 @@ def base_scheduler(monkeypatch: pytest.MonkeyPatch) -> list[_StubRequest]:
 
 def _make_scheduler(scheduler_cls):
     scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler._prefix_cache_next_admission = 0
+    scheduler._prefix_cache_step_sequence = 0
+    scheduler._prefix_cache_pending_replacements = []
+    scheduler._prefix_cache_pending_terminal_owners = {}
     scheduler.requests = {}
     scheduler.running = []
     scheduler.waiting = []
