@@ -11,10 +11,25 @@
 # YAML anchors are nested lists; the loader flattens them.
 
 x-chatterbox: &chatterbox
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/engine/arg_utils.py
+  - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/entrypoints/openai/serving_speech.py
+  - vllm_omni/entrypoints/openai/tts_adapters/
+  - vllm_omni/worker_v2/
+  - vllm_omni/core/sched/
+  - vllm_omni/config/stage_config.py
+  - vllm_omni/config/omni_config.py
+  - vllm_omni/engine/stage_runtime.py
+  - vllm_omni/engine/stage_init_utils.py
+  - vllm_omni/engine/cuda_mps.py
   - vllm_omni/model_executor/models/chatterbox/
+  - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
+  - vllm_omni/model_executor/models/cosyvoice3/utils.py
+  - vllm_omni/model_executor/models/glm_tts/vocoder.py
+  - vllm_omni/model_executor/models/indextts2/
   - vllm_omni/model_executor/stage_input_processors/chatterbox.py
   - vllm_omni/transformers_utils/configs/chatterbox.py
-  - vllm_omni/entrypoints/openai/tts_adapters/chatterbox.py
   - vllm_omni/deploy/chatterbox.yaml
   - vllm_omni/deploy/chatterbox_turbo.yaml
   - vllm_omni/deploy/chatterbox_high_concurrency.yaml
