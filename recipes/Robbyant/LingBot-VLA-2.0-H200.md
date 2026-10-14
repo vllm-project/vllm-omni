@@ -146,7 +146,9 @@ recovery, reset and reconnect.
 ## Notes
 
 - Memory usage: the FP32 weights take about 25 GB (6.26 B inference
-  parameters). Keep 40 GiB of device memory free, as the serving tests assume.
+  parameters). Serving the repository's online tests (one to three cameras,
+  2 and 10 flow steps) peaked at 30.2 GiB of device memory on an H100 80GB.
+  Keep 40 GiB free, as the serving tests assume.
 - Key flags: `--omni` selects the pipeline; `--deploy-config` carries the
   OpenPI handshake metadata (`policy_server_config`); FP32 and eager execution
   are required.
