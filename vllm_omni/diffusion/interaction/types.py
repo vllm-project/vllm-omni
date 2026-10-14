@@ -20,6 +20,9 @@ InteractionPayload = Mapping[str, object]
 # Prompt specialization narrows this to ``"target"`` only.
 InteractionMode = Literal["target", "velocity"]
 
+# Include coalesced event IDs: acknowledgements also occupy pending memory.
+MAX_PENDING_INTERACTION_EVENTS = 256
+
 
 def synchronized_monotonic_time(stamp: float | None = None) -> float:
     """Return a monotonic timestamp shared across DiT ranks.
