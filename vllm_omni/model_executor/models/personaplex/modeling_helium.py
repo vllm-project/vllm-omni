@@ -104,6 +104,34 @@ class HeliumMLP(nn.Module):
         return x
 
 
+def moshi_attention_window(context: int) -> int:
+    """How many keys, counting its own, a Moshi streaming query attends to.
+
+    Moshi's ``RingKVCache`` holds ``context`` cells but labels the oldest as the
+    next write position, so once it wraps a query attends to the last
+    ``context - 1`` keys (``personaplex_temporal._ringkv_positions`` keeps the
+    same convention). vLLM's sliding window counts the query too, so this is
+    the window that matches Moshi at every position.
+    """
+    return context - 1
+
+
+def check_rope_covers_context(max_model_len: int, max_position_embeddings: int) -> None:
+    """Refuse a context that would read RoPE past Helium's table.
+
+    vllm-omni lets an explicit max_model_len exceed the config's
+    max_position_embeddings (it sets VLLM_ALLOW_LONG_MAX_MODEL_LEN), and vLLM
+    then only warns. Helium's rotary table has one row per position, so a
+    sequence that grows past it would index out of range mid-call.
+    """
+    if max_model_len > max_position_embeddings:
+        raise ValueError(
+            f"max_model_len {max_model_len} exceeds Helium's RoPE table of {max_position_embeddings} "
+            "positions; raise max_position_embeddings with it (PersonaPlex Stage 0: "
+            "hf_overrides.temporal_config.max_position_embeddings)."
+        )
+
+
 def _get_helium_rope(config: HeliumConfig):
     rope_kwargs = {
         "head_size": config.head_dim,
@@ -178,7 +206,7 @@ class HeliumAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
-            per_layer_sliding_window=config.sliding_window,
+            per_layer_sliding_window=moshi_attention_window(config.sliding_window),
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
@@ -306,6 +334,7 @@ class HeliumModel(nn.Module):
         # Helium backbone from its temporal sub-config while the engine's top-level
         # hf_config is the composite PersonaPlexConfig. Defaults to the engine's.
         config = config or vllm_config.model_config.hf_config
+        check_rope_covers_context(vllm_config.model_config.max_model_len, config.max_position_embeddings)
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vocab_size = config.vocab_size

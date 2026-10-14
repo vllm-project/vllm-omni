@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -17,6 +18,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -27,6 +29,7 @@ from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.duplex.intermediate import DUPLEX_POSITION_BASE_KEY, DUPLEX_POSITION_REBASE_KEY
 from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
@@ -1152,6 +1155,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
+        if stage_id == 0 and self._rebase_streaming_positions(session, update):
+            return
         if self._streaming_update_overflows(session, update):
             return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
@@ -1369,6 +1374,145 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         session._minicpmo45_window_open_start = new_preserve_len + sum(int(unit["length"]) for unit in retained_units)
         return True
 
+    # Runtime-config flag a duplex plugin sets when its Stage 0 model adds the
+    # session's ``duplex.position_base`` to its RoPE positions.
+    STREAMING_POSITION_REBASE_KEY = DUPLEX_POSITION_REBASE_KEY
+    # A cut is a multiple of this many tokens (and of the KV page size).
+    # FlashAttention reduces keys in tiles of up to 256 tokens counted from key
+    # 0, so such a cut keeps every in-window key in its tile and the attention
+    # sums in the same order. (The kernel may still split a shorter batch
+    # differently, as it does whenever the batch's longest sequence changes.)
+    STREAMING_REBASE_ALIGN_TOKENS = 256
+
+    def _rebase_streaming_positions(self, session: Request, update: StreamingUpdate) -> bool:
+        """Keep a sliding-window duplex session's placeholder prompt bounded.
+
+        A duplex Stage 0 session grows its prompt by a placeholder per frame, so
+        on its own a call ends at ``max_model_len`` and every append re-ships a
+        prompt that keeps growing. Once the session has run far enough past its
+        sliding window, the block-aligned prefix no later step can attend to is
+        cut from the prompt and from the block table (vLLM has already freed
+        those blocks), and the cut length moves into the session's position
+        base, which the model adds back before RoPE. Absolute positions and the
+        KV still inside the window are untouched, so attention is unchanged
+        (see ``STREAMING_REBASE_ALIGN_TOKENS`` for the order of its sums).
+
+        Opt-in per session through the duplex runtime config
+        (``STREAMING_POSITION_REBASE_KEY``); the base reaches the worker as
+        ``duplex.position_base`` on every append. The RoPE table, sized by the
+        text config's ``max_position_embeddings``, then caps the call instead of
+        ``max_model_len``: an append past it finishes the session like any other
+        context overflow. Returns True when the session was finished.
+        """
+        buffer = getattr(update, "model_intermediate_buffer", None)
+        if not isinstance(buffer, dict):
+            return False
+        duplex = buffer.get("duplex")
+        if not isinstance(duplex, dict):
+            return False
+        runtime_config = duplex.get("runtime_config")
+        if not isinstance(runtime_config, dict) or runtime_config.get(self.STREAMING_POSITION_REBASE_KEY) is not True:
+            return False
+        base = int(getattr(session, "_omni_position_base", 0) or 0)
+        hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
+        max_positions = getattr(hf_text_config, "max_position_embeddings", None)
+        if max_positions:
+            current = max(int(session.num_prompt_tokens), int(session.num_computed_tokens))
+            if self._streaming_update_overflows(
+                session,
+                update,
+                projected_len=base + current + len(update.prompt_token_ids or ()),
+                max_len=int(max_positions),
+                limit_name="max_position_embeddings",
+            ):
+                return True
+        cut = self._trim_streaming_prompt_behind_window(session)
+        if cut:
+            base += cut
+            logger.debug(
+                "[Omni] %s: cut %d prompt tokens behind the sliding window; position base %d",
+                session.request_id,
+                cut,
+                base,
+            )
+        session._omni_position_base = base
+        update.model_intermediate_buffer = {**buffer, "duplex": {**duplex, DUPLEX_POSITION_BASE_KEY: base}}
+        return False
+
+    def _trim_streaming_prompt_behind_window(self, session: Request) -> int:
+        """Cut the prompt prefix behind the session's KV window; return its length.
+
+        Applies only on a Stage 0 whose KV groups share one sliding window, and
+        only once the span behind that window reaches half the slack between
+        the window and ``max_model_len``: the session then runs that many frames
+        between cuts, and an append that cannot cut (tokens still in flight)
+        leaves the other half as headroom. The cut is a whole number of pages,
+        so token ``p`` of the trimmed session sits in the page token
+        ``p + cut`` used, and of attention tiles
+        (``STREAMING_REBASE_ALIGN_TOKENS``).
+        """
+        groups = getattr(getattr(self, "kv_cache_config", None), "kv_cache_groups", None) or ()
+        windows = {
+            group.kv_cache_spec.sliding_window if isinstance(group.kv_cache_spec, SlidingWindowSpec) else None
+            for group in groups
+        }
+        if len(windows) != 1 or None in windows:
+            return 0
+        (window,) = windows
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        align = math.lcm(self.STREAMING_REBASE_ALIGN_TOKENS, *(manager.block_size for manager in managers))
+        quantum = (int(self.max_model_len) - window) // 2 // align * align
+        if quantum <= 0:
+            logger.warning_once(
+                "[Omni] max_model_len %d leaves no room past the %d-token sliding window to rebase "
+                "streaming sessions; sessions end at max_model_len",
+                int(self.max_model_len),
+                window,
+            )
+            return 0
+        computed = int(session.num_computed_tokens)
+        if computed < session.num_prompt_tokens or session.num_in_flight_tokens:
+            return 0
+        if session.block_hashes:
+            # Block hashes (prefix caching or a KV connector) chain over the
+            # prompt from token 0; a cut would misalign them with the trimmed
+            # block table.
+            logger.warning_once(
+                "[Omni] %s: this session's blocks are hashed (prefix caching or a KV connector); not rebasing",
+                session.request_id,
+            )
+            return 0
+        # The next step attends to the last ``window - 1`` computed tokens.
+        behind = computed - (window - 1)
+        if behind < quantum:
+            return 0
+        cut = behind // align * align
+        request_id = session.request_id
+        # vLLM frees these pages at the next allocation; free them now so the
+        # whole cut prefix is null pages.
+        self.kv_cache_manager.remove_skipped_blocks(request_id, computed)
+        null_block = self.kv_cache_manager.block_pool.null_block
+        cuts = []
+        for manager in managers:
+            blocks = manager.req_to_blocks.get(request_id)
+            num_blocks = cut // manager.block_size
+            if blocks is None or len(blocks) < num_blocks or any(b is not null_block for b in blocks[:num_blocks]):
+                logger.warning_once(
+                    "[Omni] %s: KV pages behind the sliding window are still allocated; not rebasing",
+                    request_id,
+                )
+                return 0
+            cuts.append((manager, num_blocks))
+        for manager, num_blocks in cuts:
+            del manager.req_to_blocks[request_id][:num_blocks]
+            if request_id in manager.num_cached_block:
+                manager.num_cached_block[request_id] = max(0, manager.num_cached_block[request_id] - num_blocks)
+        del session._all_token_ids[:cut]
+        del session.prompt_token_ids[:cut]
+        session.num_prompt_tokens -= cut
+        session.num_computed_tokens -= cut
+        return cut
+
     # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
     # serving side can map it to a stable error code.
     STREAMING_CONTEXT_OVERFLOW_STOP_REASON = "context_length_exceeded"
@@ -1379,6 +1523,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         update: StreamingUpdate,
         *,
         projected_len: int | None = None,
+        max_len: int | None = None,
+        limit_name: str = "max_model_len",
     ) -> bool:
         """Finish a streaming session whose next extension cannot fit the model.
 
@@ -1407,9 +1553,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         ``projected_len`` overrides the extended-prompt projection for a caller
         that replaces the prompt instead of growing it, such as the MiniCPM
-        Stage-0 window rebuild.
+        Stage-0 window rebuild. ``max_len`` and ``limit_name`` check a limit
+        other than ``max_model_len``, such as the RoPE positions of a session
+        whose prompt is rebased (:meth:`_rebase_streaming_positions`).
         """
-        max_model_len = getattr(self, "max_model_len", None)
+        max_model_len = max_len if max_len is not None else getattr(self, "max_model_len", None)
         if max_model_len is None:
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
             max_model_len = getattr(model_config, "max_model_len", None)
@@ -1433,7 +1581,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return False
         reason = (
             f"{self.STREAMING_CONTEXT_OVERFLOW_STOP_REASON}: streaming session prompt would grow to "
-            f"{projected} tokens, leaving no room to sample within max_model_len {int(max_model_len)}"
+            f"{projected} tokens, leaving no room to sample within {limit_name} {int(max_model_len)}"
         )
         logger.error(
             "[Omni] %s: %s; finishing the request instead of extending it",

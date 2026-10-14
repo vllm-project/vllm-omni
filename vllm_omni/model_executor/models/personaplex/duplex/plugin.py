@@ -25,6 +25,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputDecision,
 )
+from vllm_omni.engine.duplex.intermediate import DUPLEX_POSITION_REBASE_KEY
 from vllm_omni.engine.duplex.plugin import (
     DefaultDuplexModelSessionState,
     DuplexModelPlugin,
@@ -54,6 +55,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "personaplex_model_path",
         "personaplex_voice_prompt",
         "personaplex_persona",
+        DUPLEX_POSITION_REBASE_KEY,
     }
 )
 
@@ -209,6 +211,9 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
             "personaplex_voice_prompt": voice,
             "personaplex_persona": persona,
             "personaplex_prefill_slots": prefill_slots,
+            # The talker adds Stage 0's position base back before RoPE, so the
+            # scheduler may cut a long call's prompt behind the sliding window.
+            DUPLEX_POSITION_REBASE_KEY: True,
         }
 
     async def _prefill_slots_for(self, model_path: str, voice: str, persona: str) -> int:

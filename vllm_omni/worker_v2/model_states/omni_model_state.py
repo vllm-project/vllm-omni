@@ -928,6 +928,8 @@ class OmniModelState(DefaultModelState):
 
             ids_slice = input_ids[start : start + n_tok]
             emb_slice = embeds[start : start + n_tok]
+            # Where this request's tokens start in the step's flat batch.
+            info["_omni_token_start"] = start
             new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
 
             # Write back in-place

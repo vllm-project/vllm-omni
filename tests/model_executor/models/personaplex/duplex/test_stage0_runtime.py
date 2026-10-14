@@ -532,3 +532,81 @@ def test_talker_gives_the_aborted_epoch_a_neutral_row_in_the_same_step() -> None
     assert stale_info["pplex_depformer_audio_tokens"].numel() == 16
     assert outs["req-e1"][2]["duplex"]["epoch"] == 1
     assert list(runtime.sessions) == [("session", 1)]
+
+
+def _talker_with_position_base(runtime: PersonaPlexStage0DuplexRuntime, num_tokens: int = 8):
+    talker = PersonaPlexTalkerForConditionalGeneration.__new__(PersonaPlexTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._personaplex_duplex_stage0_runtime = runtime
+    talker._dtype = torch.float32
+    talker.mtp_hidden_size = 4
+    talker.register_buffer("_rope_position_base", torch.zeros(num_tokens, dtype=torch.long), persistent=False)
+    talker.register_buffer("_rope_positions", torch.zeros(num_tokens, dtype=torch.long), persistent=False)
+    return talker
+
+
+def test_talker_rotates_a_rebased_session_at_its_absolute_positions() -> None:
+    """The scheduler cuts a long session's prompt behind the KV window and
+    sends the cut length as ``duplex.position_base``: preprocess writes it over
+    the session's tokens, and the next forward adds it to the runner's
+    positions, which count from the cut, then clears it."""
+    talker = _talker_with_position_base(_runtime(_FakeCodec()))
+    talker.preprocess(
+        torch.zeros(18, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        duplex=_duplex_info(seq=1),
+        request_id="req",
+        duplex_prompt_len=18,
+        duplex_token_offset=0,
+        _omni_token_start=0,
+    )
+    assert not talker._rope_position_base.any()
+
+    append = {**_duplex_info(seq=2), "position_base": 4096}
+    talker.preprocess(
+        torch.zeros(1, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        duplex=append,
+        request_id="req",
+        duplex_prompt_len=19,
+        duplex_token_offset=18,
+        _omni_token_start=3,
+    )
+    assert talker._rope_position_base.tolist() == [0, 0, 0, 4096, 0, 0, 0, 0]
+
+    seen = []
+    talker.model = lambda _ids, positions, _intermediate, _embeds: seen.append(positions)
+    talker.forward(None, torch.arange(5), None, torch.zeros(5, 4))
+    assert seen[0].tolist() == [0, 1, 2, 4099, 4]
+    assert not talker._rope_position_base.any()
+
+    # Helium always reads its positions at one address: piecewise CUDA graphs
+    # replay from the input addresses captured.
+    talker.forward(None, torch.arange(5) + 7, None, torch.zeros(5, 4))
+    assert seen[1].tolist() == [7, 8, 9, 10, 11]
+    assert seen[0].data_ptr() == seen[1].data_ptr() == talker._rope_positions.data_ptr()
+
+
+def test_talker_refuses_a_position_base_without_token_offsets() -> None:
+    talker = _talker_with_position_base(_runtime(_FakeCodec()))
+    talker.preprocess(
+        torch.zeros(18, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        duplex=_duplex_info(seq=1),
+        request_id="req",
+        duplex_prompt_len=18,
+        duplex_token_offset=0,
+    )
+    with pytest.raises(RuntimeError, match="_omni_token_start"):
+        talker.preprocess(
+            torch.zeros(1, dtype=torch.long),
+            None,
+            _omni_is_prefill=True,
+            duplex={**_duplex_info(seq=2), "position_base": 4096},
+            request_id="req",
+            duplex_prompt_len=19,
+            duplex_token_offset=18,
+        )
