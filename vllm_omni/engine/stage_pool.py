@@ -1019,6 +1019,7 @@ class StagePool:
         affinity_request_id: str | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
+        expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
@@ -1047,6 +1048,14 @@ class StagePool:
             request_id,
             affinity_request_id=affinity_request_id,
         )
+        # A request whose multimodal cache keys name a replica must not move: that
+        # replica's sender-cache entries may omit media the new one never received.
+        if expected_replica_id is not None and replica_id != expected_replica_id:
+            self.release_binding(request_id)
+            raise StageUnavailableError(
+                f"stage {self.stage_id} replica {expected_replica_id} keyed by {request_id} became "
+                "unavailable before submit"
+            )
         client = self.clients[replica_id]
         if client is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")

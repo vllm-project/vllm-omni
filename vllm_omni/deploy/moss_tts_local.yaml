@@ -18,9 +18,13 @@ connectors:
       connector_get_max_wait: 300
       initial_codec_chunk_frames: 1  # 80 ms first packet at 48 kHz
       codec_chunk_frames: 15  # 1.2 s steady chunks
+      # Stage0 sends frame 1; Stage1 adds 160 ms, then 480 ms, then 1.2 s.
+      codec_chunk_ramp: [3, 6, 15]
       codec_left_context_frames: 0
       generation_min_batch_size: 16
       generation_max_wait_ms: 6
+      # Decode first chunks separately from longer continuation chunks.
+      generation_first_chunk_express: true
 stages:
   - stage_id: 0
     max_num_seqs: 64
@@ -82,7 +86,7 @@ platforms:
         attention_config:
           backend: TRITON_ATTN
       - stage_id: 1
-        # Graphs cover both batch B and codec chunk length T={1, 15}.
+        # Codec frame graph buckets are derived from codec_chunk_ramp above.
         compilation_config:
           mode: 3
           backend: inductor

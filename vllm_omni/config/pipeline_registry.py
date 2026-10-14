@@ -58,6 +58,7 @@ from vllm_omni.model_executor.models.cosmos3.pipeline import (
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
+from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
@@ -76,6 +77,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS25_PIPELINE,
 )
 from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
@@ -156,6 +158,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "cosyvoice3": resolve_cosyvoice3_pipeline,
     "covo_audio": COVO_AUDIO_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
+    "fish_omni": FISH_OMNI_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
@@ -170,6 +173,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2": INDEXTTS2_PIPELINE,
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
+    "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,

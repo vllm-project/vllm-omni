@@ -150,6 +150,7 @@ _PIPELINE_STAGES = [
     "dac_decoder",
     "diffusion",
     "dit",
+    "fish_omni",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
     "gepard",

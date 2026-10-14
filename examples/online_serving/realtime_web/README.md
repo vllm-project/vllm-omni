@@ -216,7 +216,9 @@ This Qwen3 UI profile requires the server-VAD deployment above.
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).
-- `--ref-audio`: required for MiniCPM; rejected for Qwen3 and AURA.
+- `--ref-audio`: optional MiniCPM assistant voice override; the server uses the
+  model-bundled `assets/HT_ref_audio.wav` when it is omitted. Rejected for
+  Qwen3 and AURA.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.
