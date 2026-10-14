@@ -2,18 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Original scheduled prompt reconstruction and guidance request metadata."""
 
+from collections.abc import Callable, Iterator
+
 import pytest
 import torch
-from torch import nn
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.model_executor.models.chatterbox.chatterbox import ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
-from vllm_omni.model_executor.models.chatterbox.original_heads import (
-    OriginalHeads,
-    original_prefill_embeds,
-    original_speech_embeds,
-)
+from vllm_omni.model_executor.models.chatterbox.original_heads import original_prefill_embeds, original_speech_embeds
 from vllm_omni.model_executor.stage_input_processors.chatterbox import (
     expand_original_cfg_prompts,
     prepare_original_prompt,
@@ -24,15 +22,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
-def model():
-    config = ChatterboxConfig("original")
-    config.hidden_size = 8
-    talker = object.__new__(ChatterboxOriginalT3)
-    nn.Module.__init__(talker)
-    talker.config = config
-    talker.heads = OriginalHeads(config).eval()
-    talker.cfg_pairs = {}
-    return talker
+def model(built_stage: Callable[[str, int], ChatterboxForConditionalGeneration]) -> Iterator[ChatterboxOriginalT3]:
+    """Original's stage 0 as the engine builds it from the deploy file.
+
+    The stage is shared by the module, so each test's guidance
+    registrations are released afterwards the way the runner releases them.
+    """
+    talker = built_stage("original", 0).model
+    yield talker
+    talker.on_requests_finished(set(talker.cfg_pairs))
 
 
 @pytest.fixture
@@ -57,7 +55,8 @@ def test_prefill_slices_and_recomputed_speech(model, metadata, offset, span):
         model.heads,
         torch.tensor(metadata["ids"]["prompt"]),
         torch.tensor(metadata["ids"]["speech_token"]),
-        metadata["embed"]["voice"],
+        # The voice arrives in float32; the stage runs in the deploy file's bfloat16.
+        metadata["embed"]["voice"].to(model.heads.text_emb.weight.dtype),
         exaggeration=0.7,
     )
     full = torch.cat((prompt, original_speech_embeds(model.heads, torch.tensor([17] * 3), torch.arange(1, 4))))

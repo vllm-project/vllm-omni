@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-from types import SimpleNamespace
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -8,7 +8,8 @@ from torch import nn
 from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.models.interfaces_base import is_text_generation_model
 
-from vllm_omni.model_executor.models.chatterbox import chatterbox
+from tests.model_executor.models.chatterbox.helpers import DEPLOY, build_stage, stage_vllm_config
+from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.model_executor.models.chatterbox.chatterbox import STAGES, ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import ChatterboxS3Gen
@@ -18,33 +19,15 @@ from vllm_omni.model_executor.models.registry import _OMNI_MODELS, OmniModelRegi
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
-class StubStage(nn.Module):
-    """A stage with one parameter, a forward and a loader."""
-
-    def __init__(self, *, vllm_config: SimpleNamespace, prefix: str = "") -> None:
-        super().__init__()
-        self.prefix = prefix
-        self.weight = nn.Parameter(torch.zeros(1))
-
-    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **runner_kwargs):
-        return runner_kwargs
-
-    def load_weights(self, weights):
-        return {"weight"}
-
-
-@pytest.fixture
-def unified(monkeypatch: pytest.MonkeyPatch) -> ChatterboxForConditionalGeneration:
-    monkeypatch.setitem(chatterbox.STAGES, "stub", StubStage)
-    config = SimpleNamespace(model_config=SimpleNamespace(model_stage="stub"))
-    return ChatterboxForConditionalGeneration(vllm_config=config)
+BuiltStage = Callable[[str, int], ChatterboxForConditionalGeneration]
 
 
 @pytest.mark.parametrize(
-    ("stage", "flags", "hooks", "undefined"),
+    ("variant", "stage_id", "stage", "flags", "hooks", "undefined"),
     [
         (
+            "turbo",
+            0,
             ChatterboxT3ForConditionalGeneration,
             # Without the first the runner never calls preprocess; without the
             # second it drops make_omni_output's payload; with the third true it
@@ -55,6 +38,8 @@ def unified(monkeypatch: pytest.MonkeyPatch) -> ChatterboxForConditionalGenerati
             ["mrv2_decode_preprocess_is_identity", "make_omni_output_mrv2", "on_requests_finished"],
         ),
         (
+            "original",
+            0,
             ChatterboxOriginalT3,
             # The last two have the runner sample through the stage's guidance
             # sampler and hand it each request's guidance pair.
@@ -69,6 +54,8 @@ def unified(monkeypatch: pytest.MonkeyPatch) -> ChatterboxForConditionalGenerati
             ["mrv2_decode_preprocess_is_identity", "make_omni_output_mrv2"],
         ),
         (
+            "turbo",
+            1,
             ChatterboxS3Gen,
             # Without requires_request_ids the runner passes no ids, and
             # decode_step returns empty audio for every request with no error.
@@ -84,14 +71,21 @@ def unified(monkeypatch: pytest.MonkeyPatch) -> ChatterboxForConditionalGenerati
     ids=["chatterbox_t3", "chatterbox_original_t3", "chatterbox_s3gen"],
 )
 def test_the_runners_find_each_stages_hooks_on_the_registered_class(
-    stage: type[nn.Module], flags: dict[str, bool], hooks: list[str], undefined: list[str]
+    built_stage: BuiltStage,
+    variant: str,
+    stage_id: int,
+    stage: type[nn.Module],
+    flags: dict[str, bool],
+    hooks: list[str],
+    undefined: list[str],
 ) -> None:
-    """Both runners look hooks up on the class the registry names, with ``getattr`` and ``hasattr``."""
-    unified = object.__new__(ChatterboxForConditionalGeneration)
-    nn.Module.__init__(unified)
-    unified.model = object.__new__(stage)
-    nn.Module.__init__(unified.model)
+    """Both runners look hooks up on the class the registry names, with ``getattr`` and ``hasattr``.
 
+    The wrapper is built from each deploy file's stage, as the engine builds it.
+    """
+    unified = built_stage(variant, stage_id)
+
+    assert type(unified.model) is stage
     assert {name: getattr(unified, name) for name in flags} == flags
     for name in hooks:
         assert getattr(unified, name) == getattr(unified.model, name), name
@@ -99,20 +93,68 @@ def test_the_runners_find_each_stages_hooks_on_the_registered_class(
         assert not hasattr(unified, name), name
 
 
-def test_loaded_names_carry_the_wrapper_prefix(unified: ChatterboxForConditionalGeneration) -> None:
-    """vLLM fails the load on any parameter the returned set does not name."""
-    assert unified.model.prefix == "model"
-    assert unified.load_weights(iter(())) == {name for name, _ in unified.named_parameters()} == {"model.weight"}
+def test_the_stage_is_built_under_the_wrappers_prefix(model_dir: str, built_stage: BuiltStage) -> None:
+    """vLLM names every attention layer by its module path; the stage sits under ``model``.
+
+    ``built_stage`` keeps vLLM's process groups up, which the backbone reads
+    when it is built.
+    """
+    config = stage_vllm_config(model_dir, DEPLOY["turbo"], 0)
+
+    unified = build_stage(config, "cpu")
+
+    layers = config.compilation_config.static_forward_context
+    assert set(layers) == {f"model.tfmr.h.{layer}.attn.attn" for layer in range(unified.model.config.num_hidden_layers)}
+    assert all(layers[name] is unified.get_submodule(name) for name in layers)
+    assert all(name.startswith("model.") for name, _ in unified.named_parameters())
 
 
-def test_forward_passes_runner_keywords_through(unified: ChatterboxForConditionalGeneration) -> None:
-    assert unified(torch.zeros(1), torch.zeros(1), seq_token_counts=[1]) == {"seq_token_counts": [1]}
+def test_forward_passes_runner_keywords_through(built_stage: BuiltStage) -> None:
+    """Stage 1's audio comes back through the wrapper as the stage returns it.
+
+    Its keywords are the runner's (``seq_token_counts``, the payloads, the
+    request ids); the vocoder draws its noise, so both calls are seeded alike.
+    """
+    unified = built_stage("turbo", 1)
+    torch.manual_seed(4)
+    voice = {
+        "speech_token": torch.randint(0, 6561, (1, 20)),
+        "speech_feat": torch.randn(1, 40, 80),
+        "embedding": torch.randn(1, 192),
+    }
+    payload = {"meta": {"stream_finished": torch.tensor(True), "left_context_size": 0}, "embed": voice}
+    tokens = torch.randint(0, 6561, (23,))
+
+    def decode(module: nn.Module, request_id: str) -> dict:
+        torch.manual_seed(5)
+        output = module(
+            tokens,
+            torch.arange(23),
+            seq_token_counts=[23, 0],
+            model_intermediate_buffer=[payload, {}],
+            request_ids=[request_id, "done"],
+        )
+        return output.multimodal_outputs
+
+    through_wrapper, direct = decode(unified, "a"), decode(unified.model, "b")
+
+    assert [audio.shape for audio in through_wrapper["audio"]] == [(2 * (23 + 3) * 480,), (0,)]
+    assert all(torch.equal(a, b) for a, b in zip(through_wrapper["audio"], direct["audio"], strict=True))
+    assert [int(rate) for rate in through_wrapper["sr"]] == [24000, 24000]
+    assert unified.model.streams == {}
 
 
-def test_unknown_stage_is_refused_by_name() -> None:
-    config = SimpleNamespace(model_config=SimpleNamespace(model_stage="chatterbox_vocoder"))
+def test_unknown_stage_is_refused_by_name(model_dir: str) -> None:
+    config = OmniEngineArgs(
+        model=model_dir,
+        model_arch="ChatterboxForConditionalGeneration",
+        model_stage="chatterbox_vocoder",
+        worker_type="generation",
+        skip_tokenizer_init=True,
+    ).create_engine_config()
+
     with pytest.raises(KeyError, match="chatterbox_vocoder"):
-        ChatterboxForConditionalGeneration(vllm_config=config)
+        build_stage(config, "cpu")
 
 
 def test_one_registered_architecture_wraps_every_stage() -> None:
