@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 from collections.abc import Awaitable
 from dataclasses import replace
@@ -21,6 +22,7 @@ from tests.engine.duplex.test_session_runner import (
     commands,
     listen_output,
     open_harness,
+    pcm_f32,
     tts_output,
     types,
 )
@@ -415,6 +417,61 @@ async def test_a_commit_is_acknowledged_once_the_turn_it_submitted_is_decided() 
         (ack,) = _acks(events)
         assert (ack.trigger, ack.input_index) == ("input_audio_buffer.commit", 2)
         assert ack.units == ({"end_ms": 200, "decision": "listen"},)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_unit_built_from_several_appends_belongs_to_the_input_that_completes_it() -> None:
+    """600 ms + 600 ms + commit, 1 s units: the second append owns the unit, the commit owns the rest."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        (ack,) = _acks(await h.run(append_audio(samples=9600)))
+        assert (ack.input_index, ack.audio_end_ms, ack.unit_end_ms, ack.units) == (1, 600, 0, ())
+        assert h.port.submissions == []
+
+        assert _acks(await h.run(append_audio(samples=9600))) == []
+        (ack,) = _acks(await _deliver_listen(h, h.port.submissions[-1].context.request_id))
+        assert (ack.trigger, ack.input_index, ack.audio_end_ms, ack.unit_end_ms) == (
+            "input_audio_buffer.append",
+            2,
+            1200,
+            1000,
+        )
+        assert ack.units == ({"end_ms": 1000, "decision": "listen"},)
+
+        assert _acks(await h.run(commands.Commit())) == []
+        (ack,) = _acks(await _deliver_listen(h, h.port.submissions[-1].context.request_id))
+        assert (ack.trigger, ack.input_index, ack.audio_end_ms, ack.unit_end_ms) == (
+            "input_audio_buffer.commit",
+            3,
+            1200,
+            1200,
+        )
+        assert ack.units == ({"end_ms": 1200, "decision": "listen"},)
+        assert len(h.port.submissions) == 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_commit_flushes_the_trailing_partial_unit_padded_by_the_model_not_counted_as_input() -> None:
+    """The committed 200 ms is one final submission; the model pads it to its 1 s unit, the session adds nothing."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        await h.run(append_audio(samples=3200))
+        await h.run(commands.Commit())
+
+        (final,) = h.port.submissions
+        duplex = final.prompt["model_intermediate_buffer"]["duplex"]
+        assert duplex["final"] is True
+        audio = base64.b64decode(duplex["payload"]["audio"])
+        assert len(audio) == 16000 * 4, "padded to the model's unit by its input buffer"
+        assert audio[: 3200 * 4] == pcm_f32(3200) and set(audio[3200 * 4 :]) == {0}
+
+        (ack,) = _acks(await _deliver_listen(h, final.context.request_id))
+        assert (ack.audio_end_ms, ack.unit_end_ms) == (200, 200), "the padding is not client input"
+        assert len(h.port.submissions) == 1, "no silence unit of the session's own"
     finally:
         await close_harness(h)
 
@@ -973,7 +1030,11 @@ async def test_late_audio_of_a_timed_out_speaking_unit_is_not_credited_to_the_ne
         assert h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True) is False
         await h.settle()
 
-        assert _acks(await _deliver_audio_end(h, request_id)) == [], "the end of unit 1's audio, late"
+        late = await h.deliver_and_settle(
+            tts_output(request_id, samples=48000, text="hello", tts_is_last_chunk=True), segment_finished=True
+        )
+        assert "response.output_audio.delta" in types(late), "sent after its acknowledgement, not dropped"
+        assert _acks(late) == [], "the end of unit 1's audio, late"
         (ack,) = _acks(await _deliver_audio_end(h, request_id))
 
         assert ack.input_index == 2 and _units(ack) == [("speak", None)]
