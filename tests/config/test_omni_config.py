@@ -179,6 +179,42 @@ def test_nested_stage_override_deep_merges_structured_model_config() -> None:
     assert model_config["policy_server_config"]["action_space"] == "joint_position"
 
 
+def test_global_model_config_override_deep_merges_structured_model_config() -> None:
+    pipeline = _resolve_pipeline_or_skip("cosmos3_omni_deploy")
+    # cosmos3_omni.yaml already ships ``guardrails: false``; flip it back to True
+    # (plus a nested key) so the CLI override is observable.
+    deploy = load_deploy_config(_DEPLOY_DIR / "cosmos3_omni.yaml")
+    deploy.stages[0].engine_extras["model_config"] = {
+        "guardrails": True,
+        "inference_overrides": {"history_mode": "full"},
+    }
+
+    baseline = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert baseline.stage_by_id(0).diffusion_config.model_config["guardrails"] is True
+
+    # --no-guardrails emits a global (not stage-scoped) model_config override.
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model_config": {"guardrails": False}},
+    )
+
+    model_config = config.stage_by_id(0).diffusion_config.model_config
+    assert model_config["guardrails"] is False
+    assert model_config["inference_overrides"]["history_mode"] == "full"
+
+
+def test_global_model_config_override_skips_llm_stages() -> None:
+    overrides = {"model_config": {"guardrails": False}}
+
+    assert "model_config" not in omni_config_module._stage_cli_overrides(
+        0, overrides, execution_type=StageExecutionType.LLM_AR
+    )
+    assert omni_config_module._stage_cli_overrides(0, overrides, execution_type=StageExecutionType.DIFFUSION)[
+        "model_config"
+    ] == {"guardrails": False}
+
+
 def _build_single_diffusion_config(
     *,
     cli_overrides: dict | None = None,
@@ -825,6 +861,17 @@ def test_joyai_code2wav_waits_for_full_payload():
     assert code2wav.model_config.requires_full_payload_input is True
 
 
+def test_joyai_asr_profile_topology():
+    config = _from_pipeline_key("joyai_vl_interaction_asr")
+    asr, joyai, talker, _ = (config.stage_by_id(i) for i in range(4))
+
+    assert [stage.model_stage for stage in config.stage_configs] == ["asr", "joyvl", "qwen3_tts", "code2wav"]
+    assert asr.bypass_without_modalities == ("audio",)
+    assert joyai.model_config.model_arch == "Qwen3VLForConditionalGeneration"
+    assert joyai.custom_process_input_func.endswith("joyai_vl_interaction.asr_to_joyai")
+    assert talker.custom_process_input_func.endswith("joyai_vl_interaction.joyai_action_to_tts")
+
+
 @pytest.mark.parametrize("model_runner", ["v1", "v2"])
 def test_deploy_model_runner_selection_propagates_to_every_stage(tmp_path: Path, model_runner: str):
     deploy_path = tmp_path / "qwen3_tts_runner.yaml"
@@ -1364,9 +1411,24 @@ def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():
     assert cfg.world_size == 4
 
 
-def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():
-    with pytest.raises(ValidationError):
-        OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
+def test_diffusion_parallel_config_accepts_ulysses_allgather_composition():
+    cfg = OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
+
+    assert cfg.sequence_parallel_size == 4
+    assert cfg.world_size == 4
+
+
+def test_diffusion_parallel_config_rejects_allgather_composed_with_ring():
+    with pytest.raises(ValidationError, match="cannot be composed with ring_degree"):
+        OmniStageDiffusionParallelConfig(allgather_degree=2, ring_degree=2)
+
+
+def test_diffusion_parallel_config_derives_sequence_parallel_size_from_all_three_degrees():
+    cfg = OmniStageDiffusionParallelConfig(ulysses_degree=2, ring_degree=2, allgather_degree=1)
+    assert cfg.sequence_parallel_size == 4
+
+    cfg = OmniStageDiffusionParallelConfig(ulysses_degree=2, allgather_degree=4)
+    assert cfg.sequence_parallel_size == 8
 
 
 def test_stage_realizations_use_stage_specific_parallel_config_types():
@@ -2350,3 +2412,23 @@ def test_async_chunk_auto_disabled_without_processor():
     # since doing so will just raise a ValueError in validation.
     merge_pipeline_deploy(pipeline, deploy)
     assert not deploy.async_chunk
+
+
+def test_mrv2_duplex_session_validation():
+    from vllm_omni.config.stage_config import validate_native_mrv2_session
+
+    ps = StagePipelineConfig(
+        stage_id=1,
+        model_stage="tts",
+        input_sources=(0,),
+        supports_native_mrv2_data_plane=True,
+        supports_duplex_mrv2=True,
+    )
+    # Allowed when supports_duplex_mrv2 is True
+    deploy_duplex = DeployConfig(session_mode="duplex")
+    validate_native_mrv2_session(deploy_duplex, ps, "v2")
+
+    # Rejected when supports_duplex_mrv2 is False
+    ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
+    with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
+        validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")

@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from transformers import GPT2Config
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import MossTTSLocalDepthTransformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
@@ -138,7 +139,7 @@ def test_lookup_retains_compiled_fallback_sampler(monkeypatch, configured, env, 
     assert (model._compiled_audio_sampler is depth._sample_token) is expected
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_lookup_compiled_cuda_graph_replay():

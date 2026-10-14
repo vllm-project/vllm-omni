@@ -12,17 +12,17 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
-import asyncio
-import threading
 import time as _time
 from collections.abc import Coroutine
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.v1.engine import FinishReason
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputContext,
@@ -80,7 +80,6 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._prompt_processing_lock = threading.Lock()
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
         self.session_manager = DuplexSessionManager(
@@ -189,6 +188,26 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request_id=request_id,
             context=context,
         )
+
+    async def _report_duplex_session_request_error(
+        self,
+        stage_id: int,
+        replica_id: int | None,
+        eco: OmniEngineCoreOutput,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
+            return
+        # Segment boundaries do not terminate a resumable request. Context
+        # overflow emits a separate terminal ERROR with is_segment_finished=False.
+        if getattr(eco, "is_segment_finished", False):
+            return
+        reason = getattr(eco, "stop_reason", None)
+        error = reason if isinstance(reason, str) and reason else "duplex session request failed"
+        # Duplex sessions receive session events, not the ordinary request queue's
+        # ErrorMessage. Close a resident session before another append can recreate
+        # its finished stage request without the model's voice/persona prefill.
+        await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
 
     async def _handle_forward_failure(
         self,
@@ -351,68 +370,64 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             request = OmniEngineCoreRequest.from_request(request)
         return request
 
-    def _process_turn_prompt(self, *args, **kwargs):
-        # Input processors own mutable caches. Hold a thread lock even if the
-        # awaiting session is cancelled while its preprocessing is still running.
-        with self._prompt_processing_lock:
-            return self._build_next_stage_request(*args, **kwargs)
-
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
-        request_state = self.request_states.get(context.request_id)
-        if not isinstance(request_state, DuplexOrchestratorRequestState):
-            raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
-        request_state.streaming.enabled = submission.resumable
-        if submission.resumable:
-            request = build_engine_core_request_from_tokens(
-                request_id=context.request_id,
-                prompt=dict(submission.prompt),
-                params=context.stage_sampling_params,
-                model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
-                resumable=True,
-            )
-        else:
-            # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
-            # stage input processors via process_engine_inputs. Resumable requests
-            # leave it unset: their prompt is one append with Stage0's duplex
-            # buffer, which the async-chunk prewarm would copy downstream.
-            request_state.prompt = dict(submission.prompt)
-            # Use the ordinary multimodal input processor for turn-model plugins.
-            # Its CPU preprocessing runs off the session/orchestrator event loop.
-            request = await asyncio.to_thread(
-                self._process_turn_prompt,
-                context.request_id,
-                context.stage_id,
-                dict(submission.prompt),
-                context.stage_sampling_params,
-                resumable=False,
-            )
-            if self.request_states.get(context.request_id) is not request_state:
-                raise RuntimeError("duplex request cancelled during input preprocessing")
-        request.external_req_id = request.request_id
-        mm_features = getattr(request, "mm_features", None)
-        if mm_features is not None:
-            request_state.mm_features = mm_features
-        pool = self.stage_pools[context.stage_id]
-        if submission.already_submitted:
-            if not submission.resumable:
-                raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")
-            replica_id = await pool.submit_update(context.request_id, request_state, request)
-        else:
-            replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
-            if self.async_chunk and context.stage_id == 0:
-                prewarmed = await self._prewarm_async_chunk_stages(
-                    context.request_id,
-                    request,
-                    request_state,
+        input_guard = nullcontext() if submission.resumable else self._stage_input_submission(context.stage_id)
+        async with input_guard as mark_submitting:
+            request_state = self.request_states.get(context.request_id)
+            if not isinstance(request_state, DuplexOrchestratorRequestState):
+                raise RuntimeError(f"duplex request was not preregistered: {context.request_id}")
+            request_state.streaming.enabled = submission.resumable
+            if submission.resumable:
+                request = build_engine_core_request_from_tokens(
+                    request_id=context.request_id,
+                    prompt=dict(submission.prompt),
+                    params=context.stage_sampling_params,
+                    model_config=self.stage_pools[context.stage_id].stage_vllm_config.model_config,
+                    resumable=True,
                 )
-                if not prewarmed:
-                    # The prewarm already failed the request, aborted it and
-                    # popped its state; the runner turns this into an append
-                    # error instead of writing onto an orphaned object.
-                    raise RuntimeError(
-                        f"async-chunk prewarm failed for duplex request {context.request_id}; the request was aborted"
-                    )
+            else:
+                # Keep raw Stage0 prompt (additional_information / multi_modal_data) for
+                # stage input processors via process_engine_inputs. Resumable requests
+                # leave it unset: their prompt is one append with Stage0's duplex
+                # buffer, which the async-chunk prewarm would copy downstream.
+                request_state.prompt = dict(submission.prompt)
+                # Use the ordinary multimodal input processor for turn-model plugins.
+                # Its CPU preprocessing runs off the session/orchestrator event loop.
+                request = await self._build_next_stage_request(
+                    context.request_id,
+                    context.stage_id,
+                    dict(submission.prompt),
+                    context.stage_sampling_params,
+                    resumable=False,
+                )
+                if self.request_states.get(context.request_id) is not request_state:
+                    raise RuntimeError("duplex request cancelled during input preprocessing")
+            request.external_req_id = request.request_id
+            mm_features = getattr(request, "mm_features", None)
+            if mm_features is not None:
+                request_state.mm_features = mm_features
+            pool = self.stage_pools[context.stage_id]
+            if mark_submitting is not None:
+                mark_submitting()
+            if submission.already_submitted:
+                if not submission.resumable:
+                    raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")
+                replica_id = await pool.submit_update(context.request_id, request_state, request)
+            else:
+                replica_id = await pool.submit_initial(context.request_id, request_state, request, prompt_text=None)
+
+        # The current-stage send has completed. Downstream prewarm
+        # must not hold up another session's use of this stage's sender cache.
+        if not submission.already_submitted and self.async_chunk and context.stage_id == 0:
+            prewarmed = await self._prewarm_async_chunk_stages(context.request_id, request, request_state)
+            if not prewarmed:
+                # The prewarm already failed the request, aborted it and
+                # popped its state; the runner turns this into an append
+                # error instead of writing onto an orphaned object.
+                raise RuntimeError(
+                    f"async-chunk prewarm failed for duplex request {context.request_id}; the request was aborted"
+                )
         request_state.stage_fences[context.stage_id] = context.fence
         now = _time.time()
         request_state.stage_submit_ts[context.stage_id] = now

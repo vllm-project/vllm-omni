@@ -71,7 +71,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    check_interleaved_audio_video,
     merge_interleaved_embeddings,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
@@ -120,6 +119,7 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.torch_utils import async_tensor_h2d
 
 from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerMultiModalDataParser,
@@ -606,15 +606,19 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                 hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
         if not get_pp_group().is_last_rank:
-            tensors = {"hidden_states": hidden_states, "residual": residual}
-            if captured_hidden_states:
-                tensors.update(
-                    {
-                        _get_capture_key(index): value
-                        for index, value in captured_hidden_states["hidden_states"]["layers"].items()
-                    }
-                )
-            return IntermediateTensors(tensors)
+            captured = (
+                {
+                    _get_capture_key(index): value
+                    for index, value in captured_hidden_states["hidden_states"]["layers"].items()
+                }
+                if captured_hidden_states
+                else {}
+            )
+            # A local tensors.update(...) survives Dynamo transformation with
+            # `update` in co_names, and vLLM's cudagraph-in-compiler guard
+            # rejects any `update` as a possible buffer mutation (#8818). Build
+            # the dict in one expression instead; the contents are identical.
+            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual, **captured})
         hidden_states, _ = self.norm(hidden_states, residual)
         if captured_hidden_states is not None:
             return hidden_states, captured_hidden_states

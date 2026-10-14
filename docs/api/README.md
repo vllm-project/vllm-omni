@@ -115,11 +115,6 @@ Core scheduling and caching components.
 - [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.SineGen2][]
 - [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.Snake][]
 - [vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan.SourceModuleHnNSF][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedGroupResidualVectorQuantization][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedResidualVectorQuantization][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.EuclideanCodebook][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.VectorQuantization][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.preprocess][]
 
 ## Configuration
 
@@ -143,11 +138,6 @@ Configuration classes.
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSTalkerConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2Config][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2DecoderConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1Config][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderBigVGANConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
-- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
 - [vllm_omni.transformers_utils.configs.cosyvoice3.CosyVoice3Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]

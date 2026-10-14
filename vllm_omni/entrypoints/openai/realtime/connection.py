@@ -56,6 +56,9 @@ MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
 AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
 
+# OpenAI's error code for a cancel when no matching response is in progress.
+RESPONSE_CANCEL_NOT_ACTIVE = "response_cancel_not_active"
+
 
 def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
     return exc.parameter in {"input_text", "input_tokens"}
@@ -112,7 +115,6 @@ class OpenAIFullDuplexConnection:
             await self.ws.accept()
             logger.info("[realtime] connection opened, session_id=%s", self.session.session_id)
             await self._send_session_created()
-            await self._send_conversation_created()
 
             while self._connected:
                 try:
@@ -1275,7 +1277,7 @@ class OpenAIFullDuplexConnection:
         if active is None:
             await self._send_error(
                 "No response is in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return
@@ -1283,7 +1285,7 @@ class OpenAIFullDuplexConnection:
         if response_id is not None and response_id != active.response_id:
             await self._send_error(
                 f"Response '{response_id}' is not in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return
@@ -1851,18 +1853,6 @@ class OpenAIFullDuplexConnection:
                 event_id=_gen_id("evt"),
                 type="session.updated",
                 session=session_obj,  # type: ignore[arg-type]
-            )
-        )
-
-    async def _send_conversation_created(self) -> None:
-        await self._send_event(
-            types.ConversationCreatedEvent(
-                event_id=_gen_id("evt"),
-                type="conversation.created",
-                conversation={  # type: ignore[arg-type]
-                    "id": self.session.conversation_id,
-                    "object": "realtime.conversation",
-                },
             )
         )
 

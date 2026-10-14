@@ -27,6 +27,10 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 PROMPT = "Two anthropomorphic cats in boxing gear on a spotlighted stage."
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
+# The online and offline tests run in separate Buildkite jobs, so either can
+# encounter the cold ROCm load. Keep the test deadline five minutes below the
+# merge job's 40-minute process deadline for cleanup.
+WAN22_INIT_TIMEOUT_S = 35 * 60
 
 # CUDA / ROCm: single card, no extra server_args — behavior unchanged.
 # Skip on NPU, where a single A3 (64 GB HBM) cannot hold Wan2.2-T2V-A14B.
@@ -54,7 +58,12 @@ def _get_diffusion_feature_cases(model: str):
     return [
         # CUDA: single card, no extra server_args
         pytest.param(
-            OmniServerParams(model=model, init_timeout=1800, stage_init_timeout=1800, startup_timeout=2100),
+            OmniServerParams(
+                model=model,
+                init_timeout=WAN22_INIT_TIMEOUT_S,
+                stage_init_timeout=WAN22_INIT_TIMEOUT_S,
+                startup_timeout=WAN22_INIT_TIMEOUT_S,
+            ),
             id="default",
             marks=CUDA_SINGLE_CARD_FEATURE_MARKS,
         ),

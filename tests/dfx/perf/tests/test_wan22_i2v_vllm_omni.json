@@ -84,6 +84,8 @@
     "server_params": {
       "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       "serve_args": {
+        "stage-init-timeout": 1800,
+        "init-timeout": 2100,
         "usp": 2,
         "vae-patch-parallel-size": 2,
         "use-hsdp": true,

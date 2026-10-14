@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -143,15 +144,66 @@ class StreamingState:
 
 
 @dataclass(frozen=True)
+class StreamingAttentionMetadata:
+    """One resolution group's pre-call offsets and optional dense attention mask."""
+
+    offsets: torch.Tensor
+    next_offsets: torch.Tensor
+    valid_lengths: torch.Tensor
+    scatter_indexes: torch.Tensor | None
+    positions: torch.Tensor | None
+    attn_bias: torch.Tensor | None
+
+
+def prepare_streaming_attention_metadata(
+    offsets: torch.Tensor,
+    valid_rows: torch.Tensor,
+    frames: int,
+    capacity: int,
+    context: int | None,
+    causal: bool,
+    *,
+    slot_attention: bool = False,
+) -> StreamingAttentionMetadata:
+    next_offsets = torch.where(valid_rows, offsets + frames, offsets)
+    valid_lengths = valid_rows.to(dtype=torch.int32) * frames
+    if slot_attention:
+        # Direct slot attention already constructs ring addresses/masks in its
+        # kernel. Do not materialize a dense mask or gather for that backend.
+        return StreamingAttentionMetadata(offsets, next_offsets, valid_lengths, None, None, None)
+    time = torch.arange(frames, device=offsets.device, dtype=torch.long)
+    write_length = min(frames, capacity)
+    scatter_indexes = (offsets[:, None] + time[frames - write_length :]) % capacity
+    cache_indexes = torch.arange(capacity, device=offsets.device, dtype=torch.long)
+    last_offset = offsets[:, None] + frames - 1
+    delta = cache_indexes - last_offset % capacity
+    positions = torch.where(delta <= 0, last_offset + delta, last_offset + delta - capacity)
+    positions = torch.where(cache_indexes >= next_offsets[:, None], torch.full_like(positions, -1), positions)
+    bias = None
+    if causal:
+        delta = offsets[:, None, None] + time[None, :, None] - positions[:, None, :]
+        bias = (positions[:, None, :] >= 0) & (delta >= 0)
+        if context is not None:
+            bias = bias & (delta < context)
+        bias = bias[:, None]
+    return StreamingAttentionMetadata(offsets, next_offsets, valid_lengths, scatter_indexes, positions, bias)
+
+
+@dataclass(frozen=True)
 class StreamingExecutionContext:
     """Map compact execution rows to persistent streaming-state slots.
 
     ``state_slot_ids`` and ``valid_rows`` both have shape ``(B_execution,)``.
-    CUDA Graph padding rows use dedicated scratch slots and ``valid_rows=False``.
+    Padding rows use scratch slots or a read-only null slot, and
+    ``valid_rows=False``. Live request slots must be unique.
     """
 
     state_slot_ids: torch.Tensor
     valid_rows: torch.Tensor
+    attention_metadata: StreamingAttentionMetadata | None = None
+    # One transformer's ``rope_angles`` result, shared by its layers, whose
+    # per-slot offsets advance together.
+    rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
         if self.state_slot_ids.shape != (batch_size,):
@@ -308,6 +360,45 @@ def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
 # =============================================================================
 
 
+def _rope_angles(
+    offset: torch.Tensor,
+    batch: int,
+    num_frames: int,
+    head_dim: int,
+    max_period: float,
+    time_before_heads: bool,
+    device: torch.device,
+    freqs_cache: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """fp32 rotation angles, (B, T, 1, D/2) or (B, 1, T, D/2)."""
+    if freqs_cache is None:
+        ds = torch.arange(head_dim // 2, device=device, dtype=torch.float32)
+        freqs_cache = torch.exp(ds * (-math.log(max_period) * 2 / head_dim))
+    ts = offset.float().view(-1, 1) + torch.arange(num_frames, device=device, dtype=torch.float32)
+    return freqs_cache * (ts.view(batch, -1, 1, 1) if time_before_heads else ts.view(batch, 1, -1, 1))
+
+
+@torch.library.custom_op("vllm_omni::moss_codec_rope_angles", mutates_args=())
+def rope_angles(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cos, sin)``, each (B, 1, T, D/2) fp32, as ``apply_rope`` computes them.
+
+    Opaque to Inductor on purpose: a materialized table is shared by many
+    layers instead of being recomputed inside every rotation kernel.
+    """
+    angles = _rope_angles(offset, offset.shape[0], num_frames, head_dim, max_period, False, offset.device, freqs_cache)
+    return torch.cos(angles), torch.sin(angles)
+
+
+@rope_angles.register_fake
+def _(
+    offset: torch.Tensor, num_frames: int, head_dim: int, max_period: float, freqs_cache: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (offset.shape[0], 1, num_frames, head_dim // 2)
+    return offset.new_empty(shape, dtype=torch.float32), offset.new_empty(shape, dtype=torch.float32)
+
+
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -315,6 +406,7 @@ def apply_rope(
     max_period: float = 10_000,
     time_before_heads: bool = False,
     freqs_cache: torch.Tensor | None = None,
+    table: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Apply rotary position embedding (GPT-J interleaved convention).
 
@@ -342,24 +434,13 @@ def apply_rope(
     if D <= 0 or (D % 2) != 0:
         raise ValueError(f"RoPE requires an even last dimension, got D={D}")
 
-    if freqs_cache is not None:
-        freqs = freqs_cache
-    else:
-        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
-    ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
-
-    if time_before_heads:
-        ts = ts.view(B, -1, 1, 1)
-    else:
-        ts = ts.view(B, 1, -1, 1)
-
     # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
     if q.device.type == "npu":
         torch_npu = _get_torch_npu()
 
-        cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
-        sin_d2 = torch.sin(freqs * ts)
+        angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+        cos_d2 = torch.cos(angles)  # (..., 1, T, D//2)
+        sin_d2 = torch.sin(angles)
         # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
         cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
         sin = torch.cat([sin_d2, sin_d2], dim=-1)
@@ -384,8 +465,13 @@ def apply_rope(
     qr, qi = q[..., 0].float(), q[..., 1].float()
     kr, ki = k[..., 0].float(), k[..., 1].float()
 
-    rotr = torch.cos(freqs * ts)
-    roti = torch.sin(freqs * ts)
+    if table is not None:
+        # Precomputed by ``rope_angles`` for these offsets: same values.
+        rotr, roti = table
+    else:
+        angles = _rope_angles(offset, B, T, D, max_period, time_before_heads, q.device, freqs_cache)
+        rotr = torch.cos(angles)
+        roti = torch.sin(angles)
 
     qor = qr * rotr - qi * roti
     qoi = qr * roti + qi * rotr
@@ -424,10 +510,11 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
         k: torch.Tensor,
         offset: torch.Tensor,
         time_before_heads: bool = False,
+        table: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         D = q.shape[-1]
         freqs = self._get_freqs(D, q.device)  # noqa: N806
-        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs)
+        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs, table=table)
 
 
 # =============================================================================
@@ -587,6 +674,19 @@ class RingKVCache:
                 raise RuntimeError("Dynamic state-slot execution does not support weights_per_step attention.")
             slots = execution_context.state_slot_ids
             valid_rows = execution_context.valid_rows
+            metadata = execution_context.attention_metadata
+            if metadata is not None:
+                from .codec_kv_state import commit_cache
+
+                assert metadata.scatter_indexes is not None and metadata.positions is not None
+                row_cache = self.cache.index_select(1, slots)
+                write_length = min(T, self.capacity)
+                indexes = metadata.scatter_indexes.view(B, 1, write_length, 1).expand(-1, H, -1, D)
+                row_cache[0].scatter_(2, indexes, k[:, :, -write_length:])
+                row_cache[1].scatter_(2, indexes, v[:, :, -write_length:])
+                commit_cache(row_cache, self.cache, slots, valid_rows, metadata.offsets, T)
+                # Offsets advance once after the resolution group's last layer.
+                return KVCacheResult(row_cache[0], row_cache[1], metadata.positions)
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
@@ -838,6 +938,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
+        metadata = execution_context.attention_metadata if execution_context is not None else None
 
         if state is None:
             offset = torch.zeros(B, device=query.device, dtype=torch.long)
@@ -845,7 +946,11 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         elif execution_context is not None:
             if self.weights_per_step:
                 raise RuntimeError("Dynamic codec state slots do not support weights_per_step attention.")
-            offset = state.offset.index_select(0, execution_context.state_slot_ids)
+            offset = (
+                metadata.offsets
+                if metadata is not None
+                else state.offset.index_select(0, execution_context.state_slot_ids)
+            )
             offset_cpu = 0
         else:
             offset = state.offset
@@ -857,7 +962,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         q, k, v = projected[0], projected[1], projected[2]
 
         if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+            table = execution_context.rope_table if execution_context is not None else None
+            q, k = self.rope(q, k, offset, time_before_heads=False, table=table)
 
         slot_attention = getattr(self, "_slot_attention", None)
         slot_attention_rows = getattr(self, "_slot_attention_rows", None)
@@ -866,7 +972,11 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         if slot_path and slot_attention_rows is not None:
             # One launch: the gathered MHA offset equals the ring's end_offset
             # for every slot, and both advance together below.
-            valid_lengths = execution_context.valid_rows.to(dtype=torch.int32) * T
+            valid_lengths = (
+                metadata.valid_lengths
+                if metadata is not None
+                else execution_context.valid_rows.to(dtype=torch.int32) * T
+            )
             x = slot_attention_rows(
                 q,
                 k,
@@ -881,7 +991,11 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         elif slot_attention is not None and slot_path:
             # Current streaming batches use one exact T. Padding rows own
             # scratch slots and must not advance persistent attention state.
-            valid_lengths = execution_context.valid_rows.to(dtype=torch.int32) * T
+            valid_lengths = (
+                metadata.valid_lengths
+                if metadata is not None
+                else execution_context.valid_rows.to(dtype=torch.int32) * T
+            )
             x = slot_attention(
                 q,
                 k,
@@ -891,12 +1005,16 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                 execution_context.state_slot_ids,
                 valid_lengths,
                 self.context if self.context is not None else -1,
+                advance_offsets=metadata is None,
             )
         else:
             k, v, pos_k = self._complete_kv(k, v, execution_context)
             pos_k = pos_k[:, None]
 
-            if self.causal:
+            if metadata is not None:
+                attn_bias = metadata.attn_bias
+                streaming_attention = getattr(self, "_streaming_attention", None)
+            elif self.causal:
                 # Reuse cached arange(T) — keyed by (device, T) so that changing
                 # T never frees a previous allocation (CUDA graph safety: a
                 # captured graph bakes in the pointer, so storage must live as
@@ -971,7 +1089,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
         x = apply_weights_per_step(self.out_projs, self.weights_per_step_schedule, x, offset_cpu)
 
-        if state is not None:
+        if state is not None and metadata is None:
             if execution_context is None:
                 state.offset[:] = torch.where(state.exec_mask, state.offset + T, state.offset)
                 state.offset_cpu += T
@@ -1170,6 +1288,11 @@ class MossAudioTokenizerTransformer(StreamingModule):
         self.max_period = max_period
         self.positional_scale = positional_scale
 
+        self._shared_kv_metadata = False
+        self._kv_capacity = context if context is not None else 1024
+        self._kv_context = context
+        self._kv_causal = causal
+        self._head_dim = d_model // num_heads
         self.rope: MossAudioTokenizerRotaryEmbedding | None = None
         if positional_embedding in {"rope", "sin_rope"}:
             self.rope = MossAudioTokenizerRotaryEmbedding(max_period=max_period)
@@ -1198,10 +1321,13 @@ class MossAudioTokenizerTransformer(StreamingModule):
             offsets=torch.zeros(batch_size, device=device, dtype=torch.long),
         )
 
-    def forward(self, x: torch.Tensor, *args, **kwargs):
+    def forward(
+        self, x: torch.Tensor, *args, execution_context: StreamingExecutionContext | None = None, **kwargs
+    ) -> torch.Tensor:
         B, T, C = x.shape
         state = self._streaming_state
-        execution_context = kwargs.get("execution_context")
+        if self._shared_kv_metadata and execution_context is None:
+            raise RuntimeError("Shared decoder KV pools require explicit execution slots.")
         if execution_context is not None and not isinstance(execution_context, StreamingExecutionContext):
             raise TypeError("execution_context must be a StreamingExecutionContext.")
         if state is None:
@@ -1213,19 +1339,53 @@ class MossAudioTokenizerTransformer(StreamingModule):
         else:
             offsets = state.offsets.index_select(0, execution_context.state_slot_ids)
 
+        metadata = None
+        if self._shared_kv_metadata:
+            metadata = prepare_streaming_attention_metadata(
+                offsets,
+                execution_context.valid_rows,
+                T,
+                self._kv_capacity,
+                self._kv_context,
+                self._kv_causal,
+                slot_attention=self._kv_causal
+                and all(
+                    getattr(layer.self_attn, "_slot_attention", None) is not None
+                    or getattr(layer.self_attn, "_slot_attention_rows", None) is not None
+                    for layer in self.layers
+                ),
+            )
+            execution_context = StreamingExecutionContext(
+                execution_context.state_slot_ids, execution_context.valid_rows, metadata
+            )
+
         if self.positional_embedding in {"sin", "sin_rope"}:
             positions = torch.arange(T, device=x.device).view(1, -1, 1)
             positions = positions + offsets.view(-1, 1, 1)
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
+        if self.rope is not None and execution_context is not None and getattr(self, "_shared_rope", False):
+            # Every layer's attention offset equals these offsets (one reset,
+            # one advance per call), so they share one rotation table.
+            table = rope_angles(
+                offsets, T, self._head_dim, float(self.rope.max_period), self.rope._get_freqs(self._head_dim, x.device)
+            )
+            execution_context = dataclasses.replace(execution_context, rope_table=table)
+
         for layer in self.layers:
-            x = layer(x, *args, **kwargs)
+            x = layer(x, *args, execution_context=execution_context, **kwargs)
 
         if state is not None:
             assert isinstance(state, TransformerState)
             if execution_context is None:
                 state.offsets[:] = torch.where(state.exec_mask, state.offsets + T, state.offsets)
+            elif metadata is not None:
+                from .codec_kv_state import commit_offsets
+
+                commit_offsets(
+                    metadata.next_offsets, state.offsets, execution_context.state_slot_ids, execution_context.valid_rows
+                )
             else:
                 next_offsets = torch.where(execution_context.valid_rows, offsets + T, offsets)
                 state.offsets.index_copy_(0, execution_context.state_slot_ids, next_offsets)
@@ -1813,6 +1973,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._streaming_exec_mask: torch.Tensor | None = None
         self._decoder_state_capacity = 0
         self._decoder_slot_offsets: torch.Tensor | None = None
+        self._decoder_null_slot: int | None = None
         self.post_init()
 
     def _start_streaming(self, batch_size: int, *, decoder_only: bool = False) -> None:
@@ -1845,6 +2006,24 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
 
     def _centralize_decoder_slot_offsets(self, state_capacity: int) -> None:
         """Pack per-module slot offsets so reset needs one CUDA kernel."""
+        if self._decoder_null_slot is not None:
+            groups = [m for m in self._streaming_modules if isinstance(m, MossAudioTokenizerTransformer)]
+            storage = torch.zeros(
+                (len(groups), state_capacity), dtype=torch.long, device=next(self.parameters()).device
+            )
+            for row, group in enumerate(groups):
+                state = cast(TransformerState, group._streaming_state)
+                state.offsets = storage[row]
+                group._shared_kv_metadata = True
+                first_state = cast(MHAState, group.layers[0].self_attn._streaming_state)
+                group._kv_capacity = cast(RingKVCache, first_state.kv_cache).capacity
+                for layer in group.layers:
+                    attention = layer.self_attn
+                    attention_state = cast(MHAState, attention._streaming_state)
+                    attention_state.offset = state.offsets
+                    cast(RingKVCache, attention_state.kv_cache).end_offset = state.offsets
+            self._decoder_slot_offsets = storage
+            return
         state_tensors: list[tuple[StreamingState, list[tuple[object, str]]]] = []
         for module in self._streaming_modules:
             state = module._streaming_state
@@ -1888,10 +2067,13 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         """Stop streaming mode for all modules."""
         for module in self._streaming_modules:
             module._streaming_state = None
+            if isinstance(module, MossAudioTokenizerTransformer):
+                module._shared_kv_metadata = False
         self._streaming_modules = []
         self._streaming_exec_mask = None
         self._decoder_state_capacity = 0
         self._decoder_slot_offsets = None
+        self._decoder_null_slot = None
 
     def initialize_decoder_state_pool(
         self, state_capacity: int, scratch_capacity: int = 0, chunk_frames: int = 0
@@ -1909,6 +2091,10 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                 "Invalid decoder state capacities: "
                 f"state={state_capacity}, scratch={scratch_capacity}, chunk_frames={chunk_frames}."
             )
+        if self._streaming_modules:
+            raise RuntimeError("MOSS Audio Tokenizer is already streaming.")
+        scratch_capacity = 1
+        self._decoder_null_slot = state_capacity
         for module in self.decoder:
             if not isinstance(module, MossAudioTokenizerProjectedTransformer):
                 continue
@@ -1969,6 +2155,8 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         valid_rows: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tensor-only streaming decode boundary for vLLM compilation."""
+        if self._decoder_null_slot is not None:
+            state_slot_ids = torch.where(valid_rows, state_slot_ids, self._decoder_null_slot)
         execution_context = StreamingExecutionContext(
             state_slot_ids=state_slot_ids,
             valid_rows=valid_rows,
