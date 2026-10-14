@@ -100,6 +100,9 @@ class LingBotVLAV2Config:
             raise ValueError("Invalid MoE top-k")
         if len(self.camera_keys) not in (1, 2, 3):
             raise ValueError("LingBot requires one to three configured cameras")
+        # note (0xtoward): without boundary tokens, adjacent camera spans merge into one MRoPE grid.
+        if not self.qwen3vl_use_vision_boundaries:
+            raise ValueError("LingBot inference requires qwen3vl_use_vision_boundaries")
         if self.image_min_pixels < 1 or self.image_max_pixels < self.image_min_pixels:
             raise ValueError("Invalid image pixel budget")
         self.slot_indices("observation.state")

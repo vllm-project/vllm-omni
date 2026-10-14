@@ -542,37 +542,27 @@ class LingBotVLAV2ForActionPrediction(FlowMatching):
         cfg = self.qwenvl_with_expert.qwenvl.config
         visual_token_id = cfg.image_token_id
 
-        if self.config.qwen3vl_use_vision_boundaries:
-            start_emb = self.qwenvl_with_expert.embed_special_token(
-                cfg.vision_start_token_id, bsize, num_images, device, embed_dtype
-            )
-            end_emb = self.qwenvl_with_expert.embed_special_token(
-                cfg.vision_end_token_id, bsize, num_images, device, embed_dtype
-            )
-            img_chunks = torch.cat([start_emb, img_emb, end_emb], dim=2)
-            image_token_len = num_patch + 2
-            image_pad_masks = einops.repeat(img_masks, "b n -> b n l", l=image_token_len)
-            image_visual_masks = torch.zeros_like(image_pad_masks)
-            image_visual_masks[:, :, 1 : 1 + num_patch] = einops.repeat(img_masks, "b n -> b n l", l=num_patch)
-            fake_image_ids = torch.full(
-                (bsize, num_images, image_token_len),
-                visual_token_id,
-                dtype=torch.long,
-                device=device,
-            )
-            fake_image_ids[:, :, 0] = cfg.vision_start_token_id
-            fake_image_ids[:, :, -1] = cfg.vision_end_token_id
-        else:
-            img_chunks = img_emb
-            image_token_len = num_patch
-            image_pad_masks = einops.repeat(img_masks, "b n -> b n l", l=image_token_len)
-            image_visual_masks = image_pad_masks
-            fake_image_ids = torch.full(
-                (bsize, num_images, image_token_len),
-                visual_token_id,
-                dtype=torch.long,
-                device=device,
-            )
+        start_emb = self.qwenvl_with_expert.embed_special_token(
+            cfg.vision_start_token_id, bsize, num_images, device, embed_dtype
+        )
+        end_emb = self.qwenvl_with_expert.embed_special_token(
+            cfg.vision_end_token_id, bsize, num_images, device, embed_dtype
+        )
+        img_chunks = torch.cat([start_emb, img_emb, end_emb], dim=2)
+        image_token_len = num_patch + 2
+        image_pad_masks = einops.repeat(img_masks, "b n -> b n l", l=image_token_len)
+        image_visual_masks = torch.zeros_like(image_pad_masks)
+        image_visual_masks[:, :, 1 : 1 + num_patch] = einops.repeat(img_masks, "b n -> b n l", l=num_patch)
+        fake_image_ids = torch.full(
+            (bsize, num_images, image_token_len),
+            visual_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        fake_image_ids[:, :, 0] = cfg.vision_start_token_id
+        fake_image_ids[:, :, -1] = cfg.vision_end_token_id
+        # note (0xtoward): missing cameras take no MRoPE span (as in training), so image spans match rope_grid_thw.
+        fake_image_ids = fake_image_ids.masked_fill(~img_masks[..., None], cfg.text_config.eos_token_id)
 
         img_emb = einops.rearrange(img_chunks, "b n l d -> b (n l) d")
         image_pad_masks = einops.rearrange(image_pad_masks, "b n l -> b (n l)")
@@ -602,10 +592,7 @@ class LingBotVLAV2ForActionPrediction(FlowMatching):
         else:
             att_masks = torch.zeros((bsize, embs.shape[1]), device=device, dtype=torch.bool)
 
-        flat_img_masks = einops.rearrange(img_masks, "b n -> (b n)")
-        rope_grid_thw = flat_grid_thw[flat_img_masks]
-        if rope_grid_thw.numel() == 0:
-            rope_grid_thw = flat_grid_thw[:1]
+        rope_grid_thw = flat_grid_thw[einops.rearrange(img_masks, "b n -> (b n)")]
         prefix_position_ids = self.qwenvl_with_expert.build_prefix_position_ids(
             prefix_input_ids,
             pad_masks.long(),
@@ -626,11 +613,9 @@ class LingBotVLAV2ForActionPrediction(FlowMatching):
         dense_deepstack = []
         for deepstack in deepstack_embs:
             level = deepstack * img_visual_only.unsqueeze(-1).to(deepstack.dtype)
-            if image_token_len != num_patch:  # vision boundaries: patches sit at [1 : 1+num_patch]
-                wrapped = level.new_zeros(bsize, num_images, image_token_len, level.shape[-1])
-                wrapped[:, :, 1 : 1 + num_patch] = level
-                level = wrapped
-            level = einops.rearrange(level, "b n l d -> b (n l) d")
+            wrapped = level.new_zeros(bsize, num_images, image_token_len, level.shape[-1])
+            wrapped[:, :, 1 : 1 + num_patch] = level  # patches sit between the vision boundaries
+            level = einops.rearrange(wrapped, "b n l d -> b (n l) d")
             if tail_len > 0:  # language (and query) tail stays zero
                 level = torch.cat([level, level.new_zeros(bsize, tail_len, level.shape[-1])], dim=1)
             dense_deepstack.append(level.to(embed_dtype))

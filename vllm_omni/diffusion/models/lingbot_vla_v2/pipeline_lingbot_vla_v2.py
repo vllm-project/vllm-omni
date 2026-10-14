@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Single-stage, stateless LingBot action inference over the OpenPI protocol."""
 
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -58,7 +59,8 @@ class LingBotVLAV2Pipeline(nn.Module):
             if not weights_path.is_file():
                 raise FileNotFoundError(f"Expected LeRobot-format LingBot weights at {weights_path}")
             with safe_open(weights_path, framework="pt", device="cpu") as checkpoint:
-                self.model.load_weights((key, checkpoint.get_tensor(key)) for key in checkpoint.keys())
+                loaded = self.model.load_weights((key, checkpoint.get_tensor(key)) for key in checkpoint.keys())
+            self.loaded_weight_names: set[str] = {f"model.{name}" for name in loaded}
             self.model.to(self.device).eval()
         self.requires_grad_(False)
         self._validate_handshake()
@@ -98,10 +100,11 @@ class LingBotVLAV2Pipeline(nn.Module):
             if key in metadata and metadata[key] != value:
                 raise ValueError(f"OpenPI {key}={metadata[key]!r} disagrees with checkpoint value {value!r}")
 
-    def load_weights(self, weights=()):
-        """The pipeline loads its complete LeRobot checkpoint during construction."""
-        for _ in weights:
-            pass
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]] = ()) -> set[str]:
+        """Report the checkpoint loaded in __init__ to the loader's strict check; no weights_sources are exposed."""
+        streamed = next(iter(weights), None)
+        assert streamed is None, f"LingBot loads model.safetensors itself; got framework weight {streamed[0]}"
+        return self.loaded_weight_names
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:

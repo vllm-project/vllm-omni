@@ -9,6 +9,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_omni.diffusion.models.lingbot_vla_v2.modeling_lingbot_vla_v2 import LingBotVLAV2ForActionPrediction
+
 from .conftest import observation, tiny_backbone, tiny_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -50,6 +52,9 @@ def test_registered_pipeline_contract():
 
 def test_pipeline_checkpoint_to_actions(assets, model, monkeypatch):
     pytest.importorskip("vllm")
+    from vllm.config.load import LoadConfig
+
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
     from vllm_omni.diffusion.models.lingbot_vla_v2.pipeline_lingbot_vla_v2 import LingBotVLAV2Pipeline
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -68,11 +73,48 @@ def test_pipeline_checkpoint_to_actions(assets, model, monkeypatch):
     with torch.inference_mode():
         pipeline = LingBotVLAV2Pipeline(od_config=runtime)
     assert not next(pipeline.model.parameters()).is_inference()
+    loader = DiffusersPipelineLoader(LoadConfig(), runtime)
+    loader.counter_before_loading_weights = 0.0
+    loader.load_weights(pipeline)
     params = OmniDiffusionSamplingParams(num_inference_steps=2, extra_args={"robot_obs": observation()})
     params.generator = torch.Generator().manual_seed(18)
     request = OmniDiffusionRequest(prompt="pick up the cube", sampling_params=params, request_id="real")
     result = pipeline(DiffusionRequestBatch(requests=[request]))
     assert result.output["actions"].shape == (4, 7)
+
+
+@pytest.mark.parametrize(
+    ("streamed_weights", "unreported_names", "error"),
+    [
+        ((("model.state_proj.weight", torch.zeros(1)),), set(), AssertionError),
+        ((), {"model.state_proj.weight"}, ValueError),
+    ],
+    ids=["streamed", "unreported"],
+)
+def test_loader_rejects_streamed_or_unreported_weights(
+    model: LingBotVLAV2ForActionPrediction,
+    monkeypatch: pytest.MonkeyPatch,
+    streamed_weights: tuple[tuple[str, torch.Tensor], ...],
+    unreported_names: set[str],
+    error: type[Exception],
+) -> None:
+    pytest.importorskip("vllm")
+    from vllm.config.load import LoadConfig
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+    from vllm_omni.diffusion.models.lingbot_vla_v2.pipeline_lingbot_vla_v2 import LingBotVLAV2Pipeline
+
+    pipeline = LingBotVLAV2Pipeline.__new__(LingBotVLAV2Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.model = model
+    pipeline.loaded_weight_names = {f"model.{name}" for name in model.state_dict()} - unreported_names
+    loader = DiffusersPipelineLoader(LoadConfig(), OmniDiffusionConfig(model="", dtype=torch.float32))
+    loader.counter_before_loading_weights = 0.0
+    monkeypatch.setattr(loader, "get_all_weights", lambda pipeline: iter(streamed_weights))
+
+    with pytest.raises(error, match="model.state_proj.weight"):
+        loader.load_weights(pipeline)
 
 
 def test_missing_observation_is_not_a_one_step_warmup():
