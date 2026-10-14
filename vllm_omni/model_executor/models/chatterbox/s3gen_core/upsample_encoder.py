@@ -289,7 +289,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
         padding masks.
 
         Args:
-            xs (torch.Tensor): Shape (B, T, 512), the masked token embeddings.
+            xs (torch.Tensor): Shape (B, T, 512), the token embeddings; padded positions are zeroed after ``embed``.
             xs_lens (torch.Tensor): Shape (B,), each row's token count.
 
         Returns:

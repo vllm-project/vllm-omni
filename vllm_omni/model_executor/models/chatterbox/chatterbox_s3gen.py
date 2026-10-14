@@ -56,7 +56,6 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.flow import CausalMas
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.flow_matching import CausalConditionalCFM
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.upsample_encoder import UpsampleConformerEncoder
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
-from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 from vllm_omni.model_executor.models.glm_tts.vocoder import ConvRNNF0Predictor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig, validate_flow_settings
@@ -210,8 +209,8 @@ def flow_mels(
     embedding = flow.spk_embed_affine_layer(
         nn.functional.normalize(torch.cat([ref.embedding for ref in references]), dim=1)
     )
-    token_mask = (~make_pad_mask(token_len, token.shape[1])).unsqueeze(-1).to(embedding)
-    h = flow.encoder_proj(flow.encoder(flow.input_embedding(token) * token_mask, token_len))
+    # The encoder zeroes padded positions itself after its input projection.
+    h = flow.encoder_proj(flow.encoder(flow.input_embedding(token), token_len))
 
     frames = torch.arange(h.shape[1], device=device)
     mask = (frames[None, :] < torch.tensor(valid, device=device)[:, None]).unsqueeze(1).to(h)
