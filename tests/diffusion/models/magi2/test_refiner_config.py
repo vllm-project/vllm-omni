@@ -10,6 +10,7 @@ import math
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.magi2.common_layers import ElementWiseFourierEmbed, swiglu7
 from vllm_omni.diffusion.models.magi2.configuration_magi2 import (
     MAGI2_GENERATION_CONFIG,
     MAGI2_REFINER_CONFIG,
@@ -17,7 +18,7 @@ from vllm_omni.diffusion.models.magi2.configuration_magi2 import (
     Magi2RefinerConfig,
     Magi2RefinerWindowConfig,
 )
-from vllm_omni.diffusion.models.magi2.layers import ElementWiseFourierEmbed, MultiModalityRMSNorm, swiglu7
+from vllm_omni.diffusion.models.magi2.layers import MultiModalityRMSNorm
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 

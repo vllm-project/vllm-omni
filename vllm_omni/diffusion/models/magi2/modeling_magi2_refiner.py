@@ -29,9 +29,9 @@ from safetensors import safe_open
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 
-from .attention import apply_rotary_emb
+from .common_layers import ElementWiseFourierEmbed, Magi2GroupedLinear, ModalityDispatcher, swiglu7
 from .configuration_magi2 import MAGI2_REFINER_CONFIG, Magi2RefinerConfig
-from .layers import ElementWiseFourierEmbed, Magi2GroupedLinear, ModalityDispatcher, MultiModalityRMSNorm, swiglu7
+from .layers import MultiModalityRMSNorm, apply_rotary_emb
 from .preview_data_proxy import Modality
 from .window_attention import Magi2WindowAttentionKernel, Magi2WindowAttentionPlan
 

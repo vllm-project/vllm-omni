@@ -108,7 +108,7 @@ def test_musa_monitor_stops_if_inference_fails(monkeypatch):
     monkeypatch.setattr(pipeline, "_PeakReservedMonitor", Mock(return_value=monitor))
     pipe, runtime = _pipeline()
     pipe.enable_diffusion_pipeline_profiler = True
-    runtime.evaluate = Mock(side_effect=RuntimeError("inference failed"))
+    runtime.evaluate = Mock(side_effect=RuntimeError("inference failed"))  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="inference failed"):
         pipe(_request("A fox walks through snow"))
     monitor.stop.assert_called_once()
@@ -135,7 +135,7 @@ def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type
     resolver = Mock(return_value=3)
     monkeypatch.setattr(cuda_attention, "torch_varlen_attention_with_sink", reference)
     monkeypatch.setattr(cuda_attention, "vllm_flash_attn_varlen_with_lse", flash)
-    monkeypatch.setattr(cuda_attention, "_resolve_flash_attn_version", resolver)
+    monkeypatch.setattr(cuda_attention, "resolve_magi2_flash_attn_version", resolver)
     assert attention.packed_attention_with_sink(q, k, v, varlen) is expected
     if device_type == "cuda" and is_cuda:
         flash.assert_called_once()

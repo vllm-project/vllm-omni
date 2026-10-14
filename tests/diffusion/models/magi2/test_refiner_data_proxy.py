@@ -189,7 +189,7 @@ def test_cache_filled_in_inference_mode_serves_autograd() -> None:
     fields = [getattr(plan, field.name) for field in dataclasses.fields(plan)]
     plan_tensors = [value for value in fields if isinstance(value, torch.Tensor)]
 
-    assert plan is cached.window_plan and len(plan_tensors) == 6
+    assert plan is cached.window_plan and len(plan_tensors) == 9
     assert not any(tensor.is_inference() for tensor in (order, restore, *plan_tensors))
     # pack and unpack index with the cached order and restore, which autograd saves.
     proxy.unpack(packed.video * 2.0, grid).sum().backward()
