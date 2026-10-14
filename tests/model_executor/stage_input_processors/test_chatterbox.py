@@ -94,6 +94,31 @@ def decoder() -> S3GenDecoder:
     return S3GenDecoder(ChatterboxConfig(), 2048).eval()
 
 
+@pytest.fixture(autouse=True)
+def no_stream_left_behind(request: pytest.FixtureRequest) -> Iterator[None]:
+    """A test that fails mid-stream must not leave its decoder state to the next one."""
+    yield
+    if "decoder" in request.fixturenames:
+        request.getfixturevalue("decoder").streams.clear()
+
+
+def test_the_whole_utterance_decodes_through_stage_1(decoder: S3GenDecoder) -> None:
+    """With ``async_chunk: false`` stage 1 decodes the processor's prompt as a stream of one final chunk."""
+    torch.manual_seed(15)
+    tokens = torch.randint(0, 6561, (40,)).tolist()
+
+    (stage_input,) = t3_to_s3gen([talker_output([*tokens, STOP])], request_prompt(202))
+    (audio,) = decoder.decode_step(
+        torch.tensor(stage_input["prompt_token_ids"]),
+        [len(stage_input["prompt_token_ids"])],
+        [stage_input["additional_information"]],
+        ["x"],
+    )
+
+    assert audio.shape == (2 * (40 + 3) * SAMPLES_PER_FRAME,)
+    assert decoder.streams == {}
+
+
 @pytest.fixture
 def plane(connector_extra: dict) -> Iterator[OmniRunnerDataPlane]:
     """Stage 0's runner-side transport as the engine builds it, short of the connector.
@@ -292,6 +317,8 @@ def test_every_utterance_length_is_sent_once_and_finished_once(
                 chunk * connector_extra["codec_stream_scale_factor"] ** len(hops),
             )
         )
+    # The deploy file's numbers: 15, growing twice over to 60, after the alignment.
+    assert hops[:5] == ([20, 30, 60, 60, 60] if prompt_tokens == 250 else [23, 30, 60, 60, 60])
     boundaries = [sum(hops[:sent]) + lookahead for sent in range(1, len(hops)) if sum(hops[:sent]) + lookahead <= 240]
     prompt = request_prompt(prompt_tokens)
     tokens = torch.randint(0, 6561, (240,)).tolist()
@@ -453,3 +480,65 @@ def test_a_deploy_file_without_a_chunk_setting_is_an_error(connector_extra: dict
     )
     with pytest.raises(KeyError, match=key):
         t3_to_s3gen_async_chunk(transfer_manager, None, request)
+
+
+def test_two_requests_interleaved_keep_their_own_schedule_and_voice(connector_extra: dict) -> None:
+    """Two requests with references of different lengths, their tokens arriving in turn.
+
+    Each request's first hop aligns its own reference (20 and 23 tokens),
+    each sends its own voice once, and finishing one leaves the other's
+    state and schedule as they were.
+    """
+    transfer_manager = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        request_payload={},
+        connector=SimpleNamespace(config=connector_extra),
+    )
+    torch.manual_seed(16)
+    prompts = {"long": request_prompt(250), "short": request_prompt(202)}
+    tokens = {name: torch.randint(0, 6561, (60,)).tolist() for name in prompts}
+    sent: dict[str, list[OmniPayloadStruct]] = {name: [] for name in prompts}
+
+    def feed(name: str, produced: int, finished: bool = False) -> None:
+        request = SimpleNamespace(
+            external_req_id=name,
+            output_token_ids=tokens[name][:produced],
+            output_token_count=produced,
+            additional_information=prompts[name]["additional_information"],
+        )
+        payload = t3_to_s3gen_async_chunk(transfer_manager, None, request, is_finished=finished)
+        if payload is not None:
+            sent[name].append(payload)
+
+    for produced in range(1, 41):
+        for name in prompts:
+            feed(name, produced)
+    feed("short", 40, finished=True)
+    pending = dict(transfer_manager.request_payload["long"])
+    for produced in range(41, 61):
+        feed("long", produced)
+    feed("long", 60, finished=True)
+
+    assert [(len(payload.codes.audio), payload.meta.left_context_size) for payload in sent["long"]] == [
+        (23, 0),
+        (53, 20),
+        (60, 50),
+    ]
+    assert [(len(payload.codes.audio), payload.meta.left_context_size) for payload in sent["short"]] == [
+        (26, 0),
+        (40, 23),
+    ]
+    for name, payloads in sent.items():
+        assert all(payload.codes.audio.tolist() == tokens[name][: len(payload.codes.audio)] for payload in payloads)
+        reference = prompts[name]["additional_information"]["embed"]
+        assert torch.equal(payloads[0].embed.speech_token, reference["speech_token"])
+        assert torch.equal(payloads[0].embed.embedding, reference["embedding"])
+        assert [payload.embed is None for payload in payloads[1:]] == [True] * (len(payloads) - 1)
+    # The short request's end left the long one mid-stream: one chunk sent, the next hop 30.
+    assert {key: pending[key] for key in ("seen", "sent", "hop", "chunks", "terminal_sent")} == {
+        "seen": 40,
+        "sent": 20,
+        "hop": 30,
+        "chunks": 1,
+        "terminal_sent": False,
+    }
