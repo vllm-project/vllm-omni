@@ -19,6 +19,7 @@ from vllm_omni.model_extras import (
     get_extra_body_params,
     get_extra_output_params,
     get_output_tensor_range,
+    get_video_generation_defaults,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
     should_preserve_reference_image_size,
@@ -198,7 +199,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_magi2_extra_registry_is_preview_only() -> None:
+def test_magi2_extra_registry_declares_preview_and_refiner_params() -> None:
     assert get_extra_body_params("Magi2Pipeline") == frozenset(
         {
             "seconds",
@@ -207,10 +208,49 @@ def test_magi2_extra_registry_is_preview_only() -> None:
             "output_width",
             "output_height",
             "deterministic",
+            "refiner_num_inference_steps",
         }
     )
     assert get_extra_output_params("Magi2Pipeline") == frozenset()
     assert should_init_extra_args_for_non_diffusion_stages("Magi2Pipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("extra_body", "requested_size", "expected"),
+    [
+        (None, None, (896, 512, 125, 12.5)),
+        ({"resolution": "272p"}, None, (448, 256, 125, 12.5)),
+        ({"resolution": "540p"}, None, (896, 512, 125, 12.5)),
+        ({"resolution": "1080P"}, None, (1920, 1088, 249, 25.0)),
+        (None, (448, 256), (448, 256, 125, 12.5)),
+        (None, (896, 512), (896, 512, 125, 12.5)),
+        ({}, (1920, 1088), (1920, 1088, 249, 25.0)),
+        ({"resolution": None}, (1920, 1088), (1920, 1088, 249, 25.0)),
+        # A size of no preset keeps the 540p defaults; the pipeline rejects it.
+        (None, (1280, 720), (896, 512, 125, 12.5)),
+        # An explicit resolution wins over the requested size.
+        ({"resolution": "540p"}, (1920, 1088), (896, 512, 125, 12.5)),
+    ],
+)
+def test_magi2_video_generation_defaults_per_resolution(
+    extra_body: dict[str, str | None] | None,
+    requested_size: tuple[int, int] | None,
+    expected: tuple[int, int, int, float],
+) -> None:
+    defaults = get_video_generation_defaults("Magi2Pipeline", extra_body, requested_size=requested_size)
+    assert defaults is not None
+    assert (defaults.width, defaults.height, defaults.num_frames, defaults.fps) == expected
+    assert defaults.num_inference_steps == 100
+    assert defaults.duration_seconds == 10.0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_magi2_video_generation_defaults_reject_unknown_resolution() -> None:
+    with pytest.raises(ValueError, match="'272p', '540p' or '1080p'"):
+        get_video_generation_defaults("Magi2Pipeline", {"resolution": "720p"})
 
 
 @pytest.mark.core_model

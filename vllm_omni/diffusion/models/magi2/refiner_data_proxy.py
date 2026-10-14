@@ -191,6 +191,25 @@ class Magi2RefinerDataProxy:
         key = (tuple(int(n) for n in grid), torch.device(device))
         return _cached(self._block_orders, key, lambda: _build_block_order(key[0], self.config.window, key[1]))
 
+    def window_plan(
+        self,
+        grid: Sequence[int],
+        text_len: int,
+        device: torch.device | str = "cpu",
+    ) -> Magi2WindowAttentionPlan:
+        """Return the window-attention plan of a ``(T, H, W)`` grid and text length on ``device``.
+
+        The plan is built on the first request and reused by every later
+        call and by ``pack``.
+        """
+
+        key = (tuple(int(n) for n in grid), int(text_len), torch.device(device))
+        return _cached(
+            self._window_plans,
+            key,
+            lambda: _build_window_plan(key[0], key[1], self.config.window, self.page_size, key[2]),
+        )
+
     def pack(self, latent: torch.Tensor, text: torch.Tensor) -> Magi2RefinerInput:
         """Pack a ``[1, Cv, T, H, W]`` latent and ``[L, Ct]`` (or ``[1, L, Ct]``) text features.
 
@@ -213,11 +232,7 @@ class Magi2RefinerDataProxy:
         device = latent.device
         grid = tuple(int(n) for n in latent.shape[2:])
         num_video, text_len = math.prod(grid), text.shape[0]
-        window_plan = _cached(
-            self._window_plans,
-            (grid, text_len, device),
-            lambda: _build_window_plan(grid, text_len, cfg.window, self.page_size, device),
-        )
+        window_plan = self.window_plan(grid, text_len, device)
         order, _ = self.block_order(grid, device)
 
         # '1 C T H W -> (T H W) C', then block-major.
