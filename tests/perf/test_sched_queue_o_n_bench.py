@@ -19,11 +19,10 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 #  Minimal fake Request + RequestStatus (mirrors vllm.v1.request.RequestStatus
@@ -70,9 +69,7 @@ def _process_chunk_queue_OLD(
     for request in queue_snapshot:
         req_id = request.request_id
         request_can_run = (
-            req_id in finished_requests
-            or req_id in chunk_ready_req_ids
-            or req_id in requests_with_ready_chunks
+            req_id in finished_requests or req_id in chunk_ready_req_ids or req_id in requests_with_ready_chunks
         )
         if request.status != RequestStatus.WAITING_FOR_CHUNK:
             if request_can_run:
@@ -113,9 +110,7 @@ def _process_chunk_queue_NEW(
     for request in queue_snapshot:
         req_id = request.request_id
         request_can_run = (
-            req_id in finished_requests
-            or req_id in chunk_ready_req_ids
-            or req_id in requests_with_ready_chunks
+            req_id in finished_requests or req_id in chunk_ready_req_ids or req_id in requests_with_ready_chunks
         )
         if request.status != RequestStatus.WAITING_FOR_CHUNK:
             if request_can_run:
@@ -201,7 +196,6 @@ def test_bench_o_n_improvement(n: int, move_ratio: float):
     """Single-pass partition must be strictly faster than O(N·K) list.remove."""
     old_best, old_avg = _time_implementation(_process_chunk_queue_OLD, n, move_ratio)
     new_best, new_avg = _time_implementation(_process_chunk_queue_NEW, n, move_ratio)
-    speedup_best = old_best / max(new_best, 1e-12)
     speedup_avg = old_avg / max(new_avg, 1e-12)
     # At all sizes the new implementation must be at least as fast; at N≥500
     # with move_ratio=0.3 it must be materially faster (>1.2×).
@@ -211,11 +205,11 @@ def test_bench_o_n_improvement(n: int, move_ratio: float):
         f"(N={n}, move_ratio={move_ratio})"
     )
     if n >= 500 and move_ratio >= 0.3:
-        assert speedup_avg >= 1.15, (
-            f"Expected ≥15% speedup at N={n} move_ratio={move_ratio}, got {speedup_avg:.2f}x"
-        )
-    print(f"\n  N={n:5d} move={move_ratio:.1f}  OLD={old_avg*1e6:8.1f}µs  "
-          f"NEW={new_avg*1e6:8.1f}µs  speedup={speedup_avg:.2f}x")
+        assert speedup_avg >= 1.15, f"Expected ≥15% speedup at N={n} move_ratio={move_ratio}, got {speedup_avg:.2f}x"
+    print(
+        f"\n  N={n:5d} move={move_ratio:.1f}  OLD={old_avg * 1e6:8.1f}µs  "
+        f"NEW={new_avg * 1e6:8.1f}µs  speedup={speedup_avg:.2f}x"
+    )
 
 
 @pytest.mark.parametrize(
@@ -290,8 +284,7 @@ def test_new_impl_calls_remove_zero_times_on_list_queue():
     _process_chunk_queue_NEW(queue, waiting, chunk_ready, requests_with_ready, finished)
 
     assert queue.remove_calls == 0, (
-        f"NEW implementation called list.remove {queue.remove_calls} times; "
-        f"expected 0 (slice-assignment only)"
+        f"NEW implementation called list.remove {queue.remove_calls} times; expected 0 (slice-assignment only)"
     )
     # Sanity: OLD implementation WOULD have called remove n/2 times
     queue2: _ListRemoveCounter = _ListRemoveCounter(FakeRequest(f"r{i}") for i in range(n))
@@ -300,9 +293,7 @@ def test_new_impl_calls_remove_zero_times_on_list_queue():
     for i in range(n // 2, n):
         queue2[i].status = RequestStatus.WAITING_FOR_INPUT
     _process_chunk_queue_OLD(queue2, deque(), set(), set(), set())
-    assert queue2.remove_calls == n // 2, (
-        f"Expected OLD to call remove {n // 2} times, got {queue2.remove_calls}"
-    )
+    assert queue2.remove_calls == n // 2, f"Expected OLD to call remove {n // 2} times, got {queue2.remove_calls}"
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +311,15 @@ def _run_as_script() -> None:
     print("-" * len(header))
 
     scenarios = [
-        (100, 0.3), (500, 0.3), (1000, 0.3), (2000, 0.3), (5000, 0.3),
-        (100, 0.7), (500, 0.7), (1000, 0.7), (2000, 0.7),
+        (100, 0.3),
+        (500, 0.3),
+        (1000, 0.3),
+        (2000, 0.3),
+        (5000, 0.3),
+        (100, 0.7),
+        (500, 0.7),
+        (1000, 0.7),
+        (2000, 0.7),
     ]
     for n, mr in scenarios:
         old_best, old_avg = _time_implementation(_process_chunk_queue_OLD, n, mr)
@@ -338,10 +336,13 @@ def _run_as_script() -> None:
         wait_new: deque = deque()
         _process_chunk_queue_OLD(queue_old, wait_old, cr_old, rwr_old, fin_old)
         _process_chunk_queue_NEW(queue_new, wait_new, cr_new, rwr_new, fin_new)
-        correct = ([r.request_id for r in queue_old] == [r.request_id for r in queue_new]
-                   and [r.request_id for r in wait_old] == [r.request_id for r in wait_new])
+        correct = [r.request_id for r in queue_old] == [r.request_id for r in queue_new] and [
+            r.request_id for r in wait_old
+        ] == [r.request_id for r in wait_new]
 
-        print(f"{n:6d}  {mr*100:4.0f}%  {old_avg*1e6:12.1f}  {new_avg*1e6:12.1f}  {speedup:7.2f}x  {'yes' if correct else 'NO!!':>10s}")
+        print(
+            f"{n:6d}  {mr * 100:4.0f}%  {old_avg * 1e6:12.1f}  {new_avg * 1e6:12.1f}  {speedup:7.2f}x  {'yes' if correct else 'NO!!':>10s}"
+        )
 
     print()
     print("Legend:")
