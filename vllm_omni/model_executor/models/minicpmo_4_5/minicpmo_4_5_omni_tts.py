@@ -1209,6 +1209,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 updates.append({"codes": {"audio": empty_codes}})
                 continue
             live_rows.append((row, request_id))
+            # K-step: the rows vLLM schedules carry placeholder continue ids,
+            # not the real previous frame's codec id -- the true sample lives
+            # in the request state (make_omni_output sets last_code every
+            # emitted frame). Re-embed the row from it, mirroring the scalar
+            # decode hook's k_last branch. Without this the model conditions
+            # on the placeholder id and its codec stream drifts (WER tail vs
+            # main at identical weights). The single-frame path never sets
+            # last_code, so it keeps embedding the scheduled id unchanged.
+            k_last = state.get("last_code") if isinstance(state, dict) else None
+            if isinstance(k_last, int) and k_last >= 0:
+                code = torch.tensor(
+                    [k_last],
+                    dtype=torch.long,
+                    device=weight.device,
+                )
+                embeds[row : row + 1] = self.emb_code[0](code)
             # Output construction owns the codec snapshot. An empty buffer
             # update avoids retaining the preceding step's delta.
             updates.append({"codes": {"audio": empty_codes}})
