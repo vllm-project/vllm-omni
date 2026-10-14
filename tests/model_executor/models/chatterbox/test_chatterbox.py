@@ -44,7 +44,7 @@ def unified(monkeypatch: pytest.MonkeyPatch) -> ChatterboxForConditionalGenerati
     return ChatterboxForConditionalGeneration(vllm_config=config)
 
 
-def test_stage_attributes_resolve_on_the_stage_001(unified: ChatterboxForConditionalGeneration) -> None:
+def test_stage_attributes_resolve_on_the_stage(unified: ChatterboxForConditionalGeneration) -> None:
     """The runner probes the registered class for flags and hooks the stage owns."""
     assert unified.has_preprocess is True
     assert unified.model.prefix == "model"
@@ -81,7 +81,7 @@ def test_stage_attributes_resolve_on_the_stage_001(unified: ChatterboxForConditi
     ],
     ids=["chatterbox_t3", "chatterbox_s3gen"],
 )
-def test_the_runners_find_each_stages_hooks_on_the_registered_class_001(
+def test_the_runners_find_each_stages_hooks_on_the_registered_class(
     stage: type[nn.Module], defined: list[str], undefined: list[str]
 ) -> None:
     """Both runners look hooks up on the class the registry names, with ``getattr`` and ``hasattr``."""
@@ -96,22 +96,22 @@ def test_the_runners_find_each_stages_hooks_on_the_registered_class_001(
         assert not hasattr(unified, name), name
 
 
-def test_loaded_names_carry_the_wrapper_prefix_001(unified: ChatterboxForConditionalGeneration) -> None:
+def test_loaded_names_carry_the_wrapper_prefix(unified: ChatterboxForConditionalGeneration) -> None:
     """vLLM fails the load on any parameter the returned set does not name."""
     assert unified.load_weights(iter(())) == {name for name, _ in unified.named_parameters()} == {"model.weight"}
 
 
-def test_forward_passes_runner_keywords_through_001(unified: ChatterboxForConditionalGeneration) -> None:
+def test_forward_passes_runner_keywords_through(unified: ChatterboxForConditionalGeneration) -> None:
     assert unified(torch.zeros(1), torch.zeros(1), seq_token_counts=[1]) == {"seq_token_counts": [1]}
 
 
-def test_unknown_stage_is_refused_by_name_001() -> None:
+def test_unknown_stage_is_refused_by_name() -> None:
     config = SimpleNamespace(model_config=SimpleNamespace(model_stage="chatterbox_vocoder"))
     with pytest.raises(KeyError, match="chatterbox_vocoder"):
         ChatterboxForConditionalGeneration(vllm_config=config)
 
 
-def test_one_registered_architecture_wraps_every_stage_001() -> None:
+def test_one_registered_architecture_wraps_every_stage() -> None:
     """The pipeline names the wrapper for every stage; the stage classes are not architectures."""
     assert set(STAGES) == {"chatterbox_t3", "chatterbox_original_t3", "chatterbox_s3gen"}
     assert [name for name in _OMNI_MODELS if name.startswith("Chatterbox")] == ["ChatterboxForConditionalGeneration"]

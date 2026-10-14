@@ -18,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("stage_type", [ChatterboxT3ForConditionalGeneration, ChatterboxOriginalT3])
-def test_mrv2_sampling_transports_tokens_without_unused_hidden_states_001(stage_type):
+def test_mrv2_sampling_transports_tokens_without_unused_hidden_states(stage_type):
     stage = object.__new__(stage_type)
     torch.nn.Module.__init__(stage)
     stage.cfg_pairs = {}

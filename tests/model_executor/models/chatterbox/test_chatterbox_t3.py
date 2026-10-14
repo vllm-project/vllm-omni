@@ -46,7 +46,7 @@ def talker(heads: T3Heads, config: ChatterboxConfig) -> ChatterboxT3ForCondition
 
 
 @pytest.mark.parametrize("cond_len", [150, 375])
-def test_prefill_layout_follows_the_conditioning_length_001(
+def test_prefill_layout_follows_the_conditioning_length(
     heads: T3Heads, config: ChatterboxConfig, cond_len: int
 ) -> None:
     """Speaker slot, the prompt tokens, the text, one start-of-speech slot."""
@@ -63,7 +63,7 @@ def test_prefill_layout_follows_the_conditioning_length_001(
     assert torch.equal(embeds[-1], heads.speech_emb.weight[config.start_speech_token])
 
 
-def test_prefill_split_with_one_token_tail_matches_one_call_001(heads: T3Heads, config: ChatterboxConfig) -> None:
+def test_prefill_split_with_one_token_tail_matches_one_call(heads: T3Heads, config: ChatterboxConfig) -> None:
     """However the scheduler splits the prompt, each span gets its own rows."""
     text_ids = torch.tensor([5, 6, 7])
     cond_tokens = torch.randint(0, 6561, (375,))
@@ -80,9 +80,7 @@ def test_prefill_split_with_one_token_tail_matches_one_call_001(heads: T3Heads, 
     assert torch.equal(tail[0], heads.speech_emb.weight[config.start_speech_token])
 
 
-def test_prefill_span_past_the_prompt_returns_only_the_prompt_rows_001(
-    heads: T3Heads, config: ChatterboxConfig
-) -> None:
+def test_prefill_span_past_the_prompt_returns_only_the_prompt_rows(heads: T3Heads, config: ChatterboxConfig) -> None:
     """A preempted request is recomputed from zero with its generated tokens in the span."""
     text_ids = torch.tensor([5, 6, 7])
     cond_tokens = torch.randint(0, 6561, (375,))
@@ -97,7 +95,7 @@ def test_prefill_span_past_the_prompt_returns_only_the_prompt_rows_001(
     assert torch.equal(inside, whole[-3:])
 
 
-def test_preprocess_embeds_the_generated_tokens_after_the_prompt_001(
+def test_preprocess_embeds_the_generated_tokens_after_the_prompt(
     talker: ChatterboxT3ForConditionalGeneration, heads: T3Heads, config: ChatterboxConfig
 ) -> None:
     """The rows past the prompt are speech ids, embedded as a decode step would."""
@@ -126,7 +124,7 @@ def test_preprocess_embeds_the_generated_tokens_after_the_prompt_001(
 
 @pytest.mark.parametrize("text_len", [1, 3, 671])
 @pytest.mark.parametrize("cond_len", [125, 150, 375])
-def test_the_placeholder_prompt_is_as_long_as_its_embeddings_001(
+def test_the_placeholder_prompt_is_as_long_as_its_embeddings(
     heads: T3Heads, config: ChatterboxConfig, cond_len: int, text_len: int
 ) -> None:
     """``build_prompt`` counts the placeholders, ``prefill_embeds`` builds what replaces them.
@@ -158,7 +156,7 @@ def test_the_placeholder_prompt_is_as_long_as_its_embeddings_001(
     assert len(prompt["prompt_token_ids"]) == embeds.shape[0]
 
 
-def test_batched_decode_embedding_matches_per_request_preprocess_001(
+def test_batched_decode_embedding_matches_per_request_preprocess(
     talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig
 ) -> None:
     """The runner hands a step's one-token decode rows to one call instead of one call each."""
@@ -183,7 +181,7 @@ def test_batched_decode_embedding_matches_per_request_preprocess_001(
     assert updates == [update for _, _, update in each] == [{}, {}, {}]
 
 
-def test_forward_returns_the_backbones_tensor_unwrapped_001(
+def test_forward_returns_the_backbones_tensor_unwrapped(
     talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Model Runner V2 sizes its CUDA graph's output from what ``forward`` returns."""
@@ -202,7 +200,7 @@ def test_forward_returns_the_backbones_tensor_unwrapped_001(
 
 
 @pytest.mark.parametrize("padded_rows", [7, 16], ids=["as scheduled", "padded by the graph"])
-def test_every_request_of_a_step_gets_a_payload_from_the_runner_001(
+def test_every_request_of_a_step_gets_a_payload_from_the_runner(
     talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig, padded_rows: int
 ) -> None:
     """The runner-side transport calls the chunk processor only for a request the step has a payload for.
@@ -241,7 +239,7 @@ def model_state(talker: ChatterboxT3ForConditionalGeneration, payloads: list[dic
     return state
 
 
-def test_model_runner_v2_embeds_a_mixed_step_through_the_hooks_001(
+def test_model_runner_v2_embeds_a_mixed_step_through_the_hooks(
     talker: ChatterboxT3ForConditionalGeneration, heads: T3Heads, config: ChatterboxConfig
 ) -> None:
     """V2 orders decode rows first, embeds every row itself, then calls the hooks.
@@ -292,7 +290,7 @@ def test_model_runner_v2_embeds_a_mixed_step_through_the_hooks_001(
     assert [set(buffer) for buffer in state.intermediate_buffer.buffers] == [{"req_id", "ids", "embed"}] * 5
 
 
-def test_logits_are_the_speech_heads_with_the_start_token_masked_001(heads: T3Heads, config: ChatterboxConfig) -> None:
+def test_logits_are_the_speech_heads_with_the_start_token_masked(heads: T3Heads, config: ChatterboxConfig) -> None:
     """The sampler's vocabulary is the speech head's; the text vocabulary only sizes the text embedding."""
     logits = speech_logits(heads, torch.randn(2, config.hidden_size), config)
 
@@ -303,7 +301,7 @@ def test_logits_are_the_speech_heads_with_the_start_token_masked_001(heads: T3He
     assert torch.isfinite(logits[:, config.stop_speech_token]).all()
 
 
-def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads_001() -> None:
+def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads() -> None:
     weights = [
         ("tfmr.h.0.attn.c_attn.weight", torch.zeros(1)),
         ("tfmr.wte.weight", torch.zeros(1)),
@@ -330,12 +328,12 @@ def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads_001
     }
 
 
-def test_weight_routing_rejects_a_key_it_does_not_know_001() -> None:
+def test_weight_routing_rejects_a_key_it_does_not_know() -> None:
     with pytest.raises(KeyError, match="cond_enc.perceiver.weight"):
         split_t3_weights(iter([("cond_enc.perceiver.weight", torch.zeros(1))]))
 
 
-def test_prefix_caching_is_refused_at_startup_001() -> None:
+def test_prefix_caching_is_refused_at_startup() -> None:
     """Every prompt is the same placeholder id, so a cache would match on length alone."""
     vllm_config = SimpleNamespace(cache_config=SimpleNamespace(enable_prefix_caching=True))
     with pytest.raises(ValueError, match="enable_prefix_caching=False"):

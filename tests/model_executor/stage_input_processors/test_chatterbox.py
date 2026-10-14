@@ -44,13 +44,13 @@ def talker_output(token_ids: list[int], finished: bool = True) -> SimpleNamespac
     return SimpleNamespace(finished=finished, request_id="r", outputs=[SimpleNamespace(cumulative_token_ids=token_ids)])
 
 
-def test_codes_are_the_valid_speech_tokens_001() -> None:
+def test_codes_are_the_valid_speech_tokens() -> None:
     """The stop token, and any placeholder echoed from the prompt, never reach the decoder."""
     (stage_input,) = t3_to_s3gen([talker_output([6561, 6561, 10, 20, 6560, 6562])], request_prompt(250))
     assert stage_input["prompt_token_ids"] == [10, 20, 6560]
 
 
-def test_payload_is_one_final_chunk_in_the_requests_own_voice_001() -> None:
+def test_payload_is_one_final_chunk_in_the_requests_own_voice() -> None:
     prompt = request_prompt(202)
     (stage_input,) = t3_to_s3gen([talker_output([10, 20, 6562])], prompt)
     payload = to_struct(stage_input["additional_information"])
@@ -65,11 +65,11 @@ def test_payload_is_one_final_chunk_in_the_requests_own_voice_001() -> None:
     assert payload.embed.voice is None and payload.ids is None
 
 
-def test_unfinished_outputs_are_skipped_001() -> None:
+def test_unfinished_outputs_are_skipped() -> None:
     assert t3_to_s3gen([talker_output([10, 20], finished=False)], request_prompt(250)) == []
 
 
-def test_an_utterance_with_no_speech_tokens_gets_no_stage_1_request_001() -> None:
+def test_an_utterance_with_no_speech_tokens_gets_no_stage_1_request() -> None:
     """The orchestrator ends a request that has no next-stage input with empty audio.
 
     Raising here instead stops the orchestrator, and with it every other
@@ -240,7 +240,7 @@ def decoded_samples(side: str, decoder: S3GenDecoder, payloads: list[OmniPayload
 
 
 @pytest.mark.parametrize("side", PLANES)
-def test_streamed_chunks_decode_to_the_whole_utterance_001(
+def test_streamed_chunks_decode_to_the_whole_utterance(
     side: str, plane: OmniRunnerDataPlane, connector_extra: dict, decoder: S3GenDecoder
 ) -> None:
     """The processor chunks as the deploy file says and emits payloads stage 1 accepts."""
@@ -260,7 +260,7 @@ def test_streamed_chunks_decode_to_the_whole_utterance_001(
 
 @pytest.mark.parametrize("capped", [False, True], ids=["stop token", "length cap"])
 @pytest.mark.parametrize("prompt_tokens", [250, 202])
-def test_every_utterance_length_is_sent_once_and_finished_once_001(
+def test_every_utterance_length_is_sent_once_and_finished_once(
     plane: OmniRunnerDataPlane, connector_extra: dict, prompt_tokens: int, capped: bool
 ) -> None:
     """No length makes the processor send a token's audio twice, skip one or finish twice.
@@ -335,7 +335,7 @@ def test_every_utterance_length_is_sent_once_and_finished_once_001(
 
 @pytest.mark.parametrize("side", PLANES)
 @pytest.mark.parametrize(("prompt_tokens", "length"), [(250, 53), (202, 56)])
-def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length_001(
+def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length(
     side: str, plane: OmniRunnerDataPlane, connector_extra: dict, decoder: S3GenDecoder, prompt_tokens: int, length: int
 ) -> None:
     """The stop token's payload adds the lookahead's audio and nothing that was already played."""
@@ -349,7 +349,7 @@ def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length_001(
 
 
 @pytest.mark.parametrize("side", PLANES)
-def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes_001(
+def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
     side: str, plane: OmniRunnerDataPlane, connector_extra: dict
 ) -> None:
     """Stage 1 was started on a placeholder prompt, and only an explicit empty ``codes.audio`` clears it.
@@ -380,7 +380,7 @@ def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes_001(
     assert "r" in coordinator.input_terminal_req_ids
 
 
-def test_a_stream_aborted_between_chunks_is_flushed_and_freed_001(
+def test_a_stream_aborted_between_chunks_is_flushed_and_freed(
     plane: OmniRunnerDataPlane, connector_extra: dict
 ) -> None:
     """An abort reaches the processor as the same finished call, and cleanup follows it."""
@@ -412,7 +412,7 @@ def test_a_stream_aborted_between_chunks_is_flushed_and_freed_001(
     assert plane.request_payload == {} and plane.code_prompt_token_ids == {}
 
 
-def test_tokens_sampled_but_never_shown_are_an_error_001(connector_extra: dict) -> None:
+def test_tokens_sampled_but_never_shown_are_an_error(connector_extra: dict) -> None:
     """The count ran ahead of the calls and the history is gone: their audio would be missing."""
     transfer_manager = SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
@@ -439,7 +439,7 @@ def test_tokens_sampled_but_never_shown_are_an_error_001(connector_extra: dict) 
 
 
 @pytest.mark.parametrize("key", ["codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"])
-def test_a_deploy_file_without_a_chunk_setting_is_an_error_001(connector_extra: dict, key: str) -> None:
+def test_a_deploy_file_without_a_chunk_setting_is_an_error(connector_extra: dict, key: str) -> None:
     """The schedule is the deploy file's; no setting has a default to fall back on."""
     extra = {name: value for name, value in connector_extra.items() if name != key}
     transfer_manager = SimpleNamespace(

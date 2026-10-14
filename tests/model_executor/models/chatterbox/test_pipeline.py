@@ -31,7 +31,7 @@ def test_each_variant_has_its_own_pipeline() -> None:
     assert OMNI_PIPELINES["chatterbox"] is CHATTERBOX_ORIGINAL_PIPELINE
 
 
-def test_a_config_less_checkout_is_matched_by_its_directory_name_001(tmp_path: Path) -> None:
+def test_a_config_less_checkout_is_matched_by_its_directory_name(tmp_path: Path) -> None:
     turbo, original = tmp_path / "chatterbox-turbo", tmp_path / "chatterbox"
     turbo.mkdir()
     original.mkdir()
@@ -43,7 +43,7 @@ def test_a_config_less_checkout_is_matched_by_its_directory_name_001(tmp_path: P
         StageConfigFactory.try_infer_model_type.cache_clear()
 
 
-def test_stage_topology_001() -> None:
+def test_stage_topology() -> None:
     config = ChatterboxConfig()
     talker, decoder = CHATTERBOX_TURBO_PIPELINE.stages
     assert CHATTERBOX_TURBO_PIPELINE.model_arch == "ChatterboxForConditionalGeneration"
@@ -63,7 +63,7 @@ def test_stage_topology_001() -> None:
         assert callable(getattr(importlib.import_module(module), function))
 
 
-def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
+def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
     config = ChatterboxConfig()
     extra = deploy["connectors"]["connector_of_shared_memory"]["extra"]
     talker, decoder = deploy["stages"]
@@ -105,7 +105,7 @@ def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
 @pytest.mark.parametrize(
     ("platform", "runner"), [("cuda", "v2"), ("npu", "v1"), ("xpu", "v1"), ("rocm", "v1"), ("musa", "v1")]
 )
-def test_deploy_file_selects_model_runner_v2_where_it_was_run_001(platform: str, runner: str) -> None:
+def test_deploy_file_selects_model_runner_v2_where_it_was_run(platform: str, runner: str) -> None:
     """V2 with the native data plane on CUDA; the default runner where V2 is rejected or untried.
 
     The choice must reach each stage's engine arguments, which is what the
