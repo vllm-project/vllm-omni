@@ -110,6 +110,10 @@ class PinnedModuleStager:
     immutable, so no H2D copy repeats). The stable storage addresses keep
     CUDA-graph-captured weight pointers valid across offload/load swaps, at
     the cost of keeping the device storage resident while offloaded.
+
+    With ``start_loaded`` a module already on ``device`` keeps its storage:
+    the snapshot only takes the host master and the first ``offload`` drops
+    the device copy. Without it the module starts bound to the master.
     """
 
     def __init__(
@@ -121,6 +125,7 @@ class PinnedModuleStager:
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
         retain_device_storage: bool = False,
+        start_loaded: bool = False,
     ) -> None:
         modules = (module,) if isinstance(module, nn.Module) else tuple(module)
         if not modules or not all(isinstance(item, nn.Module) for item in modules):
@@ -134,7 +139,18 @@ class PinnedModuleStager:
         self.loaded = False
         self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
         self._device_storages: list[torch.Tensor] = []
-        self._restore_masters()
+        if start_loaded:
+            self._device_storages = [self._current_storage(group) for group in self._groups]
+            self.loaded = True
+        else:
+            self._restore_masters()
+
+    def _current_storage(self, group: _StorageGroup) -> torch.Tensor:
+        local = self._local_tensor(group.bindings[0].target)
+        if local.device.type != self.device.type or self.device.index not in (None, local.device.index):
+            raise ValueError(f"start_loaded needs every tensor on {self.device}, found one on {local.device}")
+        storage = local.untyped_storage()
+        return torch.empty(0, dtype=torch.uint8, device=local.device).set_(storage, 0, (storage.nbytes(),), (1,))
 
     @staticmethod
     def _local_tensor(target: torch.Tensor) -> torch.Tensor:

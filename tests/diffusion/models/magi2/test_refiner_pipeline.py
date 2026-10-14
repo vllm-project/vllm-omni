@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import functools
 from pathlib import Path
@@ -92,17 +91,28 @@ class _RefinerFactory:
 
 
 class _RecordingStager:
-    def __init__(self, events: list[Any], module: nn.Module, device: torch.device, *, pin_memory: bool) -> None:
+    def __init__(
+        self,
+        events: list[Any],
+        module: nn.Module,
+        device: torch.device,
+        *,
+        pin_memory: bool,
+        start_loaded: bool = False,
+    ) -> None:
         self.events = events
         self.module = module
         self.device = device
         self.pin_memory = pin_memory
+        self.loaded = start_loaded
         events.append(("stager", type(module).__name__))
 
     def load(self) -> None:
+        self.loaded = True
         self.events.append(("stage_in", type(self.module).__name__))
 
     def offload(self) -> None:
+        self.loaded = False
         self.events.append(("stage_out", type(self.module).__name__))
 
 
@@ -115,8 +125,8 @@ def events() -> list[Any]:
 def stagers(monkeypatch: pytest.MonkeyPatch, events: list[Any]) -> list[_RecordingStager]:
     created: list[_RecordingStager] = []
 
-    def factory(module, device, *, pin_memory):
-        stager = _RecordingStager(events, module, device, pin_memory=pin_memory)
+    def factory(module, device, *, pin_memory, start_loaded=False):
+        stager = _RecordingStager(events, module, device, pin_memory=pin_memory, start_loaded=start_loaded)
         created.append(stager)
         return stager
 
@@ -206,6 +216,46 @@ def test_first_refined_request_builds_and_loads_the_refiner_once(
     assert pipe.refiner_sampler.data_proxy is pipe.refiner_data_proxy
     assert pipe.refiner_data_proxy.config is model.config
     assert pipe.refiner_sampler.guidance_scale == 2.0
+
+
+@pytest.mark.parametrize(("output_rank", "all_ranks"), [(True, False), (False, False), (False, True)])
+def test_preview_is_released_and_reloaded_from_one_host_snapshot(monkeypatch, events, stagers, output_rank, all_ranks):
+    pipe, _ = _pipeline()
+    pipe.transformer = nn.Linear(2, 2)
+    pipe.device_str = "cpu"
+    pipe.od_config = _topology_config()
+    pipe._is_output_rank = output_rank
+    pipe._transformer_is_layerwise_offloaded = False
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    for _ in range(2):
+        pipe._release_preview(all_ranks=all_ranks)
+        pipe._release_preview(all_ranks=all_ranks)
+        events.append("released")
+        pipe._ensure_preview_resident()
+        pipe._ensure_preview_resident()
+        events.append("resident")
+
+    if not (output_rank or all_ranks):
+        assert not stagers
+        assert events == ["released", "resident", "released", "resident"]
+        return
+    (stager,) = stagers
+    assert stager.module is pipe.transformer
+    assert stager.pin_memory is True
+    # One snapshot that keeps the device copy; a release drops it once and a reload copies it back once.
+    assert stager.loaded is True
+    assert events == [
+        ("stager", "Linear"),
+        ("stage_out", "Linear"),
+        "released",
+        ("stage_in", "Linear"),
+        "resident",
+        ("stage_out", "Linear"),
+        "released",
+        ("stage_in", "Linear"),
+        "resident",
+    ]
 
 
 def test_refiner_is_compiled_with_the_preview_region_options(monkeypatch, tmp_path, events, stagers, refiner_factory):
@@ -457,7 +507,12 @@ def _install_runtime_fakes(pipe: Magi2Pipeline, state: _Runtime) -> Magi2Pipelin
     events = state.events
     pipe.device_str = "cpu"
     pipe.sampler = state.sampler
-    pipe._output_rank_memory_window = MethodType(lambda _self: contextlib.nullcontext(), pipe)
+    # Preview residency changes, with the number of runtime events seen so far.
+    pipe.residency = []
+    pipe._release_preview = MethodType(
+        lambda _self, *, all_ranks=False: _self.residency.append(("release", all_ranks, len(events))), pipe
+    )
+    pipe._ensure_preview_resident = MethodType(lambda _self: _self.residency.append(("resident", len(events))), pipe)
 
     def encode_prompts(_self, prompts):
         events.append("encode")
@@ -535,6 +590,9 @@ def test_refined_request_runs_preview_renoise_refiner_steps_then_decode(
 
     result = pipe(_request("A fox walks through snow", extra_args={"resolution": "1080p"}))
 
+    # The Preview leaves for the prompt encoding, returns for its denoise and
+    # leaves every rank before the refiner and the decode.
+    assert pipe.residency == [("release", False, 0), ("resident", 1), ("release", True, 2)]
     assert events == [
         "encode",
         "preview",
