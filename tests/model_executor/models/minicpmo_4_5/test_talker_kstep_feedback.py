@@ -20,6 +20,12 @@ Layers pinned down here:
 - The draft rule: a stop-truncated row (a request that accepted fewer
   tokens than the step ran) folds the whole batch to a draft-free step,
   the same way an empty row already did.
+- The batched decode preprocess re-embeds every live row from its own state
+  record, once per step for the whole batch, and the owned snapshot the
+  codec payload is built from carries the real ids at the row each request
+  owns.
+- Model Runner V2 is refused up front instead of silently arming a loop
+  whose decode preprocess cannot re-embed the real previous frame.
 """
 
 from types import SimpleNamespace
@@ -147,6 +153,87 @@ def test_decode_preprocess_embeds_state_last_code():
     # non-zero embed proves the state record won.
     assert torch.count_nonzero(embeds) == embeds.numel()
     assert out["codes"]["audio"].reshape(-1).tolist() == [42]
+
+
+class _CountingEmbedding(nn.Embedding):
+    """Same table as the factory's, plus a forward counter."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim)
+        self.calls = 0
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return super().forward(ids)
+
+
+def _batch_talker() -> tuple[MiniCPMO45OmniTTSForConditionalGeneration, _CountingEmbedding]:
+    """Bare talker whose real codec rows (42, 43) and scheduled id (5) differ."""
+    model = _make_talker(k_step_frames=8, scripted_samples=[])
+    emb = _CountingEmbedding(_NUM_AUDIO_TOKENS, 4)
+    with torch.no_grad():
+        emb.weight.zero_()
+        emb.weight[42] = 1.0
+        emb.weight[43] = 2.0
+        emb.weight[5] = torch.tensor([0.0, 0.0, 3.0, 0.0])
+    model.emb_code = nn.ModuleList([emb])
+    return model, emb
+
+
+def test_decode_batch_reembeds_live_rows_from_last_code():
+    model, emb = _batch_talker()
+    states = {
+        "r1": {"step": 3, "codes": torch.tensor([42]), "last_code": 42},
+        "r2": {"step": 3, "codes": torch.tensor([43]), "last_code": 43},
+        # A starved request riding the single-frame path inside a K-step
+        # batch: no record, so its scheduled id stays the real sample.
+        "r3": {"step": 3, "codes": torch.tensor([5])},
+    }
+    model._request_audio_states.update(states)
+    # K-step rows are scheduled with a placeholder continue id, never the real
+    # previous frame's sample; r3's own id is what the runner gathered.
+    input_ids = torch.tensor([0, 0, 5], dtype=torch.long)
+    req_infos = [{"request_id": request_id, "audio_state": states[request_id]} for request_id in ("r1", "r2", "r3")]
+
+    _, embeds, _ = model.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+
+    # The two recorded rows won and the placeholder-only row kept its id; a
+    # fallback to the scheduled placeholder would be an all-zero row.
+    assert embeds.tolist() == [
+        [1.0, 1.0, 1.0, 1.0],
+        [2.0, 2.0, 2.0, 2.0],
+        [0.0, 0.0, 3.0, 0.0],
+    ]
+    # One host-to-device copy and one embedding launch for the whole step.
+    assert emb.calls == 1
+    # The owned snapshot the codec payload is built from carries the real ids
+    # too, at the row each request owns.
+    assert model._decode_codec_ids["r1"][0].tolist() == [42, 43, 5]
+    assert [model._decode_codec_ids[request_id][1] for request_id in ("r1", "r2", "r3")] == [0, 1, 2]
+
+    # Parity with the scalar decode hook this batched path replaces.
+    _, scalar_embeds, _ = model.preprocess(
+        torch.tensor([0], dtype=torch.long),
+        None,
+        request_id="r1",
+        audio_state=states["r1"],
+        _omni_is_prefill=False,
+    )
+    assert torch.equal(scalar_embeds[0], embeds[0])
+
+
+def test_multi_frame_decode_is_rejected_under_v2_model_runner():
+    def _config(*, use_v2_model_runner: bool):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(model_stage="tts", use_v2_model_runner=use_v2_model_runner),
+            speculative_config={"method": "ngram", "num_speculative_tokens": 7},
+        )
+
+    # The same config arms eight frames on V1 and is refused on Model Runner
+    # V2, whose decode preprocess cannot re-embed the real previous frame.
+    assert MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=False)) == 8
+    with pytest.raises(ValueError, match="Model Runner V2"):
+        MiniCPMO45OmniTTSForConditionalGeneration._parse_k_step_frames(_config(use_v2_model_runner=True))
 
 
 def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"):

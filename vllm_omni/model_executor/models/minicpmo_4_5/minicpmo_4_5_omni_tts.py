@@ -720,12 +720,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         parsers is what keeps the runner and the scheduler from disagreeing: a
         mismatch either arms the loop with no drafts to consume, or leaves it
         off while the scheduler reserves K positions per request.
+
+        Model Runner V2 is rejected outright: its decode preprocess is an
+        identity (the runner embeds its own gathered ids), so the K-step
+        re-embed lives in the V1 batched path only. Arming the loop anyway
+        would condition every row on a placeholder continue id and quietly
+        degrade the codec stream.
         """
         model_cfg = getattr(vllm_config, "model_config", None)
         frames = talker_kstep_frames(
             getattr(model_cfg, "model_stage", None),
             getattr(vllm_config, "speculative_config", None),
         )
+        if frames > 0 and bool(getattr(model_cfg, "use_v2_model_runner", False)):
+            raise ValueError(
+                "Talker multi-frame decode is not supported with Model Runner V2: "
+                "its decode preprocess embeds the ids the runner gathered (under speculative "
+                "decoding, the placeholder continue ids) instead of the real previous codec frame, "
+                "and the owned id snapshot the codec payload is built from lives in the V1 batched "
+                "decode path. Turn off multi-frame decode (num_speculative_tokens) or Model Runner V2."
+            )
         if frames > 0:
             logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
         return frames
