@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxCFGSampler, ChatterboxMRv2CFGSampler
@@ -48,7 +49,8 @@ class RecordingSampler:
         self.logits = logits.clone()
         self.metadata = sampling_metadata
         self.input_batch = input_batch
-        return SimpleNamespace(sampled_token_ids=torch.arange(logits.shape[0]).reshape(-1, 1))
+        rows = logits.shape[0]
+        return SamplerOutput(torch.arange(rows).reshape(-1, 1), None, None, torch.ones(rows), torch.zeros(rows))
 
 
 @pytest.mark.parametrize("mrv2", [False, True])
@@ -71,7 +73,7 @@ def test_guidance_precedes_delegate_and_tokens_follow_conditional(mrv2):
             metadata,
             input_batch=batch,
             requests={
-                rid: SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"chatterbox_cfg": registry[rid]}))
+                rid: SimpleNamespace(sampling_params=SamplingParams(extra_args={"chatterbox_cfg": registry[rid]}))
                 for rid in batch.req_ids
             },
         )

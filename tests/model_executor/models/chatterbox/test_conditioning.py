@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import re
 import sys
-from types import SimpleNamespace
 
 import numpy as np
 import pyloudnorm
@@ -10,6 +9,7 @@ import pytest
 import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
+from vllm.multimodal.parse import MultiModalDataParser
 
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
@@ -25,6 +25,7 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
 )
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
+from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -202,24 +203,31 @@ def test_original_text_helper_loads_local_tokenizer_and_normalizes_spaces(tmp_pa
     assert tokenize_text("hello world", loaded, "original") == [7]
 
 
-def pass_through_conditioner(variant: str) -> VoiceConditioner:
-    """The conditioner short of its checkpoint, with a resampler that returns its input."""
+def unloaded_conditioner(variant: str) -> VoiceConditioner:
+    """The conditioner as ``__init__`` builds it, short of the checkpoint weights and the S3 tokenizer."""
     conditioner = object.__new__(VoiceConditioner)
-    conditioner.config = ChatterboxConfig(variant)
+    config = ChatterboxConfig(variant)
+    conditioner.config = config
     conditioner.device = torch.device("cpu")
-    resampler = SimpleNamespace(resample=lambda wav, orig_sr: wav)
-    conditioner.to_24k = conditioner.to_16k = resampler
+    conditioner.to_24k = MultiModalDataParser(
+        target_sr=config.sample_rate, audio_resample_method="soxr"
+    ).audio_resampler
+    conditioner.to_16k = MultiModalDataParser(
+        target_sr=config.s3_sample_rate, audio_resample_method="soxr"
+    ).audio_resampler
+    conditioner.voice_encoder = VoiceEncoder(VoiceEncConfig()).eval()
+    conditioner.campplus = CAMPPlus(feat_dim=80, embedding_size=192, memory_efficient=False).eval()
     return conditioner
 
 
 def test_a_reference_that_is_not_mono_is_refused_by_its_shape() -> None:
     with pytest.raises(ValueError, match=re.escape("got shape (2, 24000)")):
-        pass_through_conditioner("turbo").resample(np.zeros((2, 24000), dtype=np.float32), 24000)
+        unloaded_conditioner("turbo").resample(np.zeros((2, 24000), dtype=np.float32), 24000)
 
 
 def test_turbo_needs_a_reference_longer_than_five_seconds_and_normalizes_it() -> None:
     """Upstream asserts the bound and normalizes the clip to -27 LUFS before encoding it."""
-    conditioner = pass_through_conditioner("turbo")
+    conditioner = unloaded_conditioner("turbo")
     wav = (0.05 * np.random.default_rng(1).standard_normal(5 * 24000 + 1)).astype(np.float32)
     with pytest.raises(ValueError, match="longer than 5 s, got 5.00 s"):
         conditioner.resample(wav[:-1], 24000)
@@ -227,14 +235,14 @@ def test_turbo_needs_a_reference_longer_than_five_seconds_and_normalizes_it() ->
     wav24, wav16 = conditioner.resample(wav, 24000)
 
     assert abs(pyloudnorm.Meter(24000).integrated_loudness(wav24) - (-27.0)) < 1e-3
-    assert np.array_equal(wav16, wav24)
+    assert wav16.shape == (round(wav24.shape[0] * 16000 / 24000),)
 
 
 def test_original_takes_a_short_reference_as_it_is() -> None:
     """Upstream's Original neither bounds the clip's length nor normalizes its loudness."""
     wav = (0.05 * np.random.default_rng(2).standard_normal(24000)).astype(np.float32)
 
-    wav24, _ = pass_through_conditioner("original").resample(wav, 24000)
+    wav24, _ = unloaded_conditioner("original").resample(wav, 24000)
 
     assert np.array_equal(wav24, wav)
 
@@ -243,15 +251,11 @@ def test_original_takes_a_short_reference_as_it_is() -> None:
 def test_the_prompt_mel_is_cut_to_two_frames_per_prompt_token(extra: int) -> None:
     """``flow_mels`` writes the prompt mel over the first ``2 * P`` frames, so the two must agree.
 
-    The encoders are stand-ins; the mel is the real one. The tokenizer gives
-    one token more, or one fewer, than the mel's frames hold.
+    The encoders run with their initial weights; the mel is the real one. The
+    tokenizer gives one token more, or one fewer, than the mel's frames hold.
     """
-    conditioner = pass_through_conditioner("turbo")
+    conditioner = unloaded_conditioner("turbo")
     config = conditioner.config
-    conditioner.voice_encoder = SimpleNamespace(
-        hp=VoiceEncConfig(), inference=lambda mels, mel_lens, batch_size, rate: torch.zeros(len(mel_lens), 256)
-    )
-    conditioner.campplus = lambda fbank: torch.zeros(fbank.shape[0], 192)
     rng = np.random.default_rng(3)
     wav24 = (0.1 * rng.standard_normal(6 * config.sample_rate)).astype(np.float32)
     wav16 = (0.1 * rng.standard_normal(6 * config.s3_sample_rate)).astype(np.float32)

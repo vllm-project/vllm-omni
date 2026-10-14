@@ -10,6 +10,7 @@ import pytest
 import torch
 import yaml
 from torch import nn
+from vllm.sampling_params import SamplingParams
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -80,7 +81,7 @@ def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
         "generated_len": 0,
         "req_id": "scheduler-id",
         "global_request_id": ["external-id"],
-        "sampling_params": SimpleNamespace(max_tokens=16),
+        "sampling_params": SamplingParams(max_tokens=16),
     }
     if ref is not None:
         payload["embed"] = {

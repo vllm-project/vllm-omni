@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from vllm.sampling_params import SamplingParams
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
@@ -209,7 +210,7 @@ def runner_side_payloads(
             prompt_token_ids=prompt["prompt_token_ids"],
             # As the scheduler hands it to the runner.
             additional_information=serialize_additional_information(prompt["additional_information"]),
-            sampling_params=SimpleNamespace(stop_token_ids=[STOP], max_tokens=len(tokens) if capped else None),
+            sampling_params=SamplingParams(stop_token_ids=[STOP], max_tokens=len(tokens) if capped else None),
         )
     )
     # A decode step's payload for the request, as stage 0's ``make_omni_output`` leaves the runner.
@@ -419,7 +420,7 @@ def test_a_stream_aborted_between_chunks_is_flushed_and_freed(
             external_req_id="external-id",
             prompt_token_ids=prompt["prompt_token_ids"],
             additional_information=prompt["additional_information"],
-            sampling_params=SimpleNamespace(stop_token_ids=[STOP], max_tokens=None),
+            sampling_params=SamplingParams(stop_token_ids=[STOP], max_tokens=None),
         )
     )
     for token in tokens:
