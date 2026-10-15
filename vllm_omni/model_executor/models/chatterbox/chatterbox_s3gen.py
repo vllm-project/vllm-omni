@@ -245,10 +245,15 @@ class S3GenDecoder(nn.Module):
         max_utterance_tokens: The longest utterance the decoder will be
             handed, in speech tokens: the stage's context length. The noise
             buffer covers it, so no utterance runs past the buffer.
+
+    Raises:
+        ValueError: If the config's flow precision and attention backend are
+            not a pair the decoder runs, see ``validate_flow_settings``.
     """
 
     def __init__(self, config: ChatterboxConfig, max_utterance_tokens: int) -> None:
         super().__init__()
+        validate_flow_settings(config.flow_dtype, config.flow_attention_backend)
         self.config = config
         # The architecture ``S3Token2Mel`` and ``S3Token2Wav`` build (0.1.7).
         encoder = UpsampleConformerEncoder(
@@ -622,8 +627,6 @@ class ChatterboxS3Gen(S3GenDecoder):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         config: ChatterboxConfig = vllm_config.model_config.hf_config
-        # hf_overrides arrive one key at a time, so the pair is checked here.
-        validate_flow_settings(config.flow_dtype, config.flow_attention_backend)
         # The scheduler gives a new request what is left of the step's token
         # budget, and the decoder cannot tell part of an utterance from one.
         # That budget is the field vLLM's scheduler reads: the scheduled-token

@@ -98,10 +98,10 @@ class ChatterboxConfig(PretrainedConfig):
     ):
         if variant not in VARIANT_FIELDS:
             raise ValueError("Chatterbox variant must be 'turbo' or 'original'")
-        validate_flow_settings(flow_dtype, flow_attention_backend)
         kwargs.setdefault("eos_token_id", STOP_SPEECH_TOKEN)
         super().__init__(**kwargs)
         self.variant = variant
+        # Read by stage 1, which validates the pair when it is built.
         self.flow_dtype = flow_dtype
         self.flow_attention_backend = flow_attention_backend
 
@@ -143,35 +143,6 @@ class ChatterboxConfig(PretrainedConfig):
         }
         self.silence_token = 4299
         self.ve_weights = "ve.safetensors"
-
-    @property
-    def flow_dtype(self) -> str:
-        """Precision of the flow decoder: ``float32`` or ``bfloat16`` (autocast)."""
-        return self._flow_dtype
-
-    @flow_dtype.setter
-    def flow_dtype(self, value: str) -> None:
-        if value not in FLOW_DTYPES:
-            raise ValueError("Chatterbox flow_dtype must be 'float32' or 'bfloat16'")
-        self._flow_dtype = value
-
-    @property
-    def flow_attention_backend(self) -> str:
-        """Attention kernel of the flow decoder: ``auto`` or ``cudnn`` (needs BF16 flow)."""
-        return self._flow_attention_backend
-
-    @flow_attention_backend.setter
-    def flow_attention_backend(self, value: str) -> None:
-        if value not in FLOW_ATTENTION_BACKENDS:
-            raise ValueError("Chatterbox flow_attention_backend must be 'auto' or 'cudnn'")
-        self._flow_attention_backend = value
-
-    def to_dict(self) -> dict:
-        """Serialize with the flow settings under their public names."""
-        output = super().to_dict()
-        for name in ("flow_dtype", "flow_attention_backend"):
-            output[name] = output.pop(f"_{name}")
-        return output
 
     def variant_field(self, name: str) -> object:
         """The checkpoint-dependent value of ``name`` for the current variant.

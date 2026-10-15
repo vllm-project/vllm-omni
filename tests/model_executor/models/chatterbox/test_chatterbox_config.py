@@ -5,8 +5,8 @@
 import pytest
 
 from vllm_omni.config.model import OmniModelArchConfigConvertor
-from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME
-from vllm_omni.transformers_utils.configs.chatterbox import VARIANT_FIELDS, ChatterboxConfig, validate_flow_settings
+from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME, S3GenDecoder
+from vllm_omni.transformers_utils.configs.chatterbox import VARIANT_FIELDS, ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -51,7 +51,7 @@ def test_the_engine_reads_the_backbones_attention_geometry(variant: str) -> None
 
 
 def test_variant_and_flow_settings_survive_serialization() -> None:
-    """The flow settings are stored under private names and serialized under their public ones."""
+    """vLLM serializes the config into each stage process and rebuilds it there."""
     restored = ChatterboxConfig.from_dict(ChatterboxConfig("original", flow_dtype="bfloat16").to_dict())
     assert (restored.variant, restored.flow_dtype, restored.num_hidden_layers) == ("original", "bfloat16", 30)
 
@@ -84,18 +84,17 @@ def test_checkpoint_fields_cannot_be_overridden_one_by_one() -> None:
         config.update({"num_hidden_layers": 30})
 
 
-@pytest.mark.parametrize("settings", [{"flow_dtype": "float16"}, {"flow_attention_backend": "flash"}])
-def test_unknown_flow_settings_are_rejected_at_construction_and_on_override(settings: dict) -> None:
-    with pytest.raises(ValueError, match="flow"):
-        ChatterboxConfig(**settings)
+@pytest.mark.parametrize(
+    ("settings", "match"),
+    [
+        ({"flow_dtype": "float16"}, "flow_dtype"),
+        ({"flow_attention_backend": "flash"}, "flow_attention_backend"),
+        ({"flow_dtype": "float32", "flow_attention_backend": "cudnn"}, "cuDNN"),
+    ],
+)
+def test_the_decoder_refuses_flow_settings_it_cannot_run(settings: dict, match: str) -> None:
+    """A deploy file's hf_overrides arrive one key at a time, so stage 1 checks the pair when it is built."""
     config = ChatterboxConfig()
-    with pytest.raises(ValueError, match="flow"):
-        config.update(settings)
-
-
-def test_cudnn_attention_needs_bf16_flow() -> None:
-    with pytest.raises(ValueError, match="cuDNN"):
-        ChatterboxConfig(flow_attention_backend="cudnn")
-    with pytest.raises(ValueError, match="cuDNN"):
-        validate_flow_settings("float32", "cudnn")
-    validate_flow_settings("bfloat16", "cudnn")
+    config.update(settings)
+    with pytest.raises(ValueError, match=match):
+        S3GenDecoder(config, config.max_new_tokens)
