@@ -23,11 +23,22 @@ x-chatterbox: &chatterbox
   - vllm_omni/engine/stage_runtime.py
   - vllm_omni/engine/stage_init_utils.py
   - vllm_omni/engine/cuda_mps.py
+  - vllm_omni/engine/orchestrator.py
+  - vllm_omni/engine/serialization.py
+  - vllm_omni/engine/stage_engine_core_proc.py
+  - vllm_omni/distributed/omni_connectors/
+  - vllm_omni/worker/gpu_model_runner.py
+  - vllm_omni/worker/gpu_ar_model_runner.py
+  - vllm_omni/worker/gpu_generation_model_runner.py
+  - vllm_omni/data_entry_keys.py
+  - vllm_omni/utils/audio.py
   - vllm_omni/model_executor/models/chatterbox/
+  - vllm_omni/model_executor/models/common/snake_activation.py
   - vllm_omni/model_executor/models/cosyvoice3/code2wav_core/
   - vllm_omni/model_executor/models/cosyvoice3/utils.py
   - vllm_omni/model_executor/models/glm_tts/vocoder.py
   - vllm_omni/model_executor/models/indextts2/
+  - vllm_omni/model_executor/stage_input_processors/bagel.py
   - vllm_omni/model_executor/stage_input_processors/chatterbox.py
   - vllm_omni/transformers_utils/configs/chatterbox.py
   - vllm_omni/deploy/chatterbox.yaml
