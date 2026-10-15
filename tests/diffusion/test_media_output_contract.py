@@ -238,8 +238,12 @@ def test_engine_routes_typed_media_exclusively(monkeypatch: pytest.MonkeyPatch) 
     assert result == [finalized]
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("shm_threshold", [1, 1_000_000])
 def test_typed_media_crosses_runner_ipc_and_engine_without_legacy_postprocess(
     monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    shm_threshold: int,
 ) -> None:
     sampling_params = OmniDiffusionSamplingParams(output_type="np", num_outputs_per_prompt=1)
     raw_media = DiffusionMediaOutput(
@@ -247,15 +251,23 @@ def test_typed_media_crosses_runner_ipc_and_engine_without_legacy_postprocess(
             torch.linspace(-1.0, 1.0, 1 * 3 * 2 * 4 * 5).reshape(1, 3, 2, 4, 5),
             encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
             value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
-        )
+        ),
+        metadata={
+            "ar_diffusion": {
+                "session_id": "session-0",
+                "request_id": "request-0",
+                "chunk_index": 2,
+                "applied_event_ids": [3, 5],
+            },
+        },
     )
     prepared = prepare_diffusion_media_for_transport(
         raw_media,
-        od_config=_od_config(enabled=True),
+        od_config=_od_config(enabled=enabled),
         sampling_params=sampling_params,
     )
     diffusion_output = DiffusionOutput(media=prepared)
-    monkeypatch.setattr(diffusion_ipc, "_SHM_TENSOR_THRESHOLD", 1)
+    monkeypatch.setattr(diffusion_ipc, "_SHM_TENSOR_THRESHOLD", shm_threshold)
     pack_diffusion_output_shm(diffusion_output)
     unpack_diffusion_output_shm(diffusion_output)
 
@@ -268,8 +280,48 @@ def test_typed_media_crosses_runner_ipc_and_engine_without_legacy_postprocess(
     outputs = engine.postprocess_output(request, diffusion_output)
 
     assert len(outputs) == 1
-    assert outputs[0].images[0].dtype == np.uint8
-    assert outputs[0].images[0].shape == (1, 2, 4, 5, 3)
+    assert outputs[0].multimodal_output["metadata"]["ar_diffusion"] == raw_media.metadata["ar_diffusion"]
+    frames = outputs[0].images[0]
+    assert frames.dtype == (np.uint8 if enabled else np.float32)
+    assert frames.shape == (1, 2, 4, 5, 3)
+
+
+@pytest.mark.parametrize("metadata", [{"internal": {}}, {"tensor": torch.zeros(1)}, {1: "bad key"}])
+def test_media_rejects_private_or_non_transport_metadata(metadata) -> None:
+    media = DiffusionMediaOutput(
+        video=_video(
+            torch.zeros(1, 3, 2, 4, 5),
+            encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+            value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+        ),
+        metadata=metadata,
+    )
+    with pytest.raises((TypeError, ValueError), match="metadata"):
+        media.validate()
+
+
+def test_interpolation_preserves_media_metadata_without_mutating_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    media = DiffusionMediaOutput(
+        video=_video(
+            torch.zeros(1, 3, 2, 4, 5),
+            encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+            value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+            consumers=frozenset({FloatVideoConsumer.FRAME_INTERPOLATION}),
+        ),
+        prepared_for_transport=True,
+        metadata={"video": {"fps": 15}, "ar_diffusion": {"session_id": "session-0"}},
+    )
+    monkeypatch.setattr(media_postprocess, "interpolate_video_tensor", lambda video, **kwargs: (video, 2.0))
+
+    output = finalize_diffusion_media(
+        media, sampling_params=OmniDiffusionSamplingParams(output_type="np", enable_frame_interpolation=True)
+    )
+
+    assert output["metadata"] == {
+        "video": {"fps": 15, "video_fps_multiplier": 2.0},
+        "ar_diffusion": {"session_id": "session-0"},
+    }
+    assert media.metadata["video"] == {"fps": 15}
 
 
 def test_diffusion_output_rejects_typed_and_legacy_output_together() -> None:

@@ -38,6 +38,23 @@ def decoded(dtype=torch.bfloat16, device="cpu"):
     return values.view(1, 1, 7, 1, 1).expand(1, 3, 7, 2, 2).clone()
 
 
+def assert_video_equal(actual, expected):
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict) and actual.keys() == expected.keys()
+        for key in expected:
+            assert_video_equal(actual[key], expected[key])
+    elif isinstance(expected, list):
+        assert isinstance(actual, list) and len(actual) == len(expected)
+        for left, right in zip(actual, expected, strict=True):
+            assert_video_equal(left, right)
+    else:
+        assert type(actual) is type(expected)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("chunk_bytes", [1, 64 << 20])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -68,8 +85,12 @@ def test_cosmos3_shared_transport_preserves_presentation_and_guardrail_bytes(mon
         return frames
 
     monkeypatch.setattr(guardrails, "_video_guardrail", check)
-    reference_video = guardrails.check_video_safety(video) if checks else video
-    expected = VideoProcessor().postprocess_video(reference_video, output_type="np")
+    reference_video = guardrails.check_video_safety(video) if checks and output_type != "latent" else video
+    expected = (
+        {"video": video}
+        if output_type == "latent"
+        else VideoProcessor().postprocess_video(reference_video, output_type=output_type or "np")
+    )
     result = pipeline_cosmos3._cosmos3_media_output({"video": video}, cfg, params)
     typed = not checks and output_type in (None, "np")
     assert (result.media is not None) == typed
@@ -87,11 +108,10 @@ def test_cosmos3_shared_transport_preserves_presentation_and_guardrail_bytes(mon
     else:
         actual = pipeline_cosmos3.get_cosmos3_post_process_func(cfg)(result.output, sampling_params=params)
     narrowed = typed and enabled
-    assert isinstance(actual, np.ndarray)
     if narrowed:
         expected = np.round(expected * 255).astype(np.uint8)
-    np.testing.assert_array_equal(actual, expected)
-    if checks:
+    assert_video_equal(actual, expected)
+    if checks and output_type != "latent":
         np.testing.assert_array_equal(captured[0], captured[1])
 
 
@@ -241,6 +261,10 @@ def test_cosmos3_video_runs_through_engine(monkeypatch, output_type):
     assert len(outputs) == 1
     if output_type in (None, "np"):
         expected = device_reduction.reduce_video_to_uint8_frames(decoded(), preserve_input_dtype=True).numpy()
+    elif output_type == "latent":
+        expected = decoded()
     else:
-        expected = VideoProcessor().postprocess_video(decoded(), output_type="np")
-    np.testing.assert_array_equal(outputs[0].images[0], expected)
+        expected = VideoProcessor().postprocess_video(decoded(), output_type=output_type)
+    # PIL presentation is already a list of per-video frame lists; the engine
+    # uses that list directly, whereas tensor/NumPy payloads are wrapped.
+    assert_video_equal(outputs[0].images[0], expected[0] if output_type == "pil" else expected)
