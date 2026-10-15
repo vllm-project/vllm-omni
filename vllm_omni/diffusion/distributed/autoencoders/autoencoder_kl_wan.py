@@ -12,7 +12,7 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
+from vllm_omni.diffusion.distributed.autoencoders import wan_encode_split, wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
     DistributedVaeMixin,
@@ -547,6 +547,12 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         result = self.distributed_executor.execute(
             x,
             DistributedOperator(
+                split=lambda x: wan_encode_split.rank_split(self, x),
+                exec=self.encode_tile_exec,
+                merge=wan_encode_split.rank_merge,
+            )
+            if wan_encode_split.encode_split_mode() == "rank"
+            else DistributedOperator(
                 split=self.encode_tile_split,
                 exec=self.encode_tile_exec,
                 merge=self.encode_tile_merge,
