@@ -20,7 +20,7 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediat
 from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
-pytestmark = [pytest.mark.core_model, pytest.mark.npu]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 
 def _npu_available() -> bool:

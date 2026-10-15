@@ -634,18 +634,18 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_model_len": 16384,
                 "skip_mm_profiling": True,
                 "mm_processor_cache_gb": 0,
-"devices": "0",
-                 "default_sampling_params": {
-                     "temperature": 0.0,
-                     "top_p": 1.0,
-                     "top_k": -1,
-                     "max_tokens": 128,
-                     "seed": 42,
-                     "repetition_penalty": 1.1,
-                 },
-             },
-         ],
-     },
+                "devices": "0",
+                "default_sampling_params": {
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_tokens": 128,
+                    "seed": 42,
+                    "repetition_penalty": 1.1,
+                },
+            },
+        ],
+    },
     # MOSS-TTS-Local-v1.5 on NPU: run both stages eagerly. Pipelined NPUGraph
     # capture for ``moss_codec_decode`` fails on current torch-npu, and ACL
     # graph replay in stage 0 can deadlock the 8B backbone; eager execution

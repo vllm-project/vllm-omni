@@ -9,10 +9,10 @@ import torch
 from torch import nn
 from transformers import GPT2Config
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import MossTTSLocalDepthTransformer
 
-pytestmark = [pytest.mark.core_model, pytest.mark.tts, pytest.mark.npu]
+pytestmark = [pytest.mark.core_model, pytest.mark.tts, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 
 def _npu_available() -> bool:

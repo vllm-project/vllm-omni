@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for MOSS-TTS-Local-Transformer-v1.5.
 
 MOSS-TTS-Local-Transformer-v1.5 (``MossTTSLocalModel``) is the Qwen3-backbone
@@ -72,9 +72,7 @@ def _write_synthetic_reference_wav(path: Path) -> None:
     )
     for i in range(n_samples):
         t = i / _REF_SAMPLE_RATE
-        envelope = math.exp(-3.0 * t / _REF_DURATION_S) * (
-            0.5 + 0.5 * math.sin(2.0 * math.pi * 3.5 * t)
-        )
+        envelope = math.exp(-3.0 * t / _REF_DURATION_S) * (0.5 + 0.5 * math.sin(2.0 * math.pi * 3.5 * t))
         sample = sum(amp * math.sin(2.0 * math.pi * freq * t + phase) for freq, amp, phase in partials)
         sample = max(-1.0, min(1.0, sample * envelope))
         frames.extend(struct.pack("<h", int(sample * 32767)))

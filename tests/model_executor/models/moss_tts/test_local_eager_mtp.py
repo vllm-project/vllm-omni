@@ -14,7 +14,7 @@ from tests.model_executor.models.moss_tts.test_local_model_state import _admit, 
 from vllm_omni.model_executor.models.moss_tts.first_audio_state import MossEarlyFirstAudioState
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 
-pytestmark = [pytest.mark.core_model, pytest.mark.npu]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 
 def _npu_available() -> bool:
