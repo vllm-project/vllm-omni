@@ -361,6 +361,23 @@ async def test_64_distinct_references_are_encoded_together_and_cached(
 
 
 @pytest.mark.asyncio
+async def test_a_prompt_build_does_not_wait_behind_an_encoder_batch(adapter):
+    """A built-in-voice request is prepared while a reference is still in the encoders."""
+    batches = EncoderBatches(encoder(adapter), hold=True)
+    try:
+        reference_request = asyncio.create_task(adapter.resolve_voice(reference(6, seed=7)))
+        await asyncio.to_thread(batches.started.wait, 30)
+        prepared = await asyncio.wait_for(adapter.build(OpenAICreateSpeechRequest(input="hello"), [], False), 30)
+        assert not reference_request.done()
+        batches.released.set()
+        await reference_request
+    finally:
+        batches.remove()
+
+    assert prepared.prompt["additional_information"]["ids"]["prompt"] == [42, 43]
+
+
+@pytest.mark.asyncio
 async def test_reference_singleflight_survives_waiter_cancellation(adapter):
     """Two locators of one waveform share one encoding, which outlives the waiter that started it."""
     batches = EncoderBatches(encoder(adapter), hold=True)

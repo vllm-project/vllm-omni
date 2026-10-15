@@ -3,6 +3,7 @@
 """Chatterbox speech serving with the built-in voice or a reference recording."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 import numpy as np
@@ -70,7 +71,11 @@ class ChatterboxAdapter(ARTTSAdapter):
         # Publish fully initialized components before concurrent requests use them.
         self.initialization_lock = Lock()
         self.build_async = make_async(self.prepare_prompt, executor=ctx.server._tts_executor)
-        self.condition_batch_async = make_async(self.prepare_voices, executor=ctx.server._tts_executor)
+        # Encoder batches get a thread of their own, so a prompt build (the
+        # built-in voice, a cached reference) never waits behind one; the
+        # drain task already runs one batch at a time.
+        self.encoder_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chatterbox-encoder")
+        self.condition_batch_async = make_async(self.prepare_voices, executor=self.encoder_executor)
         self.conditioning_slots = asyncio.Semaphore(self.conditioning_capacity)
         self.conditioning_queue: asyncio.Queue = asyncio.Queue(maxsize=self.conditioning_capacity)
         self.conditioning_pending: dict[str, asyncio.Future] = {}
@@ -78,7 +83,7 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.closed = False
 
     def shutdown(self) -> None:
-        """Cancel queued encoder work and wake its waiters before executor shutdown."""
+        """Cancel queued encoder work, wake its waiters and stop the encoder thread."""
         self.closed = True
         if self.conditioning_task is not None:
             self.conditioning_task.cancel()
@@ -87,9 +92,10 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.conditioning_pending.clear()
         while not self.conditioning_queue.empty():
             self.conditioning_queue.get_nowait()
+        self.encoder_executor.shutdown(wait=False, cancel_futures=True)
 
     def prepare_voices(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning | ValueError]:
-        """Run one encoder batch on the server-owned executor."""
+        """Run one encoder batch on the adapter's encoder thread."""
         model = resolve_stage_model_path(self.ctx.engine_client)
         if model is None:
             raise ValueError("Chatterbox requires a stage model path")
