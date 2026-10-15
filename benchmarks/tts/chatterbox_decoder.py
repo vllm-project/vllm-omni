@@ -41,8 +41,6 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("variant", choices=("turbo", "original"))
     parser.add_argument("output", type=Path)
-    parser.add_argument("--fold-weight-norm", action="store_true")
-    parser.add_argument("--cached-istft", action="store_true")
     parser.add_argument(
         "--fp32-flow", action="store_true", help="Run the flow in FP32 instead of production's BF16 autocast"
     )
@@ -82,9 +80,6 @@ def main():
     )
     del weights
     decoder.to("cuda")
-    folded = decoder.mel2wav.remove_weight_norm() if args.fold_weight_norm else 0
-    if args.cached_istft:
-        decoder.mel2wav.enable_cached_istft()
     voice = VoiceConditioning.from_builtin(str(args.model))
     reference = Reference(voice.prompt_token.cuda(), voice.prompt_feat.cuda(), voice.embedding.cuda())
     # Use actual quantized speech codes at different positions for each row.
@@ -96,8 +91,6 @@ def main():
         "model": str(args.model),
         "torch": str(torch.__version__),
         "gpu": torch.cuda.get_device_name(),
-        "folded_weight_norm_layers": folded,
-        "cached_istft": args.cached_istft,
         "flow_dtype": config.flow_dtype,
         "cudnn_attention": args.cudnn_attention,
         "matmul_precision": torch.get_float32_matmul_precision(),

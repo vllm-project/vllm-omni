@@ -65,9 +65,6 @@ for the full-load warmup protocol and measured batch-size tradeoffs.
 
 ```bash
 uv run benchmarks/tts/chatterbox_decoder.py /path/to/snapshot turbo /path/to/results.json
-# Compare native HiFT optimizations independently:
-uv run benchmarks/tts/chatterbox_decoder.py /path/to/snapshot turbo /path/to/folded.json --fold-weight-norm
-uv run benchmarks/tts/chatterbox_decoder.py /path/to/snapshot turbo /path/to/istft.json --cached-istft
 ```
 
 ### 1. Start the server

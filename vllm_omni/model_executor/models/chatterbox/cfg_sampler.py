@@ -91,7 +91,10 @@ class ChatterboxCFGSampler:
         # token are not speech codes: the stage handoff drops every id at or
         # above speech_token_limit, because S3Gen has no embedding for it, so
         # a sampled one would silently vanish from the audio; masking makes
-        # it impossible instead.
+        # it impossible instead. Measured with both masks applied: the H100
+        # recipe's matched comparison with upstream (Chatterbox-H100.md,
+        # "Comparison with the canonical upstream implementation") keeps
+        # Original's WER and SIM within its predeclared guards.
         guided[:, START_SPEECH_TOKEN] = -torch.inf
         guided[:, STOP_SPEECH_TOKEN + 1 :] = -torch.inf
         return guided, row_pairs
