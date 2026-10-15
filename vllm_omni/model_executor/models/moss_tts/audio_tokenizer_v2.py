@@ -204,6 +204,18 @@ class StreamingExecutionContext:
     # One transformer's ``rope_angles`` result, shared by its layers, whose
     # per-slot offsets advance together.
     rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Packed decode (see ``packed_codec``): one (1, N) sequence holding a
+    # segment of ``segment_frames`` code frames per stream, in order; row ``s``
+    # of ``state_slot_ids``/``valid_rows`` belongs to segment ``s``.
+    segment_frames: torch.Tensor | None = None
+    segment_starts: torch.Tensor | None = None  # first frame of each segment
+    frame_segments: torch.Tensor | None = None  # segment of each frame, (N,)
+    # Set by a transformer for its layers: token lengths, token starts and
+    # the attention program table at that transformer's token rate.
+    packed_stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    # Set with ``packed_stage`` when the transformer advances its layers'
+    # offsets itself: every segment's offset, equal in all of its layers.
+    packed_offsets: torch.Tensor | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
         if self.state_slot_ids.shape != (batch_size,):
@@ -397,6 +409,25 @@ def _(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     shape = (offset.shape[0], 1, num_frames, head_dim // 2)
     return offset.new_empty(shape, dtype=torch.float32), offset.new_empty(shape, dtype=torch.float32)
+
+
+@torch.library.custom_op("vllm_omni::moss_codec_rope_angles_at", mutates_args=())
+def rope_angles_at(positions: torch.Tensor, head_dim: int, max_period: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(cos, sin)``, each (1, N, 1, D/2) fp32, at absolute token ``positions`` (N,).
+
+    The packed-decode table: the angle of a token equals ``rope_angles``' for
+    its stream offset plus its index in the chunk (integers exact in fp32).
+    """
+    ds = torch.arange(head_dim // 2, device=positions.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / head_dim))
+    angles = freqs * positions.float().view(1, -1, 1, 1)
+    return torch.cos(angles), torch.sin(angles)
+
+
+@rope_angles_at.register_fake
+def _(positions: torch.Tensor, head_dim: int, max_period: float) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (1, positions.shape[0], 1, head_dim // 2)
+    return positions.new_empty(shape, dtype=torch.float32), positions.new_empty(shape, dtype=torch.float32)
 
 
 def apply_rope(
@@ -952,6 +983,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
+        if execution_context is not None and execution_context.packed_stage is not None:
+            return self._forward_packed(query, state, execution_context)
         metadata = execution_context.attention_metadata if execution_context is not None else None
 
         if state is None:
@@ -1119,6 +1152,50 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
                     state.kv_cache.end_offset.index_copy_(0, execution_context.state_slot_ids, next_offset)
         return x
 
+    def _forward_packed(
+        self, query: torch.Tensor, state: MHAState | None, context: StreamingExecutionContext
+    ) -> torch.Tensor:
+        """Self-attention over packed streams (see ``MossAudioTokenizerTransformer._forward_packed``)."""
+        from vllm_omni.model_executor.models.moss_tts.slot_attention import slot_ring_flash_attention_packed
+
+        if state is None or state.kv_cache is None or not self.causal or self.weights_per_step or self.rope is None:
+            raise RuntimeError("Packed codec decode needs causal RoPE attention with a ring cache.")
+        assert context.packed_stage is not None and context.rope_table is not None
+        lengths, tok_starts, entry_seg, entry_blk = context.packed_stage
+        _, N = query.shape[:2]
+        slots = context.state_slot_ids
+        hoisted = context.packed_offsets is not None
+        offset = context.packed_offsets if hoisted else state.offset.index_select(0, slots)
+        dim_per_head = self.embed_dim // self.num_heads
+        projected = self.in_projs[0](query).view(1, N, 3, self.num_heads, dim_per_head)
+        # Token-major (1, N, H, D) views keep every stride but the batch one fixed.
+        q, k = self.rope(
+            projected[:, :, 0], projected[:, :, 1], offset, time_before_heads=True, table=context.rope_table
+        )
+        v = projected[:, :, 2]
+        x = slot_ring_flash_attention_packed(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            state.kv_cache.cache,
+            offset,
+            slots,
+            lengths,
+            tok_starts,
+            entry_seg,
+            entry_blk,
+            self.context if self.context is not None else -1,
+            int(self._packed_block_m),
+            *getattr(self, "_packed_launch", (0, 0, 0)),
+        )
+        x = self.out_projs[0](x.transpose(1, 2).reshape(1, N, self.embed_dim))
+        if hoisted:
+            return x
+        next_offset = torch.where(context.valid_rows, offset + lengths, offset)
+        state.offset.index_copy_(0, slots, next_offset)
+        state.kv_cache.end_offset.index_copy_(0, slots, next_offset)
+        return x
+
 
 # =============================================================================
 # Transformer Layer
@@ -1229,7 +1306,19 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         if self.gating is None:
             assert self.linear1 is not None
             assert self.linear2 is not None
-            update = self.linear2(self.activation(self.linear1(x)))
+            gelu_bias = getattr(self, "_gelu_epilogue_bias", None)
+            if gelu_bias is not None:
+                # Opt-in (codec_gelu_epilogue): GELU in the up-projection GEMM
+                # epilogue (cuBLASLt, tanh form, applied before bf16 rounding)
+                # instead of a separate pass over the FFN activations. Under
+                # the decoder's bf16 autocast the norm output is FP32; round it
+                # here as autocast does for linear1, so Inductor fuses the cast
+                # into the norm kernel.
+                weight = self.linear1.weight
+                hidden = linear_gelu_epilogue(x.reshape(-1, x.shape[-1]).to(weight.dtype), weight, gelu_bias)
+                update = self.linear2(hidden.view(*x.shape[:-1], hidden.shape[-1]))
+            else:
+                update = self.linear2(self.activation(self.linear1(x)))
         else:
             if self.weights_per_step:
                 assert isinstance(self.gating, nn.ModuleList)
@@ -1266,6 +1355,46 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
             assert isinstance(state, LayerState)
             state.offset_cpu += x.shape[1]
         return x
+
+
+@torch.library.custom_op("vllm_omni::moss_linear_gelu_epilogue", mutates_args=())
+def linear_gelu_epilogue(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    """``gelu(x @ weight.T)`` with GELU (tanh form) in the cuBLASLt epilogue.
+
+    Custom ops are not autocast-aware, so callers pass ``x`` in the weight
+    dtype; other input is rounded to it here, as autocast would for a GEMM.
+    """
+    return torch._addmm_activation(zero_bias, x.to(weight.dtype), weight.t(), use_gelu=True)
+
+
+@linear_gelu_epilogue.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=weight.dtype)
+
+
+def enable_gelu_epilogue(model: nn.Module) -> int:
+    """Opt-in: fuse each eligible FFN GELU into its up-projection GEMM.
+
+    Eligible layers use the plain GELU FFN with a bias-free half-precision
+    CUDA ``linear1``. cuBLASLt's GELU epilogue uses the tanh form on the FP32
+    accumulator, so outputs change at bf16-rounding level (not bitwise).
+    Returns the number of layers switched.
+    """
+    switched = 0
+    for module in model.modules():
+        if not isinstance(module, MossAudioTokenizerTransformerLayer):
+            continue
+        linear1 = module.linear1
+        if module.gating is not None or module.weights_per_step or module.activation is not F.gelu:
+            continue
+        if not isinstance(linear1, nn.Linear) or linear1.bias is not None:
+            continue
+        weight = linear1.weight
+        if weight.device.type != "cuda" or weight.dtype not in (torch.bfloat16, torch.float16):
+            continue
+        module._gelu_epilogue_bias = torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
+        switched += 1
+    return switched
 
 
 # =============================================================================
@@ -1357,6 +1486,8 @@ class MossAudioTokenizerTransformer(StreamingModule):
             raise RuntimeError("Shared decoder KV pools require explicit execution slots.")
         if execution_context is not None and not isinstance(execution_context, StreamingExecutionContext):
             raise TypeError("execution_context must be a StreamingExecutionContext.")
+        if execution_context is not None and execution_context.segment_frames is not None:
+            return self._forward_packed(x, execution_context)
         if state is None:
             offsets = torch.zeros(1, dtype=torch.long, device=x.device)
         elif not isinstance(state, TransformerState):
@@ -1427,6 +1558,51 @@ class MossAudioTokenizerTransformer(StreamingModule):
             else:
                 next_offsets = torch.where(execution_context.valid_rows, offsets + T, offsets)
                 state.offsets.index_copy_(0, execution_context.state_slot_ids, next_offsets)
+        return x
+
+    def _forward_packed(self, x: torch.Tensor, context: StreamingExecutionContext) -> torch.Tensor:
+        """Packed streams: x is (1, N * f, C), segment ``s`` spans ``f * segment_frames[s]`` tokens.
+
+        ``f`` (``_packed_factor``) is this transformer's tokens per code frame
+        and ``_packed_block_m`` the attention tile of a steady batched chunk
+        at this rate. Valid segments advance their slot offsets like batched
+        rows; padding segments (``valid_rows`` False) keep them.
+        """
+        from vllm_omni.model_executor.models.moss_tts.slot_attention import packed_block_entries
+
+        state = self._streaming_state
+        if not isinstance(state, TransformerState) or self.rope is None or self.positional_embedding != "rope":
+            raise RuntimeError("Packed codec decode needs streaming state and RoPE-only transformers.")
+        f = int(self._packed_factor)
+        block_m = int(self._packed_block_m)
+        assert context.segment_starts is not None and context.frame_segments is not None
+        slots = context.state_slot_ids
+        offsets = state.offsets.index_select(0, slots)
+        lengths = context.segment_frames * f
+        tok_starts = context.segment_starts * f
+        tokens = torch.arange(x.shape[1], device=x.device)
+        segment = context.frame_segments[tokens // f] if f > 1 else context.frame_segments
+        positions = offsets[segment] + (tokens - tok_starts[segment])
+        table = rope_angles_at(positions, self._head_dim, float(self.rope.max_period))
+        entry_seg, entry_blk = packed_block_entries(lengths, block_m, x.shape[1] // block_m + slots.shape[0])
+        # Rows of the decoder's slot-offset storage holding this transformer's
+        # and its layers' offsets (see ``_centralize_decoder_slot_offsets``):
+        # they are equal per slot, so the layers take ``offsets`` and one
+        # launch advances them all.
+        block = getattr(self, "_packed_offset_block", None)
+        context = dataclasses.replace(
+            context,
+            rope_table=table,
+            packed_stage=(lengths, tok_starts, entry_seg, entry_blk),
+            packed_offsets=offsets if block is not None else None,
+        )
+        for layer in self.layers:
+            x = layer(x, execution_context=context)
+        next_offsets = torch.where(context.valid_rows, offsets + lengths, offsets)
+        if block is not None:
+            block.index_copy_(1, slots, next_offsets.unsqueeze(0).expand(block.shape[0], -1))
+        else:
+            state.offsets.index_copy_(0, slots, next_offsets)
         return x
 
 
@@ -2095,11 +2271,30 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             device=next(self.parameters()).device,
         )
         row = 0
+        row_of: dict[int, int] = {}
         for state, fields in state_tensors:
             for owner, name in fields:
                 setattr(owner, name, storage[row])
+                row_of[id(getattr(owner, name))] = row
                 row += 1
         self._decoder_slot_offsets = storage
+        # A transformer's offsets and its layers' attention offsets advance
+        # together; when their rows are contiguous, packed decode advances
+        # them with one launch (``MossAudioTokenizerTransformer._forward_packed``).
+        for module in self._streaming_modules:
+            state = module._streaming_state
+            if not isinstance(state, TransformerState):
+                continue
+            rows = [row_of[id(state.offsets)]]
+            for sub in module.modules():
+                sub_state = getattr(sub, "_streaming_state", None)
+                if isinstance(sub_state, MHAState):
+                    rows.append(row_of[id(sub_state.offset)])
+                    if sub_state.kv_cache is not None:
+                        rows.append(row_of[id(sub_state.kv_cache.end_offset)])
+            first, last = min(rows), max(rows)
+            if sorted(rows) == list(range(first, last + 1)):
+                module._packed_offset_block = storage[first : last + 1]
 
     def _stop_streaming(self) -> None:
         """Stop streaming mode for all modules."""
@@ -2107,6 +2302,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             module._streaming_state = None
             if isinstance(module, MossAudioTokenizerTransformer):
                 module._shared_kv_metadata = False
+            module.__dict__.pop("_packed_offset_block", None)
         self._streaming_modules = []
         self._streaming_exec_mask = None
         self._decoder_state_capacity = 0
@@ -2114,7 +2310,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._decoder_null_slot = None
 
     def initialize_decoder_state_pool(
-        self, state_capacity: int, scratch_capacity: int = 0, chunk_frames: int = 0
+        self, state_capacity: int, scratch_capacity: int = 0, chunk_frames: int = 0, *, packed: bool = False
     ) -> None:
         """Allocate persistent decoder state independently of execution B.
 
@@ -2131,8 +2327,11 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             )
         if self._streaming_modules:
             raise RuntimeError("MOSS Audio Tokenizer is already streaming.")
-        scratch_capacity = 1
-        self._decoder_null_slot = state_capacity
+        # Packed segments need distinct padding slots and per-layer offsets.
+        # Keep the upstream shared/null-slot pool for ordinary batched decode.
+        if not packed:
+            scratch_capacity = 1
+            self._decoder_null_slot = state_capacity
         for module in self.decoder:
             if not isinstance(module, MossAudioTokenizerProjectedTransformer):
                 continue

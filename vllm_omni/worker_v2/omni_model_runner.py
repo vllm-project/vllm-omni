@@ -252,21 +252,26 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
-        sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
-        if sender is not None:
-            sender.close()
+        state = getattr(self, "model_state", None)
+        close_audio = getattr(state, "close_audio_senders", None)
         # Every owner must release its resources even if an earlier drain fails.
         try:
-            worker = getattr(self, "_native_output_materializer", None)
-            if worker is not None:
-                worker.close()
+            if callable(close_audio):
+                close_audio()
+            elif (sender := getattr(state, "_first_audio_sender", None)) is not None:
+                sender.close()
         finally:
-            self._native_output_materializer = None
             try:
-                if self._omni_data_plane is not None:
-                    self._omni_data_plane.close()
+                worker = getattr(self, "_native_output_materializer", None)
+                if worker is not None:
+                    worker.close()
             finally:
-                super().shutdown()
+                self._native_output_materializer = None
+                try:
+                    if self._omni_data_plane is not None:
+                        self._omni_data_plane.close()
+                finally:
+                    super().shutdown()
 
     def _prepare_native_data_plane(self, scheduler_output: SchedulerOutput) -> None:
         plane = getattr(self, "_omni_data_plane", None)
@@ -862,3 +867,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        # Audio of requests that already stopped generating is serviced on
+        # every step, also on steps that run no batch.
+        drain = getattr(self.model_state, "drain_detached_audio", None)
+        if callable(drain):
+            drain()

@@ -467,7 +467,7 @@ def test_all_adapters_are_ar_or_diffusion():
 @pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
 def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
     adapter = adapter_cls(SimpleNamespace(server=object()))
-    stage_defaults = [SimpleNamespace(max_tokens=4096)]
+    stage_defaults = [SamplingParams(max_tokens=4096)]
 
     overridden = adapter.apply_sampling_overrides(
         stage_defaults,

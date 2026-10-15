@@ -673,6 +673,29 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
+        # Accumulation below runs before emission. A tail sender can put
+        # several outputs of one request in a batch; emitting them together
+        # would attach future chunks/metadata to an earlier DELTA output.
+        # Keep batching distinct requests, but emit before revisiting an ID.
+        seen: set[str] = set()
+        batches: list[list[EngineCoreOutput]] = []
+        start = 0
+        for index, output in enumerate(engine_core_outputs):
+            if output.request_id in seen:
+                batches.append(engine_core_outputs[start:index])
+                start = index
+                seen.clear()
+            seen.add(output.request_id)
+        if batches:
+            batches.append(engine_core_outputs[start:])
+            request_outputs = []
+            reqs_to_abort = []
+            for batch in batches:
+                processed = self.process_outputs(batch, engine_core_timestamp, iteration_stats)
+                request_outputs.extend(processed.request_outputs)
+                reqs_to_abort.extend(processed.reqs_to_abort)
+            return OutputProcessorOutput(request_outputs=request_outputs, reqs_to_abort=reqs_to_abort)
+
         default_mm_type = _modality_to_type_string(self.output_modality)
 
         # Separate outputs that upstream can handle (has detokenizer or

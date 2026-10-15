@@ -168,3 +168,42 @@ def test_generation_stage_mm_delivered_only_with_terminal(streaming):
     assert completion.text == ""
     assert torch.equal(completion.multimodal_output["audio"], audio)
     assert completion.multimodal_output["sr"].item() == 24000
+
+
+@pytest.mark.parametrize("with_detokenizer", [False, True])
+@pytest.mark.parametrize("output_kind", list(RequestOutputKind))
+def test_same_request_chunks_in_one_batch_keep_audio_and_metadata_order(output_kind, with_detokenizer):
+    processor, state = _make_processor(OutputModality.AUDIO, _Detokenizer() if with_detokenizer else None)
+    state.output_kind = output_kind
+    first, regular, tail = [torch.full((2, frames * 4), value) for frames, value in [(1, 1.0), (15, 2.0), (1, 3.0)]]
+
+    def chunk(pcm, *, last=False):
+        return OmniEngineCoreOutput(
+            request_id="r",
+            new_token_ids=[],
+            multimodal_output={
+                "model_outputs": pcm,
+                "sr": torch.tensor(48000, dtype=torch.int32),
+                "meta.tts_is_last_chunk": torch.tensor([int(last)]),
+            },
+            finish_reason=FinishReason.LENGTH if last else None,
+        )
+
+    initial = processor.process_outputs([chunk(first)]).request_outputs
+    result = processor.process_outputs([chunk(regular), chunk(tail, last=True)]).request_outputs
+    full = torch.cat([first, regular, tail], dim=-1)
+    if output_kind == RequestOutputKind.FINAL_ONLY:
+        assert not initial
+        expected = [full]
+    elif output_kind == RequestOutputKind.CUMULATIVE:
+        expected = [torch.cat([first, regular], dim=-1), full]
+    else:
+        expected = [regular, tail]
+    assert len(result) == len(expected)
+    for index, (output, pcm) in enumerate(zip(result, expected, strict=True)):
+        payload = output.outputs[0].multimodal_output
+        torch.testing.assert_close(payload["audio"], pcm)
+        last = index == len(result) - 1
+        assert output.finished == last
+        assert bool(payload["meta"]["tts_is_last_chunk"].item()) == last
+    assert "r" not in processor.request_states

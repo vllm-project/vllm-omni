@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Deployment sampler settings override the legacy environment switch."""
+"""Deployment settings control sampler compilation."""
 
 import pytest
 from transformers import GPT2Config
@@ -10,11 +10,8 @@ from vllm_omni.model_executor.models.moss_tts import modeling_moss_tts_local_dep
 pytestmark = [pytest.mark.core_model, pytest.mark.tts, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize(
-    "configured,env,expected", [(None, "0", False), (None, "1", True), (True, "0", True), (False, "1", False)]
-)
-def test_sampler_compile_setting_and_idempotent_setup(monkeypatch, configured, env, expected):
-    monkeypatch.setenv("VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER", env)
+@pytest.mark.parametrize("configured", [False, True])
+def test_sampler_compile_setting_and_idempotent_setup(monkeypatch, configured):
     monkeypatch.setattr(depth.current_omni_platform, "supports_torch_inductor", lambda: True)
     calls = []
 
@@ -28,11 +25,11 @@ def test_sampler_compile_setting_and_idempotent_setup(monkeypatch, configured, e
     )
     model.setup_compile()
     model.setup_compile()
-    assert len(calls) == 1 + expected
-    assert (model._compiled_audio_sampler is depth._sample_token) is expected
+    assert len(calls) == 1 + configured
+    assert (model._compiled_audio_sampler is depth._sample_token) is configured
     sampler_calls = [kwargs for fn, kwargs in calls if fn is depth._sample_token]
-    assert len(sampler_calls) == int(expected)
-    if expected:
+    assert len(sampler_calls) == int(configured)
+    if configured:
         assert sampler_calls[0] == {"fullgraph": True, "dynamic": True, "options": {"fallback_random": True}}
 
 

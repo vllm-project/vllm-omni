@@ -114,16 +114,13 @@ def test_generate_rejects_different_prepared_depth():
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize(
-    "configured,env,expected", [(None, "0", False), (None, "1", True), (True, "0", True), (False, "1", False)]
-)
-def test_lookup_retains_compiled_fallback_sampler(monkeypatch, configured, env, expected):
+@pytest.mark.parametrize("configured", [False, True])
+def test_lookup_retains_compiled_fallback_sampler(monkeypatch, configured):
     from vllm_omni.model_executor.models.moss_tts import modeling_moss_tts_local_depth as depth
 
     model, embeddings, _, _ = _models(12)
     model.prepare_qkv_lookup(embeddings, 12)
     model._compile_audio_sampler = configured
-    monkeypatch.setenv("VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER", env)
     monkeypatch.setattr(depth.current_omni_platform, "supports_torch_inductor", lambda: True)
     calls = []
 
@@ -135,8 +132,8 @@ def test_lookup_retains_compiled_fallback_sampler(monkeypatch, configured, env, 
     model.setup_compile()
     model.setup_compile()
     assert calls.count(model._forward_lookup) == 1
-    assert calls.count(depth._sample_token) == int(expected)
-    assert (model._compiled_audio_sampler is depth._sample_token) is expected
+    assert calls.count(depth._sample_token) == int(configured)
+    assert (model._compiled_audio_sampler is depth._sample_token) is configured
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

@@ -1,0 +1,80 @@
+# Single-stage MOSS-TTS-Local-Transformer-v1.5 on one CUDA GPU.
+# The talker and streaming codec share one process, without a connector or MPS.
+# This profile needs room for a 32 GiB KV cache, codec weights, state and graphs.
+pipeline: moss_tts_local_fused
+model_runner: v2
+async_chunk: true
+
+speech_cache:
+  resolve_max_bytes: 2147483648  # 2 GiB
+  resolve_max_entries: 2048
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.60
+    enable_prefix_caching: true
+    async_scheduling: true
+    # Bound prefill work so new prompts do not monopolize streaming decode.
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    devices: "0"
+    kv_cache_memory_bytes: 34359738368  # 32 GiB
+    hf_overrides:
+      mrv2_gpu_slot_state: true
+      mrv2_batch_prefill: true
+      mrv2_direct_tokens: true
+      # Completing prefills join the step's single post-forward MTP batch.
+      mrv2_eager_mtp: true
+      local_compile_audio_sampler: true
+      local_fused_depth: true
+      talker_decode_attention: true
+      codec_attention_backend: triton_slot
+    attention_config:
+      backend: TRITON_ATTN
+    compilation_config:
+      mode: 3
+      cudagraph_mode: FULL
+      max_cudagraph_capture_size: 512
+      cudagraph_num_of_warmups: 1
+      inductor_compile_config:
+        enable_auto_functionalized_v2: false
+        combo_kernels: true
+        benchmark_combo_kernel: true
+        triton.enable_pdl: true
+        coordinate_descent_tuning: true
+        max_autotune_pointwise: true
+    additional_config:
+      moss_fused_codec:
+        initial_codec_chunk_frames: 1   # 80 ms first audio chunk
+        codec_chunk_ramp_frames: [3, 7] # Bridge the first chunk to steady decoding
+        codec_chunk_frames: 15          # 1.2 s steady chunks
+        codec_shared_rope: 1
+        codec_fused_slot_attention: 1
+        codec_skip_empty_attention_tiles: 1
+        codec_flash_slot_attention: 1
+        # Pack first chunks, steady chunks and tails without per-stream padding.
+        codec_packed_decode: 1
+        codec_packed_frame_sizes: [2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]
+        codec_packed_tuned_attention: 1
+        # GELU uses the tanh form on the GEMM accumulator before BF16 rounding.
+        codec_gelu_epilogue: 1
+        fused_decode_packed_interval: 2
+        fused_decode_min_batch: 32
+        fused_decode_max_wait_steps: 3
+        fused_decode_first_wait_steps: 1
+        # The first frame shares the packed decoder and goes ahead of step output.
+        fused_early_first_audio: 1
+        fused_decode_last_wait_steps: 1
+        fused_codec_precise_deps: 1
+        # Leave SMs available for the talker while codec GEMMs run.
+        codec_gemm_sm_carveout: 48
+        # Packed graphs handle fused chunks; retain only small unpacked buckets.
+        cudagraph_capture_sizes: [1, 2]
+    default_sampling_params:
+      temperature: 1.7
+      top_p: 0.8
+      top_k: 25
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0

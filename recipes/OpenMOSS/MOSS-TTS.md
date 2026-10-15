@@ -430,3 +430,60 @@ python -m pytest -q tests/model_executor/models/moss_tts/test_slot_attention.py 
   tests/model_executor/models/moss_tts/test_streaming_attention.py \
   -m 'core_model and cuda' --run-level=core_model
 ```
+
+## Single-stage Local fused profile (CUDA)
+
+The fused profile sends codec chunks of 1, 3, 7, then 15 frames (80, 240,
+560, then 1200 ms of audio). The smaller intermediate chunks bridge the
+first 80 ms to steady decoding without adding client prebuffering.
+`additional_config.moss_fused_codec.codec_chunk_ramp_frames` contains the
+intermediate sizes; they must increase strictly between
+`initial_codec_chunk_frames` and `codec_chunk_frames`. An empty list restores
+the direct transition from the first chunk to steady chunks. Early first
+audio counts as the first chunk. Ramp chunks use the first-chunk wait budget,
+and a stopped stream flushes its remaining
+frames immediately through the normal tail path.
+
+Chunk boundaries can change BF16 decoder rounding. Equal request seeds also
+do not guarantee identical generated codec tokens across dynamic serving
+batches. Validate chunking changes with both fixed-token decoder comparisons
+and repeated end-to-end quality runs using the deployed sampling and graph
+path. A confidence interval containing zero does not establish equal quality.
+
+`moss_tts_local_fused.yaml` runs the Local talker and streaming codec in one
+process on one GPU. It uses packed codec graphs, fused depth kernels, precise
+stream dependencies, and a codec GEMM SM carveout of 48. The ordinary
+`moss_tts_local.yaml` retains its two-stage CUDA pipeline and upstream first-audio
+path. Both CUDA profiles have 128 request slots and a 32 GiB talker KV cache.
+The fused scheduler reserves codec capacity until stopped requests finish their
+last audio. KV-cache preemption fails the affected fused request explicitly;
+it does not silently restart a partially delivered waveform.
+
+On Hopper and newer CUDA GPUs, compatible Triton kernels automatically use
+programmatic dependent launch. Prefix-cache hashing retains vLLM's request salt
+isolation. The grouped attention implementation is local to this model's
+backbone layers; it does not replace vLLM's global attention or upload functions.
+The fused depth and compiled sampler settings come from the deployment YAML.
+No additional experiment environment switches are required:
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --omni --api-server-count 4 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_fused.yaml \
+  --allowed-local-media-path /absolute/path/to/seedtts_testset
+```
+
+For a C128 main-versus-fused comparison, use the same model, dependency versions,
+physical GPU, CPU allocation, four API servers, and dataset on both sides. Run
+main with its unchanged `moss_tts_local.yaml`.
+Pass `--seed-tts-file-ref-audio` to `vllm bench serve --omni` with the
+Seed-TTS dataset; each request then refers to `file:///.../prompt.wav`. The server
+and client must see the same absolute paths. This changes reference transport;
+it does not bypass the reference encoder.
+
+Warm both services with the same full dataset before formal rounds, and report
+successful audio seconds divided by complete round wall time. Any steady-window
+estimate must be labeled separately. Historical overlay throughput and quality
+results do not establish the performance or quality of a rebase onto a new main.
+Experimental oracle, profiling, codec scheduling, and FFN chunking changes are
+excluded from this profile.

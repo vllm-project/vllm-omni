@@ -76,6 +76,22 @@ class FirstAudioSender:
         accepted = list(delivery.routes)
         if not accepted:
             return []
+        self.submit_prepared(delivery, request_ids, pcm, sample_rate, valid)
+        return accepted
+
+    def prepare(self, request_ids: list[str]) -> _PreparedDelivery:
+        """Freeze routes now for PCM decoded and submitted later."""
+        return self._sink.prepare(request_ids)
+
+    def submit_prepared(
+        self,
+        delivery: _PreparedDelivery,
+        request_ids: list[str],
+        pcm: torch.Tensor,
+        sample_rate: torch.Tensor,
+        valid: torch.Tensor | None = None,
+    ) -> None:
+        """``submit`` for routes frozen by an earlier ``prepare``."""
         host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
         host.copy_(pcm, non_blocking=True)
         host_valid = None
@@ -85,7 +101,6 @@ class FirstAudioSender:
         copied = torch.cuda.Event()
         copied.record()
         self._queue.put((copied, host, list(request_ids), sample_rate, host_valid, delivery))
-        return accepted
 
     def close(self) -> None:
         self._queue.put(None)
@@ -173,5 +188,5 @@ class _EngineOutputSink:
 
 
 def engine_output_queue_sink(output_queue: Any, scheduler: Any) -> _EngineOutputSink:
-    """Route prepared first audio from an upstream stage."""
+    """Route first PCM with the marker used to order subsequent step output."""
     return _EngineOutputSink(output_queue, scheduler)

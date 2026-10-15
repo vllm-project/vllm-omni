@@ -22,7 +22,6 @@ checkpoint 1:1 so ``load_weights()`` needs no remapping.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Sequence
 
 import torch
@@ -55,7 +54,6 @@ class _MossTTSLocalAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = hidden_size // n_head
         self.embed_dim = hidden_size
-        self._short_attention = os.environ.get("VLLM_OMNI_MOSS_LOCAL_SHORT_ATTN", "0") == "1"
         self.c_attn = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
         self.c_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
@@ -138,19 +136,7 @@ class _MossTTSLocalAttention(nn.Module):
             v_cache[:, :, position : position + 1].copy_(value)
             key = k_cache[:, :, : position + 1]
             value = v_cache[:, :, : position + 1]
-        if (
-            self._short_attention
-            and kv_cache is not None
-            and query.is_cuda
-            and query.dtype == torch.bfloat16
-            and self.head_dim <= 128
-            and key.shape[2] <= 16
-        ):
-            from vllm_omni.model_executor.models.moss_tts.local_short_attention import local_short_attention
-
-            attn_output = local_short_attention(query, key, value)
-        else:
-            attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=kv_cache is None)
+        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=kv_cache is None)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         return self.c_proj(attn_output)
 
@@ -201,7 +187,12 @@ class MossTTSLocalDepthTransformer(nn.Module):
     """
 
     def __init__(
-        self, gpt2_config, hidden_size: int | None = None, *, compile_audio_sampler: bool | None = None
+        self,
+        gpt2_config,
+        hidden_size: int | None = None,
+        *,
+        compile_audio_sampler: bool = False,
+        fused_depth: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size if hidden_size is not None else gpt2_config.n_embd)
@@ -220,6 +211,10 @@ class MossTTSLocalDepthTransformer(nn.Module):
         self._fused_attention = False
         self._auto_fused_linear = False
         self._fused_sampling = False
+        # Opt-in: one launch per codebook for sample + code store + next
+        # position's attention, a fused binary gate, and (in the talker) a
+        # fused MTP output epilogue. Bit-identical to the unfused kernels.
+        self.fused_depth = bool(fused_depth)
 
     @torch.no_grad()
     def prepare_qkv_lookup(self, audio_embeddings: nn.ModuleList, n_vq: int) -> None:
@@ -347,10 +342,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
                 options={"epilogue_fusion": False},
             )
             logger.info("MOSS-TTS local depth frame-local KV execution enabled with torch.compile")
-        compile_sampler = self._compile_audio_sampler
-        if compile_sampler is None:
-            compile_sampler = os.environ.get("VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER", "0") == "1"
-        if compile_sampler and self._compiled_audio_sampler is None:
+        if self._compile_audio_sampler and self._compiled_audio_sampler is None:
             # Keep the existing top-k/top-p algorithm and torch RNG. Explicit
             # per-request generators use the original helper below. The
             # binary continue/stop head is deliberately unchanged.
@@ -449,8 +441,9 @@ class MossTTSLocalDepthTransformer(nn.Module):
             and 0 < top_p <= 1
             and repetition_penalty == 1.0
         )
+        fused_depth = fused_sampling and self.fused_depth and self._fused_attention
         if fused_sampling:
-            from vllm_omni.model_executor.models.moss_tts.local_kernels import fused_sample
+            from vllm_omni.model_executor.models.moss_tts.local_kernels import fused_sample, sample_attend
 
             # Philox state remains owned by PyTorch, including graph replay.
             # Uniforms are independent across requests and codebooks.
@@ -482,7 +475,14 @@ class MossTTSLocalDepthTransformer(nn.Module):
             # Position-zero RoPE is identity; only this input depends on the
             # backbone and therefore needs a runtime LN/QKV projection.
             qkv = attn.c_attn(self.h[0].ln_1(first_hidden))
-            local_hidden = self._run_lookup_step(first_hidden, qkv, key, value, 0)
+            if fused_depth:
+                from vllm_omni.model_executor.models.moss_tts.local_kernels import lookup_attention
+
+                out, _ = lookup_attention(qkv, key, value, 0, late_store=True)
+                forward = self._compiled_forward_lookup or self._forward_lookup
+                local_hidden = forward(first_hidden, out)
+            else:
+                local_hidden = self._run_lookup_step(first_hidden, qkv, key, value, 0)
         else:
             attn = self.h[0].attn
             cache_shape = (batch_size, attn.n_head, n_vq, attn.head_dim)
@@ -493,30 +493,64 @@ class MossTTSLocalDepthTransformer(nn.Module):
             hidden = self._run_prefix(backbone_last_hidden[:, None, :].to(dtype), kv_cache, 0)
             local_hidden = hidden[:, 0, :]
 
-        binary_logits = local_text_lm_head(local_hidden).float()
-        # This is a binary continue/stop gate. The checkpoint expects sampling
-        # here; greedy argmax is biased toward "continue" and may never stop.
-        binary_choice = _sample_token(
-            binary_logits,
-            text_temperature,
-            text_top_k,
-            text_top_p,
-            do_sample,
-            generator=generator,
-            generators=generators,
-        )
-        should_continue = binary_choice.eq(0)
-        import os as _os
+        per_row_generators = generators is not None and any(gen is not None for gen in generators)
+        if (
+            fused_depth
+            and do_sample
+            and text_temperature > 0
+            and not (0 < text_top_k < 2)
+            and not (0.0 < text_top_p < 1.0)
+            and not per_row_generators
+        ):
+            from vllm_omni.model_executor.models.moss_tts.local_kernels import binary_continue
 
-        if _os.environ.get("MOSS_TTS_DEBUG_STOP"):
-            import logging as _logging
-
-            _logging.getLogger("moss_tts_debug").warning(
-                "binary_logits=%s choice=%s", binary_logits.tolist(), binary_choice.tolist()
+            binary_logits = local_text_lm_head(local_hidden)
+            # torch.multinomial(probs, 1) draws Exp(1) noise of the probs'
+            # shape; drawing it here keeps the Philox stream identical.
+            exponential = torch.empty(binary_logits.shape, device=binary_logits.device, dtype=torch.float32)
+            exponential.exponential_(generator=generator)
+            should_continue = binary_continue(binary_logits, exponential, text_temperature)
+        else:
+            binary_logits = local_text_lm_head(local_hidden).float()
+            # This is a binary continue/stop gate. The checkpoint expects sampling
+            # here; greedy argmax is biased toward "continue" and may never stop.
+            binary_choice = _sample_token(
+                binary_logits,
+                text_temperature,
+                text_top_k,
+                text_top_p,
+                do_sample,
+                generator=generator,
+                generators=generators,
             )
-
-        codes = backbone_last_hidden.new_zeros((batch_size, n_vq), dtype=torch.long)
+            should_continue = binary_choice.eq(0)
+        if fused_depth:
+            # Every column is written by sample_attend below.
+            codes = backbone_last_hidden.new_empty((batch_size, n_vq), dtype=torch.long)
+        else:
+            codes = backbone_last_hidden.new_zeros((batch_size, n_vq), dtype=torch.long)
         for channel_index in range(n_vq):
+            if fused_depth:
+                logits = audio_lm_heads[channel_index](local_hidden)
+                last = channel_index + 1 == n_vq
+                fused = sample_attend(
+                    logits,
+                    uniforms[:, channel_index],
+                    codes[:, channel_index],
+                    top_k=top_k,
+                    temperature=temperature,
+                    top_p=top_p,
+                    qkv=None if last else self._qkv_lookup[channel_index],
+                    embedding=None if last else audio_embeddings[channel_index].weight,
+                    key=key,
+                    value=value,
+                    position=channel_index + 1,
+                )
+                if not last:
+                    out, next_embed = fused
+                    forward = self._compiled_forward_lookup or self._forward_lookup
+                    local_hidden = forward(next_embed, out)
+                continue
             if fused_sampling:
                 channel_token = fused_sample(
                     audio_lm_heads[channel_index](local_hidden),

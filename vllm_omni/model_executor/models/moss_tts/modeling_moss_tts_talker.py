@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSLocalConfig,
     MossTTSRealtimeConfig,
 )
+from vllm_omni.model_executor.models.moss_tts.fused_codec import build_fused_codec, fused_codec_enabled
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     MossTTSRealtimeLocalTransformer,
     _normalize_generators,
@@ -1328,6 +1329,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             vllm_config=vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
+        if getattr(self.config, "talker_decode_attention", False):
+            from .decode_attention import use_moss_local_attention
+
+            use_moss_local_attention(self.model)
 
         # Real text LM head -- loaded from the checkpoint but never consulted
         # at inference (see class docstring); kept purely as a destination
@@ -1354,7 +1359,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self.local_transformer = MossTTSLocalDepthTransformer(
             self.config.gpt2_config,
             hidden_size=hidden_size,
-            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", None),
+            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", False),
+            fused_depth=getattr(self.config, "local_fused_depth", False),
         )
 
         self._batch_state: list[dict[str, Any]] | None = None
@@ -1381,6 +1387,13 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             ("audio_codes", "accumulated"),
             ("hidden_states", "last"),
         }
+        # Single-stage pipeline: the codec is loaded after the talker weights.
+        # Kept outside the module tree: its weights come from another
+        # checkpoint and its decoder keeps its own dtype.
+        self.__dict__["fused_codec"] = None
+        if fused_codec_enabled(vllm_config):
+            # Per-step PCM outputs are freshly allocated by the codec.
+            self.mm_outputs_fresh_per_step = True
 
     # ------------------------------------------------------------------
     # vLLM hooks
@@ -1653,7 +1666,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             device=input_embeds.device,
             dtype=input_embeds.dtype,
         )
-        active_mask = text_step.reshape(bsz, -1)[:, :1] > 0
 
         # Match MOSS-TTS Local v1.5's model-card/SGLang defaults. The generic
         # stage SamplingParams are for the backbone token loop and should not
@@ -1679,6 +1691,25 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             generators=generators,
         )
         new_codes = new_codes.to(device=input_embeds.device, dtype=torch.long)
+        stacked = getattr(self, "_stacked_audio_emb_w", None)
+        if (
+            getattr(self.local_transformer, "fused_depth", False)
+            and stacked is not None
+            and new_codes.is_cuda
+            and stacked.dtype == input_embeds_out.dtype
+            and stacked.device == new_codes.device
+        ):
+            from vllm_omni.model_executor.models.moss_tts.local_kernels import mtp_epilogue
+
+            return mtp_epilogue(
+                new_codes,
+                should_continue_t.reshape(bsz),
+                text_step.reshape(bsz, -1),
+                input_embeds_out,
+                stacked,
+                self.audio_pad_token_id,
+            )
+        active_mask = text_step.reshape(bsz, -1)[:, :1] > 0
         emit_mask = active_mask & should_continue_t.reshape(bsz, 1)
         audio_embed = self._audio_embed(new_codes).to(dtype=input_embeds_out.dtype)
         input_embeds_out = input_embeds_out + audio_embed * emit_mask.to(dtype=input_embeds_out.dtype)
@@ -1849,6 +1880,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
         if not self.vllm_config.model_config.enforce_eager:
             self.local_transformer.setup_compile()
+        if fused_codec_enabled(self.vllm_config):
+            self.__dict__["fused_codec"] = build_fused_codec(self.vllm_config)
 
         logger.info(
             "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",
@@ -1867,6 +1900,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             model_config.use_v2_model_runner
             and model_config.async_chunk
             and getattr(self.config, "mrv2_gpu_slot_state", False)
+            and not fused_codec_enabled(self.vllm_config)
             and supports_in_process_first_audio(self.vllm_config)
         ):
             from .first_frame_decoder import MossFirstFrameDecoder
