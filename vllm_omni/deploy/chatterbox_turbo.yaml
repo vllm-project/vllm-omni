@@ -22,8 +22,7 @@
 # of equal length would share a cache entry whatever their voice or text.
 #
 # No stage loads a tokenizer: prompts are placeholder ids and nothing is
-# detokenized. Loading one would also have vLLM look in the repo for the
-# config.json it does not ship and log the miss as an error in every process.
+# detokenized.
 #
 # Chunking: the first chunk is 15 tokens plus the padding that aligns the
 # reference prompt to 15 (20 for a ten-second reference), then 30, then 60;

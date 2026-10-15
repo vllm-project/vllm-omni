@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reference conditioning and prompt construction for Chatterbox.
 
-``VoiceConditioner`` mirrors ``ChatterboxTurboTTS.prepare_conditionals``
-(chatterbox 0.1.7) step for step, without ``librosa`` and without the model
-object it hangs off upstream, with one deliberate difference: the decoder's
-prompt mel is cut to exactly two frames per prompt token (see
-``VoiceConditioner.from_resampled_batch``). The result travels with the request in
-``additional_information``: stage 0 reads ``ids.prompt``, ``ids.speech_token``
+``VoiceConditioner`` mirrors ``ChatterboxTurboTTS.prepare_conditionals`` and,
+for Original, ``ChatterboxTTS.prepare_conditionals`` (chatterbox 0.1.7) step
+for step, without ``librosa`` and without the model object it hangs off
+upstream, with one deliberate difference: the decoder's prompt mel is cut to
+exactly two frames per prompt token (see
+``VoiceConditioner.from_resampled_batch``). The result travels with the
+request in ``additional_information``: stage 0 reads ``ids.prompt``, ``ids.speech_token``
 and ``embed.voice`` in its ``preprocess``; stage 1 reads ``embed.speech_token``,
 ``embed.speech_feat`` and ``embed.embedding``, which the stage handoff
 (``stage_input_processors.chatterbox``) forwards to it. The serving adapter
@@ -179,7 +180,8 @@ class VoiceConditioning:
     """One reference clip, as both stages consume it.
 
     Attributes:
-        cond_tokens: Shape (1, C), S3 tokens of the first fifteen seconds, C <= 375.
+        cond_tokens: Shape (1, C), S3 tokens of the clip's first ``enc_cond_seconds``,
+            C <= ``cond_prompt_len`` (15 s and 375 for Turbo, 6 s and 150 for Original).
         speaker_emb: Shape (1, 256), the voice encoder's embedding.
         prompt_token: Shape (1, P), S3 tokens of the first ten seconds, P <= 250.
         prompt_feat: Shape (1, 2P, 80), 24 kHz mel of the same ten seconds.
@@ -212,7 +214,7 @@ class VoiceConditioning:
         """The request payload: stage 0's prompt and stage 1's reference.
 
         Args:
-            text_ids: GPT-2 ids of the normalized text.
+            text_ids: Text tokenizer ids of the normalized text.
 
         Returns:
             A nested dict that validates as an ``OmniPayloadStruct``.
@@ -277,8 +279,7 @@ class VoiceConditioner:
         self.campplus.to(device).eval()
 
         # soxr's default quality is the resampler librosa.load and
-        # librosa.resample use upstream; vLLM's default (torchaudio) differs
-        # enough to move a tenth of the S3 tokens.
+        # librosa.resample use upstream; vLLM's default is torchaudio.
         self.to_24k = MultiModalDataParser(target_sr=config.sample_rate, audio_resample_method="soxr").audio_resampler
         self.to_16k = MultiModalDataParser(
             target_sr=config.s3_sample_rate, audio_resample_method="soxr"
@@ -422,7 +423,9 @@ def build_prompt(
     Every prompt id is the start-of-speech token, whose logit is always
     ``-inf``: vLLM applies the repetition penalty to prompt ids too, and this
     keeps it off real speech tokens. Stage 0 replaces the placeholders with
-    ``[speaker | prompt tokens | text | start-of-speech]`` embeddings.
+    the variant's layout: ``[speaker | prompt tokens | text | start-of-speech]``
+    for Turbo, ``[speaker | perceiver queries | emotion | text with BOS and EOS
+    | two start-of-speech]`` for Original.
 
     Args:
         text_ids: Text tokenizer ids of ``punc_norm(text)``.

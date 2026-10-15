@@ -295,6 +295,9 @@ def test_original_owns_its_stage_and_controls(original):
     assert isinstance(original, ChatterboxOriginalAdapter) and original.config.variant == "original"
     request = OpenAICreateSpeechRequest(input="Hello.", extra_params={"cfg_weight": 0, "exaggeration": 0.7})
     assert original.validate(request) is None
+    assert original.validate(OpenAICreateSpeechRequest(input="Hello.", language="French")) == (
+        "Chatterbox Original supports English only"
+    )
 
 
 @pytest.mark.asyncio

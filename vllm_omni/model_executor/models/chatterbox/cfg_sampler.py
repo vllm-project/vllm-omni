@@ -28,7 +28,7 @@ class ChatterboxCFGSampler:
     MRv2 warmup rows bypass pairing and still receive the speech token mask.
     Shared negative-infinity restrictions from V1 logit bias are preserved
     during blending, including min_tokens and allowed_token_ids masks.
-    The wrapper deliberately owns no nn.Module state or request lifecycle.
+    The stage that owns the registry registers and releases its pairs.
     """
 
     def __init__(self, base_sampler: Sampler | GpuSampler, pairs: CFGPairRegistry):
@@ -114,7 +114,7 @@ class ChatterboxMRv2Sampler(OmniSampler):
     def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
         output = super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
         # make_omni_output creates fresh CPU flags every step, outside graph
-        # capture. No hidden-state copy or graph-output lifetime guard is needed.
+        # capture, so the sampler owns them as they are.
         return replace(output, include_hidden_states=False, owns_multimodal_outputs=True)
 
 

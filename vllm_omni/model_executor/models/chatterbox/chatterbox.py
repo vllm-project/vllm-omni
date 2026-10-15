@@ -38,7 +38,7 @@ STAGES: dict[str, type[nn.Module]] = {
 
 
 class ChatterboxForConditionalGeneration(nn.Module):
-    """Stage 0 (``chatterbox_t3``) or stage 1 (``chatterbox_s3gen``)."""
+    """Stage 0 (``chatterbox_t3`` or ``chatterbox_original_t3``) or stage 1 (``chatterbox_s3gen``)."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

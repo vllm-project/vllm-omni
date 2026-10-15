@@ -154,7 +154,8 @@ class ChatterboxAdapter(ARTTSAdapter):
                 self.conditioning_slots.release()
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Reject requests whose controls the Turbo checkpoint cannot honor."""
+        """Reject requests the checkpoint cannot honor."""
+        checkpoint = f"Chatterbox {self.variant.capitalize()}"
         error = self.ctx.server._apply_uploaded_speaker(request)
         if error:
             return error
@@ -164,25 +165,25 @@ class ChatterboxAdapter(ARTTSAdapter):
         if error:
             return error
         if request.language is not None and request.language.lower() not in {"auto", "en", "english"}:
-            return "Chatterbox Turbo supports English only"
+            return f"{checkpoint} supports English only"
         if request.instructions:
-            return "Chatterbox Turbo does not support instructions"
+            return f"{checkpoint} does not support instructions"
         if request.task_type == "VoiceDesign":
-            return "Chatterbox Turbo does not support VoiceDesign"
+            return f"{checkpoint} does not support VoiceDesign"
         if request.x_vector_only_mode:
-            return "Chatterbox Turbo requires full reference conditioning"
+            return f"{checkpoint} requires full reference conditioning"
         if (CONTROLS - self.controls).intersection(request.extra_params or {}):
             return "Exaggeration and CFG controls require Chatterbox Original"
         if request.ref_audio_2 is not None or request.speaker_embedding is not None:
-            return "Chatterbox Turbo accepts one reference recording"
+            return f"{checkpoint} accepts one reference recording"
         if request.ref_audio is None:
             if request.voice not in (None, "", "default"):
-                return "Chatterbox Turbo supports voice='default' or an uploaded reference voice"
+                return f"{checkpoint} supports voice='default' or an uploaded reference voice"
         else:
             reference = request.ref_audio
             if isinstance(reference, list):
                 if len(reference) != 1:
-                    return "Chatterbox Turbo accepts one reference recording"
+                    return f"{checkpoint} accepts one reference recording"
                 reference = reference[0]
             error = self.ctx.server._validate_ref_audio_format(reference)
             if error:
@@ -247,9 +248,3 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
     variant = "original"
     sequences_per_request = 2
     controls = CONTROLS
-
-    def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
-        error = super().validate(request)
-        if error:
-            return error.replace("Chatterbox Turbo", "Chatterbox Original")
-        return None
