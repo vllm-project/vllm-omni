@@ -18,6 +18,8 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import wrap_methods_by_paths
+
 from . import ltx2_latents as latent_ops
 from .ltx2_guidance import euler_step_from_velocity
 
@@ -392,6 +394,8 @@ class LTXI2VConditioningMixin:
             vae_scale_factor=self.vae_spatial_compression_ratio,
             resample="bilinear",
         )
+        if getattr(self, "enable_diffusion_pipeline_profiler", False):
+            wrap_methods_by_paths(self, ["video_processor.postprocess_video"])
 
     @staticmethod
     def _resolve_single_prompt_image(raw_image: Any) -> Any:

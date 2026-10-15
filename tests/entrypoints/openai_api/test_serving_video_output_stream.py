@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for `/v1/realtime/video` WebSocket video output streaming."""
 
 from __future__ import annotations
@@ -7,12 +7,13 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator, Callable
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
@@ -957,3 +958,100 @@ class TestStreamingVideoOutputPromptUpdate:
                 "transition_chunks": 2,
             },
         )
+
+    def test_composite_prompt_and_camera_interaction_forwarded(self, mocker: MockerFixture):
+        """Prompt + camera multi_modal_data is admitted and forwarded to the engine."""
+
+        async def mock_generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[_fake_video_frames(2)],
+                final_output_type="image",
+                finished=False,
+            )
+            await asyncio.sleep(0.3)
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[_fake_video_frames(2)],
+                final_output_type="image",
+                finished=True,
+            )
+
+        app, _handler, engine_client = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[(b"mp4-chunk-0", False), (b"mp4-chunk-1", True)],
+            mock_generate=mock_generate,
+        )
+
+        camera_payload = {
+            "mode": "target",
+            "data": {"translation": [0.0, 0.0, 1.0]},
+        }
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime/video") as ws:
+                ws.send_json({"type": "session.start", "prompt": "initial scene"})
+                start = ws.receive_json()
+                assert start["type"] == "video.start"
+                request_id = start["request_id"]
+
+                assert _receive_video_chunk(ws)[1] == b"mp4-chunk-0"
+
+                ws.send_json(
+                    {
+                        "type": "session.interaction",
+                        "interaction": {
+                            "event_id": "combo-1",
+                            "event": {
+                                "prompt": "new scene",
+                                "multi_modal_data": {"camera": camera_payload},
+                            },
+                            "transition_chunks": 2,
+                        },
+                    }
+                )
+                queued = ws.receive_json()
+                assert queued["type"] == "session.interaction.queued"
+                assert queued["event_id"] == "combo-1"
+
+                assert _receive_video_chunk(ws)[1] == b"mp4-chunk-1"
+                assert ws.receive_json()["type"] == "session.done"
+
+        engine_client.submit_interaction_async.assert_awaited_once_with(
+            request_id,
+            interaction={
+                "event_id": "combo-1",
+                "event": {
+                    "prompt": "new scene",
+                    "multi_modal_data": {"camera": camera_payload},
+                },
+                "transition_chunks": 2,
+            },
+        )
+
+
+class TestStreamingVideoOutputExtraParams:
+    """extra_params handling when building streaming generation inputs."""
+
+    @staticmethod
+    def _handler() -> OmniStreamingVideoOutputHandler:
+        handler = object.__new__(OmniStreamingVideoOutputHandler)
+        handler._engine_client = SimpleNamespace(default_sampling_params_list=[])
+        return handler
+
+    async def test_preencode_mp4_is_rejected_for_streaming_sessions(self):
+        """Worker-side pre-encoding emits one progressive MP4 the fMP4 encoder cannot consume."""
+        request = VideoGenerationRequest(prompt="p", extra_params={"preencode_mp4": True})
+
+        with pytest.raises(HTTPException) as excinfo:
+            await self._handler()._build_prompt_and_sampling_params(request)
+
+        assert excinfo.value.status_code == HTTPStatus.BAD_REQUEST.value
+        assert "preencode_mp4" in excinfo.value.detail
+
+    async def test_other_extra_params_still_reach_the_engine(self):
+        request = VideoGenerationRequest(prompt="p", extra_params={"flow_shift": 3.0})
+
+        _, gen_params, _ = await self._handler()._build_prompt_and_sampling_params(request)
+
+        assert gen_params.extra_args["flow_shift"] == 3.0

@@ -497,7 +497,6 @@ class LTXRequestMixin:
         image_crf = _normalize_image_crf(first_image_crf if first_image_crf is not None else image_crf)
 
         sampling = sampling_params_list[0]
-        is_dummy_run = req.is_dummy_run()
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
         negative_prompt = _resolve_negative_prompts(
             req.prompts,
@@ -511,8 +510,6 @@ class LTXRequestMixin:
         num_inference_steps = (
             sampling.num_inference_steps or num_inference_steps or self.pipeline_recipe.num_inference_steps
         )
-        if is_dummy_run and self.pipeline_recipe.fixed_num_inference_steps:
-            num_inference_steps = self.pipeline_recipe.num_inference_steps
         num_inference_steps = max(int(num_inference_steps), 2)
 
         num_videos_per_prompt = (
@@ -528,8 +525,6 @@ class LTXRequestMixin:
             for item in sampling_params_list
         ]
         guidance = guidance_specs[0]
-        if is_dummy_run and not self.pipeline_recipe.phases[0].allow_guidance_override:
-            guidance = self.pipeline_recipe.request_guidance
         if any(item != guidance for item in guidance_specs[1:]):
             raise ValueError("Batched LTX requests must use identical video/audio guidance parameters.")
 

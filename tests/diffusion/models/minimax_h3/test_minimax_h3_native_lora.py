@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import save_file
 from vllm.lora.lora_weights import PackedLoRALayerWeights
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3.npu import lora as lora_module
 from vllm_omni.diffusion.models.minimax_h3.npu.lora import load_minimax_h3_native_lora
@@ -259,7 +260,11 @@ def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
         ("", "must not be empty"),
         (",,", "must not be empty"),
         ("1.0,oops,0.15,0.0", "is malformed"),
-        ("0.9,0.7,0.4,0.15,0.0", "is malformed"),
+        # A capped opening rung below 1.0 is a legal DMD2 schedule, so the
+        # out-of-range cases are a first position above 1.0 and a tail that
+        # never reaches clean latents.
+        ("1.5,0.7,0.4,0.15,0.0", "is malformed"),
+        ("1.0,0.7,0.4,0.15", "is malformed"),
     ],
 )
 def test_h3_native_rejects_malformed_schedule_metadata(tmp_path, raw_schedule, message):
@@ -305,7 +310,7 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
-    pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
     pipeline._base_schedule_by_partition = {"fl2va": None}
@@ -326,7 +331,7 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
         pipeline._resolve_task(
             "fl2va",
             {},
-            has_turbo_lora=False,
+            turbo_spec=None,
             has_native_lora=True,
         )
 
@@ -414,7 +419,7 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
     )
-    pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
 
@@ -468,7 +473,7 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=True,
     )
-    pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     captured: dict[str, object] = {}
@@ -608,7 +613,7 @@ def test_legacy_manager_uses_native_loader(tmp_path):
                 enable_layerwise_offload=False,
                 enable_distributed_layerwise_offload=False,
             )
-            pipeline._turbo_lora_adapter_ids = set()
+            pipeline._turbo_lora_specs = {}
             pipeline._native_lora_adapter_ids = set()
             pipeline._lora_sigma_schedules = {}
             return pipeline._load_diffusion_lora_adapter(**kwargs)
@@ -630,7 +635,7 @@ def test_pipeline_schedule_inactive_when_scale_zero():
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
-    pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
     pipeline._base_schedule_by_partition = {"fl2va": None}
@@ -660,7 +665,7 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
     )
-    pipeline._turbo_lora_adapter_ids = set()
+    pipeline._turbo_lora_specs = {}
     pipeline._native_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     pipeline._base_schedule_by_partition = {"fl2va": None}
@@ -706,6 +711,8 @@ def test_lora_manager_activates_native_packed_qkv(tmp_path):
     assert isinstance(packed, PackedLoRALayerWeights)
     assert len(packed.lora_b) == 3
     assert all(b.shape[0] == _TINY_QKV_SLICE for b in packed.lora_b)
+    # This fixture only exposes one layer, so activate only its LoRA weights.
+    lora_model.loras = {"blocks.0.attn.qkv_proj": packed}
 
     class _DummyLoRALayer:
         def __init__(self):
@@ -829,7 +836,7 @@ def test_native_lora_load_is_platform_agnostic(tmp_path, dtype):
     assert {name: tensor.dtype for name, tensor in tensors.items() if tensor.dtype != dtype} == {}
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_native_lora_delta_matches_between_cpu_and_cuda(tmp_path):
     """The packed adapter produces the same delta weight on CUDA as on CPU.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Literal
 
@@ -56,7 +56,8 @@ class SDPABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
         return True
 
     @staticmethod

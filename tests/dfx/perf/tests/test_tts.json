@@ -5,7 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
+            "cuda": ["H100", "B200"],
             "npu": "A3"
           },
           "num_cards": 2
@@ -46,6 +46,14 @@
             "median_audio_rtf": [
               0.1591
             ]
+          },
+          "A3": {
+            "median_audio_ttfp_ms": [
+              220.3239
+            ],
+            "median_audio_rtf": [
+              0.3995
+            ]
           }
         }
       },
@@ -85,6 +93,23 @@
               40.3552,
               43.2572
             ]
+          },
+          "A3": {
+            "median_audio_ttfp_ms": [
+              345.5784,
+              451.6758,
+              1844.1087
+            ],
+            "median_audio_rtf": [
+              0.6414,
+              0.7981,
+              1.7064
+            ],
+            "audio_throughput": [
+              12.2961,
+              18.9478,
+              31.6908
+            ]
           }
         }
       },
@@ -121,7 +146,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 2
         }
@@ -276,7 +301,32 @@
             ]
           }
         }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen3_tts_voicedesign",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 2
+        }
       },
+      "full_model",
+      "tts"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+      "stage_overrides": {
+        "1": {
+          "devices": "1"
+        }
+      }
+    },
+    "benchmark_params": [
       {
         "task": "voice_design",
         "eval_phase": "latency",
@@ -391,7 +441,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 1
         }

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from enum import Enum
@@ -151,6 +151,12 @@ class OmniPlatform(Platform):
         backend_cls.validate_available()
 
     @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Whether the platform's dense ``FLASH_ATTN`` dependencies exist."""
+
+        return True
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
@@ -195,11 +201,11 @@ class OmniPlatform(Platform):
     def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
         """Build native attention metadata for the diffusion paged path.
 
-        The common CUDA/ROCm/XPU path uses vLLM's builder. Platforms with a
-        backend-specific metadata contract can override this hook without
-        making the diffusion adapter import their optional runtime package.
-        ``seq_lens_cpu`` is an adapter-only convenience value and is removed
-        before calling the upstream builder.
+        This default is the GPU/common path and uses vLLM's builder. NPU
+        overrides it to build Ascend attention metadata without making the
+        shared diffusion adapter import ``vllm_ascend``. ``seq_lens_cpu`` is an
+        adapter-only convenience value and is removed before calling the
+        upstream builder.
         """
         from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 
@@ -207,11 +213,39 @@ class OmniPlatform(Platform):
         return build_attn_metadata(**kwargs)
 
     @classmethod
+    def get_diffusion_paged_kv_attn_backend(cls, attn_backend: type, *, ulysses_degree: int) -> type:
+        """Specialize a native paged backend for diffusion execution."""
+
+        del ulysses_degree
+        return attn_backend
+
+    @classmethod
+    def requires_diffusion_paged_kv_prewrite(cls) -> bool:
+        """Whether paged attention must write K/V before native execution.
+
+        The default GPU path keeps cache-update ownership in its native
+        attention call. Ascend overrides this because piecewise FIA should
+        write the complete K/V span once, then read it from cache for every
+        segment.
+        """
+
+        return False
+
+    @classmethod
     def init_diffusion_worker_vllm_config(
         cls,
         vllm_config: Any,
     ) -> None:
         """Initialize platform-specific state for diffusion worker VllmConfig."""
+        return None
+
+    @classmethod
+    def configure_diffusion_vllm_config(
+        cls,
+        vllm_config: Any,
+        od_config: Any,
+    ) -> None:
+        """Apply platform-specific native cache geometry for diffusion."""
         return None
 
     @classmethod
@@ -267,6 +301,15 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        """Bytes reserved by this process's caching allocator on ``device``.
+
+        Device-wide ``get_device_memory`` counts every process; this is the
+        portable equivalent of ``torch.cuda.memory_reserved``.
+        """
+        return 0
+
+    @classmethod
     def create_autocast_context(
         cls,
         *,
@@ -295,7 +338,7 @@ class OmniPlatform(Platform):
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
-        os.environ[cls.device_control_env_var] = devices
+        os.environ[cls.device_control_env_var] = "" if devices is None else str(devices)
 
     @classmethod
     def unset_device_control_env_var(cls) -> None:

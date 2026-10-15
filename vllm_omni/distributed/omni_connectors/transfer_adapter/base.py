@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 from collections import deque
@@ -25,7 +25,6 @@ class OmniTransferAdapterBase:
         self._pending_load_reqs = deque()
         # Requests that have successfully retrieved data
         self._finished_load_reqs = set()
-        self._cancelled_load_reqs: set[str] = set()
 
         # Requests that are waiting to be saved
         self._pending_save_reqs = deque()
@@ -37,6 +36,8 @@ class OmniTransferAdapterBase:
         self._save_cond = threading.Condition()
         self._send_failures: dict[str, str] = {}
         self._send_failure_lock = threading.Lock()
+        self._receive_failures: dict[str, str] = {}
+        self._receive_failure_lock = threading.Lock()
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -63,10 +64,6 @@ class OmniTransferAdapterBase:
                     break
                 request = self._pending_load_reqs.popleft()
                 request_id = request.request_id
-                if request_id in self._cancelled_load_reqs:
-                    self._cancelled_load_reqs.discard(request_id)
-                    continue
-                self.request_ids_mapping[request_id] = request.external_req_id
                 try:
                     is_success = self._poll_single_request(request)
                     if is_success:
@@ -102,6 +99,17 @@ class OmniTransferAdapterBase:
             failures, self._send_failures = self._send_failures, {}
         return failures
 
+    def record_receive_failure(self, request_id: str, reason: str) -> None:
+        """Record an invalid received chunk that cannot be retried."""
+        with self._receive_failure_lock:
+            self._receive_failures.setdefault(request_id, reason)
+
+    def collect_failed_receive_request_ids(self) -> dict[str, str]:
+        """Drain and return requests whose received chunk was invalid."""
+        with self._receive_failure_lock:
+            failures, self._receive_failures = self._receive_failures, {}
+        return failures
+
     def save_loop(self):
         """Loop to send outgoing data."""
         while not self.stop_event.is_set():
@@ -123,6 +131,8 @@ class OmniTransferAdapterBase:
                     logger.error("Send gave up for %s: %s", failed, e)
                     self.record_send_failure(failed, f"{type(e).__name__}: {e}")
 
+            if self.connector is not None:
+                self.connector.reap_consumed()
             with self._save_cond:
                 if not self._pending_save_reqs and not self.stop_event.is_set():
                     self._save_cond.wait(timeout=0.1)

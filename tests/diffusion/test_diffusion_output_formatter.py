@@ -328,6 +328,25 @@ def test_formatter_preserves_audio_model_video_audio_and_actions(
     }
 
 
+def test_formatter_uses_native_model_identity_for_diffusers_video_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    frames = [["frame-0", "frame-1"]]
+    postprocess_output = normalize_diffusion_postprocess_output(frames)
+
+    [result] = format_diffusion_outputs(
+        request=_request("make a video"),
+        od_config=_config("WanImageToVideoPipeline"),
+        diffusion_output=DiffusionOutput(output=frames),
+        output_data=frames,
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.images == frames
+    assert result.final_output_type == "video"
+
+
 def test_formatter_preserves_audio_only_postprocess_dict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,3 +443,14 @@ def test_format_empty_diffusion_outputs_preserves_empty_response_shape() -> None
     assert [result.prompt for result in results] == ["prompt-0"]
     assert [result.images for result in results] == [[]]
     assert [result.metrics for result in results] == [{}]
+
+
+def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
+    [result] = format_empty_diffusion_outputs(
+        _request("prompt-0"),
+        finished=False,
+        custom_output={"lifecycle": "started"},
+    )
+
+    assert result.custom_output == {"lifecycle": "started"}
+    assert result.finished is False

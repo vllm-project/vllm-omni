@@ -30,8 +30,8 @@ PROMPT = "Two anthropomorphic cats in comfy boxing gear and bright gloves fight 
 NEGATIVE_PROMPT = "low quality, blurry, distorted face, extra limbs, bad anatomy, watermark, logo, text, ugly, deformed, mutated, jpeg artifacts"
 
 # CUDA marks (original matrix, unchanged)
-CUDA_SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-CUDA_PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+CUDA_SINGLE_CARD_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+CUDA_PARALLEL_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2)
 
 # NPU marks
 NPU_TWO_CARD_MARKS = hardware_marks(res={"npu": "A2"}, num_cards=2)
@@ -127,7 +127,13 @@ def _get_wan22_feature_cases():
         for feat_id, server_args, marks in NPU_PARALLEL_CONFIGS:
             cases.append(
                 pytest.param(
-                    OmniServerParams(model=model_path, server_args=server_args),
+                    OmniServerParams(
+                        model=model_path,
+                        server_args=server_args,
+                        stage_init_timeout=1800,
+                        init_timeout=2100,
+                        startup_timeout=2400,
+                    ),
                     id=f"npu_{model_key}_{feat_id}",
                     marks=marks,
                 )

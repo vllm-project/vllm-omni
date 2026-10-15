@@ -95,6 +95,22 @@ class _ConvRNNF0Predictor(nn.Module):
         return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
 
 
+def drop_upstream_chunk_att_buffers(flow: nn.Module) -> int:
+    """Drop upstream cosyvoice2's unused chunk-streaming ``att_cache_buffer`` tensors (~2.1 GiB); returns bytes freed.
+
+    Only ``flow.setup_cache`` / ``flow.inference_chunk`` read them, and then
+    fail instead of computing on a stand-in.
+    """
+    released = 0
+    decoder = getattr(flow, "decoder", None)
+    for module in (decoder, getattr(decoder, "estimator", None)):
+        buffer = module._buffers.get("att_cache_buffer") if isinstance(module, nn.Module) else None
+        if isinstance(buffer, torch.Tensor):
+            released += buffer.numel() * buffer.element_size()
+            del module._buffers["att_cache_buffer"]
+    return released
+
+
 def _build_hift() -> HiFTGenerator:
     return HiFTGenerator(
         sampling_rate=24000,
@@ -115,9 +131,13 @@ class StepAudio2Token2WavCore(nn.Module):
         float16: bool = False,
         device: str = "cuda",
         n_timesteps: int = DEFAULT_TOKEN2WAV_CONFIG.n_timesteps,
+        drop_upstream_chunk_att_buffers: bool = False,
     ):
         super().__init__()
         self.model_path = model_path
+        # A backend that never runs ``flow.setup_cache`` / ``flow.inference_chunk``
+        # (MiniCPM-o's ``BatchedToken2Wav``) can drop their 2.1 GiB of buffers.
+        self._drop_chunk_att_buffers = bool(drop_upstream_chunk_att_buffers)
         self.float16 = float16
         self.device = torch.device(device)
         self.n_timesteps = n_timesteps
@@ -176,6 +196,10 @@ class StepAudio2Token2WavCore(nn.Module):
         with open(f"{self.model_path}/flow.yaml") as f:
             configs = load_hyperpyyaml(f)
         self._flow = configs["flow"]
+        if self._drop_chunk_att_buffers:
+            # Before ``.to(self.device)``: the buffers never reach the device.
+            released = drop_upstream_chunk_att_buffers(self._flow)
+            logger.info("Dropped the upstream flow chunk attention buffers (%.1f MiB)", released / 2**20)
         if self.float16:
             self._flow.half()
         self._flow.load_state_dict(
@@ -461,9 +485,9 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         if model_path is None:
             # Resolve HF repo names to local cache path
             if not os.path.isdir(model_name_or_path):
-                from huggingface_hub import snapshot_download
+                from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                model_name_or_path = snapshot_download(model_name_or_path)
+                model_name_or_path = hf_api().snapshot_download(model_name_or_path)
             model_path = f"{model_name_or_path}/token2wav"
 
         float16 = getattr(self.config, "token2wav_float16", False)

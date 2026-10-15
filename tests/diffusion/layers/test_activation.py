@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -19,9 +19,17 @@ def test_silu_and_mul_native_matches_packed_reference() -> None:
     torch.testing.assert_close(SiluAndMul().forward_native(packed), F.silu(gate) * up)
 
 
-@hardware_test(res={"npu": "A3"}, num_cards=1)
-def test_silu_and_mul_npu_matches_packed_reference() -> None:
-    packed = torch.randn(257, 256, device="npu", dtype=torch.bfloat16)
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.bfloat16, marks=hardware_marks(res={"npu": "A2"}, num_cards=1), id="A2-bf16"),
+        pytest.param(torch.bfloat16, marks=hardware_marks(res={"npu": "A3"}, num_cards=1), id="A3-bf16"),
+        pytest.param(torch.bfloat16, marks=hardware_marks(res={"npu": "A5"}, num_cards=1), id="A5-bf16"),
+        pytest.param(torch.float16, marks=hardware_marks(res={"npu": "310P"}, num_cards=1), id="310P-fp16"),
+    ],
+)
+def test_silu_and_mul_npu_matches_packed_reference(dtype: torch.dtype) -> None:
+    packed = torch.randn(257, 256, device="npu", dtype=dtype)
     gate, up = packed.chunk(2, dim=-1)
 
     torch.testing.assert_close(

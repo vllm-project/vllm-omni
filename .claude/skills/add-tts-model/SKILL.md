@@ -499,6 +499,13 @@ Common pre-commit failures, recovery commands for missing sign-off, and the
 full `pre-commit run` invocation for a TTS model:
 [references/precommit-dco.md](references/precommit-dco.md).
 
+## Documentation and recipe
+
+Follow the [`add-recipe` skill](../add-recipe/SKILL.md) to add or update the
+in-repository model-family recipe, the `recipes/README.md` index, the supported
+models table, TTS example documentation, and the speech API contract using
+validated evidence.
+
 ## Integration Checklist
 
 Use this checklist when integrating a new TTS model:
@@ -543,6 +550,7 @@ Use this checklist when integrating a new TTS model:
 - [ ] Buildkite entries match level: `test-ready.yml` / `test-merge.yml` or nightly TTS job / `test-nightly.yml`
 - [ ] Gradio demo working
 - [ ] Documentation added (offline + online docs, nav, supported models)
+- [ ] In-repository recipe and `recipes/README.md` row added via the `add-recipe` skill
 
 ### Phase 4: Async Chunk
 - [ ] Pipeline declares the async handoff processor

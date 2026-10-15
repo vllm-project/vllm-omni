@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Callable
 from enum import Enum, auto
 from typing import Any, Literal, TypeAlias
@@ -27,8 +30,22 @@ class MiniMaxH3ModelSpecificParams(dict):
     pass
 
 
+MAX_REFERENCE_IMAGES = 9
+MAX_REFERENCE_VIDEOS = 3
+MAX_REFERENCE_AUDIOS = 3
+MAX_TOTAL_REFERENCES = 12
+
+
 class VideoReferences(dict):
     pass
+
+
+class LatentMaskEditing(dict):
+    pass
+
+
+class FastH3Deployment(dict):
+    """Descriptor for a server that fused FastH3 at startup."""
 
 
 class ModelMode(Enum):

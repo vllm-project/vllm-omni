@@ -12,6 +12,7 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -50,12 +51,20 @@ tts_server_params = [
             server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("qwen3_tts_mrv2.yaml"),
+            server_args=["--trust-remote-code"],
+        ),
+        id="async_chunk_mrv2",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
+    ),
 ]
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)

@@ -1,8 +1,57 @@
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 
+import numpy as np
 import torch
+from PIL import Image
 from vllm.model_executor.models.utils import maybe_prefix
+
+
+def normalize_decoded_video_frames(
+    video_input: Sequence[Image.Image],
+    *,
+    default_fps: float,
+) -> tuple[np.ndarray, float]:
+    """Convert decoded image frames to a contiguous THWC uint8 video array."""
+    if not video_input:
+        raise ValueError("video_edit received an empty decoded video frame sequence.")
+
+    frame_rate = float(default_fps)
+    for fps in (
+        getattr(video_input, "fps", None),
+        getattr(video_input, "frame_rate", None),
+    ):
+        try:
+            candidate = float(fps)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate) and candidate > 0:
+            frame_rate = candidate
+            break
+
+    frames = []
+    frame_size = None
+    for index, frame in enumerate(video_input):
+        if not isinstance(frame, Image.Image):
+            raise ValueError(
+                f"video_edit decoded video frame at index {index} must be a PIL.Image.Image, got {type(frame)}."
+            )
+        width, height = frame.size
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                f"video_edit decoded video frame at index {index} must have positive dimensions, got {width}x{height}."
+            )
+        if frame_size is None:
+            frame_size = frame.size
+        elif frame.size != frame_size:
+            raise ValueError(
+                "video_edit decoded video frames must have identical dimensions; "
+                f"frame 0 is {frame_size}, frame {index} is {frame.size}."
+            )
+        frames.append(np.asarray(frame.convert("RGB"), dtype=np.uint8))
+
+    return np.ascontiguousarray(np.stack(frames)), frame_rate
 
 
 @contextmanager

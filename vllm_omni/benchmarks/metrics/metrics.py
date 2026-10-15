@@ -5,6 +5,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import field, make_dataclass
+from typing import Any
 
 import numpy as np
 from vllm.benchmarks.datasets import SampleRequest
@@ -15,6 +16,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm_omni.metrics import definitions as defs
 
 _PERCENTILE_ROWS_TYPE = list[tuple[float, float]] | None
+_STAGE_DURATION_MAP_TYPE = dict[str, float] | None
 _FLOAT_LIST_TYPE = list[float]
 _INT_LIST_TYPE = list[int]
 
@@ -52,9 +54,29 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_IMAGE_GENERATION_MS, float, field(default=0.0)),
     (defs.STD_IMAGE_GENERATION_MS, float, field(default=0.0)),
     (defs.PERCENTILES_IMAGE_GENERATION_MS, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.TOTAL_VIDEO_DURATION_S, float, field(default=0.0)),
+    (defs.TOTAL_VIDEO_FRAMES, int, field(default=0)),
+    (defs.VIDEO_THROUGHPUT, float, field(default=0.0)),
+    (defs.MEAN_VIDEO_RTF, float, field(default=0.0)),
+    (defs.MEDIAN_VIDEO_RTF, float, field(default=0.0)),
+    (defs.STD_VIDEO_RTF, float, field(default=0.0)),
+    (defs.PERCENTILES_VIDEO_RTF, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MEAN_VIDEO_GENERATION_MS, float, field(default=0.0)),
+    (defs.MEDIAN_VIDEO_GENERATION_MS, float, field(default=0.0)),
+    (defs.STD_VIDEO_GENERATION_MS, float, field(default=0.0)),
+    (defs.PERCENTILES_VIDEO_GENERATION_MS, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MEAN_PEAK_MEMORY_MB, float, field(default=0.0)),
+    (defs.MEDIAN_PEAK_MEMORY_MB, float, field(default=0.0)),
+    (defs.STD_PEAK_MEMORY_MB, float, field(default=0.0)),
+    (defs.PERCENTILES_PEAK_MEMORY_MB, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.STAGE_DURATIONS_MEAN, _STAGE_DURATION_MAP_TYPE, field(default=None)),
+    (defs.STAGE_DURATIONS_P50, _STAGE_DURATION_MAP_TYPE, field(default=None)),
+    (defs.STAGE_DURATIONS_P99, _STAGE_DURATION_MAP_TYPE, field(default=None)),
 ]
 
-MultiModalsBenchmarkMetrics = make_dataclass(
+# ``make_dataclass`` returns a runtime class that mypy treats as a variable, not
+# a type. Annotate as Any so call sites can use these names in annotations.
+MultiModalsBenchmarkMetrics: Any = make_dataclass(
     "MultiModalsBenchmarkMetrics",
     _MULTIMODAL_BENCHMARK_FIELDS,
     bases=(BenchmarkMetrics,),
@@ -84,7 +106,7 @@ _STAGE_BENCHMARK_FIELDS = [
     (defs.INTER_OUTPUT_LATENCIES_MS, _FLOAT_LIST_TYPE, field(default_factory=list)),
 ]
 
-StageBenchmarkMetrics = make_dataclass(
+StageBenchmarkMetrics: Any = make_dataclass(
     "StageBenchmarkMetrics",
     _STAGE_BENCHMARK_FIELDS,
     namespace={"__doc__": "Aggregated metrics for one pipeline stage (for printing only)."},
@@ -108,14 +130,6 @@ def _p_label(p: float) -> str:
         return str(int(round(pf)))
     return str(pf)
 
-
-_STREAMING_OUTPUT_UNIT_TYPES = frozenset(
-    {
-        "text",
-        "stream",
-        "audio",
-    }
-)
 
 _AGGREGATE_PERCENTILE_FIELD_NAMES = {
     defs.AUDIO_TTFP: (
@@ -165,26 +179,6 @@ def _wants_stream_icl(metrics: list[str]) -> bool:
     return "icl" in metrics
 
 
-def _stage_modality_flags(
-    final_output_type: str,
-    output_unit_type: str,
-) -> tuple[bool, bool, bool, bool, bool]:
-    is_text_stage = final_output_type == "text" or output_unit_type == "text"
-    is_audio_stage = final_output_type == "audio" or output_unit_type == "audio"
-    is_image_stage = final_output_type in {"image", "images"} or output_unit_type == "image"
-    is_video_stage = final_output_type in {"video", "videos"} or output_unit_type == "video"
-    is_internal_stream_stage = (
-        output_unit_type in _STREAMING_OUTPUT_UNIT_TYPES and not is_text_stage and not is_audio_stage
-    )
-    return (
-        is_text_stage,
-        is_audio_stage,
-        is_image_stage,
-        is_video_stage,
-        is_internal_stream_stage,
-    )
-
-
 def has_metric_samples(metrics: object, metric_name: str) -> bool:
     sample_count_attr = {
         "ttft": "num_ttft_samples",
@@ -222,6 +216,8 @@ def print_metrics(
         print("{:<40} {:<10.2f}".format("Request goodput (req/s):", metrics.request_goodput))
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
         print("{:<40} {:<10.2f}".format("Peak concurrent requests:", metrics.max_concurrent_requests))
+        print_peak_memory_metrics(metrics)
+        print_stage_durations_metrics(selected_percentiles or [], metrics)
     if task_type != TaskType.GENERATION or "e2el" in selected_percentile_metrics:
         process_one_metric("e2el", metrics)
     print_text_metrics(task_type, selected_percentile_metrics, metrics)
@@ -230,9 +226,13 @@ def print_metrics(
             print_audio_metrics(selected_percentile_metrics, metrics)
         if _has_image_output(metrics):
             print_image_metrics(selected_percentiles or [], metrics)
+        if _has_video_output(metrics):
+            print_video_metrics(selected_percentiles or [], metrics)
         if print_stage and outputs and selected_percentiles is not None:
-            print("\n{s:{c}^{n}}".format(s=" Stage Benchmark Result ", n=50, c="="))
-            for sm in _build_stage_metrics_from_outputs(outputs):
+            stage_metrics = _build_stage_metrics_from_outputs(outputs)
+            if stage_metrics:
+                print("\n{s:{c}^{n}}".format(s=" Stage Benchmark Result ", n=50, c="="))
+            for sm in stage_metrics:
                 print_stage_metrics(
                     task_type,
                     selected_percentile_metrics,
@@ -243,6 +243,11 @@ def print_metrics(
 
 
 def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiModalsBenchmarkMetrics):
+    # Pure image/video runs have no user-facing text tokens; skip the whole
+    # Text Result section (token throughput / peak would be misleading).
+    if metrics.total_output <= 0 and (_has_image_output(metrics) or _has_video_output(metrics)):
+        return
+
     print("{s:{c}^{n}}".format(s=" Text Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
@@ -275,6 +280,14 @@ def _has_image_output(metrics: MultiModalsBenchmarkMetrics) -> bool:
     return int(getattr(metrics, defs.TOTAL_IMAGES, 0) or 0) > 0
 
 
+def _has_video_output(metrics: MultiModalsBenchmarkMetrics) -> bool:
+    return (
+        float(getattr(metrics, defs.TOTAL_VIDEO_DURATION_S, 0.0) or 0.0) > 0.0
+        or int(getattr(metrics, defs.TOTAL_VIDEO_FRAMES, 0) or 0) > 0
+        or float(getattr(metrics, defs.MEAN_VIDEO_GENERATION_MS, 0.0) or 0.0) > 0.0
+    )
+
+
 def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchmarkMetrics):
     print("{s:{c}^{n}}".format(s=" Audio Result ", n=50, c="="))
     print(
@@ -291,6 +304,102 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     for metric in selected_percentile_metrics:
         if metric.startswith("audio"):
             process_one_metric(metric, metrics)
+
+
+def print_peak_memory_metrics(metrics: MultiModalsBenchmarkMetrics):
+    if getattr(metrics, defs.MEAN_PEAK_MEMORY_MB) <= 0:
+        return
+    print("{s:{c}^{n}}".format(s="Peak Memory", n=50, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean PEAK_MEMORY_MB (MB):", getattr(metrics, defs.MEAN_PEAK_MEMORY_MB)))
+    print("{:<40} {:<10.2f}".format("Median PEAK_MEMORY_MB (MB):", getattr(metrics, defs.MEDIAN_PEAK_MEMORY_MB)))
+    for p, value in getattr(metrics, defs.PERCENTILES_PEAK_MEMORY_MB) or []:
+        print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} PEAK_MEMORY_MB (MB):", value))
+
+
+def aggregate_stage_durations(outputs: Sequence[RequestFuncOutput]) -> dict[str, dict[str, float]]:
+    """Aggregate pipeline profiler timings into mean/p50/p99 maps.
+
+    ``stage_N_gen_ms`` is omitted. That clock already belongs to
+    ``stage_gen_time`` / image / video generation, not to this profiler block.
+    The maps are stored on ``MultiModalsBenchmarkMetrics`` and printed with the
+    other run-level metrics. ``--print-stage`` does not gate them.
+    """
+    stage_duration_lists: dict[str, list[float]] = {}
+    for output in outputs:
+        if not getattr(output, "success", False):
+            continue
+        stage_durations = getattr(output, "stage_durations", None)
+        if not isinstance(stage_durations, dict):
+            continue
+        for stage, duration in stage_durations.items():
+            if _is_printed_stage_gen_key(str(stage)):
+                continue
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not np.isfinite(duration):
+                continue
+            stage_duration_lists.setdefault(str(stage), []).append(float(duration))
+    if not stage_duration_lists:
+        return {}
+    return {
+        defs.STAGE_DURATIONS_MEAN: {stage: float(np.mean(values)) for stage, values in stage_duration_lists.items()},
+        defs.STAGE_DURATIONS_P50: {
+            stage: float(np.percentile(values, 50)) for stage, values in stage_duration_lists.items()
+        },
+        defs.STAGE_DURATIONS_P99: {
+            stage: float(np.percentile(values, 99)) for stage, values in stage_duration_lists.items()
+        },
+    }
+
+
+def _stage_duration_display_name(stage: str) -> str:
+    """Strip pipeline-class prefix and prettify profiler keys for printing.
+
+    ``Wan22I2VPipeline.diffuse`` -> ``Diffuse``
+    ``Wan22I2VPipeline.text_encoder.forward`` -> ``Text Encoder Forward``
+    ``queue_wait_ms`` -> ``Queue Wait``
+    """
+    name = str(stage)
+    head, sep, tail = name.partition(".")
+    if sep and head.endswith("Pipeline"):
+        name = tail
+    if name.endswith("_ms"):
+        name = name[: -len("_ms")]
+    return name.replace("_", " ").replace(".", " ").title()
+
+
+def _is_printed_stage_gen_key(stage: str) -> bool:
+    """True for ``stage_0_gen_ms``, which duplicates ``--print-stage`` stage timing."""
+    name = str(stage)
+    prefix, suffix = "stage_", "_gen_ms"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    return name[len(prefix) : -len(suffix)].isdigit()
+
+
+def print_stage_durations_metrics(
+    selected_percentiles: list[float],
+    metrics: MultiModalsBenchmarkMetrics,
+) -> None:
+    """Print profiler timings already stored on ``metrics``.
+
+    Mean and median always print, matching :func:`print_image_metrics`. P99 prints
+    only when 99 is in ``selected_percentiles``. ``stage_N_gen_ms`` is not here;
+    that clock stays on stage_gen_time / image / video generation.
+    """
+    mean = getattr(metrics, defs.STAGE_DURATIONS_MEAN, None) or {}
+    if not mean:
+        return
+    p50 = getattr(metrics, defs.STAGE_DURATIONS_P50, None) or {}
+    p99 = getattr(metrics, defs.STAGE_DURATIONS_P99, None) or {}
+    show_p99 = any(float(p) == 99.0 for p in selected_percentiles)
+    print("{s:{c}^{n}}".format(s=" Stage Durations ", n=50, c="-"))
+    for stage in mean:
+        label = _stage_duration_display_name(stage)
+        unit = " (ms)" if str(stage).endswith("_ms") else " (s)"
+        print("{:<40} {:<10.2f}".format(f"Mean {label}{unit}:", mean[stage]))
+        if stage in p50:
+            print("{:<40} {:<10.2f}".format(f"Median {label}{unit}:", p50[stage]))
+        if show_p99 and stage in p99:
+            print("{:<40} {:<10.2f}".format(f"P99 {label}{unit}:", p99[stage]))
 
 
 def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsBenchmarkMetrics):
@@ -311,7 +420,7 @@ def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsB
             )
         )
     if getattr(metrics, defs.MEAN_IMAGE_GENERATION_MS) > 0:
-        print("-----------------Image Generation-----------------")
+        print("{s:{c}^{n}}".format(s=" Image Generation ", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean IMAGE_GENERATION (ms):", getattr(metrics, defs.MEAN_IMAGE_GENERATION_MS)))
         print(
             "{:<40} {:<10.2f}".format(
@@ -322,6 +431,42 @@ def print_image_metrics(selected_percentiles: list[float], metrics: MultiModalsB
         for p, value in getattr(metrics, defs.PERCENTILES_IMAGE_GENERATION_MS) or []:
             if p in selected_percentiles:
                 print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} IMAGE_GENERATION (ms):", value))
+
+
+def print_video_metrics(selected_percentiles: list[float], metrics: MultiModalsBenchmarkMetrics):
+    print("{s:{c}^{n}}".format(s=" Video Result ", n=50, c="="))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Total video duration generated(s):",
+            getattr(metrics, defs.TOTAL_VIDEO_DURATION_S),
+        )
+    )
+    print("{:<40} {:<10}".format("Total video frames generated:", getattr(metrics, defs.TOTAL_VIDEO_FRAMES)))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Video throughput(video duration/s):",
+            getattr(metrics, defs.VIDEO_THROUGHPUT),
+        )
+    )
+    if getattr(metrics, defs.MEAN_VIDEO_RTF) > 0:
+        print("{s:{c}^{n}}".format(s=" Video RTF ", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean VIDEO_RTF:", getattr(metrics, defs.MEAN_VIDEO_RTF)))
+        print("{:<40} {:<10.2f}".format("Median VIDEO_RTF:", getattr(metrics, defs.MEDIAN_VIDEO_RTF)))
+        for p, value in getattr(metrics, defs.PERCENTILES_VIDEO_RTF) or []:
+            if p in selected_percentiles:
+                print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} VIDEO_RTF:", value))
+    if getattr(metrics, defs.MEAN_VIDEO_GENERATION_MS) > 0:
+        print("{s:{c}^{n}}".format(s=" Video Generation ", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean VIDEO_GENERATION (ms):", getattr(metrics, defs.MEAN_VIDEO_GENERATION_MS)))
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Median VIDEO_GENERATION (ms):",
+                getattr(metrics, defs.MEDIAN_VIDEO_GENERATION_MS),
+            )
+        )
+        for p, value in getattr(metrics, defs.PERCENTILES_VIDEO_GENERATION_MS) or []:
+            if p in selected_percentiles:
+                print("{:<40} {:<10.2f}".format(f"P{_p_label(p)} VIDEO_GENERATION (ms):", value))
 
 
 def process_one_metric(
@@ -495,6 +640,21 @@ def _print_image_stage_metrics(
     )
 
 
+def _print_video_stage_metrics(
+    selected_percentiles: list[float],
+    sm: StageBenchmarkMetrics,
+) -> None:
+    print("{s:{c}^{n}}".format(s=" Video Result ", n=50, c="="))
+    _print_percentile_metric(
+        "Video Generation",
+        "VIDEO_GENERATION",
+        getattr(sm, defs.STAGE_GEN_TIMES_MS),
+        selected_percentiles,
+        values_are_ms=True,
+        to_ms=True,
+    )
+
+
 def _print_internal_stream_stage_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
@@ -546,14 +706,15 @@ def print_stage_metrics(
         is_image_stage,
         is_video_stage,
         is_internal_stream_stage,
-    ) = _stage_modality_flags(getattr(sm, "final_output_type"), getattr(sm, "output_unit_type"))
+    ) = defs.stage_modality_flags(getattr(sm, "final_output_type"), getattr(sm, "output_unit_type"))
 
     print("{s:{c}^{n}}".format(s=title, n=50, c="="))
-    if is_image_stage:
-        _print_image_stage_metrics(selected_percentiles, sm)
+    if is_video_stage:
+        _print_video_stage_metrics(selected_percentiles, sm)
         return
 
-    if is_video_stage:
+    if is_image_stage:
+        _print_image_stage_metrics(selected_percentiles, sm)
         return
 
     _print_stage_timing(sm, selected_percentiles)
@@ -595,7 +756,7 @@ def _build_stage_metrics_from_outputs(
         ]
         output_unit_type = output_unit_types[0] if output_unit_types else "other"
 
-        is_text_stage, is_audio_stage, _, _, is_internal_stream_stage = _stage_modality_flags(
+        is_text_stage, is_audio_stage, _, _, is_internal_stream_stage = defs.stage_modality_flags(
             final_output_type, output_unit_type
         )
         total_output = 0
@@ -721,7 +882,7 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> tuple[MultiModalsBenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
     Args:
@@ -754,6 +915,11 @@ def calculate_metrics(
     denoise_step_latencies_ms: list[float] = []
     total_images = 0
     total_image_pixels = 0
+    video_durations: list[float] = []
+    video_rtfs: list[float] = []
+    total_video_frames = 0
+    video_generation_times_ms: list[float] = []
+    peak_memories_mb: list[float] = []
     audio_underruns: list[float] = []
     audio_continuity_ok: list[bool] = []
     input_audio_duration = 0.0
@@ -762,7 +928,18 @@ def calculate_metrics(
             output_len = outputs[i].output_tokens
 
             if not output_len:
-                if tokenizer is None:
+                # Pure image/video (no generated text) must stay at 0 tokens.
+                # Do not invent output_len=1 via the tokenizer-is-None placeholder.
+                generated_text = getattr(outputs[i], "generated_text", None) or ""
+                has_image = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0) > 0
+                has_video = (
+                    float(getattr(outputs[i], defs.VIDEO_DURATION, 0.0) or 0.0) > 0.0
+                    or int(getattr(outputs[i], defs.VIDEO_FRAMES, 0) or 0) > 0
+                    or float(getattr(outputs[i], defs.VIDEO_GENERATION_TIME_MS, 0.0) or 0.0) > 0.0
+                )
+                if not generated_text and (has_image or has_video):
+                    output_len = 0
+                elif tokenizer is None:
                     output_len = 1
                 else:
                     # We use the tokenizer to count the number of output tokens
@@ -803,11 +980,9 @@ def calculate_metrics(
             all_tpots.append(tpot)
             itls += outputs[i].itl
             session_metrics = getattr(outputs[i], "duplex_session_metrics", None)
-            ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_ttft_ms") is not None
-            audio_ttfp_measured = (
-                not isinstance(session_metrics, dict) or session_metrics.get("mean_ttfp_ms") is not None
-            )
-            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_rtf") is not None
+            ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttft_ms") is not None
+            audio_ttfp_measured = not isinstance(session_metrics, dict) or session_metrics.get("ttfp_ms") is not None
+            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("rtf") is not None
             if ttft_measured:
                 ttfts.append(outputs[i].ttft)
             if audio_ttfp_measured:
@@ -817,7 +992,7 @@ def calculate_metrics(
             goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
             goodput_audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) if audio_ttfp_measured else None)
             audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
-            audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0.0))
+            audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
             total_images += image_count
             image_generation_time_ms = float(getattr(outputs[i], defs.IMAGE_GENERATION_TIME_MS, 0.0) or 0.0)
@@ -827,6 +1002,19 @@ def calculate_metrics(
             denoise_step_latency_ms = float(getattr(outputs[i], defs.DENOISE_STEP_LATENCY_MS, 0.0) or 0.0)
             if denoise_step_latency_ms > 0:
                 denoise_step_latencies_ms.append(denoise_step_latency_ms)
+            video_duration = float(getattr(outputs[i], defs.VIDEO_DURATION, 0.0) or 0.0)
+            if video_duration > 0:
+                video_durations.append(video_duration)
+            total_video_frames += int(getattr(outputs[i], defs.VIDEO_FRAMES, 0) or 0)
+            video_rtf = float(getattr(outputs[i], defs.VIDEO_RTF, 0.0) or 0.0)
+            if video_rtf > 0:
+                video_rtfs.append(video_rtf)
+            video_generation_time_ms = float(getattr(outputs[i], defs.VIDEO_GENERATION_TIME_MS, 0.0) or 0.0)
+            if video_generation_time_ms > 0:
+                video_generation_times_ms.append(video_generation_time_ms)
+            peak_memory_mb = float(getattr(outputs[i], defs.PEAK_MEMORY_MB, 0.0) or 0.0)
+            if peak_memory_mb > 0:
+                peak_memories_mb.append(peak_memory_mb)
             audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
             audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
             e2els.append(outputs[i].latency)
@@ -858,9 +1046,17 @@ def calculate_metrics(
                 good_completed += 1
 
     if completed == 0:
-        warnings.formatwarning = lambda msg, category, filename, lineno, line=None: (
-            f"{filename}:{lineno}: {category.__name__}: {msg}\n"
-        )
+
+        def _formatwarning(
+            message: Warning | str,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            line: str | None = None,
+        ) -> str:
+            return f"{filename}:{lineno}: {category.__name__}: {message}\n"
+
+        warnings.formatwarning = _formatwarning
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration on the benchmark arguments.",
             stacklevel=2,
@@ -892,18 +1088,24 @@ def calculate_metrics(
                 token_timeline_available = False
             else:
                 # Calculate token generation timestamp using
-                # start_time, ttft, and itl
-                token_times = [output.start_time + output.ttft]
-                current_time = token_times[0]
-                for itl_value in output.itl:
-                    current_time += itl_value
-                    token_times.append(current_time)
+                # start_time, ttft, and itl. Skip requests with no text tokens
+                # (empty itl, zero output_tokens, and no generated_text) so pure
+                # image/video runs do not seed a fake peak of 1 tok/s from
+                # start_time+ttft alone.
+                output_token_count = int(getattr(output, "output_tokens", 0) or 0)
+                has_generated_text = bool(getattr(output, "generated_text", None) or "")
+                if output_token_count > 0 or output.itl or has_generated_text:
+                    token_times = [output.start_time + output.ttft]
+                    current_time = token_times[0]
+                    for itl_value in output.itl:
+                        current_time += itl_value
+                        token_times.append(current_time)
 
-                # Add tokens to second buckets
-                for token_time in token_times:
-                    second_bucket = int(token_time - min_start_time)
-                    if 0 <= second_bucket < duration_seconds:
-                        tokens_per_second[second_bucket] += 1
+                    # Add tokens to second buckets
+                    for token_time in token_times:
+                        second_bucket = int(token_time - min_start_time)
+                        if 0 <= second_bucket < duration_seconds:
+                            tokens_per_second[second_bucket] += 1
 
             # Track concurrent requests for each second this request was active
             request_start_second = int(output.start_time - min_start_time)
@@ -944,6 +1146,7 @@ def calculate_metrics(
         isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs
     )
     missing_duplex_value = float("nan") if duplex_metrics_present else 0
+    stage_duration_summaries = aggregate_stage_durations(outputs)
     metrics = MultiModalsBenchmarkMetrics(
         completed=completed,
         failed=len(failed_outputs),
@@ -1009,6 +1212,25 @@ def calculate_metrics(
             defs.PERCENTILES_IMAGE_GENERATION_MS: [
                 (p, np.percentile(image_generation_times_ms or 0, p)) for p in selected_percentiles
             ],
+            defs.TOTAL_VIDEO_DURATION_S: sum(video_durations),
+            defs.TOTAL_VIDEO_FRAMES: total_video_frames,
+            defs.VIDEO_THROUGHPUT: sum(video_durations) / dur_s,
+            defs.MEAN_VIDEO_RTF: np.mean(video_rtfs or 0),
+            defs.STD_VIDEO_RTF: np.std(video_rtfs or 0),
+            defs.MEDIAN_VIDEO_RTF: np.median(video_rtfs or 0),
+            defs.PERCENTILES_VIDEO_RTF: [(p, np.percentile(video_rtfs or 0, p)) for p in selected_percentiles],
+            defs.MEAN_VIDEO_GENERATION_MS: np.mean(video_generation_times_ms or 0),
+            defs.STD_VIDEO_GENERATION_MS: np.std(video_generation_times_ms or 0),
+            defs.MEDIAN_VIDEO_GENERATION_MS: np.median(video_generation_times_ms or 0),
+            defs.PERCENTILES_VIDEO_GENERATION_MS: [
+                (p, np.percentile(video_generation_times_ms or 0, p)) for p in selected_percentiles
+            ],
+            defs.MEAN_PEAK_MEMORY_MB: np.mean(peak_memories_mb or 0),
+            defs.STD_PEAK_MEMORY_MB: np.std(peak_memories_mb or 0),
+            defs.MEDIAN_PEAK_MEMORY_MB: np.median(peak_memories_mb or 0),
+            defs.PERCENTILES_PEAK_MEMORY_MB: [
+                (p, np.percentile(peak_memories_mb or 0, p)) for p in selected_percentiles
+            ],
             defs.MEAN_AUDIO_UNDERRUN_S: np.mean(audio_underruns or 0),
             defs.STD_AUDIO_UNDERRUN_S: np.std(audio_underruns or 0),
             defs.MEDIAN_AUDIO_UNDERRUN_S: np.median(audio_underruns or 0),
@@ -1018,6 +1240,9 @@ def calculate_metrics(
             defs.AUDIO_CONTINUITY_OK_RATE: (
                 (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
             ),
+            defs.STAGE_DURATIONS_MEAN: stage_duration_summaries.get(defs.STAGE_DURATIONS_MEAN) or {},
+            defs.STAGE_DURATIONS_P50: stage_duration_summaries.get(defs.STAGE_DURATIONS_P50) or {},
+            defs.STAGE_DURATIONS_P99: stage_duration_summaries.get(defs.STAGE_DURATIONS_P99) or {},
         },
     )
     print_metrics(

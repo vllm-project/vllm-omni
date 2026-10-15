@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from pathlib import Path
 from typing import Any
@@ -43,7 +43,7 @@ class Gr00tPolicy:
         embodiment_tag: EmbodimentTag | str,
         model_path: str,
         *,
-        device: int | str,
+        device: int | str | torch.device,
         strict: bool = True,
     ):
         """Initialize the Gr00t Policy.
@@ -328,7 +328,8 @@ class Gr00tPolicy:
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional per-request model parameters, forwarded verbatim to
+                the action head (e.g. ``generator``)
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -351,7 +352,7 @@ class Gr00tPolicy:
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

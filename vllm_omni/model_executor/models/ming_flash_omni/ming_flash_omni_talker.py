@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright (c) Ant Group. All rights reserved.
 # Adapted from:
@@ -21,7 +22,7 @@ from transformers import AutoTokenizer, Qwen2Config, Qwen2Model
 from transformers.utils.hub import cached_file
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -156,6 +157,17 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             spk_head=self.spk_head,
             patch_size=self.patch_size,
         )
+
+    def model_local_kv_specs(self):
+        """Forward to the generator, which owns the talker's StaticCache.
+
+        ``MingAudioGenerator`` is a plain object rather than a submodule, so
+        the module-tree walk cannot reach it on its own.
+        """
+        generator = getattr(self, "audio_generator", None)
+        if generator is None:
+            return []
+        return generator.model_local_kv_specs()
 
     @property
     def device(self) -> torch.device:
@@ -509,12 +521,13 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         if self._standalone:
             weights = self._iter_talker_safetensors()
 
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["audio_vae."],  # loaded separately
-            skip_substrs=["rotary_embed.inv_freq"],  # non-persistent buffer
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(
+            weights,
+            mapper=WeightsMapper(
+                orig_to_new_prefix={"audio_vae.": None}, orig_to_new_substr={"rotary_embed.inv_freq": None}
+            ),
         )
-        loaded = loader.load_weights(weights)
         logger.info("Loaded %d talker weights from checkpoint", len(loaded))
 
         if self.audio_vae is not None and self._vae_weight_source is not None:

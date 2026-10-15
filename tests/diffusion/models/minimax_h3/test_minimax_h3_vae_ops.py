@@ -8,9 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.gpu, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 def _selected_operators():
@@ -198,7 +199,7 @@ def test_video_vae_installs_exact_optimizations(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, **_kwargs: FakeRemote(),
     )
     install = Mock(return_value=True)
     monkeypatch.setattr(vae_module, "install_h3_vae_optimizations", install)

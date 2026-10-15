@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe Code2Wav model."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -19,6 +20,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavDecoderBlock,
     Qwen3OmniMoeCode2WavTransformerModel,
     Qwen3OmniMoeConvNeXtBlock,
+    Qwen3OmniMoeSnakeBeta,
 )
 from vllm.config import VllmConfig  # type: ignore
 from vllm.logger import init_logger  # type: ignore
@@ -31,8 +33,92 @@ from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Fixed cost of one streaming decode call (graph replay or eager launch), in
+# decoded-frame equivalents: a call on a single frame costs about as much GPU
+# time as decoding this many extra frames inside a larger call.
+_DECODE_CALL_COST_FRAMES = 32
+
+
+def use_fused_snake(module: nn.Module) -> int:
+    """Replace HF ``Qwen3OmniMoeSnakeBeta`` activations under ``module`` with the fused one.
+
+    The HF decoder blocks recompute ``exp(alpha)`` / ``exp(beta)`` and launch
+    about seven broadcast kernels per call; the shared ``SnakeBeta`` computes the
+    same ``x + 1/b * sin^2(a*x)`` in one kernel from precomputed caches.
+    Parameter names and shapes match, so this runs before weight loading.
+    """
+    count = 0
+    for parent in list(module.modules()):
+        for name, child in list(parent.named_children()):
+            if isinstance(child, Qwen3OmniMoeSnakeBeta):
+                setattr(parent, name, SnakeBeta(child.in_features))
+                count += 1
+    return count
+
+
+def plan_decode_groups(
+    lengths: Sequence[int],
+    bucket_of: Callable[[int], int | None],
+    batch_sizes_for: Callable[[int], Sequence[int]],
+    call_cost_frames: int = _DECODE_CALL_COST_FRAMES,
+) -> list[tuple[list[int], int]]:
+    """Split a streaming batch into decode calls of rows with similar lengths.
+
+    Decoding every row at the batch's longest window wastes most of the work
+    when short ramp chunks (1-15 frames) share a step with steady 50-frame
+    windows. Rows are sorted by length and cut into contiguous groups of
+    graph buckets (``bucket_of``) so that the modelled cost, per call
+    ``call_cost_frames`` plus padded rows (to the next captured row count of
+    that bucket, ``batch_sizes_for``) times the bucket length, is smallest.
+    Returns ``(row indices, decode length)`` per call; the decode length is
+    the group's longest row.
+    """
+    count = len(lengths)
+    if count == 0:
+        return []
+    order = sorted(range(count), key=lambda row: lengths[row])
+    buckets = [bucket_of(int(lengths[row])) or int(lengths[row]) for row in order]
+    distinct = sorted(set(buckets))
+    members = [[row for row, bucket in zip(order, buckets) if bucket == size] for size in distinct]
+
+    def sizes_for(size: int) -> list[int]:
+        return sorted({int(b) for b in batch_sizes_for(size) if int(b) > 0} | {1})
+
+    def cost(rows: int, size: int) -> int:
+        batch_sizes = sizes_for(size)
+        calls, rest = divmod(rows, batch_sizes[-1])
+        padded = calls * batch_sizes[-1]
+        if rest:
+            calls += 1
+            padded += next(b for b in batch_sizes if b >= rest)
+        return calls * call_cost_frames + padded * size
+
+    best = [0] + [None] * len(distinct)
+    cut = [0] * (len(distinct) + 1)
+    for end in range(1, len(distinct) + 1):
+        rows = 0
+        for start in range(end - 1, -1, -1):
+            rows += len(members[start])
+            total = best[start] + cost(rows, distinct[end - 1])
+            if best[end] is None or total < best[end]:
+                best[end], cut[end] = total, start
+    groups: list[tuple[list[int], int]] = []
+    end = len(distinct)
+    while end > 0:
+        start = cut[end]
+        groups.append(([row for bucket_rows in members[start:end] for row in bucket_rows], distinct[end - 1]))
+        end = start
+    calls: list[tuple[list[int], int]] = []
+    for rows, size in reversed(groups):
+        max_batch = sizes_for(size)[-1]
+        for offset in range(0, len(rows), max_batch):
+            part = rows[offset : offset + max_batch]
+            calls.append((part, max(int(lengths[row]) for row in part)))
+    return calls
 
 
 class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
@@ -74,6 +160,14 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         super().__init__()
 
         self.config: Qwen3OmniMoeCode2WavConfig = vllm_config.model_config.hf_config
+        connector = getattr(vllm_config.model_config, "stage_connector_config", None)
+        extra = connector.get("extra", {}) if isinstance(connector, dict) else getattr(connector, "extra", {})
+        # Both the separate stage and the Talker's first-frame copy receive
+        # this connector config. Keep algorithm selection consistent between
+        # them, and leave other models' cuDNN settings unchanged.
+        self._cudnn_benchmark = (extra or {}).get("codec_cudnn_benchmark", False)
+        if not isinstance(self._cudnn_benchmark, bool):
+            raise ValueError("codec_cudnn_benchmark must be a boolean")
 
         # Calculate total upsampling factor
         self.total_upsample = np.prod(self.config.upsample_rates + self.config.upsampling_ratios)
@@ -122,10 +216,19 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             Qwen3OmniMoeCausalConvNet(output_dim, 1, kernel_size=7),
         ]
         self.decoder = nn.ModuleList(decoder)
+        # Keep existing V1 and non-CUDA decoder blocks unchanged.
+        if (
+            (extra or {}).get("codec_fused_snake", False)
+            and current_omni_platform.is_cuda()
+            and torch.device(vllm_config.device_config.device).type == "cuda"
+        ):
+            use_fused_snake(self.decoder)
 
         # CUDA Graph support — reuses CUDAGraphDecoderWrapper from Qwen3-TTS
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
+        # Captured row counts per graph size; empty keeps one padded decode per batch.
+        self._streaming_batch_sizes: dict[int, list[int]] = {}
 
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
@@ -142,8 +245,19 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        extra_capture_sizes: Iterable[int] = (),
+        streaming_batch_sizes: Iterable[int] = (),
     ):
-        """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav)."""
+        """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav).
+
+        ``extra_capture_sizes`` adds exact-size graphs (e.g. a chunk ramp's
+        decode windows) to the default buckets, so those chunks replay without
+        zero padding. ``streaming_batch_sizes`` (e.g. ``[2, 4, 8, 16]``) also
+        captures multi-row graphs for every bucket up to one streaming window
+        (chunk + left context); a streaming batch is then decoded as a few
+        length groups (``plan_decode_groups``) instead of one eager call
+        padded to its longest row.
+        """
         from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
             CUDAGraphDecoderWrapper,
         )
@@ -154,8 +268,30 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             logger.warning("Cannot enable CUDA Graph: not on CUDA device (got %s)", device)
             return
 
+        extra = {int(size) for size in extra_capture_sizes if int(size) > 0}
+        batch_sizes = sorted({int(b) for b in streaming_batch_sizes if int(b) > 1})
+        capture_sizes = None
+        extra_shapes: list[tuple[int, int]] = []
+        if extra or batch_sizes:
+            capture_sizes = sorted(
+                set(
+                    CUDAGraphDecoderWrapper.compute_capture_sizes(
+                        codec_chunk_frames=codec_chunk_frames,
+                        codec_left_context_frames=codec_left_context_frames,
+                    )
+                )
+                | extra
+            )
+            window = codec_chunk_frames + codec_left_context_frames
+            streaming_sizes = [size for size in capture_sizes if window <= 0 or size <= window]
+            # A multi-row graph never holds more frames than the largest
+            # single-row one, so the shared graph pool does not grow.
+            largest = max(capture_sizes)
+            extra_shapes = [(b, size) for b in batch_sizes for size in streaming_sizes if b * size <= largest]
         wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
+            capture_sizes=capture_sizes,
+            extra_capture_shapes=extra_shapes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )
@@ -172,10 +308,18 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             raise
         self._cudagraph_wrapper = wrapper
         self._cudagraph_enabled = True
+        if extra_shapes and torch.cuda.is_available():
+            # Return the eager warm-up activations: this stage shares the GPU.
+            torch.accelerator.empty_cache()
+        self._streaming_batch_sizes = {
+            size: [1, *sorted(b for b, shape_size in extra_shapes if shape_size == size)]
+            for size in {shape_size for _b, shape_size in extra_shapes}
+        }
         logger.info(
-            "CUDA Graph enabled for Code2Wav: num_quantizers=%d, sizes=%s",
+            "CUDA Graph enabled for Code2Wav: num_quantizers=%d, sizes=%s, multi-row shapes=%s",
             self.config.num_quantizers,
             self._cudagraph_wrapper.capture_sizes,
+            extra_shapes,
         )
 
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
@@ -200,6 +344,30 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
         hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
         # Shape: [batch, seq_len, hidden_size]
 
+        # Algorithm search happens during eager warmup before graph capture.
+        # Restore process settings afterward, including on a failed decode.
+        # Captured replays use the selected kernels without this Python path.
+        cudnn = torch.backends.cudnn
+        context = (
+            cudnn.flags(
+                enabled=cudnn.enabled,
+                benchmark=True,
+                benchmark_limit=10,
+                deterministic=cudnn.deterministic,
+                allow_tf32=cudnn.allow_tf32,
+            )
+            if (
+                self._cudnn_benchmark
+                and hidden.is_cuda
+                and torch.version.hip is None
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            else nullcontext()
+        )
+        with context:
+            return self._decode_waveform(hidden)
+
+    def _decode_waveform(self, hidden: torch.Tensor) -> torch.Tensor:
         # Stage 3: Upsampling
         hidden = hidden.permute(0, 2, 1)  # [batch, hidden_size, seq_len]
         for blocks in self.upsample:
@@ -305,42 +473,47 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
                 "defaulting to left_context_size=zeros(len(codes)). This is expected during cudagraph warmup."
             )
             left_context_size = [0] * codes.shape[0]
-        # Decode chunk
-        wavs = []
-        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
-            batch_wav = self._cudagraph_wrapper.decode(codes)
-        else:
-            batch_wav = self(codes)
         if seq_token_counts is not None:
             code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
         else:
             # Fallback: assume all batch elements share the same sequence length.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
-        for idx, code_seq_len in enumerate(code_seq_lens):
-            # The eager decoder (self(codes)) emits a fixed `tail` fewer samples than
-            # code_seq_len*total_upsample: the causal conv stack trims the sequence end
-            # because it lacks right context. The original slice assumed full length, so
-            # under async_chunk every streaming chunk silently dropped its last `tail`
-            # samples -> a ~23ms gap at every chunk boundary + cumulative ~1.2% time
-            # compression. Shift the start back by `tail` so this chunk refills the gap the
-            # previous chunk left (those frames are re-decoded here with proper context).
-            # `tail` is measured per call, so this is a no-op only when the decoder returns
-            # the nominal full length (tail==0, e.g. a C==0 decoder like Qwen3-TTS); for
-            # Qwen3-Omni Code2Wav both the eager forward AND the CUDA-graph wrapper
-            # (_trim_replay_output -> actual*upsample - 555) are short, so it applies to both.
-            tail = max(0, int(code_seq_len * self.total_upsample) - batch_wav.shape[-1])
-            start = max(0, left_context_size[idx] * self.total_upsample - tail)
-            wav_chunk = batch_wav[idx, :, start : code_seq_len * self.total_upsample]
-            wavs.append(wav_chunk)
+        batch, width = int(codes.shape[0]), int(codes.shape[-1])
+        graphs = self._cudagraph_wrapper if self._cudagraph_enabled else None
+        batch_sizes = getattr(self, "_streaming_batch_sizes", None)
+        if graphs is not None and batch_sizes and batch > 1:
+            groups = plan_decode_groups(
+                code_seq_lens, graphs._get_padded_size, lambda size: batch_sizes.get(size, (1,))
+            )
+        else:
+            groups = [(list(range(batch)), width)]
+        wavs: list[torch.Tensor | None] = [None] * batch
+        for rows, length in groups:
+            if len(rows) == batch and length == width:
+                group_codes = codes
+            else:
+                # Basic indexing only: a device index tensor would need a host copy.
+                group_codes = torch.stack([codes[row, :, :length] for row in rows])
+            batch_wav = graphs.decode(group_codes) if graphs is not None else self(group_codes)
+            # The decoder trims the same right-edge tail from every batch row.
+            # Infer it from the decoded window, not a shorter request's length:
+            # padding that request with codec zeros does not provide valid context.
+            tail = max(0, int(length * self.total_upsample) - batch_wav.shape[-1])
+            for position, row in enumerate(rows):
+                # Refill the previous chunk's tail using the re-decoded left context,
+                # and exclude the current row's padded tail just as singleton decode does.
+                start = max(0, left_context_size[row] * self.total_upsample - tail)
+                end = max(0, code_seq_lens[row] * self.total_upsample - tail)
+                wavs[row] = batch_wav[position, :, start:end]
         return wavs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["thinker.", "talker."],  # Already loaded above
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(
+            weights,
+            mapper=(self.hf_to_vllm_mapper) | WeightsMapper(orig_to_new_prefix={"thinker.": None, "talker.": None}),
         )
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
         # Log load summary
         try:

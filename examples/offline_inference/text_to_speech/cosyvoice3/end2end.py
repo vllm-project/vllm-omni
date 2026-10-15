@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import argparse
+import copy
+import functools
+import json
 import os
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import soundfile as sf
-from vllm import SamplingParams
 from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
-from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 # Upstream zero-shot reference clip
 ZERO_SHOT_PROMPT_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
@@ -29,6 +31,20 @@ def _default_ref_audio() -> str:
     return str(dest)
 
 
+def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
+    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
+    return config
+
+
+parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+
+
 def run_e2e():
     parser = argparse.ArgumentParser()
     # ""FunAudioLLM/Fun-CosyVoice3-0.5B-2512
@@ -42,8 +58,7 @@ def run_e2e():
         "--deploy-config",
         type=str,
         default=None,
-        help="Override the deploy config path. If unset, auto-loads "
-        "vllm_omni/deploy/cosyvoice3.yaml based on the HF model_type.",
+        help="Override the deploy config path. If unset, selects the bundled CosyVoice3 profile for the device.",
     )
     parser.add_argument("--text", type=str, default="Hello, this is a test of the CosyVoice system capability.")
     parser.add_argument(
@@ -64,6 +79,12 @@ def run_e2e():
         required=True,
         help="Path to tokenizer directory (e.g., <model_path>/CosyVoice-BlankEN).",
     )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
     args = parser.parse_args()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.tokenizer):
@@ -79,9 +100,8 @@ def run_e2e():
         deploy_config=args.deploy_config,
         tokenizer=args.tokenizer,
         log_stats=True,
+        profiler_config=args.profiler_config,
     )
-
-    sampling_cfg = {"top_p": 0.8, "top_k": 25, "eos_token_id": 6561 + 1}
 
     print("Model initialized. Preparing inputs...")
     ref_audio_path = args.ref_audio or _default_ref_audio()
@@ -114,7 +134,7 @@ def run_e2e():
 
     print(f"Generating for prompt: {args.text}")
 
-    config = CosyVoice3Config()
+    config = omni.engine.stage_vllm_configs[0].model_config.hf_config
     tokenizer = get_qwen_tokenizer(
         token_path=args.tokenizer,
         skip_special_tokens=config.skip_special_tokens,
@@ -125,32 +145,13 @@ def run_e2e():
     min_len = int(base_len * config.min_token_text_ratio)
     max_len = int(base_len * config.max_token_text_ratio)
 
-    # Build SamplingParams for each stage (GPT, S2Mel, Vocoder)
-    gpt_sampling = SamplingParams(
-        temperature=1.0,
-        top_p=sampling_cfg["top_p"],
-        top_k=sampling_cfg["top_k"],
-        repetition_penalty=2.0,
-        min_tokens=min_len,
-        max_tokens=max_len,
-        stop_token_ids=[sampling_cfg["eos_token_id"]],
-        # allowed_token_ids=list(range(6561+3)),
-        detokenize=False,
-    )
-    # Not used
-    s2mel_sampling = SamplingParams(
-        temperature=1.0,
-        top_p=1.0,
-        top_k=-1,
-        repetition_penalty=2.0,
-        max_tokens=256,
-        detokenize=False,
-    )
+    # Keep the deploy profile's sampling policy, penalties and required stops.
+    sampling_params_list = copy.deepcopy(omni.default_sampling_params_list)
+    sampling_params_list[0].max_tokens = max(1, min(2048, max_len))
+    sampling_params_list[0].min_tokens = min(max(1, min_len), sampling_params_list[0].max_tokens)
 
-    sampling_params_list = [gpt_sampling, s2mel_sampling]
-
-    # Start profiling (requires VLLM_TORCH_PROFILER_DIR env var)
-    if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+    profiler_enabled = args.profiler_config is not None
+    if profiler_enabled:
         print("Starting profiler...")
         omni.start_profile()
 
@@ -158,7 +159,7 @@ def run_e2e():
     outputs = list(omni.generate(prompts, sampling_params_list=sampling_params_list[:2]))
 
     # Stop profiling and get results
-    if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+    if profiler_enabled:
         print("Stopping profiler...")
         profile_results = omni.stop_profile()
         print(f"Profile traces saved to: {profile_results}")

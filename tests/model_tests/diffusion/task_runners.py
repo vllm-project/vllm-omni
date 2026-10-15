@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from benchmarks.accuracy.common import pil_to_png_bytes
+from tests.helpers.assertions import assert_images_generations_response
 from tests.helpers.runtime import DiffusionResponse, OmniServer, OnlineOmniClient, dummy_messages_from_mix_data
 from tests.model_tests.diffusion.config_types import DiffusionTasks
 from vllm_omni.entrypoints.omni import Omni
@@ -204,6 +206,25 @@ def _run_online_i2i(
     return client.send_diffusion_request(request_config)
 
 
+def _build_online_image_edits_request(model: str, num_images: int) -> dict[str, Any]:
+    """Build a multipart ``/v1/images/edits`` request with repeated image fields."""
+    files = [
+        ("image", (f"image_{index}.png", pil_to_png_bytes(INPUT_IMAGE), "image/png")) for index in range(num_images)
+    ]
+    return {
+        "data": {
+            "model": model,
+            "prompt": PROMPT,
+            "size": f"{WIDTH}x{HEIGHT}",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_inference_steps": 2,
+            "seed": 42,
+        },
+        "files": files,
+    }
+
+
 ### Offline task runners
 def run_and_validate_text_to_image_request(omni: Omni):
     """Run and validate a text to image request."""
@@ -220,16 +241,20 @@ def run_and_validate_text_to_video_request(omni: Omni):
     _validate_video(_run_offline_t2v(omni))
 
 
-def run_and_validate_image_to_video_request(omni: Omni):
+def run_and_validate_image_to_video_request(omni: Omni, check_t2v_divergence: bool = True):
     """Run and validate an image to video request.
 
     LTX2Pipeline uses a unified text/image entry and can fall back to T2V if
     the image never reaches conditioning, so also run T2V with the same seed
     and prompt and assert the outputs differ; a regression that silently
     drops the input image would otherwise still pass a "did we get a valid
-    video back" check alone.
+    video back" check alone. Pipelines that mandate an image and fail closed
+    without one (SANA-Video I2V) pass check_t2v_divergence=False: a dropped
+    image raises instead of silently degrading, so the T2V comparison is moot.
     """
     i2v_video = _validate_video_frames(_get_offline_videos(_run_offline_i2v(omni)))[0]
+    if not check_t2v_divergence:
+        return
     t2v_video = _validate_video_frames(_get_offline_videos(_run_offline_t2v(omni)))[0]
     assert not np.array_equal(i2v_video, t2v_video), (
         "I2V output is identical to T2V output with the same seed and prompt; "
@@ -318,6 +343,35 @@ def run_and_validate_online_text_to_image_request(server: OmniServer, client: On
 def run_and_validate_online_image_to_image_request(server: OmniServer, client: OnlineOmniClient):
     """Run and validate an image to image request through the server."""
     _validate_images(_get_online_images(_run_online_i2i(server, client)))
+
+
+def run_and_validate_online_image_edits(
+    server: OmniServer,
+    client: OnlineOmniClient,
+    num_images: int,
+    max_multimodal_image_inputs: int,
+):
+    """Run and validate one request through ``/v1/images/edits``."""
+    request = _build_online_image_edits_request(server.model, num_images)
+    if num_images <= max_multimodal_image_inputs:
+        response = client.send_images_edits_http_request(request)[0]
+        assert response.success, response.error_message
+        assert isinstance(response.json_body, dict)
+        assert_images_generations_response(
+            response.json_body,
+            {"json": {"n": 1, "size": f"{WIDTH}x{HEIGHT}"}},
+        )
+    else:
+        err_message = (
+            "Only a single image is supported by this model."
+            if max_multimodal_image_inputs == 1
+            else f"At most {max_multimodal_image_inputs} images are supported"
+        )
+        client.send_images_edits_http_request(
+            request,
+            err_code=400,
+            err_message=err_message,
+        )
 
 
 def run_and_validate_online_determinism(server: OmniServer, client: OnlineOmniClient, task_type: DiffusionTasks):

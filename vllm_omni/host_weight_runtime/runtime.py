@@ -70,7 +70,7 @@ class HostWeightRuntime:
         from .filesystem import FilesystemHostWeightStore  # noqa: PLC0415
 
         try:
-            store = FilesystemHostWeightStore(config.domain, config.capacity, config.integrity)
+            store = FilesystemHostWeightStore(config.domain, config.capacity, config.integrity, wait=config.wait)
         except HostWeightError as exc:
             return cls(
                 config,

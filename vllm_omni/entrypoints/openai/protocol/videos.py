@@ -15,7 +15,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, field_validator, model_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
@@ -55,7 +55,13 @@ class VideoParams(BaseModel):
     width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
     height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames")
-    fps: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Frames per second for output video")
+    fps: float | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        allow_inf_nan=False,
+        description="Frames per second for output video",
+    )
 
     @property
     def size(self) -> str | None:
@@ -97,6 +103,51 @@ class UrlAudioReference(BaseModel):
 
 
 AudioReference = UrlAudioReference
+
+
+class TimelineGuideUpload(BaseModel):
+    """Reference to one repeated ``guide_files`` multipart upload."""
+
+    model_config = ConfigDict(extra="forbid")
+    upload_index: int = Field(
+        strict=True,
+        ge=0,
+        le=_INT64_MAX,
+        description="Zero-based index into the request's guide_files uploads.",
+    )
+
+
+class TimelineGuide(BaseModel):
+    """One ordered timeline guide entry addressing uploaded guide media."""
+
+    model_config = ConfigDict(extra="forbid")
+    frame_index: int = Field(
+        strict=True,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
+        description=(
+            "Pixel-frame start of this guide in the output timeline. Negative values count back from "
+            "the aligned output end."
+        ),
+    )
+    image: TimelineGuideUpload | None = Field(
+        default=None, description="Still-image guide source; cannot be combined with video."
+    )
+    video: TimelineGuideUpload | None = Field(
+        default=None, description="Clip guide source; cannot be combined with image."
+    )
+    audio: TimelineGuideUpload | None = Field(
+        default=None,
+        description="Audio guide source starting at the same frame. A video's soundtrack is never used.",
+    )
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "TimelineGuide":
+        if self.image is not None and self.video is not None:
+            raise ValueError("A timeline guide cannot contain both image and video")
+        if self.image is None and self.video is None and self.audio is None:
+            raise ValueError("A timeline guide requires at least one of image, video, or audio")
+        return self
 
 
 class VideoGenerationRequest(BaseModel):
@@ -146,7 +197,13 @@ class VideoGenerationRequest(BaseModel):
     # Video-specific fields (top-level for OpenAI-style compatibility)
     width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
     height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
-    fps: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Frames per second for output video")
+    fps: float | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        allow_inf_nan=False,
+        description="Frames per second for output video",
+    )
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
     aspect_ratio: str | None = Field(
         default=None,
@@ -273,13 +330,33 @@ class VideoGenerationRequest(BaseModel):
         ),
     )
 
+    # Timeline guides for guide-capable models (MiniMax H3). The multipart
+    # parser validates the ``timeline_guides`` manifest against the
+    # ``guide_files`` uploads and attaches the decoded guide media and the
+    # request-owned temporary files here.
+    _timeline_guide_input: Any = PrivateAttr(default=None)
+
     # Generic model-specific parameters
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
+    return_stage_metrics: bool | None = Field(
+        default=None,
+        description="Whether to include server-side stage metrics in async video metadata.",
+    )
 
-    def resolve_video_params(self) -> VideoParams:
+    def resolve_video_params(
+        self,
+        *,
+        default_fps: float | None = DEFAULT_FPS,
+        default_num_frames: int | None = None,
+    ) -> VideoParams:
+        """Resolve explicit fields with optional model-owned defaults.
+
+        Callers that know the active diffusion pipeline can supply its native
+        frame contract. Other callers retain the generic 24 fps behavior.
+        """
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 
         if self.video_params is not None:
@@ -292,10 +369,13 @@ class VideoGenerationRequest(BaseModel):
             vp.width, vp.height = parse_size(self.size)
 
         if vp.fps is None:
-            vp.fps = DEFAULT_FPS
+            vp.fps = default_fps
 
-        if vp.num_frames is None and self.seconds is not None:
-            vp.num_frames = int(self.seconds) * int(vp.fps)
+        if vp.num_frames is None:
+            if default_num_frames is not None:
+                vp.num_frames = default_num_frames
+            elif self.seconds is not None and vp.fps is not None:
+                vp.num_frames = int(float(self.seconds) * float(vp.fps))
 
         return vp
 
@@ -382,6 +462,13 @@ class VideoResponse(BaseModel):
         description="Filename of the saved output video files for this job.",
     )
     inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
+    fps: float | None = Field(default=None, description="Resolved output video frames per second, if known.")
+    num_frames: int | None = Field(default=None, description="Resolved number of output video frames, if known.")
+    duration_s: float | None = Field(default=None, description="Resolved output video duration in seconds, if known.")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional profiler and stage metrics for benchmark clients.",
+    )
     stage_durations: dict[str, float] = Field(
         default_factory=dict,
         description="Profiler stage durations reported by the diffusion pipeline.",

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E offline tests for MiniCPM-o 4.5 model with multimodal input and audio / text output.
 """
@@ -44,7 +47,7 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing audio, generating text output."""
@@ -57,7 +60,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing image, generating text output."""
@@ -68,7 +71,7 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating text output."""
@@ -79,7 +82,7 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing text and generating audio through Talker and Code2Wav."""
@@ -109,7 +112,7 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating audio output."""

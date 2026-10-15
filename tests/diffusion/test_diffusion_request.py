@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from types import SimpleNamespace
 
 import pytest
 
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -61,6 +63,23 @@ def test_non_dummy_request_is_not_identified_as_dummy_run():
     assert not req.is_dummy_run()
     assert not OmniDiffusionRequest.is_dummy_run_request_id(req.request_id)
     assert not OmniDiffusionRequest.is_dummy_run_request_id(None)
+
+
+def test_step_scheduler_separates_full_forward_fallback_from_step_requests():
+    scheduler = StepScheduler()
+    scheduler.initialize(SimpleNamespace())
+    scheduler.max_num_running_reqs = 2
+    text_request = _make_request()
+    text_request.use_step_execution = False
+    image_request = _make_request()
+    image_request.request_id = "image-request"
+
+    scheduler.add_request(text_request)
+    scheduler.add_request(image_request)
+    output = scheduler.schedule()
+
+    assert output.scheduled_request_ids == [text_request.request_id]
+    assert output.num_waiting_reqs == 1
 
 
 def test_tp_seed_same_across_ranks_and_varies_across_requests():

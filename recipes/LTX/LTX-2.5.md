@@ -89,6 +89,7 @@ Install matching vLLM and vLLM-Omni versions, and ensure `ffmpeg` and
 | NVIDIA B200 or H200 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
 | NVIDIA GB200 or GB300 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
 | NVIDIA H100 80 GB | FP8 recipe | Distilled one-stage at 960x544 |
+| Intel Arc Pro B70 32 GB | Verified | Offline Full/SFT one-stage T2V at 768x512 |
 
 The 1920x1088 two-stage examples require about 114 GB of peak GPU memory.
 80 GB GPUs do not have enough safety margin for the canonical two-stage
@@ -109,6 +110,56 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 ```
 
 Use the T2V or I2V request below after the server is ready.
+
+### Multi-GPU low-latency path
+
+For low-latency 1920x1088 distilled two-stage serving, match the Ulysses and
+VAE patch-parallel degrees to the GPU count. For example, on four GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --model-class-name LTX2DistilledTwoStagePipeline \
+  --usp 4 \
+  --vae-patch-parallel-size 4 \
+  --vae-use-tiling \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --stage-init-timeout 900
+```
+
+Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
+SP attention head counts must be divisible by `ulysses_degree`. Use each
+phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
+Each GPU must still fit the resident weights. Warm up with the production shape.
+
+### 1x Intel Arc Pro B70 32 GB (XPU)
+
+Offline Full/SFT one-stage T2V at 768x512, 17 frames. Select the legacy
+convolutional VAE with `ltx2_use_conv_vae`; the default DiffVAE decoder loads a
+NATTEN kernel, which has no XPU build. FP8 with layerwise offload streams both
+the transformer and the Gemma-4 text encoder.
+
+Environment: torch 2.14.0+xpu, vLLM 0.29.0, vLLM-Omni `main` at `d8d162d8`.
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model Lightricks/LTX-2.5-Diffusers \
+  --model-class-name LTX2Pipeline \
+  --stage-overrides '{"0":{"extras":{"ltx2_use_conv_vae":true}}}' \
+  --prompt "A serene lakeside sunrise with mist over the water." \
+  --num-frames 17 \
+  --quantization fp8 \
+  --enable-layerwise-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --enforce-eager \
+  --output ltx25_output.mp4
+```
+
+Peaks at 16.3 GiB in 163 s. Two-stage, distilled, and I2V paths were not
+exercised on this hardware.
 
 ## Offline inference
 

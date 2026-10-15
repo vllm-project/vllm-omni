@@ -29,7 +29,11 @@ class BasePipelineUtils:
         pass
 
     def validate_runtime_sampling_params(self, sampling: OmniDiffusionSamplingParams) -> None:
-        pass
+        if sampling.enable_frame_interpolation:
+            raise ValueError(
+                "Frame interpolation is not supported with the Diffusers backend because "
+                "Diffusers returns already postprocessed frames."
+            )
 
     def update_call_kwargs(
         self,
@@ -99,6 +103,7 @@ class WanPipelineUtils(BasePipelineUtils):
             )
 
     def validate_runtime_sampling_params(self, sampling: OmniDiffusionSamplingParams) -> None:
+        super().validate_runtime_sampling_params(sampling)
         if sampling.boundary_ratio is not None:
             raise ValueError(
                 "Boundary ratio is not supported at runtime with the diffusers backend for Wan models. Please set "

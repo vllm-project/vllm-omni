@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """WebSocket handler for streaming generated video chunks.
 
 Protocol:
@@ -362,15 +362,41 @@ class OmniStreamingVideoOutputHandler:
         if not isinstance(event, dict):
             await self._send_error(websocket, "session.interaction requires event object", send_lock=send_lock)
             return
-
         prompt = event.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
+        multi_modal_data = event.get("multi_modal_data")
+        has_prompt = isinstance(prompt, str) and bool(prompt.strip())
+        has_mm = isinstance(multi_modal_data, dict) and bool(multi_modal_data)
+        if not has_prompt and not has_mm:
             await self._send_error(
                 websocket,
-                "session.interaction requires a non-empty event.prompt",
+                "session.interaction requires a non-empty event.prompt and/or non-empty event.multi_modal_data",
                 send_lock=send_lock,
             )
             return
+        if "prompt" in event and prompt is not None and not has_prompt:
+            await self._send_error(
+                websocket,
+                "session.interaction event.prompt must be a non-empty string when provided",
+                send_lock=send_lock,
+            )
+            return
+        if "multi_modal_data" in event and multi_modal_data is not None and not has_mm:
+            await self._send_error(
+                websocket,
+                "session.interaction event.multi_modal_data must be a non-empty object when provided",
+                send_lock=send_lock,
+            )
+            return
+        if has_mm:
+            assert isinstance(multi_modal_data, dict)
+            for modality, payload in multi_modal_data.items():
+                if not isinstance(payload, dict):
+                    await self._send_error(
+                        websocket,
+                        f"session.interaction multi_modal_data[{modality!r}] must be an object",
+                        send_lock=send_lock,
+                    )
+                    return
 
         if "negative_prompt" in event and event["negative_prompt"] is not None:
             await self._send_error(
@@ -380,9 +406,19 @@ class OmniStreamingVideoOutputHandler:
             )
             return
 
+        normalized_event: dict[str, Any] = {}
+        if has_prompt:
+            normalized_event["prompt"] = prompt
+        if has_mm:
+            normalized_event["multi_modal_data"] = multi_modal_data
+        # Preserve other event fields that OmniInteractionEvent may carry.
+        for key, value in event.items():
+            if key not in normalized_event and key not in ("prompt", "multi_modal_data"):
+                normalized_event[key] = value
+
         normalized: OmniInteractionPrompt = {
             "event_id": event_id,
-            "event": cast(OmniInteractionEvent, event),
+            "event": cast(OmniInteractionEvent, normalized_event),
         }
         transition_chunks = interaction.get("transition_chunks")
         if transition_chunks is not None:
@@ -556,6 +592,14 @@ class OmniStreamingVideoOutputHandler:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
+            # Worker-side pre-encoding produces one progressive MP4, which this
+            # path's incremental fMP4 encoder cannot consume; streaming already
+            # overlaps encoding through that encoder instead.
+            if request.extra_params.get("preencode_mp4"):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="preencode_mp4 is not supported for streaming video sessions.",
+                )
             gen_params.extra_args.update(request.extra_params)
 
         self._apply_lora(request.lora, gen_params)
@@ -564,8 +608,11 @@ class OmniStreamingVideoOutputHandler:
     @staticmethod
     async def _decode_image_reference(request: VideoGenerationRequest) -> Image.Image | None:
         try:
+            image_reference = request.image_reference
+            if isinstance(image_reference, list):
+                raise InvalidInputReferenceError("image_reference must be a single image reference.")
             media_data = await decode_input_reference(
-                request.image_reference,
+                image_reference,
                 None,
                 None,
             )

@@ -5,14 +5,20 @@ import asyncio
 import re
 from types import SimpleNamespace
 
+import anyio
 import pytest
+from vllm.engine.protocol import StreamingInput
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.kv_hints import KvHintsEnvelope
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model]
@@ -38,7 +44,8 @@ def get_fake_add_request(submitted_request_ids, submitted_lora_requests=None):
 
 
 def get_fake_abort(aborted_request_batches):
-    async def fake_abort_async(request_ids):
+    async def fake_abort_async(request_ids, timeout=None):
+        del timeout
         aborted_request_batches.append(list(request_ids))
 
     return fake_abort_async
@@ -62,6 +69,7 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._paused = False
     omni.engine = SimpleNamespace(
         num_stages=1,
+        stage_configs=[],
         add_request_async=fake_add_request,
         abort_async=fake_abort_request,
     )
@@ -132,6 +140,39 @@ def test_generate_forwards_lora_request_to_engine():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("streaming", [None, "chunk", "empty"])
+def test_generate_forwards_kv_hints_on_initial_stage_submission(streaming):
+    async def run():
+        submissions = []
+
+        async def add(**kwargs):
+            submissions.append(kwargs)
+
+        omni = get_async_omni_instance(fake_add_request=add)
+        omni.engine.add_streaming_update_async = _noop
+        omni.engine.stage_configs = [SimpleNamespace(is_comprehension=True, stage_type="llm")]
+        omni.engine.stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))]
+        hints = KvHintsEnvelope("1", "message", [])
+        params = SamplingParams(max_tokens=2, output_kind=RequestOutputKind.DELTA)
+
+        async def chunks():
+            if streaming == "chunk":
+                yield StreamingInput(prompt={"prompt_token_ids": [1]})
+
+        async for _ in omni.generate(
+            prompt=chunks() if streaming else {"prompt_token_ids": [1]},
+            request_id="hints",
+            sampling_params_list=[params],
+            kv_hints=hints,
+        ):
+            pass
+        assert len(submissions) == 1
+        assert submissions[0]["kv_hints"] is hints
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "req_ids,cancel_prefix,expected_cancel_count",
     [
@@ -196,8 +237,8 @@ def test_abort_keeps_request_states_until_generate_cleanup():
         release = asyncio.Event()
         seen_during_wait: list[int] = []
 
-        async def slow_abort_async(request_ids):
-            del request_ids
+        async def slow_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             seen_during_wait.append(len(omni.request_states))
             await release.wait()
 
@@ -224,8 +265,8 @@ def test_abort_keeps_request_states_until_generate_cleanup():
 @pytest.mark.cpu
 def test_abort_propagates_engine_errors_without_popping_state():
     async def run():
-        async def failing_abort_async(request_ids):
-            del request_ids
+        async def failing_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             raise RuntimeError("orchestrator abort failed")
 
         omni = get_async_omni_instance(fake_abort_request=failing_abort_async)
@@ -253,7 +294,8 @@ def test_abort_enqueues_prefix_tokens_from_engine():
 
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def abort_with_prefix(request_ids):
+        async def abort_with_prefix(request_ids, timeout=None):
+            del timeout
             rid = request_ids[0]
             engine_output = OmniRequestOutput(
                 request_id=rid,
@@ -308,8 +350,8 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
     async def run():
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def empty_abort_async(request_ids):
-            del request_ids
+        async def empty_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             return []
 
         omni = get_async_omni_instance(fake_abort_request=empty_abort_async)
@@ -325,6 +367,95 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
         assert msg.request_id == "req-1-dddd"
         assert msg.engine_outputs.outputs[0].finish_reason == "abort"
         assert "req-1-dddd" in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_drops_consumed_metric_message_ids_with_state():
+    """Exercise the production leak path from #6462: a metric-bearing
+    ``OutputMessage`` goes through ``_handle_output_message`` (which populates
+    the per-request de-dup set), the request is aborted (which, since #6367,
+    keeps ``request_states`` registered and enqueues a terminal abort output),
+    and the set must be released with the state by ``generate()``'s normal
+    cleanup — with no independent request-keyed metric state surviving on the
+    instance at any point. A reintroduced
+    class-level ``_consumed_metric_messages``-style map populated by the
+    production handler fails the sweep below.
+    """
+    import time as _time
+    from collections.abc import Mapping
+
+    from vllm_omni.engine.messages import OutputMessage
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+    from vllm_omni.metrics.stats import OrchestratorAggregator
+
+    async def run():
+        omni = get_async_omni_instance()
+        omni.engine.get_stage_metadata = lambda stage_id: SimpleNamespace(
+            stage_type="llm",
+            final_output=True,
+            final_output_type="text",
+        )
+
+        rid = "req-1-cccc"
+        state = ClientRequestState(request_id=rid, external_request_id="req-1")
+        state.metrics = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=False,
+            wall_start_ts=_time.time(),
+            final_stage_id_for_e2e=0,
+        )
+        state.input_stream_task = None
+        omni.request_states[rid] = state
+
+        msg = OutputMessage(
+            request_id=rid,
+            stage_id=0,
+            engine_outputs=SimpleNamespace(final_output_type="text"),
+            metrics=SimpleNamespace(
+                num_tokens_in=3,
+                num_tokens_out=5,
+                stage_gen_time_ms=1.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+            ),
+            finished=False,
+        )
+        handled, out_rid, out_stage, out_state = omni._handle_output_message(msg)
+        assert handled is False and out_state is state
+        # The production handler recorded the de-dup entry on the state...
+        assert id(msg) in state.consumed_metric_message_ids
+        # ...and de-duplicates a replay of the same message object.
+        omni._handle_output_message(msg)
+        assert len(state.consumed_metric_message_ids) == 1
+
+        assert not hasattr(omni, "_consumed_metric_messages")
+
+        # #6367 contract: abort() keeps the state registered and enqueues a
+        # terminal abort output; generate()'s ``finally`` owns the cleanup.
+        await omni.abort("req-1")
+        assert rid in omni.request_states
+        terminal = state.queue.get_nowait()
+        assert terminal.finished is True
+        assert terminal.engine_outputs.outputs[0].finish_reason == "abort"
+        # The de-dup set still lives only on the (still-registered) state.
+        for name, value in vars(omni).items():
+            if name == "request_states":
+                continue
+            assert not (isinstance(value, Mapping) and rid in value), (
+                f"request-keyed metric state kept outside request_states in {name!r}"
+            )
+
+        # generate()'s normal cleanup releases the state and the set with it.
+        omni._log_summary_and_cleanup(rid)
+        assert rid not in omni.request_states
+        for name, value in vars(omni).items():
+            assert not (isinstance(value, Mapping) and rid in value), (
+                f"request-keyed state survived cleanup in {name!r}"
+            )
+        assert not hasattr(omni, "_consumed_metric_messages")
 
     asyncio.run(run())
 
@@ -379,6 +510,97 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize("input_fails", [False, True])
+def test_streaming_input_terminal_submit_failure_reaches_generate(mocker, has_chunk, input_fails):
+    async def run_test():
+        submissions: list[tuple[str, bool]] = []
+
+        async def add_request_async(*, resumable, **kwargs):
+            del kwargs
+            submissions.append(("add", resumable))
+            if not resumable:
+                raise RuntimeError("terminal streaming submit failed")
+
+        async def add_streaming_update_async(*, resumable, **kwargs):
+            del kwargs
+            submissions.append(("update", resumable))
+            assert not resumable
+            raise RuntimeError("terminal streaming submit failed")
+
+        omni = get_async_omni_instance(fake_add_request=add_request_async)
+        omni.engine.add_streaming_update_async = add_streaming_update_async
+        omni.engine.stage_clients = []
+        omni.engine.model_config = object()
+        del omni._process_orchestrator_results
+        mocker.patch(
+            "vllm_omni.entrypoints.async_omni.extract_prompt_components",
+            return_value=(None, None, None),
+        )
+        error_metadata = mocker.spy(async_omni_mod, "client_error_metadata")
+
+        async def input_stream():
+            if has_chunk:
+                yield StreamingInput(prompt={"prompt": "chunk"})
+            if input_fails:
+                raise RuntimeError("streaming input failed")
+
+        async def consume():
+            async for _ in omni.generate(
+                prompt=input_stream(),
+                request_id="stream-submit-error",
+                sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.DELTA)],
+                output_modalities=["text"],
+            ):
+                pass
+
+        expected_error = "streaming input failed" if input_fails else "terminal streaming submit failed"
+        with pytest.raises(RuntimeError, match=expected_error):
+            await asyncio.wait_for(consume(), timeout=1.0)
+        assert error_metadata.call_count == 1
+        assert submissions == ([("add", True), ("update", False)] if has_chunk else [("add", False)])
+        assert omni.request_states == {}
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
+    """Cancelled generate() must not wait forever on a wedged orchestrator abort."""
+    monkeypatch.setattr(async_omni_mod, "ABORT_TIMEOUT_S", 0.05)
+
+    async def run():
+        seen_timeouts: list[float | None] = []
+
+        async def hanging_abort_async(request_ids, timeout=None):
+            del request_ids
+            seen_timeouts.append(timeout)
+            await asyncio.Event().wait()
+
+        omni = get_async_omni_instance(fake_abort_request=hanging_abort_async)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-hang-abort",
+                sampling_params_list=[SimpleNamespace()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert seen_timeouts
+        assert seen_timeouts[-1] == 0.05
+        assert omni.request_states == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
     async def run_test():
         submitted_request_ids: list[str] = []
@@ -411,6 +633,87 @@ def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
         assert submitted_request_ids[0].startswith("cancel-shutdown-")
         assert omni.request_states == {}
         engine.request_queue.sync_q.put.assert_not_called()
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_waits_for_abort_inside_cancelled_asgi_scope():
+    async def run_test():
+        submitted = anyio.Event()
+        acknowledged = []
+
+        async def add_request(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids, timeout=None):
+            assert timeout == async_omni_mod.ABORT_TIMEOUT_S
+            await anyio.sleep(0)
+            acknowledged.extend(request_ids)
+
+        omni = get_async_omni_instance(fake_add_request=add_request, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-asgi",
+                sampling_params_list=[SamplingParams()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(collect)
+            await submitted.wait()
+            group.cancel_scope.cancel()
+        assert len(acknowledged) == 1 and acknowledged[0].startswith("cancel-asgi-")
+        assert omni.request_states == {}
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_bounds_abort_inside_cancelled_asgi_scope(monkeypatch):
+    monkeypatch.setattr(async_omni_mod, "ABORT_TIMEOUT_S", 0.05)
+
+    async def run_test():
+        submitted = anyio.Event()
+        abort_started = anyio.Event()
+        abort_finished = anyio.Event()
+
+        async def add_request(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids, timeout=None):
+            assert len(request_ids) == 1
+            assert timeout == 0.05
+            abort_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                abort_finished.set()
+
+        omni = get_async_omni_instance(fake_add_request=add_request, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-asgi-hanging-abort",
+                sampling_params_list=[SamplingParams()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        async def cancel_request():
+            async with anyio.create_task_group() as group:
+                group.start_soon(collect)
+                await submitted.wait()
+                group.cancel_scope.cancel()
+
+        await asyncio.wait_for(cancel_request(), timeout=1.0)
+        assert abort_started.is_set()
+        assert abort_finished.is_set()
+        assert omni.request_states == {}
 
     asyncio.run(run_test())
 
@@ -483,6 +786,46 @@ def test_output_kind_is_preserved_with_explicit_sampling_params(output_kind):
 
     asyncio.run(run())
     assert captured_params[0].output_kind == output_kind
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "input_kind", [None, RequestOutputKind.CUMULATIVE, RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY]
+)
+def test_qwen_video_sampling_keeps_all_three_stages_delta(input_kind):
+    """Real generate/resolution preserves the video handler's DELTA contract."""
+    captured = []
+
+    async def submit(*, sampling_params_list, **kwargs):
+        captured.extend(sampling_params_list)
+
+    async def run():
+        omni = get_async_omni_instance(fake_add_request=submit)
+        # The common fixture bypasses resolution; this test must execute it.
+        del omni.resolve_sampling_params_list
+        omni.engine.num_stages = 3
+        omni.default_sampling_params_list = [SamplingParams(output_kind=RequestOutputKind.CUMULATIVE) for _ in range(3)]
+        omni.sampling_constraints_list = omni._get_sampling_constraints_list(QWEN3_OMNI_PIPELINE.stages)
+        params = None
+        if input_kind is not None:
+            # The video handler applies this coercion to explicit overrides.
+            params = coerce_param_message_types(
+                [SamplingParams(output_kind=input_kind) for _ in range(3)], is_streaming=True
+            )
+        async for _ in omni.generate(
+            prompt={"prompt": "video"},
+            request_id="video-sampling",
+            sampling_params_list=params,
+            output_modalities=["text", "audio"],
+        ):
+            pass
+        assert len(captured) == 3
+        assert all(param.output_kind == RequestOutputKind.DELTA for param in captured)
+        assert captured[1].stop_token_ids == [2150]
+        assert [param.detokenize for param in captured] == [True, False, True]
+        assert all(param.output_kind == RequestOutputKind.CUMULATIVE for param in omni.default_sampling_params_list)
+
+    asyncio.run(run())
 
 
 # End to end tests for ensuring internal manipulation of request ID

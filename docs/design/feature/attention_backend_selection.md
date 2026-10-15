@@ -4,6 +4,9 @@ This document defines the selection and extension contract for diffusion
 attention backends. User-facing backend choices, installation, and tuning are
 in the [attention backend guides](../../user_guide/diffusion/attention_backends.md).
 
+The [execution contract PoC](attention_execution_contract_poc.md) describes the
+experimental post-selection capability and lifecycle contract from RFC #7226.
+
 ## Scope
 
 The contract applies to DiT and other diffusion attention layers. It is
@@ -76,6 +79,34 @@ preserve common `self` or `cross` policies. A model also decides whether its
 path is compatible with automatic TRTLLM selection, because only the model
 knows whether masking and packing satisfy the kernel contract.
 
+### Model-owned implementation specializations
+
+Use `Attention(..., impl_overrides={backend_name: implementation_class})`
+when a model needs different computation within an existing backend contract.
+The model defines the implementation in its own directory and passes it when
+constructing the layer:
+
+```python
+# MyModelVSAImpl is a model-owned subclass of FastVideoVSAImpl.
+self.attention = Attention(
+    num_heads=num_heads,
+    head_size=head_size,
+    softmax_scale=head_size**-0.5,
+    causal=False,
+    role="self",
+    impl_overrides={"FASTVIDEO_VSA": MyModelVSAImpl},
+)
+```
+
+The override is applied after role/platform selection, keyed by the selected
+backend's `get_name()`. It must subclass the **selected implementation**;
+incompatible platform implementations raise `TypeError`. Unselected overrides
+have no effect. Backend capabilities, constructor options, and shared
+parallel dispatch remain unchanged and must be honored by the specialization.
+
+Use a new backend for a new provider/capability contract. `custom_attention`
+instead owns communication and requires `skip_sequence_parallel=True`.
+
 ## Adding or changing a backend
 
 An implementation change is complete only when it:
@@ -91,8 +122,9 @@ An implementation change is complete only when it:
 
 ## FastVideo VSA model metadata
 
-FastVideo VSA support is scoped to `FastVideo/FastWan2.2-TI2V-5B-Diffusers`, whose text-to-video and image-to-video modes both use `Wan22Pipeline`. It operates on a flattened DiT sequence but partitions tokens in
-the original latent video grid. Wan integrations therefore attach the
+FastWan's text-to-video and image-to-video modes both use `Wan22Pipeline`.
+It operates on a flattened DiT sequence but partitions tokens in the original
+latent video grid. Wan integrations therefore attach the
 post-patch `(T, H, W)` shape as `vsa_dit_seq_shape` attention metadata. The
 backend validates that `T * H * W` equals the sequence length, derives the
 runtime block count, and selects the configured top-k key/value blocks for
@@ -104,3 +136,8 @@ the checkpoint contains those weights. Checkpoints without the projection do
 not allocate or execute it. When top-k selects every block, native checkpoints
 route to SDPA, while FastVideo DMD checkpoints preserve the VSA all-block path
 to retain checkpoint semantics.
+
+MiniMax-H3 supplies `MiniMaxH3VSAImpl` through `impl_overrides`.
+`models/minimax_h3/attention/fastvideo_h3.py` owns its prefix layout, video tiling, and
+learned compression gate. Pooling, block-map construction, and tile64 provider
+calls are shared through `attention/ops/block_sparse.py`.

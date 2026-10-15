@@ -183,7 +183,7 @@ def _generate_online_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_hunyuanvideo15_i2v_diffusers_offline_generates_video(
     hunyuanvideo15_i2v_image_source: str | None,
 ) -> None:
@@ -203,7 +203,7 @@ def test_hunyuanvideo15_i2v_diffusers_offline_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_i2v_online_serving_generates_video(
     omni_server,
@@ -229,7 +229,7 @@ def test_hunyuanvideo15_i2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity(
     hunyuanvideo15_i2v_image_source: str | None,
 ) -> None:

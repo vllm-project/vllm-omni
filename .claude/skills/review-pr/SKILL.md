@@ -42,6 +42,11 @@ lists `path:line` findings, but keeps the same confidence and severity bar.
 
 ## Reference guide
 
+Before reviewing, read the relevant entries in
+[Review and issue lessons](../../../docs/contributing/ci/lessons.md). Verify their
+linked evidence against the current diff and revision; historical examples are
+not proof of a new defect.
+
 Load references in review order: process, one primary module contract, matching
 feature designs, evidence checks, then delivery. Every file is linked directly
 below; do not load unrelated module references.
@@ -123,10 +128,11 @@ it changes again, report the churn and wait for a stable target.
 
 For a trusted PR head, materialize the pinned head in an isolated detached
 worktree. A worktree freezes identity but is not a security sandbox. Treat fork
-heads as untrusted unless the user and environment policy explicitly establish
-otherwise: execute them only in a disposable, secret-free sandbox with restricted
-filesystem, network, and resources; without one, use static SHA-addressed reads
-and CI evidence only. For a local review, freeze the committed, index, worktree,
+heads as untrusted until the user and environment policy explicitly establish
+trust: execute their code only after that trust is recorded for this host,
+with the trusted SHA noted in the review state and secrets kept out of the
+execution scope; without recorded trust, use static SHA-addressed reads and CI
+evidence only. For a local review, freeze the committed, index, worktree,
 and NUL-safe in-scope untracked contents. Follow
 [review-execution.md](references/process/review-execution.md) for trust gates,
 state fingerprints, and byte-for-byte staleness checks.
@@ -196,7 +202,7 @@ style preferences as simplification findings.
 
 Before each validation group, verify the frozen SHA plus the tracked, index,
 untracked, and ignored-file fingerprint, or recreate a pristine snapshot. On a
-trusted head or inside the required sandbox, run an import/version preflight,
+head the user explicitly trusted for this host, run an import/version preflight,
 then the narrowest relevant tests and low-cost static checks. Bind every result
 to the head SHA, snapshot fingerprint, and environment fingerprint. Never run
 imports, tests, builds, hooks, or repo-configurable tooling from an untrusted
@@ -224,9 +230,11 @@ and restart from the new snapshot.
 
 Return findings first. Use
 [maintainer-style-study.md](references/delivery/maintainer-style-study.md) to keep them
-direct and brief. Each finding must include an exact `path:line`, trigger or
-call path, current behavior, impact, and smallest fix direction. If there are
-no findings, say so briefly and name material validation gaps.
+direct and brief. For consolidated replies with multiple actions, use its short
+contributor-owned checklist; omit routine process and maintainer CI narration.
+Each finding must include an exact `path:line`, trigger or call path, current
+behavior, impact, and smallest fix direction. If there are no findings, say so
+briefly and name material validation gaps.
 
 Keep the review read-only unless the user explicitly authorizes posting. Do not
 submit `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`, add labels, edit code, or push
