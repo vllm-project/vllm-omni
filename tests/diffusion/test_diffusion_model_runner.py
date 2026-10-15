@@ -258,6 +258,33 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("stepwise", [False, True])
+def test_offload_request_boundary_runs_before_model_work(monkeypatch, mocker, stepwise):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.offload_backend = mocker.Mock()
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    platform = _fake_platform_for_peak_memory()
+    platform.is_available = lambda: False
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", platform)
+    request = _make_request()
+    if stepwise:
+        runner.pipeline = _FinalOnlyStepPipeline()
+        wave = DiffusionSchedulerOutput(
+            step_id=0,
+            scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+            scheduled_cached_reqs=CachedRequestData(request_ids=[]),
+            finished_req_ids=set(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
+        )
+        DiffusionModelRunner.execute_stepwise(runner, wave)
+    else:
+        DiffusionModelRunner.execute_model(runner, request)
+    runner.offload_backend.prepare_for_request.assert_called_once()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 @pytest.mark.parametrize("imported_tokens", [None, (4, 4), (4, 2)])
 def test_request_forward_separates_imported_kv_and_local_hits(monkeypatch, imported_tokens):
     from contextlib import nullcontext

@@ -49,6 +49,8 @@ def test_no_allgather_example_selects_distributed_backend():
         enable_distributed_layerwise_offload=kwargs["enable_distributed_layerwise_offload"],
         dlo_use_allgather=kwargs["dlo_use_allgather"],
         dlo_resident_layers=kwargs["dlo_resident_layers"],
+        dlo_chunk_size_mb=64,
+        dlo_attention_head_buckets=0,
         dlo_host_registration_limit_gib=0.0,
         host_weight_runtime_mode="disabled",
         pin_cpu_memory=True,

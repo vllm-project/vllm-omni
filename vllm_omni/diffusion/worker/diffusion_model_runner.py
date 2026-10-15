@@ -651,7 +651,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         use_prefetch: bool = False,
     ) -> None:
-        # Fetch upstream conditioning before anything else: the pipeline reads
+        if self.offload_backend is not None:
+            self.offload_backend.prepare_for_request()
+        # Fetch upstream conditioning before model work: the pipeline reads
         # it out of the prompt during the forward below.
         self._maybe_recv_stage_payload(req)
 
@@ -1214,6 +1216,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 per_req_exc: BaseException | None = None
                 try:
+                    if self.offload_backend is not None:
+                        self.offload_backend.prepare_for_request()
                     self._initialize_generator(state.sampling)
                     clear_pipeline_stage_durations(pipeline)
                     pipeline.prepare_encode(state)
@@ -1405,7 +1409,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Run the denoise step after metadata admission and row installation."""
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        # Match full-request DLO execution, retaining metadata version counters.
+        use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
             pipeline = self.pipeline
             assert pipeline is not None, "Model not loaded. Call load_model() first."
