@@ -918,16 +918,6 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
-            "--diffusion-offload-config",
-            type=json.loads,
-            default=None,
-            help="Diffusion CPU-offload config as JSON. "
-            "Set mode to module or layer, list dit and/or text_encoder in "
-            "components, and put layer-only tuning under layer_options. "
-            "Layer settings are weight_transfer (rank-local or allgather) and "
-            "resident_layers (DiT only).",
-        )
-        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
             help="Compatibility alias for model-level CPU offload. New integrations should use "
