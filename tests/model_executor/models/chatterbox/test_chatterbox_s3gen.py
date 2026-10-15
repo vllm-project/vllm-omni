@@ -385,8 +385,9 @@ def test_the_voice_arrives_once_and_is_kept_for_the_stream(decoder: S3GenDecoder
     assert decoder.streams == {}
     # Not vacuous: the other voice from the first chunk on gives other audio in the later chunks.
     other = decode_stream(decoder, tokens, "other", references[1], later=None)
-    assert not torch.equal(other[1], once[1])
-    assert not torch.equal(other[2], once[2])
+    # Measured on initial weights: about 5e-4 apart.
+    assert not torch.allclose(other[1], once[1], atol=1e-4)
+    assert not torch.allclose(other[2], once[2], atol=1e-4)
 
 
 def test_interleaved_streams_keep_their_own_voices(decoder: S3GenDecoder, references: list[Reference]) -> None:
