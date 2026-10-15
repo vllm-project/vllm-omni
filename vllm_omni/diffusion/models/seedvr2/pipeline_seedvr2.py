@@ -26,7 +26,9 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.seedvr2 import config as envs
 from vllm_omni.diffusion.models.seedvr2.config import COLOR_CORRECTION_METHODS, DEFAULT_COLOR_CORRECTION_METHOD
 from vllm_omni.diffusion.models.seedvr2.nadit import SEEDVR2_3B_CONFIG, SeedVR2NaDiT, validate_seedvr2_parallel_config
+from vllm_omni.diffusion.models.seedvr2.nadit_cuda_graph import NaDiTCoreGraphs, NaDiTGraphConfig
 from vllm_omni.diffusion.models.seedvr2.vae import SeedVR2VAE
+from vllm_omni.diffusion.models.seedvr2.vae_cuda_graph import VAEDecoderGraphConfig, VAEDecoderGraphs
 from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -104,7 +106,7 @@ def scaled_clip_pixels(frame_pixels: int, device_memory: int | None) -> int:
     return min(max(CALIBRATED_SHARDED_CLIP_PIXELS, int(clip)), VALIDATED_SHARDED_CLIP_PIXELS)
 
 
-def sharded_budget() -> tuple[int, int]:
+def sharded_budget(*, reserved_bytes: int = 0) -> tuple[int, int]:
     """Per-frame and padded-clip budgets for the VAE-sharded serving profile.
 
     An unset clip budget scales with the smallest visible device's memory.
@@ -112,7 +114,8 @@ def sharded_budget() -> tuple[int, int]:
     frame_pixels = envs.VLLM_OMNI_SEEDVR2_SHARDED_FRAME_PIXELS
     clip_pixels = envs.VLLM_OMNI_SEEDVR2_SHARDED_CLIP_PIXELS
     if clip_pixels is None:
-        clip_pixels = scaled_clip_pixels(frame_pixels, _device_memory())
+        memory = _device_memory()
+        clip_pixels = scaled_clip_pixels(frame_pixels, None if memory is None else max(0, memory - reserved_bytes))
     return frame_pixels, clip_pixels
 
 
@@ -378,8 +381,10 @@ def validate_seedvr2_config(config: OmniDiffusionConfig) -> None:
     sharded_budget()
     if config.dtype != torch.float16:
         raise ValueError("SeedVR2 3B requires dtype=float16")
-    if not config.enforce_eager:
-        raise ValueError("SeedVR2 requires enforce_eager=True; compiled execution is not supported")
+    graph_config = NaDiTGraphConfig.from_extras(config.extras, enforce_eager=config.enforce_eager)
+    vae_graph_config = VAEDecoderGraphConfig.from_extras(config.extras, enforce_eager=config.enforce_eager)
+    if not config.enforce_eager and graph_config is None and vae_graph_config is None:
+        raise ValueError("SeedVR2 requires enforce_eager=True or explicit model-owned graph profiles")
     if config.cache_backend != "none" or config.quantization_config is not None:
         raise ValueError("SeedVR2 requires unquantized weights and cache_backend=none for its single Euler step")
     if config.vae_use_slicing:
@@ -388,6 +393,14 @@ def validate_seedvr2_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("SeedVR2 native whole-clip execution does not support CPU offload")
     parallel = config.parallel_config
     validate_seedvr2_parallel_config(parallel)
+    if (graph_config is not None or vae_graph_config is not None) and (
+        parallel.sequence_parallel_size not in (1, 2, 4) or not config.vae_use_tiling
+    ):
+        raise ValueError("SeedVR2 model-owned graphs require a single GPU or SP2/SP4 and VAE tiling")
+    if vae_graph_config is not None and parallel.sequence_parallel_size not in (2, 4):
+        raise ValueError("SeedVR2 VAE decoder graphs require SP2/SP4 height sharding")
+    if vae_graph_config is not None and parallel.vae_patch_parallel_size != parallel.sequence_parallel_size:
+        raise ValueError("SeedVR2 VAE decoder graphs require VAE height sharding on the complete SP group")
     if parallel.data_parallel_size is not None and parallel.data_parallel_size > 1:
         raise ValueError("SeedVR2 does not support data_parallel_size > 1")
     if parallel.ulysses_degree > 20:
@@ -463,7 +476,10 @@ def _admission_budget(config: OmniDiffusionConfig) -> tuple[int, int]:
     parallel = config.parallel_config
     sharded = parallel.ulysses_degree == parallel.vae_patch_parallel_size
     if config.vae_use_tiling and sharded and parallel.ulysses_degree >= 4:
-        return sharded_budget()
+        graphs = NaDiTGraphConfig.from_extras(config.extras, enforce_eager=config.enforce_eager)
+        vae_graphs = VAEDecoderGraphConfig.from_extras(config.extras, enforce_eager=config.enforce_eager)
+        reserved = sum(item.max_pool_bytes + 64 * 1024**2 for item in [graphs, vae_graphs] if item is not None)
+        return sharded_budget(reserved_bytes=reserved)
     return MAX_FRAME_PIXELS, MAX_CLIP_PIXELS
 
 
@@ -585,6 +601,10 @@ class SeedVR2Pipeline(nn.Module):
         set_torch_threads_for_runtime()
         self.device = get_local_device()
         self.od_config = od_config
+        self.nadit_graph_config = NaDiTGraphConfig.from_extras(od_config.extras, enforce_eager=od_config.enforce_eager)
+        self.vae_graph_config = VAEDecoderGraphConfig.from_extras(
+            od_config.extras, enforce_eager=od_config.enforce_eager
+        )
         self.frame_pixels, self.clip_pixels = _admission_budget(od_config)
         self.transformer = SeedVR2NaDiT(**SEEDVR2_3B_CONFIG, use_varlen_kernel=False)
         self.vae = SeedVR2VAE()
@@ -613,6 +633,7 @@ class SeedVR2Pipeline(nn.Module):
         self.register_buffer("text", text.to(device=self.device, dtype=od_config.dtype), persistent=False)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self.release_captured_graphs()
         targets = self.state_dict()
         loaded: set[str] = set()
         for name, weight in weights:
@@ -627,7 +648,41 @@ class SeedVR2Pipeline(nn.Module):
         missing = targets.keys() - loaded
         if missing:
             raise ValueError(f"Missing SeedVR2 checkpoint keys: {sorted(missing)}")
+        # Also covers checkpoint copies into inference tensors without version counters.
+        for block in self.transformer.blocks:
+            block.attn.rope.clear_frequency_cache()
         return loaded
+
+    @property
+    def owns_cuda_graph_execution(self) -> bool:
+        return self.nadit_graph_config is not None or getattr(self, "vae_graph_config", None) is not None
+
+    def setup_model_owned_cuda_graphs(self) -> None:
+        """Prepare all exact profiles after loading weights and before ready."""
+        if self.od_config.enforce_eager or not self.owns_cuda_graph_execution:
+            return
+        if self.device.type != "cuda":
+            raise ValueError("SeedVR2 model-owned CUDA graphs require a CUDA device")
+        for config in [self.nadit_graph_config, self.vae_graph_config]:
+            for frames, height, width in () if config is None else config.profiles:
+                pixels = height * width * 64
+                if pixels > self.frame_pixels or pixels * ((frames - 1) * 4 + 1) > self.clip_pixels:
+                    raise ValueError("SeedVR2 graph profile exceeds the existing input admission budget")
+        self.release_captured_graphs()
+        if self.nadit_graph_config is not None:
+            self.transformer.core_graphs = NaDiTCoreGraphs(
+                self.transformer, self.text, self.od_config.parallel_config, self.nadit_graph_config
+            )
+        if self.vae_graph_config is not None:
+            self.vae.decoder_graphs = VAEDecoderGraphs(self.vae, self.vae_graph_config)
+
+    def release_captured_graphs(self) -> None:
+        release = getattr(self.transformer, "release_captured_graphs", None)
+        if callable(release):
+            release()
+        release_vae = getattr(getattr(self, "vae", None), "release_captured_graphs", None)
+        if callable(release_vae):
+            release_vae()
 
     @torch.inference_mode()
     def forward(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
@@ -637,6 +692,22 @@ class SeedVR2Pipeline(nn.Module):
             if not isinstance(request.prepared_layout, SeedVR2Input):
                 prepare_request(request, frame_pixels=self.frame_pixels, clip_pixels=self.clip_pixels)
             prepared = request.prepared_layout
+            graph_runtime = None
+            vae_graph_entry = None
+            if getattr(self.vae, "decoder_graphs", None) is not None:
+                geometry = ((prepared.frame_count + 2) // 4 + 1, params.height // 8, params.width // 8)
+                vae_graph_entry = self.vae.decoder_graphs.begin_request(geometry)
+            if self.transformer.core_graphs is not None:
+                # The VAE pads the input to 4n+1 and reduces space by eight.
+                # Select the mode from known CPU media geometry before any GPU
+                # work, with one group decision for the complete request.
+                geometry = ((prepared.frame_count + 2) // 4 + 1, params.height // 8, params.width // 8)
+                graph_runtime = self.transformer.build_runtime(
+                    self.transformer.token_grid_for(geometry),
+                    text_len=self.text.shape[0],
+                    parallel_config=self.od_config.parallel_config,
+                )
+                self.transformer.core_graphs.begin_request(geometry, graph_runtime)
             sample = prepare_video(prepared.frames, params.height, params.width, self.device)
             generator = params.generator
             if generator is None:
@@ -647,10 +718,10 @@ class SeedVR2Pipeline(nn.Module):
             condition = latent.permute(0, 2, 3, 4, 1).squeeze(0) * 0.9152
             noise = sample_noise(condition, generator)
             video = torch.cat((noise, condition, torch.ones_like(condition[..., :1])), dim=-1).reshape(-1, 33)
-            shape = torch.tensor([condition.shape[:3]], device=self.device, dtype=torch.long)
+            shape = tuple(condition.shape[:3])
             text_shape = torch.tensor([[self.text.shape[0]]], device=self.device, dtype=torch.long)
             timestep = torch.tensor([1000.0], device=self.device, dtype=torch.float16)
-            runtime = self.transformer.build_runtime(
+            runtime = graph_runtime or self.transformer.build_runtime(
                 self.transformer.token_grid_for(shape),
                 text_len=self.text.shape[0],
                 parallel_config=self.od_config.parallel_config,
@@ -658,7 +729,11 @@ class SeedVR2Pipeline(nn.Module):
             velocity = self.transformer(video, self.text, shape, text_shape, timestep, runtime).vid_sample
             # Reference Euler returns fp32, then VAE casts to fp16 before scaling.
             restored = noise - velocity.reshape_as(noise)
-            decoded = self.vae.decode((restored / 0.9152).permute(3, 0, 1, 2).unsqueeze(0))
+            decoder_input = (restored / 0.9152).permute(3, 0, 1, 2).unsqueeze(0)
+            if getattr(self.vae, "decoder_graphs", None) is not None:
+                decoded = self.vae.decode(decoder_input, _graph_entry=vae_graph_entry)
+            else:
+                decoded = self.vae.decode(decoder_input)
             method = params.extra_args.get("color_correction_method") or DEFAULT_COLOR_CORRECTION_METHOD
             video = finish_video(decoded, sample, prepared.frame_count, method)
             payload: dict[str, object] = {"video": video}
