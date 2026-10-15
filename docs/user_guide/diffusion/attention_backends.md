@@ -165,6 +165,58 @@ portable guarantees.
 Mask-heavy DiTs favored `CUDNN_ATTN`; lighter-mask or TP-saturated workloads
 were close enough that users should benchmark their exact model and shape.
 
+## Unified attention quantization (`diffusion_kv_cache_dtype`)
+
+`diffusion_kv_cache_dtype` is a historically named Omni option. It requests
+quantized attention **compute** for every eligible DiT attention layer; it does
+not select the dtype of a persistent KV cache. It is independent of the
+upstream vLLM `--kv-cache-dtype` option, which belongs to autoregressive KV
+storage:
+
+```bash
+vllm-omni serve <model> --diffusion-kv-cache-dtype fp8
+```
+
+- Leaving the option unset or using `auto` keeps native dtype execution.
+- `fp8` quantizes Q/K/V for the current attention call and dequantizes inside
+  the attention kernel. Persistent model-owned KV storage is unaffected.
+- CUDA FA3 uses vLLM's dynamic per-tensor `scaled_fp8_quant` custom op to
+  compute scales and convert Q/K/V to FP8; Omni only adapts the diffusion
+  tensor layout and FA3 descales.
+- Ascend NPU passes BF16/FP16 Q/K/V and the selected precision to MindIE-SD's
+  `quant_attention`, which performs the vendor-side quantization and attention.
+- `diffusion_kv_cache_skip_steps` / `diffusion_kv_cache_skip_layers` exempt
+  individual denoise steps or transformer blocks (format: `"0-9,20,25-30"`).
+
+Backend support for `fp8`:
+
+| Backend | Platform | Notes |
+| --- | --- | --- |
+| `FLASH_ATTN` | CUDA (SM90 Hopper) | FA3 FP8 varlen; one dynamic scale for each of Q, K and V |
+| `FLASH_ATTN` | Ascend NPU | MindIE-SD `quant_attention` with Hadamard Q/K rotation; also `mxfp8`, `mxfp4` |
+| `RAINFUSION_ATTN` | Ascend NPU | Block-sparse fp8/mxfp4 |
+
+Backends not listed here reject the knob at startup with the list of compatible
+options. Quantization is lossy; validate image/video quality against the
+unquantized baseline before enabling it in production.
+
+CUDA FA3 uses separate scalar scales for Q, K and V, each shared across all
+samples, tokens and heads of that input tensor. Each scalar is broadcast to
+FA3's `(batch_size, num_kv_heads)` descale shape for MHA, GQA and MQA. This is
+online per-tensor quantization; scales are recomputed on every forward.
+The FA3 FP8 kernel returns BF16 output, including for FP16 inputs. This CUDA
+path currently accepts dense inputs without caller masks, packed-sequence
+metadata, or piecewise spans; incompatible requests fail explicitly.
+
+Dynamic quantization adds reductions, FP8 conversion, and kernel launches.
+FP8 attention can therefore be slower than BF16, especially for short
+sequences. This option does not promise lower peak memory use or faster
+end-to-end generation.
+
+An explicit `diffusion_attention_config.*.quant` spec conflicts with the knob
+and is rejected at config load; drop one of them. A pure
+`flashinfer_backend` variant pin without dtypes is allowed to compose.
+
 ## Compatibility anchors
 
 The following headings preserve links to sections that moved into dedicated

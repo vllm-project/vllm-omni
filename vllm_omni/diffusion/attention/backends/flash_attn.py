@@ -87,6 +87,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     # Until then, model authors can opt a specific Attention layer out via
     # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
+        "cuda": {"fp8"},
         "npu": {"fp8", "mxfp8", "mxfp4"},
     }
 
@@ -416,6 +417,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
         extra = attn_metadata.extra if attn_metadata is not None else {}
 
+        kv_quant_method = extra.get("kv_cache_dtype")
+        if kv_quant_method not in (None, "float", "auto"):
+            if kv_quant_method != "fp8":
+                raise ValueError(
+                    f"CUDA FLASH_ATTN supports only 'fp8' attention precision, got {kv_quant_method!r}. "
+                    "Use the NPU backend for mxfp8/mxfp4 or set diffusion_kv_cache_dtype='auto'."
+                )
+            return self.forward_fa_quant_cuda(query, key, value, attn_metadata)
+
         # Try piecewise attention
         if full_attn_spans is not None:
             self._warn_fa_deterministic_non_dense("piecewise")
@@ -485,6 +495,181 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             key,
             value,
         )
+
+    def _validate_quant_request_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> None:
+        extra = attn_metadata.extra if attn_metadata else {}
+        reason = None
+        if any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")):
+            reason = "packed/varlen metadata requires the float attention path"
+        elif attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            reason = "piecewise attention requires the float attention path"
+        elif attn_metadata is not None and attn_metadata.attn_mask is not None:
+            reason = "caller masks require the float attention path"
+        elif query.ndim != 4:
+            reason = "expected four-dimensional (batch, seq, heads, head_dim) query input"
+        elif key.ndim != 4 or value.ndim != 4:
+            reason = "expected four-dimensional (batch, seq, heads, head_dim) key/value inputs"
+        elif query.device != key.device or query.device != value.device:
+            reason = "Q/K/V must be on the same CUDA device"
+        elif query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+            reason = "Q/K/V batch sizes must match"
+        elif query.shape[1] <= 0 or key.shape[1] <= 0:
+            reason = "Q/K/V sequence lengths must be positive"
+        elif key.shape[1] != value.shape[1] or key.shape[2] != value.shape[2]:
+            reason = "K/V sequence lengths and head counts must match"
+        elif query.shape[-1] != key.shape[-1] or query.shape[-1] != value.shape[-1]:
+            reason = "Q/K/V head dimensions must match"
+        elif query.shape[-1] % 8 != 0 or query.shape[-1] > 256:
+            reason = f"FA3 FP8 requires head_dim divisible by 8 and <= 256, got {query.shape[-1]}"
+        elif (
+            query.dtype not in (torch.bfloat16, torch.float16) or key.dtype != query.dtype or value.dtype != query.dtype
+        ):
+            reason = (
+                "FA3 FP8 requires matching bfloat16 or float16 Q/K/V inputs, "
+                f"got {query.dtype}, {key.dtype}, {value.dtype}"
+            )
+        if reason is None:
+            reason = self._fa3_fp8_device_unsupported_reason(query.device)
+        if reason is None and query.device.type == "cuda":
+            # Reuse vLLM's own FA capability matrix and version selector so
+            # this stays aligned with the kernel selected by vLLM 0.31.
+            try:
+                from vllm.v1.attention.backends.fa_utils import (
+                    flash_attn_supports_kv_cache_dtype,
+                    flash_attn_supports_quant_query_input,
+                    get_flash_attn_version,
+                )
+
+                if not flash_attn_supports_quant_query_input():
+                    reason = "vLLM reports quantized query input is unsupported on this platform"
+                elif (
+                    get_flash_attn_version(
+                        head_size=query.shape[-1],
+                        head_size_v=value.shape[-1],
+                    )
+                    != 3
+                ):
+                    reason = "vLLM selected an attention version other than FA3"
+                elif not flash_attn_supports_kv_cache_dtype(
+                    "fp8",
+                    head_size=query.shape[-1],
+                    head_size_v=value.shape[-1],
+                ):
+                    reason = "vLLM reports no supported FA3 FP8 kernel for this device or head size"
+            except ImportError:
+                reason = "the installed vLLM build has no FA capability probe"
+        if reason is not None:
+            raise ValueError(
+                f"CUDA attention precision 'fp8' is unavailable: {reason}. "
+                "Set diffusion_kv_cache_dtype to 'auto', or select a backend with fp8 "
+                "support. Automatic precision fallback is not performed."
+            )
+
+    @staticmethod
+    def _fa3_fp8_device_unsupported_reason(device: torch.device) -> str | None:
+        """Device gate for the FA3 FP8 kernels (Hopper SM90 only).
+
+        Extracted as a static method so CPU tests can mock the hardware probe.
+        """
+        if device.type != "cuda":
+            return f"FA3 FP8 requires a CUDA device, got {device.type}"
+        capability = torch.cuda.get_device_capability(device)
+        if capability[0] != 9:
+            return f"FA3 FP8 kernels require SM90 (Hopper); current device is SM{capability[0]}{capability[1]}"
+        return None
+
+    def forward_fa_quant_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """FP8 (e4m3) FlashAttention-3 path for CUDA (SM90).
+
+        vLLM computes one dynamic scale for each of Q, K and V on every
+        forward. No calibration data or stored state is involved. Layout
+        conversion mirrors ``_forward_varlen_dense``.
+        """
+        self._validate_quant_request_cuda(query, key, value, attn_metadata)
+        try:
+            # vLLM exposes the FA dispatcher from ``fa_utils``.  Keep the
+            # version-specific import out of Omni: vLLM 0.31 selects the
+            # vendored FA3 implementation there and keeps the public call
+            # contract stable across its FA3 builds.
+            from vllm.v1.attention.backends.fa_utils import (
+                flash_attn_varlen_func as fa3_varlen_func,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "CUDA attention precision 'fp8' requires vLLM's FlashAttention-3 dispatcher "
+                "(vllm.v1.attention.backends.fa_utils). Set diffusion_kv_cache_dtype='auto' or install a "
+                "compatible vLLM build."
+            ) from exc
+        if fa3_varlen_func is None:
+            raise ImportError(
+                "CUDA attention precision 'fp8' requires vLLM's FlashAttention-3 dispatcher. "
+                "Set diffusion_kv_cache_dtype='auto' or install a compatible vLLM build."
+            )
+
+        from vllm import _custom_ops as ops
+
+        batch_size, q_len = query.size()[:2]
+        k_len = key.size(1)
+        q_heads, head_dim = query.shape[2:]
+        kv_heads = key.size(2)
+        if q_heads < 1 or kv_heads < 1 or q_heads % kv_heads:
+            raise ValueError(
+                "FA3 FP8 requires positive Q/KV head counts with Q heads divisible by KV heads; "
+                f"got {q_heads} Q heads and {kv_heads} KV heads"
+            )
+        device = query.device
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=device)
+        cu_seqlens_k = (
+            cu_seqlens_q
+            if k_len == q_len
+            else torch.arange(0, (batch_size + 1) * k_len, step=k_len, dtype=torch.int32, device=device)
+        )
+
+        # The upstream dynamic per-tensor op computes and returns the scale
+        # used for its FP8 conversion. Q/K/V each have an independent scale;
+        # no head reordering or GQA-specific scale grouping is needed.
+        q_input = query.reshape(batch_size * q_len, -1)
+        k_input = key.reshape(batch_size * k_len, -1)
+        v_input = value.reshape(batch_size * k_len, -1)
+        # vLLM 0.31's quantizer accepts strided rows and writes contiguous FP8
+        # output. Only the last input dimension must be contiguous; preserving
+        # row strides avoids copying V slices from a fused QKV projection.
+        q_fp8, q_descale = ops.scaled_fp8_quant(q_input if q_input.stride(-1) == 1 else q_input.contiguous())
+        k_fp8, k_descale = ops.scaled_fp8_quant(k_input if k_input.stride(-1) == 1 else k_input.contiguous())
+        v_fp8, v_descale = ops.scaled_fp8_quant(v_input if v_input.stride(-1) == 1 else v_input.contiguous())
+
+        out = fa3_varlen_func(
+            q=q_fp8.view(batch_size * q_len, q_heads, head_dim),
+            k=k_fp8.view(batch_size * k_len, kv_heads, head_dim),
+            v=v_fp8.view(batch_size * k_len, kv_heads, head_dim),
+            max_seqlen_q=q_len,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=k_len,
+            cu_seqlens_k=cu_seqlens_k,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            # FA3 indexes descales by sequence and KV head. Broadcast each
+            # tensor's scalar scale to that interface, including for GQA/MQA.
+            q_descale=q_descale.expand(batch_size, kv_heads),
+            k_descale=k_descale.expand(batch_size, kv_heads),
+            v_descale=v_descale.expand(batch_size, kv_heads),
+            fa_version=3,
+        )
+        out = self._unwrap_flash_output(out)
+        # (b s) h d -> b s h d
+        return out.reshape(batch_size, q_len, *out.shape[1:])
 
     def forward_xpu(
         self,
