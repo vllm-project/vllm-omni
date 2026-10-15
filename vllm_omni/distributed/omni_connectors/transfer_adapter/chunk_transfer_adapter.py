@@ -1456,18 +1456,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     continue
 
     def _requeue_replaced_prompts(self, waiting_queue: Any, running_queue: list[Request]) -> None:
-        """Move a replaced running prompt back through scheduler admission."""
-        for request in list(running_queue):
+        """Move replaced running prompts back through scheduler admission.
+
+        Single-pass partition: collect moved requests, bulk-filter at the end.
+        Avoids O(N²) running_queue.remove() per replaced request.
+        """
+        moved: list[Request] = []
+        for request in running_queue:
             request_id = request.request_id
             if (
                 request_id not in self.replaced_streaming_prompt_ids
                 or request_id not in self.requests_with_ready_chunks
             ):
                 continue
-            running_queue.remove(request)
             request.status = RequestStatus.WAITING
             self.requests_origin_status[request_id] = RequestStatus.WAITING
+            moved.append(request)
             waiting_queue.add_request(request)
+
+        if moved:
+            moved_set = set(moved)
+            running_queue[:] = [r for r in running_queue if r not in moved_set]
 
     def _promote_active_streams(self, queue: Any) -> None:
         if len(self._active_streams) >= self._active_window:
@@ -1561,8 +1570,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         target_status: RequestStatus,
         finished_load_reqs: set[str],
     ) -> None:
-        queue_snapshot = list(queue)
-        for request in queue_snapshot:
+        moved: list[Any] = []
+        for request in queue:
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
                     # Requests that have loaded chunk from last round
@@ -1584,9 +1593,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # deadline measures stall time rather than total stream time.
                     self._waiting_since.pop(request.request_id, None)
                     continue
-            queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
-            waiting_for_chunk_list.append(request)
+            moved.append(request)
+
+        if moved:
+            if isinstance(queue, list):
+                moved_set = set(moved)
+                queue[:] = [req for req in queue if req not in moved_set]
+            else:
+                queue.remove_requests(moved)
+            waiting_for_chunk_list.extend(moved)
 
     def _purge_untracked_chunk_requests(
         self,
@@ -1698,8 +1714,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         target_status: RequestStatus,
         finished_load_reqs: set[str],
     ) -> None:
-        queue_snapshot = list(queue)
-        for request in queue_snapshot:
+        moved: list[Any] = []
+        for request in queue:
             if not self._ensure_active_stream(request):
                 if target_status == RequestStatus.WAITING:
                     # A non-active placeholder must not remain visible to the
@@ -1707,8 +1723,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # it would execute the downstream model with empty
                     # additional_information. Park it until restore_queues()
                     # and retry admission on the next scheduler tick.
-                    queue.remove(request)
-                    waiting_for_chunk_list.append(request)
+                    moved.append(request)
                 continue
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
@@ -1731,9 +1746,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # deadline measures stall time rather than total stream time.
                     self._waiting_since.pop(request.request_id, None)
                     continue
-            queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
-            waiting_for_chunk_list.append(request)
+            moved.append(request)
+
+        if moved:
+            if isinstance(queue, list):
+                moved_set = set(moved)
+                queue[:] = [req for req in queue if req not in moved_set]
+            else:
+                queue.remove_requests(moved)
+            waiting_for_chunk_list.extend(moved)
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
         if scheduler_output.scheduled_new_reqs:
