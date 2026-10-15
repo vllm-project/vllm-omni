@@ -32,7 +32,8 @@ real-time-factor estimate assumes sequential
 decoder batches; it excludes T3, conditioning, transport, and GPU contention.
 It is not an end-to-end serving result.
 
-Use `--tf32` or `--bf16-flow` to compare flow precision. Each precision run
+The flow runs in BF16, as in production; use `--fp32-flow` or `--tf32` to
+compare flow precision. Each precision run
 also saves paired `.fp32.wav` and `.selected.wav` replay chunks beside the
 JSON report for listening. Numerical similarity and these short clips do not
 replace end-to-end intelligibility and speaker-quality evaluation.

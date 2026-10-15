@@ -185,10 +185,10 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
   measured with the earlier fractions (35 % / 40 %), which only reserved
   more.
 - Key flags: `conditioning_device: cuda:0` under stage 0
-  `additional_config` puts the reference encoders on the GPU;
-  `flow_dtype: bfloat16` under stage 1 `hf_overrides` (the default in both
-  profiles) runs the flow decoder under BF16 autocast with FP32 weights and
-  FP32 HiFT, and `flow_dtype: float32` restores the FP32 flow;
+  `additional_config` puts the reference encoders on the GPU; the flow
+  decoder runs under BF16 autocast with FP32 weights and FP32 HiFT, which
+  is `ChatterboxConfig`'s default `flow_dtype`, and
+  `hf_overrides: {flow_dtype: float32}` on stage 1 restores the FP32 flow;
   `flow_attention_backend: cudnn` selects cuDNN attention for the BF16
   flow; `cuda_mps: true` shares the device between the API process and the
   stages.

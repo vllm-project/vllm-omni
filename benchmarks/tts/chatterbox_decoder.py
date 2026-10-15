@@ -43,15 +43,17 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--fold-weight-norm", action="store_true")
     parser.add_argument("--cached-istft", action="store_true")
-    parser.add_argument("--bf16-flow", action="store_true", help="Experimental flow autocast; HiFT remains FP32")
+    parser.add_argument(
+        "--fp32-flow", action="store_true", help="Run the flow in FP32 instead of production's BF16 autocast"
+    )
     parser.add_argument("--tf32", action="store_true", help="Use PyTorch high-precision FP32 matmul policy")
     parser.add_argument(
         "--cudnn-attention", action="store_true", help="Require native cuDNN SDPA in the BF16 estimator"
     )
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=BATCH_SIZES)
     args = parser.parse_args()
-    if args.cudnn_attention and not args.bf16_flow:
-        parser.error("cuDNN attention requires --bf16-flow")
+    if args.cudnn_attention and args.fp32_flow:
+        parser.error("cuDNN attention requires the BF16 flow")
     if any(size not in BATCH_SIZES for size in args.batch_sizes):
         parser.error("batch sizes must be powers of two from 1 through 64")
     logging.basicConfig(level=logging.INFO)
@@ -60,7 +62,7 @@ def main():
     torch.set_float32_matmul_precision("high" if args.tf32 else "highest")
     config = ChatterboxConfig(
         args.variant,
-        flow_dtype="bfloat16" if args.bf16_flow else "float32",
+        flow_dtype="float32" if args.fp32_flow else "bfloat16",
         flow_attention_backend="cudnn" if args.cudnn_attention else "auto",
     )
     # Stage 1 as the variant's deploy file sizes it.
@@ -96,7 +98,7 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "folded_weight_norm_layers": folded,
         "cached_istft": args.cached_istft,
-        "bf16_flow": args.bf16_flow,
+        "flow_dtype": config.flow_dtype,
         "cudnn_attention": args.cudnn_attention,
         "matmul_precision": torch.get_float32_matmul_precision(),
         "workload": "isolated real-weight decoder with built-in speech-code replay",
@@ -104,13 +106,13 @@ def main():
         "batch_sizes": args.batch_sizes,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    if args.bf16_flow or args.tf32:
+    if not args.fp32_flow or args.tf32:
         probe = make_chunks(decoder, reference, codes, 1, "steady")
         torch.set_float32_matmul_precision("highest")
         config.flow_dtype = "float32"
         config.flow_attention_backend = "auto"
         expected = decoder.chunk_mels(probe)[0]
-        config.flow_dtype = "bfloat16" if args.bf16_flow else "float32"
+        config.flow_dtype = "float32" if args.fp32_flow else "bfloat16"
         config.flow_attention_backend = "cudnn" if args.cudnn_attention else "auto"
         torch.set_float32_matmul_precision("high" if args.tf32 else "highest")
         actual = decoder.chunk_mels(probe)[0]
