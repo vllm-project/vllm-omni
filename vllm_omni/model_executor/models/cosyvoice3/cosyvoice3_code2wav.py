@@ -44,6 +44,23 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 logger = init_logger(__name__)
 
 
+def _pad_and_cat(tensors: list[torch.Tensor], *, dim: int) -> torch.Tensor:
+    """Concatenate single-row tensors along dim 0, zero-padding ``dim`` to the
+    widest row. The flow reads each row's real width from the per-row lengths
+    it is given, so the padding is never conditioning."""
+    width = max(int(tensor.shape[dim]) for tensor in tensors)
+    rows = []
+    for tensor in tensors:
+        missing = width - int(tensor.shape[dim])
+        if missing:
+            pad = [0] * (2 * tensor.ndim)
+            # F.pad counts dimensions from the last one backwards.
+            pad[2 * (tensor.ndim - 1 - dim) + 1] = missing
+            tensor = torch.nn.functional.pad(tensor, pad)
+        rows.append(tensor)
+    return torch.cat(rows, dim=0)
+
+
 def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
     """Build CosyVoice's embedded DiT with diffusion backend configuration.
 
@@ -371,9 +388,10 @@ class CosyVoice3Code2Wav(nn.Module):
     ) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
         """Batch the flow-matching mel path, then run HiFT per request.
 
-        Items are grouped by prompt condition shape and finalization state.
-        Codec tokens may have different lengths; those are padded within the
-        group and passed to the flow as per-row token lengths.
+        Items are grouped by finalization state alone: the flow takes each
+        row's own reference and codec-token lengths, so requests with
+        different speaker references share one call instead of each forming a
+        group of one. Both are padded to the group's longest within the call.
         """
         if items and cosyvoice3_packed_streaming_enabled():
             results = [None] * len(items)
@@ -396,15 +414,15 @@ class CosyVoice3Code2Wav(nn.Module):
         ):
             return [(speech, None) for speech in self.forward_batch(items, n_timesteps=n_timesteps)]
         results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
-        groups: dict[tuple[int, int, int, bool], list[tuple[int, StreamingFlowItem]]] = {}
+        groups: dict[tuple[int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
             assert isinstance(item["token"], torch.Tensor)
             assert isinstance(item["prompt_token"], torch.Tensor)
             assert isinstance(item["prompt_feat"], torch.Tensor)
             assert isinstance(item["embedding"], torch.Tensor)
+            # The speaker-embedding width is the model's and never varies, but
+            # a mismatch would silently concatenate along the wrong axis.
             key = (
-                int(item["prompt_token"].shape[1]),
-                int(item["prompt_feat"].shape[1]),
                 int(item["embedding"].shape[1]),
                 bool(item.get("finalize", False)),
             )
@@ -444,24 +462,14 @@ class CosyVoice3Code2Wav(nn.Module):
                 [int(token.shape[1]) for token in token_tensors],
                 dtype=torch.int32,
             )
-            max_token_len = int(token_lens.max().item())
-            padded_tokens = []
-            for token in token_tensors:
-                if int(token.shape[1]) == max_token_len:
-                    padded_tokens.append(token)
-                else:
-                    pad = torch.zeros(
-                        (token.shape[0], max_token_len - int(token.shape[1])),
-                        device=token.device,
-                        dtype=token.dtype,
-                    )
-                    padded_tokens.append(torch.cat([token, pad], dim=1))
-            tokens = torch.cat(padded_tokens, dim=0)
-            prompt_tokens = torch.cat([item["prompt_token"] for _, item in group], dim=0)
-            prompt_feats = torch.cat([item["prompt_feat"] for _, item in group], dim=0)
+            tokens = _pad_and_cat(token_tensors, dim=1)
+            prompt_tokens = _pad_and_cat([item["prompt_token"] for _, item in group], dim=1)
+            prompt_feats = _pad_and_cat([item["prompt_feat"] for _, item in group], dim=1)
             embeddings = torch.cat([item["embedding"] for _, item in group], dim=0)
-            prompt_token_lens = torch.full((len(group),), prompt_tokens.shape[1], dtype=torch.int32)
-            prompt_feat_lens = torch.full((len(group),), prompt_feats.shape[1], dtype=torch.int32)
+            prompt_token_lens = torch.tensor(
+                [int(item["prompt_token"].shape[1]) for _, item in group], dtype=torch.int32
+            )
+            prompt_feat_lens = torch.tensor([int(item["prompt_feat"].shape[1]) for _, item in group], dtype=torch.int32)
             finalize = bool(group[0][1].get("finalize", False))
 
             with cosyvoice3_batch_flow_profile(f"cosyvoice3_flow_batch_b{len(group)}_t{tokens.shape[1]}"):

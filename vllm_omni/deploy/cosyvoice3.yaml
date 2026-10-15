@@ -60,6 +60,10 @@ stages:
     skip_mm_profiling: true
 
   - stage_id: 1
+    # Combine ready streaming requests with different reference lengths.
+    # TensorRT builds a dynamic CFG-batch profile bounded by max_num_seqs.
+    env:
+      COSYVOICE3_BATCH_FLOW: "1"
     max_num_batched_tokens: 32768
     max_num_seqs: 8
     gpu_memory_utilization: 0.2

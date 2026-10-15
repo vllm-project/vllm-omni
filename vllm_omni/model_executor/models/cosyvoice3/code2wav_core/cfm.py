@@ -174,21 +174,16 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond, estimator_session=None):
-        if isinstance(self.estimator, torch.nn.Module):
-            return self.estimator(x, mask, mu, t, spks, cond)
-        elif estimator_session is not None:
-            return estimator_session.run(x, mask, mu, t, spks, cond)
-        else:
-            # TensorRT estimator: bind raw device pointers. The flow runs in
-            # fp32 but the engine may have fp16 I/O (strongly-typed fp16 engine),
-            # so cast inputs/output to the engine's dtype at the boundary. Keep
-            # references to the cast buffers alive until execute completes (a bare
-            # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
-            io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
-            [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            caller_stream = torch.cuda.current_stream(x.device)
-            stream.wait_stream(caller_stream)
+    def _forward_estimator_trt_once(self, x, mask, mu, t, spks, cond):
+        """Execute one TensorRT estimator call for a profile-supported shape."""
+        io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
+        [estimator, stream], trt_engine = self.estimator.acquire_estimator(
+            int(x.shape[0]),
+            int(x.shape[2]),
+        )
+        caller_stream = torch.cuda.current_stream(x.device)
+        stream.wait_stream(caller_stream)
+        try:
             with torch.cuda.stream(stream):
                 x_e = x.to(io_dtype).contiguous()
                 mask_e = mask.to(io_dtype).contiguous()
@@ -214,7 +209,6 @@ class ConditionalCFM(BASECFM):
                 ]
                 for i, j in enumerate(data_ptrs):
                     estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
-                # run trt engine
                 assert estimator.execute_async_v3(stream.cuda_stream) is True
                 for tensor in (x_e, mask_e, mu_e, t_e, spks_e, cond_e, out_e):
                     if tensor.is_cuda:
@@ -222,8 +216,54 @@ class ConditionalCFM(BASECFM):
             caller_stream.wait_stream(stream)
             if out_e.is_cuda:
                 out_e.record_stream(caller_stream)
-            self.estimator.release_estimator(estimator, stream)
             return out_e.to(x.dtype)
+        finally:
+            self.estimator.release_estimator(estimator, stream)
+
+    def forward_estimator(self, x, mask, mu, t, spks, cond, estimator_session=None):
+        if isinstance(self.estimator, torch.nn.Module):
+            return self.estimator(x, mask, mu, t, spks, cond)
+        if estimator_session is not None:
+            return estimator_session.run(x, t)
+
+        batch_size = int(x.shape[0])
+        sequence_length = int(x.shape[2])
+        supports_shape = getattr(self.estimator, "supports_estimator_shape", None)
+        if batch_size > 2 and supports_shape is not None and not supports_shape(batch_size, sequence_length):
+            if batch_size % 2 != 0:
+                raise RuntimeError(f"TensorRT CFG estimator batch must be even, got {batch_size}")
+
+            # Dynamic profile 1 intentionally covers the common batched-flow
+            # window only. If a long cumulative stream (or an unusually large
+            # request batch) falls outside that profile, preserve TensorRT and
+            # exact CFG semantics by serializing request pairs through profile 0.
+            # CFG layout is [B conditioned rows | B unconditional rows].
+            requests = batch_size // 2
+            conditioned = []
+            unconditional = []
+            for index in range(requests):
+                pair = (
+                    slice(index, index + 1),
+                    slice(index + requests, index + requests + 1),
+                )
+
+                def pair_rows(tensor):
+                    return torch.cat((tensor[pair[0]], tensor[pair[1]]), dim=0)
+
+                pair_out = self._forward_estimator_trt_once(
+                    pair_rows(x),
+                    pair_rows(mask),
+                    pair_rows(mu),
+                    pair_rows(t),
+                    pair_rows(spks),
+                    pair_rows(cond),
+                )
+                conditioned.append(pair_out[:1])
+                unconditional.append(pair_out[1:])
+
+            return torch.cat((*conditioned, *unconditional), dim=0)
+
+        return self._forward_estimator_trt_once(x, mask, mu, t, spks, cond)
 
 
 class CausalConditionalCFM(ConditionalCFM):
@@ -345,36 +385,77 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             embedding = F.normalize(embedding, dim=1)
             embedding = self.spk_embed_affine_layer(embedding)
 
+        batch_size = int(token.shape[0])
+        ratio = int(self.token_mel_ratio)
+        lookahead = 0 if finalize else int(self.pre_lookahead_len)
+        # One host sync for the row geometry; the loops below need it anyway,
+        # and the uniform path used to sync on ``prompt_feat.shape[1]``.
+        prompt_lens = [int(v) for v in prompt_token_len.reshape(-1).tolist()]
+        target_lens = [int(v) for v in token_len.reshape(-1).tolist()]
+        prompt_mel_lens = [int(v) for v in prompt_feat_len.reshape(-1).tolist()]
+        combined_lens = [p + t for p, t in zip(prompt_lens, target_lens, strict=True)]
+        # Rows that share a reference length keep the single-tensor path, so a
+        # uniform batch is computed exactly as before.
+        uniform_prompts = len(set(prompt_lens)) <= 1 and len(set(prompt_mel_lens)) <= 1
+        uniform_combined = len(set(combined_lens)) <= 1
+
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_token_embedding_lookahead"):
             # concat text and prompt_text
-            codec_token_len = token_len
-            token, total_token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + codec_token_len
+            total_token_len = prompt_token_len + token_len
+            if uniform_prompts:
+                token = torch.concat([prompt_token, token], dim=1)
+            else:
+                # Each row is prompt-then-generated and padded at the tail, so
+                # a row's own tokens start where its own reference ends.
+                token = torch.nn.utils.rnn.pad_sequence(
+                    [
+                        torch.concat([prompt_token[i, : prompt_lens[i]], token[i, : target_lens[i]]])
+                        for i in range(batch_size)
+                    ],
+                    batch_first=True,
+                )
             mask = (~make_pad_mask(total_token_len, max_len=token.shape[1])).unsqueeze(-1).to(embedding)
             token = self.input_embedding(torch.clamp(token, min=0)) * mask
             # text encode
             if finalize is True:
                 h = self.pre_lookahead_layer(token)
-            else:
+            elif uniform_combined:
                 h = self.pre_lookahead_layer(
                     token[:, : -self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len :]
                 )
+            else:
+                # Rows are left-aligned and padded to the longest, so
+                # ``token[:, -lookahead:]`` would feed a short row its padding
+                # as lookahead context instead of its own last tokens.
+                bodies = [max(length - lookahead, 0) for length in combined_lens]
+                max_body = max(bodies)
+                rows = []
+                for i, length in enumerate(combined_lens):
+                    row = self.pre_lookahead_layer(
+                        token[i : i + 1, : bodies[i]],
+                        context=token[i : i + 1, bodies[i] : length],
+                    )
+                    rows.append(F.pad(row, (0, 0, 0, max_body - int(row.shape[1]))))
+                h = torch.concat(rows, dim=0)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_repeat_to_mel_axis"):
-            h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+            h = h.repeat_interleave(ratio, dim=1)
 
-        batch_size = int(token.shape[0])
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cond_prompt_mel"):
-            mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+            mel_width = int(h.shape[1])
 
             # get conditions
-            conds = torch.zeros([batch_size, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-            conds[:, :mel_len1] = prompt_feat
+            conds = torch.zeros([batch_size, mel_width, self.output_size], device=token.device).to(h.dtype)
+            if uniform_prompts:
+                conds[:, : prompt_mel_lens[0]] = prompt_feat[:, : prompt_mel_lens[0]]
+            else:
+                for i, prompt_mel in enumerate(prompt_mel_lens):
+                    conds[i, :prompt_mel] = prompt_feat[i, :prompt_mel]
             conds = conds.transpose(1, 2)
 
-            lookahead = 0 if finalize else int(self.pre_lookahead_len)
             valid_h_lens = torch.clamp(total_token_len.to(torch.long) - lookahead, min=0)
-            mel_lens = torch.clamp(valid_h_lens * int(self.token_mel_ratio), max=mel_len1 + mel_len2)
-            mask = (~make_pad_mask(mel_lens, max_len=mel_len1 + mel_len2)).to(h)
+            mel_lens = torch.clamp(valid_h_lens * ratio, max=mel_width)
+            mask = (~make_pad_mask(mel_lens, max_len=mel_width)).to(h)
 
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
@@ -386,6 +467,18 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         )
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_crop_prompt_mel"):
-            feat = feat[:, :, mel_len1:]
-            assert feat.shape[2] == mel_len2
+            if uniform_prompts:
+                feat = feat[:, :, prompt_mel_lens[0] :]
+            else:
+                # Drop each row's own prompt region, keeping the rows
+                # left-aligned at their first generated frame.
+                widths = [mel_width - prompt_mel for prompt_mel in prompt_mel_lens]
+                max_width = max(widths)
+                feat = torch.concat(
+                    [
+                        F.pad(feat[i : i + 1, :, prompt_mel_lens[i] :], (0, max_width - widths[i]))
+                        for i in range(batch_size)
+                    ],
+                    dim=0,
+                )
         return feat.float(), None

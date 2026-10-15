@@ -164,14 +164,11 @@ The H200 default targets streaming throughput at C32/C64. It changes sampling fr
 
 Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path; use `--deploy-config cosyvoice3.yaml` alongside it when selecting that path on H200.
 
-Cross-request Stage-1 flow batching is enabled in the H200 profile. For the generic configuration, enable it in the server environment when concurrent requests should share a flow-estimator call:
+Cross-request Stage-1 flow batching is enabled in both the H200 profile and the generic `cosyvoice3.yaml` profile (`COSYVOICE3_BATCH_FLOW: "1"` in the Stage-1 `env`). Requests are grouped only by whether they are on their final chunk, so concurrent requests with different reference voices share one flow-estimator call; each row keeps its own reference length, lookahead context and crop point.
 
-```bash
-export COSYVOICE3_BATCH_FLOW=1
-vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
-```
+With TensorRT enabled, the first batched-flow startup builds and caches one dual-profile estimator engine. Profile 0 preserves the legacy single-request CFG batch 2 path up to the full 3000-frame estimator limit. Profile 1 covers cross-request CFG batches 4-16 up to 1024 estimator frames, which includes the generic Stage-1 default of `max_num_seqs: 8` while keeping TensorRT activation memory bounded. If a scheduled group is larger than eight requests or a cumulative flow window grows beyond 1024 frames, vLLM-Omni transparently serializes request pairs through profile 0 instead of falling back to Torch. The engine cache key includes the TensorRT/GPU, batch-profile version, and batched-frame limit, so the build cost is not paid on every launch. If the dual-profile engine cannot be built at all, vLLM-Omni keeps the Torch estimator rather than installing a partial TensorRT path.
 
-Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+Batching preserves output lengths and streaming cache alignment, but the different GEMM/TensorRT tactic shapes can produce small numerical differences compared with processing each request separately. When request-independent numerical behavior is required, copy `cosyvoice3.yaml`, set `COSYVOICE3_BATCH_FLOW: "0"` in its Stage-1 `env`, and pass the copy with `--deploy-config`; the stage `env` overrides a value exported in the server shell. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
 ### CLI client
 
