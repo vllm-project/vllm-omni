@@ -614,8 +614,9 @@ class ChatterboxS3Gen(S3GenDecoder):
 
     Raises:
         ValueError: If one step's token budget cannot hold every slot's
-            longest utterance.
-        KeyError: If the deploy file's connector lacks ``codec_left_context_frames``.
+            longest utterance, or the connector's largest chunk is smaller
+            than its first.
+        KeyError: If the deploy file's connector lacks a ``codec_*`` setting.
     """
 
     # Without this the runner discards OmniOutput.multimodal_outputs.
@@ -653,6 +654,12 @@ class ChatterboxS3Gen(S3GenDecoder):
         # The deploy file's connector settings; the chunk processor reads the
         # same section for its schedule.
         connector = vllm_config.model_config.stage_connector_config["extra"]
+        # The chunk processor grows the chunk from the first size to the largest.
+        if connector["codec_max_chunk_frames"] < connector["codec_chunk_frames"]:
+            raise ValueError(
+                f"codec_max_chunk_frames ({connector['codec_max_chunk_frames']}) must be at least "
+                f"codec_chunk_frames ({connector['codec_chunk_frames']})"
+            )
         # The flow noise is drawn from the stage's own seed.
         super().__init__(config, max_model_len, connector["codec_left_context_frames"], vllm_config.model_config.seed)
         # The repo holds other checkpoints too; this stage loads its own.

@@ -836,6 +836,16 @@ def test_the_stage_takes_its_left_context_from_the_deploy_files_connector(model_
         build_stage(stage_vllm_config(model_dir, deploy, 1), "cpu")
 
 
+def test_a_largest_chunk_below_the_first_is_refused_at_startup(model_dir: str) -> None:
+    """The schedule grows from codec_chunk_frames to codec_max_chunk_frames; a cap below the start is a typo."""
+    deploy = modify_stage_config(
+        get_deploy_config_path(DEPLOY["turbo"]),
+        updates={"connectors.connector_of_shared_memory.extra.codec_max_chunk_frames": 10},
+    )
+    with pytest.raises(ValueError, match="codec_max_chunk_frames"):
+        build_stage(stage_vllm_config(model_dir, deploy, 1), "cpu")
+
+
 def test_the_stage_seeds_its_flow_noise_with_its_own_seed(model_dir: str) -> None:
     """The flow noise is the draw of stage 1's vLLM ``seed``, as ``--stage-overrides`` gives it."""
     config = stage_vllm_config(model_dir, DEPLOY["turbo"], 1, seed=7)

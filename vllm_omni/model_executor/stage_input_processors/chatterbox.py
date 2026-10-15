@@ -115,7 +115,6 @@ def t3_to_s3gen_async_chunk(
 
     Raises:
         KeyError: If the deploy file's connector lacks one of the settings.
-        ValueError: If the settings' largest chunk is smaller than the first.
         RuntimeError: If the request has sampled more tokens than were taken
             and the snapshot no longer has them: the audio would be missing
             them with no other symptom.
@@ -130,8 +129,6 @@ def t3_to_s3gen_async_chunk(
 
     state = transfer_manager.request_payload.get(request_id)
     if state is None:
-        if largest < chunk:
-            raise ValueError(f"codec_max_chunk_frames ({largest}) must be at least codec_chunk_frames ({chunk})")
         reference = deserialize_additional_information(request.additional_information)["embed"]
         state = transfer_manager.request_payload[request_id] = {
             # Output tokens taken from the snapshot, control tokens included.
