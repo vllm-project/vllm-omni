@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.hardware import _safe_filename_token, hardware_json_value
 from tests.helpers.hardware import get_runtime_resource_label as get_runtime_resource_label
-from tests.helpers.hardware import hardware_json_value
 from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
@@ -407,16 +407,6 @@ def create_benchmark_indices(
 
 # Omni perf/stability: ``vllm bench serve --omni`` result template (used if bench exits without writing JSON).
 OMNI_RESULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "perf" / "scripts" / "result_omni_template.json"
-
-
-def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
-    """Make a single path segment safe for result filenames on common filesystems."""
-    if value is None:
-        return default
-    text = str(value).strip()
-    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
-        text = text.replace(bad, "_")
-    return text if text else default
 
 
 def _benchmark_param_id_suffix(param: dict[str, Any], *, idx: int) -> str:
