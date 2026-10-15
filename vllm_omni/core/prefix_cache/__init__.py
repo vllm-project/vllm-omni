@@ -33,6 +33,7 @@ from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
     check_prefix_cache_kv_transfer,
+    find_full_attention_group_index,
     get_prefix_cache_group_view,
     stage_prefix_cache_config,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "WriteSchedule",
     "check_prefix_cache_kv_groups",
     "check_prefix_cache_kv_transfer",
+    "find_full_attention_group_index",
     "get_prefix_cache_group_view",
     "stage_prefix_cache_config",
 ]

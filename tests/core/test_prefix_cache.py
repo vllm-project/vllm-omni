@@ -35,6 +35,18 @@ except ModuleNotFoundError:
     _vllm.logger = _vllm_logger
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
+    # Fake kv_cache_interface so group_view can isinstance-check FullAttentionSpec.
+    _vllm_v1 = __import__("types").ModuleType("vllm.v1")
+    _vllm_kv = __import__("types").ModuleType("vllm.v1.kv_cache_interface")
+
+    class _FakeFullAttentionSpec: ...
+
+    class _FakeSlidingWindowSpec: ...
+
+    _vllm_kv.FullAttentionSpec = _FakeFullAttentionSpec
+    _vllm_kv.SlidingWindowSpec = _FakeSlidingWindowSpec
+    sys.modules["vllm.v1"] = _vllm_v1
+    sys.modules["vllm.v1.kv_cache_interface"] = _vllm_kv
 
 from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheEventKind,
@@ -46,6 +58,8 @@ from vllm_omni.core.prefix_cache.controller import StagingBufferHolder, WriteTas
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
+    find_full_attention_group_index,
+    get_prefix_cache_group_view,
     stage_prefix_cache_config,
 )
 from vllm_omni.core.prefix_cache.interface import (
@@ -68,6 +82,26 @@ NUM_BLOCKS = 16
 BLOCK_SIZE = 4
 HIDDEN = 8
 DTYPE = torch.float32
+
+
+def _get_fake_full_attention_spec():
+    """Resolve FullAttentionSpec from real vllm or the test shim."""
+    try:
+        from vllm.v1.kv_cache_interface import FullAttentionSpec  # type: ignore[import-not-found]
+
+        return FullAttentionSpec
+    except ModuleNotFoundError:
+        return sys.modules["vllm.v1.kv_cache_interface"].FullAttentionSpec
+
+
+def _get_fake_sliding_window_spec():
+    """Resolve SlidingWindowSpec from real vllm or the test shim."""
+    try:
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec  # type: ignore[import-not-found]
+
+        return SlidingWindowSpec
+    except ModuleNotFoundError:
+        return sys.modules["vllm.v1.kv_cache_interface"].SlidingWindowSpec
 
 
 class FakeView:
@@ -792,11 +826,63 @@ def test_deferred_unpadded_registers_on_padded_step():
     assert torch.equal(outs.mm_outputs["codes.audio"]["a"], audio)
 
 
-def test_check_kv_groups_rejects_empty_or_multi():
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
-        check_prefix_cache_kv_groups([])
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
-        check_prefix_cache_kv_groups([object(), object()])
+def test_find_full_attention_group_index_locates_by_spec():
+    """Group selection scans by kv_cache_spec type, not by position."""
+    FullAttentionSpec = _get_fake_full_attention_spec()
+    SlidingWindowSpec = _get_fake_sliding_window_spec()
+
+    # Single group — still works (backward compat).
+    groups = [SimpleNamespace(kv_cache_spec=FullAttentionSpec())]
+    assert find_full_attention_group_index(groups) == 0
+    assert check_prefix_cache_kv_groups(groups) == 0
+
+    # Full-attention at position 1, sliding-window at 0.
+    groups = [SimpleNamespace(kv_cache_spec=SlidingWindowSpec()), SimpleNamespace(kv_cache_spec=FullAttentionSpec())]
+    assert find_full_attention_group_index(groups) == 1
+
+    # Full-attention at position 2.
+    groups = [
+        SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+        SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+        SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
+    ]
+    assert find_full_attention_group_index(groups) == 2
+
+
+def test_find_full_attention_group_index_rejects_zero_or_multi():
+    FullAttentionSpec = _get_fake_full_attention_spec()
+    SlidingWindowSpec = _get_fake_sliding_window_spec()
+
+    # No groups → no full-attention group found.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="exactly one full-attention"):
+        find_full_attention_group_index([])
+
+    # Groups exist but none are full attention.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="exactly one full-attention.*found none"):
+        find_full_attention_group_index(
+            [
+                SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+                SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+            ]
+        )
+
+    # Two full-attention groups is ambiguous.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="exactly one full-attention.*found 2"):
+        find_full_attention_group_index(
+            [
+                SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
+                SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
+            ]
+        )
+
+    # check_prefix_cache_kv_groups delegates and returns the index for new callers.
+    idx = check_prefix_cache_kv_groups(
+        [
+            SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+            SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
+        ]
+    )
+    assert idx == 1
 
 
 def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None):
@@ -826,9 +912,9 @@ def test_stage_prefix_cache_config_gate():
     with pytest.raises(OmniPrefixCacheUnmatchError, match="block-aligned"):
         _stage_cfg(match_unit=BLOCK_SIZE // 2, groups=())
     # A unit equal to the block is a whole-block match; only the group check is left.
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="exactly one full-attention.*found none"):
         _stage_cfg(match_unit=BLOCK_SIZE, groups=())
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="exactly one full-attention.*found none"):
         _stage_cfg(groups=(object(), object()))
 
 
@@ -2082,3 +2168,210 @@ def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
         assert torch.equal(result.hidden_states["b"], expected)
     finally:
         mgr.shutdown()
+
+
+# ============================================================================
+# Multi-KV-group support (RFC #7902 §7.2)
+# ============================================================================
+
+
+class _MultiGroupTensorWrap:
+    """Duck-typed TensorWrap for multi-group block table construction."""
+
+    def __init__(self, t: torch.Tensor):
+        self.cpu = t
+
+
+class _MultiGroupLayout:
+    """Block-table layout wrapper with all required vLLM attrs."""
+
+    def __init__(self, table: torch.Tensor, *, hybrid=False, blocks_per=1, dcp=1, kv_bs=None):
+        self.block_table = _MultiGroupTensorWrap(table)
+        self.use_hybrid_blocks = hybrid
+        self.blocks_per_kv_block = blocks_per
+        self.dcp_world_size = dcp
+        self.kv_cache_block_size = kv_bs if kv_bs is not None else BLOCK_SIZE
+
+
+class _MultiGroupBT:
+    """InputBatch.block_table for N groups, each with its own table."""
+
+    def __init__(self, *tables: torch.Tensor):
+        self._layouts = [_MultiGroupLayout(t) for t in tables]
+        self.block_tables = [layout.block_table for layout in self._layouts]
+        # Forwards layout attrs from group 0 — only checked when iterating
+        # self._layouts via __getitem__
+        self.kv_cache_block_size = BLOCK_SIZE
+        self.blocks_per_kv_block = 1
+        self.use_hybrid_blocks = False
+        self.dcp_world_size = 1
+
+    def __getitem__(self, idx: int) -> _MultiGroupLayout:
+        return self._layouts[idx]
+
+
+class _MultiGroupIB:
+    """InputBatch fake backed by a multi-group block table."""
+
+    def __init__(self, tables: list[torch.Tensor], computed: list[int] | None = None):
+        self.req_ids = ["r1", "r2"]
+        self.req_id_to_index = {"r1": 0, "r2": 1}
+        self.num_computed_tokens_cpu = torch.tensor(computed if computed is not None else [0, 0])
+        self.block_table = _MultiGroupBT(*tables)
+
+
+def test_full_attention_group_view_reads_correct_group_block_table():
+    """group_index parameter disambiguates multi-group KV caches."""
+    table_g0 = torch.tensor([[10, 20, 30], [15, 25, 35]], dtype=torch.int32)
+    table_g1 = torch.tensor([[40, 50, 60], [45, 55, 65]], dtype=torch.int32)
+    table_g2 = torch.tensor([[70, 80, 90], [75, 85, 95]], dtype=torch.int32)
+
+    ib = _MultiGroupIB([table_g0, table_g1, table_g2])
+
+    # Default (backward compat): group 0.
+    v0 = FullAttentionGroupView(ib, block_size=BLOCK_SIZE)
+    assert v0.group_index == 0
+    assert torch.equal(v0._block_table_cpu(), table_g0)
+
+    # Explicit group indices.
+    v1 = FullAttentionGroupView(ib, block_size=BLOCK_SIZE, group_index=1)
+    assert v1.group_index == 1
+    assert torch.equal(v1._block_table_cpu(), table_g1)
+
+    v2 = FullAttentionGroupView(ib, block_size=BLOCK_SIZE, group_index=2)
+    assert v2.group_index == 2
+    assert torch.equal(v2._block_table_cpu(), table_g2)
+
+
+def test_step_slots_cpu_differs_per_group():
+    """Different groups produce different slot mappings."""
+    table_g0 = torch.tensor([[10, 20, 30]], dtype=torch.int32)
+    table_g1 = torch.tensor([[40, 50, 60]], dtype=torch.int32)
+    ib = _MultiGroupIB([table_g0, table_g1], computed=[0])
+
+    v0 = FullAttentionGroupView(ib, block_size=BLOCK_SIZE, group_index=0)
+    v1 = FullAttentionGroupView(ib, block_size=BLOCK_SIZE, group_index=1)
+
+    s0 = v0.step_slots_cpu(["r1"], {"r1": 6})
+    s1 = v1.step_slots_cpu(["r1"], {"r1": 6})
+    # Different block tables → different slot values.
+    assert not torch.equal(s0, s1)
+    assert s0.numel() == 6
+    assert s1.numel() == 6
+
+
+def test_get_prefix_cache_group_view_resolves_multi_group_config():
+    """FullAttentionSpec detection by index, not position."""
+    FullAttentionSpec = _get_fake_full_attention_spec()
+    SlidingWindowSpec = _get_fake_sliding_window_spec()
+
+    table_g0 = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+    table_g1 = torch.tensor([[4, 5, 6]], dtype=torch.int32)
+    ib = _MultiGroupIB([table_g0, table_g1])
+
+    # Full-attention at index 1, sliding-window at index 0.
+    groups = [SimpleNamespace(kv_cache_spec=SlidingWindowSpec()), SimpleNamespace(kv_cache_spec=FullAttentionSpec())]
+    view = get_prefix_cache_group_view(ib, BLOCK_SIZE, kv_cache_groups=groups)
+    assert view is not None
+    assert view.group_index == 1
+    assert torch.equal(view._block_table_cpu(), table_g1)
+
+    # Full-attention at index 0 (single group, backward compat).
+    groups_single = [SimpleNamespace(kv_cache_spec=FullAttentionSpec())]
+    view_single = get_prefix_cache_group_view(ib, BLOCK_SIZE, kv_cache_groups=groups_single)
+    assert view_single is not None
+    assert view_single.group_index == 0
+    assert torch.equal(view_single._block_table_cpu(), table_g0)
+
+
+def test_multi_group_layout_validation_hits_correct_group():
+    """check_prefix_cache_block_layout validates the selected group, not 0."""
+    table_g0 = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+    table_g1 = torch.tensor([[4, 5, 6]], dtype=torch.int32)
+
+    # Build a multi-group BT where group 0 has a bad layout and group 1 is fine.
+    bad_layout = _MultiGroupLayout(table_g0, hybrid=True, blocks_per=2)
+    good_layout = _MultiGroupLayout(table_g1)
+
+    class _BT(_MultiGroupBT):
+        pass
+
+    bt = _MultiGroupBT.__new__(_BT)
+    bt._layouts = [bad_layout, good_layout]
+    bt.block_tables = [bad_layout.block_table, good_layout.block_table]
+    bt.kv_cache_block_size = BLOCK_SIZE
+    bt.blocks_per_kv_block = 1
+    bt.use_hybrid_blocks = False
+    bt.dcp_world_size = 1
+
+    ib = _MultiGroupIB.__new__(_MultiGroupIB)
+    ib.req_ids = ["r1"]
+    ib.req_id_to_index = {"r1": 0}
+    ib.num_computed_tokens_cpu = torch.tensor([0])
+    ib.block_table = bt
+
+    # group_index=0 → hybrid blocks → rejected.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="kernel_block_size"):
+        FullAttentionGroupView(ib, BLOCK_SIZE, group_index=0)
+
+    # group_index=1 → good layout → accepted.
+    v = FullAttentionGroupView(ib, BLOCK_SIZE, group_index=1)
+    assert v.group_index == 1
+
+
+def test_multi_group_backward_compat_single_group_still_works():
+    """Single FullAttentionSpec group behaves exactly as before."""
+    table = torch.tensor([[7, 8, 9], [1, 2, 3]], dtype=torch.int32)
+    ib = _MultiGroupIB([table], computed=[4, 0])
+    v = FullAttentionGroupView(ib, BLOCK_SIZE)
+
+    # Backward compat: default group_index=0.
+    assert v.group_index == 0
+    s = v.step_slots_cpu(["r1", "r2"], {"r1": 4, "r2": 8})
+    want_r1 = _table_slots(table, 0, 4, 8)
+    want_r2 = _table_slots(table, 1, 0, 8)
+    assert torch.equal(s, torch.cat([want_r1, want_r2]))
+
+
+def test_multi_group_find_index_all_positions():
+    """Full-attention group at any valid position is found correctly."""
+    FullAttentionSpec = _get_fake_full_attention_spec()
+    SlidingWindowSpec = _get_fake_sliding_window_spec()
+
+    # 3 groups, full-attention at each position.
+    for pos in range(3):
+        groups = [
+            SimpleNamespace(kv_cache_spec=(FullAttentionSpec() if i == pos else SlidingWindowSpec())) for i in range(3)
+        ]
+        assert find_full_attention_group_index(groups) == pos
+
+    # 5 groups, full-attention at position 4.
+    groups = [SimpleNamespace(kv_cache_spec=SlidingWindowSpec()) for _ in range(4)]
+    groups.append(SimpleNamespace(kv_cache_spec=FullAttentionSpec()))
+    assert find_full_attention_group_index(groups) == 4
+
+
+@pytest.mark.parametrize(
+    ("groups", "match"),
+    [
+        ([], "found none"),
+        ([SimpleNamespace()], "found none"),
+        (
+            [
+                SimpleNamespace(kv_cache_spec=_get_fake_full_attention_spec()()),
+                SimpleNamespace(kv_cache_spec=_get_fake_full_attention_spec()()),
+            ],
+            "found 2",
+        ),
+        (
+            [
+                SimpleNamespace(kv_cache_spec=_get_fake_sliding_window_spec()()),
+                SimpleNamespace(kv_cache_spec=_get_fake_sliding_window_spec()()),
+            ],
+            "found none",
+        ),
+    ],
+)
+def test_find_full_attention_group_index_rejects_all_invalid_configs(groups, match):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match=match):
+        find_full_attention_group_index(groups)
