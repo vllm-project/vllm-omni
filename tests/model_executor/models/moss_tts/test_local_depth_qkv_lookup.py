@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from transformers import GPT2Config
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import MossTTSLocalDepthTransformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
@@ -26,7 +26,8 @@ def _npu_available() -> bool:
 npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
 
 
-npu_device = pytest.param("npu", marks=npu_only)
+npu_device = pytest.param("npu", marks=[npu_only, *hardware_marks(res={"npu": "A3"}, num_cards=1)])
+
 
 @pytest.fixture(
     params=[pytest.param("cpu", marks=pytest.mark.cpu), npu_device],

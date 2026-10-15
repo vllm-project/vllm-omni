@@ -662,6 +662,23 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "enforce_eager": True,
             },
         ],
+        # ``platforms.npu.stages[1]`` from the base deploy YAML contributes
+        # ``compilation_config.cudagraph_mode: PIECEWISE`` outside the top-level
+        # ``stages`` merge. Disable it explicitly so the CI profile does not
+        # depend on ``enforce_eager`` vs ``cudagraph_mode`` precedence.
+        "platforms": {
+            "npu": {
+                "stages": [
+                    {
+                        "stage_id": 1,
+                        "compilation_config": {
+                            "cudagraph_mode": "NONE",
+                            "cudagraph_capture_sizes": [],
+                        },
+                    },
+                ],
+            },
+        },
     },
 }
 
