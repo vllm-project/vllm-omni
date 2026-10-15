@@ -21,19 +21,23 @@ if TYPE_CHECKING:
 
 
 class FullAttentionGroupView:
-    """View over the first (full-attention) KV-cache group.
+    """View over one (full-attention) KV-cache group chosen by spec.
 
     Step slots come from the CPU block table (`step_slots_cpu`), not the
-    device slot_mapping.
+    device slot_mapping. ``group_index`` selects which group's block table
+    to read; callers should resolve it via
+    :func:`find_full_attention_group_index` so multi-group models with a
+    sliding-window group do not silently read the wrong group.
     """
 
-    def __init__(self, input_batch: InputBatch, block_size: int):
+    def __init__(self, input_batch: InputBatch, block_size: int, group_index: int = 0):
         self._input_batch = input_batch
         self.block_size = block_size
-        check_prefix_cache_block_layout(input_batch.block_table[0], block_size)
+        self.group_index = group_index
+        check_prefix_cache_block_layout(input_batch.block_table[group_index], block_size)
 
     def _block_table_cpu(self) -> torch.Tensor:
-        return self._input_batch.block_table[0].block_table.cpu
+        return self._input_batch.block_table[self.group_index].block_table.cpu
 
     def batch_req_ids(self) -> list[str]:
         return list(self._input_batch.req_ids)
@@ -95,26 +99,50 @@ def check_prefix_cache_block_layout(block_table: object, block_size: int) -> Non
         )
 
 
-def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
-    """Reject hybrid / multi-group models at kv-cache init, not first step.
+def find_full_attention_group_index(kv_cache_groups: object) -> int:
+    """Locate the single full-attention group among ``kv_cache_groups``.
 
-    Only needs ``kv_cache_config.kv_cache_groups``. ``FullAttentionSpec``
-    is imported here so ``tests/core`` can load this module without vllm.
+    Multi-group models pair a full-attention group with one or more
+    sliding-window or Mamba groups; only the full-attention group carries
+    the complete KV range the prefix cache needs. This function returns
+    its index.
+
+    Raises :class:`OmniPrefixCacheUnmatchError` when no group is full
+    attention or when more than one is — the cache needs exactly one.
+    ``FullAttentionSpec`` is imported lazily so ``tests/core`` can load
+    this module without a vllm install.
     """
-    groups = list(kv_cache_groups or ())
-    if len(groups) != 1:
-        raise OmniPrefixCacheUnmatchError(
-            "omni prefix caching requires a single full-attention kv-cache group; "
-            f"found {len(groups)}. disable enable_prefix_caching for this model"
-        )
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-    spec = getattr(groups[0], "kv_cache_spec", None)
-    if not isinstance(spec, FullAttentionSpec):
+    groups = list(kv_cache_groups or ())
+    full_attn_indices = [
+        i for i, g in enumerate(groups)
+        if isinstance(getattr(g, "kv_cache_spec", None), FullAttentionSpec)
+    ]
+    if len(full_attn_indices) == 0:
         raise OmniPrefixCacheUnmatchError(
-            "omni prefix caching requires a single full-attention kv-cache group; "
-            f"found {type(spec).__name__}. disable enable_prefix_caching for this model"
+            "omni prefix caching requires exactly one full-attention kv-cache group; "
+            "found none. disable enable_prefix_caching for this model"
         )
+    if len(full_attn_indices) > 1:
+        raise OmniPrefixCacheUnmatchError(
+            "omni prefix caching requires exactly one full-attention kv-cache group; "
+            f"found {len(full_attn_indices)} at positions {full_attn_indices}. "
+            "disable enable_prefix_caching for this model"
+        )
+    return full_attn_indices[0]
+
+
+def check_prefix_cache_kv_groups(kv_cache_groups: object) -> int:
+    """Validate kv-cache groups and return the full-attention group index.
+
+    Backward-compatible: the return value was previously ``None`` and callers
+    that ignore it keep working. New callers (notably
+    :func:`get_prefix_cache_group_view`) consume the index so multi-group
+    configs resolve the correct block table instead of silently reading
+    group 0.
+    """
+    return find_full_attention_group_index(kv_cache_groups)
 
 
 def check_prefix_cache_kv_transfer(kv_transfer_config: object) -> None:
@@ -199,10 +227,12 @@ def get_prefix_cache_group_view(
     Group spec is checked first (raises). Selection is by spec, not by
     counting block tables: a hybrid model's group 0 is not necessarily
     full attention, and a narrower per-group table would make
-    step_slots_cpu silently clamp.
+    step_slots_cpu silently clamp. The returned index from
+    :func:`check_prefix_cache_kv_groups` is passed through so multi-group
+    models pick their full-attention group instead of always reading 0.
     """
-    check_prefix_cache_kv_groups(kv_cache_groups)
+    group_index = check_prefix_cache_kv_groups(kv_cache_groups)
     block_tables = getattr(input_batch.block_table, "block_tables", None)
     if not block_tables:
         return None
-    return FullAttentionGroupView(input_batch, block_size)
+    return FullAttentionGroupView(input_batch, block_size, group_index=group_index)
