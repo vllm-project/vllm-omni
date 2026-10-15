@@ -950,19 +950,48 @@ class FragmentedMP4VideoEncoder:
         self._video_codec_options = video_codec_options
         self._muxer: Any | None = None
 
-    def encode(self, video: Any) -> bytes:
-        """Encode one generated video chunk and return newly emitted fMP4 bytes."""
+    def encode(
+        self,
+        video: Any,
+        audio: Any | None = None,
+        *,
+        audio_sample_rate: int | None = None,
+    ) -> bytes:
+        """Encode one generated video chunk (plus its audio, if any) and return newly emitted fMP4 bytes.
+
+        The audio track is created with the first chunk that carries audio and
+        must then be present on every later chunk; the chunk's samples are
+        appended after its frames so both timelines advance together.
+        """
         from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer
 
-        frames_u8 = _coerce_video_to_uint8_frames(video)
+        frames_u8 = _coerce_video_to_uint8_frames(video) if _has_frames(video) else None
+        audio_np = _coerce_audio_to_numpy(audio) if audio is not None and _has_samples(audio) else None
         if self._muxer is None:
+            if frames_u8 is None:
+                return b""
+            muxer_kwargs: dict[str, Any] = {}
+            if audio_np is not None:
+                audio_channels = int(min(audio_np.shape)) if audio_np.ndim == 2 else 1
+                muxer_kwargs = {
+                    "audio_sample_rate": audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
+                    "audio_channels": 1 if audio_channels == 1 else 2,
+                }
             self._muxer = FragmentedMP4Muxer(
                 width=frames_u8.shape[2],
                 height=frames_u8.shape[1],
                 fps=self._fps,
                 video_codec_options=self._video_codec_options,
+                **muxer_kwargs,
             )
-        return self._muxer.mux_video_frames(frames_u8)
+        chunk = b""
+        if frames_u8 is not None:
+            chunk += self._muxer.mux_video_frames(frames_u8)
+        if audio_np is not None:
+            if not self._muxer.has_audio:
+                raise ValueError("Audio arrived after the fMP4 header was written without an audio track.")
+            chunk += self._muxer.mux_audio_samples(audio_np)
+        return chunk
 
     def close(self) -> bytes:
         """Close the underlying fMP4 muxer and return trailing bytes, if any."""
@@ -972,6 +1001,22 @@ class FragmentedMP4VideoEncoder:
 
 
 StreamingVideoFormat = Literal["m4s"]
+
+
+def _has_frames(video: Any) -> bool:
+    if isinstance(video, (np.ndarray, torch.Tensor)):
+        return video.ndim >= 1 and int(video.shape[0]) > 0
+    if isinstance(video, list):
+        return len(video) > 0
+    return video is not None
+
+
+def _has_samples(audio: Any) -> bool:
+    if isinstance(audio, (np.ndarray, torch.Tensor)):
+        return audio.ndim >= 1 and int(np.prod(audio.shape)) > 0
+    if isinstance(audio, list):
+        return len(audio) > 0
+    return audio is not None
 
 
 def create_streaming_video_encoder(

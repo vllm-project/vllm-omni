@@ -513,19 +513,22 @@ class OmniStreamingVideoOutputHandler:
                 if result.error:
                     raise RuntimeError(str(result.error))
                 videos = self._extract_video_outputs(result)
-                for video in videos:
-                    chunk = encoder.encode(video)
+                audio, audio_sample_rate = self._extract_audio_output(result)
+                for index, video in enumerate(videos):
+                    chunk_audio = audio if index == 0 else None
+                    chunk = encoder.encode(video, chunk_audio, audio_sample_rate=audio_sample_rate)
                     if chunk:
-                        yield (
-                            chunk,
-                            self._build_chunk_metadata(
-                                request_id=request_id,
-                                kind="media",
-                                byte_length=len(chunk),
-                                num_frames=self._num_video_frames(video),
-                                stream_metadata=self._extract_stream_metadata(result),
-                            ),
+                        metadata = self._build_chunk_metadata(
+                            request_id=request_id,
+                            kind="media",
+                            byte_length=len(chunk),
+                            num_frames=self._num_video_frames(video),
+                            stream_metadata=self._extract_stream_metadata(result),
                         )
+                        if chunk_audio is not None:
+                            metadata["num_audio_samples"] = self._num_audio_samples(chunk_audio)
+                            metadata["audio_sample_rate"] = audio_sample_rate
+                        yield (chunk, metadata)
 
             completed = True
             final_chunk = encoder.close()
@@ -728,6 +731,37 @@ class OmniStreamingVideoOutputHandler:
                 detail="No video outputs found in generation result.",
             )
         return normalized
+
+    @staticmethod
+    def _extract_audio_output(result: OmniRequestOutput) -> tuple[Any | None, int | None]:
+        """Return the chunk's audio payload and sample rate, if the model streams audio."""
+        multimodal_output = result.multimodal_output
+        if not isinstance(multimodal_output, dict):
+            return None, None
+        audio = multimodal_output.get("audio")
+        if audio is None:
+            return None, None
+        if isinstance(audio, list) and len(audio) == 1 and isinstance(audio[0], (np.ndarray, torch.Tensor)):
+            audio = audio[0]
+        metadata = multimodal_output.get("metadata")
+        sample_rate = None
+        if isinstance(metadata, dict):
+            audio_metadata = metadata.get("audio")
+            if isinstance(audio_metadata, dict) and isinstance(audio_metadata.get("sample_rate"), int):
+                sample_rate = int(audio_metadata["sample_rate"])
+        return audio, sample_rate
+
+    @staticmethod
+    def _num_audio_samples(audio: Any) -> int:
+        if isinstance(audio, (np.ndarray, torch.Tensor)):
+            if audio.ndim == 0:
+                return 0
+            if audio.ndim == 1:
+                return int(audio.shape[0])
+            return int(max(audio.shape[0], audio.shape[-1]))
+        if isinstance(audio, list):
+            return len(audio)
+        return 0
 
     @staticmethod
     def _extract_stream_metadata(result: OmniRequestOutput) -> dict[str, Any]:
