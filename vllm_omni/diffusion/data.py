@@ -297,9 +297,9 @@ class DiffusionParallelConfig:
         expected_sp_size = (
             self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
         )
-        assert (
-            self.sequence_parallel_size == expected_sp_size
-        ), f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
+        assert self.sequence_parallel_size == expected_sp_size, (
+            f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
+        )
         assert self.ulysses_mode in {
             "strict",
             "advanced_uaa",
