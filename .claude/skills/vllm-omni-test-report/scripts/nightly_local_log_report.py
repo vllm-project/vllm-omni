@@ -3151,7 +3151,10 @@ def _summary_row_for_job(job_name: str, paths: list[Path], info: dict[str, Any])
             skip = str(counts["skipped"]) if counts["skipped"] else "?"
             errc = str(ec)
 
-    dur = extract_pytest_duration_display(info.get("summary"))
+    # Manifest-backed jobs (no .log) carry the manifest duration (e.g. "24h 11m 6s")
+    # in ``elapsed_display``; prefer it over the pytest footer regex, which only
+    # understands ``in 123.4s`` seconds form and cannot parse manifest durations.
+    dur = info.get("elapsed_display") or extract_pytest_duration_display(info.get("summary"))
     dur_cell = _md_cell(dur) if dur else "—"
     return [
         _md_cell(job_name),
