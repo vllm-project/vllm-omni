@@ -230,9 +230,37 @@ def test_prepare_batch_encodes_every_reference_together_and_keeps_order(
     assert conditioner.prepare_batch([]) == []
 
 
+def test_a_refused_reference_leaves_the_rest_of_its_batch(conditioners: dict[str, VoiceConditioner]) -> None:
+    """A clip Turbo refuses gets its error in its place; the others are encoded in one batch."""
+    conditioner = conditioners["turbo"]
+    rng = np.random.default_rng(5)
+    good = [((0.05 * rng.standard_normal(6 * 24000 + 960 * index)).astype(np.float32), 24000) for index in range(2)]
+    short = (np.zeros(24000, dtype=np.float32), 24000)
+    calls, hook = tokenizer_calls(conditioner)
+    try:
+        first, refused, last = conditioner.prepare_batch([good[0], short, good[1]])
+    finally:
+        hook.remove()
+
+    assert isinstance(refused, ValueError) and "longer than 5 s" in str(refused)
+    assert calls == [2, 2]
+    assert torch.equal(first.prompt_token, conditioner.prepare(*good[0]).prompt_token)
+    assert torch.equal(last.prompt_token, conditioner.prepare(*good[1]).prompt_token)
+    with pytest.raises(ValueError, match="longer than 5 s"):
+        conditioner.prepare(*short)
+
+
 def test_original_prompt_rejects_text_beyond_learned_positions():
     with pytest.raises(ValueError, match="2048 text tokens"):
         build_prompt([5] * 2049, conditioning(10, 125), ChatterboxConfig("original"))
+
+
+@pytest.mark.parametrize("control", ["exaggeration", "cfg_weight"])
+@pytest.mark.parametrize("value", [-1, float("inf"), float("nan"), "0.5"])
+def test_original_prompt_rejects_invalid_guidance_controls(control: str, value: object) -> None:
+    """The serving adapter passes a request's ``extra_params`` through unchecked; this is their one check."""
+    with pytest.raises(ValueError, match=f"{control} must be a finite nonnegative number"):
+        build_prompt([5], conditioning(10, 125), ChatterboxConfig("original"), **{control: value})
 
 
 def test_original_text_helper_loads_local_tokenizer_and_normalizes_spaces(tmp_path):

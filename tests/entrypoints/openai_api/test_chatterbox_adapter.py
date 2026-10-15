@@ -270,13 +270,6 @@ def test_request_token_cap_does_not_mutate_deploy_defaults(adapter):
     assert defaults[0].max_tokens == 1000
 
 
-@pytest.mark.parametrize("value", [-1, float("inf"), "0.5"])
-def test_original_rejects_invalid_guidance_controls(adapter, value):
-    original = ChatterboxOriginalAdapter(adapter.ctx)
-    request = OpenAICreateSpeechRequest(input="Hello.", extra_params={"cfg_weight": value})
-    assert "finite nonnegative" in original.validate(request)
-
-
 def test_original_owns_its_stage_and_controls(adapter):
     assert detect_tts_model_type("chatterbox_original_t3", None) == "chatterbox_original"
     original = ChatterboxOriginalAdapter(adapter.ctx)

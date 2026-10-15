@@ -3,7 +3,6 @@
 """Chatterbox speech serving with the built-in voice or a reference recording."""
 
 import asyncio
-import math
 from threading import Lock
 
 import numpy as np
@@ -22,7 +21,6 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     resolve_stage_model_path,
 )
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
-    RESAMPLE_POOL,
     VoiceConditioner,
     VoiceConditioning,
     build_prompt,
@@ -88,7 +86,7 @@ class ChatterboxAdapter(ARTTSAdapter):
         while not self.conditioning_queue.empty():
             self.conditioning_queue.get_nowait()
 
-    def prepare_voices(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning | Exception]:
+    def prepare_voices(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning | ValueError]:
         """Run one encoder batch on the server-owned executor."""
         model = resolve_stage_model_path(self.ctx.engine_client)
         if model is None:
@@ -97,27 +95,7 @@ class ChatterboxAdapter(ARTTSAdapter):
             if self.conditioner is None:
                 self.conditioner = VoiceConditioner(model, self.config, self.conditioning_device)
             conditioner = self.conditioner
-        results: dict[int, VoiceConditioning | Exception] = {}
-        samples = []
-        indices = []
-
-        def resample(reference: tuple[np.ndarray, int]) -> tuple[np.ndarray, np.ndarray] | ValueError:
-            try:
-                return conditioner.resample(*reference)
-            except ValueError as error:
-                return error
-
-        resampled = list(RESAMPLE_POOL.map(resample, references))
-        for index, clip in enumerate(resampled):
-            if isinstance(clip, ValueError):
-                results[index] = clip
-            else:
-                samples.append(clip)
-                indices.append(index)
-        if samples:
-            for index, voice in zip(indices, self.conditioner.from_resampled_batch(samples), strict=True):
-                results[index] = voice
-        return [results[index] for index in range(len(references))]
+        return conditioner.prepare_batch(references)
 
     async def drain_conditioning(self) -> None:
         """Own encoder execution; every queued reference goes through the encoders together."""
@@ -281,11 +259,4 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
         error = super().validate(request)
         if error:
             return error.replace("Chatterbox Turbo", "Chatterbox Original")
-        for name, default in (
-            ("exaggeration", ORIGINAL_DEFAULT_EXAGGERATION),
-            ("cfg_weight", ORIGINAL_DEFAULT_CFG_WEIGHT),
-        ):
-            value = (request.extra_params or {}).get(name, default)
-            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-                return f"{name} must be a finite nonnegative number"
         return None

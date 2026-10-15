@@ -301,19 +301,31 @@ class VoiceConditioner:
 
         Raises:
             ValueError: If ``wav`` is not one-dimensional, or the clip is not
-                longer than five seconds, the bound upstream asserts.
+                longer than the checkpoint's minimum, see ``resample``.
         """
-        return self.prepare_batch([(wav, sample_rate)])[0]
+        (voice,) = self.prepare_batch([(wav, sample_rate)])
+        if isinstance(voice, ValueError):
+            raise voice
+        return voice
 
-    def prepare_batch(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning]:
+    def prepare_batch(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning | ValueError]:
         """Encode every reference together, preserving input order.
 
         The references are resampled concurrently on the CPU, then encoded
         as one batch: the caller's admission bound, not this method, decides
-        how many fit the device.
+        how many fit the device. A reference ``resample`` refuses gets its
+        error in its place and leaves the others' batch.
         """
-        clips = list(RESAMPLE_POOL.map(lambda reference: self.resample(*reference), references))
-        return self.from_resampled_batch(clips)
+
+        def resample(reference: tuple[np.ndarray, int]) -> tuple[np.ndarray, np.ndarray] | ValueError:
+            try:
+                return self.resample(*reference)
+            except ValueError as error:
+                return error
+
+        clips = list(RESAMPLE_POOL.map(resample, references))
+        voices = iter(self.from_resampled_batch([clip for clip in clips if not isinstance(clip, ValueError)]))
+        return [clip if isinstance(clip, ValueError) else next(voices) for clip in clips]
 
     def resample(self, wav: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
         """Validate, normalize and resample one reference at both model rates."""
@@ -450,7 +462,7 @@ def build_prompt(
         if len(text_ids) > ORIGINAL_MAX_TEXT_TOKENS:
             raise ValueError(f"Chatterbox Original supports at most {ORIGINAL_MAX_TEXT_TOKENS} text tokens")
         for name, value in (("exaggeration", exaggeration), ("cfg_weight", cfg_weight)):
-            if not math.isfinite(value) or value < 0:
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be a finite nonnegative number")
     length = (
         len(text_ids) + ORIGINAL_PROMPT_EXTRA_ROWS
