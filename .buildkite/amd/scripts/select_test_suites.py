@@ -13,6 +13,14 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Iterable
+from pathlib import Path
+
+_COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "common" / "scripts"
+if str(_COMMON_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_COMMON_SCRIPTS))
+
+from ci_conditions import is_release_line_branch  # noqa: E402, I001
+
 
 SUITE_SPECS = {
     "ready": "READY_TESTS:test-amd-ready.yml",
@@ -47,7 +55,7 @@ def select_amd_test_suites(
 
     if debug_test_yaml:
         return _parse_debug_suites(debug_test_yaml)
-    if branch == "main":
+    if is_release_line_branch(branch):
         return ("nightly",) if nightly else ("merge",)
 
     label_set = {label.strip() for label in labels if label.strip()}
@@ -85,7 +93,11 @@ def main() -> int:
         parser.error(str(exc))
 
     label_set = {label.strip() for label in labels if label.strip()}
-    if args.branch != "main" and not args.debug_test_yaml and not ({"ready", "merge-test", "nightly-test"} & label_set):
+    if (
+        not is_release_line_branch(args.branch)
+        and not args.debug_test_yaml
+        and not ({"ready", "merge-test", "nightly-test"} & label_set)
+    ):
         print(
             "No AMD ready/merge/nightly label found; preserving the legacy ready-suite fallback.",
             file=sys.stderr,

@@ -25,9 +25,12 @@ def _run_bootstrap(
     jq_status: int = 0,
     labels: tuple[str, ...] = (),
     pull_request: bool = True,
+    branch: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     for relative_path in (
+        ".buildkite/common/scripts/ci_conditions.py",
         ".buildkite/common/scripts/resolve_skip_ci.sh",
+        ".buildkite/common/scripts/release_line_branch.sh",
         ".buildkite/amd/scripts/select_test_suites.py",
     ):
         destination = tmp_path / relative_path
@@ -39,11 +42,12 @@ def _run_bootstrap(
     env = {
         "PATH": os.environ["PATH"],
         "BUILDKITE_PULL_REQUEST": "123" if pull_request else "false",
-        "BUILDKITE_BRANCH": "feature" if pull_request else "main",
+        "BUILDKITE_BRANCH": branch if branch is not None else ("feature" if pull_request else "main"),
         "TEST_PYTHON": sys.executable,
         "TEST_CURL_STATUS": str(curl_status),
         "TEST_JQ_STATUS": str(jq_status),
         "TEST_PR_LABELS": "\n".join(labels),
+        "TEST_GIT_LOG": str(tmp_path / "git-calls.txt"),
     }
     if debug_test_yaml is not None:
         env["DEBUG_TEST_YAML"] = debug_test_yaml
@@ -59,7 +63,9 @@ jq() {
     printf '%s\n' "$TEST_PR_LABELS"
     return "$TEST_JQ_STATUS"
 }
-git() { :; }
+git() {
+    printf '%s\n' "$*" >> "$TEST_GIT_LOG"
+}
 python3() { "$TEST_PYTHON" "$@"; }
 source "$1"
 """
@@ -149,6 +155,39 @@ def test_invalid_debug_override_fails_without_label_lookup(tmp_path, debug_test_
 
 def test_main_does_not_lookup_labels(tmp_path):
     result = _run_bootstrap(tmp_path, pull_request=False, curl_status=22, jq_status=4)
+
+    assert result.returncode == 0, result.stderr
+    assert "curl called" not in result.stderr
+    assert "jq called" not in result.stderr
+    assert "Skipping AMD l3 suite" in result.stdout
+
+
+def _git_calls(tmp_path: Path) -> list[str]:
+    return (tmp_path / "git-calls.txt").read_text(encoding="utf-8").splitlines()
+
+
+def test_version_branch_reads_parent_from_commit_header(tmp_path):
+    result = _run_bootstrap(tmp_path, pull_request=False, branch="0.30.0")
+
+    assert result.returncode == 0, result.stderr
+    assert "cat-file -p HEAD" in _git_calls(tmp_path)
+
+
+def test_feature_branch_trusted_commit_uses_merge_base(tmp_path):
+    result = _run_bootstrap(tmp_path, pull_request=True, branch="feature")
+
+    assert result.returncode == 0, result.stderr
+    assert "cat-file -p HEAD" not in _git_calls(tmp_path)
+
+
+def test_version_branch_does_not_lookup_labels(tmp_path):
+    result = _run_bootstrap(
+        tmp_path,
+        pull_request=False,
+        branch="0.30.0",
+        curl_status=22,
+        jq_status=4,
+    )
 
     assert result.returncode == 0, result.stderr
     assert "curl called" not in result.stderr
