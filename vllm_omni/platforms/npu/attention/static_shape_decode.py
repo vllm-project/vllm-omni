@@ -130,7 +130,7 @@ def _log_declined_once(capacity: int) -> None:
     _declined_logged.add(key)
     logger.info(
         "[minicpmo] static-shape: no captured graph for (num_tokens=%s, capacity=%s); "
-        "the stock decode path handles this shape",
+        "falling back to the eager runnable",
         key[0],
         capacity,
     )
@@ -520,7 +520,7 @@ def sync_captured_inputs(num_tokens: int, seq_lens_device: torch.Tensor, block_t
 
 
 def reset() -> None:
-    global _capture_bucket, _runtime_bucket
+    global _capture_bucket, _runtime_bucket, _warned_moved_inputs
     _graph_scratch.clear()
     _workspace_cache.clear()
     _captured_inputs.clear()
@@ -530,3 +530,5 @@ def reset() -> None:
     _scalar_cache.clear()
     _capture_bucket = None
     _runtime_bucket = None
+    _declined_logged.clear()
+    _warned_moved_inputs = False
