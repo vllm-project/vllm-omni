@@ -441,12 +441,14 @@ def build_prompt(
 
     Raises:
         ValueError: For Original, if the text is longer than its position
-            table or a control is not a finite nonnegative number.
+            table or a control is missing or not a finite nonnegative number.
     """
     if config.variant == "original":
         if len(text_ids) > ORIGINAL_MAX_TEXT_TOKENS:
             raise ValueError(f"Chatterbox Original supports at most {ORIGINAL_MAX_TEXT_TOKENS} text tokens")
         for name, value in (("exaggeration", exaggeration), ("cfg_weight", cfg_weight)):
+            if value is None:
+                raise ValueError(f"Chatterbox Original prompts require {name}")
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be a finite nonnegative number")
     length = (

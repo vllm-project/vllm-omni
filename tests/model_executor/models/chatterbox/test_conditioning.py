@@ -255,6 +255,13 @@ def test_original_prompt_rejects_invalid_guidance_controls(control: str, value: 
         )
 
 
+@pytest.mark.parametrize("missing", ["exaggeration", "cfg_weight"])
+def test_original_prompt_requires_both_controls(missing: str) -> None:
+    controls = {name: 0.5 for name in ("exaggeration", "cfg_weight") if name != missing}
+    with pytest.raises(ValueError, match=f"Chatterbox Original prompts require {missing}"):
+        build_prompt([5], random_voice(10, 125), ChatterboxConfig("original"), **controls)
+
+
 def test_original_text_helper_loads_local_tokenizer_and_normalizes_spaces(tmp_path):
     tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "Hello[SPACE]world.": 7}, unk_token="[UNK]"))
     tokenizer.save(str(tmp_path / "tokenizer.json"))

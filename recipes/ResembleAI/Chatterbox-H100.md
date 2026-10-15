@@ -135,13 +135,15 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
 )
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
-model, variant = "ResembleAI/chatterbox-turbo", "turbo"
-# For Original: model, variant = "ResembleAI/chatterbox", "original"
+model, variant, controls = "ResembleAI/chatterbox-turbo", "turbo", {}
+# For Original, which takes its two controls (upstream's defaults shown):
+# model, variant = "ResembleAI/chatterbox", "original"
+# controls = {"exaggeration": 0.5, "cfg_weight": 0.5}
 config = ChatterboxConfig(variant)
 tokenizer = load_text_tokenizer(model, variant)
 voice = VoiceConditioning.from_builtin(model)
 ids = tokenize_text("Hello, this is Chatterbox speaking.", tokenizer, variant)
-prompt = build_prompt(ids, voice, config)
+prompt = build_prompt(ids, voice, config, **controls)
 engine = Omni(model=model)
 try:
     output = list(engine.generate([prompt]))[0].outputs[0].multimodal_output
