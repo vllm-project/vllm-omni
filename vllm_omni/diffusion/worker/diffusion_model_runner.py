@@ -726,6 +726,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
         if num_inference_steps is not None:
+            # Let the pipeline apply request-scoped scheduler settings (e.g. a
+            # Wan flow_shift override) that the refresh reads, since forward()
+            # would only apply them after the cache context was planned.
+            prepare_cache_refresh = getattr(self.pipeline, "prepare_cache_refresh", None)
+            if prepare_cache_refresh is not None:
+                prepare_cache_refresh(first_req)
             self.cache_backend.refresh(self.pipeline, num_inference_steps)
         else:
             logger.warning(

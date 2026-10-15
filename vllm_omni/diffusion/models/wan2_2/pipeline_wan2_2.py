@@ -149,6 +149,21 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
 
 
+def apply_wan_request_scheduler(pipeline: Any, req: OmniDiffusionRequest) -> tuple[str, float]:
+    """Rebuild ``pipeline.scheduler`` for the request's sample_solver / flow_shift.
+
+    Idempotent, so the runner can call it ahead of the Cache-DiT refresh and
+    ``forward()`` can call it again for the same request.
+    """
+    sample_solver = resolve_wan_sample_solver(req, default=pipeline._sample_solver)
+    flow_shift = resolve_wan_flow_shift(req, pipeline.od_config)
+    if sample_solver != pipeline._sample_solver or abs(flow_shift - pipeline._flow_shift) > 1e-6:
+        pipeline.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+        pipeline._sample_solver = sample_solver
+        pipeline._flow_shift = flow_shift
+    return sample_solver, flow_shift
+
+
 def resolve_wan_guidance_scales(
     sampling_params: OmniDiffusionSamplingParams,
     default_guidance_scale: float,
@@ -1175,6 +1190,16 @@ class Wan22Pipeline(
             settings.append(current)
         validate_wan_batch_settings(settings, stage="generation")
 
+    def prepare_cache_refresh(self, req: OmniDiffusionRequest) -> None:
+        """Apply the request's scheduler settings before the runner refreshes the cache.
+
+        The Cache-DiT dual-expert step split reads ``self.scheduler`` and
+        ``self._flow_shift``; without this, a per-request ``flow_shift`` would
+        only reach them in ``forward()``, after the split was already planned.
+        """
+        if not self.is_dmd:
+            apply_wan_request_scheduler(self, req)
+
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
@@ -1320,13 +1345,7 @@ class Wan22Pipeline(
         if self.is_dmd:
             timesteps = torch.tensor(FASTWAN_DMD_TIMESTEPS, device=device, dtype=torch.float32)
         else:
-            first_request = req.requests[0]
-            sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
-            flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
-            if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-                self._sample_solver = sample_solver
-                self._flow_shift = flow_shift
+            sample_solver, flow_shift = apply_wan_request_scheduler(self, req.requests[0])
 
             if sample_solver == "unipc":
                 self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)

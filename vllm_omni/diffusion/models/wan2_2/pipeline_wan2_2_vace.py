@@ -497,6 +497,11 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
 
         return torch.stack(mask_list)
 
+    def prepare_cache_refresh(self, req: OmniDiffusionRequest) -> None:
+        # VACE denoises with the startup scheduler and ignores per-request
+        # sample_solver / flow_shift, so the cache split already matches.
+        pass
+
     def forward(
         self,
         req: DiffusionRequestBatch,

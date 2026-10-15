@@ -257,6 +257,35 @@ def test_wan22_custom_enabler_passes_taylorseer_calibrator(
         assert modifier._context_kwargs["calibrator_config"] is calibrator_config
 
 
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.cache_dit")
+def test_wan22_custom_enabler_low_noise_expert_only(mock_cache_dit, mock_block_adapter, mock_backend_cache_dit):
+    """boundary_ratio=1.0 loads only transformer_2; cache and refresh must target it."""
+    transformer_2 = Mock()
+    transformer_2.blocks = [Mock()]
+    pipeline = SimpleNamespace(transformer=None, transformer_2=transformer_2)
+
+    refresh = cd_model_specific.enable_cache_for_wan22(pipeline, SAMPLE_CACHE_CONFIG)
+
+    mock_cache_dit.enable_cache.assert_called_once()
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    assert adapter_kwargs["transformer"] is transformer_2
+    assert adapter_kwargs["blocks"] == [transformer_2.blocks]
+
+    refresh(pipeline, 40, False)
+    mock_backend_cache_dit.refresh_context.assert_called_once()
+    assert mock_backend_cache_dit.refresh_context.call_args.args[0] is transformer_2
+    assert mock_backend_cache_dit.refresh_context.call_args.kwargs["num_inference_steps"] == 40
+
+
+def test_wan22_custom_enabler_without_any_transformer_raises():
+    pipeline = SimpleNamespace(transformer=None, transformer_2=None)
+
+    with pytest.raises(ValueError, match="no loaded transformer"):
+        cd_model_specific.enable_cache_for_wan22(pipeline, SAMPLE_CACHE_CONFIG)
+
+
 @pytest.mark.parametrize(
     ("flow_shift", "expected_split"),
     [(5.0, (17, 23)), (1.0, (5, 35))],
@@ -278,6 +307,32 @@ def test_wan22_step_split_applies_unipc_flow_shift(flow_shift, expected_split):
     boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
     num_high_noise_steps = int((pipeline.scheduler.timesteps >= boundary_timestep).sum())
     assert (num_high_noise_steps, 40 - num_high_noise_steps) == expected_split
+
+
+def test_wan22_step_split_follows_request_flow_shift_override():
+    """A per-request flow_shift must reach the split before the runner refreshes the cache."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
+
+    pipeline = SimpleNamespace(
+        is_dmd=False,
+        od_config=SimpleNamespace(flow_shift=5.0),
+        transformer=torch.nn.Linear(1, 1),
+        scheduler=build_wan_scheduler("unipc", 5.0),
+        boundary_ratio=0.875,
+        _sample_solver="unipc",
+        _flow_shift=5.0,
+    )
+    req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"flow_shift": 12.0}))
+
+    Wan22Pipeline.prepare_cache_refresh(pipeline, req)
+
+    assert pipeline._flow_shift == 12.0
+    split = cd_model_specific._split_wan22_inference_steps(pipeline, 40)
+    reference = build_wan_scheduler("unipc", 12.0)
+    reference.set_timesteps(40, device="cpu", shift=12.0)
+    num_high_noise_steps = int((reference.timesteps >= 875).sum())
+    assert split == (num_high_noise_steps, 40 - num_high_noise_steps)
+    assert split != (17, 23)
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
