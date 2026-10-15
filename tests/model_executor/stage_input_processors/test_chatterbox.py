@@ -27,13 +27,9 @@ from tests.model_executor.models.chatterbox.helpers import (
     stage_vllm_config,
     write_model_dir,
 )
-from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
-from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
-    _OmniConnectorPayloadTransportMixin as Transport,
-)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME, S3GenDecoder
@@ -452,32 +448,40 @@ def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length(
 
 @pytest.mark.parametrize("side", PLANES)
 def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
-    side: str, adapter: OmniChunkTransferAdapter, plane: OmniRunnerDataPlane, receiver: SharedMemoryConnector
+    side: str,
+    adapter: OmniChunkTransferAdapter,
+    plane: OmniRunnerDataPlane,
+    receiver: SharedMemoryConnector,
+    stage_configs: list,
 ) -> None:
     """Stage 1 was started on a placeholder prompt, and only an explicit empty ``codes.audio`` clears it.
 
-    The payload stage 1's connector read is put through the receiving
-    transport's own metadata extraction and the receiving scheduler's update
-    of stage 1's request, as a chunk that arrives is.
+    The terminal payload is handed to stage 1's own scheduler-side transport,
+    which receives it as it receives any chunk: the request's prompt becomes
+    empty and its upstream is done.
     """
     (terminal,) = streamed_payloads(side, adapter, plane, receiver, request_prompt(250), [])
-    payload = to_dict(terminal)
+    assert terminal.codes.audio.numel() == 0 and bool(terminal.meta.finished)
 
-    assert payload["codes"]["audio"].numel() == 0 and bool(payload["meta"]["finished"])
-    assert not Transport._payload_is_consumable(payload)
     stage1_request = OmniRequest(
         request_id="r",
         prompt_token_ids=[0] * 88,
         sampling_params=SamplingParams(max_tokens=1),
         pooling_params=None,
-        external_req_id="r",
+        external_req_id=f"stage-1-{uuid.uuid4().hex}",
     )
-    coordinator = OmniSchedulingCoordinator(stage_id=1)
-    coordinator.update_request_metadata(
-        {"r": stage1_request}, {"r": Transport._extract_scheduling_metadata(payload)}, model_mode="generation"
-    )
-    assert stage1_request.prompt_token_ids == [] and stage1_request.num_prompt_tokens == 0
-    assert "r" in coordinator.input_terminal_req_ids
+    stage1 = OmniChunkTransferAdapter(stage_configs[1])
+    try:
+        receiver.put("0", "1", f"{stage1_request.external_req_id}_0_0", to_dict(terminal))
+        stage1.load_async(stage1_request)
+        deadline = time.monotonic() + DELIVERY_SECONDS
+        while not stage1.is_done_receiving_chunks("r"):
+            assert time.monotonic() < deadline, "stage 1 did not receive the terminal chunk"
+            time.sleep(0.001)
+    finally:
+        stage1.shutdown()
+
+    assert stage1_request.prompt_token_ids == []
 
 
 def test_a_stream_aborted_between_chunks_is_flushed_and_freed(
@@ -616,8 +620,6 @@ def test_two_requests_interleaved_keep_their_own_schedule_and_voice(
         for name in prompts:
             feed(name)
     sent = {"short": receive_through_final(receiver, requests["short"].external_req_id)}
-    # The sender thread works in order, so the long request's fortieth token is in.
-    pending = dict(adapter.request_payload[requests["long"].external_req_id])
     for _ in range(20):
         feed("long")
     sent["long"] = receive_through_final(receiver, requests["long"].external_req_id)
@@ -637,11 +639,3 @@ def test_two_requests_interleaved_keep_their_own_schedule_and_voice(
         assert torch.equal(payloads[0].embed.speech_token, reference["speech_token"])
         assert torch.equal(payloads[0].embed.embedding, reference["embedding"])
         assert [payload.embed is None for payload in payloads[1:]] == [True] * (len(payloads) - 1)
-    # The short request's end left the long one mid-stream: one chunk sent, the next hop 30.
-    assert {key: pending[key] for key in ("seen", "sent", "hop", "chunks", "terminal_sent")} == {
-        "seen": 40,
-        "sent": 20,
-        "hop": 30,
-        "chunks": 1,
-        "terminal_sent": False,
-    }

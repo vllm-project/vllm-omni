@@ -14,7 +14,7 @@ from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import Ch
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import ChatterboxS3Gen
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import ChatterboxT3ForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE, CHATTERBOX_TURBO_PIPELINE
-from vllm_omni.model_executor.models.registry import _OMNI_MODELS, OmniModelRegistry
+from vllm_omni.model_executor.models.registry import OmniModelRegistry
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -161,9 +161,9 @@ def test_one_registered_architecture_wraps_every_stage() -> None:
     pipelines = (CHATTERBOX_TURBO_PIPELINE, CHATTERBOX_ORIGINAL_PIPELINE)
     assert {stage.model_stage for pipeline in pipelines for stage in pipeline.stages} == set(STAGES)
     assert {pipeline.model_arch for pipeline in pipelines} == {"ChatterboxForConditionalGeneration"}
-    assert [name for name in _OMNI_MODELS if name.startswith("Chatterbox")] == ["ChatterboxForConditionalGeneration"]
-    model_cls = OmniModelRegistry._try_load_model_cls("ChatterboxForConditionalGeneration")
-    assert model_cls is ChatterboxForConditionalGeneration
+    archs = [name for name in OmniModelRegistry.get_supported_archs() if name.startswith("Chatterbox")]
+    assert archs == ["ChatterboxForConditionalGeneration"]
+    assert OmniModelRegistry.models[archs[0]].load_model_cls() is ChatterboxForConditionalGeneration
 
 
 def test_vllm_gives_the_registered_class_the_generate_runner() -> None:

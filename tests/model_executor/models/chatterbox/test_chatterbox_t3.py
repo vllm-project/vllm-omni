@@ -10,7 +10,6 @@ import copy
 from collections.abc import Callable
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
@@ -34,7 +33,6 @@ from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import (
 )
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
-from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -190,26 +188,25 @@ def test_batched_decode_embedding_matches_per_request_preprocess(
 
 
 @pytest.mark.parametrize("padded_rows", [7, 16], ids=["as scheduled", "padded by the graph"])
-def test_every_request_of_a_step_gets_a_payload_from_the_runner(
+def test_every_token_row_gets_a_payload_flag_and_nothing_else(
     talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig, padded_rows: int
 ) -> None:
     """The runner-side transport calls the chunk processor only for a request the step has a payload for.
 
-    Two decode rows and a five-token prefill, cut per request by the
-    runner's own slicing, each end up with one key that is not a client
-    output. It holds one false flag per token row and nothing else.
+    The runner cuts the payload per request by token rows, so it is one
+    false flag per row, CUDA-graph padding included, on the CPU, and no
+    client output.
     """
     hidden = torch.randn(padded_rows, config.hidden_size)
 
     output = talker.make_omni_output(hidden, model_intermediate_buffer=[{}, {}, {}])
 
     assert output.text_hidden_states is hidden
-    inter_stage, client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
-        output.multimodal_outputs, np.array([0, 1, 2]), np.array([1, 1, 5]), 3, 7, padded_rows
-    )
-    assert client is None
-    assert [list(payload) for payload in inter_stage] == [["meta.codec_frame_valid"]] * 3
-    assert [payload["meta.codec_frame_valid"].tolist() for payload in inter_stage] == [[False], [False], [False] * 5]
+    assert list(output.multimodal_outputs) == ["meta"] and list(output.multimodal_outputs["meta"]) == [
+        "codec_frame_valid"
+    ]
+    flags = output.multimodal_outputs["meta"]["codec_frame_valid"]
+    assert flags.device.type == "cpu" and flags.tolist() == [False] * padded_rows
 
 
 def test_logits_are_the_speech_heads_with_the_start_token_masked(heads: T3Heads, config: ChatterboxConfig) -> None:
