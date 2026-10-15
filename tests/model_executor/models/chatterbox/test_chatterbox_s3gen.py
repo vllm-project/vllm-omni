@@ -492,13 +492,19 @@ def test_spans_without_a_payload_or_tokens_give_empty_audio(decoder: S3GenDecode
         decoder.on_requests_finished({"live"})
 
 
-@pytest.mark.parametrize("payloads", [[{"embed": {}}], [{}]], ids=["payload without stream metadata", "empty payload"])
-def test_tokens_without_stream_metadata_are_refused(decoder: S3GenDecoder, payloads: list[dict]) -> None:
-    """Decoding them as a whole utterance would play wrong audio with no error.
+@pytest.mark.parametrize(
+    "payloads",
+    [[{"embed": {}}], [{}], None],
+    ids=["payload without stream metadata", "empty payload", "no payload list"],
+)
+def test_tokens_without_stream_metadata_are_refused(decoder: S3GenDecoder, payloads: list[dict] | None) -> None:
+    """Decoding them as a whole utterance, or skipping them, would play wrong audio with no error.
 
-    The runner passes an empty payload for a request it holds none for.
+    The runner passes an empty payload for a request it holds none for, and
+    no list at all only on the profiling run, which has no request ids; the
+    default runner also goes on without one when building it failed.
     """
-    with pytest.raises(RuntimeError, match="23 tokens for request x without stream metadata"):
+    with pytest.raises(RuntimeError, match="request.*x.* without stream metadata"):
         decoder.decode_step(torch.randint(0, 6561, (23,)), [23], payloads, ["x"])
 
 

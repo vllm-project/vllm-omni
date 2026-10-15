@@ -515,7 +515,7 @@ class S3GenDecoder(nn.Module):
             payloads: Per request, the inter-stage payload of its chunk;
                 empty for a request the runner holds none for. Only a
                 request's first chunk has to carry its voice. None on the
-                engine's profiling run, and only then.
+                engine's profiling run; with request ids, an error.
             request_ids: Per request, the scheduler's id. None on the
                 engine's profiling run, and only then.
 
@@ -530,8 +530,10 @@ class S3GenDecoder(nn.Module):
         """
         device, dtype = self.trim_fade.device, self.trim_fade.dtype
         audios = [torch.zeros(0, device=input_ids.device)] * len(counts)
-        if request_ids is None or payloads is None:
+        if request_ids is None:
             return audios
+        if payloads is None:
+            raise RuntimeError(f"chatterbox_s3gen got tokens for requests {request_ids} without stream metadata")
 
         flat = input_ids.reshape(-1)
         chunks: list[Chunk] = []
