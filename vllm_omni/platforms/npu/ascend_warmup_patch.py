@@ -151,11 +151,14 @@ def _apply_contiguous_kv_patch() -> None:
     paged attention; the one-query FIA graph reads every KV slot of its
     bucket each frame, so it only ever pays for the stride indirection.
 
-    Patched on the consumer module: ``model_runner_v1`` binds the function
-    with a from-import, so patching ``vllm_ascend.attention.utils`` alone
-    would not be seen at the call site. Gated on the K-step config so any
-    other worker (stage 0, non-speculative deployments) keeps its stock
-    layout choice.
+    Patched via a code-object transplant on the consumer module:
+    ``model_runner_v1`` binds the function with a from-import, so patching
+    ``vllm_ascend.attention.utils`` alone would not be seen at the call
+    site, and replacing the module attribute would break the function's
+    identity that the upstream #8827 tests assert on. Transplanting the
+    code keeps the function object — and every from-import binding to it —
+    intact. Gated on the K-step config so any other worker (stage 0,
+    non-speculative deployments) keeps its stock layout choice.
     """
     try:
         import importlib
@@ -170,11 +173,16 @@ def _apply_contiguous_kv_patch() -> None:
         return
 
     def _contiguous_for_kstep(layer, vllm_config, spec, *args, **kwargs):
+        # This code object is transplanted onto the consumer function, so it
+        # runs with that module's globals: everything it needs is imported
+        # locally, and the fallback below re-states the platform-level
+        # contract instead of calling the (now self-referential) original.
         try:
-            # Reproduce the original guard verbatim minus the one condition
-            # this patch overrides (using_paged_attention, which is
-            # unconditionally False under speculative configs).
+            import logging
+
             from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+            from vllm_omni.platforms.npu.ascend_warmup_patch import _kstep_armed
 
             impl = getattr(layer, "impl", None)
             armed = _kstep_armed(vllm_config)
@@ -186,7 +194,7 @@ def _apply_contiguous_kv_patch() -> None:
             runner = getattr(vllm_config.model_config, "runner_type", None)
             page_eq = spec.page_size_bytes == spec.real_page_size_bytes
             passed = backend_ok and sliding is None and runner != "pooling" and page_eq
-            logger.info(
+            logging.getLogger("vllm_omni.npu.contiguous_kv").info(
                 "[npu] contiguous KV probe: layer=%s armed=%s impl=%s backend_ok=%s "
                 "sliding_window=%s runner=%s page_eq=%s -> return=%s",
                 getattr(layer, "layer_name", "?"),
@@ -201,11 +209,16 @@ def _apply_contiguous_kv_patch() -> None:
             if armed and passed:
                 return True
         except Exception:
-            logger.exception("[npu] contiguous KV probe failed")
-        return original(layer, vllm_config, spec, *args, **kwargs)
+            logging.getLogger("vllm_omni.npu.contiguous_kv").exception(
+                "[npu] contiguous KV probe failed"
+            )
+        # Same contract as the platform-level patch: keep the unpadded K/V
+        # layout unless the spec carries padded pages (V2's separate K/V
+        # allocation needs unpadded pages).
+        return spec.page_size_bytes == spec.real_page_size_bytes
 
-    _contiguous_for_kstep._vllm_omni_contiguous = True  # type: ignore[attr-defined]
-    runner_module.requires_contiguous_pa_kv_cache = _contiguous_for_kstep  # type: ignore[attr-defined]
+    original.__code__ = _contiguous_for_kstep.__code__  # type: ignore[attr-defined]
+    original._vllm_omni_contiguous = True  # type: ignore[attr-defined]
     logger.info(
         "[npu] contiguous KV patch applied: the K-step Talker's layers leave "
         "the strided block-major set (its one-query FIA decode reads the "
