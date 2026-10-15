@@ -40,7 +40,9 @@ except ModuleNotFoundError:
     _vllm_kv = __import__("types").ModuleType("vllm.v1.kv_cache_interface")
 
     class _FakeFullAttentionSpec: ...
+
     class _FakeSlidingWindowSpec: ...
+
     _vllm_kv.FullAttentionSpec = _FakeFullAttentionSpec
     _vllm_kv.SlidingWindowSpec = _FakeSlidingWindowSpec
     sys.modules["vllm.v1"] = _vllm_v1
@@ -85,8 +87,9 @@ DTYPE = torch.float32
 def _get_fake_full_attention_spec():
     """Resolve FullAttentionSpec from real vllm or the test shim."""
     try:
-        from vllm.v1.kv_cache_interface import FullAttentionSpec as _FA  # type: ignore[import-not-found]
-        return _FA
+        from vllm.v1.kv_cache_interface import FullAttentionSpec  # type: ignore[import-not-found]
+
+        return FullAttentionSpec
     except ModuleNotFoundError:
         return sys.modules["vllm.v1.kv_cache_interface"].FullAttentionSpec
 
@@ -94,8 +97,9 @@ def _get_fake_full_attention_spec():
 def _get_fake_sliding_window_spec():
     """Resolve SlidingWindowSpec from real vllm or the test shim."""
     try:
-        from vllm.v1.kv_cache_interface import SlidingWindowSpec as _SW  # type: ignore[import-not-found]
-        return _SW
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec  # type: ignore[import-not-found]
+
+        return SlidingWindowSpec
     except ModuleNotFoundError:
         return sys.modules["vllm.v1.kv_cache_interface"].SlidingWindowSpec
 
@@ -855,23 +859,29 @@ def test_find_full_attention_group_index_rejects_zero_or_multi():
 
     # Groups exist but none are full attention.
     with pytest.raises(OmniPrefixCacheUnmatchError, match="exactly one full-attention.*found none"):
-        find_full_attention_group_index([
-            SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
-            SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
-        ])
+        find_full_attention_group_index(
+            [
+                SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+                SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+            ]
+        )
 
     # Two full-attention groups is ambiguous.
     with pytest.raises(OmniPrefixCacheUnmatchError, match="exactly one full-attention.*found 2"):
-        find_full_attention_group_index([
-            SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
-            SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
-        ])
+        find_full_attention_group_index(
+            [
+                SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
+                SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
+            ]
+        )
 
     # check_prefix_cache_kv_groups delegates and returns the index for new callers.
-    idx = check_prefix_cache_kv_groups([
-        SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
-        SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
-    ])
+    idx = check_prefix_cache_kv_groups(
+        [
+            SimpleNamespace(kv_cache_spec=SlidingWindowSpec()),
+            SimpleNamespace(kv_cache_spec=FullAttentionSpec()),
+        ]
+    )
     assert idx == 1
 
 
@@ -2164,6 +2174,7 @@ def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
 # Multi-KV-group support (RFC #7902 §7.2)
 # ============================================================================
 
+
 class _MultiGroupTensorWrap:
     """Duck-typed TensorWrap for multi-group block table construction."""
 
@@ -2187,7 +2198,7 @@ class _MultiGroupBT:
 
     def __init__(self, *tables: torch.Tensor):
         self._layouts = [_MultiGroupLayout(t) for t in tables]
-        self.block_tables = [l.block_table for l in self._layouts]
+        self.block_tables = [layout.block_table for layout in self._layouts]
         # Forwards layout attrs from group 0 — only checked when iterating
         # self._layouts via __getitem__
         self.kv_cache_block_size = BLOCK_SIZE
@@ -2330,8 +2341,7 @@ def test_multi_group_find_index_all_positions():
     # 3 groups, full-attention at each position.
     for pos in range(3):
         groups = [
-            SimpleNamespace(kv_cache_spec=(FullAttentionSpec() if i == pos else SlidingWindowSpec()))
-            for i in range(3)
+            SimpleNamespace(kv_cache_spec=(FullAttentionSpec() if i == pos else SlidingWindowSpec())) for i in range(3)
         ]
         assert find_full_attention_group_index(groups) == pos
 

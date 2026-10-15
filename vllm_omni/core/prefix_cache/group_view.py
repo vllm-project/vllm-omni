@@ -116,8 +116,7 @@ def find_full_attention_group_index(kv_cache_groups: object) -> int:
 
     groups = list(kv_cache_groups or ())
     full_attn_indices = [
-        i for i, g in enumerate(groups)
-        if isinstance(getattr(g, "kv_cache_spec", None), FullAttentionSpec)
+        i for i, g in enumerate(groups) if isinstance(getattr(g, "kv_cache_spec", None), FullAttentionSpec)
     ]
     if len(full_attn_indices) == 0:
         raise OmniPrefixCacheUnmatchError(
