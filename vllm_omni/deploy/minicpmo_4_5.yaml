@@ -149,10 +149,15 @@ platforms:
         # Keep the three stages' concurrency caps aligned so the top tier is
         # not gated by a single stage.
         max_num_seqs: 8
-        # Measured single-card co-location budget (910B1): 0.50 keeps stage-0
-        # KV at 4.7GiB and leaves headroom for Talker KV + concurrent
-        # Code2Wav; at 0.55 stage 2 starved into OOM.
-        gpu_memory_utilization: 0.50
+        # Measured single-card co-location budget (910B1). The turn-mode v1
+        # KV check needs one full 40960-token request on this stage:
+        # 144.8 KiB/token x 40960 = 5.62 GiB, so the KV pool must stay above
+        # that -- 0.50 leaves only 4.79 GiB and engine init fails with
+        # "estimated maximum model length is 33536"; main's platform value
+        # 0.55 gives 7.85 GiB and passes CI (A3). At 0.55 stage 2 starved
+        # into OOM on 910B1 once; re-verify the co-located tiers on both
+        # before shrinking this again.
+        gpu_memory_utilization: 0.55
         # 32768 leaves no KV cache on 910B1 at the colocated budgets above.
         # Audio Conv1d stays eager; the transformer stack is what this graph replays.
         additional_config:
