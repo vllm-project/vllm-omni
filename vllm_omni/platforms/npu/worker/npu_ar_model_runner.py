@@ -308,32 +308,34 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 # returns empty for three expected reasons -- a request that
                 # sampled nothing, a *live* multi-frame request whose codec stop
                 # fired mid-span, or a batch mixing drafted with undrafted rows
-                # -- and each of those already reports itself once through
-                # `_log_block_once`. The one genuine degradation, the
+                # -- and each of those names itself once at INFO through
+                # `_log_fold_once`. The one genuine degradation, the
                 # padded-drafter tensor path, names itself above. What is left
                 # here is the per-step dump of WHICH row folded and at what
-                # shape, so it rides at debug.
+                # shape, so it rides at debug: it fires on every folded step,
+                # so the description is only built when debug is on.
                 # Type-safe throughout: the padded-drafter branch passes a
                 # tensor, and `tensor or []` raises the ambiguous-truth error.
-                if isinstance(valid_sampled_token_ids, list):
-                    rows = valid_sampled_token_ids
-                    _desc = (
-                        f"rows={len(rows)}"
-                        f" types={[type(r).__name__ for r in rows[:8]]}"
-                        f" lens={[len(r) for r in rows[:8] if isinstance(r, list)]}"
-                        f" scheduled={scheduled_draft_counts[:8]}"
-                        f" head={repr(rows)[:400]}"
+                if logger.isEnabledFor(logging.DEBUG):
+                    if isinstance(valid_sampled_token_ids, list):
+                        rows = valid_sampled_token_ids
+                        _desc = (
+                            f"rows={len(rows)}"
+                            f" types={[type(r).__name__ for r in rows[:8]]}"
+                            f" lens={[len(r) for r in rows[:8] if isinstance(r, list)]}"
+                            f" scheduled={scheduled_draft_counts[:8]}"
+                            f" head={repr(rows)[:400]}"
+                        )
+                    else:
+                        seen = valid_sampled_token_ids
+                        shape = tuple(seen.shape) if hasattr(seen, "shape") else "?"
+                        _desc = f"rows=<{type(seen).__name__} shape={shape}>"
+                    logger.debug(
+                        "[kstep] no drafts emitted: frames=%s num_reqs=%s %s",
+                        frames,
+                        self.input_batch.num_reqs,
+                        _desc,
                     )
-                else:
-                    seen = valid_sampled_token_ids
-                    shape = tuple(seen.shape) if hasattr(seen, "shape") else "?"
-                    _desc = f"rows=<{type(seen).__name__} shape={shape}>"
-                logger.debug(
-                    "[kstep] no drafts emitted: frames=%s num_reqs=%s %s",
-                    frames,
-                    self.input_batch.num_reqs,
-                    _desc,
-                )
             return drafts
         return super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
 

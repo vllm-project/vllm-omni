@@ -111,9 +111,10 @@ def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
         logger.warning("[minicpmo] K-step min_tokens neutralization skipped: %r", exc)
 
 
-_LOGGED_BLOCK: str | None = None
+_LOGGED_BLOCKS: set[str] = set()
+_LOGGED_FOLDS: set[str] = set()
 _LOGGED_NARROW = False
-_LOGGED_NARROW_BLOCK: str | None = None
+_LOGGED_NARROW_BLOCKS: set[str] = set()
 
 # SoC families whose one-query capture is known to fault. The 910_93 part
 # trips a vector-core error (acl 507035) inside the packaged codec operator
@@ -162,12 +163,31 @@ def _narrow_soc_allows() -> bool:
 
 
 def _log_block_once(reason: str) -> None:
-    """Say once why the loop never engaged; silence is the worse failure."""
-    global _LOGGED_BLOCK
-    if _LOGGED_BLOCK == reason:
+    """Say each distinct blocking reason once; silence is the worse failure.
+
+    A set, not a single slot: the blocking conditions and the per-step folds
+    alternate at concurrency, and comparing against only the *last* reason
+    logs on every alternation. The reason strings are a fixed set in this
+    module, so the set stays bounded.
+    """
+    if reason in _LOGGED_BLOCKS:
         return
-    _LOGGED_BLOCK = reason
+    _LOGGED_BLOCKS.add(reason)
     logger.info("[minicpmo] multi-frame Talker decode not engaged: %s", reason)
+
+
+def _log_fold_once(reason: str) -> None:
+    """Say each distinct fold reason once, at INFO.
+
+    Separate from ``_log_block_once`` on purpose: a fold is an expected
+    per-step outcome on an *engaged* loop, so it wants its own wording, and
+    sharing one global would let a fold reason clobber the blocking reason
+    that explains why the loop never engaged at all.
+    """
+    if reason in _LOGGED_FOLDS:
+        return
+    _LOGGED_FOLDS.add(reason)
+    logger.info("[minicpmo] multi-frame Talker decode folded this step: %s", reason)
 
 
 def applies(model: Any, model_kwargs_extra: dict[str, Any]) -> int:
@@ -411,10 +431,16 @@ def end_narrow_step(forward_context: Any, narrow: NarrowStep | None) -> None:
 
 
 def _decline(reason: str) -> None:
-    global _LOGGED_NARROW_BLOCK
-    if _LOGGED_NARROW_BLOCK != reason:
-        _LOGGED_NARROW_BLOCK = reason
-        logger.info("[minicpmo] one-query Talker replay not engaged: %s", reason)
+    """Say each distinct decline reason once; silence is the worse failure.
+
+    A set, not a single slot: the narrow path is re-decided every step, and one
+    of its reasons carries the step's own row count, so comparing against only
+    the last reason would log on every step whose row count moved.
+    """
+    if reason in _LOGGED_NARROW_BLOCKS:
+        return None
+    _LOGGED_NARROW_BLOCKS.add(reason)
+    logger.info("[minicpmo] one-query Talker replay not engaged: %s", reason)
     return None
 
 
@@ -631,7 +657,7 @@ def constant_drafts(
         if isinstance(valid_sampled_token_ids, list) and index < len(valid_sampled_token_ids):
             sampled = valid_sampled_token_ids[index]
         if not sampled:
-            _log_block_once("a request in this batch sampled nothing; no drafts this step")
+            _log_fold_once("a request in this batch sampled nothing; no drafts this step")
             return [[] for _ in range(num_reqs)]
         scheduled = scheduled_draft_counts[index] if scheduled_draft_counts is not None else frames - 1
         if scheduled > 0:
@@ -645,13 +671,13 @@ def constant_drafts(
             # against frames=8, folded, 4 requests dead). Only a row shorter
             # than the step scheduled is a real codec stop.
             if fold_short_rows and isinstance(sampled, list) and len(sampled) < scheduled + 1:
-                _log_block_once("a request stopped mid-step, short of its drafts; no drafts this step")
+                _log_fold_once("a request stopped mid-step, short of its drafts; no drafts this step")
                 return [[] for _ in range(num_reqs)]
             saw_drafted = True
         else:
             saw_undrafted = True
     if scheduled_draft_counts is not None and saw_drafted and saw_undrafted:
-        _log_block_once("a batch mixed drafted and undrafted requests; no drafts this step")
+        _log_fold_once("a batch mixed drafted and undrafted requests; no drafts this step")
         return [[] for _ in range(num_reqs)]
     return [[CONTINUE_TOKEN_ID] * (frames - 1) for _ in range(num_reqs)]
 
