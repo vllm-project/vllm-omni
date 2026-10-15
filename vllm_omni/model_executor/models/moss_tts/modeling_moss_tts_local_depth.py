@@ -86,7 +86,7 @@ class _MossTTSLocalAttention(nn.Module):
         cache_device_ok = (
             cache.numel() > 0
             and cache.device.type == device.type
-            and (device.index is None or cache.device.index == device.index)
+            and (cache.device.index or 0) == (device.index or 0)
             and cache.dtype == dtype
             and int(cache.shape[1]) >= max_seq_len
         )

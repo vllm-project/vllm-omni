@@ -11,7 +11,7 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth impo
     MossTTSLocalDepthTransformer,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.tts, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 
 
 def _npu_available() -> bool:
@@ -23,7 +23,7 @@ def _npu_available() -> bool:
 
 
 npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
-npu_device = pytest.param("npu", marks=npu_only)
+npu_device = pytest.param("npu", marks=[npu_only, *hardware_marks(res={"npu": "A3"}, num_cards=1)])
 
 
 @pytest.fixture(

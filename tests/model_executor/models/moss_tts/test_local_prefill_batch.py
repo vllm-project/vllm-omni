@@ -25,7 +25,7 @@ def _npu_available() -> bool:
 
 
 npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
-npu_device = pytest.param("npu", marks=npu_only)
+npu_device = pytest.param("npu", marks=[npu_only, *hardware_marks(res={"npu": "A3"}, num_cards=1)])
 
 
 @pytest.fixture(
