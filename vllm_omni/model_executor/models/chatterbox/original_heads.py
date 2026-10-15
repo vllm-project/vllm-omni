@@ -13,6 +13,13 @@ from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_DEFAULT_EXA
 ORIGINAL_MAX_TEXT_TOKENS = 2048
 ORIGINAL_TEXT_POSITIONS = ORIGINAL_MAX_TEXT_TOKENS + 2
 ORIGINAL_SPEECH_POSITIONS = 4100
+# Upstream ``T3Config``: the perceiver's learned queries and the text BOS/EOS ids.
+PERCEIVER_QUERIES = 32
+START_TEXT_TOKEN = 255
+STOP_TEXT_TOKEN = 0
+# Prompt rows besides the text: speaker, perceiver queries, emotion, text
+# BOS and EOS, and the two start-of-speech rows.
+ORIGINAL_PROMPT_EXTRA_ROWS = 1 + PERCEIVER_QUERIES + 1 + 2 + 2
 
 
 class OriginalAttention(nn.Module):
@@ -38,12 +45,13 @@ class OriginalAttention(nn.Module):
 
 
 class OriginalPerceiver(nn.Module):
-    """The same attention parameters resample and then mix 32 learned queries."""
+    """The same attention parameters resample and then mix the learned queries."""
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
-        self.pre_attention_query = nn.Parameter(torch.empty(1, 32, hidden_size))
-        nn.init.uniform_(self.pre_attention_query, -((3 / 32) ** 0.5), (3 / 32) ** 0.5)
+        self.pre_attention_query = nn.Parameter(torch.empty(1, PERCEIVER_QUERIES, hidden_size))
+        bound = (3 / PERCEIVER_QUERIES) ** 0.5
+        nn.init.uniform_(self.pre_attention_query, -bound, bound)
         self.attn = OriginalAttention(hidden_size)
 
     def forward(self, context: torch.Tensor) -> torch.Tensor:
@@ -101,14 +109,14 @@ def original_prefill_embeds(
     exaggeration: float = ORIGINAL_DEFAULT_EXAGGERATION,
     unconditional: bool = False,
 ) -> torch.Tensor:
-    """Build one raw-text request's exact Original prompt, shape (T + 38, H).
+    """Build one raw-text request's exact Original prompt, shape (T + ORIGINAL_PROMPT_EXTRA_ROWS, H).
 
     Inputs have shapes (T,), (C,), and (1, speaker_embed_size). CFG retains
     speaker, reference and emotion; only text content embeddings are zeroed.
     Both initial speech tokens use learned speech position zero upstream.
     """
     device = text_ids.device
-    text_ids = torch.cat((text_ids.new_tensor([255]), text_ids, text_ids.new_tensor([0])))
+    text_ids = torch.cat((text_ids.new_tensor([START_TEXT_TOKEN]), text_ids, text_ids.new_tensor([STOP_TEXT_TOKEN])))
     text = heads.text_emb(text_ids)
     if unconditional:
         text = torch.zeros_like(text)

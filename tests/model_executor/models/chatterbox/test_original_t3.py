@@ -121,15 +121,31 @@ def test_a_context_beyond_the_speech_position_table_is_refused(
         build_stage(config, "cpu")
 
 
-def test_prompt_length_mismatch_fails(model, metadata):
-    with pytest.raises(ValueError, match="placeholder length"):
-        model.preprocess(
-            torch.tensor([6561]),
-            None,
-            _omni_is_prefill=True,
-            _omni_num_computed_tokens=0,
-            **{**metadata, "_omni_prompt_len": 42},
-        )
+@pytest.mark.parametrize("text_len", [1, 3, 2048])
+def test_the_placeholder_prompt_is_as_long_as_its_embeddings(model, text_len):
+    """``build_prompt`` counts the placeholders, ``original_prefill_embeds`` builds what replaces them.
+
+    Nothing checks the two agree at run time, so they are pinned to each
+    other here, through the request payload ``preprocess`` is handed.
+    """
+    conditioning = VoiceConditioning(
+        cond_tokens=torch.randint(0, 6561, (1, 150)),
+        speaker_emb=torch.randn(1, 256),
+        prompt_token=torch.randint(0, 6561, (1, 250)),
+        prompt_feat=torch.randn(1, 500, 80),
+        embedding=torch.randn(1, 192),
+    )
+    prompt = build_prompt([5] * text_len, conditioning, model.config)
+    info = prompt["additional_information"]
+
+    embeds = original_prefill_embeds(
+        model.heads,
+        torch.tensor(info["ids"]["prompt"]),
+        torch.tensor(info["ids"]["speech_token"]),
+        info["embed"]["voice"].to(model.heads.text_emb.weight.dtype),
+    )
+
+    assert len(prompt["prompt_token_ids"]) == embeds.shape[0]
 
 
 @pytest.mark.parametrize("weight", [0.0, 0.5])

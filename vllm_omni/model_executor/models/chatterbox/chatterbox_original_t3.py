@@ -112,8 +112,6 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
                 exaggeration=chatterbox["exaggeration"],
                 unconditional=role == "uncond",
             )
-            if prompt.shape[0] != _omni_prompt_len:
-                raise ValueError("Original Chatterbox placeholder length does not match its conditioned prompt")
             in_prompt = min(input_ids.shape[0], _omni_prompt_len - _omni_num_computed_tokens)
             prompt_rows = prompt[_omni_num_computed_tokens : _omni_num_computed_tokens + in_prompt]
         speech_ids = input_ids[in_prompt:]

@@ -28,7 +28,10 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from vllm.inputs import tokens_input
 from vllm.multimodal.parse import MultiModalDataParser
 
-from vllm_omni.model_executor.models.chatterbox.original_heads import ORIGINAL_MAX_TEXT_TOKENS
+from vllm_omni.model_executor.models.chatterbox.original_heads import (
+    ORIGINAL_MAX_TEXT_TOKENS,
+    ORIGINAL_PROMPT_EXTRA_ROWS,
+)
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.indextts2.preprocess_utils import compute_fbank
@@ -450,7 +453,7 @@ def build_prompt(
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be a finite nonnegative number")
     length = (
-        len(text_ids) + 38
+        len(text_ids) + ORIGINAL_PROMPT_EXTRA_ROWS
         if config.variant == "original"
         else 1 + conditioning.cond_tokens.shape[1] + len(text_ids) + 1
     )
