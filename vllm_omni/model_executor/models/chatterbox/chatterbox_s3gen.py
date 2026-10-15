@@ -479,11 +479,13 @@ class S3GenDecoder(nn.Module):
                 results.append(
                     (
                         speech[i][:, :-SOURCE_CACHE_SAMPLES],
+                        # Copies, so a request's state does not keep the
+                        # whole step's batch tensors alive between its chunks.
                         StreamState(
                             reference=chunk.reference,
-                            mel=mels[i][:, :, -MEL_CACHE_FRAMES:],
-                            source=source[i][:, :, -SOURCE_CACHE_SAMPLES:],
-                            speech=speech[i][:, -SOURCE_CACHE_SAMPLES:],
+                            mel=mels[i][:, :, -MEL_CACHE_FRAMES:].clone(),
+                            source=source[i][:, :, -SOURCE_CACHE_SAMPLES:].clone(),
+                            speech=speech[i][:, -SOURCE_CACHE_SAMPLES:].clone(),
                         ),
                     )
                 )

@@ -3,6 +3,7 @@
 """Play a speech server's streamed PCM through Gradio's native streaming audio player."""
 
 import argparse
+import functools
 import io
 
 import gradio as gr
@@ -28,10 +29,10 @@ def main():
         text = gr.Textbox(value="Hello, this is a streamed sentence.", label="Text")
         reference = gr.Audio(type="filepath", label="Reference voice (optional)")
         audio = gr.Audio(streaming=True, autoplay=True, label="Generated speech")
+        # A partial of the generator function keeps it one for Gradio, which
+        # streams a handler only when inspect.isgeneratorfunction says so.
         gr.Button("Speak").click(
-            lambda api_base, text, reference: stream_speech(
-                api_base, text, reference, model=args.model, voice=args.voice, sample_rate=args.sample_rate
-            ),
+            functools.partial(stream_speech, model=args.model, voice=args.voice, sample_rate=args.sample_rate),
             [api, text, reference],
             audio,
         )
