@@ -18,6 +18,7 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
+from diffusers import FlowMatchEulerDiscreteScheduler
 from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -49,7 +50,6 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmTransformer3DModel,
 )
-from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteScheduler
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
@@ -715,8 +715,8 @@ class SanaWmPipeline(
         )
 
         # Shared flow-matching Euler scheduler. NVlabs ``LTXFlowEuler`` drives
-        # diffusers' ``FlowMatchEulerDiscreteScheduler``; this is vLLM-Omni's
-        # vendored copy of it, including the ``per_token_timesteps`` step branch.
+        # diffusers' ``FlowMatchEulerDiscreteScheduler``, including the
+        # ``per_token_timesteps`` step branch.
         # The schedule applies the shift twice (once via the shifted ``sigma_min``
         # persisted by ``__init__``, once in ``set_timesteps``), which is what
         # reproduces the NVlabs timestep table (e.g. shift=9.8, N=3 ->
