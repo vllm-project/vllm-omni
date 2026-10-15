@@ -5,7 +5,7 @@
 native terminal state, in-flight no-resubmission, slot release on finish,
 and single scheduling of a terminal empty-prompt chunk."""
 
-from collections import deque
+from collections import defaultdict, deque
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +15,7 @@ from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerCo
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, _has_async_chunk_payload_to_run
@@ -174,6 +175,127 @@ class _HashableChunkRequest(SimpleNamespace):
     # Deferred queues require identity hashing; SimpleNamespace types it as None.
     __hash__ = object.__hash__  # type: ignore[assignment]
     __eq__ = object.__eq__
+
+
+def _make_full_payload_scheduler(requests, *, already_running=False, chunked_prefill=True):
+    scheduler = _make_generation_scheduler(requests[0])
+    scheduler.max_num_running_reqs = len(requests)
+    scheduler.chunk_transfer_adapter = None
+    scheduler.scheduler_config.enable_chunked_prefill = chunked_prefill
+    scheduler._process_pending_omni_inputs = lambda **kwargs: None
+    scheduler._postprocess_omni_schedule_output = lambda output: None
+    scheduler._restore_omni_wait_queues = lambda: None
+    scheduler._record_prefill_stats = lambda request: None
+    scheduler.waiting = create_request_queue(scheduler.policy)
+    scheduler.requests = {request.request_id: request for request in requests}
+    for request in requests:
+        if already_running:
+            request.status = RequestStatus.RUNNING
+            scheduler.running.append(request)
+        else:
+            scheduler.waiting.add_request(request)
+    # Exercise the real finish_requests/_free_request cleanup on rejection.
+    scheduler._inflight_prefills = set()
+    scheduler.finished_req_ids_dict = defaultdict(set)
+    scheduler.defer_block_free = False
+    scheduler.encoder_cache_manager.free = lambda request: None
+    scheduler.kv_cache_manager.free = lambda request: None
+    return scheduler
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+@pytest.mark.parametrize("chunked_prefill", [False, True])
+def test_full_payload_is_deferred_without_partial_execution(already_running, chunked_prefill):
+    requests = [
+        Request(name, [0] * 6, SamplingParams(max_tokens=1), pooling_params=None) for name in ("first", "second")
+    ]
+    scheduler = _make_full_payload_scheduler(requests, already_running=already_running, chunked_prefill=chunked_prefill)
+    allocations = []
+    allocate = scheduler.kv_cache_manager.allocate_slots
+
+    def record_allocation(request, num_tokens, **kwargs):
+        allocations.append((request.request_id, num_tokens))
+        return allocate(request, num_tokens, **kwargs)
+
+    scheduler.kv_cache_manager.allocate_slots = record_allocation
+    assert scheduler.schedule().num_scheduled_tokens == {"first": 6}
+    assert requests[1].num_computed_tokens == 0
+    assert allocations == [("first", 6)]
+    requests[0].num_computed_tokens = 6
+    assert scheduler.schedule().num_scheduled_tokens == {"second": 6}
+    assert allocations == [("first", 6), ("second", 6)]
+    requests[1].num_computed_tokens = 6
+    assert scheduler.schedule().num_scheduled_tokens == {}
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+@pytest.mark.parametrize("chunked_prefill", [False, True])
+@pytest.mark.parametrize("with_valid_request", [False, True])
+def test_oversized_payload_emits_request_error(already_running, chunked_prefill, with_valid_request):
+    oversized = Request("large", [0] * 9, SamplingParams(max_tokens=1), pooling_params=None, client_index=3)
+    valid = Request("valid", [0] * 8, SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler = _make_full_payload_scheduler(
+        [oversized, valid] if with_valid_request else [oversized],
+        already_running=already_running,
+        chunked_prefill=chunked_prefill,
+    )
+    freed = []
+    scheduler.kv_cache_manager.free = lambda request: freed.append(request.request_id)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == ({"valid": 8} if with_valid_request else {})
+    assert oversized.status == RequestStatus.FINISHED_ERROR
+    assert "large" not in scheduler.requests
+    assert oversized not in scheduler.running
+    assert oversized not in list(scheduler.waiting)
+    assert freed == ["large"]
+    outputs: dict[int, EngineCoreOutputs] = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    [error] = outputs[3].outputs
+    assert error.request_id == "large"
+    assert error.finish_reason == FinishReason.ERROR
+    assert "9 tokens" in error.stop_reason
+    assert "max_num_batched_tokens=8" in error.stop_reason
+    outputs = {}
+    scheduler._attach_finished_request_sets(outputs, synthesize_abort_outputs=False)
+    assert outputs == {}
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+def test_full_payload_allocation_failure_does_not_fall_back(monkeypatch, already_running):
+    request = Request("req", [0] * 8, SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler = _make_full_payload_scheduler([request], already_running=already_running)
+
+    def unexpected_fallback(*args, **kwargs):
+        pytest.fail("Full payloads must not fall back to the token-splitting scheduler")
+
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.Scheduler.schedule", unexpected_fallback)
+    allocate = scheduler.kv_cache_manager.allocate_slots
+    scheduler.kv_cache_manager.allocate_slots = lambda *args, **kwargs: None
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    assert request.num_computed_tokens == 0
+    assert request in scheduler.running or request in list(scheduler.waiting)
+    scheduler.kv_cache_manager.allocate_slots = allocate
+    assert scheduler.schedule().num_scheduled_tokens == {"req": 8}
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+def test_async_chunk_transport_keeps_existing_budget_behavior(already_running):
+    request = Request("chunk", [0] * 9, SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler = _make_full_payload_scheduler([request], already_running=already_running)
+    scheduler.chunk_transfer_adapter = FakeAdapter()
+    assert scheduler.schedule().num_scheduled_tokens == {"chunk": 8}
+    assert not request.is_finished()
+
+
+@pytest.mark.parametrize("already_running", [False, True])
+def test_paused_full_payload_scheduler_does_not_execute(already_running):
+    request = Request("req", [0] * 6, SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler = _make_full_payload_scheduler([request], already_running=already_running)
+    scheduler._pause_state = PauseState.PAUSED_ALL
+    assert scheduler.schedule().num_scheduled_tokens == {}
+    assert request.num_computed_tokens == 0
+    scheduler._pause_state = PauseState.UNPAUSED
+    assert scheduler.schedule().num_scheduled_tokens == {"req": 6}
 
 
 def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> None:
