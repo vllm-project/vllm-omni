@@ -28,6 +28,7 @@ from vllm_omni.diffusion.interaction.modality_handlers.prompt import (
     PromptSession,
 )
 from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -516,10 +517,13 @@ class TestPromptUpdateExecution:
         monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
         monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
 
-        scheduler_output = SimpleNamespace(
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=0,
             finished_req_ids=set(),
-            scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+            scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Admit request and run first denoise step (no chunk boundary yet).
         DiffusionModelRunner.execute_stepwise(runner, scheduler_output)  # pyright: ignore[reportArgumentType]
@@ -528,10 +532,13 @@ class TestPromptUpdateExecution:
 
         runner.submit_interaction("req", _prompt_interaction("new scene", transition_chunks=2))
 
-        cached = SimpleNamespace(
+        cached = DiffusionSchedulerOutput(
+            step_id=1,
             finished_req_ids=set(),
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+            scheduled_cached_reqs=CachedRequestData(request_ids=["req"]),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Second step completes chunk 0: apply runs (no peek), metadata staged.
         chunk0 = DiffusionModelRunner.execute_stepwise(runner, cached).get_request_output("req")  # pyright: ignore[reportArgumentType]

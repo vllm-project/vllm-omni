@@ -690,7 +690,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # tensors it copies from are torn down.
         self._shutdown_omni_prefix_cache()
 
-        # 7. Delegate to upstream shutdown (model = None, KV caches, workspace).
+        # 7. Drop the bound model method cached by load_model so it does not
+        #    keep the model alive after upstream sets self.model = None.
+        self._sampled_token_ids_cpu_override = None
+
+        # 8. Delegate to upstream shutdown (model = None, KV caches, workspace).
         super().shutdown()
 
     def _capture_talker_mtp_graphs(self, skip_full: bool = False) -> None:

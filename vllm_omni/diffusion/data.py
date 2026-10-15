@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import diffusers
 import huggingface_hub
+import numpy as np
 import torch
 from PIL import Image
 from pydantic import model_validator
@@ -1911,6 +1912,38 @@ class DiffusionOutput:
     # migrated to typed media. Only this tuple entry is eligible for video
     # transport optimizations; unmarked legacy outputs retain their old path.
     video_output_index: int | None = None
+
+    # Host-side playback diagnostics; carried through the existing output metadata.
+    streaming_metrics: dict[str, float | int] = field(default_factory=dict)
+
+    def output_nbytes(self) -> int:
+        """Payload bytes retained by one decoded output, excluding model workspace."""
+
+        def size(value: Any) -> int:
+            if isinstance(value, torch.Tensor):
+                return value.untyped_storage().nbytes()
+            if isinstance(value, np.ndarray):
+                return value.nbytes
+            if isinstance(value, Image.Image):
+                return value.width * value.height * len(value.getbands())
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return len(value)
+            if isinstance(value, dict):
+                return sum(size(item) for item in value.values())
+            if isinstance(value, (tuple, list)):
+                return sum(size(item) for item in value)
+            return 0
+
+        return sum(
+            size(value)
+            for value in (
+                self.media.video.tensor if self.media is not None else self.output,
+                self.trajectory_timesteps,
+                self.trajectory_latents,
+                self.trajectory_log_probs,
+                self.trajectory_decoded,
+            )
+        )
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):

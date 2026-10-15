@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import janus
 import torch
@@ -366,6 +366,7 @@ class OrchestratorBase:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
+        self._interaction_queue: asyncio.Queue[InteractionMessage] = asyncio.Queue(maxsize=64)
 
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
@@ -3301,6 +3302,27 @@ class OrchestratorBase:
 class Orchestrator(OrchestratorBase):
     """Turn-based orchestrator: admits ``add_request`` / streaming / companion / interaction messages."""
 
+    def _background_tasks(self) -> list[Coroutine[Any, Any, None]]:
+        return [*super()._background_tasks(), self._interaction_worker()]
+
+    async def _interaction_worker(self) -> None:
+        # Keep interaction order, without holding up playback feedback or aborts
+        # while a worker RPC waits for the current GPU chunk to finish.
+        async def consume() -> None:
+            while True:
+                await self._handle_interaction(await self._interaction_queue.get())
+
+        consumer = asyncio.create_task(consume())
+        shutdown = asyncio.create_task(self._shutdown_event.wait())
+        try:
+            done, _ = await asyncio.wait({consumer, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+            if consumer in done:
+                await consumer
+        finally:
+            consumer.cancel()
+            shutdown.cancel()
+            await asyncio.gather(consumer, shutdown, return_exceptions=True)
+
     async def _dispatch_message(self, msg: EngineQueueMessage) -> bool:
         msg_type = msg.type
         if msg_type == "add_request":
@@ -3310,7 +3332,21 @@ class Orchestrator(OrchestratorBase):
         elif msg_type == "add_companion_request":
             await self._handle_add_companion(msg)
         elif msg_type == "interaction":
-            await self._handle_interaction(msg)
+            interaction = cast(InteractionMessage, msg)
+            try:
+                self._interaction_queue.put_nowait(interaction)
+            except asyncio.QueueFull:
+                # This is a request-scoped failure: terminate the overloaded
+                # stream rather than silently dropping camera commands.
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        error="Too many pending interactions",
+                        fatal=False,
+                        request_id=interaction.request_id,
+                        event_id=interaction.interaction.get("event_id"),
+                        stage_id=0,
+                    )
+                )
         else:
             return False
         return True

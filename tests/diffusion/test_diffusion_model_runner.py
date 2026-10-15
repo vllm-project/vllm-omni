@@ -383,16 +383,13 @@ def test_execute_stepwise_falls_back_to_full_forward_without_creating_step_state
     request = _make_request()
     request.request_id = "text-request"
     request.use_step_execution = False
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids=set(),
-        scheduled_new_reqs=[
-            SimpleNamespace(
-                request_id=request.request_id,
-                req=request,
-                diffusion_kv_metadata=None,
-            )
-        ],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
@@ -433,16 +430,13 @@ def test_non_step_fallback_cleans_finished_step_wave_state_and_paged_kv(monkeypa
     text_request = _make_request()
     text_request.request_id = "text-fallback-request"
     text_request.use_step_execution = False
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids={"aborted-step-request"},
-        scheduled_new_reqs=[
-            SimpleNamespace(
-                request_id=text_request.request_id,
-                req=text_request,
-                diffusion_kv_metadata=None,
-            )
-        ],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_new_reqs=[NewRequestData(request_id=text_request.request_id, req=text_request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
@@ -463,21 +457,16 @@ def test_execute_stepwise_rejects_mixed_step_and_full_forward_batch():
     non_step_request.use_step_execution = False
     step_request = _make_request()
     step_request.request_id = "step-request"
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids=set(),
         scheduled_new_reqs=[
-            SimpleNamespace(
-                request_id=non_step_request.request_id,
-                req=non_step_request,
-                diffusion_kv_metadata=None,
-            ),
-            SimpleNamespace(
-                request_id=step_request.request_id,
-                req=step_request,
-                diffusion_kv_metadata=None,
-            ),
+            NewRequestData(request_id=non_step_request.request_id, req=non_step_request),
+            NewRequestData(request_id=step_request.request_id, req=step_request),
         ],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
     )
 
     with pytest.raises(ValueError, match="Cannot mix stepwise and non-step fallback"):
@@ -646,20 +635,26 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
     monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids=set(),
-        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
 
     first = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert first.get_request_output("req").result is None
     assert sent == []
 
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=1,
         finished_req_ids=set(),
         scheduled_new_reqs=[],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+        scheduled_cached_reqs=CachedRequestData(request_ids=["req"]),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
     second = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert second.get_request_output("req").result == chunks[0]
@@ -731,10 +726,13 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids=set(),
-        scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
 
     output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")

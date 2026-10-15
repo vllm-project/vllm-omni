@@ -14,6 +14,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
@@ -33,7 +34,7 @@ from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -264,6 +265,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
+            for index, params in enumerate(req_sp_list):
+                if isinstance(params, OmniDiffusionSamplingParams) and params.streaming_buffer_seconds is not None:
+                    self.validate_streaming_playback_request()
+                    req_sp_list[index] = replace(params, streaming_output_ack=True)
             pd_pair = self._get_pd_separation_pair()
             if pd_pair is not None:
                 p_id = pd_pair[0]
@@ -324,6 +329,13 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 wall_start_ts,
             ):
                 yield output
+                metadata = (getattr(output, "multimodal_output", None) or {}).get("metadata", {})
+                stream = metadata.get("stream", {}) if isinstance(metadata, dict) else {}
+                chunk_index = stream.get("output_chunk_index") if isinstance(stream, dict) else None
+                if chunk_index is not None:
+                    await self._engine_core_rpc(
+                        "release_streaming_output", stage_ids=[0], args=(request_id, chunk_index)
+                    )
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
@@ -626,6 +638,20 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # aborted. This is also what happens in this case in vLLM's output processor.
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids, timeout=timeout)
+
+    async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
+        """Forward external-session playback progress to the diffusion engine."""
+        self.validate_streaming_playback_request()
+        for state in list(self.request_states.values()):
+            if state.external_request_id == request_id:
+                await self._engine_core_rpc(
+                    "update_streaming_playback", stage_ids=[0], args=(state.request_id, position_seconds)
+                )
+
+    def validate_streaming_playback_request(self) -> None:
+        """Validate pacing topology before a realtime video request starts."""
+        if self.num_stages != 1 or self.engine.get_stage_metadata(0).stage_type != "diffusion":
+            raise ValueError("playback feedback requires single-stage diffusion")
 
     async def submit_interaction_async(
         self,
