@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from vllm_omni.entrypoints.api_server_shared_dir import create_api_server_shared_dir, remove_api_server_shared_dir
-from vllm_omni.model_executor.models.moss_tts import shared_reference_encoder as shared
+from vllm_omni.utils import shared_reference_encoder as shared
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -34,7 +34,7 @@ class _Recorder:
 
 @pytest.fixture
 def host_dir(monkeypatch):
-    monkeypatch.setattr(shared, "_host_lock_handle", None)
+    monkeypatch.setattr(shared, "_host_lock_handles", {})
     # AF_UNIX limits the full socket path: use the server's short directory,
     # not pytest's nested one.
     path = create_api_server_shared_dir()

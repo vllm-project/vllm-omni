@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for `estimate_prompt_len_from_additional_information`.
 
 Pins the 2D `voice_clone_prompt.ref_code` shape behaviour. Applying the
@@ -148,3 +151,38 @@ def test_estimate_prompt_len_uses_list_of_int_ref_ids_from_voice_clone_prompt() 
         f"got delta={est_50 - est_30}; expected 20 (= 50 - 30 extra ref_ids). "
         f"Did `_first(ref_ids)` collapse the list to its first int?"
     )
+
+
+def test_api_reference_artifacts_agree_on_frames_with_estimate_and_talker() -> None:
+    """The API server's precomputed ref codes keep the per-item 2D contract."""
+    import torch
+
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import voice_clone_prompt_ref_code
+    from vllm_omni.model_executor.models.qwen3_tts.reference_encoder import ReferenceArtifacts
+
+    num_frames, num_codebooks = 73, 16
+    artifacts = ReferenceArtifacts(
+        ref_code=torch.arange(num_frames * num_codebooks).view(num_frames, num_codebooks),
+        ref_spk_embedding=torch.linspace(-1, 1, 32, dtype=torch.bfloat16),
+    )
+    prompt = artifacts.voice_clone_prompt(icl_mode=True)
+    info = {
+        "task_type": ["Base"],
+        "text": ["hello"],
+        "ref_text": ["world"],
+        "voice_clone_prompt": [prompt],
+        "non_streaming_mode": [False],
+        "language": ["English"],
+    }
+    est = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information=info,
+        task_type="Base",
+        tokenize_prompt=_fake_tokenize,
+        codec_language_id={"english": 0},
+        spk_is_dialect=None,
+    )
+    ref_code = voice_clone_prompt_ref_code(prompt["ref_code"], device=torch.device("cpu"))
+    assert torch.equal(ref_code, artifacts.ref_code)
+    # Streaming ICL prompt length is aligned to codec_bos + ref_code frames.
+    assert est >= 1 + num_frames
+    assert torch.equal(torch.tensor(prompt["ref_spk_embedding"], dtype=torch.bfloat16), artifacts.ref_spk_embedding)

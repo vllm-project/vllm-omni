@@ -3,6 +3,7 @@
 """Qwen3-TTS serving adapter."""
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import regex as re
+import torch
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.utils.async_utils import make_async
@@ -21,8 +23,12 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     TTSGenerationError,
     conditioning_cache_salt,
+    resolve_stage_model_path,
+    stage_additional_config,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.shared_reference_encoder import ReferenceEncoderSpec
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -121,15 +127,6 @@ def _first_value(value: object) -> object:
     return value
 
 
-def _stage_additional_config(stage: Any) -> Mapping[str, Any] | None:
-    """Return the Talker stage ``additional_config`` from typed or legacy stage configs."""
-    for owner in (getattr(stage, "runtime_config", None), getattr(stage, "engine_args", None)):
-        config = getattr(owner, "additional_config", None)
-        if isinstance(config, Mapping):
-            return config
-    return None
-
-
 def _ref_audio_wire_waveform(waveform: np.ndarray) -> dict[str, Any]:
     """Encode a float32 waveform as raw bytes for the engine request.
 
@@ -162,7 +159,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         self._estimate_prompt_len_async = make_async(
             self._estimate_prompt_len, executor=getattr(ctx.server, "_tts_executor", None)
         )
-        self.codec_budgets = load_codec_budgets(_stage_additional_config(getattr(ctx.server, "_tts_stage", None)))
+        additional_config = stage_additional_config(getattr(ctx.server, "_tts_stage", None))
+        self.codec_budgets = load_codec_budgets(additional_config)
+        # Base voice cloning: encode reference clips in encoder processes of
+        # the API server, before admission, instead of in the Talker step
+        # (see qwen3_tts/reference_encoder.py).
+        self._api_reference_encode = bool(additional_config.get("ref_audio_encode_in_api_server", False))
+        self._reference_workers = int(additional_config.get("ref_audio_encode_workers", 2))
         logger.info(
             "Qwen3-TTS default codec budgets (frames): %s",
             ", ".join(
@@ -585,6 +588,10 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             artifact_key = server._get_resolved_ref_audio_artifact_key(cache_key)
             if artifact_key:
                 tts_params[_REF_AUDIO_CACHE_KEY] = [artifact_key]
+            if self._api_reference_encode and "voice_clone_prompt" not in tts_params:
+                await self._attach_reference_artifacts(tts_params, waveform, sr)
+                tts_params.pop(_REF_AUDIO_CACHE_KEY, None)
+                return await self._finish_build(request, tts_params)
             ref_code_length = self._estimate_ref_code_len([waveform, sr])
             if ref_code_length is not None:
                 tts_params["ref_code_length"] = [int(ref_code_length)]
@@ -594,7 +601,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             # The artifact key lets a cache hit skip ref_code / speaker
             # encoding; a miss recomputes from this payload instead of failing.
             tts_params["ref_audio"] = [[_ref_audio_wire_waveform(waveform), sr]]
+        return await self._finish_build(request, tts_params)
 
+    async def _finish_build(self, request: "OpenAICreateSpeechRequest", tts_params: dict[str, Any]) -> PreparedRequest:
         ph_len = await self._estimate_prompt_len_async(tts_params)
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = tts_params
@@ -604,6 +613,47 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             tts_params=tts_params,
             model_type=tts_params.get("task_type", ["unknown"])[0],
         )
+
+    def reference_encoder_spec(self) -> ReferenceEncoderSpec | None:
+        if not self._api_reference_encode:
+            return None
+        model_path = resolve_stage_model_path(self.ctx.engine_client)
+        if model_path is None:
+            raise RuntimeError("Qwen3-TTS reference encoding needs the model path")
+        model_config = getattr(self.ctx.engine_client, "model_config", None)
+        dtype = getattr(model_config, "dtype", None)
+        module = "vllm_omni.model_executor.models.qwen3_tts.reference_encoder"
+        # x-vectors are host-bound: clips encode in parallel only in separate processes.
+        return ReferenceEncoderSpec(
+            name="qwen3-tts-ref",
+            factory=f"{module}:Qwen3TTSReferenceEncoder",
+            kwargs={
+                "model_path": model_path,
+                "device": current_omni_platform.device_type,
+                "construct_dtype": dtype if isinstance(dtype, torch.dtype) else torch.bfloat16,
+            },
+            wire=f"{module}:QWEN3_TTS_REFERENCE_WIRE",
+            namespace=f"qwen3_tts:{os.path.realpath(model_path)}",
+            nbytes=lambda artifacts: artifacts.nbytes,
+            workers=self._reference_workers,
+        )
+
+    async def _attach_reference_artifacts(self, tts_params: dict[str, Any], waveform: np.ndarray, sr: int) -> None:
+        """Send the clip's ICL codes and x-vector instead of the waveform.
+
+        The clip is flattened exactly as the Talker's ``normalize_ref_audio``
+        reads the waveform it would otherwise receive.
+        """
+        from vllm_omni.model_executor.models.qwen3_tts.reference_encoder import MIN_REFERENCE_SAMPLES
+
+        wav = np.ascontiguousarray(waveform, dtype=np.float32).reshape(-1)
+        if wav.size < MIN_REFERENCE_SAMPLES:
+            raise ValueError(f"ref_audio waveform too short: {wav.size} samples")
+        artifacts = await self.encode_reference(wav, int(sr))
+        x_vector_only = bool((tts_params.get("x_vector_only_mode") or [False])[0])
+        tts_params["voice_clone_prompt"] = [artifacts.voice_clone_prompt(icl_mode=not x_vector_only)]
+        if not x_vector_only:
+            tts_params["ref_code_length"] = [int(artifacts.ref_code.shape[0])]
 
     def _get_expected_speaker_embedding_dim(self) -> int:
         """Return the loaded Qwen3-TTS speaker embedding dim, if known.

@@ -11,6 +11,7 @@ instead of editing the shared serving module in ~10 scattered places.
 See the RFC for the full design (issue #4327).
 """
 
+import asyncio
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -24,7 +25,10 @@ from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_fr
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.utils.shared_reference_encoder import ReferenceEncoderPool, ReferenceEncoderSpec
 
 DEFAULT_TTS_LANGUAGES = frozenset(
     {
@@ -56,6 +60,15 @@ def resolve_stage_model_path(engine_client: Any) -> str | None:
             return str(model_path)
     model_path = getattr(engine_client, "model", None)
     return str(model_path) if model_path else None
+
+
+def stage_additional_config(stage: Any) -> Mapping[str, Any]:
+    """The serving stage's ``additional_config`` from typed or legacy stage configs (empty if none)."""
+    for owner in (getattr(stage, "runtime_config", None), getattr(stage, "engine_args", None)):
+        config = getattr(owner, "additional_config", None)
+        if isinstance(config, Mapping):
+            return config
+    return {}
 
 
 def conditioning_cache_salt(
@@ -412,6 +425,49 @@ class ARTTSAdapter(TTSModelAdapter):
     """
 
     backend: ClassVar[str] = "ar"
+
+    _reference_pool: "ReferenceEncoderPool | None" = None
+    _reference_pool_lock: asyncio.Lock | None = None
+
+    def reference_encoder_spec(self) -> "ReferenceEncoderSpec | None":
+        """The model's reference encoder, when this server encodes voice-clone references.
+
+        A spec starts the encoder with the server (``warmup``), in worker
+        processes shared by all of the server's API processes, and
+        ``encode_reference`` serves each clip's artifact from a content-keyed
+        cache. Default: the API server does not encode references.
+        """
+        return None
+
+    async def warmup(self) -> None:
+        try:
+            await self._start_reference_encoder()
+        except Exception:  # noqa: BLE001 - only voice cloning depends on it; its requests report the failure
+            logger.exception("%s reference encoder failed to start; voice cloning requests will fail", self.name)
+
+    async def encode_reference(self, waveform: "np.ndarray", sample_rate: int) -> Any:
+        """The artifact of one reference clip, from the model's ``reference_encoder_spec`` encoder."""
+        pool = await self._start_reference_encoder()
+        if pool is None:
+            raise RuntimeError(f"{self.name} does not encode reference audio in the API server")
+        return await pool.get(waveform, sample_rate)
+
+    async def _start_reference_encoder(self) -> "ReferenceEncoderPool | None":
+        if self._reference_pool is None:
+            if self._reference_pool_lock is None:
+                self._reference_pool_lock = asyncio.Lock()
+            async with self._reference_pool_lock:
+                if self._reference_pool is None:
+                    spec = self.reference_encoder_spec()
+                    if spec is None:
+                        return None
+                    from vllm_omni.utils.shared_reference_encoder import ReferenceEncoderPool
+
+                    self._reference_pool = ReferenceEncoderPool(
+                        spec, getattr(self.ctx.server, "api_server_shared_dir", None)
+                    )
+        await self._reference_pool.start()
+        return self._reference_pool
 
 
 class DiffusionTTSAdapter(TTSModelAdapter):

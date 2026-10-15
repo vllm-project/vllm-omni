@@ -270,27 +270,36 @@ def _encode_ref_audio_codes(
 
     Returns shape ``[num_codebooks, T_raw]`` (before BOS/EOS + delay-pattern wrap).
     """
-    import torchaudio
-
     global _ENCODER_CACHE
     if _ENCODER_CACHE is None:
-        try:
-            _ENCODER_CACHE = _load_audio_tokenizer()
-        except ImportError as exc:
-            raise RuntimeError(
-                "higgs_audio_v2 voice clone needs `transformers>=5.3.0` "
-                "(which ships the HiggsAudioV2TokenizerModel class). "
-                "Install via `pip install -U 'transformers>=5.3.0'`."
-            ) from exc
+        _ENCODER_CACHE = load_audio_tokenizer()
+    return encode_ref_audio_codes_with(_ENCODER_CACHE, wav, sr)
 
-    target_sr = int(getattr(_ENCODER_CACHE.config, "sample_rate", 24000))
+
+def load_audio_tokenizer():
+    """The codec encoder for reference clips (see ``_load_audio_tokenizer``)."""
+    try:
+        return _load_audio_tokenizer()
+    except ImportError as exc:
+        raise RuntimeError(
+            "higgs_audio_v2 voice clone needs `transformers>=5.3.0` "
+            "(which ships the HiggsAudioV2TokenizerModel class). "
+            "Install via `pip install -U 'transformers>=5.3.0'`."
+        ) from exc
+
+
+def encode_ref_audio_codes_with(model: Any, wav: np.ndarray, sr: int) -> torch.Tensor:
+    """Encode one ref clip with a loaded codec ``model``; returns ``[num_codebooks, T_raw]``."""
+    import torchaudio
+
+    target_sr = int(getattr(model.config, "sample_rate", 24000))
     wav_t = torch.as_tensor(wav, dtype=torch.float32).reshape(-1)
     if sr and sr != target_sr:
         wav_t = torchaudio.functional.resample(wav_t, sr, target_sr)
     # HF encode() expects (batch=1, channels=1, num_samples).
-    input_values = wav_t.unsqueeze(0).unsqueeze(0).to(_ENCODER_CACHE.device)
+    input_values = wav_t.unsqueeze(0).unsqueeze(0).to(model.device)
     with torch.inference_mode():
-        codes = _ENCODER_CACHE.encode(input_values, return_dict=False)
+        codes = model.encode(input_values, return_dict=False)
     # codes shape: (batch=1, num_quantizers, codes_length) -> (num_quantizers, T).
     if codes.dim() == 3:
         codes = codes.squeeze(0)

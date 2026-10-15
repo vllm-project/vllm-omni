@@ -2031,8 +2031,7 @@ class TestTTSMethods:
         speech_server._adapter = speech_server._get_tts_adapter()
         speech_server._adapter._resolve_higgs_audio_v3_adapter = mocker.AsyncMock(return_value=adapter)
         codes = torch.arange(16, dtype=torch.long).view(2, 8)
-        speech_server._adapter._resolve_higgs_audio_v3_ref_codes = mocker.AsyncMock(return_value=(codes, False, False))
-        speech_server._adapter._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value="art")
+        speech_server._adapter._higgs_audio_v3_ref_codes = mocker.AsyncMock(return_value=codes)
 
         req = OpenAICreateSpeechRequest(
             input="hello",

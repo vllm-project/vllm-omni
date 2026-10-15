@@ -21,7 +21,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
-from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
@@ -40,6 +39,7 @@ from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 from .first_audio import talker_first_audio_enabled
 from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+from .reference_encoder import encode_reference_codes
 from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Encoder
@@ -1186,32 +1186,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             self._req_x_vector_only = {k: v for k, v in self._req_x_vector_only.items() if k in live}
 
     def _encode_ref_audio_batch(self, wavs: list[np.ndarray], sr: int, *, device: torch.device) -> list[torch.Tensor]:
-        fe = self._encoder_feature_extractor
-        target_sr = int(fe.sampling_rate)
-        if int(sr) != target_sr:
-            resampler = AudioResampler(target_sr=target_sr)
-            wavs = [resampler.resample(w.astype(np.float32), orig_sr=int(sr)) for w in wavs]
-
-        inputs = fe(
-            raw_audio=wavs,
-            sampling_rate=target_sr,
-            return_tensors="pt",
+        return encode_reference_codes(
+            self.encoder,
+            self._encoder_feature_extractor,
+            wavs,
+            sr,
+            device=device,
+            downsample_rate=self._encoder_downsample_rate,
+            num_quantizers=self._encoder_valid_num_quantizers,
         )
-        input_values = inputs["input_values"].squeeze(1).to(device=device, dtype=torch.bfloat16)
-        downsample = self._encoder_downsample_rate
-        valid_code_lengths = [(int(wav.size) + downsample - 1) // downsample for wav in wavs]
-
-        with torch.inference_mode():
-            encoded = self.encoder.encode(
-                input_values=input_values.unsqueeze(1),
-                return_dict=True,
-            )
-
-        audio_codes = encoded.audio_codes[:, : self._encoder_valid_num_quantizers]
-        return [
-            code[:, : int(valid_len)].transpose(0, 1).to(dtype=torch.long).contiguous()
-            for code, valid_len in zip(audio_codes, valid_code_lengths, strict=True)
-        ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         self._prompt_builder._projected_token_cache.clear()

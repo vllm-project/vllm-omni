@@ -53,6 +53,7 @@ from vllm_omni.model_executor.models.moss_tts.shared_reference_encoder import (
     elect_host,
     socket_path_fits,
 )
+from vllm_omni.utils.reference_encoding import MicroBatcher
 
 logger = init_logger(__name__)
 
@@ -227,117 +228,15 @@ def _registered_voice(voice_name: str | None, voice_created_at: int) -> tuple[st
     return None, 0
 
 
-class _RefEncodeBatcher:
-    """Coalesce cold reference encodes into batched processor forwards."""
+class _RefEncodeBatcher(MicroBatcher):
+    """Coalesce cold reference encodes into batched processor forwards.
 
-    def __init__(
-        self,
-        encode_batch_fn: Callable[[list[tuple[_Waveform, int]]], list],
-        *,
-        window_ms: float,
-        max_batch: int,
-        max_inflight: int = 1,
-    ):
-        # encode_batch_fn: sync, takes [(waveform, sr), ...], returns a list of
-        # (codes_tensor | Exception) aligned to the input order.
-        self._encode_batch_fn = encode_batch_fn
-        self._window_s = max(0.0, float(window_ms) / 1000.0)
-        self._max_batch = max(1, int(max_batch))
-        # Batches encoded at once. Clips that arrive while every slot is busy
-        # are queued and form the next batch.
-        self._max_inflight = max(1, int(max_inflight))
-        self._queue: asyncio.Queue | None = None
-        self._slots: asyncio.Semaphore | None = None
-        self._inflight: set[asyncio.Task] = set()
-        self._drainer: asyncio.Task | None = None
+    ``encode_batch_fn`` takes ``[(waveform, sr), ...]`` and returns a list of
+    (codes tensor | Exception) aligned to the input order.
+    """
 
-    def _ensure_started(self) -> None:
-        if self._queue is None:
-            self._queue = asyncio.Queue()
-        if self._slots is None:
-            self._slots = asyncio.Semaphore(self._max_inflight)
-        if self._drainer is None or self._drainer.done():
-            self._drainer = asyncio.create_task(self._drain_loop())
-
-    async def submit(self, waveform: _Waveform, sr: int) -> torch.Tensor:
-        self._ensure_started()
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._queue.put_nowait((waveform, sr, fut))  # type: ignore[union-attr]
-        return await fut
-
-    async def _drain_loop(self) -> None:
-        assert self._queue is not None and self._slots is not None
-        while True:
-            await self._slots.acquire()
-            try:
-                jobs = await self._coalesce(await self._queue.get())
-            except BaseException:
-                self._slots.release()
-                raise
-            task = asyncio.create_task(self._run_and_release(jobs))
-            self._inflight.add(task)
-            task.add_done_callback(self._inflight.discard)
-            # Do not retain the batch here while waiting for new work.
-            del jobs
-
-    async def _run_and_release(self, jobs: list[tuple[_Waveform, int, asyncio.Future]]) -> None:
-        try:
-            await self._run_batch(jobs)
-        finally:
-            del jobs
-            assert self._slots is not None
-            self._slots.release()
-
-    async def _coalesce(self, first: tuple) -> list[tuple]:
-        """Group ``first`` with jobs arriving within the batch window."""
-        jobs = [first]
-        if self._window_s > 0:
-            deadline = asyncio.get_running_loop().time() + self._window_s
-            while len(jobs) < self._max_batch:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                try:
-                    jobs.append(await asyncio.wait_for(self._queue.get(), remaining))
-                except asyncio.TimeoutError:
-                    break
-        else:
-            # window=0: coalesce only what is already queued, never wait.
-            while len(jobs) < self._max_batch:
-                try:
-                    jobs.append(self._queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-        return jobs
-
-    async def _run_batch(self, jobs: list[tuple[_Waveform, int, asyncio.Future]]) -> None:
-        payload = [(waveform, sr) for waveform, sr, _ in jobs]
-        futs = [fut for _, _, fut in jobs]
-        try:
-            results = await asyncio.to_thread(self._encode_batch_fn, payload)
-        except Exception as exc:  # noqa: BLE001 — propagate the batch failure to every waiter
-            for fut in futs:
-                if not fut.done():
-                    fut.set_exception(exc)
-            return
-        for fut, res in zip(futs, results):
-            if fut.done():
-                continue
-            if isinstance(res, BaseException):
-                fut.set_exception(res)
-            else:
-                fut.set_result(res)
-
-    async def aclose(self) -> None:
-        if self._drainer is not None:
-            self._drainer.cancel()
-            try:
-                await self._drainer
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-            self._drainer = None
-        for task in list(self._inflight):
-            task.cancel()
+    async def submit(self, waveform: _Waveform, sr: int) -> torch.Tensor:  # type: ignore[override]
+        return await super().submit((waveform, sr))
 
 
 class MossReferenceEncoder:

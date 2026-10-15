@@ -10,7 +10,6 @@ without requiring the actual checkpoint or GPU.
 import asyncio
 import json
 import os
-import time
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -1713,64 +1712,60 @@ class TestVoiceCloneReferenceCache:
         assert tok._normalize_audio_tokenizer_dir(str(parent)) is None
         assert tok._resolve_audio_tokenizer_dir() is None
 
-    def test_higgs_v3_ref_code_cache_returns_clone(self):
-        adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
+    @staticmethod
+    def _fake_codec():
+        class FakeCodec:
+            """Four codebooks, one frame per 960 samples at 24 kHz."""
 
-        codes = torch.arange(16, dtype=torch.long).reshape(2, 8)
-        adapter._put_higgs_audio_v3_ref_codes("ref-a", codes)
+            config = SimpleNamespace(sample_rate=24000)
+            device = torch.device("cpu")
+            calls = 0
 
-        cached = adapter._get_higgs_audio_v3_ref_codes("ref-a")
-        assert cached is not None
-        cached.fill_(0)
+            def encode(self, input_values, return_dict=False):
+                FakeCodec.calls += 1
+                frames = input_values.shape[-1] // 960
+                if frames == 0:
+                    raise ValueError("clip too short")
+                return (torch.arange(4 * frames).reshape(1, 4, frames) % 1024).to(input_values.device)
 
-        cached_again = adapter._get_higgs_audio_v3_ref_codes("ref-a")
-        assert cached_again is not None
-        assert torch.equal(cached_again, codes)
+        return FakeCodec()
 
-    def test_higgs_v3_ref_code_inflight_deduplicates_concurrent_encode(self):
-        adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
-        calls = 0
+    def test_reference_encoder_yields_delayed_codes_and_per_clip_errors(self, monkeypatch):
+        import numpy as np
 
-        def encode_reference_audio(_wav, _sr):
-            nonlocal calls
-            calls += 1
-            time.sleep(0.05)
-            return torch.arange(16, dtype=torch.long).reshape(2, 8)
+        from vllm_omni.model_executor.models.higgs_audio_v3 import reference_encoder as ref
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import apply_delay_pattern
 
-        def apply_delay_pattern(codes):
-            return codes + 1
+        monkeypatch.setattr(ref, "load_audio_tokenizer", self._fake_codec)
+        encoder = ref.HiggsAudioV3ReferenceEncoder()
+        good, bad = encoder.encode_batch(
+            [(np.zeros(960 * 5, dtype=np.float32), 24000), (np.zeros(10, np.float32), 24000)]
+        )
+
+        expected = apply_delay_pattern((torch.arange(20).reshape(4, 5) % 1024).transpose(0, 1).contiguous())
+        assert good.dtype == torch.long and torch.equal(good, expected)
+        assert isinstance(bad, ValueError)
+        wire = ref.HIGGS_AUDIO_V3_REFERENCE_WIRE
+        assert torch.equal(wire.artifact_from_arrays(wire.artifact_to_arrays(good)), good)
+
+    def test_adapter_encodes_each_clip_once_and_returns_copies(self, monkeypatch):
+        import numpy as np
+
+        from vllm_omni.model_executor.models.higgs_audio_v3 import reference_encoder as ref
+
+        codec = self._fake_codec()
+        monkeypatch.setattr(ref, "load_audio_tokenizer", lambda: codec)
+        stage = SimpleNamespace(runtime_config=SimpleNamespace(additional_config={"ref_audio_encode_workers": 0}))
+        adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace(_tts_stage=stage)))
+        wav = np.linspace(-1, 1, 960 * 3, dtype=np.float32)
 
         async def run():
-            return await asyncio.gather(
-                *[
-                    adapter._resolve_higgs_audio_v3_ref_codes(
-                        "ref-a",
-                        object(),
-                        24000,
-                        encode_reference_audio,
-                        apply_delay_pattern,
-                    )
-                    for _ in range(3)
-                ]
-            )
+            await adapter.warmup()
+            first = await asyncio.gather(*[adapter._higgs_audio_v3_ref_codes(wav, 24000) for _ in range(3)])
+            first[0].fill_(0)
+            return first, await adapter._higgs_audio_v3_ref_codes(wav.copy(), 24000)
 
-        results = asyncio.run(run())
-        assert calls == 1
-        assert sum(int(inflight_wait) for _, _, inflight_wait in results) == 2
-        for codes, cache_hit, _ in results:
-            assert cache_hit is False
-            assert torch.equal(codes, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
-
-        cached, cache_hit, inflight_wait = asyncio.run(
-            adapter._resolve_higgs_audio_v3_ref_codes(
-                "ref-a",
-                object(),
-                24000,
-                encode_reference_audio,
-                apply_delay_pattern,
-            )
-        )
-        assert calls == 1
-        assert cache_hit is True
-        assert inflight_wait is False
-        assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
+        (a, b, c), again = asyncio.run(run())
+        assert type(codec).calls == 1
+        assert torch.equal(b, c) and torch.equal(again, b)
+        assert again.shape == (3 + 4 - 1, 4)

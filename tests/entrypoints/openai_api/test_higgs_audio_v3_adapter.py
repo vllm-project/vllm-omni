@@ -2,128 +2,87 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
-import gc
 import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v3 import HiggsAudioV3Adapter
+from vllm_omni.model_executor.models.higgs_audio_v3 import reference_encoder as ref
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_ref_code_inflight_survives_request_cancellation():
-    adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
-    encode_started = threading.Event()
-    release_encode = threading.Event()
-    calls = 0
-    expected_codes = torch.arange(16, dtype=torch.long).reshape(2, 8) + 1
+class _GatedCodec:
+    """Encodes only once released; raises for clips starting with a negative sample."""
 
-    def encode_reference_audio(_wav, _sr):
-        nonlocal calls
-        calls += 1
-        encode_started.set()
-        assert release_encode.wait(timeout=5)
-        return torch.arange(16, dtype=torch.long).reshape(2, 8)
+    config = SimpleNamespace(sample_rate=24000)
+    device = torch.device("cpu")
 
-    def apply_delay_pattern(codes):
-        return codes + 1
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
 
-    async def resolve():
-        return await adapter._resolve_higgs_audio_v3_ref_codes(
-            "ref-a",
-            object(),
-            24000,
-            encode_reference_audio,
-            apply_delay_pattern,
-        )
+    def encode(self, input_values, return_dict=False):
+        self.calls += 1
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        if float(input_values.reshape(-1)[0]) < 0:
+            raise RuntimeError("encode failed")
+        return torch.arange(8).reshape(1, 4, 2)
+
+
+def _adapter(monkeypatch, codec: _GatedCodec) -> HiggsAudioV3Adapter:
+    monkeypatch.setattr(ref, "load_audio_tokenizer", lambda: codec)
+    stage = SimpleNamespace(runtime_config=SimpleNamespace(additional_config={"ref_audio_encode_workers": 0}))
+    return HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace(_tts_stage=stage)))
+
+
+def test_ref_code_encode_survives_request_cancellation(monkeypatch):
+    codec = _GatedCodec()
+    adapter = _adapter(monkeypatch, codec)
+    wav = np.full(1920, 0.5, dtype=np.float32)
 
     async def run():
-        creator = asyncio.create_task(resolve())
+        await adapter.warmup()
+        creator = asyncio.create_task(adapter._higgs_audio_v3_ref_codes(wav, 24000))
         try:
-            assert await asyncio.wait_for(asyncio.to_thread(encode_started.wait), timeout=5)
-
-            cancelled_waiter = asyncio.create_task(resolve())
-            survivor = asyncio.create_task(resolve())
+            assert await asyncio.wait_for(asyncio.to_thread(codec.started.wait, 5), timeout=5)
+            cancelled_waiter = asyncio.create_task(adapter._higgs_audio_v3_ref_codes(wav, 24000))
+            survivor = asyncio.create_task(adapter._higgs_audio_v3_ref_codes(wav, 24000))
             await asyncio.sleep(0)
-
-            cancelled_waiter.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await cancelled_waiter
-
-            creator.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await creator
-
-            release_encode.set()
-            survivor_result = await asyncio.wait_for(survivor, timeout=5)
-            await asyncio.sleep(0)
-            return survivor_result
+            for task in (cancelled_waiter, creator):
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            codec.release.set()
+            return await asyncio.wait_for(survivor, timeout=5), await adapter._higgs_audio_v3_ref_codes(wav, 24000)
         finally:
-            release_encode.set()
+            codec.release.set()
 
-    codes, cache_hit, inflight_wait = asyncio.run(run())
-
-    assert calls == 1
-    assert cache_hit is False
-    assert inflight_wait is True
-    assert torch.equal(codes, expected_codes)
-    assert "ref-a" not in adapter._higgs_audio_v3_ref_code_inflight
-    cached = adapter._get_higgs_audio_v3_ref_codes("ref-a")
-    assert cached is not None
-    assert torch.equal(cached, expected_codes)
+    survivor_codes, cached = asyncio.run(run())
+    assert codec.calls == 1
+    assert survivor_codes.shape == (2 + 4 - 1, 4)
+    assert torch.equal(cached, survivor_codes)
 
 
-def test_ref_code_inflight_consumes_failure_after_all_callers_cancel():
-    adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
-    encode_started = threading.Event()
-    release_encode = threading.Event()
+def test_failed_ref_code_encode_is_reported_and_not_cached(monkeypatch):
+    codec = _GatedCodec()
+    codec.release.set()
+    adapter = _adapter(monkeypatch, codec)
+    wav = np.full(1920, -0.5, dtype=np.float32)
     loop_errors = []
 
-    def encode_reference_audio(_wav, _sr):
-        encode_started.set()
-        assert release_encode.wait(timeout=5)
-        raise RuntimeError("encode failed")
-
-    async def resolve():
-        return await adapter._resolve_higgs_audio_v3_ref_codes(
-            "ref-a",
-            object(),
-            24000,
-            encode_reference_audio,
-            lambda codes: codes,
-        )
-
     async def run():
-        loop = asyncio.get_running_loop()
-        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
-        creator = asyncio.create_task(resolve())
-        try:
-            assert await asyncio.wait_for(asyncio.to_thread(encode_started.wait), timeout=5)
-            waiter = asyncio.create_task(resolve())
-            await asyncio.sleep(0)
-
-            creator.cancel()
-            waiter.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await creator
-            with pytest.raises(asyncio.CancelledError):
-                await waiter
-
-            release_encode.set()
-            for _ in range(100):
-                if "ref-a" not in adapter._higgs_audio_v3_ref_code_inflight:
-                    break
-                await asyncio.sleep(0.01)
-            gc.collect()
-            await asyncio.sleep(0)
-        finally:
-            release_encode.set()
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="encode failed"):
+                await adapter._higgs_audio_v3_ref_codes(wav, 24000)
 
     asyncio.run(run())
-
-    assert "ref-a" not in adapter._higgs_audio_v3_ref_code_inflight
+    assert codec.calls == 2
     assert not loop_errors

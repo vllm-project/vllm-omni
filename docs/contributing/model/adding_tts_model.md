@@ -765,6 +765,24 @@ prompt-length limits (`_max_instructions_length`). Read a comparable adapter bef
 writing your own — `fish_speech.py` for voice cloning, `higgs_audio_v3.py` for
 parameter-heavy models, `moss_tts.py` for a family sharing one base class.
 
+If the API server encodes reference clips (codec codes, speaker embeddings) before
+admission, do not load the encoder or cache artifacts in the adapter. Return a
+`ReferenceEncoderSpec` from `reference_encoder_spec()` and call
+`await self.encode_reference(waveform, sample_rate)`:
+
+- the encoder class (`"module:Class"`) lives in the model package; its
+  `encode_batch(clips)` returns or yields one artifact or exception per
+  `(waveform, sample_rate)` clip;
+- a `WireFormat` says how clips and artifacts cross processes as arrays;
+- the server starts the encoder in worker processes during `warmup`, before it
+  accepts requests. One API process hosts them and the others send it their clips,
+  so a multi-API server keeps one copy of the encoder;
+- artifacts are cached by clip content, with single-flight and micro-batching.
+
+`higgs_audio_v3.py` (codec codes) and `qwen3_tts.py` (codes plus x-vector) are the
+in-tree examples. `ref_audio_encode_workers` in the stage's `additional_config` sets
+the number of encoder processes; `0` encodes in the hosting API process.
+
 ### 4. Test it
 
 `tests/entrypoints/openai_api/test_tts_adapter.py` covers registry invariants and

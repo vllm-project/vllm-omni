@@ -44,6 +44,8 @@ from vllm.multimodal.audio import AudioResampler
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
+from .reference_encoder import MIN_REFERENCE_SAMPLES, reference_speaker_embedding
+
 if TYPE_CHECKING:
     from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 
@@ -142,7 +144,25 @@ def coerce_ref_code_tensor(value: object, *, device: torch.device) -> torch.Tens
         ref_code = ref_code[0]
     if ref_code.ndim != 2 or ref_code.numel() == 0:
         return None
-    return ref_code.to(device=device, dtype=torch.long).contiguous()
+    ref_code = ref_code.to(dtype=torch.long).contiguous()
+    if ref_code.device.type == "cpu" and torch.device(device).type != "cpu":
+        # Request payloads arrive on the host; a pageable copy would wait for
+        # the step's queued GPU work.
+        return to_device_nonblocking(ref_code, device)
+    return ref_code.to(device=device)
+
+
+def voice_clone_prompt_ref_code(value: object, *, device: torch.device) -> object:
+    """``voice_clone_prompt["ref_code"]`` for the Talker.
+
+    The value is a per-item payload, as
+    ``estimate_prompt_len_from_additional_information`` reads it: a
+    ``[frames, quantizers]`` list (e.g. from the API server's reference
+    encoding) becomes a tensor; a tensor or array passes through.
+    """
+    if isinstance(value, list) and value and isinstance(value[0], list):
+        return coerce_ref_code_tensor([value], device=device)
+    return first_value(value)
 
 
 def coerce_token_ids(value: object, *, device: torch.device) -> torch.Tensor | None:
@@ -627,7 +647,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             raise TypeError(f"Unsupported waveform type: {type(x)}")
 
         wav_np = _to_np(wav_obj)
-        if wav_np.size < 1024:
+        if wav_np.size < MIN_REFERENCE_SAMPLES:
             raise ValueError(f"ref_audio waveform too short: {wav_np.size} samples")
         return wav_np, sr
 
@@ -692,31 +712,21 @@ class Qwen3TTSPromptEmbedsBuilder:
                 self._speaker_encoder.to(device=dev, dtype=dtype)
         except StopIteration:
             pass
-        # Resample to 24kHz for speaker encoder.
+        # Resample to 24kHz for speaker encoder; mel_spectrogram expects 24kHz.
+        # The STFT/mel stays on the model device instead of materializing a CPU
+        # mel tensor per request; devices without torch.stft set
+        # _mel_spectrogram_on_cpu instead.
         target_sr = int(getattr(self._config.speaker_encoder_config, "sample_rate", 24000))
-        if sr != target_sr:
-            resampler = self._get_resampler(int(sr), target_sr)
-            wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
-            sr = target_sr
-
-        # Follow official implementation: mel_spectrogram expects 24kHz. Move
-        # the waveform first so STFT/mel computation stays on the model device
-        # instead of materializing a CPU mel tensor and copying it per request.
-        # Devices without torch.stft set _mel_spectrogram_on_cpu instead.
-        mel_device = torch.device("cpu") if self._mel_spectrogram_on_cpu else dev
-        wav_tensor = torch.from_numpy(wav).to(device=mel_device, dtype=torch.float32).unsqueeze(0)
-        mels = mel_spectrogram(
-            wav_tensor,
-            n_fft=1024,
-            num_mels=128,
-            sampling_rate=24000,
-            hop_size=256,
-            win_size=1024,
-            fmin=0,
-            fmax=12000,
-        ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
-        return spk.to(dtype=dtype)
+        return reference_speaker_embedding(
+            self._speaker_encoder,
+            wav,
+            sr,
+            target_sr=target_sr,
+            resampler=self._get_resampler(int(sr), target_sr) if int(sr) != target_sr else None,
+            device=dev,
+            dtype=dtype,
+            mel_device=torch.device("cpu") if self._mel_spectrogram_on_cpu else dev,
+        )
 
     def encode_ref_audio_batch(
         self,
@@ -1298,7 +1308,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
             ref_code = None
             if voice_clone_prompt is not None:
-                ref_code = _as_singleton(voice_clone_prompt.get("ref_code"))
+                ref_code = voice_clone_prompt_ref_code(voice_clone_prompt.get("ref_code"), device=input_ids.device)
             ref_code_t = None
             if isinstance(ref_code, torch.Tensor):
                 ref_code_t = ref_code
@@ -1341,7 +1351,9 @@ class Qwen3TTSPromptEmbedsBuilder:
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=speaker_dtype).view(1, 1, -1)
             elif isinstance(spk, (list, np.ndarray)):
-                speaker_embed = torch.tensor(spk, dtype=speaker_dtype, device=input_ids.device).view(1, 1, -1)
+                speaker_embed = to_device_nonblocking(torch.tensor(spk, dtype=speaker_dtype), input_ids.device).view(
+                    1, 1, -1
+                )
             elif cached_artifacts is not None and isinstance(cached_artifacts.get("ref_spk_embedding"), torch.Tensor):
                 speaker_embed = (
                     cached_artifacts["ref_spk_embedding"]
