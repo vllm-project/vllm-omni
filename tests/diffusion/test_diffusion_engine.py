@@ -84,9 +84,6 @@ class MockScheduler:
     def num_running_requests(self) -> int:
         return 0
 
-    def pending_finished_request_ids(self) -> set[str]:
-        return set()
-
     def get_admission_wait_decision(
         self,
         *,
