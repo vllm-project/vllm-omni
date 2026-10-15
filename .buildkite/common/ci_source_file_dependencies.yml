@@ -5,8 +5,8 @@
 # YAML anchors above the registry hold model business-code paths. Job keys
 # ({model}_function / _perf / _accuracy / _reliability / _doc / _cov) alias
 # those anchors and add the scripts the job actually runs. Feature keys below
-# are unchanged. ``source_filter_fallback`` is not a job key: when no job-key
-# prefix matches, a matching diff keeps every job for that upload.
+# are unchanged. ``source_filter_fallback`` is not a job key: a fallback-only
+# diff, or a fallback hit with no job-key match, keeps every job for that upload.
 #
 # YAML anchors are nested lists; the loader flattens them.
 
@@ -145,6 +145,12 @@ x-qwen-image: &qwen_image
   - vllm_omni/diffusion/models/dmd2/
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
 
+x-qwen-image-21: &qwen_image_21
+  - vllm_omni/diffusion/models/qwen_image_21/
+  - vllm_omni/diffusion/models/qwen_image/
+  - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py
+  - vllm_omni/model_extras/qwen_image_21.py
+
 x-hunyuan-image3: &hunyuan_image3
   - vllm_omni/diffusion/models/hunyuan_image3/
   - vllm_omni/model_executor/models/hunyuan_image3/
@@ -182,7 +188,8 @@ x-lingbot-world: &lingbot_world
 
 source_file_dependencies:
   # Hardware presets and shared test helpers. Not a job key — do not attach this
-  # to a step. Used only when no job-key prefix matches: then a hit keeps every job.
+  # to a step. Fallback-only diffs keep every job, even when a job lists a shared
+  # path. Mixed diffs use normal job dependencies when any job-key prefix matches.
   source_filter_fallback:
     - .buildkite/common/ci_mirror_hardwares.yml
     - tests/helpers/
@@ -460,6 +467,15 @@ source_file_dependencies:
     - *qwen_image
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
+
+  diffusion_qwen_image_21_accuracy:
+    - *qwen_image_21
+    - tests/e2e/accuracy/qwen_image_21/
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    - tests/assets/qwen_image_edit/
+    - tests/helpers/
+    - tests/conftest.py
 
   diffusion_qwen_image_perf:
     - *qwen_image

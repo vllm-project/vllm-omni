@@ -158,7 +158,13 @@ def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] |
     return error_obj
 
 
-def _build_sidecar_cmd(device: int, target_mem_ratio: float, hold_seconds: int, strict: bool) -> list[str]:
+def _build_sidecar_cmd(
+    device: int,
+    target_mem_ratio: float,
+    hold_seconds: int,
+    strict: bool,
+    max_free_bytes: int | None,
+) -> list[str]:
     sidecar = r"""
 import sys
 import time
@@ -168,12 +174,16 @@ device = int(sys.argv[1])
 target_ratio = float(sys.argv[2])
 hold_seconds = int(sys.argv[3])
 strict = sys.argv[4] == "1"
+max_free_bytes_arg = int(sys.argv[5])
+max_free_bytes = None if max_free_bytes_arg < 0 else max_free_bytes_arg
 
 torch.cuda.init()
 torch.cuda.set_device(device)
 props = torch.cuda.get_device_properties(device)
 free_before, total_bytes = torch.cuda.mem_get_info(device)
-target_bytes = int(free_before * target_ratio)
+ratio_target_bytes = int(free_before * target_ratio)
+ceiling_target_bytes = 0 if max_free_bytes is None else max(0, int(free_before) - max_free_bytes)
+target_bytes = max(ratio_target_bytes, ceiling_target_bytes)
 chunk_bytes = 256 * 1024 * 1024
 chunks = []
 allocated = 0
@@ -205,7 +215,9 @@ if strict:
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
 free_after, _ = torch.cuda.mem_get_info(device)
-if strict and allocated < target_bytes:
+ratio_target_missed = strict and allocated < ratio_target_bytes
+free_ceiling_missed = max_free_bytes is not None and int(free_after) > max_free_bytes
+if ratio_target_missed or free_ceiling_missed:
     print(
         "ERROR:"
         f"achieved_free_ratio={achieved_free_ratio:.4f};"
@@ -213,6 +225,7 @@ if strict and allocated < target_bytes:
         f"free_before={int(free_before)};"
         f"free_after={int(free_after)};"
         f"target_bytes={target_bytes};"
+        f"max_free_bytes={max_free_bytes};"
         f"allocated={allocated}",
         flush=True,
     )
@@ -225,6 +238,7 @@ print(
     f"free_before={int(free_before)};"
     f"free_after={int(free_after)};"
     f"target_bytes={target_bytes};"
+    f"max_free_bytes={max_free_bytes};"
     f"allocated={allocated}",
     flush=True,
 )
@@ -243,6 +257,7 @@ print("DONE", flush=True)
         str(target_mem_ratio),
         str(hold_seconds),
         "1" if strict else "0",
+        str(max_free_bytes) if max_free_bytes is not None else "-1",
     ]
 
 
@@ -253,6 +268,7 @@ def start_gpu_oom_hog(
     hold_seconds: int = 60,
     startup_timeout_sec: int = 20,
     strict: bool = True,
+    max_free_bytes: int | None = None,
     poll_interval_sec: float = 0.2,
 ) -> OomHandle:
     """Start a CUDA sidecar process that occupies GPU memory to trigger OOM.
@@ -260,6 +276,9 @@ def start_gpu_oom_hog(
     Note:
         ``target_mem_ratio`` is evaluated against free memory at injection start
         (not total GPU memory), i.e. success gate is ``allocated / free_before``.
+        When ``max_free_bytes`` is set, the sidecar also allocates until no more
+        than that many bytes remain free and fails startup if it cannot reach the
+        ceiling.
         ``hold_seconds <= 0`` means keeping OOM pressure until the sidecar is
         explicitly stopped via ``stop_gpu_oom_hog(s)``.
     """
@@ -267,9 +286,11 @@ def start_gpu_oom_hog(
         raise RuntimeError("CUDA OOM sidecar is intended for Linux CI/runtime.")
     if not (0.0 <= target_mem_ratio < 1.0):
         raise ValueError("target_mem_ratio should be in [0.0, 1.0).")
+    if max_free_bytes is not None and max_free_bytes <= 0:
+        raise ValueError("max_free_bytes should be greater than 0 when set.")
 
     # Explicit opt-out for debugging: keep API shape stable while disabling injection.
-    if target_mem_ratio == 0.0:
+    if target_mem_ratio == 0.0 and max_free_bytes is None:
         print(f"[oom-sidecar][gpu={device}] DISABLED: target_mem_ratio=0.0 (no OOM injection)", flush=True)
         return OomHandle(
             proc=None,
@@ -278,7 +299,7 @@ def start_gpu_oom_hog(
             start_ts=time.time(),
         )
 
-    cmd = _build_sidecar_cmd(device, target_mem_ratio, hold_seconds, strict)
+    cmd = _build_sidecar_cmd(device, target_mem_ratio, hold_seconds, strict, max_free_bytes)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -338,6 +359,7 @@ def inject_gpu_oom(
     hold_seconds: int = 60,
     startup_timeout_sec: int = 20,
     strict: bool = True,
+    max_free_bytes: int | None = None,
 ) -> OomHandle | list[OomHandle]:
     """Convenience wrapper to start CUDA OOM sidecar(s).
 
@@ -346,6 +368,8 @@ def inject_gpu_oom(
             or a list of device ids (``[0, 1, 2]``).
         hold_seconds: OOM hold time in seconds; ``<=0`` keeps pressure until
             ``stop_gpu_oom_hogs`` is called.
+        max_free_bytes: Optional upper bound for free memory after injection.
+            Sidecar startup fails if this ceiling cannot be reached.
     """
     if isinstance(device, int):
         devices = [device]
@@ -363,6 +387,7 @@ def inject_gpu_oom(
             hold_seconds=hold_seconds,
             startup_timeout_sec=startup_timeout_sec,
             strict=strict,
+            max_free_bytes=max_free_bytes,
         )
         for dev in devices
     ]

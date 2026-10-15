@@ -12,6 +12,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
+AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
@@ -670,6 +671,38 @@ def test_amd_template_supplies_a_server_verified_aiter_artifact_source() -> None
     assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)" in bootstrap
     assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)" in bootstrap
     assert '-D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT"' in bootstrap
+
+
+def test_weekly_reliability_is_distinct_from_nightly() -> None:
+    weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
+    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    group = weekly["steps"][0]
+    jobs = {
+        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "test_reliability_qwen3_omni.py"),
+        "Reliability Test · wan22": ("mi300_1", "cards_1", "test_reliability_wan22.py"),
+        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "test_reliability_hunyuan_image.py"),
+        "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
+            "mi300_2",
+            "cards_2",
+            "test_invalid_omni_chat.py",
+        ),
+    }
+
+    assert group["group"] == "Reliability Test"
+    assert "if" not in group
+    assert [step["label"] for step in group["steps"]] == list(jobs)
+    for step in group["steps"]:
+        pool, cards, filename = jobs[step["label"]]
+        command = "\n".join(step["commands"])
+        assert "if" not in step
+        assert step["agent_pool"] == pool
+        assert step["grade"] == "NonBlocking"
+        assert step["depends_on"] == "amd-build"
+        assert "slow and rocm and MI325 and " + cards in command
+        assert filename in command
+        assert filename not in nightly
+    assert "tests/dfx/reliability/" not in nightly
+    assert "Qwen3-Omni Function Expansion" not in AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8")
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:

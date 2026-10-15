@@ -278,6 +278,22 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and B200 and cards_1" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
 
+      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        mirror_hardwares: h100_1
+        timeout_in_minutes: 180
+        env:
+          QWEN_IMAGE_21_CALIBRATE: "0"
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/qwen_image_21/**/*
+        commands:
+          - >-
+            bash -c 'source tests/e2e/accuracy/qwen_image_21/setup_reference.sh &&
+            exec pytest -sv tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py
+            -m "full_model and diffusion and H100 and cards_1"
+            --run-level full_model
+            --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
+
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180

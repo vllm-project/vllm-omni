@@ -190,6 +190,24 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          QWEN_IMAGE_21_CALIBRATE: "0"
+          HF_HUB_OFFLINE: "1"
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/qwen_image_21/**/*
+        commands:
+          - >-
+            bash -c 'source tests/e2e/accuracy/qwen_image_21/setup_reference.sh &&
+            exec pytest -sv tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py
+            -m "full_model and diffusion and npu and A3 and cards_1"
+            --run-level full_model
+            --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180
