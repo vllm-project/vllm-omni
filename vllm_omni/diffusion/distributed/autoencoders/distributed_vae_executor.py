@@ -220,8 +220,10 @@ class DistributedVaeMixin:
             self.distributed_executor.parallel_size <= 1
             or self.distributed_executor.parallel_mode == "batch"
             or not dist.is_initialized()
-            or not getattr(self, "use_tiling", False)
         ):
+            return False
+        # Only "tile" mode splits the tiled path's tiles; spatial_shard_* decodes the full frame.
+        if self.distributed_executor.parallel_mode == "tile" and not getattr(self, "use_tiling", False):
             return False
         world_size = dist.get_world_size(group=self.distributed_executor.group)
         pp_size = min(int(self.distributed_executor.parallel_size), int(world_size))

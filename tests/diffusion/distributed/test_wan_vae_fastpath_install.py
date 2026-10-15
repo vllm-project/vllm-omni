@@ -720,11 +720,13 @@ class _StubPipeline(nn.Module):
         self.vae = vae
 
 
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 @pytest.mark.parametrize(("level", "expected"), [("lossless", True), ("channels_last", True), ("off", False)])
-def test_registry_hook_installs_on_cuda_platform(mocker, level: str, expected: bool) -> None:
+def test_registry_hook_installs_on_supported_platform(mocker, device_type: str, level: str, expected: bool) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     platform = mocker.Mock()
-    platform.is_cuda.return_value = True
+    platform.is_cuda.return_value = device_type == "cuda"
+    platform.is_xpu.return_value = device_type == "xpu"
     mocker.patch.object(registry_module, "current_omni_platform", platform)
 
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path=level))
@@ -733,10 +735,11 @@ def test_registry_hook_installs_on_cuda_platform(mocker, level: str, expected: b
         assert getattr(vae, REPORT_ATTR).level == level
 
 
-def test_registry_hook_skips_non_cuda_platform_and_non_wan_vaes(mocker) -> None:
+def test_registry_hook_skips_unsupported_platform_and_non_wan_vaes(mocker) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     platform = mocker.Mock()
     platform.is_cuda.return_value = False
+    platform.is_xpu.return_value = False
     mocker.patch.object(registry_module, "current_omni_platform", platform)
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
     assert not is_installed(vae)

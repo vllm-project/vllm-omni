@@ -484,6 +484,22 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             return False
         return True
 
+    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+        """Run the spatially sharded decode on the un-tiled path; it decodes the full frame."""
+        # A directly constructed VAE has no distributed state; decode it like the parent does.
+        if getattr(self, "distributed_executor", None) is not None and self._spatial_shard_decode_enabled(z):
+            split_dim = self._spatial_shard_decode_split_dim()
+            assert split_dim is not None
+            logger.debug("Decode running with Wan VAE spatial_shard_%s mode (un-tiled)", split_dim)
+            return wan_spatial_shard.spatial_shard_decode(
+                self,
+                z,
+                group=self.distributed_executor.group,
+                return_dict=return_dict,
+                split_dim=split_dim,
+            )
+        return super()._decode(z, return_dict=return_dict)
+
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)

@@ -34,6 +34,8 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from ._utils import on_kernel_device
+
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_CHANNELS = 1024
 # Positions x channels per program. Autotuning on the first call picked one
@@ -132,7 +134,7 @@ def rms_norm_channels_last(
     convolution that produced ``x``); ``None`` skips the add. ``exact_bf16``
     keeps the reference epilogue's roundings for BF16 (encoder only).
     """
-    if not HAS_TRITON or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if not HAS_TRITON or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     channels = x.shape[1]
     if channels < 2 or channels > _MAX_CHANNELS or x.numel() == 0:

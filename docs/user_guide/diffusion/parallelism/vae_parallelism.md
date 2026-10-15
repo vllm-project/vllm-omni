@@ -121,7 +121,7 @@ Additional requirements:
 | `vae_use_tiling` | bool   | False     | Must be set to `True` when using VAE patch parallelism. |
 
 !!! note "Automatic VAE Tiling"
-    When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), tile and spatial-shard modes automatically enable `vae_use_tiling`. Batch mode preserves the requested tiling setting.
+    When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), tile mode automatically enables `vae_use_tiling`. Spatial-shard and batch modes preserve the requested tiling setting: spatial-shard decode is full-frame and does not need tiling. In spatial-shard modes the **encode** is distributed only through the tiled path, so set `vae_use_tiling=True` (`--vae-use-tiling`) explicitly if you also want a multi-rank encode; the decode stays spatially sharded either way.
 
 ---
 

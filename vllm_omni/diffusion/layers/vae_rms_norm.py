@@ -19,8 +19,8 @@ _NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def kernels_allowed(x: torch.Tensor) -> bool:
-    """Allow eager CUDA kernels only when autograd and compilation are inactive."""
-    return x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+    """Allow eager CUDA/XPU kernels only when autograd and compilation are inactive."""
+    return rn.on_kernel_device(x) and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
 
 
 def _add_channel_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
