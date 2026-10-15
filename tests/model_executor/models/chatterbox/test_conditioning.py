@@ -32,6 +32,7 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+from vllm_omni.utils.audio import mel_filter_bank
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -117,17 +118,62 @@ def test_voice_encoder_mel_shape_and_power() -> None:
     """Power magnitudes through a linear basis, with no log: doubling the signal quadruples every bin."""
     hp = VoiceEncConfig()
     wav = (0.1 * np.random.default_rng(0).standard_normal(16000)).astype(np.float32)
-    mel = voice_encoder_mel(wav, hp)
+    (mel,) = voice_encoder_mel([wav], hp, torch.device("cpu"))
     assert mel.shape == (1 + 16000 // hp.hop_size, hp.num_mels)
     assert mel.min() >= 0
-    assert torch.equal(voice_encoder_mel(2 * wav, hp), 4 * mel)
+    assert torch.equal(voice_encoder_mel([2 * wav], hp, torch.device("cpu"))[0], 4 * mel)
+
+
+def test_voice_encoder_mel_rows_are_each_clips_own_centered_stft() -> None:
+    """Each row of a batch of unequal clips is the clip's own ``torch.stft(center=True)`` mel, then zeros."""
+    hp = VoiceEncConfig()
+    rng = np.random.default_rng(6)
+    wavs = [(0.1 * rng.standard_normal(length)).astype(np.float32) for length in (16000, 9137, 24001)]
+
+    batched = voice_encoder_mel(wavs, hp, torch.device("cpu"))
+
+    basis = mel_filter_bank(sr=hp.sample_rate, n_fft=hp.n_fft, n_mels=hp.num_mels, fmin=hp.fmin, fmax=hp.fmax)
+    for row, wav in zip(batched, wavs, strict=True):
+        spectrum = torch.stft(
+            torch.from_numpy(wav),
+            n_fft=hp.n_fft,
+            hop_length=hp.hop_size,
+            win_length=hp.win_size,
+            window=torch.hann_window(hp.win_size),
+            center=True,
+            pad_mode="reflect",
+            return_complex=True,
+        ).abs()
+        alone = (basis @ spectrum**hp.mel_power).T
+        torch.testing.assert_close(row[: alone.shape[0]], alone, atol=1e-5, rtol=1e-5)
+        assert not row[alone.shape[0] :].any()
+
+
+def test_a_batch_of_unequal_clips_conditions_each_as_it_is_alone(conditioners: dict[str, VoiceConditioner]) -> None:
+    """Clips shorter and longer than the conditioning windows, encoded together and one at a time."""
+    conditioner = conditioners["original"]
+    rng = np.random.default_rng(7)
+    clips = []
+    for seconds in (1.3, 7.2, 12.5):
+        wav24 = (0.1 * rng.standard_normal(round(seconds * 24000))).astype(np.float32)
+        clips.append((wav24, torchaudio.functional.resample(torch.from_numpy(wav24), 24000, 16000).numpy()))
+
+    batched = conditioner.from_resampled_batch(clips)
+
+    for voice, clip in zip(batched, clips, strict=True):
+        (alone,) = conditioner.from_resampled_batch([clip])
+        assert torch.equal(voice.cond_tokens, alone.cond_tokens)
+        assert torch.equal(voice.prompt_token, alone.prompt_token)
+        torch.testing.assert_close(voice.prompt_feat, alone.prompt_feat, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(voice.embedding, alone.embedding, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(voice.speaker_emb, alone.speaker_emb, atol=1e-6, rtol=1e-5)
 
 
 def test_voice_encoder_mel_puts_a_1_khz_tone_in_its_slaney_band() -> None:
     """Forty Slaney bands over 0 to 8 kHz: 1 kHz falls in band 13, counting from 0."""
     hp = VoiceEncConfig()
     tone = (0.5 * np.sin(2 * np.pi * 1000 * np.arange(16000) / 16000)).astype(np.float32)
-    assert int(voice_encoder_mel(tone, hp).mean(dim=0).argmax()) == 13
+    assert int(voice_encoder_mel([tone], hp, torch.device("cpu"))[0].mean(dim=0).argmax()) == 13
 
 
 def test_build_prompt_follows_the_conditioning_length() -> None:

@@ -152,27 +152,48 @@ def trim_silence(wav: np.ndarray, top_db: float = 20.0) -> np.ndarray:
     return wav[int(loud[0] * hop_length) : min(len(wav), int((loud[-1] + 1) * hop_length))]
 
 
-def voice_encoder_mel(wav16: np.ndarray, hp: VoiceEncConfig) -> torch.Tensor:
-    """Port of ``chatterbox.models.voice_encoder.melspec.melspectrogram``, transposed.
-
-    Power STFT magnitudes through a Slaney mel basis; the shipped config uses
-    no log, no normalization and no pre-emphasis.
+def to_device_batch(arrays: list[np.ndarray], device: torch.device) -> torch.Tensor:
+    """Zero-pad float32 clips to one batch and copy it to ``device`` once.
 
     Returns:
-        Mel of shape (T, 40).
+        Shape (B, N), N the longest clip.
     """
+    return torch.nn.utils.rnn.pad_sequence(
+        [torch.from_numpy(np.asarray(array, dtype=np.float32)) for array in arrays], batch_first=True
+    ).to(device)
+
+
+def voice_encoder_mel(wavs16: list[np.ndarray], hp: VoiceEncConfig, device: torch.device) -> torch.Tensor:
+    """Port of ``chatterbox.models.voice_encoder.melspec.melspectrogram`` for a batch, transposed.
+
+    Power STFT magnitudes through a Slaney mel basis; the shipped config uses
+    no log, no normalization and no pre-emphasis. Each clip gets its own
+    reflected edges on the host, as ``torch.stft``'s centering would give it
+    alone, so the batch's zero padding reaches none of its frames.
+
+    Args:
+        wavs16: Clips at the encoder's rate, of any lengths.
+        hp: The encoder's config.
+        device: Where the STFT and the mel run.
+
+    Returns:
+        Shape (B, T, 40), each clip's ``1 + len // hop_size`` frames followed by zeros.
+    """
+    edge = hp.n_fft // 2
+    batch = to_device_batch([np.pad(wav, edge, mode="reflect") for wav in wavs16], device)
     spectrum = torch.stft(
-        torch.from_numpy(np.asarray(wav16, dtype=np.float32)),
+        batch,
         n_fft=hp.n_fft,
         hop_length=hp.hop_size,
         win_length=hp.win_size,
-        window=torch.hann_window(hp.win_size),
-        center=True,
-        pad_mode="reflect",
+        window=torch.hann_window(hp.win_size, device=device),
+        center=False,
         return_complex=True,
     ).abs()
     basis = mel_filter_bank(sr=hp.sample_rate, n_fft=hp.n_fft, n_mels=hp.num_mels, fmin=hp.fmin, fmax=hp.fmax)
-    return (basis @ spectrum**hp.mel_power).T.contiguous()
+    mels = (basis.to(device) @ spectrum**hp.mel_power).transpose(1, 2)
+    frames = torch.tensor([1 + len(wav) // hp.hop_size for wav in wavs16], device=device)
+    return mels * (torch.arange(mels.shape[1], device=device) < frames[:, None]).unsqueeze(-1)
 
 
 @dataclass
@@ -345,69 +366,92 @@ class VoiceConditioner:
     def from_resampled_batch(self, clips: list[tuple[np.ndarray, np.ndarray]]) -> list[VoiceConditioning]:
         """Encode clips with FP32 speaker kernels and unpadded CAMPPlus statistics.
 
+        Each signal family goes to the device as one padded batch, its
+        features are computed there, and the results come back once. Every
+        clip's features are its own: its edges are reflected from its own
+        samples on the host, and lengths come from each clip.
+
         cuDNN's TF32 RNN/convolution kernels change speaker embeddings with
         batch shape. The native flags context restores the caller's precision.
         """
         if not clips:
             return []
-        mels = [voice_encoder_mel(trim_silence(wav16), self.voice_encoder.hp) for _, wav16 in clips]
-        # inference selects partial windows using mel_lens and supplies the
-        # same zero right padding for a single clip itself.
+        config, device = self.config, self.device
+        hp = self.voice_encoder.hp
+        trimmed = [trim_silence(wav16) for _, wav16 in clips]
+        # inference selects partial windows using mel_lens and reads zeros past them.
         speaker_embs = self.voice_encoder.inference(
-            torch.nn.utils.rnn.pad_sequence(mels, batch_first=True).to(self.device),
-            mel_lens=[mel.shape[0] for mel in mels],
-            rate=1.3,
+            voice_encoder_mel(trimmed, hp, device), mel_lens=[1 + len(wav) // hp.hop_size for wav in trimmed], rate=1.3
         )
-        encoder_clips = [
-            torch.from_numpy(wav16[: self.config.enc_cond_seconds * self.config.s3_sample_rate]) for _, wav16 in clips
-        ]
-        cond_tokens = self.tokenize_batch(encoder_clips, self.config.cond_prompt_len)
-        decoder_clips = [
-            torch.from_numpy(wav24[: self.config.dec_cond_seconds * self.config.sample_rate]) for wav24, _ in clips
-        ]
-        # S3Gen.embed_ref resamples its own ten seconds with torchaudio.
-        decoder_clips_16 = [
-            torchaudio.functional.resample(wav, self.config.sample_rate, self.config.s3_sample_rate)
-            for wav in decoder_clips
-        ]
+        encoder_clips = [wav16[: config.enc_cond_seconds * config.s3_sample_rate] for _, wav16 in clips]
+        encoder_batch = to_device_batch(encoder_clips, device)
+        cond_tokens = self.tokenize_batch(
+            [encoder_batch[index, : len(clip)] for index, clip in enumerate(encoder_clips)], config.cond_prompt_len
+        )
+
+        decoder_clips = [wav24[: config.dec_cond_seconds * config.sample_rate] for wav24, _ in clips]
+        lengths = torch.tensor([len(clip) for clip in decoder_clips], device=device)
+        # mel_spectrogram reflects (n_fft - hop) / 2 samples on each side; each
+        # clip carries its own right reflection, so the batch padding never
+        # stands in for it.
+        edge = (config.mel["n_fft"] - config.mel["hop_size"]) // 2
+        decoder_batch = to_device_batch(
+            [np.concatenate([clip, clip[-2 : -edge - 2 : -1]]) for clip in decoder_clips], device
+        )
+        prompt_feats = mel_spectrogram(decoder_batch, **config.mel).transpose(1, 2)
+        # S3Gen.embed_ref resamples its own ten seconds with torchaudio; zeros,
+        # not the reflection, follow each clip, as they would alone.
+        unpadded = decoder_batch * (torch.arange(decoder_batch.shape[1], device=device) < lengths[:, None])
+        decoder_batch_16 = torchaudio.functional.resample(unpadded, config.sample_rate, config.s3_sample_rate)
+        lengths_16 = [math.ceil(config.s3_sample_rate * len(clip) / config.sample_rate) for clip in decoder_clips]
+        decoder_clips_16 = [decoder_batch_16[index, :length] for index, length in enumerate(lengths_16)]
         prompt_tokens = self.tokenize_batch(decoder_clips_16, None)
         # CAMPPlus uses unmasked temporal statistics and attention. Equal
         # waveform lengths give equal fbank lengths and require no padding.
-        groups = {}
-        for index, wav in enumerate(decoder_clips_16):
-            groups.setdefault(wav.shape[0], []).append(index)
-        embeddings = {}
-        for indices in groups.values():
-            batch = self.campplus(
-                torch.cat([compute_fbank(decoder_clips_16[index].to(self.device), self.device) for index in indices])
-            )
-            for row, index in enumerate(indices):
-                embeddings[index] = batch[row : row + 1].float().cpu().clone()
+        groups: dict[int, list[int]] = {}
+        for index, length in enumerate(lengths_16):
+            groups.setdefault(length, []).append(index)
+        order = [index for indices in groups.values() for index in indices]
+        embeddings = torch.cat(
+            [
+                self.campplus(torch.cat([compute_fbank(decoder_clips_16[index], device) for index in indices]))
+                for indices in groups.values()
+            ]
+        )
+        embeddings = embeddings.float().cpu()[torch.tensor(order).argsort()]
+        prompt_feats = prompt_feats.float().cpu()
         results = []
-        for index, (decoder_clip, prompt_token) in enumerate(zip(decoder_clips, prompt_tokens)):
-            prompt_feat = mel_spectrogram(decoder_clip.unsqueeze(0), **self.config.mel).transpose(1, 2)
+        for index, (clip, prompt_token) in enumerate(zip(decoder_clips, prompt_tokens, strict=True)):
             # Keep exactly token_mel_ratio frames per prompt token so that a
             # leftover prompt frame cannot overlap generated-token positions.
-            frames = min(prompt_feat.shape[1] // self.config.token_mel_ratio, prompt_token.shape[1])
+            frames = min(len(clip) // config.mel["hop_size"] // config.token_mel_ratio, prompt_token.shape[1])
             results.append(
                 VoiceConditioning(
-                    cond_tokens=cond_tokens[index].cpu().clone(),
-                    speaker_emb=speaker_embs[index : index + 1].float().cpu().clone(),
-                    prompt_token=prompt_token[:, :frames].cpu().clone(),
-                    prompt_feat=prompt_feat[:, : self.config.token_mel_ratio * frames].float().cpu().clone(),
-                    embedding=embeddings[index],
+                    cond_tokens=cond_tokens[index],
+                    speaker_emb=speaker_embs[index : index + 1].float().clone(),
+                    prompt_token=prompt_token[:, :frames].clone(),
+                    prompt_feat=prompt_feats[index : index + 1, : config.token_mel_ratio * frames].clone(),
+                    embedding=embeddings[index : index + 1].clone(),
                 )
             )
         return results
 
     def tokenize_batch(self, wavs16: list[torch.Tensor], max_tokens: int | None) -> list[torch.Tensor]:
-        """Quantize a padded mel batch, retaining each clip's code length."""
+        """Quantize a padded mel batch, retaining each clip's code length.
+
+        The tokenizer's log mel normalizes by its clip's own maximum, so it is
+        computed per clip, on the clip's device.
+
+        Returns:
+            Per clip, its codes of shape (1, T), long, on the host.
+        """
         mels = [self.s3tokenizer.log_mel_spectrogram(wav.float()) for wav in wavs16]
         if max_tokens is not None:
             mels = [mel[..., : max_tokens * 4] for mel in mels]
         padded, mel_lens = self.s3tokenizer.padding(mels)
         codes, code_lens = self.tokenizer.quantize(padded.to(self.device), mel_lens.to(self.device))
-        return [codes[index : index + 1, : int(length)].long().clone() for index, length in enumerate(code_lens)]
+        codes = codes.long().cpu()
+        return [codes[index : index + 1, : int(length)].clone() for index, length in enumerate(code_lens.tolist())]
 
 
 def build_prompt(
