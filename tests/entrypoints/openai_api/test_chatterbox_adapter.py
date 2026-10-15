@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 import soundfile
 import torch
+import yaml
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from torch import nn
@@ -40,7 +41,7 @@ from tests.model_executor.models.chatterbox.helpers import (
 )
 from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.config.speech_cache import SpeechCacheConfig
-from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy, resolve_deploy_yaml
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type
@@ -133,7 +134,7 @@ def server(
     ``clean_speaker_cache`` fixture resets around the test.
     """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, DEPLOY["turbo"]))
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"], tmp_path)))
     yield speech
     speech.shutdown()
 
@@ -156,7 +157,7 @@ def original(
     directory = write_model_dir(tmp_path / "chatterbox")
     (Path(directory) / "conds.pt").write_bytes((Path(model_dir) / "conds.pt").read_bytes())
     Tokenizer(WordLevel({"[UNK]": 0, "Hello.": 7}, unk_token="[UNK]")).save(str(Path(directory) / "tokenizer.json"))
-    speech = serving(engine_client(directory, DEPLOY["original"]))
+    speech = serving(engine_client(directory, deploy_on_cpu(DEPLOY["original"], tmp_path)))
     yield speech._adapter
     speech.shutdown()
 
@@ -169,19 +170,17 @@ def reference(seconds: float, seed: int, sample_rate: int = 24000, mime: str = "
     return f"data:{mime};base64,{base64.b64encode(buffer.getvalue()).decode()}"
 
 
-def high_concurrency_on_cpu(variant: str) -> str:
-    """The variant's high-concurrency overlay with its reference encoders on the CPU of this host."""
-    overlay = Path(
-        get_deploy_config_path(f"{'chatterbox_turbo' if variant == 'turbo' else 'chatterbox'}_high_concurrency.yaml")
-    )
-    return modify_stage_config(
-        str(overlay),
-        updates={
-            # The copy lives elsewhere, so it names its base file by path.
-            "base_config": str(overlay.parent / DEPLOY[variant]),
-            "stages": {0: {"additional_config.conditioning_device": "cpu"}},
-        },
-    )
+def deploy_on_cpu(name: str, directory: Path) -> str:
+    """A copy of deploy file ``name``, inheritance resolved, with its reference encoders on this host's CPU.
+
+    Every profile conditions on ``cuda:0``; these tests build servers on a CPU host.
+    """
+    deploy = resolve_deploy_yaml(get_deploy_config_path(name))
+    (stage0,) = [stage for stage in deploy["stages"] if stage["stage_id"] == 0]
+    stage0["additional_config"]["conditioning_device"] = "cpu"
+    path = directory / f"cpu-{name}"
+    path.write_text(yaml.safe_dump(deploy))
+    return str(path)
 
 
 def encoder(adapter: ChatterboxAdapter) -> VoiceConditioner:
@@ -331,7 +330,14 @@ async def test_64_distinct_references_are_encoded_together_and_cached(
     is served from the cache.
     """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, high_concurrency_on_cpu(variant)))
+    speech = serving(
+        engine_client(
+            model_dir,
+            deploy_on_cpu(
+                f"{'chatterbox_turbo' if variant == 'turbo' else 'chatterbox'}_high_concurrency.yaml", tmp_path
+            ),
+        )
+    )
     concurrent = speech._adapter
     assert isinstance(concurrent, adapter_cls)
     assert concurrent.conditioning_capacity == 64
@@ -422,7 +428,9 @@ async def test_a_zero_speaker_cache_budget_encodes_every_request(
 ) -> None:
     """The deploy file's ``speech_cache.speaker_max_bytes`` bounds the conditioning cache; zero disables it."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, DEPLOY["turbo"]), SpeechCacheConfig(speaker_max_bytes=0))
+    speech = serving(
+        engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"], tmp_path)), SpeechCacheConfig(speaker_max_bytes=0)
+    )
     batches = EncoderBatches(encoder(speech._adapter))
     source = reference(6, seed=6)
     try:
@@ -439,7 +447,7 @@ async def test_a_zero_speaker_cache_budget_encodes_every_request(
 async def test_cancelled_wave_cannot_overfill_encoder_queue(model_dir, tmp_path, monkeypatch, clean_speaker_cache):
     """Cancelled waiters keep their encoder work, and with it the slots a new wave would take."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, high_concurrency_on_cpu("original")))
+    speech = serving(engine_client(model_dir, deploy_on_cpu("chatterbox_high_concurrency.yaml", tmp_path)))
     original = speech._adapter
     assert isinstance(original, ChatterboxOriginalAdapter) and original.conditioning_capacity == 64
     batches = EncoderBatches(encoder(original), hold=True)
@@ -486,30 +494,40 @@ async def test_shutdown_cancels_encoder_waiters(adapter):
 def test_conditioning_device_is_explicit_in_stage_config(
     model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None, legacy: bool
 ) -> None:
-    """The high-concurrency deploy file puts the reference encoders on the GPU, in either stage config form."""
+    """The deploy file puts the reference encoders on the stages' GPU, in either stage config form.
+
+    Nothing is encoded, so no device is needed.
+    """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, "chatterbox_turbo_high_concurrency.yaml", legacy))
+    speech = serving(engine_client(model_dir, DEPLOY["turbo"], legacy))
     try:
         assert speech._adapter.conditioning_device == torch.device("cuda:0")
     finally:
         speech.shutdown()
 
 
-def test_unsupported_conditioning_device_is_rejected(
-    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
+@pytest.mark.parametrize(
+    ("device", "error"),
+    [("meta", "must be cpu or cuda"), (None, "additional_config.conditioning_device")],
+    ids=["unsupported", "missing"],
+)
+def test_the_conditioning_device_must_be_a_supported_one_and_set(
+    model_dir: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_speaker_cache: None,
+    device: str | None,
+    error: str,
 ):
+    """No device is assumed: a deploy file without one fails at startup."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    high_concurrency = Path(get_deploy_config_path("chatterbox_turbo_high_concurrency.yaml"))
     deploy = modify_stage_config(
-        str(high_concurrency),
-        updates={
-            # The copy lives elsewhere, so it names its base file by path.
-            "base_config": str(high_concurrency.parent / DEPLOY["turbo"]),
-            "stages": {0: {"additional_config.conditioning_device": "meta"}},
-        },
+        get_deploy_config_path(DEPLOY["turbo"]),
+        updates={"stages": {0: {"additional_config.conditioning_device": device}}} if device is not None else None,
+        deletes={"stages": {0: ["additional_config"]}} if device is None else None,
     )
     client = engine_client(model_dir, deploy)
-    with pytest.raises(ValueError, match="must be cpu or cuda"):
+    with pytest.raises(ValueError, match=error):
         serving(client)
 
 

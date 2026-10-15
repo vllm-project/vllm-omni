@@ -35,9 +35,13 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
-    # A request's exaggeration and cfg_weight when it gives none: upstream's
-    # ChatterboxTTS.generate defaults. Read by the serving adapter.
+    # The reference encoders run in the API process, on the stages' device:
+    # the API process must see device 0. NPU, XPU and MUSA use the CPU
+    # (platforms block below). Read by the serving adapter.
+    # A request's exaggeration and cfg_weight when it gives none are
+    # upstream's ChatterboxTTS.generate defaults.
     additional_config:
+      conditioning_device: cuda:0
       exaggeration: 0.5
       cfg_weight: 0.5
     default_sampling_params:
@@ -65,12 +69,33 @@ stages:
     input_connectors:
       from_stage_0: connector_of_shared_memory
 
+# The reference encoders cannot use an NPU, XPU or MUSA device; ROCm keeps
+# cuda:0. A platform's additional_config replaces the stage's, so the
+# controls are restated.
 platforms:
   npu:
     model_runner: v1
+    stages:
+      - stage_id: 0
+        additional_config:
+          conditioning_device: cpu
+          exaggeration: 0.5
+          cfg_weight: 0.5
   xpu:
     model_runner: v1
+    stages:
+      - stage_id: 0
+        additional_config:
+          conditioning_device: cpu
+          exaggeration: 0.5
+          cfg_weight: 0.5
   rocm:
     model_runner: v1
   musa:
     model_runner: v1
+    stages:
+      - stage_id: 0
+        additional_config:
+          conditioning_device: cpu
+          exaggeration: 0.5
+          cfg_weight: 0.5

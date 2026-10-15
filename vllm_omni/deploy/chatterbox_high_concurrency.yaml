@@ -14,14 +14,6 @@ stages:
     # 1.5 GiB of weights and activations (measured on H100); 0.40 fitted them
     # exactly, so this leaves 3 GiB over on an 80 GB card.
     gpu_memory_utilization: 0.45
-    # The reference encoders run on the GPU in the API process, which must
-    # share visible device 0 with both stages. Read by the serving adapter.
-    # additional_config replaces the base mapping, so the controls' request
-    # defaults are repeated.
-    additional_config:
-      conditioning_device: cuda:0
-      exaggeration: 0.5
-      cfg_weight: 0.5
 
   - stage_id: 1
     max_num_seqs: 64

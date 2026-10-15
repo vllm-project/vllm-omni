@@ -55,7 +55,9 @@ class ChatterboxAdapter(ARTTSAdapter):
         # reference encoders run (the API process must see that device) and
         # the controls' request defaults.
         additional_config = self.stage_setting("runtime_config", "additional_config") or {}
-        self.conditioning_device = torch.device(additional_config.get("conditioning_device", "cpu"))
+        if "conditioning_device" not in additional_config:
+            raise ValueError("Chatterbox deploy files set stage 0 additional_config.conditioning_device")
+        self.conditioning_device = torch.device(additional_config["conditioning_device"])
         self.default_controls = {name: additional_config[name] for name in self.controls}
         # As many references are encoded together as stage 0 admits requests:
         # the deploy profile sizes that for its card, and nothing here divides it.

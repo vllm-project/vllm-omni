@@ -8,10 +8,6 @@ base_config: chatterbox_turbo.yaml
 stages:
   - stage_id: 0
     max_num_seqs: 64
-    # The reference encoders run on the GPU in the API process, which must
-    # share visible device 0 with both stages. Read by the serving adapter.
-    additional_config:
-      conditioning_device: cuda:0
 
   - stage_id: 1
     max_num_seqs: 64
