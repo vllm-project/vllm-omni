@@ -4111,7 +4111,7 @@ def test_process_chunk_queue_legacy_partition(build_adapter, queue_type):
     def _is_done(req_id):
         return req_id == "req-3"
 
-    with Mock.object(adapter, "is_done_receiving_chunks", _is_done):
+    with patch.object(adapter, "is_done_receiving_chunks", _is_done):
         adapter._process_chunk_queue_legacy(queue, waiting_for_chunk, RequestStatus.RUNNING, finished_load_reqs)
 
     # Retained: req-0 (restored), req-2 (ready chunk), req-3 (done receiving)
@@ -4164,8 +4164,8 @@ def test_process_chunk_queue_partition(build_adapter, queue_type):
     def _ensure(request):
         return request.request_id != "req-inactive"
 
-    with Mock.object(adapter, "_ensure_active_stream", _ensure):
-        with Mock.object(adapter, "is_done_receiving_chunks", lambda r: False):
+    with patch.object(adapter, "_ensure_active_stream", _ensure):
+        with patch.object(adapter, "is_done_receiving_chunks", lambda r: False):
             # Case A: target_status = WAITING → inactive gets parked
             adapter._process_chunk_queue(
                 list(queue), waiting_for_chunk, RequestStatus.WAITING, finished_load_reqs
@@ -4181,15 +4181,19 @@ def test_process_chunk_queue_partition(build_adapter, queue_type):
 
     # Reset and test Case B: target_status != WAITING → inactive skipped
     adapter2, _ = build_adapter(stage_id=1)
-    adapter2.requests_with_ready_chunks = {"req-ready"}
+    adapter2.requests_with_ready_chunks = {"q-ready"}
+
+    def _ensure_b(request):
+        return request.request_id != "q-inactive"
+
     q_inactive = _req("q-inactive", RequestStatus.WAITING)
     q_ready = _req("q-ready", RequestStatus.WAITING)
     q_park = _req("q-park", RequestStatus.WAITING)
     queue2 = [q_inactive, q_ready, q_park]
     wfc2 = []
 
-    with Mock.object(adapter2, "_ensure_active_stream", _ensure):
-        with Mock.object(adapter2, "is_done_receiving_chunks", lambda r: False):
+    with patch.object(adapter2, "_ensure_active_stream", _ensure_b):
+        with patch.object(adapter2, "is_done_receiving_chunks", lambda r: False):
             adapter2._process_chunk_queue(queue2, wfc2, RequestStatus.RUNNING, set())
 
     retained_b = {r.request_id for r in queue2}
@@ -4208,8 +4212,8 @@ def test_process_chunk_queue_all_retained_no_bulk_op(build_adapter):
     queue = [_req(f"req-{i}", RequestStatus.WAITING) for i in range(2)]
     original_ids = [r.request_id for r in queue]
 
-    with Mock.object(adapter, "_ensure_active_stream", lambda r: True):
-        with Mock.object(adapter, "is_done_receiving_chunks", lambda r: True):
+    with patch.object(adapter, "_ensure_active_stream", lambda r: True):
+        with patch.object(adapter, "is_done_receiving_chunks", lambda r: True):
             adapter._process_chunk_queue(queue, [], RequestStatus.RUNNING, set())
 
     assert [r.request_id for r in queue] == original_ids
@@ -4221,8 +4225,8 @@ def test_process_chunk_queue_all_moved(build_adapter):
     queue = [_req(f"req-{i}", RequestStatus.WAITING) for i in range(4)]
     waiting = []
 
-    with Mock.object(adapter, "_ensure_active_stream", lambda r: True):
-        with Mock.object(adapter, "is_done_receiving_chunks", lambda r: False):
+    with patch.object(adapter, "_ensure_active_stream", lambda r: True):
+        with patch.object(adapter, "is_done_receiving_chunks", lambda r: False):
             adapter._process_chunk_queue(queue, waiting, RequestStatus.RUNNING, set())
 
     assert len(queue) == 0
@@ -4345,7 +4349,7 @@ def test_requeue_replaced_prompts_correct_moved_set():
     assert {r["id"] for r in moved} == expected_moved
 
 
-def test_process_chunk_queue_legacy_mixed_queue_types():
+def test_process_chunk_queue_legacy_mixed_queue_types(build_adapter):
     """Both list queues and object queues with remove_requests() must work."""
     adapter, _ = build_adapter(stage_id=1)
     adapter.requests_with_ready_chunks = set()
@@ -4361,7 +4365,7 @@ def test_process_chunk_queue_legacy_mixed_queue_types():
     def _always_not_done(r):
         return False
 
-    with Mock.object(adapter, "is_done_receiving_chunks", _always_not_done):
+    with patch.object(adapter, "is_done_receiving_chunks", _always_not_done):
         adapter._process_chunk_queue_legacy(list_queue, list_wfc, RequestStatus.RUNNING, set())
         adapter._process_chunk_queue_legacy(obj_queue, obj_wfc, RequestStatus.RUNNING, set())
 
@@ -4370,21 +4374,21 @@ def test_process_chunk_queue_legacy_mixed_queue_types():
     assert len(list_wfc) == len(obj_wfc) == n
 
 
-def test_process_chunk_queue_preserves_waiting_for_chunk_list_order():
+def test_process_chunk_queue_preserves_waiting_for_chunk_list_order(build_adapter):
     """waiting_for_chunk_list must receive moved requests in queue iteration order."""
     adapter, _ = build_adapter(stage_id=1)
     queue = [_req(f"req-{i}", RequestStatus.WAITING) for i in range(5)]
     wfc = []
 
-    with Mock.object(adapter, "_ensure_active_stream", lambda r: True):
-        with Mock.object(adapter, "is_done_receiving_chunks", lambda r: False):
+    with patch.object(adapter, "_ensure_active_stream", lambda r: True):
+        with patch.object(adapter, "is_done_receiving_chunks", lambda r: False):
             adapter._process_chunk_queue(queue, wfc, RequestStatus.RUNNING, set())
 
     moved_ids = [r.request_id for r in wfc]
     assert moved_ids == ["req-0", "req-1", "req-2", "req-3", "req-4"]
 
 
-def test_chunk_queue_processing_large_queue_correctness():
+def test_chunk_queue_processing_large_queue_correctness(build_adapter):
     """Stress test: 1000 requests, half moved, half retained. Partition must be
     100% correct (no duplicates, no missed, correct statuses)."""
     adapter, _ = build_adapter(stage_id=1)
@@ -4394,8 +4398,8 @@ def test_chunk_queue_processing_large_queue_correctness():
     queue = [_req(f"req-{i}", RequestStatus.WAITING) for i in range(n)]
     wfc = []
 
-    with Mock.object(adapter, "_ensure_active_stream", lambda r: True):
-        with Mock.object(adapter, "is_done_receiving_chunks", lambda r: False):
+    with patch.object(adapter, "_ensure_active_stream", lambda r: True):
+        with patch.object(adapter, "is_done_receiving_chunks", lambda r: False):
             adapter._process_chunk_queue(queue, wfc, RequestStatus.RUNNING, set())
 
     assert len(queue) + len(wfc) == n
@@ -4411,7 +4415,7 @@ def test_chunk_queue_processing_large_queue_correctness():
     assert len(wfc_ids) == len(set(wfc_ids))
 
 
-def test_requeue_replaced_prompts_no_false_positives():
+def test_requeue_replaced_prompts_no_false_positives(build_adapter):
     """Requests that are only replaced OR only ready-chunk (not both) must NOT move."""
     adapter, _ = build_adapter(stage_id=1)
     # 10 requests, indices 0-4 replaced only, 5-9 ready only
@@ -4428,7 +4432,7 @@ def test_requeue_replaced_prompts_no_false_positives():
     assert len(running) == 10
 
 
-def test_queue_with_remove_requests_gets_called_once():
+def test_queue_with_remove_requests_gets_called_once(build_adapter):
     """When queue is NOT a list, remove_requests() must be called exactly once
     with all moved requests."""
     adapter, _ = build_adapter(stage_id=1)
@@ -4436,9 +4440,9 @@ def test_queue_with_remove_requests_gets_called_once():
     queue = _QueueWithRemoveRequests(reqs)
     wfc = []
 
-    with Mock.object(adapter, "_ensure_active_stream", lambda r: True):
-        with Mock.object(adapter, "is_done_receiving_chunks", lambda r: False):
-            with Mock.object(adapter, "load_async", lambda r: None):
+    with patch.object(adapter, "_ensure_active_stream", lambda r: True):
+        with patch.object(adapter, "is_done_receiving_chunks", lambda r: False):
+            with patch.object(adapter, "load_async", lambda r: None):
                 adapter._process_chunk_queue(queue, wfc, RequestStatus.RUNNING, set())
 
     # All 5 should have gone through remove_requests
