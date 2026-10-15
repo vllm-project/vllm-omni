@@ -4112,9 +4112,7 @@ def test_process_chunk_queue_legacy_partition(build_adapter, queue_type):
         return req_id == "req-3"
 
     with Mock.object(adapter, "is_done_receiving_chunks", _is_done):
-        adapter._process_chunk_queue_legacy(
-            queue, waiting_for_chunk, RequestStatus.RUNNING, finished_load_reqs
-        )
+        adapter._process_chunk_queue_legacy(queue, waiting_for_chunk, RequestStatus.RUNNING, finished_load_reqs)
 
     # Retained: req-0 (restored), req-2 (ready chunk), req-3 (done receiving)
     # Moved: req-1 (still waiting for chunk), req-4 (newly parked)
@@ -4192,9 +4190,7 @@ def test_process_chunk_queue_partition(build_adapter, queue_type):
 
     with Mock.object(adapter2, "_ensure_active_stream", _ensure):
         with Mock.object(adapter2, "is_done_receiving_chunks", lambda r: False):
-            adapter2._process_chunk_queue(
-                queue2, wfc2, RequestStatus.RUNNING, set()
-            )
+            adapter2._process_chunk_queue(queue2, wfc2, RequestStatus.RUNNING, set())
 
     retained_b = {r.request_id for r in queue2}
     moved_b = {r.request_id for r in wfc2}
@@ -4283,25 +4279,30 @@ def test_process_chunk_queue_legacy_finished_load_restores_status(build_adapter)
 def test_process_chunk_queue_legacy_output_matches_equivalent_o_n2():
     """Generate a mixed-status queue, run partition, and verify the split
     exactly matches what the original per-iteration remove would have produced."""
-    from collections import deque
 
     # Construct a synthetic queue with deterministic statuses
     n = 50
+
     class _FakeQueue:
-        def __init__(self, items): self.items = list(items)
-        def __iter__(self): return iter(self.items)
-        def __len__(self): return len(self.items)
+        def __init__(self, items):
+            self.items = list(items)
+
+        def __iter__(self):
+            return iter(self.items)
+
+        def __len__(self):
+            return len(self.items)
+
         def remove_requests(self, moved):
             ids = {r["id"] for r in moved}
             self.items = [r for r in self.items if r["id"] not in ids]
-        def remove(self, item): self.items.remove(item)
 
-    queue_items = [
-        {"id": f"req-{i}", "status": "WAITING" if i % 3 != 0 else "WAITING_FOR_CHUNK"}
-        for i in range(n)
-    ]
+        def remove(self, item):
+            self.items.remove(item)
+
+    queue_items = [{"id": f"req-{i}", "status": "WAITING" if i % 3 != 0 else "WAITING_FOR_CHUNK"} for i in range(n)]
     queue = _FakeQueue(queue_items)
-    snapshot_before = list(queue.items)
+    list(queue.items)
 
     # Run partition (new code path — we simulate it inline)
     moved = []
@@ -4352,14 +4353,13 @@ def test_process_chunk_queue_legacy_mixed_queue_types():
 
     n = 10
     list_queue = [_req(f"req-{i}", RequestStatus.WAITING) for i in range(n)]
-    obj_queue = _QueueWithRemoveRequests(
-        [_req(f"obj-{i}", RequestStatus.WAITING) for i in range(n)]
-    )
+    obj_queue = _QueueWithRemoveRequests([_req(f"obj-{i}", RequestStatus.WAITING) for i in range(n)])
 
     list_wfc = []
     obj_wfc = []
 
-    def _always_not_done(r): return False
+    def _always_not_done(r):
+        return False
 
     with Mock.object(adapter, "is_done_receiving_chunks", _always_not_done):
         adapter._process_chunk_queue_legacy(list_queue, list_wfc, RequestStatus.RUNNING, set())
@@ -4400,7 +4400,7 @@ def test_chunk_queue_processing_large_queue_correctness():
 
     assert len(queue) + len(wfc) == n
     assert len(queue) == n // 2  # evens retained
-    assert len(wfc) == n // 2    # odds moved
+    assert len(wfc) == n // 2  # odds moved
     assert {r.request_id for r in queue} == {f"req-{i}" for i in range(0, n, 2)}
     assert {r.request_id for r in wfc} == {f"req-{i}" for i in range(1, n, 2)}
 
