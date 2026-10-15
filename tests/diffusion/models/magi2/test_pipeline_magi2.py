@@ -17,11 +17,14 @@ from PIL import Image
 from vllm_omni.diffusion.data import OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.magi2.pipeline_magi2 import (
+    _PRESET_BY_SIZE,
+    _RESOLUTION_PRESETS,
     MAGI2_AUDIO_SAMPLE_RATE,
     MAGI2_MODEL_REVISION,
     Magi2Pipeline,
     _Magi2StagedComponent,
     _resolve_checkpoint_root,
+    _resolve_native_resolution,
     _validate_native_topology,
 )
 from vllm_omni.diffusion.models.magi2.preview_data_proxy import Magi2DataProxy
@@ -118,6 +121,14 @@ def _pipeline() -> tuple[Magi2Pipeline, _FakeNativeRuntime]:
     return pipe, runtime
 
 
+def _refining_pipeline() -> tuple[Magi2Pipeline, _FakeNativeRuntime, Mock]:
+    """A fake-runtime pipeline whose refiner loads without a checkpoint."""
+    pipe, runtime = _pipeline()
+    load_refiner = Mock()
+    pipe._load_refiner = load_refiner
+    return pipe, runtime, load_refiner
+
+
 def _request(prompt, **sampling_overrides):
     sampling = _SamplingStub()
     for key, value in sampling_overrides.items():
@@ -198,9 +209,129 @@ def test_forward_uses_native_540p_preview_defaults(monkeypatch):
     assert call["image"] is None
     assert (call["width"], call["height"]) == (896, 512)
     assert call["num_inference_steps"] == 100
+    assert call["refiner_size"] is None
     assert result.output["metadata"]["video"]["fps"] == 12.5
     assert result.output["metadata"]["audio"]["sample_rate"] == MAGI2_AUDIO_SAMPLE_RATE
     assert result.stage_durations["magi2_preview_e2e"] >= 0
+
+
+@pytest.mark.parametrize(
+    ("resolution", "size", "preview_size"),
+    [
+        ("272p", (448, 256), (448, 256)),
+        ("540p", (896, 512), (896, 512)),
+        ("1080p", (1920, 1088), (896, 512)),
+    ],
+)
+def test_resolution_presets_round_trip_through_their_sizes(resolution, size, preview_size):
+    assert _RESOLUTION_PRESETS[resolution] == size
+    assert _PRESET_BY_SIZE[size] == resolution
+    by_name = _resolve_native_resolution(_SamplingStub(), {"resolution": resolution.upper()})
+    by_size = _resolve_native_resolution(_SamplingStub(width=size[0], height=size[1]), {})
+    labelled = _resolve_native_resolution(_SamplingStub(width=size[0], height=size[1]), {"resolution": resolution})
+    assert by_name == by_size == labelled == (resolution, size, preview_size)
+
+
+def test_every_preset_has_its_own_size():
+    assert len(_PRESET_BY_SIZE) == len(_RESOLUTION_PRESETS)
+    # The 1080p Preview size is the 540p request size, so it must not label a preset itself.
+    assert _resolve_native_resolution(_SamplingStub(width=896, height=512), {})[0] == "540p"
+    with pytest.raises(OmniClientError, match="requires 1920x1088"):
+        _resolve_native_resolution(_SamplingStub(width=896, height=512), {"resolution": "1080p"})
+
+
+@pytest.mark.parametrize("extra_args", [{}, {"use_refiner": False}])
+def test_unlabelled_preview_size_request_runs_the_540p_preview(monkeypatch, extra_args):
+    pipe, runtime = _pipeline()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.magi2.pipeline_magi2.current_omni_platform.is_available",
+        lambda: False,
+    )
+    result = pipe(
+        _request(
+            "A fox walks through snow",
+            width=896,
+            height=512,
+            fps=12.5,
+            num_frames=125,
+            extra_args=extra_args,
+        )
+    )
+
+    call = runtime.calls[0]
+    assert (call["width"], call["height"]) == (896, 512)
+    assert call["refiner_size"] is None
+    assert result.output["metadata"]["video"]["fps"] == 12.5
+
+
+@pytest.mark.parametrize(
+    ("sampling_overrides", "extra_args"),
+    [
+        ({}, {"resolution": "1080p"}),
+        ({"width": 1920, "height": 1088}, {}),
+        ({"fps": 25.0, "num_frames": 249}, {"resolution": "1080p", "use_refiner": True}),
+        ({"resolved_frame_rate": 25, "num_frames": 1}, {"resolution": "1080p", "use_refiner": "1"}),
+    ],
+)
+def test_forward_runs_1080p_as_a_refined_540p_preview(monkeypatch, sampling_overrides, extra_args):
+    pipe, runtime, load_refiner = _refining_pipeline()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.magi2.pipeline_magi2.current_omni_platform.is_available",
+        lambda: False,
+    )
+    result = pipe(_request("A fox walks through snow", extra_args=extra_args, **sampling_overrides))
+
+    call = runtime.calls[0]
+    assert (call["width"], call["height"]) == (896, 512)
+    assert call["refiner_size"] == (1920, 1088)
+    assert call["num_inference_steps"] == 100
+    assert call["refiner_num_inference_steps"] == 5
+    assert result.output["metadata"]["video"]["fps"] == 25.0
+    assert result.output["metadata"]["audio"]["sample_rate"] == MAGI2_AUDIO_SAMPLE_RATE
+    load_refiner.assert_called_once_with()
+
+
+@pytest.mark.parametrize(("value", "expected"), [(3, 3), ("7", 7), (2.0, 2)])
+def test_forward_passes_requested_refiner_steps(monkeypatch, value, expected):
+    pipe, runtime, _ = _refining_pipeline()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.magi2.pipeline_magi2.current_omni_platform.is_available",
+        lambda: False,
+    )
+    pipe(
+        _request(
+            "A fox walks through snow",
+            num_inference_steps=40,
+            extra_args={"resolution": "1080p", "refiner_num_inference_steps": value},
+        )
+    )
+    assert runtime.calls[0]["num_inference_steps"] == 40
+    assert runtime.calls[0]["refiner_num_inference_steps"] == expected
+
+
+@pytest.mark.parametrize(
+    ("resolution", "sampling_overrides", "message"),
+    [
+        ("1080p", {"fps": 12.5}, "1080p output is fixed at 25 fps"),
+        ("1080p", {"frame_rate": 12.5}, "1080p output is fixed at 25 fps"),
+        ("1080p", {"num_frames": 125}, "1080p output is fixed at 249 frames"),
+        ("540p", {"fps": 25.0}, "540p output is fixed at 12.5 fps"),
+        ("540p", {"num_frames": 249}, "540p output is fixed at 125 frames"),
+        ("272p", {"resolved_frame_rate": 25.0}, "272p output is fixed at 12.5 fps"),
+        ("272p", {"num_frames": 249}, "272p output is fixed at 125 frames"),
+    ],
+)
+def test_forward_rejects_frame_rates_and_counts_of_other_resolutions(
+    monkeypatch, resolution, sampling_overrides, message
+):
+    pipe, runtime = _pipeline()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.magi2.pipeline_magi2.current_omni_platform.is_available",
+        lambda: False,
+    )
+    with pytest.raises(OmniClientError, match=message):
+        pipe(_request("prompt", extra_args={"resolution": resolution}, **sampling_overrides))
+    assert not runtime.calls
 
 
 def test_forward_maps_272p_i2v_and_output_resize(monkeypatch):
@@ -263,8 +394,17 @@ def test_forward_rejects_conflicting_resolution_and_sampling_geometry(monkeypatc
         ("prompt", {"seconds": 5}, "10-second clips"),
         ("prompt", {"duration": 5}, "10-second clips"),
         ("prompt", {"resolution": "720p"}, "Unsupported native"),
-        ("prompt", {"resolution": "1080p"}, "Unsupported native"),
-        ("prompt", {"resolution": "540p", "use_refiner": True}, "refiner"),
+        ("prompt", {"resolution": "540p", "use_refiner": True}, "conflicts with resolution '540p'"),
+        ("prompt", {"use_refiner": "true"}, "conflicts with resolution '540p'"),
+        ("prompt", {"resolution": "272p", "use_refiner": 1}, "conflicts with resolution '272p'"),
+        ("prompt", {"resolution": "1080p", "use_refiner": False}, "conflicts with resolution '1080p'"),
+        ("prompt", {"resolution": "1080p", "seconds": 5}, "10-second clips"),
+        ("prompt", {"resolution": "540p", "refiner_num_inference_steps": 5}, "applies to 1080p only"),
+        ("prompt", {"resolution": "1080p", "refiner_num_inference_steps": 0}, "refiner inference steps"),
+        ("prompt", {"resolution": "1080p", "refiner_num_inference_steps": -2}, "refiner inference steps"),
+        ("prompt", {"resolution": "1080p", "refiner_num_inference_steps": 2.5}, "refiner inference steps"),
+        ("prompt", {"resolution": "1080p", "refiner_num_inference_steps": "five"}, "refiner inference steps"),
+        ("prompt", {"resolution": "1080p", "refiner_num_inference_steps": True}, "refiner inference steps"),
         ("prompt", {"output_width": 0, "output_height": 4}, "positive integers"),
     ],
 )
