@@ -33,13 +33,13 @@ GPU holds only the two model stages.
 | Output | Value |
 | --- | --- |
 | Audio | mono, 24 kHz, float32 offline; WAV, PCM, MP3 or FLAC online; streamed PCM or WAV as delta chunks |
-| Streaming | first chunk 15 tokens plus reference alignment, then 30 and 60; a fixed 50-token left context and position-aligned flow noise keep chunks consistent |
+| Streaming | first chunk 15 tokens plus reference alignment, then 30 and 60; a fixed 50-token left context (`codec_left_context_frames`) and position-aligned flow noise keep chunks consistent |
 
 | Profile on this hardware | Status |
 | --- | --- |
-| `chatterbox_turbo.yaml` (default): BF16 T3 with CUDA graphs, FP32 eager S3Gen, 8 AR slots, Model Runner V2 | runtime-qualified, both runners and both handoff modes |
-| `chatterbox.yaml` (default Original): the same with the Llama T3 and paired classifier-free guidance (two AR slots per guided request) | runtime-qualified offline and at 64 WebSocket sessions with a 128-token cap |
-| `*_high_concurrency.yaml` and `*_high_concurrency_bf16_mps.yaml` (64 requests, GPU conditioning, BF16 flow) | configuration-only here; qualified in the [H100 recipe](Chatterbox-H100.md) |
+| `chatterbox_turbo.yaml` (default): BF16 T3 with CUDA graphs; eager S3Gen with FP32 weights, the flow decoder under BF16 autocast and FP32 HiFT; 8 AR slots, Model Runner V2 | runtime-qualified, both runners and both handoff modes, with the FP32 flow of an earlier revision; the BF16-flow default is configuration-only here |
+| `chatterbox.yaml` (default Original): the same with the Llama T3 and paired classifier-free guidance (two AR slots per guided request) | runtime-qualified offline and at 64 WebSocket sessions with a 128-token cap, with the FP32 flow of an earlier revision; the BF16-flow default is configuration-only here |
+| `*_high_concurrency.yaml` (64 requests, GPU conditioning) and the `*_high_concurrency_cudnn_mps.yaml` cuDNN attention + MPS overlays over them | configuration-only here; qualified in the [H100 recipe](Chatterbox-H100.md) |
 
 ## References
 
@@ -164,9 +164,11 @@ above writes a playable WAV; `soundfile.info("chatterbox.wav")` reports
   slots; the encoders add their weights to host memory, not the GPU.
 - Key flags: `model_runner: v1` in a copy of the deploy file selects the
   default runner (both are supported; V2 is the default on CUDA). Stage 1
-  accepts `hf_overrides: {flow_dtype: bfloat16, flow_attention_backend: cudnn}`
-  for BF16 flow with native cuDNN attention; HiFT and the output stay FP32,
-  and the audio changes numerically, so validate quality before enabling it.
+  keeps FP32 weights and runs its flow decoder under BF16 autocast
+  (`hf_overrides: {flow_dtype: bfloat16}` in both profiles); HiFT and the
+  output stay FP32. `flow_dtype: float32` restores the FP32 flow, and
+  `flow_attention_backend: cudnn` adds native cuDNN attention to the BF16
+  flow (the H100 `*_cudnn_mps` overlays).
 - Deploy relations: keep stage 1's `max_model_len` at least stage 0's and its
   `max_num_batched_tokens` at least `max_num_seqs * max_model_len`; the
   stages refuse to start otherwise. Prefix caching must stay off: prompts are
@@ -191,11 +193,14 @@ above writes a playable WAV; `soundfile.info("chatterbox.wav")` reports
 | Model Runner V2, native data plane | default on CUDA; V1 supported |
 | AR CUDA graphs | on by default; S3Gen stays eager |
 | Original CFG and exaggeration | supported; Turbo rejects the fields |
-| BF16 flow, cuDNN attention, CUDA MPS | opt-in overlays, qualified only on H100 |
+| BF16 flow decoder (HiFT FP32) | default in both profiles; quality and speed measured on H100, configuration-only here |
+| cuDNN flow attention, CUDA MPS | `*_cudnn_mps` overlays, qualified only on H100 |
 | Multilingual, VoiceDesign, instructions, prefix caching | unsupported |
 | NPU, XPU, ROCm, MUSA | configuration-only (`model_runner: v1` kept there); not qualified |
 
 ## Qualification evidence
+
+Both runs below predate the BF16-flow default: stage 1 ran the flow in FP32.
 
 Turbo, default profile, streaming, short English reference clip, three
 sentences scored with Whisper (`small`), medians of three runs over two

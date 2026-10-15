@@ -16,11 +16,13 @@ are wired into both the manual CLI and the DFX nightly CI matrix
 Chatterbox Turbo and Original are registered in `model_configs.yaml`, so their
 HTTP load, latency and streaming-continuity measurements come from the shared
 `bench_tts.py` driver below (`audio_ttfp`, `audio_rtf`, `audio_underrun`,
-`audio_continuity_ok`), as the nightly perf job's do. The sentence-segmented
-WebSocket frontend has no shared load driver. `chatterbox_conditioning.py`
-checks real-weight serial/batch parity over 64 references on CPU or an explicit
-CUDA device. See the [Chatterbox recipe](../../recipes/ResembleAI/Chatterbox-A5000.md#conditioning-load-validation-at-64-clients)
-for measured 64-client results and their capacity and quality limitations.
+`audio_continuity_ok`), as the nightly perf job's do. Cloned-voice capacity
+needs a distinct reference per request: a repeated reference is a
+conditioning-cache hit after its first use and measures cached traffic.
+`chatterbox_conditioning.py` encodes 64 references serially and as one batch
+on CPU or an explicit CUDA device, times both and checks real-weight
+serial/batch parity. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#concurrent-http-clients-high-concurrency-profiles)
+for measured 8- to 64-client results and their capacity and quality limitations.
 
 `chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech
 codes replayed from the checkpoint's built-in voice. It measures first,
@@ -348,7 +350,8 @@ The Chatterbox rows in `tests/dfx/perf/tests/test_tts.json`
 (`test_chatterbox_{turbo,original}_{graph,eager}`) run with the other TTS
 models' nightly perf cases: default-voice latency for Turbo and Original,
 each paired with a server that differs only in stage 0's `enforce_eager`;
-stage 1 remains eager and FP32. Use the same dataset, seed, request count
+stage 1 remains eager, with FP32 weights, the BF16 flow decoder and FP32 HiFT.
+Use the same dataset, seed, request count
 and hardware when comparing graph and eager results. These are end-to-end
 serving measurements, not isolated AR graph timings.
 
@@ -359,18 +362,20 @@ uv run python -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 ```
 
 Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
-H100 baselines come from the October 14 qualification run documented in the
+H100 baselines come from the October 15 qualification run documented in the
 [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-latency-and-throughput-baselines-default-profiles).
 B200 is routed as a CI mirror without an assigned performance baseline.
-The job measures the built-in voice over HTTP; cold-reference and WebSocket
-behaviour are qualified separately in the recipes.
+The job measures the built-in voice over HTTP; cloned-voice load is
+qualified separately in the H100 recipe.
 
 ## Matched Chatterbox reference qualification
 
 `chatterbox_reference.py` compares the canonical upstream Python `generate`
 API with `Omni.generate` on an exclusive GPU, one request at a time. Use pinned
-local checkpoints and the same reference WAV. It measures whole utterances in
-FP32/eager mode, including fresh reference conditioning for every cloned-voice
+local checkpoints and the same reference WAV. It measures whole utterances
+with FP32 weights, TF32 off and the deploy file's flow precision (BF16 by
+default; upstream is FP32 throughout), stage 0 eager unless `--cuda-graphs`,
+including fresh reference conditioning for every cloned-voice
 request, with two warmups per text and voice mode and three texts across three seeds.
 Initialization and WAV writing are excluded. Whole-device memory includes
 Omni's separate workers and is sampled every 100 ms.

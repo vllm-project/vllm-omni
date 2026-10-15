@@ -596,10 +596,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              217.1889
+              239.0126
             ],
             "median_audio_rtf": [
-              0.1064
+              0.1188
             ]
           }
         }
@@ -626,13 +626,13 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              576.6845
+              542.2602
             ],
             "median_audio_rtf": [
-              0.2398
+              0.2209
             ],
             "audio_throughput": [
-              32.5314
+              35.2003
             ]
           }
         }
@@ -659,10 +659,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              302.6142
+              301.5696
             ],
             "median_audio_rtf": [
-              0.1314
+              0.1406
             ]
           }
         }
@@ -717,10 +717,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              418.9393
+              437.0747
             ],
             "median_audio_rtf": [
-              0.2793
+              0.285
             ]
           }
         }
@@ -775,10 +775,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              515.129
+              587.9185
             ],
             "median_audio_rtf": [
-              0.294
+              0.3624
             ]
           }
         }
@@ -805,13 +805,13 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              1358.3943
+              1279.5174
             ],
             "median_audio_rtf": [
-              0.8294
+              0.7199
             ],
             "audio_throughput": [
-              9.6572
+              10.7146
             ]
           }
         }
@@ -838,10 +838,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              1026.8255
+              1118.5934
             ],
             "median_audio_rtf": [
-              0.6371
+              0.6396
             ]
           }
         }
@@ -896,10 +896,10 @@
         "baseline": {
           "H100": {
             "median_audio_ttfp_ms": [
-              682.6453
+              765.8151
             ],
             "median_audio_rtf": [
-              0.389
+              0.42
             ]
           }
         }
