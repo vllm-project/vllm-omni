@@ -216,6 +216,41 @@ window within the whole-clip pixel budget; it does not raise the
 uses fixed one-step, CFG=1 conditioning and requires `imageio[ffmpeg]` for
 audio muxing. The 7,200-frame 768×1344 case is still undergoing full GPU E2E.
 
+## Exact DiT metadata reuse
+
+The eager DiT reuses equal-length grouped SDPA row indices and complete RoPE
+sin/cos tables across layers within each request and layout. Window boundaries,
+FP32 rotary arithmetic, checkpoint precision, and the attention backend are
+unchanged. This does not skip transformer computation or alter the VAE.
+
+Full rotary tables are request-owned and bounded; modules with different
+frequency values do not share them. The checkpoint loader invalidates frequency
+signatures and axis tables on reload. Set `VLLM_OMNI_SEEDVR2_DIT_CACHE=0` before
+starting a worker to use the uncached reference path; the default is enabled.
+
+Run these short tests from the checkout with the released local model directory:
+
+```bash
+PYTHONPATH=. python -m pytest tests/diffusion/models/seedvr2/test_dit_cache.py \
+  -m 'core_model and cpu' --run-level=core_model
+PYTHONPATH=. python -m pytest tests/diffusion/models/seedvr2/test_dit_cache.py \
+  -m 'core_model and cuda' --run-level=core_model
+PYTHONPATH=. python tests/diffusion/models/seedvr2/benchmark_dit_cache.py \
+  --model "$MODEL_DIR" --output dit-cache-5f.json
+PYTHONPATH=. python tests/diffusion/models/seedvr2/benchmark_dit_cache.py \
+  --model "$MODEL_DIR" --frames 33 --height 192 --width 320 \
+  --output dit-cache-33f.json
+```
+
+The benchmark uses one GPU, native tiled VAE, FP16, eager execution, one Euler
+step, CFG=1, LAB colour correction, and synthetic uint8 inputs. It warms both
+variants, alternates four A/B rounds over two input/seed cases, records
+GPU-synchronized request and stage wall times and allocator peaks, and requires
+bitwise-equal DiT tensors and final RGB. Hashing occurs after timing; model load
+and MP4 encoding are excluded. Both profiles respect the default admission
+limits. CPU unit tests need no model weights; CUDA unit tests additionally need
+a CUDA device, and the benchmark requires a single-process CUDA runtime.
+
 ## Temporal and spatial VAE tiling
 
 Add `--vae-use-tiling` to bound VAE intermediate activations along time. The
@@ -253,7 +288,7 @@ parallel outputs are numerically close rather than bitwise identical.
 | Randomness | Per-request generator; preserve reference latent strides when sampling noise |
 | Sequence parallelism | Native engine SP1/2/4 correctness verified on five-frame L20 cases |
 | VAE placement | Replicated by default; optional height sharding on the window-SP group |
-| Unsupported | VFR, multichannel audio, 7B, other sampling schedules, quantization, cache acceleration, VAE width sharding / batch slicing, CPU offload, CFG/TP/PP parallelism, compiled execution, LoRA |
+| Unsupported | VFR, multichannel audio, 7B, other sampling schedules, quantization, approximate activation caching, VAE width sharding / batch slicing, CPU offload, CFG/TP/PP parallelism, compiled execution, LoRA |
 
 Unsupported engine modes are rejected before process hooks and worker creation.
 `ulysses_degree` selects the model-owned SP group. This branch assigns whole
