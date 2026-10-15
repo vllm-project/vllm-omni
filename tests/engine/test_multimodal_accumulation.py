@@ -76,7 +76,7 @@ def test_meta_finished_is_replaced_per_chunk_not_appended():
     replace_snapshot_keys(accumulated, incoming)
     merged = accumulated.merged_with(incoming)
 
-    flag = merged.tensors["meta.finished"]
+    flag = merged["meta.finished"]
     assert not isinstance(flag, list)
     assert bool(flag.reshape(())) is True
 
@@ -88,4 +88,4 @@ def test_meta_finished_consolidates_to_latest_flag_without_cat():
 
     payload.consolidate_tensors(OutputModality.TEXT)
 
-    assert bool(payload.tensors["meta.finished"].reshape(())) is True
+    assert bool(payload["meta.finished"].reshape(())) is True
