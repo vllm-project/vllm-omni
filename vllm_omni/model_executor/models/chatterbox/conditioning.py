@@ -54,6 +54,8 @@ PUNCTUATION_REPLACEMENTS = (
     ("’", "'"),
 )
 SENTENCE_ENDERS = (".", "!", "?", "-", ",")
+# Resamples references on the CPU, concurrently within one encoder batch.
+RESAMPLE_POOL = ThreadPoolExecutor(thread_name_prefix="chatterbox-resample")
 # Not parameters the checkpoint carries: the S3Tokenizer subclass upstream
 # registers them itself, and the s3tokenizer package computes its own.
 TOKENIZER_BUFFERS = ("tokenizer._mel_filters", "tokenizer.window")
@@ -307,8 +309,7 @@ class VoiceConditioner:
         as one batch: the caller's admission bound, not this method, decides
         how many fit the device.
         """
-        with ThreadPoolExecutor() as pool:
-            clips = list(pool.map(lambda reference: self.resample(*reference), references))
+        clips = list(RESAMPLE_POOL.map(lambda reference: self.resample(*reference), references))
         return self.from_resampled_batch(clips)
 
     def resample(self, wav: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:

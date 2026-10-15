@@ -37,6 +37,7 @@ from tests.model_executor.models.chatterbox.helpers import (
     write_voice_encoder,
 )
 from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -112,9 +113,12 @@ def engine_client(model_dir: str, deploy: str, legacy: bool = False) -> SimpleNa
     )
 
 
-def serving(client: SimpleNamespace) -> OmniOpenAIServingSpeech:
+def serving(client: SimpleNamespace, speech_cache: SpeechCacheConfig | None = None) -> OmniOpenAIServingSpeech:
+    """The speech server, with the deploy file's ``speech_cache`` budgets when given."""
     models = OpenAIServingModels(client, [BaseModelPath(name=client.model, model_path=client.model)])
-    return OmniOpenAIServingSpeech(engine_client=client, models=models, request_logger=None)
+    return OmniOpenAIServingSpeech(
+        engine_client=client, models=models, request_logger=None, speech_cache_config=speech_cache
+    )
 
 
 @pytest.fixture
@@ -323,7 +327,8 @@ async def test_64_distinct_references_are_encoded_together_and_cached(
     assert lengths == list(range(lengths[0], lengths[0] + 64))
     assert len(encoded) == 2 and sum(encoded) == 64
     assert batches.most_active == 1
-    assert all(left is right for left, right in zip(voices, cached, strict=True))
+    # Served from the speaker cache: the same tensors, and no further encoder batch.
+    assert all(left.prompt_feat is right.prompt_feat for left, right in zip(voices, cached, strict=True))
     assert batches.batches == encoded
     assert not concurrent.conditioning_pending
 
@@ -347,7 +352,7 @@ async def test_reference_singleflight_survives_waiter_cancellation(adapter):
 
     assert isinstance(voice, VoiceConditioning)
     assert batches.batches == [1]
-    assert list(adapter.conditioning_cache.values()) == [voice]
+    assert adapter.ctx.server._speaker_cache.stats()["entries"] == 1
 
 
 @pytest.mark.asyncio
@@ -363,8 +368,27 @@ async def test_bad_reference_does_not_poison_batch(adapter):
     assert isinstance(results[0], ValueError) and "longer than 5 s" in str(results[0])
     assert isinstance(results[1], VoiceConditioning)
     assert batches.batches == [1]
-    assert list(adapter.conditioning_cache.values()) == [results[1]]
+    assert adapter.ctx.server._speaker_cache.stats()["entries"] == 1
     assert not adapter.conditioning_pending
+
+
+@pytest.mark.asyncio
+async def test_a_zero_speaker_cache_budget_encodes_every_request(
+    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
+) -> None:
+    """The deploy file's ``speech_cache.speaker_max_bytes`` bounds the conditioning cache; zero disables it."""
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+    speech = serving(engine_client(model_dir, DEPLOY["turbo"]), SpeechCacheConfig(speaker_max_bytes=0))
+    batches = EncoderBatches(encoder(speech._adapter))
+    source = reference(6, seed=6)
+    try:
+        for _ in range(2):
+            await speech._adapter.resolve_voice(source)
+    finally:
+        batches.remove()
+        speech.shutdown()
+
+    assert batches.batches == [1, 1]
 
 
 @pytest.mark.asyncio

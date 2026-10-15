@@ -4,8 +4,6 @@
 
 import asyncio
 import math
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 import numpy as np
@@ -24,6 +22,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     resolve_stage_model_path,
 )
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
+    RESAMPLE_POOL,
     VoiceConditioner,
     VoiceConditioning,
     build_prompt,
@@ -36,8 +35,6 @@ from vllm_omni.transformers_utils.configs.chatterbox import (
     ChatterboxConfig,
 )
 
-CONDITIONING_CACHE_ENTRIES = 128
-
 
 @register_tts_adapter
 class ChatterboxAdapter(ARTTSAdapter):
@@ -46,7 +43,6 @@ class ChatterboxAdapter(ARTTSAdapter):
     name = "chatterbox"
     stage_keys = frozenset({"chatterbox_t3"})
     supported_output_sample_rates = frozenset({24000})
-    preprocessing_workers = 4
     variant = "turbo"
     # Stage 0 sequences one request holds: Original's guided requests run in pairs.
     sequences_per_request = 1
@@ -78,7 +74,6 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.conditioning_slots = asyncio.Semaphore(self.conditioning_capacity)
         self.conditioning_queue: asyncio.Queue = asyncio.Queue(maxsize=self.conditioning_capacity)
         self.conditioning_pending: dict[str, asyncio.Future] = {}
-        self.conditioning_cache: OrderedDict[str, VoiceConditioning] = OrderedDict()
         self.conditioning_task: asyncio.Task | None = None
         self.closed = False
 
@@ -92,7 +87,6 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.conditioning_pending.clear()
         while not self.conditioning_queue.empty():
             self.conditioning_queue.get_nowait()
-        self.conditioning_cache.clear()
 
     def prepare_voices(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning | Exception]:
         """Run one encoder batch on the server-owned executor."""
@@ -113,8 +107,7 @@ class ChatterboxAdapter(ARTTSAdapter):
             except ValueError as error:
                 return error
 
-        with ThreadPoolExecutor() as pool:
-            resampled = list(pool.map(resample, references))
+        resampled = list(RESAMPLE_POOL.map(resample, references))
         for index, clip in enumerate(resampled):
             if isinstance(clip, ValueError):
                 results[index] = clip
@@ -142,11 +135,12 @@ class ChatterboxAdapter(ARTTSAdapter):
                     if isinstance(voice, Exception):
                         self.conditioning_pending.pop(key).set_exception(voice)
                         continue
-                    self.conditioning_cache[key] = voice
-                    self.conditioning_cache.move_to_end(key)
-                    while len(self.conditioning_cache) > CONDITIONING_CACHE_ENTRIES:
-                        self.conditioning_cache.popitem(last=False)
+                    self.ctx.server._speaker_cache.put(self.cache_key(key), dict(vars(voice)))
                     self.conditioning_pending.pop(key).set_result(voice)
+
+    def cache_key(self, artifact_key: str) -> tuple[str, str, int]:
+        """A reference's key in the server's speaker cache, which ``speech_cache.speaker_max_bytes`` bounds."""
+        return self.ctx.server._speaker_cache.make_cache_key(f"ref:{artifact_key}", model_type=self.name)
 
     async def resolve_voice(self, source: str) -> VoiceConditioning:
         """Bound decoded references, coalesce identical misses, and cache artifacts."""
@@ -159,10 +153,9 @@ class ChatterboxAdapter(ARTTSAdapter):
             key = self.ctx.server._get_resolved_ref_audio_artifact_key(locator_key)
             if key is None:
                 key = self.ctx.server._make_ref_audio_artifact_cache_key(wav, sample_rate)
-            cached = self.conditioning_cache.get(key)
+            cached = self.ctx.server._speaker_cache.get(self.cache_key(key))
             if cached is not None:
-                self.conditioning_cache.move_to_end(key)
-                return cached
+                return VoiceConditioning(**cached)
             pending = self.conditioning_pending.get(key)
             if pending is None:
                 pending = asyncio.get_running_loop().create_future()
