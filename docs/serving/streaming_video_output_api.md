@@ -118,7 +118,7 @@ close or abort an abandoned iterator. Controls and playback feedback remain
 receivable while media output is blocked, through bounded control queues.
 
 For interaction timing, queue limits and cancellation semantics, see the
-[streaming video example protocol](../../examples/online_serving/streaming_video_generation/README.md).
+[streaming video example protocol](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/streaming_video_generation/README.md).
 
 ## Mid-Generation Interaction
 
