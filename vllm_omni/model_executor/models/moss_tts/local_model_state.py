@@ -258,7 +258,11 @@ class MossLocalModelState(OmniModelState):
                 break
         if staging is None:
             host = torch.empty((capacity, self.model.n_vq + 1), dtype=torch.long, pin_memory=embeds.is_cuda)
-            device = torch.empty_like(host, device=embeds.device) if (embeds.is_cuda or embeds.device.type == "npu") else host
+            device = (
+                torch.empty_like(host, device=embeds.device)
+                if (embeds.is_cuda or embeds.device.type == "npu")
+                else host
+            )
             staging = [host, device, torch.cuda.Event() if embeds.is_cuda else None]
             if len(self._prefill_staging) < 3:
                 self._prefill_staging.append(staging)
