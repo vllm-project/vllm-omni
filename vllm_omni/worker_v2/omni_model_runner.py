@@ -436,14 +436,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         else:
             result = super().capture_model(profile_only=profile_only)
 
+        # The MTP runner is a CUDAGraphWrapper, so during profiling upstream
+        # has swapped it to the throwaway pool and clears it afterwards. Report
+        # its pool with the rest in both passes.
+        result += self._capture_mtp_graphs(profile_only)
         if profile_only:
             # Upstream discards captures in its temporary profiling pool.
             # Model-owned graphs must be recorded during the real capture.
             return result
 
-        capture_mtp = getattr(getattr(self, "model_state", None), "capture_mtp_graphs", None)
-        if callable(capture_mtp):
-            capture_mtp(self._dispatch_mtp_batch_descriptor)
         capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
         if callable(capture_first_frame):
             capture_first_frame()
@@ -452,6 +453,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             sizes = [int(s) for s in self.model_state._get_mtp_capture_sizes()]
             capture_stream(sorted(set(sizes + [1])))
         return result
+
+    def _capture_mtp_graphs(self, profile_only: bool) -> int:
+        """Capture the MTP graphs and return the device memory they took."""
+        model_state = getattr(self, "model_state", None)
+        is_graph_runner = getattr(model_state, "_is_mtp_graph_runner", None)
+        if model_state is None or not callable(is_graph_runner) or not is_graph_runner():
+            return 0
+        torch.accelerator.synchronize()
+        free_before = torch.accelerator.get_memory_info()[0]
+        model_state.capture_mtp_graphs(self._dispatch_mtp_batch_descriptor, restore_capturing=profile_only)
+        torch.accelerator.synchronize()
+        return max(free_before - torch.accelerator.get_memory_info()[0], 0)
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
         capture_sizes = self.model_state._get_mtp_capture_sizes()

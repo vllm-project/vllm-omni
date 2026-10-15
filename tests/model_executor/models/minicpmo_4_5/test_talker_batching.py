@@ -770,7 +770,11 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
             "native_duplex": True,
             "duplex": {"epoch": 3, "turn_id": 7},
             "ids": {"tts": [41]},
-            "meta": {"native_duplex_segment_text": "first", "turn_eos_token_id": 99},
+            "meta": {
+                "native_duplex_segment_text": "first",
+                "turn_eos_token_id": 99,
+                "streaming_condition_seq": 11,
+            },
             "codes": {"audio": torch.empty(0)},
         },
         {
@@ -778,7 +782,11 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
             "native_duplex": True,
             "duplex": {"epoch": 4, "turn_id": 8},
             "ids": {"tts": [42, 99]},
-            "meta": {"native_duplex_segment_text": "second", "turn_eos_token_id": 99},
+            "meta": {
+                "native_duplex_segment_text": "second",
+                "turn_eos_token_id": 99,
+                "streaming_condition_seq": 12,
+            },
             "codes": {"audio": torch.empty(0)},
         },
     ]
@@ -793,6 +801,7 @@ def test_talker_projects_request_aligned_duplex_metadata() -> None:
     assert [value.item() for value in meta["native_duplex"]] == [True, True]
     assert [value.item() for value in meta["duplex_epoch"]] == [3, 4]
     assert [value.item() for value in meta["duplex_turn_id"]] == [7, 8]
+    assert [value.item() for value in meta["streaming_condition_seq"]] == [11, 12]
     assert [bytes(value.tolist()).decode("utf-8") for value in meta["llm_output_text_utf8"]] == [
         "first",
         "second",

@@ -1098,6 +1098,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         native_duplex_flags: list[torch.Tensor] = []
         duplex_epochs: list[torch.Tensor] = []
         duplex_turn_ids: list[torch.Tensor] = []
+        condition_seqs: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = torch.empty((0, 1), dtype=torch.long, device="cpu")
@@ -1119,6 +1120,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
                 duplex_epochs.append(torch.tensor(epoch, dtype=torch.long))
                 duplex_turn_ids.append(torch.tensor(turn_id, dtype=torch.long))
+                meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), Mapping) else {}
+                condition_seq = meta_info.get("streaming_condition_seq")
+                condition_seqs.append(
+                    torch.tensor(condition_seq if isinstance(condition_seq, int) else -1, dtype=torch.long)
+                )
                 segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
                 turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
 
@@ -1260,6 +1266,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "native_duplex": native_duplex_flags,
                     "duplex_epoch": duplex_epochs,
                     "duplex_turn_id": duplex_turn_ids,
+                    "streaming_condition_seq": condition_seqs,
                     "llm_output_text_utf8": segment_texts_utf8,
                     "turn_end": turn_end_flags,
                 }

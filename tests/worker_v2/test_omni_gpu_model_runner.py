@@ -119,7 +119,9 @@ def test_duplex_kv_reanchor_runs_after_block_table_writes():
 
 @pytest.mark.parametrize("output_form", ["tuple", "omni"])
 @pytest.mark.parametrize("profile_only", [False, True])
-def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile_only):
+def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile_only, monkeypatch):
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: (0, 0))
     runner = object.__new__(OmniGPUModelRunner)
     hidden = torch.ones(1, 2)
 
@@ -138,7 +140,7 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
         _capture_descs={CUDAGraphMode.PIECEWISE: [piecewise], CUDAGraphMode.FULL: [full]},
         _candidates={(1, 0): [piecewise, full]},
     )
-    runner.model_state = SimpleNamespace(capture_mtp_graphs=MagicMock())
+    runner.model_state = SimpleNamespace(capture_mtp_graphs=MagicMock(), _is_mtp_graph_runner=lambda: True)
     runner._dispatch_mtp_batch_descriptor = MagicMock(return_value="desc")
 
     def assert_unwrapped(_self, *, profile_only: bool = False):
@@ -152,10 +154,10 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
 
     assert runner.model.forward is original_forward  # restored after capture
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.PIECEWISE: [piecewise]}
-    if profile_only:
-        runner.model_state.capture_mtp_graphs.assert_not_called()
-    else:
-        runner.model_state.capture_mtp_graphs.assert_called_once_with(runner._dispatch_mtp_batch_descriptor)
+    # The MTP graphs are captured in the profiling pass too, so their pool is in the estimate.
+    runner.model_state.capture_mtp_graphs.assert_called_once_with(
+        runner._dispatch_mtp_batch_descriptor, restore_capturing=profile_only
+    )
 
 
 @pytest.mark.parametrize(

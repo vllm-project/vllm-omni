@@ -21,7 +21,7 @@ import torch
 from torch.profiler import record_function
 from vllm.config import LoadConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -614,7 +614,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         return self.prompt_embed_cache.stats()
 
     def _sample_peak_memory_mb(self) -> float:
-        """Return peak GPU memory for the current forward pass in MB.
+        """Return peak reserved GPU memory for the current forward pass in MiB.
 
         Must be called immediately after the measured forward/step work, with
         reset_peak_memory_stats() called just before it, so the measurement
@@ -624,21 +624,22 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         Uses max_memory_reserved (CUDA memory pool high-water mark) rather than
         max_memory_allocated so that allocator fragmentation is also visible.
         See: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
+
+        Named ``_mb`` to match the public ``peak_memory_mb`` field.
         """
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
         peak_allocated_bytes = current_omni_platform.max_memory_allocated()
 
+        pool_overhead_bytes = peak_reserved_bytes - peak_allocated_bytes
+
         peak_memory_mb = peak_reserved_bytes / (1024**2)
-        peak_reserved_gb = peak_reserved_bytes / (1024**3)
-        peak_allocated_gb = peak_allocated_bytes / (1024**3)
-        pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
         logger.debug(
-            "Peak GPU memory (this request): %.2f GB reserved, %.2f GB allocated, %.2f GB pool overhead (%.1f%%)",
-            peak_reserved_gb,
-            peak_allocated_gb,
-            pool_overhead_gb,
-            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
+            "Peak GPU memory (this request): %s GiB reserved, %s GiB allocated, %s GiB pool overhead (%.1f%%)",
+            format_gib(peak_reserved_bytes),
+            format_gib(peak_allocated_bytes),
+            format_gib(pool_overhead_bytes),
+            pool_overhead_bytes / peak_reserved_bytes * 100 if peak_reserved_bytes > 0 else 0.0,
         )
         return peak_memory_mb
 

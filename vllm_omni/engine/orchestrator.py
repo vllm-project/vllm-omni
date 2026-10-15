@@ -866,6 +866,7 @@ class OrchestratorBase:
         pool = self.stage_pools[stage_id]
         await self._route_upstream_first_audio(stage_id, replica_id, raw_outputs)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+
         for eco in raw_outputs.outputs:
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
             # async_chunk early-return so it lands in all modes.
@@ -883,9 +884,14 @@ class OrchestratorBase:
             req_state = self.request_states.get(request_id) if request_id is not None else None
             if req_state is None:
                 continue
+
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
+
+            # A non-session ERROR is fatal to the whole request. Handle it
+            # before normal terminal routing so it reaches the client once.
             if (
                 getattr(eco, "finish_reason", None) == FinishReason.ERROR
-                and not getattr(eco, "is_segment_finished", False)
+                and not segment_finished
                 and not req_state.session_owned
             ):
                 reason = getattr(eco, "stop_reason", None)
@@ -895,8 +901,9 @@ class OrchestratorBase:
                     error=reason if isinstance(reason, str) and reason else "Stage request failed",
                 )
                 continue
+
+            # Only streaming requests maintain the per-stage segment snapshot.
             if req_state.streaming.enabled:
-                segment_finished = bool(getattr(eco, "is_segment_finished", False))
                 raw_mm = self._completion_multimodal_output(eco, None)
                 req_state.streaming.segments[stage_id] = StreamingSegmentState(
                     finished=segment_finished,
@@ -908,26 +915,45 @@ class OrchestratorBase:
                     "new_prompt_len_snapshot",
                     None,
                 )
-            if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
+
+            if await self._apply_raw_terminal_stage_finish(
+                stage_id,
+                eco,
+                req_state,
+            ):
                 raw_terminal_request_ids.add(req_state.request_id)
-            await self._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
-        iteration_stats = IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
+
+            await self._report_duplex_session_request_error(
+                stage_id,
+                replica_id,
+                eco,
+                req_state,
+            )
+
+        iteration_stats = IterationStats() if self._stat_logger is not None and raw_outputs.outputs else None
         processed = await pool.process_llm_raw_outputs(
             replica_id,
             raw_outputs,
             iteration_stats=iteration_stats,
         )
+
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             key = (stage_id, replica_id)
             if key not in self._stage_replica_to_engine_idx:
                 engine_idx = len(self._stage_replica_to_engine_idx)
-                self._stat_logger.register_replica(engine_idx, str(stage_id), str(replica_id))
+                self._stat_logger.register_replica(
+                    engine_idx,
+                    str(stage_id),
+                    str(replica_id),
+                )
                 self._stage_replica_to_engine_idx[key] = engine_idx
+
             self._stat_logger.record(
                 raw_outputs.scheduler_stats,
                 iteration_stats,
                 engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
             )
+
         _sched_stats = raw_outputs.scheduler_stats
         if (
             self._prom_metrics is not None
@@ -939,6 +965,7 @@ class OrchestratorBase:
                 replica_id,
                 int(_sched_stats.num_waiting_reqs),
             )
+
         return processed
 
     async def _route_upstream_first_audio(self, stage_id: int, replica_id: int, raw_outputs: Any) -> None:
@@ -1852,26 +1879,48 @@ class OrchestratorBase:
     ) -> None:
         """Finish requests whose raw terminal had no processed output."""
         pool = self.stage_pools[stage_id]
+
         for request_id in request_ids:
             req_state = self.request_states.get(request_id)
             if req_state is None or req_state.session_owned:
                 continue
+
+            # A processed terminal output may have arrived before every submitted
+            # stage reported completion. Keep that real output instead of replacing
+            # it with the empty raw-terminal fallback below.
             pending = req_state.pending_final_output
             if pending is not None:
-                if set(req_state.stage_submit_ts).issubset(req_state.finished_stage_ids):
+                submitted_stage_ids = set(req_state.stage_submit_ts)
+                if submitted_stage_ids.issubset(req_state.finished_stage_ids):
                     req_state.pending_final_output = None
                     await self.output_async_queue.put(pending)
-                    await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+                    await self._cleanup_request_ids(
+                        [
+                            request_id,
+                            *self._cfg_tracker.cleanup_parent(request_id),
+                        ]
+                    )
+
                 # A real terminal output is pending; do not replace it with
                 # the swallowed-output fallback before upstream completion.
                 continue
+
+            # Ordinary raw terminals are client completions only when they
+            # come from a configured final-output stage. Non-session ERROR
+            # terminals are handled earlier by _handle_stage_error; session
+            # errors are reported separately and skipped above.
             if not pool.final_output:
                 continue
+
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
                 continue
 
-            final_output_type = getattr(pool.stage_client, "final_output_type", None)
+            final_output_type = getattr(
+                pool.stage_client,
+                "final_output_type",
+                None,
+            )
             logger.info(
                 "[Orchestrator] req=%s stage-%s raw terminal produced no processed terminal; returning empty %s output",
                 request_id,
@@ -1894,7 +1943,12 @@ class OrchestratorBase:
                     stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
                 )
             )
-            await self._cleanup_request_ids([request_id, *self._cfg_tracker.cleanup_parent(request_id)])
+            await self._cleanup_request_ids(
+                [
+                    request_id,
+                    *self._cfg_tracker.cleanup_parent(request_id),
+                ]
+            )
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
         """Attach CFG companion ids to diffusion sampling params when needed."""

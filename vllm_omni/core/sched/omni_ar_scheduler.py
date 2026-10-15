@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -179,6 +180,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
+        self._init_prefill_admission_policy()
 
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
@@ -332,8 +334,41 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         is_final, _ = self._omni_final_stage_flags(request)
         return is_final
 
+    def _init_prefill_admission_policy(self) -> None:
+        """Optional prefill batching under load (stage connector ``extra``).
+
+        While at least ``ar_prefill_admission_min_running`` requests run, a new
+        request waits until ``ar_prefill_admission_min_batch`` requests wait or
+        the oldest has waited ``ar_prefill_admission_max_wait_ms``: arrivals then
+        share one prefill / mixed step instead of each turning a decode step
+        into one. Off unless ``ar_prefill_admission_min_batch`` > 1.
+        """
+        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+        extra = (
+            connector_config.get("extra", connector_config)
+            if isinstance(connector_config, dict)
+            else getattr(connector_config, "extra", None)
+        ) or {}
+        self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
+        self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
+        self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
+        if self._prefill_admission_min_batch > 1 and self._prefill_admission_max_wait_s <= 0:
+            raise ValueError("ar_prefill_admission_min_batch > 1 needs ar_prefill_admission_max_wait_ms > 0")
+        if self._prefill_admission_min_running < 0:
+            raise ValueError("ar_prefill_admission_min_running must be >= 0")
+
     def _should_defer_waiting_admission(self) -> bool:
-        return False
+        min_batch = getattr(self, "_prefill_admission_min_batch", 0)
+        if (
+            min_batch <= 1
+            or not self.running
+            or not self.waiting
+            or len(self.running) < self._prefill_admission_min_running
+            or len(self.waiting) >= min_batch
+        ):
+            return False
+        oldest = min(request.arrival_time for request in self.waiting)
+        return time.time() - oldest < self._prefill_admission_max_wait_s
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -543,6 +578,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # One processor call per step when the next-stage processor has an
+        # opted-in batch form (``per_step_batch``; it needs per-request finish
+        # flags, not step tokens).
+        batch_saves: list[dict[str, Any]] | None = (
+            []
+            if inspect.isfunction(
+                getattr(
+                    getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_batch_func", None
+                )
+            )
+            and not requires_token_updates
+            else None
+        )
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -893,12 +941,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 }
                 if is_segment_finished:
                     save_kwargs["segment_generation"] = boundary_generation
-                self.chunk_transfer_adapter.save_async(
-                    inter_stage_output,
-                    request,
-                    is_segment_finished,
-                    **save_kwargs,
-                )
+                if batch_saves is not None:
+                    batch_saves.append(
+                        {
+                            "multimodal_output": inter_stage_output,
+                            "request": request,
+                            "is_segment_finished": is_segment_finished,
+                            **save_kwargs,
+                        }
+                    )
+                else:
+                    self.chunk_transfer_adapter.save_async(
+                        inter_stage_output,
+                        request,
+                        is_segment_finished,
+                        **save_kwargs,
+                    )
+
+        if batch_saves and self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter.save_async_batch(batch_saves)
 
         self._remove_stopped_requests_from_queues(
             stopped_running_reqs,

@@ -12,6 +12,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
+AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
@@ -587,6 +588,37 @@ def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("label", "pytest_marker"),
+    [
+        ("ROCm · FlashAttention/AITER GPU Coverage", "tests/diffusion/attention/"),
+        ("Custom Pipeline Test", "tests/e2e/features/custom_pipeline/"),
+        ("Diffusion · Batch Test", "tests/diffusion/batching"),
+    ],
+)
+def test_ready_jobs_restore_bf16_aiter_module_without_publishing(label: str, pytest_marker: str) -> None:
+    step = _find_step(label, AMD_READY_PIPELINE)
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    _assert_build_scoped_aiter_mha_cache(step, pytest_marker, publishes=False)
+    assert all("VLLM_ROCM_USE_AITER=0" not in command for command in step["commands"])
+
+
+def test_ready_flashattention_keeps_one_worker_and_mammoth_reuse() -> None:
+    step = _find_step("ROCm · FlashAttention/AITER GPU Coverage", AMD_READY_PIPELINE)
+    pytest_commands = [command for command in step["commands"] if "pytest" in command]
+
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 60
+    assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+    assert len(pytest_commands) == 2
+    assert all("-n 1" in command for command in pytest_commands)
+    assert "tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in pytest_commands[1]
+    assert "core_model and rocm and MI325 and cards_1" in pytest_commands[0]
+
+
 def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
     step = _find_step("Diffusion Stable Audio Layerwise Offload Test (quarantined)")
 
@@ -639,6 +671,38 @@ def test_amd_template_supplies_a_server_verified_aiter_artifact_source() -> None
     assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)" in bootstrap
     assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)" in bootstrap
     assert '-D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT"' in bootstrap
+
+
+def test_weekly_reliability_is_distinct_from_nightly() -> None:
+    weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
+    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    group = weekly["steps"][0]
+    jobs = {
+        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "test_reliability_qwen3_omni.py"),
+        "Reliability Test · wan22": ("mi300_1", "cards_1", "test_reliability_wan22.py"),
+        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "test_reliability_hunyuan_image.py"),
+        "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
+            "mi300_2",
+            "cards_2",
+            "test_invalid_omni_chat.py",
+        ),
+    }
+
+    assert group["group"] == "Reliability Test"
+    assert "if" not in group
+    assert [step["label"] for step in group["steps"]] == list(jobs)
+    for step in group["steps"]:
+        pool, cards, filename = jobs[step["label"]]
+        command = "\n".join(step["commands"])
+        assert "if" not in step
+        assert step["agent_pool"] == pool
+        assert step["grade"] == "NonBlocking"
+        assert step["depends_on"] == "amd-build"
+        assert "slow and rocm and MI325 and " + cards in command
+        assert filename in command
+        assert filename not in nightly
+    assert "tests/dfx/reliability/" not in nightly
+    assert "Qwen3-Omni Function Expansion" not in AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8")
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
