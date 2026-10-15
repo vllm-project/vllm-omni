@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -34,6 +35,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
@@ -50,6 +52,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _model_state_patch_lock = threading.RLock()
+
+
+def _runner_assisted_batch_descriptor(
+    batch_desc: BatchExecutionDescriptor,
+    request: RunnerAssistedFullAttentionMetadataRequest,
+    num_reqs: int,
+    max_num_seqs: int,
+) -> BatchExecutionDescriptor | None:
+    bucket = request.num_reqs_padded
+    tokens = request.num_tokens_padded if request.num_tokens_padded is not None else bucket
+    if not (num_reqs <= bucket <= max_num_seqs and batch_desc.num_tokens <= tokens and tokens >= bucket):
+        return None
+    return replace(batch_desc, num_reqs=bucket, num_tokens=tokens)
 
 
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
@@ -436,14 +451,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         else:
             result = super().capture_model(profile_only=profile_only)
 
+        # The MTP runner is a CUDAGraphWrapper, so during profiling upstream
+        # has swapped it to the throwaway pool and clears it afterwards. Report
+        # its pool with the rest in both passes.
+        result += self._capture_mtp_graphs(profile_only)
         if profile_only:
             # Upstream discards captures in its temporary profiling pool.
             # Model-owned graphs must be recorded during the real capture.
             return result
 
-        capture_mtp = getattr(getattr(self, "model_state", None), "capture_mtp_graphs", None)
-        if callable(capture_mtp):
-            capture_mtp(self._dispatch_mtp_batch_descriptor)
         capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
         if callable(capture_first_frame):
             capture_first_frame()
@@ -452,6 +468,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             sizes = [int(s) for s in self.model_state._get_mtp_capture_sizes()]
             capture_stream(sorted(set(sizes + [1])))
         return result
+
+    def _capture_mtp_graphs(self, profile_only: bool) -> int:
+        """Capture the MTP graphs and return the device memory they took."""
+        model_state = getattr(self, "model_state", None)
+        is_graph_runner = getattr(model_state, "_is_mtp_graph_runner", None)
+        if model_state is None or not callable(is_graph_runner) or not is_graph_runner():
+            return 0
+        torch.accelerator.synchronize()
+        free_before = torch.accelerator.get_memory_info()[0]
+        model_state.capture_mtp_graphs(self._dispatch_mtp_batch_descriptor, restore_capturing=profile_only)
+        torch.accelerator.synchronize()
+        return max(free_before - torch.accelerator.get_memory_info()[0], 0)
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
         capture_sizes = self.model_state._get_mtp_capture_sizes()
@@ -558,9 +586,51 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._merge_ec_connector_no_forward(scheduler_output, empty_output)
             )
 
+        runner_assisted_request = None
+        if (
+            not dummy_run
+            and batch_desc.cg_mode == CUDAGraphMode.NONE
+            and intermediate_tensors is None
+            and batch_req_state is not None
+            and num_reqs > 0
+        ):
+            request_hook = getattr(self.model, "get_runner_assisted_full_attention_metadata_request", None)
+            context_hook = getattr(self.model, "set_runner_assisted_full_attention_metadata_context", None)
+            if callable(request_hook) and callable(context_hook):
+                runner_assisted_request = request_hook(
+                    req_ids=batch_req_state.req_ids,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens=batch_req_state.num_scheduled_tokens,
+                    num_computed_tokens=self.req_states.num_computed_tokens_np[batch_req_state.idx_mapping_np],
+                    max_num_scheduled_tokens=max_query_len,
+                    num_prompt_tokens=self.req_states.prompt_len.np[batch_req_state.idx_mapping_np],
+                )
+                if runner_assisted_request is not None:
+                    if not isinstance(runner_assisted_request, RunnerAssistedFullAttentionMetadataRequest):
+                        raise TypeError("runner-assisted full attention metadata hook returned an invalid request")
+                    padded_desc = _runner_assisted_batch_descriptor(
+                        batch_desc, runner_assisted_request, num_reqs, self.scheduler_config.max_num_seqs
+                    )
+                    if padded_desc is not None:
+                        # Prepare the padded query locations, slot mappings,
+                        # and block-table rows through the normal InputBatch
+                        # path before requesting FULL attention metadata.
+                        batch_desc = padded_desc
+                    else:
+                        runner_assisted_request = None
+
         if not dummy_run:
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
+            if runner_assisted_request is not None:
+                # Preserve the uniform decode bound. Mixed graphs instead
+                # need a stable varlen launch layout across packed layouts.
+                query_bound = (
+                    max_query_len
+                    if runner_assisted_request.num_tokens_padded is None
+                    else max(2, runner_assisted_request.num_tokens_padded)
+                )
+                input_batch = replace(input_batch, max_query_len=query_bound)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             self.model_state.preprocess_state(
                 input_batch,
@@ -607,18 +677,23 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         attn_metadata = None
         slot_mappings_by_layer = None
+        # Models with their own unified decode graph need FULL attention
+        # metadata even when the v2 runner itself is executing eagerly. Only
+        # pad request/token metadata to the model-owned unified graph bucket.
+        runner_assisted_full_attn = runner_assisted_request is not None
+        runner_assisted_capture = runner_assisted_full_attn and runner_assisted_request.for_cudagraph_capture
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(slot_mappings, self.kv_cache_config)
             assert block_tables is not None
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
-                batch_desc.cg_mode,
+                CUDAGraphMode.FULL if runner_assisted_full_attn else batch_desc.cg_mode,
                 block_tables,
                 slot_mappings,
                 self.attn_groups,
                 self.kv_cache_config,
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                for_capture=(dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL) or runner_assisted_capture,
             )
         input_ids, inputs_embeds, ec_connector_output = self._prepare_mm_inputs(
             scheduler_output,
@@ -667,26 +742,34 @@ class OmniGPUModelRunner(GPUModelRunner):
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
             )
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=dp_sync.num_tokens_across_dp if dp_sync is not None else None,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-                is_padding=input_batch.is_padding,
-            ):
-                self.kv_connector.pre_forward(scheduler_output)
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model,
-                        model_inputs,
+            try:
+                if runner_assisted_full_attn:
+                    self.model.set_runner_assisted_full_attention_metadata_context(
+                        enabled=True, num_reqs=input_batch.num_reqs
                     )
-                else:
-                    model_output = self.model(**model_inputs)
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL if runner_assisted_full_attn else batch_desc.cg_mode,
+                    num_tokens_across_dp=dp_sync.num_tokens_across_dp if dp_sync is not None else None,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                    is_padding=input_batch.is_padding,
+                ):
+                    self.kv_connector.pre_forward(scheduler_output)
+                    if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model,
+                            model_inputs,
+                        )
+                    else:
+                        model_output = self.model(**model_inputs)
+            finally:
+                if runner_assisted_full_attn:
+                    self.model.set_runner_assisted_full_attention_metadata_context(enabled=False)
 
             # Extract hidden_states from model output.
             self._last_aux_output = None

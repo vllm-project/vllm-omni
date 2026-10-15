@@ -24,6 +24,10 @@ if [[ -z "${NIGHTLY:-}" ]]; then
     NIGHTLY=0
 fi
 
+if [[ -z "${WEEKLY:-}" ]]; then
+    WEEKLY=0
+fi
+
 if [[ -z "${VLLM_CI_BRANCH:-}" ]]; then
     VLLM_CI_BRANCH="main"
 fi
@@ -61,7 +65,8 @@ resolve_test_specs() {
         --branch "$BUILDKITE_BRANCH" \
         --labels "$PR_LABELS" \
         --debug-test-yaml "${DEBUG_TEST_YAML:-}" \
-        --nightly "$NIGHTLY"); then
+        --nightly "$NIGHTLY" \
+        --weekly "$WEEKLY"); then
         exit 1
     fi
 
@@ -84,6 +89,23 @@ filter_test_specs_by_skip_ci() {
             NIGHTLY_TESTS:*)
                 # Explicit PR and scheduled nightly selections must survive
                 # L2/L3 diff gating, including docs-only main commits.
+                runnable_specs+=("$suite_spec")
+                continue
+                ;;
+            WEEKLY_TESTS:*)
+                # Scheduled main weekly survives docs-only skip-all. A PR
+                # weekly-test label does not.
+                if [[ "$BUILDKITE_BRANCH" == "main" && "${WEEKLY}" == "1" ]]; then
+                    runnable_specs+=("$suite_spec")
+                    continue
+                fi
+                if decision=$(python3 "$SKIP_CI_PY" gate amd l2); then
+                    if [[ "$decision" == "skip-all" ]]; then
+                        echo "Skipping AMD weekly suite due to skip-all decision."
+                        skip_all=1
+                        continue
+                    fi
+                fi
                 runnable_specs+=("$suite_spec")
                 continue
                 ;;

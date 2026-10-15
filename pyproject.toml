@@ -117,6 +117,11 @@ chatterbox = [
     "pyloudnorm==0.1.1",
 ]
 
+# Optional torch-based fallback for server-side Silero VAD.
+server-vad = [
+    "silero-vad",
+]
+
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
 quack = [

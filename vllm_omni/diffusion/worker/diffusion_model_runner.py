@@ -1184,7 +1184,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         prepared_states: list[StepRequestState] = []
         error_outputs: list[RunnerOutput] = []
         for state in states:
-            if state.request_id in new_request_ids:
+            if state.request_id in new_request_ids or state.pending_chunk_boundary:
                 # Everything that requires rank-synchronization must be called
                 # inside a try, record the exception and handle with `_dit_any_rank_failed`.
                 # Reason (example): An exception in ``_initialize_generator`` or
@@ -1214,9 +1214,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 per_req_exc: BaseException | None = None
                 try:
-                    self._initialize_generator(state.sampling)
                     clear_pipeline_stage_durations(pipeline)
-                    pipeline.prepare_encode(state)
+                    if state.request_id in new_request_ids:
+                        if getattr(
+                            state.sampling, "streaming_buffer_seconds", None
+                        ) is not None and not supports_interaction_apply(pipeline):
+                            raise ValueError("playback feedback requires an interactive chunked pipeline")
+                        self._initialize_generator(state.sampling)
+                        pipeline.prepare_encode(state)
                 except Exception as exc:
                     per_req_exc = exc
                 # Pipelines that do rank-0-only work (e.g. MiniMax H3
@@ -1231,13 +1236,24 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # If the pipeline supports interaction, the interaction session initialization also needs to call
                 # synchronized_monotonic_time(). Wrap in another try-block to not block on prepare_encode failures.
                 try:
-                    if supports_interaction_apply(pipeline) and state.chunk_index == 0:
+                    if supports_interaction_apply(pipeline):
                         pipe = cast(SupportsInteractionApply, pipeline)
-                        assert self._interaction_coordinator is not None, "Model not loaded. Call load_model() first."
-                        state.interaction_chunk_metadata = self._interaction_coordinator.maybe_prepare_initial_session(
-                            state, pipe
-                        )
+                        if state.pending_chunk_boundary:
+                            # The engine drains control RPCs (and waits for
+                            # playback, when enabled) before this next call.
+                            pipe.apply_interaction_at_chunk_boundary(state)
+                            state.pending_chunk_boundary = False
+                        elif state.chunk_index == 0:
+                            assert self._interaction_coordinator is not None, (
+                                "Model not loaded. Call load_model() first."
+                            )
+                            state.interaction_chunk_metadata = (
+                                self._interaction_coordinator.maybe_prepare_initial_session(state, pipe)
+                            )
                         pipe.prepare_next_chunk(state)
+                        buffer_seconds = getattr(state.sampling, "streaming_buffer_seconds", None)
+                        if buffer_seconds is not None and pipe.peek_chunk_media(state).duration_s > buffer_seconds:
+                            raise ValueError("streaming_buffer_seconds must fit a complete media chunk")
                     merge_stage_durations(
                         state,
                         consume_pipeline_stage_durations(pipeline),
@@ -1343,6 +1359,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # admits a full-forward fallback request. Do this before dispatch so
         # the fallback does not bypass normal state/KV retirement.
         self._cleanup_finished_step_requests(scheduler_output)
+        if not scheduler_output.scheduled_request_ids:
+            return BatchRunnerOutput.from_list([])
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
         non_step_requests = [
@@ -1470,7 +1488,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             else:
                                 should_decode = req.denoise_completed
 
+                            streaming_media_duration = 0.0
+                            streaming_next_media_duration = 0.0
                             if should_decode:
+                                if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
+                                    streaming_media_duration = (
+                                        cast(SupportsInteractionApply, pipeline).peek_chunk_media(req).duration_s
+                                    )
                                 clear_pipeline_stage_durations(pipeline)
                                 result = pipeline.post_decode(req)
                                 if result is not None:
@@ -1479,12 +1503,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         req,
                                         result,
                                     )
-                                    # After consuming this chunk's interaction metadata, apply pending interactions and
-                                    # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
                                     if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
-                                        pipe = cast(SupportsInteractionApply, pipeline)
-                                        pipe.apply_interaction_at_chunk_boundary(req)
-                                        pipe.prepare_next_chunk(req)
+                                        if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
+                                            req.pending_chunk_boundary = True
+                                            pipe = cast(SupportsInteractionApply, pipeline)
+                                            streaming_next_media_duration = pipe.peek_chunk_media(req).duration_s
+                                        else:
+                                            pipe = cast(SupportsInteractionApply, pipeline)
+                                            pipe.apply_interaction_at_chunk_boundary(req)
+                                            pipe.prepare_next_chunk(req)
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index
@@ -1501,6 +1528,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                     step_index=req.step_index,
                                     finished=finished,
                                     result=result,
+                                    streaming_media_duration=streaming_media_duration,
+                                    streaming_next_media_duration=streaming_next_media_duration,
                                 )
                             )
                             offset = offset + row_num

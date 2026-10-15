@@ -36,7 +36,8 @@ def _make_engine() -> DiffusionEngine:
     engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
     engine.scheduler.initialize(SimpleNamespace())
-    engine.executor = SimpleNamespace(shutdown=Mock())
+    engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
+    engine.executor = SimpleNamespace(shutdown=Mock(), collective_rpc=Mock())
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
@@ -369,11 +370,12 @@ def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest
         "_init_executor",
         lambda self, config: setattr(self, "executor", fake_executor),
     )
-    monkeypatch.setattr(
-        DiffusionEngine,
-        "_prepare_diffusion_kv_profile_requests",
-        lambda self: events.append("prepare-profile") or expected_profile_requests,
-    )
+
+    def prepare_profile_requests(self) -> list[object]:
+        events.append("prepare-profile")
+        return expected_profile_requests
+
+    monkeypatch.setattr(DiffusionEngine, "_prepare_diffusion_kv_profile_requests", prepare_profile_requests)
 
     def initialize(executor, config, *, profile_requests):
         events.append("profile-workers")

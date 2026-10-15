@@ -72,6 +72,17 @@ def test_end_of_speech_frame_carries_no_audio():
     assert final.codes.audio.shape == (CODEBOOKS, 0) and bool(final.meta.finished)
 
 
+def test_a_one_frame_window_has_byte_viewable_codes():
+    # A request that yields a single frame sends a [codebooks, 1] window; the
+    # shared-memory connector views the codes as bytes, which needs stride 1.
+    manager, request = _manager(ramp="2"), _request()
+    assert fish_omni_to_dac_decoder_async_chunk(manager, _frame(0), request) is None
+    final = fish_omni_to_dac_decoder_async_chunk(manager, None, request, is_finished=True)
+    codes = final.codes.audio
+    assert codes.shape == (CODEBOOKS, 1) and codes.stride(-1) == 1
+    assert codes.view(torch.uint8).numel() == CODEBOOKS * 8
+
+
 def test_stream_keeps_only_frames_later_windows_read():
     manager, request = _manager(ramp="2", chunk=2, left=1), _request()
     for index in range(40):

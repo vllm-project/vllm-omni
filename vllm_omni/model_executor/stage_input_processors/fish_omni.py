@@ -175,7 +175,9 @@ def _advance(
     # A [codebooks, frames] tensor: Stage 1 schedules one placeholder token per
     # window and the decoder reads the codes from runtime info, instead of a
     # Python int per code through the scheduler and back.
-    codes = torch.from_numpy(np.ascontiguousarray(frames.T, dtype=np.int64))
+    # A fresh C-order copy: for a one-frame window ``ascontiguousarray`` keeps the
+    # transposed strides, which the shared-memory connector cannot view as bytes.
+    codes = torch.from_numpy(np.array(frames.T, dtype=np.int64, order="C", copy=True))
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),
         meta=MetaStruct(

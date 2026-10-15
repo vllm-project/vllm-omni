@@ -61,6 +61,7 @@ FAULT_ERROR_KEYWORDS = (
     "oom",
     "out of memory",
     "cuda",
+    "connection",
     "job failed",
     "unknown error",
     "internal server error",
@@ -188,7 +189,7 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.skip(reason="issue#4285")
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_image_large_request_failure(
     omni_server_function,
@@ -217,6 +218,7 @@ def test_reliability_fault_gpu_oom_image_large_request_failure(
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -239,6 +241,7 @@ def test_reliability_fault_process_kill_request_failure(
 @pytest.mark.diffusion
 @pytest.mark.skip(reason="issue#4522")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -330,6 +333,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 @pytest.mark.diffusion
 @pytest.mark.skip(reason="issue#4526")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -360,7 +364,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
@@ -394,7 +398,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
@@ -419,6 +423,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
@@ -447,6 +452,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 @pytest.mark.diffusion
 @pytest.mark.skip(reason="issue#4526")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", HUNYUAN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
