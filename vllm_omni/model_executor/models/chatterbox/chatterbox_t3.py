@@ -16,7 +16,7 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from transformers import GPT2Config
+from transformers import GPT2Config, PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.models.gpt2 import GPT2Model
 from vllm.model_executor.models.utils import maybe_prefix
@@ -178,6 +178,23 @@ class ChatterboxT3ForConditionalGeneration(nn.Module):
     # default runner. MRv2 uses the sampler's token-only output contract below.
     omni_pooler_payload_include_hidden = False
 
+    # The backbone and heads a checkpoint wraps; Original overrides all three.
+    backbone_class: type[nn.Module] = GPT2Model
+    heads_class: type[nn.Module] = T3Heads
+
+    @staticmethod
+    def backbone_config(config: ChatterboxConfig) -> PretrainedConfig:
+        """The backbone's transformers config: upstream's GPT-2 medium with the checkpoint's sizes."""
+        return GPT2Config(
+            vocab_size=config.text_vocab_size,
+            n_positions=config.max_position_embeddings,
+            n_embd=config.hidden_size,
+            n_layer=config.num_hidden_layers,
+            n_head=config.num_attention_heads,
+            activation_function=config.activation_function,
+            layer_norm_epsilon=config.layer_norm_epsilon,
+        )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         if vllm_config.cache_config.enable_prefix_caching:
@@ -187,22 +204,15 @@ class ChatterboxT3ForConditionalGeneration(nn.Module):
             )
         config: ChatterboxConfig = vllm_config.model_config.hf_config
         self.config = config
-        backbone = GPT2Config(
-            vocab_size=config.text_vocab_size,
-            n_positions=config.max_position_embeddings,
-            n_embd=config.hidden_size,
-            n_layer=config.num_hidden_layers,
-            n_head=config.num_attention_heads,
-            activation_function=config.activation_function,
-            layer_norm_epsilon=config.layer_norm_epsilon,
-        )
-        self.tfmr = GPT2Model(
-            vllm_config=vllm_config.with_hf_config(backbone, architectures=["ChatterboxForConditionalGeneration"]),
+        self.tfmr = self.backbone_class(
+            vllm_config=vllm_config.with_hf_config(
+                self.backbone_config(config), architectures=["ChatterboxForConditionalGeneration"]
+            ),
             prefix=maybe_prefix(prefix, "tfmr"),
         )
-        self.heads = T3Heads(config)
-        # The repo also holds the 10-step S3Gen weights; vLLM's loader would
-        # otherwise read every safetensors file in the snapshot.
+        self.heads = self.heads_class(config)
+        # The repo also holds the other checkpoint's and S3Gen's weights;
+        # vLLM's loader would otherwise read every safetensors file in the snapshot.
         self.allow_patterns_overrides = [config.t3_weights]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

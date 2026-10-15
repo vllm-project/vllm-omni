@@ -5,11 +5,9 @@
 from collections.abc import Iterable
 
 import torch
-from torch import nn
-from transformers import LlamaConfig
+from transformers import LlamaConfig, PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.models.llama import LlamaModel
-from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxCFGSampler, ChatterboxMRv2CFGSampler
@@ -30,19 +28,14 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
     prefer_model_sampler = True
     model_sampler_wants_extra_args = True
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        nn.Module.__init__(self)
-        if vllm_config.cache_config.enable_prefix_caching:
-            raise ValueError("Chatterbox requires enable_prefix_caching=False for conditioned placeholder prompts")
-        # A request's speech positions stay below its context, so a context
-        # within the checkpoint's speech position table bounds every request.
-        if vllm_config.model_config.max_model_len > ORIGINAL_SPEECH_POSITIONS:
-            raise ValueError(f"Chatterbox Original supports max_model_len up to {ORIGINAL_SPEECH_POSITIONS}")
-        config: ChatterboxConfig = vllm_config.model_config.hf_config
-        self.config = config
-        # Upstream's LLAMA_520M_CONFIG_DICT: the checkpoint's own eight-row
-        # embedding table (the heads embed every token) and llama3 RoPE.
-        backbone = LlamaConfig(
+    backbone_class = LlamaModel
+    heads_class = OriginalHeads
+
+    @staticmethod
+    def backbone_config(config: ChatterboxConfig) -> PretrainedConfig:
+        """Upstream's ``LLAMA_520M_CONFIG_DICT``: the checkpoint's own eight-row embedding table
+        (the heads embed every token) and llama3 RoPE."""
+        return LlamaConfig(
             vocab_size=8,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -65,12 +58,13 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
             },
             tie_word_embeddings=False,
         )
-        self.tfmr = LlamaModel(
-            vllm_config=vllm_config.with_hf_config(backbone, architectures=["ChatterboxForConditionalGeneration"]),
-            prefix=maybe_prefix(prefix, "tfmr"),
-        )
-        self.heads = OriginalHeads(self.config)
-        self.allow_patterns_overrides = [self.config.t3_weights]
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # A request's speech positions stay below its context, so a context
+        # within the checkpoint's speech position table bounds every request.
+        if vllm_config.model_config.max_model_len > ORIGINAL_SPEECH_POSITIONS:
+            raise ValueError(f"Chatterbox Original supports max_model_len up to {ORIGINAL_SPEECH_POSITIONS}")
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.cfg_pairs: dict[str, tuple[str, str, float]] = {}
         self.cfg_sampler = ChatterboxCFGSampler(Sampler(), self.cfg_pairs)
 
