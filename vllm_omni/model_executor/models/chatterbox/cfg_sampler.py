@@ -83,6 +83,15 @@ class ChatterboxCFGSampler:
             guided[cond] = blended
             guided[uncond] = blended
             row_pairs.append((cond, uncond))
+        # Two deliberate departures from upstream's T3.inference, which
+        # samples over all 8194 ids; both renormalize the distribution over
+        # the remaining ids. The start-of-speech id is never sampled: every
+        # placeholder prompt id is that token, so the repetition penalty
+        # reaches no real speech token through the prompt. Ids above the stop
+        # token are not speech codes: the stage handoff drops every id at or
+        # above speech_token_limit, because S3Gen has no embedding for it, so
+        # a sampled one would silently vanish from the audio; masking makes
+        # it impossible instead.
         guided[:, START_SPEECH_TOKEN] = -torch.inf
         guided[:, STOP_SPEECH_TOKEN + 1 :] = -torch.inf
         return guided, row_pairs
