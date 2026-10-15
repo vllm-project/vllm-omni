@@ -61,7 +61,7 @@ def main():
     if args.backend == "quality":
         evaluate_quality(args)
         return
-    synthesize, close, engine, sample_rate = make_backend(args)
+    synthesize, close, engine, sample_rate, flow_dtype = make_backend(args)
     rows = []
     try:
         for voice in ("builtin", "clone"):
@@ -109,7 +109,7 @@ def main():
                         )
                     )
                     logging.info("%s %s %s: %.3fs, RTF %.3f", args.backend, voice, seed, elapsed, elapsed / duration)
-            write_report(args, rows)
+            write_report(args, rows, flow_dtype)
             if args.profile:
                 profile_generation(args, synthesize, reference, voice, engine)
     finally:
@@ -121,6 +121,10 @@ def make_backend(args):
 
     Upstream runs with its own ``generate`` defaults; Omni with the deploy
     file's ``default_sampling_params``, which record them, and each request's seed.
+
+    Returns:
+        The synthesis function, its cleanup, the Omni engine (None upstream),
+        the output sample rate and the precision the flow decoder runs in.
     """
     if args.backend == "upstream":
         from chatterbox.tts import ChatterboxTTS
@@ -137,7 +141,7 @@ def make_backend(args):
             model.conds = builtin
             return model.generate(text, audio_prompt_path=str(reference) if reference else None)
 
-        return synthesize, lambda: None, None, model.sr
+        return synthesize, lambda: None, None, model.sr, "float32"
 
     import yaml
 
@@ -192,7 +196,9 @@ def make_backend(args):
         audio = output["audio"]
         return torch.cat([chunk.flatten() for chunk in audio]) if isinstance(audio, list) else audio
 
-    return synthesize, engine.close, engine, config.sample_rate
+    # Every weight is float32 below; the flow decoder runs in the deploy file's flow_dtype.
+    flow_dtype = ChatterboxConfig(**settings["stages"][1].get("hf_overrides", {})).flow_dtype
+    return synthesize, engine.close, engine, config.sample_rate, flow_dtype
 
 
 def profile_generation(args, synthesize, reference, voice, engine):
@@ -234,7 +240,7 @@ def sample_gpu_memory(finished, samples, gpu_uuid):
         finished.wait(0.1)
 
 
-def write_report(args, rows):
+def write_report(args, rows, flow_dtype):
     """Persist provenance and per-mode variability after each completed mode."""
     summaries = {}
     for voice in ("builtin", "clone"):
@@ -259,7 +265,7 @@ def write_report(args, rows):
         checkpoint=args.model.name,
         reference_sha256=hashlib.sha256(args.reference.read_bytes()).hexdigest(),
         packages={name: importlib.metadata.version(name) for name in ("torch", "torchaudio", "transformers", "numpy")},
-        precision="float32; TF32 disabled",
+        precision=f"float32 weights, {flow_dtype} flow decoder; TF32 disabled",
         concurrency=1,
         model_runner=args.runner if args.backend == "omni" else None,
         cuda_graphs=args.backend == "omni" and args.cuda_graphs,

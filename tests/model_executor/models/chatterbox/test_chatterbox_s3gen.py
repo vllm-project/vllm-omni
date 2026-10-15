@@ -102,8 +102,9 @@ def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
 
 @pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
+    """A float32 flow: the value-level checks below compare float32 computations."""
     torch.manual_seed(0)
-    return S3GenDecoder(ChatterboxConfig(), CONTEXT).eval()
+    return S3GenDecoder(ChatterboxConfig(flow_dtype="float32"), CONTEXT).eval()
 
 
 @pytest.fixture(autouse=True)
@@ -136,10 +137,10 @@ def test_fade_in_out_blends_the_overlap() -> None:
 def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder: S3GenDecoder) -> None:
     """Actual flow and HiFT calls enforce the mixed-precision boundary.
 
-    The decoder is built from a config asking for bfloat16 flow, with the
-    float32 decoder's weights.
+    The decoder is built from the default config, whose flow runs in
+    bfloat16, with the float32 decoder's weights.
     """
-    bf16 = S3GenDecoder(ChatterboxConfig(flow_dtype="bfloat16"), CONTEXT).eval()
+    bf16 = S3GenDecoder(ChatterboxConfig(), CONTEXT).eval()
     bf16.load_state_dict(decoder.state_dict())
     flow_dtypes, vocoder_dtypes = [], []
 
@@ -169,8 +170,8 @@ def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder: S3GenDecoder)
 
 
 def test_cudnn_attention_rejects_cpu_execution(model_dir: str) -> None:
-    """The bfloat16 MPS deploy file asks for cuDNN attention, which a CPU decoder cannot give."""
-    stage = build_stage(stage_vllm_config(model_dir, "chatterbox_turbo_high_concurrency_bf16_mps.yaml", 1), "cpu")
+    """The cuDNN MPS deploy file asks for cuDNN attention, which a CPU decoder cannot give."""
+    stage = build_stage(stage_vllm_config(model_dir, "chatterbox_turbo_high_concurrency_cudnn_mps.yaml", 1), "cpu")
     assert (stage.config.flow_dtype, stage.config.flow_attention_backend) == ("bfloat16", "cudnn")
 
     with pytest.raises(ValueError, match="requires CUDA"):
@@ -1020,8 +1021,8 @@ def test_profile_with_64_slots_skips_neural_decode(decoder: S3GenDecoder) -> Non
     [
         ("chatterbox", 128, ""),
         ("chatterbox_turbo", 64, ""),
-        ("chatterbox", 128, "_bf16_mps"),
-        ("chatterbox_turbo", 64, "_bf16_mps"),
+        ("chatterbox", 128, "_cudnn_mps"),
+        ("chatterbox_turbo", 64, "_cudnn_mps"),
     ],
 )
 def test_high_concurrency_profiles_admit_64_complete_requests(name, stage0_slots, suffix):
@@ -1037,7 +1038,6 @@ def test_high_concurrency_profiles_admit_64_complete_requests(name, stage0_slots
     if suffix:
         assert config["cuda_mps"] is True
         assert decoder["dtype"] == "float32"
-        assert decoder["hf_overrides"]["flow_dtype"] == "bfloat16"
         assert decoder["hf_overrides"]["flow_attention_backend"] == "cudnn"
         chunking = config["connectors"]["connector_of_shared_memory"]["extra"]
         assert chunking["codec_chunk_frames"] == (30 if name == "chatterbox" else 15)

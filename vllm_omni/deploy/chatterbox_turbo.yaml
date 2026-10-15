@@ -11,9 +11,11 @@
 # runner; both are supported. The ``platforms:`` section at the end keeps
 # V1 where V2 is rejected (NPU, XPU) or has not been run (ROCm, MUSA).
 #
-# Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 runs in float32 (the
-# vocoder is not half-precision safe) and eagerly (its convolutions see a
-# different length every step).
+# Stage 0 runs in bfloat16 with CUDA graphs. Stage 1 keeps float32 weights
+# for HiFT, which is not half-precision safe, runs the flow decoder under
+# bfloat16 autocast (the config's ``flow_dtype``, overridable through
+# ``hf_overrides``), and runs eagerly (its convolutions see a different
+# length every step).
 #
 # Prefix caching is off for correctness, not speed: stage 0's prompt is
 # placeholder ids, and the real prefix arrives as embeddings, so two requests

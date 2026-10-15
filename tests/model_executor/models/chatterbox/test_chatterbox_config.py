@@ -52,8 +52,8 @@ def test_the_engine_reads_the_backbones_attention_geometry(variant: str) -> None
 
 def test_variant_and_flow_settings_survive_serialization() -> None:
     """vLLM serializes the config into each stage process and rebuilds it there."""
-    restored = ChatterboxConfig.from_dict(ChatterboxConfig("original", flow_dtype="bfloat16").to_dict())
-    assert (restored.variant, restored.flow_dtype, restored.num_hidden_layers) == ("original", "bfloat16", 30)
+    restored = ChatterboxConfig.from_dict(ChatterboxConfig("original", flow_dtype="float32").to_dict())
+    assert (restored.variant, restored.flow_dtype, restored.num_hidden_layers) == ("original", "float32", 30)
 
 
 @pytest.mark.parametrize("variant", ["turbo", "original"])

@@ -94,14 +94,16 @@ class ChatterboxConfig(PretrainedConfig):
     model_type = "chatterbox"
 
     def __init__(
-        self, variant: str = "turbo", flow_dtype: str = "float32", flow_attention_backend: str = "auto", **kwargs
+        self, variant: str = "turbo", flow_dtype: str = "bfloat16", flow_attention_backend: str = "auto", **kwargs
     ):
         if variant not in VARIANT_FIELDS:
             raise ValueError("Chatterbox variant must be 'turbo' or 'original'")
         kwargs.setdefault("eos_token_id", STOP_SPEECH_TOKEN)
         super().__init__(**kwargs)
         self.variant = variant
-        # Read by stage 1, which validates the pair when it is built.
+        # Stage 1's flow runs under bfloat16 autocast unless a deploy file
+        # overrides it; HiFT always runs in float32. Stage 1 validates the
+        # pair when it is built.
         self.flow_dtype = flow_dtype
         self.flow_attention_backend = flow_attention_backend
 

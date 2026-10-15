@@ -1,7 +1,7 @@
-# Opt-in H100 acceleration; admission at 64 does not guarantee real-time audio.
+# Throughput overlay for the Original, tested on H100: cuDNN's attention
+# kernel for the BF16 flow and shared GPU execution (CUDA MPS).
 # Requires CUDA, native cuDNN SDPA and nvidia-cuda-mps-control on PATH.
-# BF16 flow changes numerical audio; HiFT remains FP32. See the profiling report
-# for measured concurrency, intelligibility, warmup and playback limitations.
+# See the recipe for measured limits; admission at 64 is a capacity contract.
 base_config: chatterbox_high_concurrency.yaml
 cuda_mps: true
 
@@ -16,5 +16,4 @@ stages:
     hf_overrides:
       # hf_overrides replaces the base mapping during deployment inheritance.
       variant: original
-      flow_dtype: bfloat16
       flow_attention_backend: cudnn
