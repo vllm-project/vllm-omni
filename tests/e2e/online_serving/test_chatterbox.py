@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Chatterbox speech serving through the shared TTS test client."""
 
+import json
+
 import pytest
+from websockets.sync.client import connect
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -77,3 +80,45 @@ def test_reference_voice_without_transcript(omni_server, online_client):
         },
         request_num=4,
     )
+
+
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVERS, indirect=True)
+def test_sentence_streaming_websocket(omni_server):
+    """The shared WebSocket frontend splits the text into sentences and streams PCM for each."""
+    sentences: dict[int, int] = {}
+    with connect(f"ws://{omni_server.host}:{omni_server.port}/v1/audio/speech/stream") as ws:
+        ws.send(
+            json.dumps(
+                {
+                    "type": "session.config",
+                    "voice": "default",
+                    "response_format": "pcm",
+                    "stream_audio": True,
+                    "split_granularity": "sentence",
+                }
+            )
+        )
+        ws.send(json.dumps({"type": "input.text", "text": f"{TEXT} Please leave your name after the tone."}))
+        ws.send(json.dumps({"type": "input.done"}))
+        current = -1
+        while True:
+            frame = ws.recv(timeout=300)
+            if isinstance(frame, bytes):
+                sentences[current] += len(frame)
+                continue
+            message = json.loads(frame)
+            assert message["type"] != "error", message
+            if message["type"] == "audio.start":
+                assert message["sample_rate"] == 24000
+                current = message["sentence_index"]
+                sentences[current] = 0
+            elif message["type"] == "session.done":
+                assert message["total_sentences"] == 2
+                break
+
+    # Mono 16-bit PCM: more than a second of audio per sentence.
+    assert sorted(sentences) == [0, 1]
+    assert all(size > 2 * 24000 for size in sentences.values())
