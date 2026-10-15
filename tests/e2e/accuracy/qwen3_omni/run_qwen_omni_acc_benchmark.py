@@ -91,6 +91,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import sys
 from datetime import datetime
@@ -107,6 +108,8 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     videomme_bench_argv,
 )
 
+logger = logging.getLogger(__name__)
+
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -118,21 +121,46 @@ def _default_result_dir() -> Path:
     return Path(__file__).resolve().parent / "results" / "qwen_omni_acc"
 
 
-def _write_accuracy_result_metadata(path: Path, data: dict[str, Any], baseline: dict[str, Any]) -> None:
-    """Write the gates and runtime hardware into the bench result JSON.
+def _accuracy_hardware_label() -> str:
+    """Local device token for the accuracy result, or ``""`` when detection fails.
+
+    The accuracy client can target a remote server, so ``device_count`` /
+    ``get_device_name`` may be unusable on the host that writes the JSON.
+    Dashboard metadata must not abort the run before the accuracy gate.
+    """
+    try:
+        from tests.helpers.hardware import get_runtime_resource_label, hardware_json_value
+
+        return hardware_json_value(get_runtime_resource_label())
+    except Exception:
+        logger.warning("Could not detect Hardware for the accuracy result; writing an empty label", exc_info=True)
+        return ""
+
+
+def _write_accuracy_result_metadata(
+    path: Path,
+    data: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    dataset: str,
+) -> None:
+    """Write dashboard fields into the bench result JSON.
 
     ``vllm bench serve`` saves measured scores only. The thresholds from the
     accuracy test (``--min-daily-omni-accuracy``, ``--max-seed-tts-mean-wer``, …)
     are applied afterwards, so persist them under ``baseline`` before the check.
     Unset optional gates (``None``) are omitted.
 
-    ``Hardware`` uses the same runtime label as ``tests/dfx/perf/scripts/run_benchmark.py``
-    (``H100``, ``A3``, …; empty when the device is unknown).
-    """
-    from tests.dfx.conftest import get_runtime_resource_label, hardware_json_value
+    ``dataset`` is the filename token (``daily_omni``, ``videomme``, ``seed_tts``).
+    Model and dataset names both contain underscores, so the dashboard reads
+    ``dataset`` from this field. ``model_id`` stays as ``vllm bench serve`` wrote it.
 
+    ``Hardware`` uses the same runtime label as ``tests/dfx/perf/scripts/run_benchmark.py``
+    (``H100``, ``A3``, …; empty when the device is unknown or detection fails).
+    """
+    data["dataset"] = dataset
     data["baseline"] = {key: value for key, value in baseline.items() if value is not None}
-    data["Hardware"] = hardware_json_value(get_runtime_resource_label())
+    data["Hardware"] = _accuracy_hardware_label()
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -693,6 +721,7 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                 path,
                 data,
                 {"min_daily_omni_accuracy": ns.min_daily_omni_accuracy},
+                dataset="daily_omni",
             )
             errs = _validate_daily_omni(data, min_accuracy=ns.min_daily_omni_accuracy)
             if errs:
@@ -712,6 +741,7 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                 path,
                 data,
                 {"min_videomme_accuracy": ns.min_videomme_accuracy},
+                dataset="videomme",
             )
             errs = _validate_videomme(data, min_accuracy=ns.min_videomme_accuracy)
             if errs:
@@ -736,6 +766,7 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                     "min_seed_tts_mean_sim": ns.min_seed_tts_mean_sim,
                     "min_seed_tts_mean_utmos": ns.min_seed_tts_mean_utmos,
                 },
+                dataset="seed_tts",
             )
             errs = _validate_seed_tts(
                 data,
