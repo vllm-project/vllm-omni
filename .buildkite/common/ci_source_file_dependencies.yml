@@ -15,6 +15,9 @@ x-chatterbox: &chatterbox
   - vllm_omni/engine/arg_utils.py
   - vllm_omni/entrypoints/omni_base.py
   - vllm_omni/entrypoints/openai/serving_speech.py
+  - vllm_omni/entrypoints/openai/serving_speech_stream.py
+  - vllm_omni/utils/speaker_cache.py
+  - vllm_omni/config/speech_cache.py
   - vllm_omni/entrypoints/openai/tts_adapters/
   - vllm_omni/worker_v2/
   - vllm_omni/core/sched/
