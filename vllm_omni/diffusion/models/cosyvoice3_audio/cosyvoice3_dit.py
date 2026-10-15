@@ -19,6 +19,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_batch_flow_profile
+from vllm_omni.model_executor.models.cosyvoice3.utils import build_dit_attention_mask
 
 logger = init_logger(__name__)
 
@@ -54,15 +55,21 @@ def get_pos_embed_indices(start, length, max_pos, scale=1.0):
     return pos
 
 
+def _is_full_qk_mask(mask: torch.Tensor | None) -> bool:
+    """True when ``mask`` is a full query-key map, not a padding vector."""
+    if mask is None or mask.dim() < 3:
+        return False
+    return mask.shape[-1] == mask.shape[-2]
+
+
 def _normalize_attention_mask(mask: torch.Tensor | None, batch_size: int, seq_len: int) -> torch.Tensor | None:
+    """Collapse key-padding masks to ``(B, S)``. Do not flatten full QK maps."""
     if mask is None:
         return None
     if mask.dim() == 2:
         attn_mask = mask
     elif mask.dim() == 3 and mask.shape[1] == 1:
         attn_mask = mask[:, 0]
-    elif mask.dim() == 4:
-        attn_mask = mask[:, 0, -1]
     else:
         return None
     if attn_mask.shape != (batch_size, seq_len):
@@ -91,6 +98,14 @@ class DiTAttention(nn.Module):
 
     This replaces the original Attention class to leverage FlashAttention,
     SageAttention, or SDPA backends automatically.
+
+    Padding masks stay on that accelerated path via ``AttentionMetadata``.
+    Streaming chunk masks are full query-key maps, which the diffusion
+    backends do not take, so they go to ``F.scaled_dot_product_attention``
+    with ``attn_mask``. SDPA only dispatches to kernels that apply the mask
+    before softmax (FLASH is ineligible with a mask; memory-efficient honours
+    it), so no backend is pinned: MATH would materialize the fp32
+    ``(B, H, T, T)`` score map, which grows with the resent stream history.
     """
 
     def __init__(
@@ -107,6 +122,10 @@ class DiTAttention(nn.Module):
         self.inner_dim = dim_head * heads
         self.dropout = dropout
         self.scale = 1.0 / math.sqrt(dim_head)
+        # Run the full-mask SDPA in fp32 under autocast. Only the fp16 ONNX
+        # export sets it (see ``flow_estimator_trt``), so the engine keeps
+        # the masked softmax in fp32.
+        self.fp32_masked_attention = False
 
         # Q/K/V projections
         self.to_q = nn.Linear(dim, self.inner_dim)
@@ -145,26 +164,45 @@ class DiTAttention(nn.Module):
                 key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_backend"):
-            # Reshape for attention: (batch, seq, heads, head_dim)
-            query = query.view(batch_size, seq_len, self.heads, self.dim_head)
-            key = key.view(batch_size, seq_len, self.heads, self.dim_head)
-            value = value.view(batch_size, seq_len, self.heads, self.dim_head)
-
-            # The diffusion Attention layer expects (batch, seq, heads, head_dim)
-            attn_mask = _normalize_attention_mask(mask, batch_size, seq_len)
-            attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
-            out = self.attn(query, key, value, attn_metadata=attn_metadata)
+            if _is_full_qk_mask(mask):
+                # (B, H, L, D) — SDPA applies the chunk map inside softmax.
+                query_h = query.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
+                key_h = key.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
+                value_h = value.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
+                attn_mask = mask.unsqueeze(1) if mask.dim() == 3 else mask
+                if self.fp32_masked_attention:
+                    with torch.autocast(device_type=query_h.device.type, enabled=False):
+                        out = F.scaled_dot_product_attention(
+                            query_h.float(), key_h.float(), value_h.float(), attn_mask=attn_mask
+                        ).to(query_h.dtype)
+                else:
+                    out = F.scaled_dot_product_attention(
+                        query_h, key_h, value_h, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+                    )
+                out = out.transpose(1, 2).reshape(batch_size, seq_len, self.inner_dim)
+            else:
+                # Reshape for attention: (batch, seq, heads, head_dim)
+                # The diffusion Attention layer expects (batch, seq, heads, head_dim)
+                query_s = query.view(batch_size, seq_len, self.heads, self.dim_head)
+                key_s = key.view(batch_size, seq_len, self.heads, self.dim_head)
+                value_s = value.view(batch_size, seq_len, self.heads, self.dim_head)
+                pad_mask = _normalize_attention_mask(mask, batch_size, seq_len)
+                attn_metadata = AttentionMetadata(attn_mask=pad_mask) if pad_mask is not None else None
+                out = self.attn(query_s, key_s, value_s, attn_metadata=attn_metadata)
+                # Some attention backends return a non-contiguous layout.
+                out = out.reshape(batch_size, seq_len, self.inner_dim)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_output_projection"):
-            # Some attention backends return a non-contiguous layout.
-            out = out.reshape(batch_size, seq_len, self.inner_dim)
             out = out.to(x.dtype)
             out = self.to_out(out)
 
         # Apply mask if provided
-        attn_mask = _normalize_attention_mask(mask, batch_size, seq_len)
-        if attn_mask is not None:
-            out = out.masked_fill(~attn_mask.unsqueeze(-1), 0.0)
+        pad_mask = _normalize_attention_mask(mask, batch_size, seq_len)
+        if pad_mask is not None:
+            out = out.masked_fill(~pad_mask.unsqueeze(-1), 0.0)
+        elif _is_full_qk_mask(mask):
+            out_mask = mask[:, 0, -1] if mask.dim() == 4 else mask[:, -1]
+            out = out.masked_fill(~out_mask.unsqueeze(-1).bool(), 0.0)
 
         return out
 
@@ -403,7 +441,29 @@ class DiT(nn.Module):
         self.static_chunk_size = static_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
 
-    def forward(self, x, mask, mu, t, spks=None, cond=None):
+    def forward(
+        self,
+        x,
+        mask,
+        mu,
+        t,
+        spks=None,
+        cond=None,
+        streaming: bool = False,
+        attn_mask: torch.Tensor | None = None,
+    ):
+        """Forward CosyVoice3 DiT.
+
+        When ``streaming=True``, attention uses a static chunk mask
+        (``static_chunk_size``) so each frame only attends within the allowed
+        causal chunk window — required for CosyVoice3 streaming flow matching.
+
+        ``attn_mask`` (``(B, 1, T, T)`` or ``(B, T, T)`` bool) overrides that
+        computation with an explicit query-key map. It is how the module is
+        exported to ONNX/TensorRT: the engine cannot evaluate ``streaming`` at
+        run time, so the mask becomes an engine input built by
+        ``build_dit_attention_mask`` on the host side.
+        """
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_prepare_inputs"):
             x = x.transpose(1, 2)
             mu = mu.transpose(1, 2)
@@ -419,7 +479,16 @@ class DiT(nn.Module):
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_rope_and_mask"):
             rope = self.rotary_embed.forward_from_seq_len(seq_len)
-            attn_mask = mask[:, 0].bool() if mask.dim() == 3 and mask.shape[1] == 1 else mask.bool()
+            # Explicit map (export / TensorRT) > streaming chunk map > padding
+            # vector. Only the padding vector can take the accelerated
+            # DiffusionAttention path; the full maps go through SDPA.
+            if attn_mask is not None:
+                if attn_mask.dim() == 3:
+                    attn_mask = attn_mask.unsqueeze(dim=1)
+            elif streaming:
+                attn_mask = build_dit_attention_mask(mask, streaming=True, static_chunk_size=self.static_chunk_size)
+            else:
+                attn_mask = mask[:, 0].bool() if mask.dim() == 3 and mask.shape[1] == 1 else mask.bool()
 
         if self.long_skip_connection is not None:
             residual = x

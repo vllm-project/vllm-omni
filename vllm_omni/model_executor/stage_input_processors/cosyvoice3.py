@@ -93,6 +93,23 @@ def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
     return None
 
 
+# ``static_chunk_size`` (50 mel frames) / ``token_mel_ratio`` (2): the DiT's
+# streaming attention block, in speech tokens. Mirrors the checkpoint config,
+# which this stage cannot see.
+_FLOW_CHUNK_TOKENS = 25
+
+
+def _warn_if_unaligned(name: str, value: int) -> None:
+    if value > 0 and value % _FLOW_CHUNK_TOKENS != 0:
+        logger.warning_once(
+            "CosyVoice3 %s=%d is not a multiple of the flow's %d-token attention block; "
+            "streaming chunks will recompute a partial block at each boundary.",
+            name,
+            value,
+            _FLOW_CHUNK_TOKENS,
+        )
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: dict[str, Any] | None,
@@ -112,13 +129,26 @@ def talker2code2wav_async_chunk(
         pre_lookahead_len = int(cfg.get("codec_pre_lookahead_frames", 3))
         max_chunk_size = int(cfg.get("codec_max_chunk_frames", 4 * chunk_size))
         stream_scale_factor = int(cfg.get("codec_stream_scale_factor", 2))
-        if chunk_size <= 0 or pre_lookahead_len < 0 or max_chunk_size <= 0 or stream_scale_factor <= 0:
+        first_chunk_size = int(cfg.get("codec_first_chunk_frames", chunk_size))
+        if (
+            chunk_size <= 0
+            or pre_lookahead_len < 0
+            or max_chunk_size <= 0
+            or stream_scale_factor <= 0
+            or first_chunk_size <= 0
+        ):
             raise ValueError(
                 f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
                 f"codec_pre_lookahead_frames={pre_lookahead_len}, "
                 f"codec_max_chunk_frames={max_chunk_size}, "
-                f"codec_stream_scale_factor={stream_scale_factor}"
+                f"codec_stream_scale_factor={stream_scale_factor}, "
+                f"codec_first_chunk_frames={first_chunk_size}"
             )
+        # A hop that is not a whole number of flow attention blocks leaves an
+        # audible seam at every boundary; see the chunk-size note in
+        # vllm_omni/deploy/cosyvoice3.yaml.
+        _warn_if_unaligned("codec_chunk_frames", chunk_size)
+        _warn_if_unaligned("codec_max_chunk_frames", max_chunk_size)
 
         request_state = transfer_manager.request_payload.get(request_id)
         if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
@@ -159,10 +189,21 @@ def talker2code2wav_async_chunk(
                     if isinstance(prompt_token, torch.Tensor) and prompt_token.ndim >= 2
                     else 0
                 )
+                # The first hop pads the prompt up to a multiple of the first
+                # chunk size, so prompt + first hop ends on a chunk boundary.
                 prompt_token_pad = (
-                    ((prompt_token_len + chunk_size - 1) // chunk_size) * chunk_size - prompt_token_len
+                    ((prompt_token_len + first_chunk_size - 1) // first_chunk_size) * first_chunk_size
+                    - prompt_token_len
                     if prompt_token_len > 0
                     else 0
+                )
+                # A first chunk shorter than the block-aligned hop keeps TTFA
+                # low; the second hop then stretches to the next flow block
+                # boundary, so only that one boundary cuts a block and every
+                # later one is aligned. Realigning only makes sense when the
+                # steady-state hop is itself a whole number of blocks.
+                realign_min_hop = (
+                    first_chunk_size if first_chunk_size != chunk_size and chunk_size % _FLOW_CHUNK_TOKENS == 0 else 0
                 )
             request_state = {
                 "_cosyvoice3_async_state": {
@@ -171,6 +212,9 @@ def talker2code2wav_async_chunk(
                     "emitted_chunks": 0,
                     "emitted_token_len": 0,
                     "token_hop_len": chunk_size,
+                    "first_hop_len": first_chunk_size + prompt_token_pad,
+                    "prompt_token_len": prompt_token_len,
+                    "realign_min_hop": realign_min_hop,
                     "prompt_token_pad": prompt_token_pad,
                     "pre_lookahead_len": pre_lookahead_len,
                     "token_max_hop_len": max(chunk_size, max_chunk_size),
@@ -231,8 +275,17 @@ def talker2code2wav_async_chunk(
             token_hop_len = max(1, int(state.get("token_hop_len", chunk_size)))
             prompt_token_pad = max(0, int(state.get("prompt_token_pad", 0)))
             pre_lookahead_len = max(0, int(state.get("pre_lookahead_len", pre_lookahead_len)))
+            realign_min_hop = max(0, int(state.get("realign_min_hop", 0)))
             available = max(0, length - emitted_token_len)
-            this_token_hop_len = token_hop_len + prompt_token_pad if emitted_token_len == 0 else token_hop_len
+            if emitted_token_len == 0:
+                this_token_hop_len = max(1, int(state.get("first_hop_len", token_hop_len + prompt_token_pad)))
+            elif realign_min_hop > 0:
+                # Shortest hop, at least as long as the first chunk, that
+                # lands prompt + emitted tokens on a flow block boundary.
+                end = int(state.get("prompt_token_len", 0)) + emitted_token_len + realign_min_hop
+                this_token_hop_len = realign_min_hop + (-end) % _FLOW_CHUNK_TOKENS
+            else:
+                this_token_hop_len = token_hop_len
             required = this_token_hop_len + pre_lookahead_len
 
             if not finished:
@@ -267,10 +320,14 @@ def talker2code2wav_async_chunk(
 
         if not finished:
             state["emitted_token_len"] = emitted_token_len + this_token_hop_len
-            state["token_hop_len"] = min(
-                int(state.get("token_max_hop_len", chunk_size)),
-                max(chunk_size, token_hop_len * int(state.get("stream_scale_factor", 1))),
-            )
+            # The short first chunk is not a hop of the upstream schedule:
+            # the hop starts growing only after the realigning hop.
+            if emitted_token_len > 0 or realign_min_hop == 0:
+                state["realign_min_hop"] = 0
+                state["token_hop_len"] = min(
+                    int(state.get("token_max_hop_len", chunk_size)),
+                    max(chunk_size, token_hop_len * int(state.get("stream_scale_factor", 1))),
+                )
         else:
             state["terminal_sent"] = True
 

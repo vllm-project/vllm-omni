@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import logging
 from functools import cache, lru_cache
 
 import numpy as np
@@ -10,8 +9,6 @@ import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 
 from vllm_omni.utils.audio import mel_filter_bank
-
-logger = logging.getLogger(__name__)
 
 
 def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):
@@ -273,3 +270,53 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
     seq_length_expand = lengths.unsqueeze(-1)
     mask = seq_range_expand >= seq_length_expand
     return mask
+
+
+def subsequent_chunk_mask(
+    size: int,
+    chunk_size: int,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Create chunk-wise causal mask ``(size, size)`` for streaming DiT/encoder.
+
+    ``True`` means the query position may attend to that key position.
+
+    Example (size=4, chunk_size=2)::
+
+        [[1, 1, 0, 0],
+         [1, 1, 0, 0],
+         [1, 1, 1, 1],
+         [1, 1, 1, 1]]
+    """
+    pos_idx = torch.arange(size, device=device)
+    block_value = (torch.div(pos_idx, chunk_size, rounding_mode="trunc") + 1) * chunk_size
+    return pos_idx.unsqueeze(0) < block_value.unsqueeze(1)
+
+
+def build_dit_attention_mask(pad_mask: torch.Tensor, *, streaming: bool, static_chunk_size: int) -> torch.Tensor:
+    """The DiT's full query-key attention mask, ``(B, 1, T, T)`` bool.
+
+    Upstream CosyVoice3 (``cosyvoice/flow/DiT/dit.py``) builds this inside the
+    DiT from the ``streaming`` flag: chunk-causal blocks of ``static_chunk_size``
+    mel frames (a frame attends to everything up to the end of its own block,
+    all earlier blocks, and nothing after) when streaming, the padding mask
+    alone otherwise. It is factored out so the TensorRT estimator, whose
+    attention is frozen at export time, can receive the same mask as an
+    engine input.
+
+    ``pad_mask`` is ``(B, 1, T)`` or ``(B, T)``; ``True`` marks a valid frame.
+    """
+    if pad_mask.dim() == 2:
+        pad_mask = pad_mask.unsqueeze(1)
+    if pad_mask.dim() != 3:
+        raise ValueError(f"pad_mask must be (B, 1, T) or (B, T), got {tuple(pad_mask.shape)}")
+    masks = pad_mask.bool()
+    size = int(masks.shape[-1])
+    if streaming and static_chunk_size > 0:
+        chunk = subsequent_chunk_mask(size, int(static_chunk_size), masks.device).unsqueeze(0)
+        full = masks & chunk
+    else:
+        full = masks.expand(masks.shape[0], size, size)
+    empty_rows = ~full.any(dim=-1, keepdim=True)
+    full = torch.where(empty_rows, torch.ones_like(full), full)
+    return full.unsqueeze(1)

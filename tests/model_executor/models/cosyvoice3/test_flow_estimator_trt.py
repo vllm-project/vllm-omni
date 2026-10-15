@@ -414,3 +414,76 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
     first, last = session_engine.context.calls[0], session_engine.context.calls[-1]
     assert not torch.equal(first[0], last[0])
     assert not torch.equal(first[3], last[3])
+
+
+class TestExportCacheKey:
+    """Exported ONNX bakes in the checkpoint's weights, so its cache path must
+    change with the checkpoint even when the export directory is shared."""
+
+    def test_fingerprint_differs_across_checkpoint_dirs(self, tmp_path):
+        a, b = tmp_path / "ckpt_a", tmp_path / "ckpt_b"
+        for d in (a, b):
+            d.mkdir()
+            (d / "flow.pt").write_bytes(b"same bytes")
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(a)) != flow_estimator_trt.flow_checkpoint_fingerprint(
+            str(b)
+        )
+
+    def test_fingerprint_changes_when_weights_change_in_place(self, tmp_path):
+        d = tmp_path / "ckpt"
+        d.mkdir()
+        (d / "flow.pt").write_bytes(b"v1")
+        before = flow_estimator_trt.flow_checkpoint_fingerprint(str(d))
+        assert before == flow_estimator_trt.flow_checkpoint_fingerprint(str(d))
+        (d / "flow.pt").write_bytes(b"v2 longer")
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(d)) != before
+
+    def test_fingerprint_is_stable_without_weights(self, tmp_path):
+        d = tmp_path / "ckpt"
+        d.mkdir()
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(d)) == flow_estimator_trt.flow_checkpoint_fingerprint(
+            str(d)
+        )
+
+    def test_fingerprint_changes_with_export_version(self, tmp_path, monkeypatch):
+        before = flow_estimator_trt.flow_checkpoint_fingerprint(str(tmp_path))
+        monkeypatch.setattr(flow_estimator_trt, "_CHUNK_MASK_EXPORT_VERSION", 999)
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(tmp_path)) != before
+
+    def test_onnx_path_carries_the_key(self, tmp_path):
+        keyed = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="abc123")
+        plain = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key=None)
+        assert keyed != plain
+        assert keyed.endswith(".abc123.onnx") and "chunk_mask.autocast_fp16" in keyed
+        assert plain.endswith("flow.decoder.estimator.chunk_mask.autocast_fp16.onnx")
+
+
+class TestFusedAttentionFallback:
+    def _patch_builder(self, monkeypatch, fail_fused: bool):
+        calls = []
+
+        def fake_build(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention):
+            calls.append(fused_attention)
+            if fused_attention and fail_fused:
+                raise RuntimeError("UNSUPPORTED_NODE: Attention")
+            return f"engine(fused={fused_attention})"
+
+        monkeypatch.setattr(flow_estimator_trt, "_build_chunk_mask_engine", fake_build)
+        return calls
+
+    def test_fused_engine_is_preferred(self, tmp_path, monkeypatch):
+        calls = self._patch_builder(monkeypatch, fail_fused=False)
+        got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda")
+        assert got == "engine(fused=True)" and calls == [True]
+
+    def test_unbuildable_fused_engine_falls_back_to_fp32_attention(self, tmp_path, monkeypatch):
+        calls = self._patch_builder(monkeypatch, fail_fused=True)
+        got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda")
+        assert got == "engine(fused=False)" and calls == [True, False]
+
+    def test_fused_and_fp32_attention_exports_do_not_share_a_file(self, tmp_path):
+        fused = flow_estimator_trt.chunk_mask_estimator_onnx_path(
+            str(tmp_path), fp16=True, cache_key="k", fused_attention=True
+        )
+        plain = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="k")
+        assert fused != plain and "fused_attn" in fused
