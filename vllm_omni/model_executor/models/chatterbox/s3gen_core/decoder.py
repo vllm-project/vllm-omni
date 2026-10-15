@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""S3Gen's flow estimator: Matcha-TTS's causal U-Net with one level and diffusers' transformer blocks."""
+
 import torch
 import torch.nn as nn
 from diffusers.models.attention import BasicTransformerBlock
@@ -28,6 +30,13 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import mask
 
 
 class Transpose(torch.nn.Module):
+    """Swap two dimensions, so a LayerNorm can sit inside a channels-first ``Sequential``.
+
+    Args:
+        dim0: The first dimension.
+        dim1: The second dimension.
+    """
+
     def __init__(self, dim0: int, dim1: int):
         super().__init__()
         self.dim0 = dim0
@@ -39,6 +48,13 @@ class Transpose(torch.nn.Module):
 
 
 class CausalBlock1D(Block1D):
+    """Matcha's convolution block with a causal convolution and LayerNorm in place of GroupNorm.
+
+    Args:
+        dim: Input channels.
+        dim_out: Output channels.
+    """
+
     def __init__(self, dim: int, dim_out: int):
         super().__init__(dim, dim_out)
         self.block = torch.nn.Sequential(
@@ -55,6 +71,15 @@ class CausalBlock1D(Block1D):
 
 
 class CausalResnetBlock1D(ResnetBlock1D):
+    """Matcha's residual block built from two causal blocks.
+
+    Args:
+        dim: Input channels.
+        dim_out: Output channels.
+        time_emb_dim: Width of the time embedding added between the blocks.
+        groups: Unused by the causal blocks; the parent's signature.
+    """
+
     def __init__(self, dim: int, dim_out: int, time_emb_dim: int, groups: int = 8):
         super().__init__(dim, dim_out, time_emb_dim, groups)
         self.block1 = CausalBlock1D(dim, dim_out)
@@ -62,6 +87,30 @@ class CausalResnetBlock1D(ResnetBlock1D):
 
 
 class ConditionalDecoder(nn.Module):
+    """The velocity estimator: a causal U-Net with one channel level, as the S3Gen checkpoint has it.
+
+    The input and the target have the same number of frames.
+
+    Args:
+        in_channels: Channels of the concatenated input: noisy mel, encoder
+            output, speaker embedding and conditioning mel.
+        out_channels: Mel bins of the predicted velocity.
+        channels: The U-Net's channel levels; the checkpoint has one.
+        dropout: Dropout of the transformer blocks.
+        attention_head_dim: Width of each attention head.
+        n_blocks: Transformer blocks per level.
+        num_mid_blocks: Middle levels.
+        num_heads: Attention heads.
+        act_fn: Feed-forward activation of the transformer blocks.
+        meanflow: Whether the checkpoint is a meanflow model, which also
+            embeds the step's end time.
+
+    Raises:
+        ValueError: If ``channels`` has more than one level: the checkpoint's
+            U-Net does not down- or upsample, and the layers that would are
+            not ported.
+    """
+
     def __init__(
         self,
         in_channels=320,
@@ -75,15 +124,6 @@ class ConditionalDecoder(nn.Module):
         act_fn="gelu",
         meanflow=False,
     ):
-        """Matcha-TTS's causal U-Net with one level, as the S3Gen checkpoint has it.
-
-        This decoder requires an input with the same shape of the target. So, if your text content
-        is shorter or longer than the outputs, please re-sampling it before feeding to the decoder.
-
-        Raises:
-            ValueError: If ``channels`` has more than one level: the checkpoint's U-Net does not
-                down- or upsample, and the layers that would are not ported.
-        """
         super().__init__()
         if len(channels) != 1:
             raise ValueError(f"ConditionalDecoder supports one channel level, got {len(channels)}")
@@ -125,7 +165,6 @@ class ConditionalDecoder(nn.Module):
 
         for _ in range(num_mid_blocks):
             input_channel = channels[-1]
-            out_channels = channels[-1]
             resnet = CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
 
             transformer_blocks = nn.ModuleList(
@@ -164,36 +203,16 @@ class ConditionalDecoder(nn.Module):
             self.up_blocks.append(nn.ModuleList([resnet, transformer_blocks, upsample]))
         self.final_block = CausalBlock1D(channels[-1], channels[-1])
         self.final_proj = nn.Conv1d(channels[-1], self.out_channels, 1)
-        self.initialize_weights()
-        self.time_embed_mixer = None
-        if self.meanflow:
-            # Diagonal init as described in 3.3 https://arxiv.org/pdf/2510.07979
-            self.time_embed_mixer = nn.Linear(time_embed_dim * 2, time_embed_dim, bias=False)
-            with torch.no_grad():
-                target_weight = torch.zeros(time_embed_dim, 2 * time_embed_dim)
-                target_weight[:, 0:time_embed_dim] = torch.eye(time_embed_dim)
-                self.time_embed_mixer.weight.data = target_weight
+        # Mixes the start- and end-time embeddings of a meanflow step.
+        self.time_embed_mixer = nn.Linear(time_embed_dim * 2, time_embed_dim, bias=False) if self.meanflow else None
 
     @property
-    def dtype(self):
+    def dtype(self) -> torch.dtype:
+        """The estimator's parameter dtype, which the solvers cast their inputs to."""
         return self.final_proj.weight.dtype
 
-    def initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.GroupNorm):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
     def forward(self, x, mask, mu, t, spks=None, cond=None, r=None):
-        """Forward pass of the UNet1DConditional model.
+        """Predict the velocity of the noisy mel ``x`` at time ``t``.
 
         Args:
             x (torch.Tensor): Noisy mel sample, shape (B, 80, T).
@@ -240,7 +259,7 @@ class ConditionalDecoder(nn.Module):
                     timestep=t,
                 )
             x = x.transpose(1, 2).contiguous()
-            hiddens.append(x)  # Save hidden states for skip connections
+            hiddens.append(x)
             x = downsample(x * mask_down)
             masks.append(mask_down[:, :, ::2])
         masks = masks[:-1]

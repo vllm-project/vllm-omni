@@ -57,6 +57,8 @@ def test_perceiver_matches_explicit_attention():
     heads = OriginalHeads(config)
     heads.eval()
     perceiver = heads.cond_enc.perceiver
+    with torch.no_grad():
+        perceiver.pre_attention_query.normal_()
     context = torch.randn(2, 7, 8)
     expected = perceiver.pre_attention_query.tile(2, 1, 1)
     attention = perceiver.attn

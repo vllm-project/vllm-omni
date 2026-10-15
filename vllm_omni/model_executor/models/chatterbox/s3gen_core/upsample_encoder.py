@@ -16,13 +16,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Modified from ESPnet(https://github.com/espnet/espnet)
-"""Encoder definition."""
+"""S3Gen's token encoder: an ESPnet/WeNet Conformer with a 2x upsampling in the middle."""
 
 import math
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.attention import EspnetRelPositionMultiHeadedAttention
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
@@ -34,21 +33,18 @@ from vllm_omni.model_executor.models.indextts2.gpt.conformer_encoder import (
 
 
 class EspnetRelPositionalEncoding(torch.nn.Module):
-    """Relative positional encoding module (new implementation).
+    """ESPnet's relative positional encoding: one row per relative distance, left and right.
 
-    Details can be found in https://github.com/espnet/espnet/pull/2816.
-
-    See : Appendix B in https://arxiv.org/abs/1901.02860
+    See Transformer-XL (https://arxiv.org/abs/1901.02860), Appendix B, and
+    https://github.com/espnet/espnet/pull/2816.
 
     Args:
         d_model (int): Embedding dimension.
         dropout_rate (float): Dropout rate.
-        max_len (int): Maximum input length.
-
+        max_len (int): Input length the table is first built for; it grows on demand.
     """
 
     def __init__(self, d_model: int, dropout_rate: float, max_len: int = 5000):
-        """Construct an PositionalEncoding object."""
         super().__init__()
         self.d_model = d_model
         self.xscale = math.sqrt(self.d_model)
@@ -57,7 +53,7 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         self.extend_pe(torch.tensor(0.0).expand(1, max_len))
 
     def extend_pe(self, x: torch.Tensor):
-        """Reset the positional encodings."""
+        """Rebuild the table when ``x`` is longer than it covers, or move it to ``x``'s dtype and device."""
         if self.pe is not None:
             # self.pe contains both positive and negative parts
             # the length of self.pe is 2 * input_len - 1
@@ -106,7 +102,7 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
 
 
 class LinearNoSubsampling(torch.nn.Module):
-    """Linear transform the input without subsampling
+    """Project the input and add relative positions, keeping every frame.
 
     Args:
         idim (int): Input dimension.
@@ -116,7 +112,6 @@ class LinearNoSubsampling(torch.nn.Module):
     """
 
     def __init__(self, idim: int, odim: int, dropout_rate: float, pos_enc_class: torch.nn.Module):
-        """Construct an linear object."""
         super().__init__()
         self.out = torch.nn.Sequential(
             torch.nn.Linear(idim, odim),
@@ -126,7 +121,7 @@ class LinearNoSubsampling(torch.nn.Module):
         self.pos_enc = pos_enc_class
 
     def forward(self, x: torch.Tensor, x_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Input x.
+        """Project ``x`` and take its positions.
 
         Args:
             x (torch.Tensor): Input tensor (#batch, time, idim).
@@ -176,12 +171,13 @@ class Upsample1D(nn.Module):
         self.channels = channels
         self.out_channels = out_channels
         self.stride = stride
-        # In this mode, first repeat interpolate, than conv with stride=1
+        # Nearest-neighbour repeat, then a stride-1 convolution.
         self.conv = nn.Conv1d(self.channels, self.out_channels, stride * 2 + 1, stride=1, padding=0)
 
-    def forward(self, inputs: torch.Tensor, input_lengths: torch.Tensor):
-        outputs = F.interpolate(inputs, scale_factor=float(self.stride), mode="nearest")
-        outputs = F.pad(outputs, (self.stride * 2, 0), value=0.0)
+    def forward(self, inputs: torch.Tensor, input_lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Upsample shape (B, C, T) to (B, out_channels, stride * T), causally, with the lengths."""
+        outputs = nn.functional.interpolate(inputs, scale_factor=float(self.stride), mode="nearest")
+        outputs = nn.functional.pad(outputs, (self.stride * 2, 0), value=0.0)
         outputs = self.conv(outputs)
         return outputs, input_lengths * self.stride
 
@@ -240,7 +236,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
             dropout_rate,
             activation,
         )
-        self.pre_lookahead_layer = PreLookaheadLayer(in_channels=512, channels=512, pre_lookahead_len=3)
+        self.pre_lookahead_layer = PreLookaheadLayer(in_channels=output_size, channels=output_size, pre_lookahead_len=3)
         self.encoders = torch.nn.ModuleList(
             [
                 WenetConformerEncoderLayer(
@@ -252,7 +248,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
                 for _ in range(num_blocks)
             ]
         )
-        self.up_layer = Upsample1D(channels=512, out_channels=512, stride=2)
+        self.up_layer = Upsample1D(channels=output_size, out_channels=output_size, stride=2)
         self.up_embed = LinearNoSubsampling(
             input_size,
             output_size,
@@ -272,6 +268,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
         )
 
     def output_size(self) -> int:
+        """The encoder's output width, which the flow's projection reads."""
         return self._output_size
 
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor) -> torch.Tensor:

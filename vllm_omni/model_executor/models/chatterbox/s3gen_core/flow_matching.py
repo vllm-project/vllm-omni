@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""S3Gen's flow-matching solvers: guided Euler for the standard checkpoint, plain Euler for meanflow."""
+
 import torch
 
 # Upstream's classifier-free guidance strength (``CFM_PARAMS``), used by the
@@ -21,6 +23,7 @@ INFERENCE_CFG_RATE = 0.7
 
 
 def cast_all(*args, dtype):
+    """Cast every floating-point tensor to ``dtype``; leave the others as they are."""
     return [a if (not a.dtype.is_floating_point) or a.dtype == dtype else a.to(dtype) for a in args]
 
 
@@ -37,33 +40,24 @@ class CausalConditionalCFM(torch.nn.Module):
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, noised_mels, spks=None, cond=None, meanflow=False):
-        """Forward diffusion
+        """Integrate the flow from noise to a mel.
 
         Args:
-            mu (torch.Tensor): output of encoder
-                shape: (batch_size, n_feats, mel_timesteps)
-            mask (torch.Tensor): output_mask
-                shape: (batch_size, 1, mel_timesteps)
-            n_timesteps (int): number of diffusion steps
-            spks (torch.Tensor, optional): speaker ids. Defaults to None.
-                shape: (batch_size, spk_emb_dim)
-            cond (torch.Tensor, optional): Conditioning mel, the reference prompt's frames.
+            mu (torch.Tensor): The encoder's output, shape (batch_size, n_feats, mel_timesteps).
+            mask (torch.Tensor): Frame mask, shape (batch_size, 1, mel_timesteps).
+            n_timesteps (int): Euler steps.
             noised_mels (torch.Tensor): The noise every frame starts from, shape (batch_size, n_feats, mel_timesteps).
-            meanflow (bool, optional): Whether the estimator is a meanflow model. Defaults to False.
+            spks (torch.Tensor, optional): Speaker embedding, shape (batch_size, spk_emb_dim).
+            cond (torch.Tensor, optional): Conditioning mel, the reference prompt's frames.
+            meanflow (bool, optional): Whether the estimator is a distilled meanflow model, which
+                is stepped without guidance. Defaults to False.
 
         Returns:
             output (tuple[torch.Tensor, None]): The generated mel-spectrogram, shape
                 (batch_size, n_feats, mel_timesteps), and None.
         """
-
         z = noised_mels.to(mu.dtype)
-
-        # time steps for reverse diffusion
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-
-        # NOTE: right now, the only meanflow models are also distilled models, which don't need CFG
-        #   because they were distilled with CFG outputs. We would need to add another hparam and
-        #   change the conditional logic here if we want to use CFG inference with a meanflow model.
         if meanflow:
             return self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
 
@@ -72,25 +66,23 @@ class CausalConditionalCFM(torch.nn.Module):
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond):
-        """
-        Fixed euler solver for ODEs, with classifier-free guidance.
+        """Euler steps with classifier-free guidance, the conditional and unconditional rows in one batch.
+
         Args:
-            x (torch.Tensor): random noise
-            t_span (torch.Tensor): n_timesteps interpolated
-                shape: (n_timesteps + 1,)
-            mu (torch.Tensor): output of encoder
-                shape: (batch_size, n_feats, mel_timesteps)
-            mask (torch.Tensor): output_mask
-                shape: (batch_size, 1, mel_timesteps)
-            spks (torch.Tensor, optional): speaker ids. Defaults to None.
-                shape: (batch_size, spk_emb_dim)
-            cond: Conditioning mel, the reference prompt's frames.
+            x (torch.Tensor): The starting noise, shape (B, 80, T).
+            t_span (torch.Tensor): The step times, shape (n_timesteps + 1,).
+            mu (torch.Tensor): The encoder's output, shape (B, 80, T).
+            mask (torch.Tensor): Frame mask, shape (B, 1, T).
+            spks (torch.Tensor): Speaker embedding, shape (B, 80).
+            cond (torch.Tensor): Conditioning mel, shape (B, 80, T).
+
+        Returns:
+            torch.Tensor: The mel, shape (B, 80, T), in ``x``'s dtype.
         """
         in_dtype = x.dtype
         x, t_span, mu, mask, spks, cond = cast_all(x, t_span, mu, mask, spks, cond, dtype=self.estimator.dtype)
 
-        # Duplicated batch dims are for CFG
-        # Do not use concat, it may cause memory format changed and trt infer with wrong results!
+        # Rows [:B] are conditional; rows [B:] keep zero mu, speaker and condition.
         B, T = mu.size(0), x.size(2)
         x_in = torch.zeros([2 * B, 80, T], device=x.device, dtype=x.dtype)
         mask_in = torch.zeros([2 * B, 1, T], device=x.device, dtype=x.dtype)
@@ -102,20 +94,6 @@ class CausalConditionalCFM(torch.nn.Module):
         for t, r in zip(t_span[:-1], t_span[1:]):
             t = t.unsqueeze(dim=0)
             r = r.unsqueeze(dim=0)
-            # Shapes:
-            #      x_in  ( 2B, 80, T )
-            #   mask_in  ( 2B,  1, T )
-            #     mu_in  ( 2B, 80, T )
-            #      t_in  ( 2B,       )
-            #   spks_in  ( 2B, 80,   )
-            #   cond_in  ( 2B, 80, T )
-            #         x  (  B, 80, T )
-            #      mask  (  B,  1, T )
-            #        mu  (  B, 80, T )
-            #         t  (  B,       )
-            #      spks  (  B, 80,   )
-            #      cond  (  B, 80, T )
-
             x_in[:B] = x_in[B:] = x
             mask_in[:B] = mask_in[B:] = mask
             mu_in[:B] = mu
@@ -138,6 +116,19 @@ class CausalConditionalCFM(torch.nn.Module):
         return x.to(in_dtype)
 
     def basic_euler(self, x, t_span, mu, mask, spks, cond):
+        """Plain Euler steps, each also giving the estimator its end time, as meanflow needs.
+
+        Args:
+            x (torch.Tensor): The starting noise, shape (B, 80, T).
+            t_span (torch.Tensor): The step times, shape (n_timesteps + 1,).
+            mu (torch.Tensor): The encoder's output, shape (B, 80, T).
+            mask (torch.Tensor): Frame mask, shape (B, 1, T).
+            spks (torch.Tensor): Speaker embedding, shape (B, 80).
+            cond (torch.Tensor): Conditioning mel, shape (B, 80, T).
+
+        Returns:
+            torch.Tensor: The mel, shape (B, 80, T), in ``x``'s dtype.
+        """
         in_dtype = x.dtype
         x, t_span, mu, mask, spks, cond = cast_all(x, t_span, mu, mask, spks, cond, dtype=self.estimator.dtype)
 

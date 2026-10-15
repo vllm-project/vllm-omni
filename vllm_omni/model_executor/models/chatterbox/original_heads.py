@@ -40,7 +40,7 @@ class OriginalAttention(nn.Module):
             projection(value).unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
             for projection, value in ((self.to_q, query_norm), (self.to_k, context_norm), (self.to_v, context_norm))
         ]
-        attended = nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.2 if self.training else 0.0)
+        attended = nn.functional.scaled_dot_product_attention(q, k, v)
         return queries + self.proj_out(attended.transpose(1, 2).flatten(2))
 
 
@@ -49,9 +49,8 @@ class OriginalPerceiver(nn.Module):
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
-        self.pre_attention_query = nn.Parameter(torch.empty(1, PERCEIVER_QUERIES, hidden_size))
-        bound = (3 / PERCEIVER_QUERIES) ** 0.5
-        nn.init.uniform_(self.pre_attention_query, -bound, bound)
+        # Filled from the checkpoint.
+        self.pre_attention_query = nn.Parameter(torch.zeros(1, PERCEIVER_QUERIES, hidden_size))
         self.attn = OriginalAttention(hidden_size)
 
     def forward(self, context: torch.Tensor) -> torch.Tensor:
