@@ -209,9 +209,7 @@ def _apply_contiguous_kv_patch() -> None:
             if armed and passed:
                 return True
         except Exception:
-            logging.getLogger("vllm_omni.npu.contiguous_kv").exception(
-                "[npu] contiguous KV probe failed"
-            )
+            logging.getLogger("vllm_omni.npu.contiguous_kv").exception("[npu] contiguous KV probe failed")
         # Same contract as the platform-level patch: keep the unpadded K/V
         # layout unless the spec carries padded pages (V2's separate K/V
         # allocation needs unpadded pages).
