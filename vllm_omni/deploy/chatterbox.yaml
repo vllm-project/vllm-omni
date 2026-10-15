@@ -47,6 +47,8 @@ stages:
     hf_overrides:
       variant: original
     dtype: float32
+    # Seeds the flow-noise buffer, so every process draws the same one.
+    seed: 0
     max_num_seqs: 8
     max_model_len: 2048
     max_num_batched_tokens: 16384

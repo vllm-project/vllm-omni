@@ -71,6 +71,7 @@ def main():
         config,
         deploy["stages"][1]["max_model_len"],
         deploy["connectors"]["connector_of_shared_memory"]["extra"]["codec_left_context_frames"],
+        deploy["stages"][1]["seed"],
     ).eval()
     weights = load_file(str(args.model / config.s3gen_weights))
     decoder.load_state_dict(

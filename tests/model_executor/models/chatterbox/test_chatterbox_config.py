@@ -4,7 +4,7 @@
 
 import pytest
 
-from tests.model_executor.models.chatterbox.helpers import LEFT_CONTEXT
+from tests.model_executor.models.chatterbox.helpers import LEFT_CONTEXT, SEED
 from vllm_omni.config.model import OmniModelArchConfigConvertor
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME, S3GenDecoder
 from vllm_omni.transformers_utils.configs.chatterbox import VARIANT_FIELDS, ChatterboxConfig
@@ -98,4 +98,4 @@ def test_the_decoder_refuses_flow_settings_it_cannot_run(settings: dict, match: 
     config = ChatterboxConfig()
     config.update(settings)
     with pytest.raises(ValueError, match=match):
-        S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT)
+        S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT, SEED)

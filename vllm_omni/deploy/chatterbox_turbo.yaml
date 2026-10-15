@@ -78,6 +78,8 @@ stages:
 
   - stage_id: 1
     dtype: float32
+    # Seeds the flow-noise buffer, so every process draws the same one.
+    seed: 0
     max_num_seqs: 8
     # The longest utterance this stage is built for: its noise buffer and
     # the budget below are sized from it. It must not be smaller than stage

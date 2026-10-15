@@ -33,6 +33,7 @@ from tests.helpers.mark import hardware_test
 from tests.model_executor.models.chatterbox.helpers import (
     DEPLOY,
     LEFT_CONTEXT,
+    SEED,
     build_stage,
     model_parallel,
     stage_vllm_config,
@@ -466,7 +467,7 @@ def test_v1_runner_hands_each_request_its_guidance_pair(runners: Callable[[str],
 def test_stage_1_noise_is_the_same_draw_when_built_on_the_gpu(model_dir: str) -> None:
     """vLLM's loader builds stage 1 inside a GPU default-device context; its flow noise is the CPU's draw."""
     config = stage_vllm_config(model_dir, DEPLOY["turbo"], 1)
-    on_cpu = S3GenDecoder(config.model_config.hf_config, config.model_config.max_model_len, LEFT_CONTEXT)
+    on_cpu = S3GenDecoder(config.model_config.hf_config, config.model_config.max_model_len, LEFT_CONTEXT, SEED)
 
     stage = build_stage(config, "cuda").model
 

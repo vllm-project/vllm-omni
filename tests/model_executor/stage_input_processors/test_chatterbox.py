@@ -20,7 +20,13 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.request import RequestStatus
 
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
-from tests.model_executor.models.chatterbox.helpers import DEPLOY, LEFT_CONTEXT, stage_vllm_config, write_model_dir
+from tests.model_executor.models.chatterbox.helpers import (
+    DEPLOY,
+    LEFT_CONTEXT,
+    SEED,
+    stage_vllm_config,
+    write_model_dir,
+)
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, to_struct
@@ -148,7 +154,7 @@ def connector_extra(stage_configs: list) -> dict:
 
 @pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
-    return S3GenDecoder(ChatterboxConfig(), 2048, LEFT_CONTEXT).eval()
+    return S3GenDecoder(ChatterboxConfig(), 2048, LEFT_CONTEXT, SEED).eval()
 
 
 @pytest.fixture(autouse=True)

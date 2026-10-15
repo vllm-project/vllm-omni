@@ -66,8 +66,6 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig, va
 MEL_CACHE_FRAMES = 8
 SAMPLES_PER_FRAME = 480
 SOURCE_CACHE_SAMPLES = MEL_CACHE_FRAMES * SAMPLES_PER_FRAME
-# Seed of the flow-noise buffer: fixed, so every process draws the same one.
-NOISE_SEED = 0
 # The checkpoint also holds the reference encoders, which run in the API
 # process (conditioning.VoiceConditioner), not in this stage.
 REFERENCE_ENCODER_PREFIXES = ("tokenizer.", "speaker_encoder.")
@@ -247,13 +245,17 @@ class S3GenDecoder(nn.Module):
             buffer covers it, so no utterance runs past the buffer.
         left_context_tokens: Played tokens each chunk is decoded with again;
             bounding them keeps a chunk's cost constant.
+        noise_seed: Seed of the flow-noise buffer, so every process that
+            serves the stage draws the same one.
 
     Raises:
         ValueError: If the config's flow precision and attention backend are
             not a pair the decoder runs, see ``validate_flow_settings``.
     """
 
-    def __init__(self, config: ChatterboxConfig, max_utterance_tokens: int, left_context_tokens: int) -> None:
+    def __init__(
+        self, config: ChatterboxConfig, max_utterance_tokens: int, left_context_tokens: int, noise_seed: int
+    ) -> None:
         super().__init__()
         validate_flow_settings(config.flow_dtype, config.flow_attention_backend)
         self.config = config
@@ -325,7 +327,7 @@ class S3GenDecoder(nn.Module):
         ratio = config.token_mel_ratio
         self.prompt_noise_frames = config.dec_cond_seconds * config.token_rate * ratio
         capped_frames = self.prompt_noise_frames + (config.max_new_tokens + config.n_silence_tokens) * ratio
-        generator = torch.Generator().manual_seed(NOISE_SEED)
+        generator = torch.Generator().manual_seed(noise_seed)
         self.register_buffer(
             "flow_noise",
             torch.cat(
@@ -652,7 +654,8 @@ class ChatterboxS3Gen(S3GenDecoder):
         # The deploy file's connector settings; the chunk processor reads the
         # same section for its schedule.
         connector = vllm_config.model_config.stage_connector_config["extra"]
-        super().__init__(config, max_model_len, connector["codec_left_context_frames"])
+        # The flow noise is drawn from the stage's own seed.
+        super().__init__(config, max_model_len, connector["codec_left_context_frames"], vllm_config.model_config.seed)
         # The repo holds other checkpoints too; this stage loads its own.
         self.allow_patterns_overrides = [config.s3gen_weights]
 
