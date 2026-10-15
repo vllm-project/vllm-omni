@@ -5,6 +5,7 @@
 import asyncio
 import math
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 import numpy as np
@@ -23,7 +24,6 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     resolve_stage_model_path,
 )
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
-    CONDITIONING_BATCH_SIZE,
     VoiceConditioner,
     VoiceConditioning,
     build_prompt,
@@ -37,7 +37,6 @@ from vllm_omni.transformers_utils.configs.chatterbox import (
     ChatterboxConfig,
 )
 
-CONDITIONING_MAX_PENDING = 64
 CONDITIONING_CACHE_ENTRIES = 128
 
 
@@ -50,13 +49,23 @@ class ChatterboxAdapter(ARTTSAdapter):
     supported_output_sample_rates = frozenset({24000})
     preprocessing_workers = 4
     variant = "turbo"
+    # Stage 0 sequences one request holds: Original's guided requests run in pairs.
+    sequences_per_request = 1
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         super().__init__(ctx)
         self.config = ChatterboxConfig(self.variant)
         # The deploy file's stage 0 ``additional_config`` names where the
         # reference encoders run; the API process must see that device.
-        self.conditioning_device = torch.device(self.stage_additional_config().get("conditioning_device", "cpu"))
+        self.conditioning_device = torch.device(
+            (self.stage_setting("additional_config") or {}).get("conditioning_device", "cpu")
+        )
+        # As many references are encoded together as stage 0 admits requests:
+        # the deploy profile sizes that for its card, and nothing here divides it.
+        max_num_seqs = self.stage_setting("max_num_seqs")
+        if max_num_seqs is None:
+            raise ValueError("Chatterbox deploy files set stage 0 max_num_seqs")
+        self.conditioning_capacity = max_num_seqs // self.sequences_per_request
         if self.conditioning_device.type not in {"cpu", "cuda"}:
             raise ValueError("Chatterbox conditioning_device must be cpu or cuda")
         self.tokenizer: PreTrainedTokenizerBase | Tokenizer | None = None
@@ -66,8 +75,8 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.initialization_lock = Lock()
         self.build_async = make_async(self.prepare_prompt, executor=ctx.server._tts_executor)
         self.condition_batch_async = make_async(self.prepare_voices, executor=ctx.server._tts_executor)
-        self.conditioning_slots = asyncio.Semaphore(CONDITIONING_MAX_PENDING)
-        self.conditioning_queue: asyncio.Queue = asyncio.Queue(maxsize=CONDITIONING_MAX_PENDING)
+        self.conditioning_slots = asyncio.Semaphore(self.conditioning_capacity)
+        self.conditioning_queue: asyncio.Queue = asyncio.Queue(maxsize=self.conditioning_capacity)
         self.conditioning_pending: dict[str, asyncio.Future] = {}
         self.conditioning_cache: OrderedDict[str, VoiceConditioning] = OrderedDict()
         self.conditioning_task: asyncio.Task | None = None
@@ -93,15 +102,24 @@ class ChatterboxAdapter(ARTTSAdapter):
         with self.initialization_lock:
             if self.conditioner is None:
                 self.conditioner = VoiceConditioner(model, self.config, self.conditioning_device)
+            conditioner = self.conditioner
         results: dict[int, VoiceConditioning | Exception] = {}
         samples = []
         indices = []
-        for index, reference in enumerate(references):
+
+        def resample(reference: tuple[np.ndarray, int]) -> tuple[np.ndarray, np.ndarray] | ValueError:
             try:
-                samples.append(self.conditioner.resample(*reference))
+                return conditioner.resample(*reference)
             except ValueError as error:
-                results[index] = error
+                return error
+
+        with ThreadPoolExecutor() as pool:
+            resampled = list(pool.map(resample, references))
+        for index, clip in enumerate(resampled):
+            if isinstance(clip, ValueError):
+                results[index] = clip
             else:
+                samples.append(clip)
                 indices.append(index)
         if samples:
             for index, voice in zip(indices, self.conditioner.from_resampled_batch(samples), strict=True):
@@ -109,10 +127,10 @@ class ChatterboxAdapter(ARTTSAdapter):
         return [results[index] for index in range(len(references))]
 
     async def drain_conditioning(self) -> None:
-        """Own encoder execution; finish each reference's waiters independently."""
+        """Own encoder execution; every queued reference goes through the encoders together."""
         while not self.conditioning_queue.empty():
-            batch = [self.conditioning_queue.get_nowait()]
-            while len(batch) < CONDITIONING_BATCH_SIZE and not self.conditioning_queue.empty():
+            batch = []
+            while not self.conditioning_queue.empty():
                 batch.append(self.conditioning_queue.get_nowait())
             try:
                 voices = await self.condition_batch_async([reference for _, reference in batch])
@@ -263,6 +281,7 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
     name = "chatterbox_original"
     stage_keys = frozenset({"chatterbox_original_t3"})
     variant = "original"
+    sequences_per_request = 2
     max_new_tokens_max = ORIGINAL_MAX_NEW_TOKENS
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:

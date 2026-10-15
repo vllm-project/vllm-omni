@@ -127,7 +127,7 @@ clients.
 | Feature | Status |
 | --- | --- |
 | Built-in voice, voice cloning, async streaming | both variants, qualified at 64 HTTP clients |
-| GPU reference conditioning | `conditioning_device: cuda:0`; batches of up to 8, a 64-request admission bound, a 128-entry cache |
+| GPU reference conditioning | `conditioning_device: cuda:0`; every admitted reference is encoded in one batch, admission equal to stage 0's request capacity (64), a 128-entry cache |
 | AR CUDA graphs | on by default; graph versus eager measured below |
 | BF16 flow, cuDNN attention, CUDA MPS | opt-in overlays, measured below |
 | Real-time at 64 clients | Turbo yes on warm and built-in workloads; Original no (32 clients yes) |

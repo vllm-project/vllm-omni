@@ -19,7 +19,6 @@ from tests.model_executor.models.chatterbox.helpers import (
 )
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
-    CONDITIONING_BATCH_SIZE,
     VoiceConditioner,
     VoiceConditioning,
     build_prompt,
@@ -197,16 +196,18 @@ def test_tokenize_batch_uses_one_quantization_and_isolates_rows(conditioners: di
     assert tokens[1].min() >= 0
 
 
-def test_prepare_batch_is_bounded_and_keeps_order(conditioners: dict[str, VoiceConditioner]) -> None:
-    """Seventeen references are encoded eight at a time, and each result is its own reference's.
+def test_prepare_batch_encodes_every_reference_together_and_keeps_order(
+    conditioners: dict[str, VoiceConditioner],
+) -> None:
+    """Seventeen references go through the encoders as one batch, and each result is its own reference's.
 
     Each clip is 40 ms (one prompt token) longer than the one before, so the
     prompt lengths show the order; one clip encoded alone shows a result in
-    a full batch is that clip's own.
+    the batch is that clip's own.
     """
     conditioner = conditioners["turbo"]
     rng = np.random.default_rng(4)
-    count = CONDITIONING_BATCH_SIZE * 2 + 1
+    count = 17
     references = [
         ((0.05 * rng.standard_normal(6 * 24000 + 960 * index)).astype(np.float32), 24000) for index in range(count)
     ]
@@ -217,8 +218,8 @@ def test_prepare_batch_is_bounded_and_keeps_order(conditioners: dict[str, VoiceC
         hook.remove()
     (alone,) = conditioner.prepare_batch(references[3:4])
 
-    # Per batch, the conditioning tokens and the prompt tokens.
-    assert calls == [CONDITIONING_BATCH_SIZE] * 4 + [1, 1]
+    # One batch: the conditioning tokens, then the prompt tokens.
+    assert calls == [count, count]
     lengths = [voice.prompt_token.shape[1] for voice in voices]
     assert lengths == list(range(lengths[0], lengths[0] + count))
     assert torch.equal(voices[3].cond_tokens, alone.cond_tokens)

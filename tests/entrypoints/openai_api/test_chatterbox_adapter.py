@@ -145,6 +145,21 @@ def reference(seconds: float, seed: int, sample_rate: int = 24000, mime: str = "
     return f"data:{mime};base64,{base64.b64encode(buffer.getvalue()).decode()}"
 
 
+def high_concurrency_on_cpu(variant: str) -> str:
+    """The variant's high-concurrency overlay with its reference encoders on the CPU of this host."""
+    overlay = Path(
+        get_deploy_config_path(f"{'chatterbox_turbo' if variant == 'turbo' else 'chatterbox'}_high_concurrency.yaml")
+    )
+    return modify_stage_config(
+        str(overlay),
+        updates={
+            # The copy lives elsewhere, so it names its base file by path.
+            "base_config": str(overlay.parent / DEPLOY[variant]),
+            "stages": {0: {"additional_config.conditioning_device": "cpu"}},
+        },
+    )
+
+
 def encoder(adapter: ChatterboxAdapter) -> VoiceConditioner:
     """The adapter's reference encoders, loaded as its first encoder batch loads them."""
     assert adapter.prepare_voices([]) == []
@@ -267,29 +282,46 @@ def test_original_owns_its_stage_and_controls(adapter):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("adapter_cls", "seconds"), [(ChatterboxAdapter, 5.04), (ChatterboxOriginalAdapter, 1.0)])
-async def test_64_distinct_references_are_batched_and_cached(adapter, adapter_cls, seconds):
-    """64 references arriving together are encoded at most eight at a time, one batch at a time.
+@pytest.mark.parametrize(
+    ("variant", "adapter_cls", "seconds"),
+    [("turbo", ChatterboxAdapter, 5.04), ("original", ChatterboxOriginalAdapter, 1.0)],
+)
+async def test_64_distinct_references_are_encoded_together_and_cached(
+    model_dir, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds
+):
+    """Everything queued while the encoders are busy goes through them as one batch.
 
-    Each clip is 40 ms (one prompt token) longer than the one before, so the
-    prompt lengths show every voice is its own reference's. A second wave of
-    the same references is served from the cache.
+    The high-concurrency overlays admit 64 requests (Original's 128 sequences
+    are 64 guided pairs), so 64 references arriving together are one
+    admission. The first batch is held so that the other references queue
+    behind it; the batch after it is all of them. Each clip is 40 ms (one
+    prompt token) longer than the one before, so the prompt lengths show
+    every voice is its own reference's. A second wave of the same references
+    is served from the cache.
     """
-    concurrent = adapter_cls(adapter.ctx)
-    batches = EncoderBatches(encoder(concurrent))
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+    speech = serving(engine_client(model_dir, high_concurrency_on_cpu(variant)))
+    concurrent = speech._adapter
+    assert isinstance(concurrent, adapter_cls)
+    assert concurrent.conditioning_capacity == 64
+    batches = EncoderBatches(encoder(concurrent), hold=True)
     sources = [reference(seconds + 0.04 * index, seed=index) for index in range(64)]
     try:
-        voices = await asyncio.gather(*(concurrent.resolve_voice(source) for source in sources))
+        requests = [asyncio.create_task(concurrent.resolve_voice(source)) for source in sources]
+        await asyncio.to_thread(batches.started.wait, 30)
+        while len(concurrent.conditioning_pending) < 64:
+            await asyncio.sleep(0.01)
+        batches.released.set()
+        voices = await asyncio.wait_for(asyncio.gather(*requests), 120)
         encoded = list(batches.batches)
         cached = await asyncio.gather(*(concurrent.resolve_voice(source) for source in sources))
     finally:
         batches.remove()
+        speech.shutdown()
 
     lengths = [voice.prompt_token.shape[1] for voice in voices]
     assert lengths == list(range(lengths[0], lengths[0] + 64))
-    assert sum(encoded) == 64
-    assert max(encoded) <= 8
-    assert len(encoded) < 64
+    assert len(encoded) == 2 and sum(encoded) == 64
     assert batches.most_active == 1
     assert all(left is right for left, right in zip(voices, cached, strict=True))
     assert batches.batches == encoded
@@ -336,9 +368,12 @@ async def test_bad_reference_does_not_poison_batch(adapter):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_wave_cannot_overfill_encoder_queue(adapter):
+async def test_cancelled_wave_cannot_overfill_encoder_queue(model_dir, tmp_path, monkeypatch, clean_speaker_cache):
     """Cancelled waiters keep their encoder work, and with it the slots a new wave would take."""
-    original = ChatterboxOriginalAdapter(adapter.ctx)
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+    speech = serving(engine_client(model_dir, high_concurrency_on_cpu("original")))
+    original = speech._adapter
+    assert isinstance(original, ChatterboxOriginalAdapter) and original.conditioning_capacity == 64
     batches = EncoderBatches(encoder(original), hold=True)
     try:
         first = [asyncio.create_task(original.resolve_voice(reference(1, seed=index))) for index in range(64)]
@@ -355,6 +390,7 @@ async def test_cancelled_wave_cannot_overfill_encoder_queue(adapter):
         voices = await asyncio.wait_for(asyncio.gather(*second), 60)
     finally:
         batches.remove()
+        speech.shutdown()
 
     assert all(isinstance(voice, VoiceConditioning) for voice in voices)
     assert not original.conditioning_pending

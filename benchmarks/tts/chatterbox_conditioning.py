@@ -18,7 +18,7 @@ import soundfile as sf
 import torch
 from tqdm import tqdm
 
-from vllm_omni.model_executor.models.chatterbox.conditioning import CONDITIONING_BATCH_SIZE, VoiceConditioner
+from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioner
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 COUNT = 64
@@ -88,7 +88,8 @@ def main():
         "durations_seconds": [DURATIONS[i % 4] for i in range(COUNT)],
         "waveform_sha256": hashes,
         "references": COUNT,
-        "batch_size": CONDITIONING_BATCH_SIZE,
+        # Every reference is encoded in one batch; the stage's admission sets the size.
+        "batch_size": COUNT,
         "cycles": CYCLES,
         "torch_version": str(torch.__version__),
         "torch_threads": torch.get_num_threads(),

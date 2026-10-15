@@ -16,6 +16,7 @@ and offline callers both build prompts with ``build_prompt``.
 
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -56,7 +57,6 @@ SENTENCE_ENDERS = (".", "!", "?", "-", ",")
 # Not parameters the checkpoint carries: the S3Tokenizer subclass upstream
 # registers them itself, and the s3tokenizer package computes its own.
 TOKENIZER_BUFFERS = ("tokenizer._mel_filters", "tokenizer.window")
-CONDITIONING_BATCH_SIZE = 8
 
 
 def punc_norm(text: str, variant: str = "turbo") -> str:
@@ -301,15 +301,15 @@ class VoiceConditioner:
         return self.prepare_batch([(wav, sample_rate)])[0]
 
     def prepare_batch(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning]:
-        """Encode references in bounded batches, preserving input order."""
-        results = []
-        for start in range(0, len(references), CONDITIONING_BATCH_SIZE):
-            clips = [
-                self.resample(wav, sample_rate)
-                for wav, sample_rate in references[start : start + CONDITIONING_BATCH_SIZE]
-            ]
-            results.extend(self.from_resampled_batch(clips))
-        return results
+        """Encode every reference together, preserving input order.
+
+        The references are resampled concurrently on the CPU, then encoded
+        as one batch: the caller's admission bound, not this method, decides
+        how many fit the device.
+        """
+        with ThreadPoolExecutor() as pool:
+            clips = list(pool.map(lambda reference: self.resample(*reference), references))
+        return self.from_resampled_batch(clips)
 
     def resample(self, wav: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
         """Validate, normalize and resample one reference at both model rates."""
@@ -349,12 +349,6 @@ class VoiceConditioner:
         cuDNN's TF32 RNN/convolution kernels change speaker embeddings with
         batch shape. The native flags context restores the caller's precision.
         """
-        if len(clips) > CONDITIONING_BATCH_SIZE:
-            return [
-                result
-                for start in range(0, len(clips), CONDITIONING_BATCH_SIZE)
-                for result in self.from_resampled_batch(clips[start : start + CONDITIONING_BATCH_SIZE])
-            ]
         if not clips:
             return []
         mels = [voice_encoder_mel(trim_silence(wav16), self.voice_encoder.hp) for _, wav16 in clips]
@@ -363,7 +357,6 @@ class VoiceConditioner:
         speaker_embs = self.voice_encoder.inference(
             torch.nn.utils.rnn.pad_sequence(mels, batch_first=True).to(self.device),
             mel_lens=[mel.shape[0] for mel in mels],
-            batch_size=32,
             rate=1.3,
         )
         encoder_clips = [
