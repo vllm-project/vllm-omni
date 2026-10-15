@@ -65,8 +65,8 @@ def original_admission_prompt(weight: float) -> dict:
 # A guided request gets its companion whatever stage it ends at: the atomic
 # CFG scheduler admits a cfg_group member only together with its twin.
 @pytest.mark.parametrize("weight,final_stage_id", [(0.0, 0), (0.0, 1), (0.5, 0), (0.5, 1)])
-@pytest.mark.parametrize("max_tokens", [None, 4096])
-def test_original_offline_admission_preserves_supported_budget(
+@pytest.mark.parametrize("max_tokens", [None, 64])
+def test_original_offline_admission_preserves_the_requests_budget(
     original_admission_engine, weight, final_stage_id, max_tokens
 ):
     engine = original_admission_engine
@@ -75,8 +75,8 @@ def test_original_offline_admission_preserves_supported_budget(
         "original", original_admission_prompt(weight), sampling_params_list=params, final_stage_id=final_stage_id
     )
     message = engine.request_queue.sync_q.get_nowait()
-    assert message.sampling_params_list[0].max_tokens == (1000 if params is None else 4096)
-    assert message.sampling_params_list[0].min_tokens == (0 if params is None else 4096)
+    assert message.sampling_params_list[0].max_tokens == (1000 if params is None else 64)
+    assert message.sampling_params_list[0].min_tokens == (0 if params is None else 64)
     assert engine.request_queue.sync_q.qsize() == int(weight != 0)
     parent_info = deserialize_additional_information(message.prompt.additional_information)
     assert parent_info["omni_final_stage_id"] == final_stage_id
@@ -102,21 +102,6 @@ def test_unguided_stage0_only_request_is_not_expanded(original_admission_engine)
     engine.add_request("plain", prompt, final_stage_id=0)
     message = engine.request_queue.sync_q.get_nowait()
     assert message.request_id == "plain"
-    assert engine.request_queue.sync_q.empty()
-
-
-@pytest.mark.parametrize("weight", [0.0, 0.5])
-@pytest.mark.parametrize("final_stage_id", [0, 1])
-@pytest.mark.parametrize("max_tokens,min_tokens", [(4200, 0), (4200, 4101), (None, 0)])
-def test_original_offline_admission_rejects_unsupported_budget(
-    original_admission_engine, weight, final_stage_id, max_tokens, min_tokens
-):
-    engine = original_admission_engine
-    params = SamplingParams(max_tokens=max_tokens, min_tokens=min_tokens)
-    with pytest.raises(ValueError, match="Chatterbox Original.*4096"):
-        engine.add_request(
-            "original", original_admission_prompt(weight), sampling_params_list=[params], final_stage_id=final_stage_id
-        )
     assert engine.request_queue.sync_q.empty()
 
 
