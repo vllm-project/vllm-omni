@@ -147,12 +147,12 @@ def test_get_runtime_resource_label(monkeypatch):
     from tests.dfx.conftest import get_runtime_resource_label
 
     monkeypatch.setattr(
-        "tests.dfx.conftest._read_runtime_device_name",
+        "tests.helpers.hardware._read_runtime_device_name",
         lambda *, device_id=0: "NVIDIA H100 80GB HBM3",
     )
     assert get_runtime_resource_label(refresh=True) == "H100"
     monkeypatch.setattr(
-        "tests.dfx.conftest._read_runtime_device_name",
+        "tests.helpers.hardware._read_runtime_device_name",
         lambda *, device_id=0: "Ascend910B2",
     )
     assert get_runtime_resource_label(refresh=True) == "910B"
@@ -501,10 +501,8 @@ def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeyp
 
 
 def test_is_hardware_nested_baseline():
-    from tests.dfx.conftest import (
-        _RUNTIME_DEVICE_ALIASES,
-        is_hardware_nested_baseline,
-    )
+    from tests.dfx.conftest import is_hardware_nested_baseline
+    from tests.helpers.hardware import _RUNTIME_DEVICE_ALIASES
     from tests.helpers.mark import get_hardware_mark_list
 
     hardware_marks = get_hardware_mark_list()

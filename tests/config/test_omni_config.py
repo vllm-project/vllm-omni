@@ -861,6 +861,17 @@ def test_joyai_code2wav_waits_for_full_payload():
     assert code2wav.model_config.requires_full_payload_input is True
 
 
+def test_joyai_asr_profile_topology():
+    config = _from_pipeline_key("joyai_vl_interaction_asr")
+    asr, joyai, talker, _ = (config.stage_by_id(i) for i in range(4))
+
+    assert [stage.model_stage for stage in config.stage_configs] == ["asr", "joyvl", "qwen3_tts", "code2wav"]
+    assert asr.bypass_without_modalities == ("audio",)
+    assert joyai.model_config.model_arch == "Qwen3VLForConditionalGeneration"
+    assert joyai.custom_process_input_func.endswith("joyai_vl_interaction.asr_to_joyai")
+    assert talker.custom_process_input_func.endswith("joyai_vl_interaction.joyai_action_to_tts")
+
+
 @pytest.mark.parametrize("model_runner", ["v1", "v2"])
 def test_deploy_model_runner_selection_propagates_to_every_stage(tmp_path: Path, model_runner: str):
     deploy_path = tmp_path / "qwen3_tts_runner.yaml"
@@ -936,10 +947,15 @@ def test_platform_v1_fallback_overrides_stage_v2():
     assert deploy.stages[1].model_runner is None
 
 
-def test_downstream_mrv2_stage_requires_turn_sessions():
-    stages = [StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")]
-    with pytest.raises(ValueError, match="session_mode 'turn' only"):
-        merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+def test_qwen3_omni_downstream_mrv2_accepts_duplex_sessions():
+    stages = [
+        StageDeployConfig(stage_id=0),
+        StageDeployConfig(stage_id=1, model_runner="v2"),
+        StageDeployConfig(stage_id=2, model_runner="v2"),
+    ]
+    merged = merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in merged] == [False, True, True]
+    assert [stage.yaml_engine_args["session_mode"] for stage in merged] == ["duplex", "duplex", "duplex"]
 
 
 def test_v1_downstream_stage_keeps_duplex_sessions():
@@ -1077,6 +1093,7 @@ def test_sub_config_fields_match_structured_scopes():
         "attention_backend",
         "attention_config",
         "moe_backend",
+        "linear_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
         "interleave_mm_strings",
@@ -1944,10 +1961,12 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path)
 
     topology_keys = {
         "stage_input_payload_keys": ("conditioning", "metadata"),
+        "stage_input_optional_payload_keys": ("metadata",),
         "stage_output_payload_keys": ("latents",),
     }
     override_keys = {
         "stage_input_payload_keys": (),
+        "stage_input_optional_payload_keys": (),
         "stage_output_payload_keys": ("audio", "video"),
     }
     pipeline = _resolve_pipeline_or_skip("dreamzero")
@@ -1986,6 +2005,25 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path)
         assert getattr(od_config, name) == keys
     for name in topology_keys:
         assert getattr(topology, name) == (() if source == "default" else topology_keys[name])
+
+
+@pytest.mark.parametrize("pipeline_key", ["wan2_2_eg", "wan2_2_egd"])
+def test_wan_stage_roles_survive_structured_runtime_projection(pipeline_key, tmp_path):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    pipeline = _resolve_pipeline_or_skip(pipeline_key)
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=_load_default_deploy(pipeline))
+    for topology in pipeline.stages:
+        stage = ForkingPickler.loads(ForkingPickler.dumps(config.stage_by_id(topology.stage_id)))
+        assert stage.diffusion_config.stage_role == topology.stage_role.value
+        engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
+        kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
+            engine_args, stage_id=stage.stage_id, include_engine_adapter_metadata=True
+        )
+        runtime = OmniDiffusionConfig.from_kwargs(**kwargs)
+        assert runtime.stage_role == topology.stage_role.value
+        assert runtime.stage_input_optional_payload_keys == topology.stage_input_optional_payload_keys
 
 
 def test_diffusion_config_field_classification_covers_current_fields():

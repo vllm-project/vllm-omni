@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -43,9 +44,11 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
 )
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
+    QwenImage21KVCache,
     QwenImage21Transformer2DModel,
 )
 from vllm_omni.diffusion.models.utils import create_transformers_model
+from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -316,6 +319,7 @@ class QwenImage21Pipeline(
 
         The runner looks this up on the pipeline, not on the transformer.
         """
+        self._prompt_embedding_cache = OrderedDict()
         transformer = getattr(self, "transformer", None)
         release = getattr(transformer, "release_captured_graphs", None)
         if callable(release):
@@ -729,13 +733,52 @@ class QwenImage21Pipeline(
                 number of images that should be generated per prompt
         """
         prompt = [prompt] if isinstance(prompt, str) else prompt
-
-        prompt_embeds, prompt_embeds_mask, image_pad_mask = self._get_qwen_prompt_embeds(
-            prompt,
-            images_per_prompt,
-            max_sequence_length=max_sequence_length,
-            prompt_name=prompt_name,
+        cacheable = (
+            len(prompt) == 1
+            and isinstance(prompt[0], str)
+            and not (images_per_prompt is not None and any(images_per_prompt))
+            and not torch.is_grad_enabled()
+            and not self.text_encoder.training
+            and not getattr(self.od_config, "lora_config", None)
+            and not offload_enabled(self.od_config)
         )
+        cache = getattr(self, "_prompt_embedding_cache", None)
+        if cache is None or not cacheable:
+            cache = self._prompt_embedding_cache = OrderedDict()
+        key = (
+            (
+                tuple(prompt),
+                max_sequence_length,
+                prompt_name,
+                id(self.text_encoder),
+                id(self.processor),
+                self.text_encoder.dtype,
+                str(self.device),
+                self.prompt_template_t2i,
+                self._drop_idx,
+            )
+            if cacheable
+            else None
+        )
+        encoded = cache.get(key) if cacheable else None
+        if encoded is None:
+            encoded = self._get_qwen_prompt_embeds(
+                prompt,
+                images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name=prompt_name,
+            )
+            size = sum(t.numel() * t.element_size() for t in encoded)
+            if cacheable and size <= 16 * 1024 * 1024:
+                cache[key] = encoded
+                while (
+                    len(cache) > 16
+                    or sum(t.numel() * t.element_size() for entry in cache.values() for t in entry) > 16 * 1024 * 1024
+                ):
+                    cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        prompt_embeds, prompt_embeds_mask, image_pad_mask = encoded
 
         # Request-major expansion (A,A,B,B). ``repeat`` on the 2D masks would
         # prepend a dimension and reshape to A,B,A,B — wrong pairing with embeds.
@@ -1238,7 +1281,7 @@ class QwenImage21Pipeline(
         state.extra["width"] = width
         cache_enabled = getattr(self.transformer, "causal_condition", False)
         state.extra["kv_cache"] = (
-            [{} for _ in range(len(self.transformer.transformer_blocks))] if cache_enabled else None
+            QwenImage21KVCache({} for _ in self.transformer.transformer_blocks) if cache_enabled else None
         )
 
         return state
@@ -1268,7 +1311,7 @@ class QwenImage21Pipeline(
             # Batched prefill: a fresh merged cache collects all requests' prefix
             # K/V; written entries are split back per request after the step.
             num_blocks = len(caches[0])
-            return [{} for _ in range(num_blocks)], True
+            return QwenImage21KVCache({} for _ in range(num_blocks)), True
         if phases == {"decode"}:
             # Decode only reads the cache, so a batched view is enough and the
             # per-request caches stay untouched. Merge every stored part — FP8
@@ -1282,7 +1325,7 @@ class QwenImage21Pipeline(
                     "lengths. denoise_step must sub-batch by prefill_prompt_seq_len first."
                 )
             num_blocks = len(caches[0])
-            merged = []
+            merged = QwenImage21KVCache()
             for block_idx in range(num_blocks):
                 branches: dict[str, dict[str, torch.Tensor]] = {}
                 branch_names = {branch for cache in caches for branch in cache[block_idx]}

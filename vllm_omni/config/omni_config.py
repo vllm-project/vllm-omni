@@ -23,7 +23,7 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
-from vllm.config import KVTransferConfig
+from vllm.config import KernelConfig, KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
@@ -124,6 +124,8 @@ class _TrackExplicitConfigFields:
         kwargs = getattr(value, "kwargs", None)
         if kwargs is not None:
             explicit_fields = frozenset(kwargs)
+        elif isinstance(value, Mapping):
+            explicit_fields = frozenset(value)
         elif isinstance(value, cls):
             explicit_fields = getattr(value, "_omni_explicit_fields", frozenset())
         else:
@@ -172,6 +174,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     attention_backend: Any
     attention_config: Any
     moe_backend: str
+    linear_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
@@ -480,6 +483,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     attention_backend: Any = None
     attention_config: Any = None
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
@@ -526,6 +530,11 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     generation_config: str | None = None
     override_generation_config: dict[str, Any] | None = None
     enable_prompt_embeds: bool | None = None
+
+    def __post_init__(self) -> None:
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -785,7 +794,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
-class _DiffusionConfigProjection:
+class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     """Diffusion-specific per-stage settings.
 
     Shared AR/diffusion fields are projected into the other sub-configs.  This
@@ -872,6 +881,7 @@ class _DiffusionConfigProjection:
     diffusion_kv_cache_skip_step_indices: set[int] | None = None
     diffusion_kv_cache_skip_layer_indices: set[int] | None = None
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
@@ -894,6 +904,8 @@ class _DiffusionConfigProjection:
     kv_transfer_config: KVTransferConfig | None = None
     # Full stage-payload transport, independent of native paged KV transfer.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
+    stage_role: str | None = None
     stage_output_payload_keys: tuple[str, ...] = ()
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
@@ -940,6 +952,10 @@ class _DiffusionConfigProjection:
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
+
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
 
         if self.tf_model_config is None:
             self.tf_model_config = TransformerConfig()
@@ -1141,6 +1157,7 @@ _DIFFUSION_ONLY_CONFIG_FIELDS = (
 )
 _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
     {
+        "model_stage",
         "parallel_config",
         "num_gpus",
         "log_level",
@@ -1728,6 +1745,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.requires_multimodal_data
 
     @property
+    def bypass_without_modalities(self) -> tuple[str, ...]:
+        return tuple(self.stage_pipeline_config.bypass_without_modalities)
+
+    @property
     def prompt_expand_func(self) -> str | None:
         return self.stage_pipeline_config.prompt_expand_func
 
@@ -2192,6 +2213,8 @@ def _build_diffusion_config_projection(
     # Match the legacy builder: topology supplies defaults, while explicit
     # deploy/CLI values (including empty tuples) retain precedence.
     diffusion_kwargs.setdefault("stage_input_payload_keys", tuple(topology.stage_input_payload_keys))
+    diffusion_kwargs.setdefault("stage_input_optional_payload_keys", tuple(topology.stage_input_optional_payload_keys))
+    diffusion_kwargs.setdefault("stage_role", topology.stage_role.value if topology.stage_role is not None else None)
     diffusion_kwargs.setdefault("stage_output_payload_keys", tuple(topology.stage_output_payload_keys))
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(

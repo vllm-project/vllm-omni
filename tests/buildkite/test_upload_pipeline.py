@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -899,3 +900,104 @@ def test_source_filter_fallback_is_fallback_when_no_job_key_matches(
         "ungated",
         "gated_a",
     }
+
+
+@pytest.mark.parametrize(
+    ("changed_files", "expected_keys"),
+    [
+        (["tests/helpers/runtime.py"], {"ungated", "helper_user", "model_b", "unrelated"}),
+        (["tests/helpers/runtime.py", "README.md"], {"ungated", "helper_user", "model_b", "unrelated"}),
+        (["tests/helpers/runtime.py", "pkg/model_b/pipeline.py"], {"ungated", "helper_user", "model_b"}),
+        (
+            ["tests/helpers/runtime.py", "README.md", "pkg/model_b/pipeline.py"],
+            {"ungated", "helper_user", "model_b"},
+        ),
+        (["pkg/model_b/pipeline.py"], {"ungated", "model_b"}),
+    ],
+)
+def test_shared_helper_dependencies_preserve_broad_and_mixed_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_files: list[str],
+    expected_keys: set[str],
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = {
+        "steps": [
+            {"key": "ungated", "commands": ["true"]},
+            {"key": "helper_user", "source_file_dependencies": ["tests/helpers/"], "commands": ["true"]},
+            {"key": "model_b", "source_file_dependencies": ["pkg/model_b/"], "commands": ["true"]},
+            {"key": "unrelated", "source_file_dependencies": ["pkg/unrelated/"], "commands": ["true"]},
+        ],
+    }
+    rendered = _render_test_pipeline(doc, changed_files, pipeline_path=NIGHTLY_YAML)
+    assert {step["key"] for step in _iter_steps(rendered)} == expected_keys
+
+
+@pytest.mark.parametrize("pipeline_path", [NIGHTLY_YAML, Path(".buildkite/npu/test-npu-nightly.yml")])
+def test_qwen_image_21_accuracy_shared_helper_routing(monkeypatch: pytest.MonkeyPatch, pipeline_path: Path) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    qwen_label = next(
+        step["label"]
+        for step in _iter_steps(doc)
+        if step.get("source_file_dependencies") == "diffusion_qwen_image_21_accuracy"
+    )
+
+    def selected_labels(changed_files: list[str] | None) -> set[str]:
+        rendered = _render_test_pipeline(copy.deepcopy(doc), changed_files, pipeline_path=pipeline_path)
+        return {step["label"] for step in _iter_steps(rendered) if "label" in step}
+
+    helper = "tests/helpers/runtime.py"
+    wan = "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"
+    assert selected_labels([helper]) == selected_labels(None)
+    assert selected_labels([helper, "README.md"]) == selected_labels(None)
+    wan_labels = selected_labels([wan])
+    assert qwen_label not in wan_labels
+    mixed_labels = selected_labels([helper, wan])
+    assert qwen_label in mixed_labels
+    assert wan_labels <= mixed_labels
+    assert selected_labels([helper, "README.md", wan]) == mixed_labels
+
+
+@pytest.mark.parametrize(
+    "changed_path,selected",
+    [
+        ("vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py", True),
+        ("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py", True),
+        ("vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py", True),
+        ("vllm_omni/model_extras/qwen_image_21.py", True),
+        ("tests/e2e/accuracy/qwen_image_21/thresholds.json", True),
+        ("vllm_omni/diffusion/attention/backends/sdpa.py", False),
+        ("vllm_omni/diffusion/worker/diffusion_worker.py", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "pipeline_path,queue,selector",
+    [
+        (NIGHTLY_YAML, "mithril-h100-pool", "full_model and diffusion and H100 and cards_1"),
+        (
+            Path(".buildkite/npu/test-npu-nightly.yml"),
+            "ascend-a3",
+            "full_model and diffusion and npu and A3 and cards_1",
+        ),
+    ],
+)
+def test_qwen_image_21_accuracy_model_dependencies(
+    monkeypatch: pytest.MonkeyPatch, changed_path: str, selected: bool, pipeline_path: Path, queue: str, selector: str
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    # Include a known model match so the no-match fallback cannot mask routing.
+    changed_files = [changed_path, "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"]
+    rendered = _render_test_pipeline(doc, changed_files, pipeline_path=pipeline_path)
+    steps = [step for step in _iter_steps(rendered) if "Qwen-Image 2.1 Accuracy Test" in step.get("label", "")]
+    assert len(steps) == int(selected)
+    if not selected:
+        return
+    step = steps[0]
+    assert step["agents"]["queue"] == queue
+    assert not step.get("skip")
+    assert step["env"]["QWEN_IMAGE_21_CALIBRATE"] == "0"
+    assert any("test_qwen_image_21.py" in command for command in step["commands"])
+    assert any(selector in command for command in step["commands"])
+    assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]

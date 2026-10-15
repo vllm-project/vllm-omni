@@ -154,6 +154,9 @@ steps:
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
+    # Restore the unmasked BF16 AITER module into a job-local directory.
+    # This consumer does not publish a duplicate artifact.
+    - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
     - pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
 
 
@@ -168,8 +171,9 @@ steps:
 - group: ":card_index_dividers: Diffusion Test"
   steps:
     # Keep real FlashAttention execution out of the CPU-marked Simple lane.
-    # AITER may need to build several kernels on a cold worker, so run one
-    # pytest worker with job-local build directories and a bounded timeout.
+    # Restore the unmasked BF16 AITER module into a job-local directory.
+    # A miss, and the varlen module, still compile there. One pytest worker
+    # lets Mammoth reuse that directory instead of compiling again.
     - label: "ROCm · FlashAttention/AITER GPU Coverage"
       agent_pool: mi300_1
       depends_on: amd-build
@@ -178,9 +182,9 @@ steps:
       timeout_in_minutes: 60
       commands:
         - export VLLM_ROCM_USE_AITER=1
-        - export AITER_JIT_DIR="/tmp/vllm-omni-aiter-$$BUILDKITE_JOB_ID"
         - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-torch-extensions-$$BUILDKITE_JOB_ID"
-        - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
+        - mkdir -p "$$TORCH_EXTENSIONS_DIR"
+        - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
         - >-
           timeout --signal=TERM --kill-after=2m 55m
           pytest -s -v -n 1
@@ -222,6 +226,9 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
+        # Restore the unmasked BF16 AITER module into a job-local directory.
+        # This consumer does not publish a duplicate artifact.
+        - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
         - pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
 
     - label: "Diffusion · Offloader Test"
