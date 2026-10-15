@@ -116,6 +116,26 @@ class _CapacityEntries(dict):
         self.by_capacity.clear()
 
 
+_declined_logged: set[tuple[int | None, int]] = set()
+
+
+def _log_declined_once(capacity: int) -> None:
+    """One INFO per missed (num_tokens, capacity) so a CI log self-explains."""
+    from vllm.forward_context import get_forward_context
+
+    descriptor = getattr(get_forward_context(), "batch_descriptor", None)
+    key = (getattr(descriptor, "num_tokens", None), capacity)
+    if key in _declined_logged:
+        return
+    _declined_logged.add(key)
+    logger.info(
+        "[minicpmo] static-shape: no captured graph for (num_tokens=%s, capacity=%s); "
+        "the stock decode path handles this shape",
+        key[0],
+        capacity,
+    )
+
+
 def install_into_ascend_aclgraph() -> None:
     """Give the image's ACLGraphWrapper a per-capacity key and drop a dead barrier.
 
@@ -152,7 +172,34 @@ def install_into_ascend_aclgraph() -> None:
     def _call(self, *args, **kwargs):
         capacity = current_capacity()
         if capacity is None:
+            # Runner-driven steps always carry a capacity; a None here means
+            # the runner took a non-static path for this step (seen when the
+            # KV pool is large enough to change the capacity-bucket table).
+            # Passing through to the stock wrapper would hit its "no entry ->
+            # capture now" branch at request time -- engine-fatal. Dispatch to
+            # the runnable directly, same as the decline branch below. Capture
+            # passes keep the stock call: capture time is exactly when
+            # capturing is legal.
+            if _capture_bucket is None:
+                return self.runnable(*args, **kwargs)
             return original_call(self, *args, **kwargs)
+        captured_here = _is_static_shape_graph_here(capacity)
+        # A runtime step the capture passes never covered has no fixed graph to
+        # replay. Neither fallback is survivable: swapping in the per-capacity
+        # dict leaves the stock wrapper nothing to find, and passing through to
+        # the stock call hits its "no entry -> capture now" branch -- both end
+        # in capturing a new graph mid-request, which vLLM forbids (engine
+        # -fatal, "CUDA graph capturing detected at an inappropriate time").
+        # Call the wrapped runnable directly instead: that is exactly how the
+        # stock wrapper dispatches when the runtime mode is NONE (profile /
+        # warmup / eager), so the step runs eagerly with none of the graph
+        # machinery. The runner's ``is_static_shape_graph`` checks key on the
+        # same (num_tokens, capacity), so both sides agree on which steps are
+        # static-shape; capture passes always run under ``capturing_bucket``,
+        # so only runtime steps are screened.
+        if _capture_bucket is None and not captured_here:
+            _log_declined_once(capacity)
+            return self.runnable(*args, **kwargs)
         entries = self.concrete_aclgraph_entries
         if not isinstance(entries, _CapacityEntries):
             entries = _CapacityEntries(entries)
@@ -163,7 +210,7 @@ def install_into_ascend_aclgraph() -> None:
         # Only once the capture has recorded this (size, capacity) is there a
         # fixed graph to replay with nothing to order against; during the
         # capture itself the barrier still has to stand.
-        if not saved_enpu and _is_static_shape_graph_here(capacity):
+        if not saved_enpu and captured_here:
             self.enable_enpu = True
         try:
             return original_call(self, *args, **kwargs)
