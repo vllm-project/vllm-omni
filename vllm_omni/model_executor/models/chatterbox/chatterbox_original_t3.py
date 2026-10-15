@@ -70,7 +70,6 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
             prefix=maybe_prefix(prefix, "tfmr"),
         )
         self.heads = OriginalHeads(self.config)
-        self.make_empty_intermediate_tensors = self.tfmr.make_empty_intermediate_tensors
         self.allow_patterns_overrides = [self.config.t3_weights]
         self.cfg_pairs: dict[str, tuple[str, str, float]] = {}
         self.cfg_sampler = ChatterboxCFGSampler(Sampler(), self.cfg_pairs)

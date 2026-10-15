@@ -5,7 +5,6 @@ from collections.abc import Callable
 import pytest
 import torch
 from torch import nn
-from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.models.interfaces_base import is_text_generation_model
 
 from tests.model_executor.models.chatterbox.helpers import DEPLOY, build_stage, stage_vllm_config
@@ -171,8 +170,6 @@ def test_vllm_gives_the_registered_class_the_generate_runner() -> None:
     """vLLM inspects the class, not an instance, so ``__getattr__`` cannot answer for it.
 
     ``embed_input_ids``, ``forward`` and ``compute_logits`` on the class make
-    it a text-generation model; ``make_empty_intermediate_tensors`` makes it
-    pipeline-parallel.
+    it a text-generation model.
     """
     assert is_text_generation_model(ChatterboxForConditionalGeneration)
-    assert supports_pp(ChatterboxForConditionalGeneration)

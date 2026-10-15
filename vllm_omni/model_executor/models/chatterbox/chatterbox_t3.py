@@ -19,7 +19,6 @@ from torch import nn
 from transformers import GPT2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.models.gpt2 import GPT2Model
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
@@ -168,7 +167,7 @@ def split_t3_weights(
     return backbone, heads
 
 
-class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
+class ChatterboxT3ForConditionalGeneration(nn.Module):
     """T3: text and reference conditioning in, S3 speech tokens out."""
 
     # The runner replaces the placeholder prompt's embeddings through preprocess.
@@ -202,7 +201,6 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
             prefix=maybe_prefix(prefix, "tfmr"),
         )
         self.heads = T3Heads(config)
-        self.make_empty_intermediate_tensors = self.tfmr.make_empty_intermediate_tensors
         # The repo also holds the 10-step S3Gen weights; vLLM's loader would
         # otherwise read every safetensors file in the snapshot.
         self.allow_patterns_overrides = [config.t3_weights]

@@ -4,8 +4,8 @@
 
 The pipeline names this class for every stage; ``model_stage`` picks the
 stage class it wraps. What vLLM inspects on the registered class itself
-(``embed_input_ids``, ``compute_logits``, ``forward``, ``load_weights``,
-``make_empty_intermediate_tensors``) is defined here and delegates. Every
+(``embed_input_ids``, ``compute_logits``, ``forward``, ``load_weights``)
+is defined here and delegates. Every
 other attribute either model runner probes for (``has_preprocess``,
 ``preprocess``, ``preprocess_decode_batch``,
 ``preprocess_decode_batch_mrv2``, ``make_omni_output``,
@@ -21,7 +21,6 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
@@ -38,7 +37,7 @@ STAGES: dict[str, type[nn.Module]] = {
 }
 
 
-class ChatterboxForConditionalGeneration(nn.Module, SupportsPP):
+class ChatterboxForConditionalGeneration(nn.Module):
     """Stage 0 (``chatterbox_t3``) or stage 1 (``chatterbox_s3gen``)."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -65,12 +64,6 @@ class ChatterboxForConditionalGeneration(nn.Module, SupportsPP):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Stage 0's speech logits."""
         return self.model.compute_logits(hidden_states)
-
-    def make_empty_intermediate_tensors(
-        self, batch_size: int, dtype: torch.dtype, device: torch.device
-    ) -> IntermediateTensors:
-        """Stage 0's pipeline-parallel buffers."""
-        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
     def forward(
         self,
