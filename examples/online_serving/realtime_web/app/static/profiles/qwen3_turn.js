@@ -38,7 +38,10 @@
           turn_detection: vad ? { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300,
             silence_duration_ms: 500, create_response: true, interrupt_response: true } : null,
         } } };
-        if (vad) session.overlap_policy = 'barge_in_on_speech';
+        if (vad) {
+          session.overlap_policy = 'barge_in_on_speech';
+          session.playback_commit_policy = 'ack_only';
+        }
         else session.type = 'realtime';
         if (instructions) session.instructions = instructions;
         return [{ type: 'session.update', session }];

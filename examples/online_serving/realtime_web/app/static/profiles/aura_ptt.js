@@ -39,6 +39,7 @@
     initialMessages(config, instructions) {
       const session = {
         modalities: ['audio', 'text'],
+        playback_commit_policy: 'ack_only',
         extra_body: { auto_response: true },
       };
       if (instructions) session.instructions = instructions;
