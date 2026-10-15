@@ -10,6 +10,7 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "audio_text_total_chars",
         "duplex_epoch",
         "duplex_turn_id",
+        "full_payload_snapshot",
         "llm_output_text_utf8",
         "segment_end",
         "tts_is_last_chunk",
