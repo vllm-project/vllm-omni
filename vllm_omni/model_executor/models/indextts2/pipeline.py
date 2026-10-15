@@ -28,6 +28,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             extras={"skip_tokenizer_init": True, "tokenizer": "gpt2"},
             custom_process_next_stage_input_func=f"{_PROC}.talker2s2mel_full_payload",
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [8193],
@@ -65,6 +66,7 @@ INDEXTTS25_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             extras={"skip_tokenizer_init": True},
             custom_process_next_stage_input_func=f"{_PROC}.talker2s2mel_full_payload",
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [8193],
