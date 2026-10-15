@@ -770,6 +770,50 @@ class OmniServeCommand(CLISubcommand):
                 "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
             ),
         )
+        # New canonical offload shortcut and JSON config (RFC #7204)
+        omni_config_group.add_argument(
+            "--diffusion-offload",
+            dest="diffusion_offload_shortcut",
+            choices=("none", "module", "layer"),
+            default=None,
+            help=(
+                "Canonical offload granularity shortcut. "
+                "none = disable offload explicitly; "
+                "module = whole-DiT swapping with pinned memory; "
+                "layer = rank-local DiT block streaming with pinned memory. "
+                "Mutually exclusive with --diffusion-offload-config. "
+                "Does not replace all legacy flags — use --diffusion-offload-config for "
+                "fine-grained control over components and weight transfer."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-offload-config",
+            dest="diffusion_offload_config",
+            type=str,
+            default=None,
+            help=(
+                "Canonical offload policy as a JSON object (RFC #7204). "
+                "Keys: mode (none/module/layer, required), components "
+                "(object keyed by dit/text_encoder with per-component options "
+                "like weight_transfer and resident_layers), pin_memory (bool). "
+                "Omitted components default to {\"dit\":{}} for new-style configs. "
+                "Mutually exclusive with --diffusion-offload."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-config",
+            dest="host_weight_runtime_config",
+            type=str,
+            default=None,
+            help=(
+                "Canonical Host Weight Runtime policy as a JSON object (RFC #7204). "
+                "Keys: mode (disabled/preferred/required, default disabled), "
+                "root (writable node-local store path, required for preferred/required), "
+                "registration_limit_gib (per-worker mmap registration ceiling, default 0). "
+                "Supplied with preferred/required mode also requires active "
+                "mode=layer offload with components.dit and rank-local transfer."
+            ),
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
