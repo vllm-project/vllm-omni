@@ -22,7 +22,11 @@ stages:
     max_num_seqs: 8
     max_model_len: 2048
     max_num_batched_tokens: 4096
-    gpu_memory_utilization: 0.35
+    # Measured on H100: 1.01 GiB of weights, 1.30 GiB with vLLM's own, 0.16 GiB
+    # of activations, 0.04 GiB of graphs, and 120 KiB of KV cache per token;
+    # the 16 sequences (8 guided requests) at 2048 tokens need 3.75 GiB, so a
+    # 24 GB card has about 1.8 GiB to spare at this fraction.
+    gpu_memory_utilization: 0.30
     enforce_eager: false
     enable_prefix_caching: false
     enable_chunked_prefill: false
@@ -52,6 +56,8 @@ stages:
     max_num_seqs: 8
     max_model_len: 2048
     max_num_batched_tokens: 16384
+    # This stage keeps no KV cache; the fraction bounds the flow's and HiFT's
+    # activations for max_num_seqs utterances.
     gpu_memory_utilization: 0.15
     enforce_eager: true
     skip_tokenizer_init: true

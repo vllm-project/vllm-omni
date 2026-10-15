@@ -61,7 +61,11 @@ stages:
     # prefill over steps, which stage 0 handles: later first token, steadier
     # decode steps for the requests already speaking.
     max_num_batched_tokens: 2048
-    gpu_memory_utilization: 0.35
+    # Measured on H100: 0.80 GiB of weights, 1.12 GiB with vLLM's own, 0.08 GiB
+    # of activations, 0.04 GiB of graphs, and 96 KiB of KV cache per token; the
+    # 8 slots at 2048 tokens need 1.5 GiB, so a 24 GB card has about 1.8 GiB
+    # to spare at this fraction.
+    gpu_memory_utilization: 0.20
     enforce_eager: false
     enable_prefix_caching: false
     skip_tokenizer_init: true
@@ -92,6 +96,8 @@ stages:
     # scheduled with part of its tokens, and the decoder would take that
     # part for the utterance.
     max_num_batched_tokens: 16384
+    # This stage keeps no KV cache; the fraction bounds the flow's and HiFT's
+    # activations for max_num_seqs utterances.
     gpu_memory_utilization: 0.15
     enforce_eager: true
     skip_tokenizer_init: true
