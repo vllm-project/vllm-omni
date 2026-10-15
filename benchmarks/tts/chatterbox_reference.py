@@ -61,7 +61,7 @@ def main():
     if args.backend == "quality":
         evaluate_quality(args)
         return
-    synthesize, close, engine = make_backend(args)
+    synthesize, close, engine, sample_rate = make_backend(args)
     rows = []
     try:
         for voice in ("builtin", "clone"):
@@ -92,8 +92,8 @@ def main():
                     if audio.numel() == 0 or not torch.isfinite(audio).all():
                         raise ValueError("Generated empty or nonfinite audio")
                     filename = f"{args.backend}-{args.variant}-{voice}-{text_index}-{seed}.wav"
-                    sf.write(args.output / filename, audio.numpy(force=True), 24000, subtype="FLOAT")
-                    duration = audio.numel() / 24000
+                    sf.write(args.output / filename, audio.numpy(force=True), sample_rate, subtype="FLOAT")
+                    duration = audio.numel() / sample_rate
                     rows.append(
                         dict(
                             voice=voice,
@@ -117,7 +117,11 @@ def main():
 
 
 def make_backend(args):
-    """Use canonical upstream generate or Omni.generate without patched model methods."""
+    """Use canonical upstream generate or Omni.generate without patched model methods.
+
+    Upstream runs with its own ``generate`` defaults; Omni with the deploy
+    file's ``default_sampling_params``, which record them, and each request's seed.
+    """
     if args.backend == "upstream":
         from chatterbox.tts import ChatterboxTTS
         from chatterbox.tts_turbo import ChatterboxTurboTTS
@@ -131,17 +135,11 @@ def make_backend(args):
 
         def synthesize(text, reference, seed):
             model.conds = builtin
-            controls = dict(temperature=0.8, repetition_penalty=1.2, top_p=0.95 if args.variant == "turbo" else 1.0)
-            if args.variant == "turbo":
-                controls.update(top_k=1000, min_p=0.0, cfg_weight=0.0, exaggeration=0.0)
-            else:
-                controls.update(min_p=0.05, cfg_weight=0.5, exaggeration=0.5)
-            return model.generate(text, audio_prompt_path=str(reference) if reference else None, **controls)
+            return model.generate(text, audio_prompt_path=str(reference) if reference else None)
 
-        return synthesize, lambda: None, None
+        return synthesize, lambda: None, None, model.sr
 
     import yaml
-    from vllm.sampling_params import SamplingParams
 
     from vllm_omni import Omni
     from vllm_omni.model_executor.models.chatterbox.conditioning import (
@@ -187,21 +185,14 @@ def make_backend(args):
             voice = conditioner.prepare(wav.mean(axis=1), rate)
         ids = tokenize_text(text, tokenizer, args.variant)
         prompt = build_prompt(ids, voice, config)
-        sampling = SamplingParams(
-            seed=seed,
-            max_tokens=1000,
-            temperature=0.8,
-            repetition_penalty=1.2,
-            top_p=0.95 if args.variant == "turbo" else 1.0,
-            top_k=1000 if args.variant == "turbo" else -1,
-            min_p=0.0 if args.variant == "turbo" else 0.05,
-        )
+        sampling = engine.default_sampling_params_list[0].clone()
+        sampling.seed = seed
         params = [sampling, *engine.default_sampling_params_list[1:]]
         output = list(engine.generate([prompt], sampling_params_list=params))[0].outputs[0].multimodal_output
         audio = output["audio"]
         return torch.cat([chunk.flatten() for chunk in audio]) if isinstance(audio, list) else audio
 
-    return synthesize, engine.close, engine
+    return synthesize, engine.close, engine, config.sample_rate
 
 
 def profile_generation(args, synthesize, reference, voice, engine):
@@ -272,7 +263,6 @@ def write_report(args, rows):
         concurrency=1,
         model_runner=args.runner if args.backend == "omni" else None,
         cuda_graphs=args.backend == "omni" and args.cuda_graphs,
-        max_new_tokens=1000,
         warmup_per_mode=2 * len(TEXTS),
         rows=rows,
         summaries=summaries,
@@ -289,9 +279,11 @@ def evaluate_quality(args):
     from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSSampleRequest
     from vllm_omni.benchmarks.data_modules.seed_tts_eval import compute_seed_tts_wer_metrics
     from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
+    from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
     # The built-in voice ships as embeddings, not a recording, so SIM covers cloned rows only.
     os.environ["SEED_TTS_SIM_EVAL"] = "1"
+    sample_rate = ChatterboxConfig(args.variant).sample_rate
     rows, summaries = [], {}
     for backend in ("upstream", "omni"):
         report = json.loads((args.output / f"{backend}-{args.variant}.json").read_text())
@@ -300,7 +292,7 @@ def evaluate_quality(args):
             requests, outputs = [], []
             for row in selected:
                 wav, rate = sf.read(args.output / row["audio"], dtype="float32")
-                if rate != 24000 or wav.ndim != 1 or len(wav) != row["audio_samples"]:
+                if rate != sample_rate or wav.ndim != 1 or len(wav) != row["audio_samples"]:
                     raise ValueError("Output waveform does not match its timed report")
                 requests.append(
                     SeedTTSSampleRequest(
