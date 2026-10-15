@@ -703,6 +703,38 @@ class AsyncOmniEngine(OmniEngineBase):
         if prepared is not None:
             self._commit_prepared_add_request(request_id, prepared)
 
+    def _prepare_streaming_update(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
+        arrival_time: float | None = None,
+        lora_request: Any = None,
+        *,
+        resumable: bool = True,
+    ) -> Any:
+        """Build a streaming update message without admitting it."""
+        with self._input_processing_lock():
+            return self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                resumable=resumable,
+                message_type="streaming_update",
+            )
+
+    def _commit_streaming_update(self, msg: Any) -> None:
+        """Admit a prepared streaming update to the orchestrator queue."""
+        self.request_queue.sync_q.put(msg)
+
     def add_streaming_update(
         self,
         request_id: str,
@@ -717,20 +749,18 @@ class AsyncOmniEngine(OmniEngineBase):
         resumable: bool = True,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
-        with self._input_processing_lock():
-            msg = self._build_add_request_message(
-                request_id=request_id,
-                prompt=prompt,
-                prompt_text=prompt_text,
-                sampling_params_list=sampling_params_list,
-                final_stage_id=final_stage_id,
-                final_output_stage_ids=final_output_stage_ids,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                resumable=resumable,
-                message_type="streaming_update",
-            )
-        self.request_queue.sync_q.put(msg)
+        msg = self._prepare_streaming_update(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_text=prompt_text,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            resumable=resumable,
+        )
+        self._commit_streaming_update(msg)
 
     async def add_streaming_update_async(
         self,
@@ -745,18 +775,28 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         resumable: bool = True,
     ) -> None:
-        """Async wrapper for add_streaming_update()."""
-        self.add_streaming_update(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            resumable=resumable,
+        """Prepare a streaming update away from the event loop, then admit it.
+
+        Input preprocessing holds _input_processing_lock and may be slow for
+        multimodal payloads. Running it synchronously on the event loop blocks
+        other sessions. This mirrors the add_request_async pattern.
+        """
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(
+            None,
+            lambda: self._prepare_streaming_update(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                resumable=resumable,
+            ),
         )
+        self._commit_streaming_update(msg)
 
     def submit_interaction(
         self,
