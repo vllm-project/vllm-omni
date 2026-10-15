@@ -83,8 +83,8 @@ class OffloadConfig:
         from vllm_omni.diffusion.offloader.config_parser import (
             OffloadMode,
             WeightTransfer,
-            parse_offload_policy,
             parse_hwr_policy,
+            parse_offload_policy,
             validate_joint,
         )
 
@@ -138,18 +138,13 @@ class OffloadConfig:
                 dlo_resident_layers = canonical.dit_resident_layers()
 
             pin_cpu_memory = canonical.pin_memory
-            hsdp_enable_distributed = (
-                strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
-                and not dlo_use_allgather
-            )
+            hsdp_enable_distributed = strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and not dlo_use_allgather
 
         else:
             # --- Legacy boolean flags (pre-RFC #7204 path) ---
             enable_cpu_offload = getattr(od_config, "enable_cpu_offload", False)
             enable_layerwise_offload = getattr(od_config, "enable_layerwise_offload", False)
-            enable_distributed_layerwise_offload = getattr(
-                od_config, "enable_distributed_layerwise_offload", False
-            )
+            enable_distributed_layerwise_offload = getattr(od_config, "enable_distributed_layerwise_offload", False)
             pin_cpu_memory = getattr(od_config, "pin_cpu_memory", True)
 
             # Determine strategy (mutual exclusion, distributed layer-wise takes priority)
@@ -180,9 +175,7 @@ class OffloadConfig:
                 hwr_mode=getattr(od_config, "host_weight_runtime_mode", "disabled"),
             )
             if dlo_resident_layers < 0:
-                raise ValueError(
-                    f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}"
-                )
+                raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
             if dlo_resident_layers and dlo_use_allgather:
                 raise ValueError(
                     "dlo_resident_layers currently requires --dlo-no-use-allgather so "
@@ -198,12 +191,8 @@ class OffloadConfig:
         dp_size = 1
         if parallel_config is not None:
             dp_size = getattr(parallel_config, "data_parallel_size", 1)
-            hsdp_shard_size = (
-                getattr(parallel_config, "hsdp_shard_size", -1) if use_hsdp else -1
-            )
-            hsdp_replicate_size = (
-                getattr(parallel_config, "hsdp_replicate_size", 1) if use_hsdp else 1
-            )
+            hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if use_hsdp else -1
+            hsdp_replicate_size = getattr(parallel_config, "hsdp_replicate_size", 1) if use_hsdp else 1
             if use_hsdp and hsdp_shard_size > 0:
                 dp_size = hsdp_shard_size * hsdp_replicate_size
             if dp_size <= 1:
@@ -212,10 +201,7 @@ class OffloadConfig:
                     dp_size = sp_size
 
         # If dlo_use_allgather=False, force dp_size=1 (each rank independent)
-        if (
-            strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
-            and not dlo_use_allgather
-        ):
+        if strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and not dlo_use_allgather:
             dp_size = 1
             logger.info(
                 "Distributed layerwise offload: dlo_use_allgather=False, "
@@ -226,11 +212,7 @@ class OffloadConfig:
         # HSDP already shards parameters into DTensors.  Running distributed
         # layerwise offload on top would shard each to_local() again, producing
         # incorrect reconstruction after AllGather.  Reject this combination.
-        if (
-            hsdp_enable_distributed
-            and use_hsdp
-            and dlo_use_allgather
-        ):
+        if hsdp_enable_distributed and use_hsdp and dlo_use_allgather:
             raise ValueError(
                 "Distributed layerwise offload with AllGather is incompatible with "
                 "HSDP: HSDP parameters are already sharded DTensors, and the offloader "

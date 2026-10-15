@@ -23,7 +23,6 @@ from vllm_omni.diffusion.offloader.config_parser import (
     validate_joint,
 )
 
-
 # ---------------------------------------------------------------------------
 # expand_shortcut
 # ---------------------------------------------------------------------------
@@ -101,9 +100,7 @@ class TestParseOffloadJSON:
         """Omitted components → {"dit":{}} default for new active configs."""
         p = parse_offload_policy(diffusion_offload_config={"mode": "module"})
         assert p.mode is OffloadMode.MODULE
-        assert p.components == {
-            "dit": ComponentOptions(WeightTransfer.RANK_LOCAL, 0)
-        }
+        assert p.components == {"dit": ComponentOptions(WeightTransfer.RANK_LOCAL, 0)}
 
     def test_mode_layer_defaults(self):
         p = parse_offload_policy(diffusion_offload_config={"mode": "layer"})
@@ -143,15 +140,11 @@ class TestParseOffloadJSON:
         assert p.has_text_encoder
 
     def test_pin_memory_false(self):
-        p = parse_offload_policy(
-            diffusion_offload_config={"mode": "layer", "pin_memory": False}
-        )
+        p = parse_offload_policy(diffusion_offload_config={"mode": "layer", "pin_memory": False})
         assert p.pin_memory is False
 
     def test_json_string_input(self):
-        p = parse_offload_policy(
-            diffusion_offload_config=json.dumps({"mode": "layer"})
-        )
+        p = parse_offload_policy(diffusion_offload_config=json.dumps({"mode": "layer"}))
         assert p.mode is OffloadMode.LAYER
 
     def test_invalid_json_string(self):
@@ -193,9 +186,7 @@ class TestOffloadValidation:
 
     def test_none_rejects_components(self):
         with pytest.raises(ValueError, match="does not accept"):
-            parse_offload_policy(
-                diffusion_offload_config={"mode": "none", "components": {"dit": {}}}
-            )
+            parse_offload_policy(diffusion_offload_config={"mode": "none", "components": {"dit": {}}})
 
     def test_unknown_component(self):
         with pytest.raises(ValueError, match="Unknown component names"):
@@ -244,21 +235,15 @@ class TestOffloadValidation:
 
     def test_unknown_top_level_key_rejected(self):
         with pytest.raises(ValueError, match="Unknown top-level keys"):
-            parse_offload_policy(
-                diffusion_offload_config={"mode": "layer", "foo": "bar"}
-            )
+            parse_offload_policy(diffusion_offload_config={"mode": "layer", "foo": "bar"})
 
     def test_non_dict_components_rejected(self):
         with pytest.raises(TypeError):
-            parse_offload_policy(
-                diffusion_offload_config={"mode": "layer", "components": ["dit"]}
-            )
+            parse_offload_policy(diffusion_offload_config={"mode": "layer", "components": ["dit"]})
 
     def test_pin_memory_must_be_bool(self):
         with pytest.raises(TypeError, match="pin_memory must be a boolean"):
-            parse_offload_policy(
-                diffusion_offload_config={"mode": "layer", "pin_memory": "yes"}
-            )
+            parse_offload_policy(diffusion_offload_config={"mode": "layer", "pin_memory": "yes"})
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +298,7 @@ class TestLegacyFlags:
         assert p.mode is OffloadMode.LAYER
 
     def test_pin_cpu_memory_false(self):
-        p = parse_offload_policy(
-            enable_cpu_offload=True, pin_cpu_memory=False
-        )
+        p = parse_offload_policy(enable_cpu_offload=True, pin_cpu_memory=False)
         assert p.pin_memory is False
 
 
@@ -332,9 +315,7 @@ class TestParseHWR:
         assert hwr.registration_limit_gib == 0.0
 
     def test_canonical_preferred(self):
-        hwr = parse_hwr_policy(
-            hwr_config={"mode": "preferred", "root": "/var/cache/hwr"}
-        )
+        hwr = parse_hwr_policy(hwr_config={"mode": "preferred", "root": "/var/cache/hwr"})
         assert hwr.mode == "preferred"
         assert hwr.root == "/var/cache/hwr"
 
@@ -382,9 +363,7 @@ class TestParseHWR:
             parse_hwr_policy(hwr_config={"mode": "disabled", "extra": 42})
 
     def test_to_dict(self):
-        hwr = HostWeightRuntimePolicy(
-            mode="preferred", root="/tmp/h", registration_limit_gib=4.5
-        )
+        hwr = HostWeightRuntimePolicy(mode="preferred", root="/tmp/h", registration_limit_gib=4.5)
         assert hwr.to_dict() == {
             "mode": "preferred",
             "root": "/tmp/h",
@@ -433,12 +412,8 @@ class TestJointValidation:
             validate_joint(off, hwr)
 
     def test_registration_limit_requires_pin_memory(self):
-        off = parse_offload_policy(
-            diffusion_offload_config={"mode": "layer", "pin_memory": False}
-        )
-        hwr = HostWeightRuntimePolicy(
-            mode="preferred", root="/tmp/h", registration_limit_gib=8.0
-        )
+        off = parse_offload_policy(diffusion_offload_config={"mode": "layer", "pin_memory": False})
+        hwr = HostWeightRuntimePolicy(mode="preferred", root="/tmp/h", registration_limit_gib=8.0)
         with pytest.raises(ValueError, match="requires pin_memory=true"):
             validate_joint(off, hwr)
 

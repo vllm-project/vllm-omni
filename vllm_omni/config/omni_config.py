@@ -820,7 +820,7 @@ class _DiffusionConfigProjection:
 
         if self.diffusion_attention_config is None or isinstance(
             self.diffusion_attention_config,
-            (AttentionConfig, Mapping),
+            AttentionConfig | Mapping,
         ):
             self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
         else:
@@ -850,27 +850,17 @@ class _DiffusionConfigProjection:
             try:
                 self.diffusion_offload_config = _json.loads(self.diffusion_offload_config)
             except _json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"Invalid JSON in diffusion_offload_config: {exc}"
-                ) from exc
+                raise ValueError(f"Invalid JSON in diffusion_offload_config: {exc}") from exc
         if isinstance(self.host_weight_runtime_config, str):
             import json as _json
 
             try:
-                self.host_weight_runtime_config = _json.loads(
-                    self.host_weight_runtime_config
-                )
+                self.host_weight_runtime_config = _json.loads(self.host_weight_runtime_config)
             except _json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"Invalid JSON in host_weight_runtime_config: {exc}"
-                ) from exc
-        if (
-            self.diffusion_offload_shortcut is not None
-            and self.diffusion_offload_config is not None
-        ):
+                raise ValueError(f"Invalid JSON in host_weight_runtime_config: {exc}") from exc
+        if self.diffusion_offload_shortcut is not None and self.diffusion_offload_config is not None:
             raise ValueError(
-                "diffusion_offload_shortcut and diffusion_offload_config are "
-                "mutually exclusive; use one or the other"
+                "diffusion_offload_shortcut and diffusion_offload_config are mutually exclusive; use one or the other"
             )
 
         validate_host_weight_runtime_options(

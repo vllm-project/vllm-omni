@@ -796,7 +796,7 @@ class OmniServeCommand(CLISubcommand):
                 "Keys: mode (none/module/layer, required), components "
                 "(object keyed by dit/text_encoder with per-component options "
                 "like weight_transfer and resident_layers), pin_memory (bool). "
-                "Omitted components default to {\"dit\":{}} for new-style configs. "
+                'Omitted components default to {"dit":{}} for new-style configs. '
                 "Mutually exclusive with --diffusion-offload."
             ),
         )
