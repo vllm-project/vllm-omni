@@ -10,6 +10,7 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `qwen3-turn --manual` | Press **Send turn**; mic pauses while the reply plays | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
 | `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
+| `joyai-turn` | Latest observation once per second while idle, or **Send observation**; waits for response completion and playback | Camera frames without audio input | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
@@ -61,6 +62,27 @@ Release itself locks vision immediately so a follow-up frame cannot abort the
 just-committed speech turn on Stage0/1 (`max_num_seqs=1`). Audio still playing
 does not hold the next vision turn once text is done.
 MiniCPM / Qwen profiles do not set `pushToTalk`, so the PTT control stays hidden.
+
+## JoyAI: camera observations and spoken replies
+
+Start the [JoyAI unified Realtime deployment](../../../recipes/JD/JoyAI-VL-Interaction.md#unified-realtime-session-textvideo), then:
+
+```bash
+python -m examples.online_serving.realtime_web --profile joyai-turn \
+    --ws-backend ws://127.0.0.1:8099 --port 7862
+```
+
+Set the task in **System prompt** before starting the session, then enable
+**Camera**. The client captures one frame per second and commits the latest
+frame while idle. **Send observation** also submits the current frame. During
+generation and playback, newer frames replace the pending observation; the
+next turn starts after both `response.done` and local playback finish.
+
+Replies appear as text and play through the existing speaker component, which
+sends `playback.ack`. This profile uses camera input and text instructions;
+microphone input will follow the unified Session ASR integration. The browser
+only requests camera permission when **Camera** is enabled. Use localhost or
+HTTPS for browser camera access.
 
 ## Qwen3: explicit-turn Realtime
 
@@ -216,7 +238,9 @@ This Qwen3 UI profile requires the server-VAD deployment above.
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).
-- `--ref-audio`: required for MiniCPM; rejected for Qwen3 and AURA.
+- `--ref-audio`: optional MiniCPM assistant voice override; the server uses the
+  model-bundled `assets/HT_ref_audio.wav` when it is omitted. Rejected for
+  Qwen3 and AURA.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.

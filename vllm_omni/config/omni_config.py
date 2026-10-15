@@ -894,6 +894,8 @@ class _DiffusionConfigProjection:
     kv_transfer_config: KVTransferConfig | None = None
     # Full stage-payload transport, independent of native paged KV transfer.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
+    stage_role: str | None = None
     stage_output_payload_keys: tuple[str, ...] = ()
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
@@ -1141,6 +1143,7 @@ _DIFFUSION_ONLY_CONFIG_FIELDS = (
 )
 _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
     {
+        "model_stage",
         "parallel_config",
         "num_gpus",
         "log_level",
@@ -1728,6 +1731,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.requires_multimodal_data
 
     @property
+    def bypass_without_modalities(self) -> tuple[str, ...]:
+        return tuple(self.stage_pipeline_config.bypass_without_modalities)
+
+    @property
     def prompt_expand_func(self) -> str | None:
         return self.stage_pipeline_config.prompt_expand_func
 
@@ -2192,6 +2199,8 @@ def _build_diffusion_config_projection(
     # Match the legacy builder: topology supplies defaults, while explicit
     # deploy/CLI values (including empty tuples) retain precedence.
     diffusion_kwargs.setdefault("stage_input_payload_keys", tuple(topology.stage_input_payload_keys))
+    diffusion_kwargs.setdefault("stage_input_optional_payload_keys", tuple(topology.stage_input_optional_payload_keys))
+    diffusion_kwargs.setdefault("stage_role", topology.stage_role.value if topology.stage_role is not None else None)
     diffusion_kwargs.setdefault("stage_output_payload_keys", tuple(topology.stage_output_payload_keys))
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(

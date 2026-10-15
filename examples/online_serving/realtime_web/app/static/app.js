@@ -38,6 +38,8 @@
   document.getElementById('profileDescription').textContent = profile.description;
   document.getElementById('policyLabel').textContent = profile.policy;
   cameraButton.hidden = !profile.camera;
+  muteButton.hidden = Boolean(profile.videoOnly);
+  document.getElementById('microphoneMeter').hidden = Boolean(profile.videoOnly);
   if (profile.cameraPreviewLarge) {
     cameraPreview.classList.add('camera-preview-large');
     // Inline, so a cached stylesheet cannot leave the 96×72 HTML default.
@@ -52,6 +54,7 @@
     }
   }
   sendTurnButton.hidden = !profile.clientCommit;
+  if (profile.videoOnly) sendTurnButton.textContent = 'Send observation';
   pttButton.hidden = !profile.pushToTalk;
   promptPreset.replaceChildren();
   for (const name of [...Object.keys(PROMPT_PRESETS), 'custom']) {
@@ -385,6 +388,11 @@
   function flushCapture() {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
 
+    if (profile.videoOnly) {
+      if (cameraPendingFrame) submitObservation(cameraPendingFrame);
+      return;
+    }
+
     // AURA: capture stays 2 fps, but a turn opens only every 2 frames, and
     // not until the previous response's text is done (or it listened).
     // Playback still running is not the lock. PTT speech is not batched here.
@@ -422,6 +430,24 @@
       ? profile.append(int16ToBase64(pcm), frame, { isSpeech: true })
       : profile.append(int16ToBase64(pcm), frame);
     socket.send(JSON.stringify(appendEvent));
+  }
+
+  function submitObservation(frame) {
+    if (!frame || !running || !connectionReady || turnSubmitted || assistantActive) return;
+    socket.send(JSON.stringify(profile.append(null, frame)));
+    cameraPendingFrame = null;
+    submitTurn();
+  }
+
+  function submitTurn() {
+    for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    turnSubmitted = true;
+    responseComplete = false;
+    markBusy();
+    armTurnTimeout();
+    sendTurnButton.disabled = true;
+    setModel('Thinking');
+    appendLog('turn submitted');
   }
 
   function setPttHeld(held) {
@@ -815,14 +841,14 @@
     if (running) return;
     callButton.disabled = true;
     setConnection('Connecting', 'connecting');
-    runtimeDetail.textContent = 'Requesting microphone access';
+    runtimeDetail.textContent = profile.videoOnly ? 'Connecting to the server' : 'Requesting microphone access';
     try {
       sessionGeneration += 1;
       audioChain = Promise.resolve();
       interruptedResponses.clear();
       pendingEvents.clear();
       await openPlayback();
-      await openCapture();
+      if (!profile.videoOnly) await openCapture();
       await openSocket();
       running = true;
       muted = false;
@@ -835,7 +861,7 @@
       startClock();
       callButton.textContent = 'End session';
       callButton.classList.add('is-active');
-      muteButton.disabled = false;
+      muteButton.disabled = Boolean(profile.videoOnly);
       cameraButton.disabled = !profile.camera;
       sendTurnButton.disabled = !profile.clientCommit;
       pttButton.disabled = !profile.pushToTalk;
@@ -1018,15 +1044,12 @@
   });
   sendTurnButton.addEventListener('click', () => {
     if (!running || !connectionReady || !profile.clientCommit || turnSubmitted) return;
+    if (profile.videoOnly) {
+      submitObservation(cameraPendingFrame || cameraLastFrame);
+      return;
+    }
     flushCapture();
-    for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
-    turnSubmitted = true;
-    responseComplete = false;
-    markBusy();
-    armTurnTimeout();
-    sendTurnButton.disabled = true;
-    setModel('Thinking');
-    appendLog('turn submitted');
+    submitTurn();
   });
   const pttDown = (event) => {
     event.preventDefault();

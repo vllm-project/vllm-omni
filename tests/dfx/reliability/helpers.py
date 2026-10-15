@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared reliability fault-injection helpers.
 
 This module keeps fault injection callable from tests directly:
@@ -18,6 +21,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import select
 import shlex
 import signal
@@ -676,23 +680,9 @@ def list_alive_pids(pids: Sequence[int]) -> list[int]:
     return out
 
 
-def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
-    """Query NVIDIA compute-process memory map (pid -> used MB).
-
-    Returns ``None`` when ``nvidia-smi`` is unavailable/unreadable on current host.
-    """
-    out = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        logger.warning("[reliability][gpu] nvidia-smi query failed: %s", out.stderr.strip())
-        return None
-
+def _parse_nvidia_compute_pid_used_memory_mb(output: str) -> dict[int, int]:
     pid_to_mem_mb: dict[int, int] = {}
-    for line in out.stdout.splitlines():
+    for line in output.splitlines():
         row = line.strip()
         if not row:
             continue
@@ -707,6 +697,99 @@ def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
             continue
         pid_to_mem_mb[int(pid_raw)] = int(mem_digits)
     return pid_to_mem_mb
+
+
+def _parse_rocm_compute_pid_used_memory_mb(output: str) -> dict[int, int]:
+    """Parse ``rocm-smi --showpids --json`` output into a PID -> used MiB map."""
+    payload = json.loads(output)
+    system = payload.get("system", {})
+    if not isinstance(system, dict):
+        return {}
+
+    pid_to_mem_mb: dict[int, int] = {}
+    for key, value in system.items():
+        pid_match = re.fullmatch(r"pid\s*(\d+)", str(key), flags=re.IGNORECASE)
+        if pid_match is None or not isinstance(value, str):
+            continue
+
+        # rocm-smi emits: process name, gpu count, VRAM bytes, SDMA bytes,
+        # CU occupancy. Split from the right so a process name containing a
+        # comma does not move the VRAM field.
+        fields = [part.strip() for part in value.rsplit(",", maxsplit=4)]
+        if len(fields) != 5:
+            continue
+        vram_raw = fields[-3]
+        value_match = re.search(r"\d+", vram_raw.replace("_", ""))
+        if value_match is None:
+            continue
+
+        value_int = int(value_match.group())
+        normalized = vram_raw.lower()
+        if "gib" in normalized or normalized.endswith("gb"):
+            used_mb = value_int * 1024
+        elif "mib" in normalized or normalized.endswith("mb"):
+            used_mb = value_int
+        elif "kib" in normalized or normalized.endswith("kb"):
+            used_mb = (value_int + 1023) // 1024
+        else:
+            # The official rocm-smi JSON format reports unitless VRAM bytes.
+            used_mb = (value_int + (1024**2 - 1)) // (1024**2)
+        pid_to_mem_mb[int(pid_match.group(1))] = used_mb
+    return pid_to_mem_mb
+
+
+def _gpu_process_query_spec(
+    platform: Any | None = None,
+) -> tuple[list[str], Callable[[str], dict[int, int]]] | None:
+    if platform is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform
+    if platform.is_rocm():
+        return ["rocm-smi", "--showpids", "--json"], _parse_rocm_compute_pid_used_memory_mb
+    if platform.is_cuda():
+        return (
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            _parse_nvidia_compute_pid_used_memory_mb,
+        )
+    return None
+
+
+def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
+    """Query platform compute-process memory (pid -> used MiB).
+
+    Returns ``None`` when the platform SMI tool is unavailable, fails, times
+    out, or returns unreadable output. Callers must still enforce process-tree
+    cleanup when GPU telemetry is unavailable.
+    """
+    query_spec = _gpu_process_query_spec()
+    if query_spec is None:
+        return None
+    command, parser = query_spec
+
+    try:
+        out = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("[reliability][gpu] %s query unavailable: %s", command[0], exc)
+        return None
+    if out.returncode != 0:
+        logger.warning("[reliability][gpu] %s query failed: %s", command[0], out.stderr.strip())
+        return None
+    try:
+        return parser(out.stdout)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning("[reliability][gpu] %s output was unreadable: %s", command[0], exc)
+        return None
 
 
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
@@ -743,6 +826,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     snapshot = getattr(server, "reliability_fault_snapshot", None)
     if not isinstance(snapshot, dict):
         pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+    assert isinstance(snapshot, dict)
     tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
     if not tree_pids:
         pytest.skip(f"[{scenario}] no server process tree PIDs captured for this run")
@@ -751,12 +835,21 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     deadline = time.monotonic() + timeout_sec
     last_alive: list[int] = []
     last_gpu_leaks: dict[int, int] = {}
+    gpu_telemetry_available: bool | None = None
     while time.monotonic() < deadline:
         last_alive = list_alive_pids(tree_pids)
-        gpu_map = query_gpu_compute_pid_used_memory_mb()
+        gpu_map = query_gpu_compute_pid_used_memory_mb() if gpu_telemetry_available is not False else None
         if gpu_map is None:
-            pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
-        last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
+            if gpu_telemetry_available is None:
+                logger.warning(
+                    "[%s] GPU process telemetry unavailable; process-tree cleanup remains mandatory",
+                    scenario,
+                )
+            gpu_telemetry_available = False
+            last_gpu_leaks = {}
+        else:
+            gpu_telemetry_available = True
+            last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
         if not last_alive and not last_gpu_leaks:
             return
         time.sleep(poll_interval_sec)
@@ -785,7 +878,7 @@ def _capture_server_fault_snapshot(
     server: Any,
     *,
     worker_markers_extra: Sequence[str] | None = None,
-) -> dict[str, list[int]]:
+) -> dict[str, list[int] | list[str]]:
     """Capture current server process snapshot for post-fault assertions.
 
     ``tree_pids`` is ``[root, ...descendants]`` and is used by
@@ -801,7 +894,7 @@ def _capture_server_fault_snapshot(
             continue
         if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
-    snapshot = {
+    snapshot: dict[str, list[int] | list[str]] = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,

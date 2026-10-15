@@ -144,6 +144,14 @@ upload_pipeline() {
 
     FAIL_FAST=$(fail_fast)
 
+    if [[ "$BUILDKITE_BRANCH" == "main" && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+        # AMD checkouts are depth one. Read the first-parent object ID from
+        # the commit header without requiring the parent object locally.
+        VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+    else
+        VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)
+    fi
+
     cd .buildkite/amd
 
     # Multiple label-selected or debug-selected suites share one image build.
@@ -199,6 +207,7 @@ PY
             -D fail_fast="$FAIL_FAST" \
             -D vllm_use_precompiled="$VLLM_USE_PRECOMPILED" \
             -D vllm_merge_base_commit="$(git merge-base origin/main HEAD)" \
+            -D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT" \
             -D cov_enabled="$COV_ENABLED" \
             -D vllm_ci_branch="$VLLM_CI_BRANCH" \
             | sed '/^[[:space:]]*$/d' \

@@ -330,10 +330,15 @@ loaded tokenizer's encoder/quantizer, length buckets and optional compilation
 attention; `VLLM_OMNI_MOSS_REF_ATTN=sdpa` retains the original attention.
 Compilation and attention changes need not produce bit-identical codes.
 
-For multiple API processes, `VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR` enables shared
-reference-code storage and, by default, a single encoder host with four
-workers. Use a dedicated directory per service, checkpoint and encoding
-configuration. Workers have their own graph resources; all graph captures
+With `--api-server-count` above 1, the API processes share reference-code
+storage and, by default, a single encoder host with four workers. The
+directory is created for the server under `/dev/shm` (or `/tmp`) and removed
+at shutdown; it keeps about the 4096 most recently used references.
+`VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR` selects a directory of your own instead
+(use a dedicated one per service, checkpoint and encoding configuration); an
+empty value turns sharing off. The encoder host listens on a Unix socket in
+that directory: if the socket path exceeds 103 bytes, each API process encodes
+its own references and only the codes are shared. Workers have their own graph resources; all graph captures
 complete before serving begins. `VLLM_OMNI_MOSS_REF_SHARED_ENCODER=0` retains
 separate encoders while sharing codes. More workers/graphs consume memory;
 they do not imply more GPUs. Example after selecting an available GPU and
@@ -348,7 +353,6 @@ VLLM_OMNI_MOSS_REF_ENCODER_WORKERS=4 \
 VLLM_OMNI_MOSS_REF_BATCH_WINDOW_MS=0 \
 VLLM_OMNI_MOSS_REF_INFLIGHT=4 \
 VLLM_OMNI_MOSS_REF_HOST_WINDOW_MS=2 \
-VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR=/dev/shm/moss-local-service \
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
   --api-server-count 4 \
   --deploy-config vllm_omni/deploy/moss_tts_local.yaml \

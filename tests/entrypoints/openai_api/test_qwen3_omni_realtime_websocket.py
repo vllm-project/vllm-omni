@@ -182,7 +182,6 @@ async def _run_realtime_audio_roundtrip(
 
             if event_type in {
                 "session.created",
-                "conversation.created",
                 "session.updated",
                 "input_audio_buffer.committed",
                 "conversation.item.added",

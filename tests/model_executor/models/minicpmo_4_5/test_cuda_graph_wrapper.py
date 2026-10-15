@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from vllm.platforms import current_platform
 
 import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
@@ -22,7 +23,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     WholeEulerCFMGraphWrapper,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 class _F0Predictor(nn.Module):
@@ -134,6 +135,7 @@ class _FakeGraph:
 def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
+    wrapper.device = torch.device("cpu")
     wrapper.capture_batch_sizes = [1]
     wrapper._legit_shapes = {(7, 0), (9, 0)}
     wrapper.graph = {}
