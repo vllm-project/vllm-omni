@@ -44,8 +44,6 @@ def metadata():
         "_omni_prompt_len": 41,
         "ids": {"prompt": [12, 13, 14], "speech_token": [1, 2, 3, 4]},
         "embed": {"voice": torch.ones(1, 256)},
-        "request_id": "engine-request",
-        "global_request_id": ["external-request"],
         "chatterbox": {"cfg_weight": 0.5, "exaggeration": 0.7},
     }
 
@@ -88,20 +86,23 @@ def test_decode_batches_preserve_independent_positions(model):
     assert updates_v2 == updates
 
 
-@pytest.mark.parametrize("identity_key", ["request_id", "req_id"])
-def test_cfg_registration_uses_external_pair_id_and_cleans_finished_requests(model, metadata, identity_key):
-    for role, request_id, external_id in (
-        ("cond", "internal-a", "external-request"),
-        ("uncond", "internal-b", "external-request__cfg_uncond"),
-    ):
-        info = {**metadata, "global_request_id": [external_id], "cfg_group": {"role": role}}
-        info.pop("request_id")
-        info[identity_key] = request_id
+def test_model_runner_v2_registers_the_pair_its_sampling_parameters_carry(model, metadata):
+    """MRv2 hands preprocess each request's sampling parameters and samples by row identity.
+
+    The pair is the ``extra_args`` tuple admission tagged the request with,
+    which the default runner hands its sampler directly; the default runner
+    passes no sampling parameters, and nothing is registered for it.
+    """
+    for role, req_id in (("cond", "internal-a"), ("uncond", "internal-b")):
+        params = SamplingParams(extra_args={"chatterbox_cfg": ("external-request", role, 0.5)})
+        info = {**metadata, "cfg_group": {"role": role}, "sampling_params": params, "req_id": req_id}
         model.preprocess(torch.tensor([8]), None, _omni_is_prefill=False, _omni_num_computed_tokens=41, **info)
-        assert model.cfg_pairs[request_id] == ("external-request", role, 0.5)
+        assert model.cfg_pairs[req_id] == ("external-request", role, 0.5)
     model.on_requests_finished({"internal-a", "already-finished"})
     assert set(model.cfg_pairs) == {"internal-b"}
     model.on_requests_finished({"internal-b"})
+
+    model.preprocess(torch.tensor([8]), None, _omni_is_prefill=False, _omni_num_computed_tokens=41, **metadata)
     assert model.cfg_pairs == {}
 
 

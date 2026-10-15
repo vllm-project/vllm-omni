@@ -8,6 +8,7 @@ import torch
 from transformers import LlamaConfig, PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.models.llama import LlamaModel
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxCFGSampler, ChatterboxMRv2CFGSampler
@@ -19,7 +20,7 @@ from vllm_omni.model_executor.models.chatterbox.original_heads import (
     original_speech_embeds,
     split_original_weights,
 )
-from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 
 class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
@@ -78,22 +79,23 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
         _omni_num_computed_tokens: int,
         ids: dict,
         embed: dict,
-        global_request_id: list[str],
         chatterbox: dict,
         cfg_group: dict | None = None,
-        request_id: str | None = None,
+        sampling_params: SamplingParams | None = None,
         req_id: str | None = None,
         **runner_metadata: object,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        """Reconstruct learned positions from scheduler progress, including recomputation."""
+        """Reconstruct learned positions from scheduler progress, including recomputation.
+
+        Model Runner V2 samples by row identity, so it registers here the
+        guidance pair that ``prepare_original_prompt`` and
+        ``expand_original_cfg_prompts`` put in the request's
+        ``extra_args``; the default runner hands the sampler that same tuple
+        itself and passes no sampling parameters.
+        """
+        if sampling_params is not None:
+            self.cfg_pairs[req_id] = sampling_params.extra_args["chatterbox_cfg"]
         role = "cond" if cfg_group is None else cfg_group["role"]
-        external_id = global_request_id[0]
-        pair_id = external_id.removesuffix(CFG_UNCOND_SUFFIX) if role == "uncond" else external_id
-        # MRv1 supplies request_id; MRv2 supplies req_id.
-        identity = request_id if request_id is not None else req_id
-        if identity is None:
-            raise ValueError("Chatterbox preprocessing requires a request identity")
-        self.cfg_pairs[identity] = (pair_id, role, chatterbox["cfg_weight"])
         device, dtype = input_ids.device, self.heads.text_emb.weight.dtype
         prompt_rows = input_ids.new_empty((0, self.config.hidden_size), dtype=dtype)
         in_prompt = 0
