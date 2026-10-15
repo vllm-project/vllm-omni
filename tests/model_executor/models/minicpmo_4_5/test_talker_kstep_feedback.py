@@ -28,6 +28,7 @@ Layers pinned down here:
   whose decode preprocess cannot re-embed the real previous frame.
 """
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +43,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     codec_sample_result,
     make_device_state,
 )
+from vllm_omni.platforms.npu.worker import talker_multiframe
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1403,3 +1405,52 @@ def test_ignore_eos_does_not_ignore_stop_ids():
 
     assert state["finished"] is True
     assert bool(model._request_codec_device_states["r1"].finished.item()) is True
+
+
+_TALKER_LOGGER = "vllm_omni.platforms.npu.worker.talker_multiframe"
+
+
+def test_kstep_log_reasons_are_deduped_by_reason_set(caplog, monkeypatch):
+    """Each distinct log reason is emitted once; a repeat is suppressed.
+
+    The dedupe has to be by *reason set*, not by "whatever the last reason
+    was": the fold reasons alternate at concurrency, and one decline reason
+    carries the step's own row count, so a single-slot guard either logs on
+    every alternation or never suppresses at all. Both shapes regressed once,
+    so this pins the behaviour. The module-level sets are reset so test order
+    cannot change the outcome.
+    """
+    monkeypatch.setattr(talker_multiframe, "_LOGGED_BLOCKS", set())
+    monkeypatch.setattr(talker_multiframe, "_LOGGED_FOLDS", set())
+    monkeypatch.setattr(talker_multiframe, "_LOGGED_NARROW_BLOCKS", set())
+
+    stopped_mid_step = "a request stopped mid-step, short of its drafts; no drafts this step"
+    mixed_batch = "a batch mixed drafted and undrafted requests; no drafts this step"
+    never_engaged = "request token spans are not uniform"
+
+    with caplog.at_level(logging.INFO, logger=_TALKER_LOGGER):
+        talker_multiframe._log_fold_once(stopped_mid_step)
+        talker_multiframe._log_fold_once(mixed_batch)
+        talker_multiframe._log_fold_once(stopped_mid_step)
+        folds = [r.getMessage() for r in caplog.records if "folded this step" in r.getMessage()]
+
+        caplog.clear()
+        talker_multiframe._log_block_once(never_engaged)
+        talker_multiframe._log_block_once(never_engaged)
+        blocks = [r.getMessage() for r in caplog.records if "not engaged" in r.getMessage()]
+
+        caplog.clear()
+        talker_multiframe._decline("no one-query graph captured for 3 rows")
+        talker_multiframe._decline("no one-query graph captured for 5 rows")
+        talker_multiframe._decline("no one-query graph captured for 3 rows")
+        declines = [r.getMessage() for r in caplog.records if "one-query Talker replay" in r.getMessage()]
+
+    assert folds == [
+        "[minicpmo] multi-frame Talker decode folded this step: " + stopped_mid_step,
+        "[minicpmo] multi-frame Talker decode folded this step: " + mixed_batch,
+    ]
+    assert blocks == ["[minicpmo] multi-frame Talker decode not engaged: " + never_engaged]
+    assert declines == [
+        "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 3 rows",
+        "[minicpmo] one-query Talker replay not engaged: no one-query graph captured for 5 rows",
+    ]
