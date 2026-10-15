@@ -38,6 +38,7 @@ x-chatterbox: &chatterbox
   - vllm_omni/model_executor/models/cosyvoice3/utils.py
   - vllm_omni/model_executor/models/glm_tts/vocoder.py
   - vllm_omni/model_executor/models/indextts2/
+  - vllm_omni/model_executor/models/step_audio2/step_audio2_thinker.py
   - vllm_omni/model_executor/stage_input_processors/bagel.py
   - vllm_omni/model_executor/stage_input_processors/chatterbox.py
   - vllm_omni/transformers_utils/configs/chatterbox.py

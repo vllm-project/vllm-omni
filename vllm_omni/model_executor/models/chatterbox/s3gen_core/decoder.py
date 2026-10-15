@@ -24,17 +24,7 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_decoder import
     SinusoidalPosEmb,
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import CausalConv1d
-
-
-def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    assert mask.dtype == torch.bool
-    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
-    mask = mask.to(dtype)
-    # attention mask bias
-    # NOTE(Mddct): torch.finfo jit issues
-    #     chunk_masks = (1.0 - chunk_masks) * torch.finfo(dtype).min
-    mask = (1.0 - mask) * -1.0e10
-    return mask
+from vllm_omni.model_executor.models.step_audio2.step_audio2_thinker import mask_to_bias
 
 
 class Transpose(torch.nn.Module):
