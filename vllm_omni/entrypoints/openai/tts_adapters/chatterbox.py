@@ -52,11 +52,11 @@ class ChatterboxAdapter(ARTTSAdapter):
         # The deploy file's stage 0 ``additional_config`` names where the
         # reference encoders run; the API process must see that device.
         self.conditioning_device = torch.device(
-            (self.stage_setting("additional_config") or {}).get("conditioning_device", "cpu")
+            (self.stage_setting("runtime_config", "additional_config") or {}).get("conditioning_device", "cpu")
         )
         # As many references are encoded together as stage 0 admits requests:
         # the deploy profile sizes that for its card, and nothing here divides it.
-        max_num_seqs = self.stage_setting("max_num_seqs")
+        max_num_seqs = self.stage_setting("scheduler_config", "max_num_seqs")
         if max_num_seqs is None:
             raise ValueError("Chatterbox deploy files set stage 0 max_num_seqs")
         self.conditioning_capacity = max_num_seqs // self.sequences_per_request

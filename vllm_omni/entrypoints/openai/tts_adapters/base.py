@@ -393,23 +393,21 @@ class TTSModelAdapter(ABC):
     async def warmup(self) -> None:
         return
 
-    def stage_setting(self, name: str) -> Any:
-        """The serving stage's deploy setting ``name``, or None.
+    def stage_setting(self, section: str, name: str) -> Any:
+        """The serving stage's deploy setting ``name``, or None when it is unset.
 
-        A typed stage config keeps its settings on ``runtime_config`` and
-        vLLM's ``scheduler_config``; a legacy one keeps them under ``engine_args``.
+        A typed stage config keeps the setting in one of its sections; a
+        legacy one keeps every setting flat under ``engine_args``.
+
+        Args:
+            section: The typed config's section that holds the setting, such
+                as ``runtime_config`` for ``additional_config`` or
+                ``scheduler_config`` for ``max_num_seqs``.
+            name: The deploy file's key.
         """
-        stage = getattr(self.ctx.server, "_tts_stage", None)
-        owners = (
-            getattr(stage, "runtime_config", None),
-            getattr(stage, "scheduler_config", None),
-            getattr(stage, "engine_args", None),
-        )
-        for owner in owners:
-            value = getattr(owner, name, None)
-            if value is not None:
-                return value
-        return None
+        stage = self.ctx.server._tts_stage
+        engine_args = getattr(stage, "engine_args", None)
+        return getattr(getattr(stage, section) if engine_args is None else engine_args, name, None)
 
     def shutdown(self) -> None:
         """Release model-specific serving work before the executor shuts down."""
