@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from tests.model_executor.models.chatterbox.helpers import (
     SEED,
     build_stage,
     load_stage_weights,
+    random_voice,
     stage_vllm_config,
     write_model_dir,
     write_s3gen_checkpoint,
@@ -51,11 +52,9 @@ TOLERANCE = 1e-5
 
 
 def reference(prompt_tokens: int) -> Reference:
-    return Reference(
-        prompt_token=torch.randint(0, 6561, (1, prompt_tokens)),
-        prompt_feat=torch.randn(1, 2 * prompt_tokens, 80),
-        embedding=torch.randn(1, 192),
-    )
+    """Stage 1's part of a random voice."""
+    voice = random_voice(1, prompt_tokens)
+    return Reference(prompt_token=voice.prompt_token, prompt_feat=voice.prompt_feat, embedding=voice.embedding)
 
 
 def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
@@ -88,13 +87,6 @@ def decoder() -> S3GenDecoder:
     """A float32 flow: the value-level checks below compare float32 computations."""
     torch.manual_seed(0)
     return S3GenDecoder(ChatterboxConfig(flow_dtype="float32"), CONTEXT, LEFT_CONTEXT, SEED).eval()
-
-
-@pytest.fixture(autouse=True)
-def no_stream_left_behind(decoder: S3GenDecoder) -> Iterator[None]:
-    """A test that fails mid-stream must not leave its state to the next one."""
-    yield
-    decoder.streams.clear()
 
 
 @pytest.fixture(scope="module")

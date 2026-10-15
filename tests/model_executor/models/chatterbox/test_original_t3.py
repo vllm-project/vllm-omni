@@ -8,10 +8,10 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
-from tests.model_executor.models.chatterbox.helpers import DEPLOY, build_stage, stage_vllm_config
+from tests.model_executor.models.chatterbox.helpers import DEPLOY, build_stage, random_voice, stage_vllm_config
 from vllm_omni.model_executor.models.chatterbox.chatterbox import ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
-from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
+from vllm_omni.model_executor.models.chatterbox.conditioning import build_prompt
 from vllm_omni.model_executor.models.chatterbox.original_heads import (
     ORIGINAL_SPEECH_POSITIONS,
     original_prefill_embeds,
@@ -106,14 +106,9 @@ def test_model_runner_v2_registers_the_pair_its_sampling_parameters_carry(model,
     assert model.cfg_pairs == {}
 
 
-def test_a_context_beyond_the_speech_position_table_is_refused(
-    model_dir: str, built_stage: Callable[[str, int], ChatterboxForConditionalGeneration]
-) -> None:
-    """A request's speech positions stay below its context; a longer context would index past the table.
-
-    ``built_stage`` keeps vLLM's process groups up, which the backbone reads
-    when it is built.
-    """
+@pytest.mark.usefixtures("process_groups")
+def test_a_context_beyond_the_speech_position_table_is_refused(model_dir: str) -> None:
+    """A request's speech positions stay below its context; a longer context would index past the table."""
     context = ORIGINAL_SPEECH_POSITIONS + 1
     config = stage_vllm_config(
         model_dir, DEPLOY["original"], 0, max_model_len=context, max_num_batched_tokens=2 * context
@@ -129,13 +124,7 @@ def test_the_placeholder_prompt_is_as_long_as_its_embeddings(model, text_len):
     Nothing checks the two agree at run time, so they are pinned to each
     other here, through the request payload ``preprocess`` is handed.
     """
-    conditioning = VoiceConditioning(
-        cond_tokens=torch.randint(0, 6561, (1, 150)),
-        speaker_emb=torch.randn(1, 256),
-        prompt_token=torch.randint(0, 6561, (1, 250)),
-        prompt_feat=torch.randn(1, 500, 80),
-        embedding=torch.randn(1, 192),
-    )
+    conditioning = random_voice(150, 250)
     prompt = build_prompt([5] * text_len, conditioning, model.config, exaggeration=0.5, cfg_weight=0.5)
     info = prompt["additional_information"]
 
@@ -153,13 +142,7 @@ def test_the_placeholder_prompt_is_as_long_as_its_embeddings(model, text_len):
 @pytest.mark.parametrize("weight", [0.0, 0.5])
 def test_only_a_guided_original_prompt_is_expanded_with_an_unconditional_companion(weight):
     config = ChatterboxConfig("original")
-    voice = VoiceConditioning(
-        cond_tokens=torch.tensor([[1, 2]]),
-        speaker_emb=torch.ones(1, 256),
-        prompt_token=torch.tensor([[3, 4]]),
-        prompt_feat=torch.zeros(1, 4, 80),
-        embedding=torch.ones(1, 192),
-    )
+    voice = random_voice(2, 2)
     prompt = build_prompt([12, 13, 14], voice, config, exaggeration=0.7, cfg_weight=weight)
     assert prompt["prompt_token_ids"] == [6561] * 41
     info = prompt["additional_information"]

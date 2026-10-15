@@ -34,7 +34,7 @@ from vllm_omni.engine.stage_init_utils import (
 from vllm_omni.model_executor.models.chatterbox.chatterbox import ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import S3GenDecoder
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import HEAD_KEYS, ChatterboxT3ForConditionalGeneration
-from vllm_omni.model_executor.models.chatterbox.conditioning import TOKENIZER_BUFFERS
+from vllm_omni.model_executor.models.chatterbox.conditioning import TOKENIZER_BUFFERS, VoiceConditioning
 from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncConfig, VoiceEncoder
 from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
@@ -47,6 +47,22 @@ DEPLOY = {"turbo": "chatterbox_turbo.yaml", "original": "chatterbox.yaml"}
 LEFT_CONTEXT = 50
 # Stage 1's seed in the deploy files, which seeds its flow noise.
 SEED = 0
+
+
+def random_voice(cond_tokens: int, prompt_tokens: int) -> VoiceConditioning:
+    """A reference's conditioning with random values, drawn from the global generator.
+
+    Args:
+        cond_tokens: Stage 0's prompt tokens, at most the variant's ``cond_prompt_len``.
+        prompt_tokens: Stage 1's prompt tokens; its mel has two frames per token.
+    """
+    return VoiceConditioning(
+        cond_tokens=torch.randint(0, 6561, (1, cond_tokens)),
+        speaker_emb=torch.randn(1, 256),
+        prompt_token=torch.randint(0, 6561, (1, prompt_tokens)),
+        prompt_feat=torch.randn(1, 2 * prompt_tokens, 80),
+        embedding=torch.randn(1, 192),
+    )
 
 
 def write_model_dir(path: Path) -> str:

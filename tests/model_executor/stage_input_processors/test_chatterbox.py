@@ -24,6 +24,7 @@ from tests.model_executor.models.chatterbox.helpers import (
     DEPLOY,
     LEFT_CONTEXT,
     SEED,
+    random_voice,
     stage_vllm_config,
     write_model_dir,
 )
@@ -33,7 +34,7 @@ from vllm_omni.distributed.omni_connectors.connectors.shm_connector import Share
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME, S3GenDecoder
-from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
+from vllm_omni.model_executor.models.chatterbox.conditioning import build_prompt
 from vllm_omni.model_executor.stage_input_processors.chatterbox import t3_to_s3gen, t3_to_s3gen_async_chunk
 from vllm_omni.request import OmniRequest
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
@@ -50,14 +51,7 @@ DELIVERY_SECONDS = 10.0
 
 
 def request_prompt(prompt_tokens: int) -> dict:
-    conditioning = VoiceConditioning(
-        cond_tokens=torch.randint(0, 6561, (1, 375)),
-        speaker_emb=torch.randn(1, 256),
-        prompt_token=torch.randint(0, 6561, (1, prompt_tokens)),
-        prompt_feat=torch.randn(1, 2 * prompt_tokens, 80),
-        embedding=torch.randn(1, 192),
-    )
-    return build_prompt([5, 6, 7], conditioning, ChatterboxConfig())
+    return build_prompt([5, 6, 7], random_voice(375, prompt_tokens), ChatterboxConfig())
 
 
 def talker_output(token_ids: list[int], finished: bool = True) -> RequestOutput:
@@ -132,27 +126,15 @@ def test_an_utterance_with_no_speech_tokens_gets_no_stage_1_request() -> None:
 
 
 @pytest.fixture(scope="module")
-def model_dir(tmp_path_factory: pytest.TempPathFactory) -> str:
-    return write_model_dir(tmp_path_factory.mktemp("chatterbox"))
-
-
-@pytest.fixture(scope="module")
-def stage_configs(model_dir: str) -> list:
-    """Both stages' engine configs, from the deploy file."""
+def stage_configs(tmp_path_factory: pytest.TempPathFactory) -> list:
+    """Both stages' engine configs, from the deploy file, for a model directory of their own."""
+    model_dir = write_model_dir(tmp_path_factory.mktemp("chatterbox"))
     return [stage_vllm_config(model_dir, DEPLOY["turbo"], stage_id) for stage_id in (0, 1)]
 
 
 @pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
     return S3GenDecoder(ChatterboxConfig(), 2048, LEFT_CONTEXT, SEED).eval()
-
-
-@pytest.fixture(autouse=True)
-def no_stream_left_behind(request: pytest.FixtureRequest) -> Iterator[None]:
-    """A test that fails mid-stream must not leave its decoder state to the next one."""
-    yield
-    if "decoder" in request.fixturenames:
-        request.getfixturevalue("decoder").streams.clear()
 
 
 @pytest.fixture
@@ -568,7 +550,7 @@ def test_tokens_sampled_but_never_shown_are_an_error(plane: OmniRunnerDataPlane)
 
 
 @pytest.mark.parametrize("key", ["codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"])
-def test_a_deploy_file_without_a_chunk_setting_is_an_error(model_dir: str, key: str) -> None:
+def test_a_deploy_file_without_a_chunk_setting_is_an_error(stage_configs: list, key: str) -> None:
     """The schedule is the deploy file's; no setting has a default to fall back on.
 
     The deploy file lacks the setting, and stage 0's scheduler-side
@@ -577,7 +559,7 @@ def test_a_deploy_file_without_a_chunk_setting_is_an_error(model_dir: str, key: 
     deploy = modify_stage_config(
         get_deploy_config_path(DEPLOY["turbo"]), deletes={f"connectors.connector_of_shared_memory.extra.{key}": None}
     )
-    config = stage_vllm_config(model_dir, deploy, 0)
+    config = stage_vllm_config(stage_configs[0].model_config.model, deploy, 0)
     assert key not in config.model_config.stage_connector_config["extra"]
     adapter = OmniChunkTransferAdapter(config)
     request = stage0_request(request_prompt(250), f"external-{uuid.uuid4().hex}")

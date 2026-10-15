@@ -13,6 +13,7 @@ from tokenizers.models import WordLevel
 from torch import nn
 
 from tests.model_executor.models.chatterbox.helpers import (
+    random_voice,
     write_model_dir,
     write_s3gen_checkpoint,
     write_voice_encoder,
@@ -20,7 +21,6 @@ from tests.model_executor.models.chatterbox.helpers import (
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
     VoiceConditioner,
-    VoiceConditioning,
     build_prompt,
     load_text_tokenizer,
     normalize_loudness,
@@ -64,16 +64,6 @@ def tokenizer_calls(conditioner: VoiceConditioner) -> tuple[list[int], torch.uti
         calls.append(inputs[0].shape[0])
 
     return calls, conditioner.tokenizer.encoder.register_forward_pre_hook(encoder_input)
-
-
-def conditioning(cond_tokens: int, prompt_tokens: int) -> VoiceConditioning:
-    return VoiceConditioning(
-        cond_tokens=torch.randint(0, 6561, (1, cond_tokens)),
-        speaker_emb=torch.randn(1, 256),
-        prompt_token=torch.randint(0, 6561, (1, prompt_tokens)),
-        prompt_feat=torch.randn(1, 2 * prompt_tokens, 80),
-        embedding=torch.randn(1, 192),
-    )
 
 
 @pytest.mark.parametrize(
@@ -144,7 +134,7 @@ def test_build_prompt_follows_the_conditioning_length() -> None:
     """A clip shorter than the 15 s window gives fewer than 375 prompt tokens."""
     cfg = ChatterboxConfig()
     for cond_tokens in (150, 375):
-        prompt = build_prompt([5, 6, 7], conditioning(cond_tokens, 125), cfg)
+        prompt = build_prompt([5, 6, 7], random_voice(cond_tokens, 125), cfg)
         assert prompt["prompt_token_ids"] == [cfg.start_speech_token] * (1 + cond_tokens + 3 + 1)
         info = prompt["additional_information"]
         assert info["ids"]["prompt"] == [5, 6, 7]
@@ -153,7 +143,7 @@ def test_build_prompt_follows_the_conditioning_length() -> None:
 
 def test_additional_information_is_a_valid_stage_payload() -> None:
     """The keys must be ones the payload schema knows, or stage 1 rejects them."""
-    info = conditioning(375, 250).additional_information([1, 2, 3])
+    info = random_voice(375, 250).additional_information([1, 2, 3])
     payload = to_struct(info)
     assert payload.embed.speech_feat.shape == (1, 500, 80)
     assert payload.embed.voice.shape == (1, 256)
@@ -252,7 +242,7 @@ def test_a_refused_reference_leaves_the_rest_of_its_batch(conditioners: dict[str
 
 def test_original_prompt_rejects_text_beyond_learned_positions():
     with pytest.raises(ValueError, match="2048 text tokens"):
-        build_prompt([5] * 2049, conditioning(10, 125), ChatterboxConfig("original"))
+        build_prompt([5] * 2049, random_voice(10, 125), ChatterboxConfig("original"))
 
 
 @pytest.mark.parametrize("control", ["exaggeration", "cfg_weight"])
@@ -262,7 +252,7 @@ def test_original_prompt_rejects_invalid_guidance_controls(control: str, value: 
     with pytest.raises(ValueError, match=f"{control} must be a finite nonnegative number"):
         build_prompt(
             [5],
-            conditioning(10, 125),
+            random_voice(10, 125),
             ChatterboxConfig("original"),
             **{"exaggeration": 0.5, "cfg_weight": 0.5, control: value},
         )

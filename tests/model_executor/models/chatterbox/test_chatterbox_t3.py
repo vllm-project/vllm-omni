@@ -17,6 +17,7 @@ from tests.model_executor.models.chatterbox.helpers import (
     DEPLOY,
     build_stage,
     load_stage_weights,
+    random_voice,
     stage_vllm_config,
     t3_checkpoint,
     write_model_dir,
@@ -31,7 +32,7 @@ from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import (
     speech_logits,
     split_t3_weights,
 )
-from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
+from vllm_omni.model_executor.models.chatterbox.conditioning import build_prompt
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -139,13 +140,7 @@ def test_the_placeholder_prompt_is_as_long_as_its_embeddings(
     at run time, so the two are pinned to each other here, through the
     request payload ``preprocess`` is handed.
     """
-    conditioning = VoiceConditioning(
-        cond_tokens=torch.randint(0, 6561, (1, cond_len)),
-        speaker_emb=torch.randn(1, 256),
-        prompt_token=torch.randint(0, 6561, (1, 250)),
-        prompt_feat=torch.randn(1, 500, 80),
-        embedding=torch.randn(1, 192),
-    )
+    conditioning = random_voice(cond_len, 250)
     prompt = build_prompt(list(range(text_len)), conditioning, config)
     info = prompt["additional_information"]
 
@@ -259,18 +254,16 @@ def test_prefix_caching_is_refused_at_startup(model_dir: str, variant: str) -> N
         build_stage(config, "cpu")
 
 
+@pytest.mark.usefixtures("process_groups")
 @pytest.mark.parametrize("variant", ["turbo", "original"])
-def test_load_weights_fills_the_heads_and_names_every_parameter(
-    built_stage: Callable[[str, int], ChatterboxForConditionalGeneration], tmp_path: Path, variant: str
-) -> None:
+def test_load_weights_fills_the_heads_and_names_every_parameter(tmp_path: Path, variant: str) -> None:
     """vLLM's loader fails the load on a parameter the returned set does not name.
 
     The file is in the released layout: transformers' backbone under
     ``tfmr.``, the heads under the checkpoint's names, and the training-only
     ``text_head``. It loads through vLLM's loader into a stage built from the
     deploy file; the heads hold the file's values and so does the backbone,
-    in vLLM's own layout. ``built_stage`` keeps vLLM's process groups up,
-    which the backbone's loaders read.
+    in vLLM's own layout.
     """
     model_dir = write_model_dir(tmp_path)
     config = stage_vllm_config(model_dir, DEPLOY[variant], 0)

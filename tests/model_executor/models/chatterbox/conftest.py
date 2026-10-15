@@ -22,12 +22,20 @@ def model_dir(tmp_path_factory: pytest.TempPathFactory) -> str:
 
 
 @pytest.fixture(scope="module")
-def built_stage(model_dir: str) -> Iterator[Callable[[str, int], ChatterboxForConditionalGeneration]]:
+def process_groups() -> Iterator[None]:
+    """vLLM's process groups for one rank, which a backbone's parallel layers read when built and loaded."""
+    with model_parallel():
+        yield
+
+
+@pytest.fixture(scope="module")
+def built_stage(
+    model_dir: str, process_groups: None
+) -> Iterator[Callable[[str, int], ChatterboxForConditionalGeneration]]:
     """Build a checkpoint's stage on the CPU with its initial weights, once per module.
 
     The returned function takes the checkpoint (``turbo`` or ``original``)
-    and the stage id. vLLM's process groups stay up while the stages are in
-    use: their parallel layers read them when loading weights too.
+    and the stage id.
     """
     built: dict[tuple[str, int], ChatterboxForConditionalGeneration] = {}
 
@@ -37,7 +45,7 @@ def built_stage(model_dir: str) -> Iterator[Callable[[str, int], ChatterboxForCo
             built[variant, stage_id] = build_stage(config, "cpu").eval()
         return built[variant, stage_id]
 
-    with model_parallel(), pytest.MonkeyPatch.context() as patch:
+    with pytest.MonkeyPatch.context() as patch:
         # Original builds vLLM's V1 sampler, which otherwise asks the GPU
         # whether FlashInfer can sample; these stages run on the CPU.
         patch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")

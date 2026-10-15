@@ -12,14 +12,14 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine import EngineCoreRequest
 
-from tests.model_executor.models.chatterbox.helpers import DEPLOY, stage_vllm_config, write_model_dir
+from tests.model_executor.models.chatterbox.helpers import DEPLOY, random_voice, stage_vllm_config, write_model_dir
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
-from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
+from vllm_omni.model_executor.models.chatterbox.conditioning import build_prompt
 from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
@@ -51,13 +51,7 @@ def original_admission_engine(tmp_path: Path) -> Iterator[AsyncOmniEngine]:
 
 
 def original_admission_prompt(weight: float) -> dict:
-    voice = VoiceConditioning(
-        cond_tokens=torch.tensor([[1, 2]]),
-        speaker_emb=torch.ones(1, 256),
-        prompt_token=torch.tensor([[3, 4]]),
-        prompt_feat=torch.zeros(1, 4, 80),
-        embedding=torch.ones(1, 192),
-    )
+    voice = random_voice(2, 2)
     return build_prompt([12, 13, 14], voice, ChatterboxConfig("original"), exaggeration=0.5, cfg_weight=weight)
 
 

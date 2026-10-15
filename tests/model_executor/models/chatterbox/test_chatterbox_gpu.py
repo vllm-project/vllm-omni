@@ -36,6 +36,7 @@ from tests.model_executor.models.chatterbox.helpers import (
     SEED,
     build_stage,
     model_parallel,
+    random_voice,
     stage_vllm_config,
 )
 from vllm_omni.core.sched.output import OmniNewRequestData, OmniSchedulerOutput
@@ -43,7 +44,7 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxMRv2CFGSampler
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import S3GenDecoder
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import prefill_embeds
-from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
+from vllm_omni.model_executor.models.chatterbox.conditioning import build_prompt
 from vllm_omni.model_executor.stage_input_processors.chatterbox import (
     expand_original_cfg_prompts,
     prepare_original_prompt,
@@ -86,16 +87,6 @@ def runners(model_dir: str) -> Iterator[Callable[[str], Runner]]:
         yield runner
         for model_runner, _ in built.values():
             model_runner.shutdown()
-
-
-def voice(cond_tokens: int) -> VoiceConditioning:
-    return VoiceConditioning(
-        cond_tokens=torch.randint(0, 6561, (1, cond_tokens)),
-        speaker_emb=torch.randn(1, 256),
-        prompt_token=torch.randint(0, 6561, (1, 250)),
-        prompt_feat=torch.randn(1, 500, 80),
-        embedding=torch.randn(1, 192),
-    )
 
 
 def new_request(
@@ -174,7 +165,9 @@ def original_prompts(
     external_id: str, weight: float, params: SamplingParams | None = None
 ) -> list[tuple[dict, SamplingParams, str]]:
     """An Original request admitted as the engine admits it: with its companion when guided."""
-    prompt = build_prompt([12, 13, 14], voice(8), ChatterboxConfig("original"), exaggeration=0.5, cfg_weight=weight)
+    prompt = build_prompt(
+        [12, 13, 14], random_voice(8, 250), ChatterboxConfig("original"), exaggeration=0.5, cfg_weight=weight
+    )
     prompt["additional_information"]["global_request_id"] = [external_id]
     params = params or greedy()
     prepare_original_prompt(prompt, [params])
@@ -191,7 +184,7 @@ def stage0_request(variant: str, external_id: str) -> tuple[dict, SamplingParams
     """One unguided request of either checkpoint, admitted as the engine admits it."""
     if variant == "original":
         return original_prompts(external_id, 0.0)[0]
-    return build_prompt([5, 6, 7], voice(150), ChatterboxConfig()), greedy(), external_id
+    return build_prompt([5, 6, 7], random_voice(150, 250), ChatterboxConfig()), greedy(), external_id
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -244,7 +237,10 @@ def test_model_runner_v2_embeds_a_mixed_step_through_the_hooks(runners: Callable
     runner, config = runners("turbo")
     heads, t3 = runner.model.model.heads, runner.model.model.config
     torch.manual_seed(6)
-    prompts = {name: build_prompt([5, 6, 7], voice(cond), t3) for name, cond in zip("abcde", (150, 140, 130, 120, 110))}
+    prompts = {
+        name: build_prompt([5, 6, 7], random_voice(cond, 250), t3)
+        for name, cond in zip("abcde", (150, 140, 130, 120, 110))
+    }
     lengths = {name: len(prompt["prompt_token_ids"]) for name, prompt in prompts.items()}
     embeds: dict[str, torch.Tensor] = {}
 

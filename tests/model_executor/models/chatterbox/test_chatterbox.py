@@ -92,12 +92,9 @@ def test_the_runners_find_each_stages_hooks_on_the_registered_class(
         assert not hasattr(unified, name), name
 
 
-def test_the_stage_is_built_under_the_wrappers_prefix(model_dir: str, built_stage: BuiltStage) -> None:
-    """vLLM names every attention layer by its module path; the stage sits under ``model``.
-
-    ``built_stage`` keeps vLLM's process groups up, which the backbone reads
-    when it is built.
-    """
+@pytest.mark.usefixtures("process_groups")
+def test_the_stage_is_built_under_the_wrappers_prefix(model_dir: str) -> None:
+    """vLLM names every attention layer by its module path; the stage sits under ``model``."""
     config = stage_vllm_config(model_dir, DEPLOY["turbo"], 0)
 
     unified = build_stage(config, "cpu")

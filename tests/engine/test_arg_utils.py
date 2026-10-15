@@ -644,12 +644,13 @@ def test_config_less_chatterbox_directory_gets_a_config_written(tmp_path):
 
 # The Hub is a remote service: its answers for the Hub id (no config.json, or
 # one that exists but cannot be fetched) are stood in for here.
+def no_config(cls, model, **kwargs):
+    """The Hub's answer for a repository without a config.json."""
+    raise OSError("no config")
+
+
 def test_config_less_chatterbox_hub_id_gets_a_config_written(monkeypatch):
-    monkeypatch.setattr(
-        PretrainedConfig,
-        "get_config_dict",
-        classmethod(lambda cls, m, **kw: (_ for _ in ()).throw(OSError("no config"))),
-    )
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
     monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: False)
     args = chatterbox_args("ResembleAI/chatterbox-turbo")
     try:
@@ -683,9 +684,8 @@ def test_a_config_that_exists_but_fails_to_load_is_left_alone(tmp_path, model_ar
 
 
 def test_chatterbox_hub_config_that_exists_but_fails_to_load_is_left_alone(monkeypatch):
-    monkeypatch.setattr(
-        PretrainedConfig, "get_config_dict", classmethod(lambda cls, m, **kw: (_ for _ in ()).throw(OSError("gated")))
-    )
+    # The file exists but the Hub refuses it, as for a gated repository.
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
     monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: True)
     hub = chatterbox_args("ResembleAI/chatterbox-turbo")
     hub._patch_empty_hf_config("chatterbox")
