@@ -147,12 +147,6 @@ def stage_configs(model_dir: str) -> list:
 
 
 @pytest.fixture(scope="module")
-def connector_extra(stage_configs: list) -> dict:
-    """The deploy file's connector settings, which are the connector's config and the chunk processor's."""
-    return stage_configs[0].model_config.stage_connector_config["extra"]
-
-
-@pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
     return S3GenDecoder(ChatterboxConfig(), 2048, LEFT_CONTEXT, SEED).eval()
 
@@ -356,13 +350,21 @@ def test_streamed_chunks_decode_to_the_whole_utterance(
     assert decoder.streams == {}
 
 
+# Per reference length, the deploy file's hops (15, growing twice over to 60,
+# the first one padded to align the reference to 15) and the utterance
+# lengths up to 240 that end exactly the lookahead past a hop.
+SCHEDULES = {
+    250: ([20, 30, 60, 60, 60, 60], [23, 53, 113, 173, 233]),
+    202: ([23, 30, 60, 60, 60, 60], [26, 56, 116, 176, 236]),
+}
+
+
 @pytest.mark.parametrize("capped", [False, True], ids=["stop token", "length cap"])
 @pytest.mark.parametrize("prompt_tokens", [250, 202])
 def test_every_utterance_length_is_sent_once_and_finished_once(
     adapter: OmniChunkTransferAdapter,
     plane: OmniRunnerDataPlane,
     receiver: SharedMemoryConnector,
-    connector_extra: dict,
     prompt_tokens: int,
     capped: bool,
 ) -> None:
@@ -385,19 +387,8 @@ def test_every_utterance_length_is_sent_once_and_finished_once(
     sends one final chunk, the runner-side one has already sent that chunk
     as an ordinary one when it learns.
     """
-    chunk, lookahead = connector_extra["codec_chunk_frames"], ChatterboxConfig().pre_lookahead_len
-    # The first hop also pads the reference prompt to a multiple of the chunk; later hops double up to the cap.
-    hops = [chunk + -prompt_tokens % chunk]
-    while sum(hops) < 240:
-        hops.append(
-            min(
-                connector_extra["codec_max_chunk_frames"],
-                chunk * connector_extra["codec_stream_scale_factor"] ** len(hops),
-            )
-        )
-    # The deploy file's numbers: 15, growing twice over to 60, after the alignment.
-    assert hops[:5] == ([20, 30, 60, 60, 60] if prompt_tokens == 250 else [23, 30, 60, 60, 60])
-    boundaries = [sum(hops[:sent]) + lookahead for sent in range(1, len(hops)) if sum(hops[:sent]) + lookahead <= 240]
+    lookahead = ChatterboxConfig().pre_lookahead_len
+    hops, boundaries = SCHEDULES[prompt_tokens]
     prompt = request_prompt(prompt_tokens)
     tokens = torch.randint(0, 6561, (240,)).tolist()
 

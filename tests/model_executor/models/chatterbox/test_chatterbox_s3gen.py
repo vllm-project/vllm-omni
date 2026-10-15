@@ -40,32 +40,16 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-LOOKAHEAD = 3
-HOPS = [20, 30, 60]
+# (cumulative prefix length, token offset, finalize) per chunk: what the
+# chunk processor sends for 70 and for 140 tokens under the deploy file's
+# schedule and a 250-token reference (hops of 20, 30 and 60, each chunk but
+# the last three lookahead tokens past its hop).
+PLAN_70 = [(23, 0, False), (53, 20, False), (70, 50, True)]
+PLAN_140 = [(23, 0, False), (53, 20, False), (113, 50, False), (140, 110, True)]
 # Stage 1's context in the deploy file: the longest utterance a decoder is built for.
 CONTEXT = 2048
 # Batched against alone, CPU float32. Comparable models use 1e-5 on CPU.
 TOLERANCE = 1e-5
-
-
-def chunk_plan(total: int) -> list[tuple[int, int, bool]]:
-    """(cumulative prefix length, token offset, finalize) per chunk.
-
-    What the chunk processor emits for ``total`` tokens with the deploy
-    file's chunk sizes and a 250-token reference (first hop 20).
-    """
-    plan = []
-    emitted = 0
-    hops = iter(HOPS)
-    hop = next(hops)
-    while True:
-        needed = emitted + hop + LOOKAHEAD
-        if needed >= total:
-            plan.append((total, emitted, True))
-            return plan
-        plan.append((needed, emitted, False))
-        emitted += hop
-        hop = next(hops, 60)
 
 
 def reference(prompt_tokens: int) -> Reference:
@@ -210,7 +194,7 @@ def test_batch_rows_match_single_rows_with_different_references(
         (alone,) = flow_mels(
             decoder.flow, [tokens[i]], [refs[i]], [finalize[i]], 2, True, noise[i : i + 1, :, : 2 * lengths[i]]
         )
-        frames = 2 * tokens[i].numel() - (0 if finalize[i] else 2 * LOOKAHEAD)
+        frames = 2 * tokens[i].numel() - (0 if finalize[i] else 2 * decoder.config.pre_lookahead_len)
         assert batched[i].shape == alone.shape == (1, 80, frames)
         # Measured on CPU float32: at most 5.3e-6 on values up to 5.1.
         torch.testing.assert_close(batched[i], alone, atol=TOLERANCE, rtol=TOLERANCE)
@@ -346,7 +330,7 @@ def test_chunked_and_one_shot_agree_in_length(decoder: S3GenDecoder, references:
 
     pieces = []
     state: StreamState | None = None
-    for prefix, offset, finalize in chunk_plan(140):
+    for prefix, offset, finalize in PLAN_140:
         ((piece, state),) = decoder.chunked_decode_streaming(
             [Chunk(tokens[:prefix], offset, references[0], state, finalize)]
         )
@@ -375,14 +359,14 @@ def test_decode_step_keeps_state_until_the_stream_finishes(decoder: S3GenDecoder
 def decode_stream(
     decoder: S3GenDecoder, tokens: torch.Tensor, request_id: str, ref: Reference, later: Reference | None
 ) -> list[torch.Tensor]:
-    """One request's chunks through ``decode_step``, one step each.
+    """One request's 70 tokens through ``decode_step`` in ``PLAN_70``'s chunks, one step each.
 
     The first chunk's payload carries ``ref``, every later one ``later``
     (or no voice). The vocoder's own draw is pinned per chunk, so two
     decodes of the same stream can be compared sample for sample.
     """
     pieces = []
-    for step, (prefix, offset, finalize) in enumerate(chunk_plan(tokens.numel())):
+    for step, (prefix, offset, finalize) in enumerate(PLAN_70):
         torch.manual_seed(step)
         voice = ref if offset == 0 else later
         (piece,) = decoder.decode_step(
@@ -402,7 +386,6 @@ def test_the_voice_arrives_once_and_is_kept_for_the_stream(decoder: S3GenDecoder
     comparison: there the later payloads hold a different voice.
     """
     tokens = torch.randint(0, 6561, (70,))
-    assert [offset for _, offset, _ in chunk_plan(70)] == [0, 20, 50]
 
     once = decode_stream(decoder, tokens, "once", references[0], later=None)
     other_later = decode_stream(decoder, tokens, "other-later", references[0], later=references[1])
@@ -422,7 +405,7 @@ def test_interleaved_streams_keep_their_own_voices(decoder: S3GenDecoder, refere
     alone = [decode_stream(decoder, row, "alone", ref, None) for row, ref in zip(tokens, references, strict=True)]
 
     interleaved: list[list[torch.Tensor]] = [[], []]
-    for step, (prefix, offset, finalize) in enumerate(chunk_plan(70)):
+    for step, (prefix, offset, finalize) in enumerate(PLAN_70):
         for stream in (0, 1):
             torch.manual_seed(step)
             voice = references[stream] if offset == 0 else None
@@ -607,7 +590,7 @@ def test_chunked_mel_is_closer_to_one_chunk_than_a_noise_redraw(
     stitched = torch.cat(
         [
             decoder.chunk_mels([Chunk(tokens[:prefix], offset, references[0], None, finalize)])[0]
-            for prefix, offset, finalize in chunk_plan(140)
+            for prefix, offset, finalize in PLAN_140
         ],
         dim=2,
     )
@@ -631,7 +614,7 @@ def test_a_non_final_chunk_shorter_than_the_mel_cache_is_refused(
     decoder: S3GenDecoder, references: list[Reference]
 ) -> None:
     """Three new tokens are six mel frames, and the cross-fade caches eight."""
-    tokens = torch.randint(0, 6561, (3 + LOOKAHEAD,))
+    tokens = torch.randint(0, 6561, (3 + decoder.config.pre_lookahead_len,))
     with pytest.raises(RuntimeError, match="codec_chunk_frames must be at least 4"):
         decoder.chunked_decode_streaming([Chunk(tokens, 0, references[0], None, False)])
 

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import importlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -10,6 +9,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine import EngineCoreRequest
 
 from tests.model_executor.models.chatterbox.helpers import DEPLOY, stage_vllm_config, write_model_dir
@@ -45,8 +45,7 @@ def original_admission_engine(tmp_path: Path) -> Iterator[AsyncOmniEngine]:
     )
     engine.request_queue = janus.Queue()
     for name in ("prompt_transform_func", "prompt_expand_func"):
-        module, function = getattr(CHATTERBOX_ORIGINAL_PIPELINE.stages[0], name).rsplit(".", 1)
-        setattr(engine, name, getattr(importlib.import_module(module), function))
+        setattr(engine, name, resolve_obj_by_qualname(getattr(CHATTERBOX_ORIGINAL_PIPELINE.stages[0], name)))
     yield engine
     engine.request_queue.close()
 

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-import importlib
 from pathlib import Path
 
 import pytest
 import yaml
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.config_factory import StageConfigFactory
@@ -61,14 +61,6 @@ def test_stage_topology() -> None:
     assert decoder.retains_state_across_chunks is False
 
 
-def resolve(path: str | None) -> object:
-    """The function a processor path names, or None for no path."""
-    if path is None:
-        return None
-    module, _, function = path.rpartition(".")
-    return getattr(importlib.import_module(module), function)
-
-
 @pytest.mark.parametrize(
     ("filename", "pipeline"),
     [("chatterbox_turbo.yaml", CHATTERBOX_TURBO_PIPELINE), ("chatterbox.yaml", CHATTERBOX_ORIGINAL_PIPELINE)],
@@ -90,10 +82,13 @@ def test_each_mode_gets_its_own_stage_handoff(filename: str, pipeline: PipelineC
 
     assert [talker.yaml_engine_args["async_chunk"], decoder.yaml_engine_args["async_chunk"]] == [async_chunk] * 2
     handoff = (
-        resolve(talker.yaml_engine_args.get("custom_process_next_stage_input_func")),
-        resolve(decoder.custom_process_input_func),
+        talker.yaml_engine_args.get("custom_process_next_stage_input_func"),
+        decoder.custom_process_input_func,
     )
-    assert handoff == ((t3_to_s3gen_async_chunk, None) if async_chunk else (None, t3_to_s3gen))
+    if async_chunk:
+        assert handoff[1] is None and resolve_obj_by_qualname(handoff[0]) is t3_to_s3gen_async_chunk
+    else:
+        assert handoff[0] is None and resolve_obj_by_qualname(handoff[1]) is t3_to_s3gen
 
 
 def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
