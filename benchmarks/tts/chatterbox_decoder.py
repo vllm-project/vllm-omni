@@ -19,6 +19,7 @@ import torch
 from safetensors.torch import load_file
 from tqdm import tqdm
 
+from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import (
     REFERENCE_ENCODER_PREFIXES,
     Chunk,
@@ -28,6 +29,7 @@ from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import (
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
+DEPLOY_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "deploy"
 BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
 REPEATS = 5
 WARMUPS = 2
@@ -61,7 +63,15 @@ def main():
         flow_dtype="bfloat16" if args.bf16_flow else "float32",
         flow_attention_backend="cudnn" if args.cudnn_attention else "auto",
     )
-    decoder = S3GenDecoder(config, 2048).eval()
+    # Stage 1 as the variant's deploy file sizes it.
+    deploy = resolve_deploy_yaml(
+        DEPLOY_DIR / ("chatterbox_turbo.yaml" if args.variant == "turbo" else "chatterbox.yaml")
+    )
+    decoder = S3GenDecoder(
+        config,
+        deploy["stages"][1]["max_model_len"],
+        deploy["connectors"]["connector_of_shared_memory"]["extra"]["codec_left_context_frames"],
+    ).eval()
     weights = load_file(str(args.model / config.s3gen_weights))
     decoder.load_state_dict(
         {name: value for name, value in weights.items() if not name.startswith(REFERENCE_ENCODER_PREFIXES)},

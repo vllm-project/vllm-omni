@@ -103,10 +103,15 @@ def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
 
     assert deploy["pipeline"] == "chatterbox_turbo"
     assert deploy["async_chunk"] is True
-    # The chunk processor reads exactly these three and has no default for
-    # any. The flow's lookahead is not among them: the processor takes it
-    # from the model config, where the decoder takes it.
-    assert set(extra) == {"codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"}
+    # The chunk processor reads the first three and stage 1 the fourth; none
+    # has a default. The flow's lookahead is not among them: the processor
+    # takes it from the model config, where the decoder takes it.
+    assert set(extra) == {
+        "codec_chunk_frames",
+        "codec_max_chunk_frames",
+        "codec_stream_scale_factor",
+        "codec_left_context_frames",
+    }
     # Upstream's ``ChatterboxTurboTTS.generate`` defaults (0.1.7), kept as a
     # record of them; the output cap is the model's.
     assert talker["default_sampling_params"] == {

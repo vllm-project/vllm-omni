@@ -43,6 +43,8 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 CONFIG_JSON = {"model_type": "chatterbox", "architectures": ["ChatterboxForConditionalGeneration"]}
 # Each checkpoint's own deploy file.
 DEPLOY = {"turbo": "chatterbox_turbo.yaml", "original": "chatterbox.yaml"}
+# Played tokens stage 1 decodes a chunk with, as the deploy files set ``codec_left_context_frames``.
+LEFT_CONTEXT = 50
 
 
 def write_model_dir(path: Path) -> str:
@@ -183,7 +185,7 @@ def write_s3gen_checkpoint(model_dir: str, config: ChatterboxConfig, seed: int) 
     from s3tokenizer.model_v2 import S3TokenizerV2
 
     torch.manual_seed(seed)
-    decoder = S3GenDecoder(config, config.max_new_tokens).state_dict()
+    decoder = S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT).state_dict()
     tokenizer = S3TokenizerV2(config.s3_tokenizer_name).state_dict()
     speaker_encoder = CAMPPlus(feat_dim=80, embedding_size=192, memory_efficient=False).state_dict()
     buffers = dict(zip(TOKENIZER_BUFFERS, (torch.zeros(128, 201), torch.hann_window(400)), strict=True))

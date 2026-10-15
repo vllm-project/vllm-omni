@@ -15,10 +15,11 @@ streaming branch sizes the decoder mask from the uncropped encoder length.
 mask built from its own cropped length.
 
 Seams follow CosyVoice 2's ``token2wav``. A chunk is decoded from the last
-``LEFT_CONTEXT_TOKENS`` of context plus its own tokens, the frames before the
-offset are dropped, the previous chunk's last eight mel frames are vocoded
-again, and the overlap is cross-faded with a Hamming window. Bounding the
-context keeps a chunk's cost constant instead of growing with the sentence.
+``codec_left_context_frames`` tokens of context (the deploy file's connector
+setting) plus its own tokens, the frames before the offset are dropped, the
+previous chunk's last eight mel frames are vocoded again, and the overlap is
+cross-faded with a Hamming window. Bounding the context keeps a chunk's cost
+constant instead of growing with the sentence.
 
 The flow attends over its whole input, so a frame's mel depends on the
 tokens decoded with it and on the noise the flow starts from. Upstream draws
@@ -65,8 +66,6 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig, va
 MEL_CACHE_FRAMES = 8
 SAMPLES_PER_FRAME = 480
 SOURCE_CACHE_SAMPLES = MEL_CACHE_FRAMES * SAMPLES_PER_FRAME
-# Tokens of already-played context a chunk is decoded with (two seconds).
-LEFT_CONTEXT_TOKENS = 50
 # Seed of the flow-noise buffer: fixed, so every process draws the same one.
 NOISE_SEED = 0
 # The checkpoint also holds the reference encoders, which run in the API
@@ -126,17 +125,18 @@ class Chunk:
     finalize: bool
 
 
-def window(tokens: torch.Tensor, token_offset: int) -> tuple[torch.Tensor, int]:
-    """Keep the last ``LEFT_CONTEXT_TOKENS`` played tokens and what follows.
+def window(tokens: torch.Tensor, token_offset: int, left_context: int) -> tuple[torch.Tensor, int]:
+    """Keep the last ``left_context`` played tokens and what follows.
 
     Args:
         tokens: Shape (N,), every valid token so far.
         token_offset: Tokens already played.
+        left_context: Played tokens a chunk is decoded with.
 
     Returns:
         The kept tokens and the offset of the first new token within them.
     """
-    start = max(0, token_offset - LEFT_CONTEXT_TOKENS)
+    start = max(0, token_offset - left_context)
     return tokens[start:], token_offset - start
 
 
@@ -245,16 +245,19 @@ class S3GenDecoder(nn.Module):
         max_utterance_tokens: The longest utterance the decoder will be
             handed, in speech tokens: the stage's context length. The noise
             buffer covers it, so no utterance runs past the buffer.
+        left_context_tokens: Played tokens each chunk is decoded with again;
+            bounding them keeps a chunk's cost constant.
 
     Raises:
         ValueError: If the config's flow precision and attention backend are
             not a pair the decoder runs, see ``validate_flow_settings``.
     """
 
-    def __init__(self, config: ChatterboxConfig, max_utterance_tokens: int) -> None:
+    def __init__(self, config: ChatterboxConfig, max_utterance_tokens: int, left_context_tokens: int) -> None:
         super().__init__()
         validate_flow_settings(config.flow_dtype, config.flow_attention_backend)
         self.config = config
+        self.left_context_tokens = left_context_tokens
         # The architecture ``S3Token2Mel`` and ``S3Token2Wav`` build (0.1.7).
         encoder = UpsampleConformerEncoder(
             output_size=512,
@@ -393,7 +396,7 @@ class S3GenDecoder(nn.Module):
         offsets: list[int] = []
         noise: list[torch.Tensor] = []
         for chunk in chunks:
-            kept, offset = window(chunk.tokens, chunk.token_offset)
+            kept, offset = window(chunk.tokens, chunk.token_offset, self.left_context_tokens)
             new_frames = (kept.numel() - offset - self.config.pre_lookahead_len) * ratio
             if not chunk.finalize and new_frames < MEL_CACHE_FRAMES:
                 raise RuntimeError(
@@ -604,12 +607,14 @@ class ChatterboxS3Gen(S3GenDecoder):
 
     Args:
         vllm_config: The engine's config; its ``hf_config`` is the
-            checkpoint's ``ChatterboxConfig``.
+            checkpoint's ``ChatterboxConfig`` and its connector's ``extra``
+            holds ``codec_left_context_frames``.
         prefix: vLLM's module prefix, unused: the stage is the root module.
 
     Raises:
         ValueError: If one step's token budget cannot hold every slot's
             longest utterance.
+        KeyError: If the deploy file's connector lacks ``codec_left_context_frames``.
     """
 
     # Without this the runner discards OmniOutput.multimodal_outputs.
@@ -644,7 +649,10 @@ class ChatterboxS3Gen(S3GenDecoder):
                 f"max_model_len ({max_model_len}) = {needed}, got {budget}: an utterance scheduled in part "
                 "would be decoded as a whole one"
             )
-        super().__init__(config, max_model_len)
+        # The deploy file's connector settings; the chunk processor reads the
+        # same section for its schedule.
+        connector = vllm_config.model_config.stage_connector_config["extra"]
+        super().__init__(config, max_model_len, connector["codec_left_context_frames"])
         # The repo holds other checkpoints too; this stage loads its own.
         self.allow_patterns_overrides = [config.s3gen_weights]
 

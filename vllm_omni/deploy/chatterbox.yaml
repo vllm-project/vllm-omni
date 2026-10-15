@@ -12,6 +12,8 @@ connectors:
       codec_chunk_frames: 15
       codec_max_chunk_frames: 60
       codec_stream_scale_factor: 2
+      # Played tokens stage 1 decodes each chunk with again (two seconds).
+      codec_left_context_frames: 50
 stages:
   - stage_id: 0
     hf_overrides:

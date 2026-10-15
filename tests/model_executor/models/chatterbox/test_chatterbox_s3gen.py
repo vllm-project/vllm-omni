@@ -11,9 +11,10 @@ import yaml
 from torch import nn
 from vllm.sampling_params import SamplingParams
 
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from tests.model_executor.models.chatterbox.helpers import (
     DEPLOY,
+    LEFT_CONTEXT,
     build_stage,
     load_stage_weights,
     stage_vllm_config,
@@ -23,7 +24,6 @@ from tests.model_executor.models.chatterbox.helpers import (
 from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.model_executor.models.chatterbox.chatterbox import ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import (
-    LEFT_CONTEXT_TOKENS,
     SAMPLES_PER_FRAME,
     SOURCE_CACHE_SAMPLES,
     ChatterboxS3Gen,
@@ -104,7 +104,7 @@ def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
 def decoder() -> S3GenDecoder:
     """A float32 flow: the value-level checks below compare float32 computations."""
     torch.manual_seed(0)
-    return S3GenDecoder(ChatterboxConfig(flow_dtype="float32"), CONTEXT).eval()
+    return S3GenDecoder(ChatterboxConfig(flow_dtype="float32"), CONTEXT, LEFT_CONTEXT).eval()
 
 
 @pytest.fixture(autouse=True)
@@ -140,7 +140,7 @@ def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder: S3GenDecoder)
     The decoder is built from the default config, whose flow runs in
     bfloat16, with the float32 decoder's weights.
     """
-    bf16 = S3GenDecoder(ChatterboxConfig(), CONTEXT).eval()
+    bf16 = S3GenDecoder(ChatterboxConfig(), CONTEXT, LEFT_CONTEXT).eval()
     bf16.load_state_dict(decoder.state_dict())
     flow_dtypes, vocoder_dtypes = [], []
 
@@ -180,10 +180,10 @@ def test_cudnn_attention_rejects_cpu_execution(model_dir: str) -> None:
 
 def test_window_keeps_the_left_context_and_rebases_the_offset() -> None:
     tokens = torch.arange(200)
-    kept, offset = window(tokens, 120)
-    assert torch.equal(kept, tokens[120 - LEFT_CONTEXT_TOKENS :])
-    assert offset == LEFT_CONTEXT_TOKENS
-    kept, offset = window(tokens, 10)
+    kept, offset = window(tokens, 120, LEFT_CONTEXT)
+    assert torch.equal(kept, tokens[120 - LEFT_CONTEXT :])
+    assert offset == LEFT_CONTEXT
+    kept, offset = window(tokens, 10, LEFT_CONTEXT)
     assert torch.equal(kept, tokens)
     assert offset == 10
 
@@ -589,7 +589,7 @@ def test_noise_is_taken_by_position_for_every_prompt_length(decoder: S3GenDecode
                 dim=2,
             )
             (whole,) = flow_mels(decoder.flow, [kept], [ref], [False], 2, True, noise)
-            return whole[:, :, 2 * LEFT_CONTEXT_TOKENS :]
+            return whole[:, :, 2 * LEFT_CONTEXT :]
 
         assert torch.equal(mel, decoded_from(start))
         # Not vacuous: the same row placed at the start of the utterance differs.
@@ -644,8 +644,8 @@ def test_a_longer_context_keeps_the_noise_of_the_default_cap():
     it has always been.
     """
     config = ChatterboxConfig()
-    capped = S3GenDecoder(config, config.max_new_tokens).flow_noise
-    longer = S3GenDecoder(config, CONTEXT).flow_noise
+    capped = S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT).flow_noise
+    longer = S3GenDecoder(config, CONTEXT, LEFT_CONTEXT).flow_noise
 
     frames = 2 * (250 + config.max_new_tokens + config.n_silence_tokens)
     assert capped.shape == (1, 80, frames)
@@ -653,7 +653,7 @@ def test_a_longer_context_keeps_the_noise_of_the_default_cap():
     assert longer.shape == (1, 80, 2 * (250 + CONTEXT + config.n_silence_tokens))
     assert torch.equal(longer[:, :, :frames], capped)
     # A context under the cap still gets the capped buffer.
-    assert torch.equal(S3GenDecoder(config, 300).flow_noise, capped)
+    assert torch.equal(S3GenDecoder(config, 300, LEFT_CONTEXT).flow_noise, capped)
 
 
 def test_an_utterance_at_the_context_limit_has_noise_for_its_last_frame(
@@ -665,9 +665,9 @@ def test_an_utterance_at_the_context_limit_has_noise_for_its_last_frame(
     and that chunk would no longer decode the same way twice.
     """
     tokens = torch.randint(0, 6561, (CONTEXT,))
-    kept = torch.cat([tokens[CONTEXT - 48 - LEFT_CONTEXT_TOKENS :], decoder.silence])
+    kept = torch.cat([tokens[CONTEXT - 48 - LEFT_CONTEXT :], decoder.silence])
     prompt = 2 * references[0].prompt_token.shape[1]
-    start = decoder.prompt_noise_frames + 2 * (CONTEXT - 48 - LEFT_CONTEXT_TOKENS)
+    start = decoder.prompt_noise_frames + 2 * (CONTEXT - 48 - LEFT_CONTEXT)
     assert start + 2 * kept.numel() == decoder.flow_noise.shape[2]
 
     (mel,) = decoder.chunk_mels([Chunk(tokens, CONTEXT - 48, references[0], None, True)])
@@ -675,7 +675,7 @@ def test_an_utterance_at_the_context_limit_has_noise_for_its_last_frame(
     noise = torch.cat([decoder.flow_noise[:, :, :prompt], decoder.flow_noise[:, :, start:]], dim=2)
     (whole,) = flow_mels(decoder.flow, [kept], [references[0]], [True], 2, True, noise)
     assert mel.shape == (1, 80, 2 * (48 + 3))
-    assert torch.equal(mel, whole[:, :, 2 * LEFT_CONTEXT_TOKENS :])
+    assert torch.equal(mel, whole[:, :, 2 * LEFT_CONTEXT :])
 
 
 @pytest.mark.parametrize("length", [1, 2, 3])
@@ -841,6 +841,22 @@ def test_the_stage_builds_with_the_deploy_files_budget(stage: ChatterboxS3Gen, d
     """The deploy file passes the startup check, and every process draws the same flow noise."""
     assert stage.allow_patterns_overrides == [ChatterboxConfig().s3gen_weights]
     assert torch.equal(stage.flow_noise, decoder.flow_noise)
+
+
+def test_the_stage_takes_its_left_context_from_the_deploy_files_connector(model_dir: str) -> None:
+    """``codec_left_context_frames`` is the connector's, like the chunk processor's schedule; it has no default."""
+    deploy = modify_stage_config(
+        get_deploy_config_path(DEPLOY["turbo"]),
+        updates={"connectors.connector_of_shared_memory.extra.codec_left_context_frames": 7},
+    )
+    assert build_stage(stage_vllm_config(model_dir, deploy, 1), "cpu").left_context_tokens == 7
+
+    deploy = modify_stage_config(
+        get_deploy_config_path(DEPLOY["turbo"]),
+        deletes={"connectors.connector_of_shared_memory.extra.codec_left_context_frames": None},
+    )
+    with pytest.raises(KeyError, match="codec_left_context_frames"):
+        build_stage(stage_vllm_config(model_dir, deploy, 1), "cpu")
 
 
 def test_forward_returns_each_requests_new_audio_and_rate(stage: ChatterboxS3Gen, references: list[Reference]) -> None:

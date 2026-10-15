@@ -29,8 +29,8 @@
 # reference prompt to 15 (20 for a ten-second reference), then 30, then 60;
 # every chunk waits for the flow's 3-token lookahead, which is the model's
 # and not a setting. Smaller chunks start audio sooner and cost more flow
-# work. Stage 1 decodes each chunk from a fixed 50-token left context of its
-# own, so no left-context key is set here.
+# work. Stage 1 decodes each chunk with the last codec_left_context_frames
+# tokens already played, which keeps a chunk's cost constant.
 #
 # Sized on one 24 GB card (see the recipe for the measurements). TUNE PER
 # GPU: on a slower card lower max_num_seqs before raising the chunk size.
@@ -44,6 +44,8 @@ connectors:
       codec_chunk_frames: 15
       codec_max_chunk_frames: 60
       codec_stream_scale_factor: 2
+      # Played tokens stage 1 decodes each chunk with again (two seconds).
+      codec_left_context_frames: 50
 
 stages:
   - stage_id: 0
