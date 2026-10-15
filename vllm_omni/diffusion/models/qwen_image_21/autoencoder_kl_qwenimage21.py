@@ -1164,6 +1164,8 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         super().__init__()
 
         self.z_dim = z_dim
+        # Runtime opt-in; temporal and tiled decoding retain their cache path.
+        self.skip_single_frame_cache = False
         self.temperal_downsample = temperal_downsample
         self.temporal_upsample = temperal_downsample[::-1]
 
@@ -1354,7 +1356,10 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 self._conv_idx = [0]
                 if i == 0:
                     out = self.decoder(
-                        x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=True
+                        x[:, :, i : i + 1, :, :],
+                        feat_cache=None if self.skip_single_frame_cache and num_frame == 1 else self._feat_map,
+                        feat_idx=self._conv_idx,
+                        first_chunk=True,
                     )
                 else:
                     out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)

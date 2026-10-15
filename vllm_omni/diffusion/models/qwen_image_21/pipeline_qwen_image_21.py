@@ -333,6 +333,9 @@ class QwenImage21Pipeline(
     ):
         super().__init__()
         self.od_config = od_config
+        skip_single_frame_cache = (od_config.additional_config or {}).get("qwen21_skip_single_frame_vae_cache", False)
+        if not isinstance(skip_single_frame_cache, bool):
+            raise ValueError("qwen21_skip_single_frame_vae_cache must be a bool")
         self.parallel_config = od_config.parallel_config
         # Model-level sampling grid from model_index.json (diffusers PR
         # 14950): when the request carries no explicit sigmas, this grid
@@ -410,6 +413,7 @@ class QwenImage21Pipeline(
             prefetch_list=qwen_subfolders,
             local_files_only=local_files_only,
         ).to(self.device)
+        self.vae.skip_single_frame_cache = skip_single_frame_cache
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImage21Transformer2DModel)
         self.transformer = QwenImage21Transformer2DModel(
             od_config=od_config,

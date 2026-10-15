@@ -16,6 +16,9 @@
 
 ## When to use this recipe
 
+The optional [single-frame VAE cache setting](../../docs/user_guide/diffusion/qwen_image_21_single_frame_vae.md)
+avoids unused temporal cache copies in untiled decode. It defaults to disabled.
+
 Use this recipe as a starting point for running `Qwen/Qwen-Image-2.1`. A single
 pipeline class, `QwenImage21Pipeline`, handles both pure text-to-image requests
 (no condition image) and image-conditioned requests with up to 4 condition
