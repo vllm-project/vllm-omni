@@ -146,6 +146,7 @@ def make_backend(args):
     import yaml
 
     from vllm_omni import Omni
+    from vllm_omni.entrypoints.openai.tts_adapters.chatterbox import CONTROLS
     from vllm_omni.model_executor.models.chatterbox.conditioning import (
         VoiceConditioner,
         VoiceConditioning,
@@ -166,6 +167,10 @@ def make_backend(args):
         / ("chatterbox_turbo.yaml" if args.variant == "turbo" else "chatterbox.yaml")
     )
     settings = yaml.safe_load(deploy.read_text())
+    # Original's controls come from stage 0's additional_config, as the serving adapter reads them.
+    controls = (
+        {} if args.variant == "turbo" else {name: settings["stages"][0]["additional_config"][name] for name in CONTROLS}
+    )
     settings["async_chunk"] = False
     settings["model_runner"] = args.runner
     for stage in settings["stages"]:
@@ -188,8 +193,7 @@ def make_backend(args):
             wav, rate = sf.read(reference, dtype="float32", always_2d=True)
             voice = conditioner.prepare(wav.mean(axis=1), rate)
         ids = tokenize_text(text, tokenizer, args.variant)
-        # Original's controls come from stage 0's additional_config, as serving reads them.
-        prompt = build_prompt(ids, voice, config, **settings["stages"][0].get("additional_config", {}))
+        prompt = build_prompt(ids, voice, config, **controls)
         sampling = engine.default_sampling_params_list[0].clone()
         sampling.seed = seed
         params = [sampling, *engine.default_sampling_params_list[1:]]

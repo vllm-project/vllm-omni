@@ -6,6 +6,8 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.config.stage_config import resolve_deploy_yaml
+from vllm_omni.entrypoints.openai.tts_adapters.chatterbox import CONTROLS
 from vllm_omni.model_executor.models.chatterbox.conditioning import (
     VoiceConditioning,
     build_prompt,
@@ -40,8 +42,9 @@ def test_text_to_audio_001(omni_runner, offline_client):
     tokenizer = load_text_tokenizer(model, variant)
     text_ids = [tokenize_text(text, tokenizer, variant) for text in texts]
     voice = VoiceConditioning.from_builtin(model)
-    # Upstream's defaults for Original's controls, as its deploy file sets them for serving.
-    controls = {"exaggeration": 0.5, "cfg_weight": 0.5} if variant == "original" else {}
+    # Original's controls as its deploy file sets them for serving.
+    additional_config = resolve_deploy_yaml(get_deploy_config_path("chatterbox.yaml"))["stages"][0]["additional_config"]
+    controls = {name: additional_config[name] for name in CONTROLS} if variant == "original" else {}
     prompts = [build_prompt(ids, voice, ChatterboxConfig(variant), **controls) for ids in text_ids]
     offline_client.send_tokenized_tts_request(
         {
