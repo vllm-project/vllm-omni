@@ -433,6 +433,7 @@ class HunYuanDecoderLayer(nn.Module):
         prefix: str = "",
         layer_id: int = -1,
         enable_eplb: bool = False,
+        moe_cls: type[HunYuanSparseMoeBlock] = HunYuanSparseMoeBlock,
     ) -> None:
         super().__init__()
         assert layer_id >= 0
@@ -479,7 +480,7 @@ class HunYuanDecoderLayer(nn.Module):
             raise RuntimeError(f"Unsupported attention type: {attention_type}")
 
         if _is_moe(config):
-            self.mlp = HunYuanSparseMoeBlock(
+            self.mlp = moe_cls(
                 config=config,
                 quant_config=quant_config,
                 layer_id=layer_id,
@@ -535,7 +536,13 @@ class HunYuanDecoderLayer(nn.Module):
     }
 )
 class HunYuanModel(nn.Module, EagleModelMixin):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        moe_cls: type[HunYuanSparseMoeBlock] = HunYuanSparseMoeBlock,
+    ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -568,6 +575,7 @@ class HunYuanModel(nn.Module, EagleModelMixin):
                 quant_config=quant_config,
                 prefix=prefix,
                 enable_eplb=enable_eplb,
+                moe_cls=moe_cls,
             ),
             prefix=f"{prefix}.layers",
         )

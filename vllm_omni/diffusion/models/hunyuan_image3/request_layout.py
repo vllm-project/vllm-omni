@@ -401,6 +401,11 @@ def build_hunyuan_diffusion_kv_requests(
     if any(boundary is not None for boundary in uncond_boundaries):
         for sequence_id in range(1, cfg_factor):
             reusable_lens[sequence_id] = min(reusable_lens[0], uncond_boundaries[sequence_id] or 0)
+    params = request.kv_transfer_params
+    if params is not None and "token_ids" in params and not any(tokenizer_output.joint_image_slices or ()):
+        # NIXL checks exact token IDs before reusing this stable text prefix.
+        # A CoT terminator is not required for ordinary text-to-image prompts.
+        reusable_lens = [int(row[-1].item()) for row in prefix_positions]
     return tuple(
         DiffusionKVRequest(
             f"{request.request_id}/diffusion-kv/{sequence_id}",
