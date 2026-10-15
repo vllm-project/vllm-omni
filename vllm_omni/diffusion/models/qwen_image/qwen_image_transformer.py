@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -48,21 +48,21 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+)
+from vllm_omni.diffusion.layers.qwen_select01_modulation import (
+    can_use_qwen_select01_triton,
+    fused_layernorm_select01,
+    fused_residual_layernorm_select01,
+    select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
-
-def _apply_qwen_image_rotary_emb(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Rotate interleaved pairs before rounding back to the activation dtype.
-
-    Qwen-Image's reference uses complex FP32 multiplication. Rounding the
-    frequencies to BF16 before rotation loses positional precision; those
-    errors accumulate across the denoising steps.
-    """
-    paired = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(paired * freqs.unsqueeze(1)).flatten(3).to(x.dtype)
+# Fuse only when B*S >= this; below it host launch overhead dominates (#7780).
+# Override: VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS (0 = always fuse).
+_FUSED_MIN_TOKENS = 2048
 
 
 def _qwen_image_qk_norm_rope(
@@ -78,14 +78,19 @@ def _qwen_image_qk_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = q.shape[-1]
     rotary_dim = freqs.shape[-1] * 2
-    if use_fused and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True):
-        batch, seq_len, num_heads, _ = q.shape
+    batch, seq_len, num_heads, _ = q.shape
+    tokens = batch * seq_len
+    if (
+        use_fused
+        and tokens >= fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
+        and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True)
+    ):
         num_kv_heads = k.shape[2]
         rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
-        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(batch * seq_len, rotary_dim)
+        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
         fused_q, fused_k = fused_qk_norm_rope(
-            q.reshape(batch * seq_len, num_heads, head_dim),
-            k.reshape(batch * seq_len, num_kv_heads, head_dim),
+            q.reshape(tokens, num_heads, head_dim),
+            k.reshape(tokens, num_kv_heads, head_dim),
             norm_q.weight,
             norm_k.weight,
             rope_table,
@@ -97,16 +102,11 @@ def _qwen_image_qk_norm_rope(
             fused_k.reshape(batch, seq_len, num_kv_heads, head_dim),
         )
 
+    # Eager path: BF16/activation-dtype RotaryEmbedding on every device.
+    # CUDA used to call FP32 complex multiply here; that matches the Diffusers
+    # helper in unit tests but drops Omni vs Diffusers pipeline PSNR (#7494).
     q = norm_q(q)
     k = norm_k(k)
-    if q.device.type == "cuda":
-        return (
-            _apply_qwen_image_rotary_emb(q, freqs),
-            _apply_qwen_image_rotary_emb(k, freqs),
-        )
-
-    # Retain the platform-specific kernels on other accelerators, which may
-    # not support complex tensors.
     cos = torch.real(freqs).to(q.dtype)
     sin = torch.imag(freqs).to(q.dtype)
     return rope(q, cos, sin), rope(k, cos, sin)
@@ -855,41 +855,11 @@ class QwenImageTransformerBlock(nn.Module):
 
         self.zero_cond_t = zero_cond_t
 
-    def _modulate(self, mod_params, index=None):
+    def _modulate(self, mod_params):
         """Apply modulation to input tensor"""
         # shift: b d, scale: b d, gate: b d
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-
-        if index is not None:
-            # Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
-            # So shift, scale, gate have shape [2*actual_batch, d]
-            actual_batch = shift.size(0) // 2
-            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]  # each: [actual_batch, d]
-            scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
-            gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
-
-            # index: [b, l] where b is actual batch size
-            # Expand to [b, l, 1] to match feature dimension
-            index_expanded = index.unsqueeze(-1)  # [b, l, 1]
-
-            # Expand chunks to [b, 1, d] then broadcast to [b, l, d]
-            shift_0_exp = shift_0.unsqueeze(1)  # [b, 1, d]
-            shift_1_exp = shift_1.unsqueeze(1)  # [b, 1, d]
-            scale_0_exp = scale_0.unsqueeze(1)
-            scale_1_exp = scale_1.unsqueeze(1)
-            gate_0_exp = gate_0.unsqueeze(1)
-            gate_1_exp = gate_1.unsqueeze(1)
-
-            # Use torch.where to select based on index
-            shift_result = torch.where(index_expanded == 0, shift_0_exp, shift_1_exp)
-            scale_result = torch.where(index_expanded == 0, scale_0_exp, scale_1_exp)
-            gate_result = torch.where(index_expanded == 0, gate_0_exp, gate_1_exp)
-        else:
-            shift_result = shift.unsqueeze(1)
-            scale_result = scale.unsqueeze(1)
-            gate_result = gate.unsqueeze(1)
-
-        return scale_result, shift_result, gate_result
+        return scale.unsqueeze(1), shift.unsqueeze(1), gate.unsqueeze(1)
 
     def forward(
         self,
@@ -915,8 +885,22 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
-        img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        use_fused_select01 = modulate_index is not None and can_use_qwen_select01_triton(hidden_states)
+        if use_fused_select01:
+            img_modulated, img_gate1 = fused_layernorm_select01(
+                hidden_states,
+                img_mod1,
+                modulate_index,
+                self.img_norm1.eps,
+                self.img_norm1.layernorm.weight,
+                self.img_norm1.layernorm.bias,
+            )
+        elif modulate_index is not None:
+            img_scale1, img_shift1, img_gate1 = select01_modulation_native(img_mod1, modulate_index)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        else:
+            img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
         txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
@@ -941,12 +925,29 @@ class QwenImageTransformerBlock(nn.Module):
         img_attn_output, txt_attn_output = attn_output
 
         # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
+        hidden_states_before_attn = hidden_states
+        if not use_fused_select01:
+            hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
-        img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        if use_fused_select01:
+            img_modulated2, hidden_states, img_gate2 = fused_residual_layernorm_select01(
+                img_attn_output,
+                hidden_states_before_attn,
+                img_gate1,
+                img_mod2,
+                modulate_index,
+                self.img_norm2.eps,
+                self.img_norm2.layernorm.weight,
+                self.img_norm2.layernorm.bias,
+            )
+        elif modulate_index is not None:
+            img_scale2, img_shift2, img_gate2 = select01_modulation_native(img_mod2, modulate_index)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        else:
+            img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
 
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output

@@ -5,7 +5,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.indexed_modulation import (
     _MAX_1D_GRID_SIZE,
     _iter_row_chunks,
@@ -152,7 +152,7 @@ def test_modulation_wrappers_match_reference_above_grid_limit(device):
         torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
@@ -190,3 +190,31 @@ def test_fused_modulation_preserves_bf16_residual_boundary() -> None:
     )
 
     assert torch.equal(modulated_out, expected)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+@pytest.mark.parametrize("fused_gate", [False, True])
+def test_fused_modulation_keeps_fp32_affine_intermediates(fused_gate: bool) -> None:
+    device = current_omni_platform.get_torch_device()
+    rows, hidden_size = 2, 5376
+    x = torch.ones(rows, hidden_size, device=device, dtype=torch.bfloat16)
+    weight = torch.full((hidden_size,), 1.125, device=device, dtype=x.dtype)
+    shift = torch.zeros(1, hidden_size, device=device, dtype=x.dtype)
+    scale = torch.full_like(shift, 0.09375)
+    indices = torch.zeros(rows, device=device, dtype=torch.int64)
+    eps = 1e-6
+    if fused_gate:
+        residual, actual = indexed_gate_rms_norm_scale_shift(
+            x, torch.zeros_like(shift), x, weight, shift, scale, indices, eps
+        )
+        assert torch.equal(residual, x)
+    else:
+        actual = rms_norm_indexed_scale_shift(x, weight, shift, scale, indices, eps)
+
+    # Without the RMS epsilon, 1.125 * 1.09375 = 1.23046875 is exactly
+    # halfway between two BF16 values. FP32 normalization keeps the epsilon
+    # and rounds down to 1.2265625. Premature BF16 rounding drops the epsilon
+    # and instead rounds the tie up to 1.234375, changing every output row.
+    assert torch.equal(actual, torch.full_like(x, 1.2265625))

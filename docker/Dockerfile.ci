@@ -1,10 +1,7 @@
-# Target vLLM version: v0.29.0 (tag @ 98dff2a81d74).
-# Use the matching release image and its coherent CUDA/PyTorch/FlashInfer
-# runtime. Do not reinstall a commit wheel or repair dependencies on top of
-# an older base image at a release boundary. For a future unreleased target,
-# restore an explicit wheel pin and validate its complete runtime stack.
+# Use the official release image with its matching CUDA/PyTorch stack.
+ARG VLLM_VERSION=0.31.0
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.29.0
+ARG VLLM_BASE_TAG=v${VLLM_VERSION}
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents
@@ -12,6 +9,7 @@ ARG VLLM_BASE_TAG=v0.29.0
 # everything except the actual project dir, since that should not
 # change much across branches.
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
+ARG VLLM_VERSION
 # Keep APP_DIR outside /workspace so k8s Buildkite workspace mounts cannot
 # shadow the editable install target (#5364). Docker WORKDIR creates /opt if
 # needed.
@@ -36,12 +34,17 @@ RUN apt-get update && \
 # for CI
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+# Scope the override to Omni; dependency source builds need their own versions.
+ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 # Editable install: deps + project metadata are cached in this layer, while
 # the package itself is linked to APP_DIR (populated later by COPY --link).
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
 RUN uv pip install --system -e ".[dev]"
+# Fail the image build if dependency resolution replaced the selected vLLM.
+# The CPU builder has no NVIDIA driver; CUDA imports are checked at the start
+# of each GPU test job by .buildkite/cuda/scripts/check_vllm_runtime.py.
+RUN python3 -c "import vllm; assert vllm.__version__ == '${VLLM_VERSION}', vllm.__version__"
 
 # The final stage just copies the working dir on top of the
 # dependencies image. This uses --link so that we can skip

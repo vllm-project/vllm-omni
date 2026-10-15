@@ -12,6 +12,7 @@ Tests cover:
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -40,6 +41,14 @@ from vllm_omni.diffusion.data import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _clear_inherited_attention_backend(monkeypatch):
+    # Weekly CPU exports DIFFUSION_ATTENTION_BACKEND; OmniDiffusionConfig
+    # treats that as an explicit default so auto-backend cases break.
+    # Tests that setenv the same variable still work: this fixture runs first.
+    monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
 
 class TestAttentionSpec:
@@ -107,6 +116,18 @@ class TestAttentionSpec:
     def test_fastvideo_vsa_topk_serialized(self):
         spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=96)
         assert spec.backend_kwargs() == {"topk": 96}
+
+    @pytest.mark.parametrize("provider", ["auto", "fastvideo", "flashinfer"])
+    def test_vsa_provider_round_trip_preserves_explicit_selection(self, provider):
+        spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_provider=provider)
+        assert spec.backend_kwargs() == (None if provider == "auto" else {"provider": provider})
+        assert AttentionSpec(backend="FASTVIDEO_VSA").fastvideo_vsa_provider == "auto"
+
+    def test_vsa_sage_can_select_provider_automatically(self):
+        spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_precision="sage")
+        assert spec.backend_kwargs() == {"precision": "sage"}
+        with pytest.raises(ValueError, match="requires the FlashInfer provider"):
+            AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_provider="fastvideo", fastvideo_vsa_precision="sage")
 
     def test_fastvideo_vsa_topk_rejected_for_other_backend(self):
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
@@ -211,6 +232,22 @@ class TestAttentionConfig:
         )
         assert config.per_role["ltx2.audio_self"].backend == "FLASH_ATTN"
         assert config.per_role["ltx2.audio_to_video"].backend == "SAGE_ATTN"
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_vsa_provider_precision_in_per_role_mapping(self, nested):
+        spec = {
+            "backend": "FASTVIDEO_VSA",
+            "fastvideo_vsa_provider": "flashinfer",
+            "fastvideo_vsa_precision": "sage",
+            "fastvideo_vsa_topk": 32,
+        }
+        roles: dict[str, Any] = {"minimax_h3": {"main": spec}} if nested else {"minimax_h3.main": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["minimax_h3.main"].backend_kwargs() == {
+            "provider": "flashinfer",
+            "precision": "sage",
+            "topk": 32,
+        }
 
     def test_constructor_normalizes_auto_to_unset(self):
         config = AttentionConfig(
@@ -415,13 +452,6 @@ class TestBuildAttentionConfig:
 
 class TestOmniDiffusionConfigAttentionParsing:
     """Test OmniDiffusionConfig attention shorthand and structured config."""
-
-    @pytest.fixture(autouse=True)
-    def _clear_diffusion_attention_backend_env(self, monkeypatch):
-        # OmniDiffusionConfig.__post_init__ applies DIFFUSION_ATTENTION_BACKEND via
-        # build_attention_config(); clear it so these tests assert config defaults,
-        # not whatever the process inherited from CI / sibling tests.
-        monkeypatch.delenv("DIFFUSION_ATTENTION_BACKEND", raising=False)
 
     def test_diffusion_attention_backend_sets_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SAGE_ATTN")

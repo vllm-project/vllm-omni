@@ -175,7 +175,8 @@ In sequential mode, each stage must wait for the previous stage to complete enti
    - **OmniChunkTransferAdapter**: Chunk-specific implementation that owns the full chunk lifecycle when async_chunk is enabled
      - **Chunk ID and key construction**: Builds keys like `{req_id}_{stage_id}_{chunk_id}` for put/get
      - **Async get**: `load_async(request)` enqueues the request; background **recv_loop** polls the connector (non-blocking); when data is available, updates the request and marks it in `_finished_load_reqs`; scheduler calls `get_finished_requests()` to learn which requests have chunks ready
-     - **Async put**: `save_async(pooling_output, request)` invokes `custom_process_next_stage_input_func` in the main thread to build the payload, then enqueues a save task; background **save_loop** performs `connector.put()`; payload processing and chunk accumulation (e.g. code2wav chunk_size) remain in the main thread
+     - **Async put**: `save_async(pooling_output, request)` admits the request and enqueues a save task; background **save_loop** runs `custom_process_next_stage_input_func` to build the payload (chunk accumulation, e.g. code2wav chunk_size, lives in the processor's per-request state) and performs `connector.put()`
+     - **Batched put**: when the processor module also defines `<func>_batch(transfer_manager, pooling_outputs, requests, is_finished) -> list[payload | None]`, the batch form opts in with `per_step_batch = True`, and the stage needs no per-step token updates, `OmniARScheduler` hands a whole step's saves to `save_async_batch`: one queued task and one processor call per step, with payloads in request order. Requests are not snapshotted for it, so an opted-in batch form reads nothing of a request but its ids and takes finishing from the flags it is given; while it runs, every live request is marked in flight as around the single processor, so a cancel's sender cleanup defers to the save loop
 
 3. **Stage Input Processors**: Custom functions that process stage outputs into chunks for different models
    - Receive **transfer_manager** (OmniChunkTransferAdapter)
@@ -208,6 +209,33 @@ In sequential mode, each stage must wait for the previous stage to complete enti
      - Each request gets correctly sized audio based on its code sequence length: `waveform[:, :, :code_seq_len * total_upsample]`
 
 7. **Request status**: `RequestStatus.WAITING_FOR_CHUNK` is added via patch (e.g. in `vllm_omni/patch.py`) so requests waiting for a chunk are not scheduled by the base vLLM scheduler until the chunk is ready.
+
+### Placeholder prewarm
+
+When a request arrives, `Orchestrator._prewarm_async_chunk_stages` submits every downstream stage that receives chunks right away, before any chunk exists. An LLM stage gets a placeholder request:
+
+- its `prompt_token_ids` are zeros of the expected prompt length (`compute_talker_prompt_ids_length`, or `hf_overrides.async_chunk_prewarm_prompt_len` if the stage sets it);
+- it carries no multimodal data;
+- it waits in `WAITING_FOR_CHUNK` until chunk 0 arrives.
+
+As a result, the downstream request already exists when the first chunk lands. Stages that only send chunks are not prewarmed, because their first real input comes from the orchestrator.
+
+#### Prewarm payload
+
+A stage can also receive data derived from the original request together with its placeholder, and use its idle steps to prepare for chunk 0. MiniCPM-o's Code2Wav uses this to prepare the reference audio (see the MiniCPM-o recipe). The contract spans four layers:
+
+| Layer | Touchpoint | Behavior |
+| --- | --- | --- |
+| Pipeline config | `StagePipelineConfig.async_chunk_prewarm_payload_func` | Dotted path to `fn(prompt) -> dict[str, Tensor \| scalar] \| None`. It is resolved in `stage_init_utils` and exposed on the stage client. |
+| Orchestrator | `_attach_async_chunk_prewarm_payload` | Runs on the initial add only. It is skipped on a streaming re-prewarm and for session-owned or resumable requests. It calls the function with the original prompt and adds the result to the placeholder's `additional_information` under flat keys `f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`. If the function fails or returns nothing, the placeholder is submitted unchanged. |
+| Scheduler | `OmniSchedulerMixin._take_async_chunk_prewarm` | In `add_request`, it pops those keys off a new request, so they never reach the runner's per-request buffer. The payload is delivered once, as an `OmniRequestPrewarm` in `OmniSchedulerOutput.pending_request_prewarms`. Finish and abort drop payloads that were never delivered. |
+| Runner and model | `on_requests_added(prewarms)`, `run_idle_prefetch()` | Optional model hooks in the GPU and NPU generation runners. `on_requests_added` runs right after `on_requests_finished`. `run_idle_prefetch` runs only on a zero-token step that follows another zero-token step, and the runner ignores its return value. A hook exception is logged and never reaches the EngineCore. |
+
+Constraints for a new integration:
+
+- Return a flat `{name: Tensor | scalar}` dict. The orchestrator turns each name into its own dotted key so that tensor values cross the wire as top-level values in `additional_information`, and the scheduler rebuilds the dict. Do not nest tensors inside containers.
+- Treat the payload as a hint. Chunk 0 must still carry everything the stage needs, because the payload is absent after a re-prewarm, for session-owned and resumable requests, and whenever the payload function fails.
+- Keep hook work bounded. The hooks run on the forward thread, so a chunk that becomes ready during a hook call waits for it to return.
 
 ## Configuration
 
@@ -245,6 +273,24 @@ stages:
     input_connectors:
       from_stage_0: connector_of_shared_memory
 ```
+
+### Scheduling Under Load
+
+Connector `extra` keys tune when a chunked AR stage admits new requests:
+
+```yaml
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # AR stage: while >= 32 requests run, a new request waits until 6
+      # requests wait or the oldest has waited 100 ms.
+      ar_prefill_admission_min_batch: 6
+      ar_prefill_admission_max_wait_ms: 100
+      ar_prefill_admission_min_running: 32
+```
+
+- `ar_prefill_admission_min_batch` / `ar_prefill_admission_max_wait_ms` / `ar_prefill_admission_min_running`: arrivals share one prefill / mixed step instead of each turning a decode step into one. Off unless `ar_prefill_admission_min_batch` > 1, which requires a positive `ar_prefill_admission_max_wait_ms`; below `ar_prefill_admission_min_running` running requests, arrivals are admitted at once. The wait counts against time to first audio, so keep it well under the first chunk's latency (Fish Audio Drama 3 at 128 streams: RTF 0.578 -> 0.513 with the values above).
 
 ### Code2Wav Batch Configuration
 

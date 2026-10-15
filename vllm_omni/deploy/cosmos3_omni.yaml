@@ -1,0 +1,30 @@
+# Cosmos3 omni deploy overlay: single co-located diffusion stage (both MoT
+# towers in one process). Topology (COSMOS3_OMNI_DEPLOY_PIPELINE) is declared in
+# vllm_omni/model_executor/models/cosmos3/pipeline.py.
+#
+# T2I / video / policy Cosmos3 checkpoints share HF metadata
+# (model_type=cosmos3_omni, model_index.json _class_name=
+# Cosmos3OmniDiffusersPipeline). This pipeline cannot be auto-detected and must
+# be selected explicitly so --deploy-config is applied (#6874):
+#
+#   vllm serve nvidia/Cosmos3-Super --omni \
+#     --deploy-config /absolute/path/to/vllm_omni/deploy/cosmos3_omni.yaml
+#
+# Same overlay works for Nano (including video). Without --deploy-config,
+# behaviour is unchanged (CLI single-stage fallback). --no-guardrails remains
+# the CLI-only equivalent of model_config.guardrails below. Per-checkpoint
+# knobs can still be layered with --stage-overrides.
+
+pipeline: cosmos3_omni_deploy
+# async_chunk defaults to True, which the deploy validator rejects for a
+# single-stage pipeline (no next-stage processor). Must be false here.
+async_chunk: false
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0
+    model_class_name: Cosmos3OmniDiffusersPipeline
+    model_config:
+      # Gated nvidia/Cosmos-1.0-Guardrail is often unavailable; default this
+      # recommended layout off. Equivalent to launching with --no-guardrails.
+      guardrails: false

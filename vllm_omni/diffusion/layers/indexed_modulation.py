@@ -112,13 +112,16 @@ def _rms_norm_indexed_scale_shift_kernel(
     x = tl.load(x_ptr + row * stride_x_row + columns, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(x * x, axis=0) / hidden_size
+    # Keep RMSNorm and AdaLN intermediates in FP32 on every architecture.
+    # Rounding the normalized value to BF16 before the affine transform
+    # changes the fused computation, including values at rounding boundaries.
     normalized = x * tl.rsqrt(variance + eps) * weight
-
     shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+    output = normalized * (1.0 + scale) + shift
     tl.store(
         output_ptr + row * hidden_size + columns,
-        normalized * (1.0 + scale) + shift,
+        output,
         mask=mask,
     )
 
@@ -162,9 +165,10 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
     normalized = updated * tl.rsqrt(variance + eps) * weight
     shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
+    output = normalized * (1.0 + scale) + shift
     tl.store(
         modulated_out_ptr + row * hidden_size + columns,
-        normalized * (1.0 + scale) + shift,
+        output,
         mask=mask,
     )
 

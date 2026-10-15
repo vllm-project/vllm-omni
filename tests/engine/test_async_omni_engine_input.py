@@ -11,7 +11,7 @@ from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -166,6 +166,37 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_not_called()
+
+
+def test_build_add_request_message_preserves_kv_hints_after_omni_payload_upgrade(mocker):
+    from vllm.v1.engine.input_processor import InputProcessor
+    from vllm.v1.kv_hints import KvHintsEnvelope
+
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    processor = mocker.create_autospec(InputProcessor, instance=True)
+    hints = KvHintsEnvelope("1", "hint-message", [])
+
+    def process(**kwargs):
+        request = _make_engine_core_request()
+        request.kv_hints = kwargs["kv_hints"]
+        return request
+
+    processor.process_inputs.side_effect = process
+    engine.input_processor = processor
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1], "additional_information": {"speaker": "voice"}},
+        sampling_params_list=[params],
+        kv_hints=hints,
+    )
+    assert processor.process_inputs.call_args.kwargs["kv_hints"] is hints
+    assert isinstance(msg.prompt, OmniEngineCoreRequest)
+    assert msg.prompt.kv_hints is hints
+    assert msg.prompt.additional_information is not None
 
 
 def test_build_add_request_message_injects_global_id_before_prompt_transform(mocker: MockerFixture):
@@ -378,6 +409,68 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
 
 
+def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmniEngine, list[str]]:
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.model = "test-model"
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = [StagePool(0, [_FakeStageClient(), _FakeStageClient()])]
+
+    seen_uuids: list[str] = []
+
+    def process_inputs(**kwargs):
+        seen_uuids.append(kwargs["prompt"]["multi_modal_uuids"]["image"][0])
+        return _make_engine_core_request(kwargs["request_id"])
+
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.side_effect = process_inputs
+    return engine, seen_uuids
+
+
+def test_mm_uuid_scoping_leaves_caller_prompt_untouched(mocker: MockerFixture):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    prompt = {
+        "prompt": "describe",
+        "multi_modal_data": {"image": "image-a"},
+        "multi_modal_uuids": {"image": ["user-uuid"]},
+    }
+
+    engine._build_add_request_message(
+        request_id="req-1", prompt=prompt, sampling_params_list=[params], final_stage_id=0
+    )
+
+    assert seen_uuids == ["stage0:rep0:user-uuid"]
+    assert prompt["multi_modal_uuids"] == {"image": ["user-uuid"]}
+
+
+def test_mm_uuid_scoping_keys_reused_prompt_by_its_own_media(mocker: MockerFixture):
+    # Callers may build each request from a dict that already went through the
+    # engine. Every request must still be keyed by its own media, otherwise the
+    # sender cache omits the new media and the replica serves the old one.
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    template = {"prompt": "describe", "multi_modal_data": {"image": "image-a"}}
+
+    engine._build_add_request_message(
+        request_id="req-0", prompt=template, sampling_params_list=[params], final_stage_id=0
+    )
+    for i, image in enumerate(("image-b", "image-c", "image-d"), start=1):
+        prompt = dict(template)
+        prompt["multi_modal_data"] = {"image": image}
+        engine._build_add_request_message(
+            request_id=f"req-{i}", prompt=prompt, sampling_params_list=[params], final_stage_id=0
+        )
+
+    assert "multi_modal_uuids" not in template
+    # Round-robin: requests 0/2 land on replica 0, requests 1/3 on replica 1.
+    assert [uuid.split(":")[1] for uuid in seen_uuids] == ["rep0", "rep1", "rep0", "rep1"]
+    assert len(set(seen_uuids)) == 4
+    assert all(uuid.count("stage0:") == 1 for uuid in seen_uuids)
+
+
 @pytest.mark.asyncio
 async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
@@ -422,6 +515,16 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert stage_pool.get_bound_replica_id("req-2") == 1
     assert await stage_pool.pick("req-1") == 0
     assert await stage_pool.pick("req-2") == 1
+
+    # Replica 0 leaves the hub after req-1's keys were scoped to it: a submit pinned to
+    # those keys fails instead of sending them to replica 1, while routing moves on.
+    stage_pool.attach_hub(_FakeHub([_replica(addr1)]))
+    with pytest.raises(StageUnavailableError):
+        await stage_pool.submit_initial(
+            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request(), expected_replica_id=0
+        )
+    assert stage_pool.get_bound_replica_id("req-1") is None
+    assert await stage_pool.pick("req-1") == 1
 
 
 def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mocker: MockerFixture):

@@ -1,5 +1,9 @@
-from collections import OrderedDict
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from collections import OrderedDict, UserDict
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -36,6 +40,7 @@ def _make_minimal_talker(
     """
     model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
     model.talker_config = SimpleNamespace(codec_pad_id=7, num_code_groups=16)
+    model._codebook_vocab_size = 2048
     model._embedding_dtype = torch.bfloat16
     if tts_pad_embed is None:
         tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
@@ -49,6 +54,22 @@ def _make_minimal_talker(
         build_prompt_embeds=build_prompt_embeds if build_prompt_embeds is not None else _default_raise,
     )
     return model
+
+
+def test_postprocess_batch_gathers_each_request_tail():
+    from vllm_omni.model_executor.models.output_templates import OwnedBatchTensor
+
+    model = _make_minimal_talker()
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+
+    key, values = model.postprocess_batch_mrv2(
+        hidden_states=hidden,
+        last_token_indices=torch.tensor([1, 3]),
+    )
+
+    assert key == ("hidden_states", "last")
+    assert isinstance(values, OwnedBatchTensor)  # freshly allocated rows transfer ownership
+    assert torch.equal(values.tensor, torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
 
 
 def _make_minimal_builder(
@@ -95,6 +116,7 @@ def _make_minimal_builder(
     )
     builder._speaker_cache = None
     builder._text_tokenizer = None
+    builder._projected_token_cache = {}
     builder._embedding_dtype = torch.bfloat16
     builder._ref_audio_artifact_cache_max_entries = 256
     builder._ref_audio_artifact_cache = OrderedDict()
@@ -259,6 +281,30 @@ def test_decode_compacts_long_trailing_text_after_large_offset():
     assert torch.equal(update["hidden_states"]["trailing_text"], trailing_text[65:])
 
 
+def test_decode_marks_codec_frame_validity_from_processed_input_token():
+    model = _make_minimal_talker()
+    model.embed_input_ids = lambda input_ids: input_ids.to(torch.float32).reshape(1, 1, 1).expand(1, 1, 4)
+    common = {
+        "input_embeds": None,
+        "text": ["hello"],
+        "task_type": ["CustomVoice"],
+        "hidden_states": {
+            "trailing_text": torch.ones((2, 4)),
+            "last": torch.ones(4),
+        },
+        "meta": {"talker_text_offset": 0},
+        "_omni_is_prefill": False,
+        "_omni_num_computed_tokens": 2,
+        "_omni_prompt_len": 2,
+    }
+
+    _, _, valid_update = model.preprocess(input_ids=torch.tensor([123]), **common)
+    _, _, eos_update = model.preprocess(input_ids=torch.tensor([4198]), **common)
+
+    assert valid_update["meta"]["codec_frame_valid"].item() is True
+    assert eos_update["meta"]["codec_frame_valid"].item() is False
+
+
 def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
     model = _make_minimal_talker()
 
@@ -286,14 +332,17 @@ def test_decode_replay_span_embeds_all_tokens_without_mutating_decode_state():
         out_embeds.cpu(),
         torch.tensor([[101.0] * 4, [202.0] * 4, [303.0] * 4], dtype=torch.bfloat16),
     )
-    assert update == {"meta": {"codec_streaming": True}}
+    assert update["meta"]["codec_streaming"] is True
+    assert update["meta"]["codec_frame_valid"].item() is False
 
 
-def test_decode_batch_preprocess_matches_decode_state_updates():
+@pytest.mark.parametrize("mrv2", [False, True])
+def test_decode_batch_preprocess_matches_decode_state_updates(mrv2):
     tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
     model = _make_minimal_talker(tts_pad_embed=tts_pad)
 
     def fake_embed_input_ids(input_ids):
+        assert not mrv2, "MRV2 must reuse the prepared token embeddings"
         return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
 
     model.embed_input_ids = fake_embed_input_ids
@@ -302,7 +351,10 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     last_a = torch.full((4,), 2.0, dtype=torch.float32)
     last_b = torch.full((4,), 3.0, dtype=torch.float32)
 
-    out_ids, out_embeds, past_hidden, text_step, updates = model.preprocess_decode_batch(
+    preprocess = model.preprocess_decode_batch_mrv2 if mrv2 else model.preprocess_decode_batch
+    prepared = torch.tensor([[101.0] * 4, [202.0] * 4], dtype=torch.bfloat16)
+    out_ids, out_embeds, past_hidden, text_step, updates = preprocess(
+        **({"input_embeds": prepared} if mrv2 else {}),
         input_ids=torch.tensor([101, 202], dtype=torch.long),
         req_infos=[
             {
@@ -321,16 +373,52 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     )
 
     assert out_ids.tolist() == [101, 202]
+    if mrv2:
+        assert out_embeds.data_ptr() == prepared.data_ptr()
     assert torch.equal(out_embeds.cpu(), torch.tensor([[101.0] * 4, [202.0] * 4], dtype=torch.bfloat16))
     assert torch.equal(past_hidden.cpu(), torch.stack([last_a, last_b]).to(torch.bfloat16))
     assert torch.equal(text_step[0].cpu(), trailing_a[1].to(torch.bfloat16))
     assert torch.equal(text_step[1].cpu(), tts_pad.reshape(-1).to(torch.bfloat16))
     assert updates[0]["meta"]["talker_text_offset"] == 2
     assert updates[0]["meta"]["codec_streaming"] is True
+    assert updates[0]["meta"]["codec_frame_valid"].item() is True
     assert "hidden_states" not in updates[0]
     assert updates[1]["meta"]["talker_text_offset"] == 0
     assert updates[1]["meta"]["codec_streaming"] is False
+    assert updates[1]["meta"]["codec_frame_valid"].item() is True
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
+
+
+def test_decode_batch_zero_fills_missing_last_hidden(monkeypatch):
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+
+    def fake_embed_input_ids(input_ids):
+        return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker.logger.warning_once",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    trailing = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    _, _, past_hidden, _, _ = model.preprocess_decode_batch(
+        input_ids=torch.tensor([101], dtype=torch.long),
+        req_infos=[
+            {
+                "text": ["hello"],
+                "task_type": ["CustomVoice"],
+                "hidden_states": {"trailing_text": trailing},
+                "meta": {"talker_text_offset": 0},
+            }
+        ],
+    )
+
+    assert torch.equal(past_hidden.cpu(), torch.zeros((1, 4), dtype=torch.bfloat16))
+    assert len(warnings) == 1
+    assert "zero-filling" in str(warnings[0][0])
 
 
 def _stub_text_embedding(device_param: torch.nn.Parameter):
@@ -449,11 +537,11 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
 
         def __call__(self, texts, *, padding=False):
             self.calls.append((texts, padding))
-            return {"input_ids": [[idx + 1, idx + 2, idx + 3] for idx, _ in enumerate(texts)]}
+            return UserDict({"input_ids": [[1, 2, 3], [2, 3, 4, 5]]})
 
     text_tok = FakeTextTokenizer()
     builder._text_tokenizer = text_tok
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],
@@ -488,9 +576,17 @@ def test_base_voice_clone_batch_preprocess_encodes_ref_code_by_sample_rate():
     assert buf["r2"][NORMALIZED_REF_AUDIO_KEY][0] is wav2
     assert len(text_tok.calls) == 2
     assert torch.equal(buf["r1"][PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([1, 2, 3]))
-    assert torch.equal(buf["r2"][PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([2, 3, 4]))
+    assert torch.equal(buf["r2"][PRECOMPUTED_TEXT_IDS_KEY], torch.tensor([2, 3, 4, 5]))
     assert torch.equal(buf["r1"][PRECOMPUTED_REF_IDS_KEY], torch.tensor([1, 2, 3]))
-    assert torch.equal(buf["r2"][PRECOMPUTED_REF_IDS_KEY], torch.tensor([2, 3, 4]))
+    assert torch.equal(buf["r2"][PRECOMPUTED_REF_IDS_KEY], torch.tensor([2, 3, 4, 5]))
+    assert (
+        buf["r1"][PRECOMPUTED_TEXT_IDS_KEY].untyped_storage().data_ptr()
+        == buf["r2"][PRECOMPUTED_TEXT_IDS_KEY].untyped_storage().data_ptr()
+    )
+    assert (
+        buf["r1"][PRECOMPUTED_REF_IDS_KEY].untyped_storage().data_ptr()
+        == buf["r2"][PRECOMPUTED_REF_IDS_KEY].untyped_storage().data_ptr()
+    )
 
 
 def test_base_voice_clone_batch_preprocess_reuses_singleton_normalized_audio_without_speech_tokenizer():
@@ -506,7 +602,7 @@ def test_base_voice_clone_batch_preprocess_reuses_singleton_normalized_audio_wit
             return {"input_ids": [[7, 8, 9] for _ in texts]}
 
     builder._text_tokenizer = FakeTextTokenizer()
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],
@@ -539,7 +635,7 @@ def test_base_voice_clone_batch_preprocess_skips_after_initial_prefill_state_exi
     builder._encode_ref_audio_batch_fn = lambda *a, **kw: (_ for _ in ()).throw(
         AssertionError("speech tokenizer not expected")
     )
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],
@@ -574,7 +670,7 @@ def test_base_voice_clone_batch_preprocess_uses_serving_artifact_cache_key_witho
             return {"input_ids": [[7, 8, 9] for _ in texts]}
 
     builder._text_tokenizer = FakeTextTokenizer()
-    buf = {
+    buf: dict[str, dict[str, Any]] = {
         "r1": {
             "task_type": ["Base"],
             "text": ["one"],
@@ -747,3 +843,72 @@ def test_ref_audio_artifact_only_cache_miss_fails_fast():
                 REF_AUDIO_CACHE_KEY: ["missing-ref"],
             },
         )
+
+
+def test_evicted_ref_audio_cache_key_with_payload_recomputes_artifacts():
+    """A serving-side artifact key whose engine entry was evicted is only a cache miss."""
+    builder = _make_minimal_builder()
+    builder._ref_audio_artifact_cache_max_entries = 1
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    builder._codec_embed = lambda ids: torch.zeros((*ids.shape, 4), device=ids.device)
+
+    class FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
+
+    builder._text_tokenizer = FakeTokenizer()
+    builder._generate_icl_prompt = lambda **kwargs: (
+        torch.ones((1, 2, 4), device=kwargs["ref_code"].device),
+        torch.ones((1, 4), device=kwargs["ref_code"].device),
+    )
+    ref_audio = np.arange(1024, dtype=np.float32)
+    builder.normalize_ref_audio = lambda _raw: (ref_audio, 16000)
+    encoded = []
+    builder._encode_ref_audio_batch_fn = lambda wavs, _sr, *, device: [
+        encoded.append(len(w)) or torch.ones((2, 2), dtype=torch.long) for w in wavs
+    ]
+    builder.extract_speaker_embedding = lambda _wav, _sr: torch.ones(4, dtype=torch.bfloat16)
+
+    stale = {"ref_code": torch.zeros((3, 2), dtype=torch.long), "ref_spk_embedding": torch.zeros(4)}
+    builder.put_ref_audio_artifacts("ref-a", **stale)
+    builder.put_ref_audio_artifacts("ref-b", **stale)
+    assert builder.get_ref_audio_artifacts("ref-a") is None
+
+    _prompt, _trailing, ref_code_len, ref_code = builder.build_prompt_embeds(
+        task_type="Base",
+        info_dict={
+            "text": ["hello"],
+            "ref_audio": ["ref.wav"],
+            "ref_ids": torch.arange(8, dtype=torch.long).reshape(1, -1),
+            "non_streaming_mode": [False],
+            REF_AUDIO_CACHE_KEY: ["ref-a"],
+        },
+    )
+
+    assert encoded == [1024]
+    assert ref_code_len == 2
+    assert torch.equal(ref_code, torch.ones((2, 2), dtype=torch.long))
+    refilled = builder.get_ref_audio_artifacts("ref-a")
+    assert refilled is not None
+    assert torch.equal(refilled["ref_code"], ref_code)
+
+
+def test_serving_ref_audio_wire_form_survives_engine_ipc_and_normalizes():
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_omni.engine import AdditionalInformationPayload
+    from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+    from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import _ref_audio_wire_waveform
+
+    wav = np.random.default_rng(0).standard_normal(24000).astype(np.float32)
+    wire = serialize_additional_information({"ref_audio": [[_ref_audio_wire_waveform(wav), 24000]]})
+    decoded = MsgpackDecoder(AdditionalInformationPayload).decode(MsgpackEncoder().encode(wire))
+    info = deserialize_additional_information(decoded)
+
+    out_wav, out_sr = _make_minimal_builder().normalize_ref_audio(info["ref_audio"][0])
+
+    assert out_sr == 24000
+    assert out_wav.dtype == np.float32
+    assert np.array_equal(out_wav, wav)

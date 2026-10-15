@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
@@ -337,14 +338,20 @@ class QwenImagePipeline(
             del visual_owner.visual
         else:
             logger.warning("Qwen-Image: vision tower not found on text encoder; skipping drop")
-        self.text_encoder = self.text_encoder.to(self.device)
+        # Under model-level CPU offload, keep the BF16 encoder/VAE on CPU so they
+        # do not share VRAM with DiT construction (#7555). The DiT follows the
+        # loader's default-device context (CUDA for online / AutoRound INT under
+        # offload, CPU for layerwise / unquantized HSDP defer).
+        cpu_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+        enc_vae_device = torch.device("cpu") if cpu_offload else self.device
+        self.text_encoder = self.text_encoder.to(enc_vae_device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLQwenImage.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=qwen_subfolders,
             local_files_only=local_files_only,
-        ).to(self.device)
+        ).to(enc_vae_device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         self.transformer = QwenImageTransformer2DModel(
             od_config=od_config,

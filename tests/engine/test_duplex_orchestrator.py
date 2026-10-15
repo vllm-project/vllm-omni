@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from tests.engine.test_orchestrator import (
@@ -21,9 +22,16 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
-from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.contracts import (
+    DuplexFence,
+    DuplexStageRequestContext,
+    DuplexStageSubmission,
+    duplex_resource_request_id,
+)
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -32,8 +40,9 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
 from vllm_omni.engine.messages import AbortRequestMessage, ShutdownRequestMessage
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import Orchestrator, build_engine_core_request_from_tokens
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -55,6 +64,7 @@ def _build(
     stages: int = 1,
     running_counter: FakeRunningCounter | None = None,
     runtime_config: DuplexSessionRuntimeConfig | None = None,
+    plugin=None,
 ) -> tuple[DuplexOrchestrator, list[FakeStageClient], asyncio.Queue, asyncio.Queue]:
     clients = [FakeStageClient(stage_type="llm", final_output=index == stages - 1) for index in range(stages)]
     pools = _build_stage_pools(
@@ -70,17 +80,22 @@ def _build(
         rpc_async_queue=rpc_q,
         stage_pools=pools,
         running_counter=running_counter,
-        plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+        plugin=plugin or MiniCPMO45DuplexPlugin(_encode_audio),
         duplex_session_config=runtime_config or DuplexSessionRuntimeConfig(reaper_interval_s=0.01),
         model_config=None,
     )
     return orchestrator, clients, rpc_q, output_q
 
 
-def _open_message(extra_body: dict[str, object] | None = None) -> OpenDuplexSessionMessage:
+def _open_message(
+    extra_body: dict[str, object] | None = None,
+    *,
+    output_buffer: DuplexOutputBuffer | None = None,
+) -> OpenDuplexSessionMessage:
     return OpenDuplexSessionMessage(
         control_id=f"open-{SESSION_ID}",
         session_id=SESSION_ID,
+        output_buffer=output_buffer or DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         session_config=DuplexSessionConfig(
             model="openbmb/MiniCPM-o-4_5",
             modalities=["text"],
@@ -197,7 +212,8 @@ async def test_open_preregisters_the_stage0_request_and_close_releases_it() -> N
     assert request_state.session_owned is True
     assert request_state.session_id == SESSION_ID
     assert request_state.fence == DuplexFence(SESSION_ID)
-    assert request_state.streaming.enabled is True
+    # Set on submit from submission.resumable, not again at preregister.
+    assert request_state.streaming.enabled is False
     # Preregistration reserves the id; nothing is running until an append submits.
     assert counter.value == 0
     assert clients[0].add_request_calls == []
@@ -209,6 +225,18 @@ async def test_open_preregisters_the_stage0_request_and_close_releases_it() -> N
     assert orchestrator.session_manager.runner_for_request_id(request_id) is None
     assert counter.value == 0
     assert orchestrator.session_manager.active_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_aura_ephemeral_preregister_disables_streaming() -> None:
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    orchestrator, _, rpc_q, _ = _build(plugin=AuraDuplexPlugin(_encode_audio))
+    result = await _open(orchestrator, rpc_q)
+    assert result.ok is True
+    request_state = next(iter(orchestrator.request_states.values()))
+    assert request_state.streaming.enabled is False
+    await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -275,6 +303,7 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     assert submitted.resumable is True
     assert submitted.sampling_params.max_tokens == 20
     request_state = orchestrator.request_states[request_id]
+    assert request_state.streaming.enabled is True
     assert request_state.stage_fences[0] == DuplexFence(SESSION_ID)
     assert 0 in request_state.stage_submit_ts
     assert counter.value == 1
@@ -290,6 +319,139 @@ async def test_append_submits_the_resumable_stage0_request_and_counts_it_running
     await _close(orchestrator, rpc_q)
     assert clients[0].abort_calls == [[request_id]]
     assert counter.value == 0
+
+
+@pytest.fixture
+def ephemeral_submissions(mocker):
+    orchestrator, clients, _, _ = _build(stages=2)
+    submissions = []
+    for request_id in ("first", "second"):
+        context = DuplexStageRequestContext(
+            request_id=request_id,
+            session_id=request_id,
+            fence=DuplexFence(request_id),
+            stage_id=0,
+            final_stage_id=1,
+            config_generation=0,
+            sampling_params=orchestrator.sampling_defaults(),
+        )
+        orchestrator.ensure_request(context)
+        submissions.append(
+            DuplexStageSubmission(
+                context=context, prompt={"prompt_token_ids": [1]}, already_submitted=False, resumable=False
+            )
+        )
+
+    async def build_request(request_id, stage_id, prompt, params, *, resumable):
+        return build_engine_core_request_from_tokens(request_id, prompt, params, resumable=resumable)
+
+    builder = mocker.patch.object(orchestrator, "_build_next_stage_request", side_effect=build_request)
+    return orchestrator, clients, submissions, builder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_ephemeral_prewarm_does_not_hold_stage_input_lock(ephemeral_submissions, mocker, outcome):
+    orchestrator, clients, submissions, _ = ephemeral_submissions
+    orchestrator.async_chunk = True
+    prewarming = asyncio.Event()
+    release = asyncio.Event()
+    clear_cache = mocker.spy(orchestrator, "_clear_stage_input_cache")
+
+    async def prewarm(request_id, request, request_state):
+        if request_id == "first":
+            prewarming.set()
+            await release.wait()
+            return outcome != "failure"
+        return True
+
+    mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", side_effect=prewarm)
+    first = asyncio.create_task(orchestrator.submit(submissions[0]))
+    try:
+        await asyncio.wait_for(prewarming.wait(), timeout=2)
+        # A different session can finish admission while the first waits downstream.
+        second = await asyncio.wait_for(orchestrator.submit(submissions[1]), timeout=2)
+        assert second.request_id == "second"
+        assert not first.done()
+        assert [args[0].request_id for args in clients[0].add_request_calls] == ["first", "second"]
+        if outcome == "cancel":
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        else:
+            release.set()
+            if outcome == "failure":
+                with pytest.raises(RuntimeError, match="async-chunk prewarm failed"):
+                    await first
+            else:
+                assert (await first).request_id == "first"
+        # A downstream failure must not invalidate a later session's sender cache.
+        clear_cache.assert_not_called()
+    finally:
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_send", [False, True])
+async def test_ephemeral_submission_preserves_send_order_and_failure_cleanup(ephemeral_submissions, mocker, fail_send):
+    orchestrator, clients, submissions, builder = ephemeral_submissions
+    sending = asyncio.Event()
+    release = asyncio.Event()
+    add_request = clients[0].add_request_async
+    clear_cache = mocker.spy(orchestrator, "_clear_stage_input_cache")
+
+    async def send(request, **kwargs):
+        if request.request_id == "first":
+            sending.set()
+            await release.wait()
+            if fail_send:
+                raise RuntimeError("send failed")
+        else:
+            assert clear_cache.call_count == int(fail_send)
+        await add_request(request, **kwargs)
+
+    mocker.patch.object(clients[0], "add_request_async", side_effect=send)
+    first = asyncio.create_task(orchestrator.submit(submissions[0]))
+    second = None
+    try:
+        await asyncio.wait_for(sending.wait(), timeout=2)
+        second = asyncio.create_task(orchestrator.submit(submissions[1]))
+        await asyncio.sleep(0)
+        assert builder.await_count == 1
+        assert orchestrator._stage_input_submission_locks[0].locked()
+        release.set()
+        if fail_send:
+            with pytest.raises(RuntimeError, match="send failed"):
+                await first
+        else:
+            await first
+        await asyncio.wait_for(second, timeout=2)
+        expected = ["second"] if fail_send else ["first", "second"]
+        assert [args[0].request_id for args in clients[0].add_request_calls] == expected
+    finally:
+        tasks = [first] if second is None else [first, second]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_resumable_append_prompt_does_not_reach_prewarmed_stages() -> None:
+    # A resumable append carries Stage0's duplex buffer. The async-chunk
+    # prewarm copies ``request_state.prompt`` into downstream placeholders,
+    # so that buffer must not end up there (#7962).
+    orchestrator, clients, rpc_q, _ = _build(stages=2)
+    orchestrator.async_chunk = True
+    orchestrator._stage_receives_async_chunks = lambda stage_id: stage_id > 0  # type: ignore[method-assign]
+    await _open(orchestrator, rpc_q)
+
+    await _submit(orchestrator, _append_audio())
+
+    assert clients[0].add_request_calls[0][0].model_intermediate_buffer
+    assert len(clients[1].add_request_calls) == 1
+    assert clients[1].add_request_calls[0][0].model_intermediate_buffer is None
+    await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -336,12 +498,13 @@ async def test_forwarded_stage_requests_are_bound_and_barge_in_aborts_them() -> 
 @pytest.mark.asyncio
 async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue() -> None:
     orchestrator, _, rpc_q, output_q = _build(stages=2)
-    await _open(orchestrator, rpc_q)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
     request_id = _stage0_request_id()
     await _submit(orchestrator, _append_audio())
     request_state = orchestrator.request_states[request_id]
-    while not output_q.empty():
-        output_q.get_nowait()
+    while output_buffer.pending_events:
+        await output_buffer.get()
 
     consumed = await orchestrator._intercept_stage_output(1, 0, _tts_output(request_id), request_state, None, None)
     await _settle(orchestrator)
@@ -349,8 +512,9 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
     assert consumed is True
     session = orchestrator.session_manager.get(SESSION_ID)
     assert session is not None and session.active_response_id is not None
-    types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    types = [(await output_buffer.get()).type for _ in range(output_buffer.pending_events)]
     assert "response.created" in types and "response.output_audio.delta" in types
+    assert output_q.empty()
 
     orphan = DuplexOrchestratorRequestState(
         request_id="duplex-s.b3RoZXI.e.0.r.stage0",
@@ -366,9 +530,158 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage_id", [0, 1])
+async def test_terminal_stage_error_closes_session_before_another_append(mocker, stage_id) -> None:
+    orchestrator, clients, rpc_q, output_q = _build(stages=2)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
+    request_id = _stage0_request_id()
+    await _submit(orchestrator, _append_audio())
+    session = orchestrator.session_manager.get(SESSION_ID)
+    reason = "context_length_exceeded: streaming session prompt would grow to 3000 tokens"
+    output = OmniEngineCoreOutput(
+        request_id=request_id,
+        finish_reason=FinishReason.ERROR,
+        stop_reason=reason,
+        is_segment_finished=False,
+        new_token_ids=[],
+    )
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+    mocker.patch.object(
+        orchestrator.stage_pools[stage_id], "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[]
+    )
+    try:
+        await orchestrator._process_llm_stage_outputs(stage_id, 0, OmniEngineCoreOutputs(outputs=[output]), set())
+        await _settle(orchestrator)
+        assert request_id not in orchestrator.request_states
+        assert clients[0].abort_calls == [[request_id]]
+        assert SESSION_ID not in orchestrator.session_manager.runners
+        assert session.state == DuplexSessionState.CLOSED
+        assert orchestrator.session_manager.active_count() == 0
+        events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
+        events.extend(output_q.get_nowait().event for _ in range(output_q.qsize()))
+        types = [event.type for event in events]
+        assert types.index("error") < types.index("session.expired")
+        assert types[-1] == "session.expired"
+        # A request-local failure must release admission without evicting the replica.
+        result = await _open(orchestrator, rpc_q)
+        assert result.ok
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin_type,close_session", [(MiniCPMO45DuplexPlugin, True), (Qwen3OmniDuplexPlugin, False)])
+async def test_terminal_stage_error_preserves_plugin_cleanup_policy(mocker, plugin_type, close_session) -> None:
+    orchestrator, _, _, _ = _build(plugin=plugin_type(_encode_audio))
+    request_state = DuplexOrchestratorRequestState(request_id="failed-request", session_owned=True)
+    output = OmniEngineCoreOutput(
+        request_id=request_state.request_id,
+        finish_reason=FinishReason.ERROR,
+        stop_reason="context_length_exceeded",
+        new_token_ids=[],
+    )
+    cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
+    try:
+        await orchestrator._report_duplex_session_request_error(0, 0, output, request_state)
+        cleanup.assert_awaited_once_with([request_state.request_id], abort=True, release_owners=close_session)
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_qwen_terminal_stage_error_allows_a_subsequent_turn(mocker) -> None:
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    render_prompt = mocker.Mock(return_value="audio prompt")
+    plugin.processor = SimpleNamespace(apply_chat_template=render_prompt)
+    orchestrator, clients, rpc_q, output_q = _build(plugin=plugin)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+
+    def process_inputs(**kwargs):
+        return build_engine_core_request_from_tokens(
+            request_id=kwargs["request_id"],
+            prompt={"prompt_token_ids": [1, 2]},
+            params=kwargs["params"],
+            model_config=orchestrator.stage_pools[0].stage_vllm_config.model_config,
+            resumable=kwargs["resumable"],
+        )
+
+    mocker.patch.object(
+        orchestrator, "_get_stage_input_processor", return_value=SimpleNamespace(process_inputs=process_inputs)
+    )
+    assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False}, output_buffer=output_buffer)).ok
+    session = orchestrator.session_manager.get(SESSION_ID)
+    try:
+        await _submit(orchestrator, _append_audio())
+        await _submit(orchestrator, commands.Commit(final=True, create_response=True))
+        first_request = clients[0].add_request_calls[0][0]
+        failed_response_id = session.active_response_id
+        assert failed_response_id is not None
+
+        await orchestrator._process_llm_stage_outputs(
+            0,
+            0,
+            OmniEngineCoreOutputs(
+                outputs=[
+                    OmniEngineCoreOutput(
+                        request_id=first_request.request_id,
+                        finish_reason=FinishReason.ERROR,
+                        stop_reason="context_length_exceeded",
+                        new_token_ids=[],
+                    )
+                ]
+            ),
+            set(),
+        )
+        await _settle(orchestrator)
+        assert clients[0].abort_calls == [[first_request.request_id]]
+        assert first_request.request_id not in orchestrator.request_states
+        assert session.state == DuplexSessionState.OPEN
+        assert session.active_response_id is None
+        assert orchestrator.session_manager.get(SESSION_ID) is session
+
+        await _submit(orchestrator, _append_audio())
+        await _submit(orchestrator, commands.Commit(final=True, create_response=True))
+        assert len(clients[0].add_request_calls) == 2
+        second_request = clients[0].add_request_calls[1][0]
+        assert second_request.request_id != first_request.request_id
+        assert second_request.resumable is False
+        # Each turn rebuilds the prompt, including the session instructions.
+        assert render_prompt.call_count == 2
+        assert render_prompt.call_args.args[0][0] == {"role": "system", "content": "public instructions"}
+        response_id = session.active_response_id
+        assert response_id is not None and response_id != failed_response_id
+        output = SimpleNamespace(
+            request_id=second_request.request_id,
+            finished=True,
+            outputs=[SimpleNamespace(text="next turn succeeded", token_ids=[], multimodal_output={})],
+            multimodal_output={},
+        )
+        assert await orchestrator._intercept_stage_output(
+            0, 0, output, orchestrator.request_states[second_request.request_id], None, None
+        )
+        await _settle(orchestrator)
+        events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
+        events.extend(output_q.get_nowait().event for _ in range(output_q.qsize()))
+        done = [event for event in events if event.type == "response.done"]
+        assert [(event.response_id, event.status) for event in done] == [
+            (failed_response_id, "failed"),
+            (response_id, "completed"),
+        ]
+        assert any(event.type == "error" for event in events)
+        assert not any(event.type in {"session.closed", "session.expired"} for event in events)
+        assert session.state == DuplexSessionState.OPEN
+    finally:
+        await _close(orchestrator, rpc_q)
+
+
+@pytest.mark.asyncio
 async def test_forward_failure_closes_the_owning_session() -> None:
     orchestrator, clients, rpc_q, output_q = _build(stages=2)
-    await _open(orchestrator, rpc_q)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
     request_id = _stage0_request_id()
     await _submit(orchestrator, _append_audio())
     request_state = orchestrator.request_states[request_id]
@@ -384,10 +697,38 @@ async def test_forward_failure_closes_the_owning_session() -> None:
     assert SESSION_ID not in orchestrator.session_manager.runners
     assert session.state == DuplexSessionState.CLOSED
     assert orchestrator.session_manager.active_count() == 0
-    types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    types = [(await output_buffer.get()).type for _ in range(output_buffer.pending_events)]
+    types.extend(output_q.get_nowait().event.type for _ in range(output_q.qsize()))
     # The stage failure is reported before the session expires, never after.
     assert types.index("error") < types.index("session.expired")
     assert types[-1] == "session.expired"
+
+
+@pytest.mark.asyncio
+async def test_aura_forward_failure_keeps_the_session() -> None:
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    orchestrator, clients, rpc_q, output_q = _build(stages=2, plugin=AuraDuplexPlugin(_encode_audio))
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
+    request_id = next(iter(orchestrator.request_states))
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    session = orchestrator.session_manager.get(SESSION_ID)
+    assert session is not None
+
+    absorbed = await orchestrator._handle_forward_failure(request_id, 1, request_state, ValueError("stale talker"))
+    await _settle(orchestrator)
+
+    assert absorbed is True
+    assert request_id not in orchestrator.request_states
+    assert SESSION_ID in orchestrator.session_manager.runners
+    assert session.state != DuplexSessionState.CLOSED
+    types = [(await output_buffer.get()).type for _ in range(output_buffer.pending_events)]
+    types.extend(output_q.get_nowait().event.type for _ in range(output_q.qsize()))
+    assert "error" in types
+    assert "session.expired" not in types
+    await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -515,3 +856,99 @@ async def test_a_dead_replica_closes_the_sessions_it_was_serving() -> None:
     messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
     types = [getattr(getattr(m, "event", None), "type", type(m).__name__) for m in messages]
     assert types[-1] in {"session.expired", "session.closed"}, f"the client needs a terminal event, got {types}"
+
+
+@pytest.mark.asyncio
+async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(monkeypatch):
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+
+    orchestrator, clients, rpc_q, _ = _build()
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "audio prompt")
+    orchestrator.plugin = orchestrator.session_manager.plugin = plugin
+    seen = []
+
+    def process_inputs(**kwargs):
+        seen.append(kwargs)
+        return build_engine_core_request_from_tokens(
+            request_id=kwargs["request_id"],
+            prompt={"prompt_token_ids": [1, 2]},
+            params=kwargs["params"],
+            model_config=orchestrator.stage_pools[0].stage_vllm_config.model_config,
+            resumable=kwargs["resumable"],
+        )
+
+    monkeypatch.setattr(
+        orchestrator, "_get_stage_input_processor", lambda stage_id: SimpleNamespace(process_inputs=process_inputs)
+    )
+    await orchestrator._dispatch_message(
+        OpenDuplexSessionMessage(
+            control_id="open-qwen",
+            session_id=SESSION_ID,
+            session_config=DuplexSessionConfig(model="qwen", modalities=["text", "audio"]),
+            output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+        )
+    )
+    assert (await rpc_q.get()).ok
+    try:
+        await _submit(orchestrator, _append_audio())
+        assert not clients[0].add_request_calls
+        await _submit(orchestrator, commands.Commit(final=True, create_response=True))
+        assert len(seen) == 1
+        assert seen[0]["prompt"]["multi_modal_data"]["audio"][0][0].shape == (16000,)
+        submitted = clients[0].add_request_calls[0][0]
+        assert submitted.resumable is False
+        assert not orchestrator.request_states[submitted.request_id].streaming.enabled
+    finally:
+        await _close(orchestrator, rpc_q)
+
+
+@pytest.mark.asyncio
+async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() -> None:
+    from vllm_omni.engine.duplex.plugin import PartialStageForward
+
+    orchestrator, *_ = _build(stages=4)
+    forwarded: list[object] = []
+
+    async def record_forward(req_id, stage_id, output, req_state, **kwargs):
+        del req_id, stage_id, req_state, kwargs
+        forwarded.append(output)
+
+    async def no_intercept(*args, **kwargs):
+        del args, kwargs
+        return False
+
+    orchestrator._forward_to_next_stage = record_forward  # type: ignore[method-assign]
+    orchestrator._intercept_stage_output = no_intercept  # type: ignore[method-assign]
+    orchestrator.async_chunk = True
+    orchestrator._stage_receives_async_chunks = lambda stage_id: False  # type: ignore[method-assign]
+
+    full = SimpleNamespace(request_id="r", finished=True, text="FULL")
+    chunk = SimpleNamespace(request_id="r", finished=True, text="CHUNK")
+    req_state = DuplexOrchestratorRequestState(
+        request_id="r",
+        final_stage_id=3,
+        session_owned=True,
+        sampling_params_list=[SimpleNamespace() for _ in range(4)],
+    )
+    orchestrator.plugin.plan_partial_stage_output = lambda *args, **kwargs: PartialStageForward(  # type: ignore[method-assign]
+        output=chunk, is_final_update=True
+    )
+    orchestrator.plugin.partial_stage_followup = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    await orchestrator._route_output(1, 0, full, req_state, None)
+
+    assert forwarded == [chunk]
+    assert req_state.skip_legacy_stage_forward is False
+
+    forwarded.clear()
+    orchestrator.plugin.plan_partial_stage_output = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    await orchestrator._route_output(1, 0, full, req_state, None)
+
+    assert forwarded == [full]
+
+
+def test_default_plugin_declares_no_draining_stages() -> None:
+    plugin = MiniCPMO45DuplexPlugin(_encode_audio)
+    assert plugin.draining_stage_ids(stage_count=4) == frozenset()

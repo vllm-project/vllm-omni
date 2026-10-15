@@ -279,19 +279,19 @@ def _install_native_modules(monkeypatch: pytest.MonkeyPatch, events: list[tuple]
         group = SimpleNamespace(get_metadata_builder=lambda _index: SimpleNamespace(reorder_batch_threshold=None))
         return [[group], [group]], "cg-support", [4, 8]
 
-    # vLLM 0.29 dropped attn_groups and cache_dtype from init_kv_cache: the
-    # layout now rides on the resolved CacheConfig.kv_cache_layout instead.
+    # f2aad6aa70 (#56888): first arg is forward_context; return a cache dict.
     def init_cache(
-        runner_kv_caches,
         forward_context,
         kv_cache_config,
         device,
         kernel_block_sizes,
         vllm_config,
+        kv_cache_allocation_context=None,
+        *,
+        block_tables=None,
     ):
         events.append(("cache", kv_cache_config, kernel_block_sizes))
-        runner_kv_caches.extend(["cache-0", "cache-1"])
-        return {"layer-0": "tensor-0", "layer-1": "tensor-1"}
+        return {"layer-0": "cache-0", "layer-1": "cache-1"}
 
     monkeypatch.setattr(model_runner_backend_module, "init_attn_backend", init_backend)
     monkeypatch.setattr(model_runner_backend_module, "init_kv_cache", init_cache)
@@ -325,7 +325,7 @@ def _runner(
         model_config=SimpleNamespace(max_model_len=max_len),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=max_num_batched_tokens,
-            max_num_seqs=max_num_seqs,
+            max_num_seqs=max_num_seqs * max_rows_per_request,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=cp_size,
@@ -403,7 +403,7 @@ def test_initialize_failure_does_not_publish_partial_cache_state(
     successful_init_cache = model_runner_backend_module.init_kv_cache
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=16),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=32, max_num_seqs=1),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32, max_num_seqs=2),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,
             cp_kv_cache_interleave_size=1,
@@ -431,8 +431,7 @@ def test_initialize_failure_does_not_publish_partial_cache_state(
         ],
     )
 
-    def fail_init_cache(runner_kv_caches, *_args, **_kwargs):
-        runner_kv_caches.append("partial-cache")
+    def fail_init_cache(forward_context, *_args, **_kwargs):
         backend._kv_cache_layer_adapters["layer-0"].kv_cache = "partial-binding"
         raise RuntimeError("cache binding failed")
 
@@ -445,7 +444,7 @@ def test_initialize_failure_does_not_publish_partial_cache_state(
     assert backend.block_tables is None
     assert backend.paged_attention_adapter is None
     assert backend._kv_cache_layer_adapters["layer-0"].kv_cache == "placeholder-0"
-    assert backend.vllm_config.scheduler_config.max_num_seqs == 1
+    assert backend.vllm_config.scheduler_config.max_num_seqs == 2
 
     monkeypatch.setattr(model_runner_backend_module, "init_kv_cache", successful_init_cache)
     backend.initialize_kv_cache(config)

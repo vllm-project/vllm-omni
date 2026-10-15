@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for Qwen2.5-Omni embed_input_ids to verify embeddings are
 correctly assigned to audio/image/video token positions.
@@ -17,6 +17,8 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.multimodal.utils import set_mm_embedding_modality
+
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -83,35 +85,31 @@ def make_interleaved_seq(video_chunks: list[int], audio_chunks: list[int], text_
 class TestCheckInterleavedAudioVideo:
     def test_non_interleaved_audio_then_video(self):
         """Audio entirely before video -> not interleaved."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(5, 0, 4)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_non_interleaved_with_image(self):
         """Audio + image + video (the mixed_modalities case) -> not interleaved."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(5, 4, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_no_audio(self):
         """Video only -> not interleaved."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(0, 0, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_interleaved(self):
         """V A V A interleaved -> True."""
-        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_interleaved_seq([4, 4], [3, 3])
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +328,56 @@ class TestEmbedInputIds:
         assert result[audio_pos].allclose(torch.full((audio_n, hidden), audio_val)), (
             "Interleaved: audio positions should get audio embeddings"
         )
+
+    def test_interleaved_audio_boundaries_keep_text_embeddings(self, mocker: MockerFixture):
+        from vllm.multimodal.processing.processor import PlaceholderFeaturesInfo
+
+        from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+            Qwen2_5OmniThinkerMultiModalProcessor,
+        )
+
+        processor = mocker.Mock()
+        processor.info.get_hf_processor.return_value = mocker.Mock(audio_token="audio", video_token="video")
+        processor.info.get_tokenizer.return_value.get_vocab.return_value = {
+            "audio": AUDIO_TOKEN_ID,
+            "video": VIDEO_TOKEN_ID,
+        }
+        # Real audio_bos/audio_eos IDs from the failing use_audio_in_video input.
+        tokens = [151647, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, 151648]
+        placeholder = PlaceholderFeaturesInfo(
+            modality="video",
+            item_idx=0,
+            start_idx=2,
+            tokens=tokens,
+            is_embed=torch.ones(len(tokens), dtype=torch.bool),
+        )
+        placeholders = Qwen2_5OmniThinkerMultiModalProcessor._derive_audio_from_video_placeholders(
+            processor,
+            {"video": [placeholder]},
+            {"audio": [[object()]]},
+            [True],
+        )
+
+        input_ids = torch.tensor([TEXT_TOKEN_ID] * 2 + tokens + [TEXT_TOKEN_ID])
+        is_multimodal = torch.zeros_like(input_ids, dtype=torch.bool)
+        for modality in ("audio", "video"):
+            derived = placeholders[modality][0].to_range()
+            is_multimodal[derived.offset : derived.offset + derived.length] |= derived.is_embed
+
+        model, hidden = make_mock_model(mocker, thinker_cls=_omni_qwen2_5_thinker_cls())
+        text_embeddings = model.get_language_model().embed_input_ids(input_ids)
+        result = model.embed_input_ids(
+            input_ids,
+            build_mm_embeds(audio_n=2, image_n=0, video_n=2, hidden=hidden),
+            is_multimodal=is_multimodal,
+        )
+
+        is_audio = input_ids == AUDIO_TOKEN_ID
+        is_video = input_ids == VIDEO_TOKEN_ID
+        assert torch.equal(is_multimodal, is_audio | is_video)
+        torch.testing.assert_close(result[is_audio], torch.full((2, hidden), 10.0))
+        torch.testing.assert_close(result[is_video], torch.full((2, hidden), 30.0))
+        torch.testing.assert_close(result[~(is_audio | is_video)], text_embeddings[~(is_audio | is_video)])
 
 
 # ---------------------------------------------------------------------------

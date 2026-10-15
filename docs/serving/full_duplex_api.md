@@ -5,7 +5,7 @@ continue receiving speech while producing speech. It adds persistent session
 state, model-specific turn policy, overlap handling, playback acknowledgement,
 and optional session resume.
 
-Full duplex is distinct from the turn-based [Realtime Audio API](realtime_api.md).
+Full duplex is distinct from the turn-based [Realtime Audio API](realtime_openai_duplex_api.md).
 
 This page is the endpoint overview. For the complete wire contract, the
 `vllm_omni.clients.duplex.DuplexClient` Python library, and the per-model
@@ -22,14 +22,14 @@ capability gates, see the [Realtime Duplex API guide](realtime_duplex_api.md).
 ## Enable Full Duplex
 
 A model is served full duplex when its registered pipeline declares a
-`duplex_plugin` (the model's `DuplexModelPlugin`). That declaration alone
-decides it: `vllm-omni serve` constructs `DuplexOmni` instead of `AsyncOmni`,
-and every surface the server exposes is backed by a duplex session. It serves
+`duplex_plugin` (the model's `DuplexModelPlugin`) and its deploy configuration
+sets `session_mode: duplex`. `vllm serve --omni` constructs `DuplexOmni`
+instead of `AsyncOmni`. It serves
 `/v1/realtime?duplex=1` (and its alias `/v1/duplex`),
 `POST /v1/chat/completions`, `/v1/models` and `/health`; every other
 turn-based HTTP route (speech, batch, embeddings, video, ...) answers "not
-available". Turn-based use of such a model stays available offline through the
-Python API (`Omni` / `AsyncOmni`).
+available". Set `session_mode: turn` to select the ordinary online serving
+stack instead. The model's supported tasks and endpoint restrictions still apply.
 
 `/v1/chat/completions` is the ordinary chat service running on the duplex
 engine: a request is a turn-based generation on the same stages, served
@@ -45,8 +45,24 @@ The deploy configuration of such a model must agree:
 session_mode: duplex
 ```
 
-A duplex model started with a deploy configuration that does not set it fails
-at startup rather than falling back to turn-based serving.
+A duplex-capable model must explicitly set `session_mode` to `duplex` or `turn`
+in its deploy configuration, possibly through `base_config` inheritance.
+Missing or invalid values fail at startup. The default MiniCPM-o deployment
+continues to use duplex mode.
+
+To run MiniCPM-o 4.5 with the turn-based engine:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5_turn.yaml \
+  --trust-remote-code \
+  --port 8091
+```
+
+This profile inherits the default model and stage settings and overrides only
+`session_mode`. It supports ordinary HTTP requests without creating a duplex
+session handler. Mode selection happens at startup; a WebSocket query parameter
+does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
 
 !!! warning
 
@@ -56,11 +72,20 @@ at startup rather than falling back to turn-based serving.
     `session.created.session.capabilities` is present before treating the
     connection as full duplex.
 
-**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`) is the only model
-served over this endpoint today. PersonaPlex and Nemotron VoiceChat still carry
-their pre-framework duplex code: their pipelines declare no `duplex_plugin`, so
-they run turn-based until the follow-up PRs port them to the plugin contract
+**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`), **Qwen3-Omni**
+(`vllm_omni/deploy/qwen3_omni_duplex.yaml`), and **Nemotron VoiceChat**
+(`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
+over this endpoint today. PersonaPlex still carries its pre-framework duplex
+code: its pipeline declares no `duplex_plugin`, so it runs turn-based until the
+follow-up PR ports it to the plugin contract
 (RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
+
+For Nemotron VoiceChat Python clients, use
+`vllm_omni.clients.nemotron_voicechat.create_duplex_session_config()` with
+`DuplexClient`. The preset selects 16 kHz float32 input, 22.05 kHz PCM16 output,
+and automatic responses. Append 1,280-sample (80 ms) input frames; when using
+`stream_pcm`, set `chunk_ms=80`. Pass `instructions` and optional `tools` to
+the preset before opening the session.
 
 JoyVL is a separate HTTP interaction orchestrator and does not use these
 WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).

@@ -422,7 +422,17 @@ def test_build_plucker_embedding_uses_framewise_deltas_for_rotations_and_transla
     torch.testing.assert_close(result[2, 3:, 0, 1], expected_direction)
 
 
-def test_build_plucker_embedding_normalizes_framewise_translation_by_max_norm() -> None:
+@pytest.mark.parametrize(
+    ("translation_scale", "expected_origins"),
+    [
+        (None, [[0.0, 0.0, 0.0], [0.3, 0.4, 0.0], [0.6, 0.8, 0.0]]),
+        (0.05, [[0.0, 0.0, 0.0], [60.0, 80.0, 0.0], [120.0, 160.0, 0.0]]),
+    ],
+)
+def test_build_plucker_embedding_normalizes_framewise_translation_by_max_norm(
+    translation_scale: float | None,
+    expected_origins: list[list[float]],
+) -> None:
     poses = torch.eye(4).repeat(3, 1, 1)
     poses[:, :3, 3] = torch.tensor(
         [
@@ -440,10 +450,37 @@ def test_build_plucker_embedding_normalizes_framewise_translation_by_max_norm() 
         target_width=1,
         device=torch.device("cpu"),
         dtype=torch.float32,
+        translation_scale=translation_scale,
     )
 
-    expected_origins = torch.tensor([[0.0, 0.0, 0.0], [0.3, 0.4, 0.0], [0.6, 0.8, 0.0]])
-    torch.testing.assert_close(result[:, :3, 0, 0], expected_origins)
+    torch.testing.assert_close(result[:, :3, 0, 0], torch.tensor(expected_origins))
+
+    from vllm_omni.diffusion.models.lingbot_world.actions import LINGBOT_CONTROLLER_TRANSLATION_UNIT
+
+    if translation_scale != LINGBOT_CONTROLLER_TRANSLATION_UNIT:
+        return
+    # Fixed controller unit keeps relative speed; max-norm would collapse both to 1.
+    slow = torch.eye(4).repeat(2, 1, 1)
+    slow[1, 2, 3] = 0.005
+    fast = torch.eye(4).repeat(2, 1, 1)
+    fast[1, 2, 3] = 0.5
+    kwargs = dict(
+        height=1,
+        width=1,
+        target_height=1,
+        target_width=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        translation_scale=LINGBOT_CONTROLLER_TRANSLATION_UNIT,
+    )
+    slow_origin = build_plucker_embedding(_trajectory(slow), **kwargs)[1, :3, 0, 0]
+    fast_origin = build_plucker_embedding(_trajectory(fast), **kwargs)[1, :3, 0, 0]
+    torch.testing.assert_close(slow_origin, torch.tensor([0.0, 0.0, 0.1]))
+    torch.testing.assert_close(fast_origin, torch.tensor([0.0, 0.0, 10.0]))
+    wasd = torch.eye(4).repeat(2, 1, 1)
+    wasd[1, 2, 3] = LINGBOT_CONTROLLER_TRANSLATION_UNIT
+    wasd_origin = build_plucker_embedding(_trajectory(wasd), **kwargs)[1, :3, 0, 0]
+    torch.testing.assert_close(wasd_origin, torch.tensor([0.0, 0.0, 1.0]))
 
 
 def test_build_plucker_embedding_interpolates_raw_poses_before_framewise_conversion() -> None:

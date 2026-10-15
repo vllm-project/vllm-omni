@@ -389,7 +389,11 @@ def _invert_camera_poses(poses: torch.Tensor) -> torch.Tensor:
     return inverse
 
 
-def _prepare_framewise_poses(raw_poses: torch.Tensor) -> torch.Tensor:
+def _prepare_framewise_poses(
+    raw_poses: torch.Tensor,
+    *,
+    translation_scale: float | None = None,
+) -> torch.Tensor:
     """Convert raw C2W poses to normalized first-relative framewise deltas."""
 
     # Remove global placement, then convert the sequence to framewise deltas.
@@ -402,12 +406,19 @@ def _prepare_framewise_poses(raw_poses: torch.Tensor) -> torch.Tensor:
             relative_poses[1:],
         )
 
-    # Only relative direction/magnitude matters to the checkpoint; normalizing
-    # by the largest step removes the trajectory's arbitrary translation scale.
+    # Normalizing the control's scale. Different between scripted and realtime input.
     translations = relative_poses[:, :3, 3]
-    max_translation_norm = torch.linalg.vector_norm(translations, dim=-1).max()
-    if max_translation_norm > 0:
-        relative_poses[:, :3, 3] = translations / max_translation_norm
+    if translation_scale is None:
+        # Scripted action_path input: divide by the largest step so an arbitrary recording scale becomes 1.
+        scale = torch.linalg.vector_norm(translations, dim=-1).max()
+    else:
+        # Realtime interaction input: use the controller translation unit (one WASD step = full speed).
+        # It cannot see future motion or normalize globally.
+        if translation_scale <= 0:
+            raise ValueError(f"translation_scale must be > 0, got {translation_scale}")
+        scale = translation_scale
+    if float(scale) > 0:
+        relative_poses[:, :3, 3] = translations / scale
     return relative_poses
 
 
@@ -420,6 +431,7 @@ def build_plucker_embedding(
     target_width: int,
     device: torch.device,
     dtype: torch.dtype,
+    translation_scale: float | None = None,
 ) -> torch.Tensor:
     """Build checkpoint-ordered ``(ray origin, ray direction)`` channels."""
 
@@ -438,7 +450,10 @@ def build_plucker_embedding(
 
     # Compute geometry in at least FP32, then cast at the model boundary.
     compute_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
-    poses = _prepare_framewise_poses(trajectory.poses.to(device=device, dtype=compute_dtype))
+    poses = _prepare_framewise_poses(
+        trajectory.poses.to(device=device, dtype=compute_dtype),
+        translation_scale=translation_scale,
+    )
     intrinsics = trajectory.intrinsics.to(device=device, dtype=compute_dtype).clone()
     intrinsics[:, (0, 2)] *= width / _REFERENCE_WIDTH
     intrinsics[:, (1, 3)] *= height / _REFERENCE_HEIGHT

@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,76 @@ from vllm_omni.entrypoints.cli.benchmark.cli_args import (
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
+
+
+def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path):
+    """Exercise real dataset/benchmark code; replace only the HTTP backend."""
+    from vllm_omni.benchmarks import serve
+    from vllm_omni.benchmarks.patch import patch
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+
+    dataset_path = Path(__file__).parents[1] / "assets/hunyuan_image3/it2i.jsonl"
+    sample = json.loads(dataset_path.read_text(encoding="utf-8"))
+    parser = argparse.ArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--model",
+            "test-model",
+            "--endpoint",
+            "/v1/images/edits",
+            "--dataset-name",
+            "custom_image",
+            "--dataset-path",
+            str(dataset_path),
+            "--skip-tokenizer-init",
+            "--disable-shuffle",
+            "--disable-tqdm",
+            "--num-prompts",
+            "8",
+            "--num-warmups",
+            "2",
+            "--max-concurrency",
+            "1",
+            "--ready-check-timeout-sec",
+            "0",
+            "--percentile-metrics",
+            "e2el",
+            "--extra-body",
+            '{"seed":42,"guidance_scale":2.5,"bot_task":"think_recaption"}',
+            "--save-result",
+            "--result-dir",
+            str(tmp_path),
+            "--result-filename",
+            "result.json",
+        ]
+    )
+    requests = []
+
+    async def request_func(request_func_input, session, pbar=None):
+        requests.append(request_func_input)
+        if pbar is not None:
+            pbar.update(1)
+        return patch.MixRequestFuncOutput(
+            success=True,
+            prompt_len=1,
+            output_tokens=1,
+            image_count=1,
+            start_time=time.perf_counter(),
+            latency=99.0 if len(requests) <= 2 else 0.1,
+        )
+
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "/v1/images/edits", request_func)
+    result = serve.main(args)
+    assert len(requests) == 10
+    for request in requests:
+        assert request.prompt == sample["prompt"]
+        assert [image["image_url"]["url"] for image in request.multi_modal_content] == sample["image_files"]
+        assert request.extra_body == args.extra_body
+    assert result["completed"] == 8
+    saved = json.loads((tmp_path / "result.json").read_text())
+    assert saved["completed"] == 8
+    assert saved["mean_e2el_ms"] == pytest.approx(100.0)  # Excludes both 99-second warmups.
 
 
 @pytest.mark.parametrize(
@@ -61,6 +132,7 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
         (["--omniinteract-subsets", "1qna"], "omniinteract_subsets", ["1qna"]),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
+        (["--seed-tts-reference-as-input"], "seed_tts_reference_as_input", True),
     ],
 )
 def test_add_omni_args_registers_arguments_on_tracking_parser(
@@ -151,6 +223,53 @@ def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
     preprocess_serve_args(args)
 
     assert args.num_prompts == expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        (["--seed", "7"], "cannot be combined with --seed"),
+        (["--dataset-path", "/tmp/omniinteract-data"], "cannot be combined with --dataset-path"),
+        (["--omniinteract-scenario-tags", "realtime"], "cannot be combined with --omniinteract-scenario-tags"),
+        (["--omniinteract-scenario-focus"], "cannot be combined with --omniinteract-scenario-focus"),
+    ],
+)
+def test_preprocess_serve_args_rejects_omniinteract_video_list_conflicts(
+    tmp_path: Path,
+    extra: list[str],
+    match: str,
+) -> None:
+    ref = tmp_path / "ref.wav"
+    ref.touch()
+    video_list = tmp_path / "list.jsonl"
+    video_list.write_text("{}\n")
+    parser = TrackingArgumentParser()
+    parser.add_argument("--dataset-name", default="sharegpt")
+    parser.add_argument("--backend", default="vllm")
+    parser.add_argument("--endpoint", default="/v1/completions")
+    parser.add_argument("--model", default="dummy")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--num-prompts", type=int, default=1000)
+    parser.add_argument("--max-concurrency", type=int, default=None)
+    add_omni_args(parser)
+    args = parser.parse_args(
+        [
+            "--dataset-name",
+            "omniinteract",
+            "--backend",
+            "openai-realtime-duplex",
+            "--endpoint",
+            "/v1/realtime",
+            "--omniinteract-ref-audio",
+            str(ref),
+            "--omniinteract-video-list",
+            str(video_list),
+            *extra,
+        ]
+    )
+    with pytest.raises(ValueError, match=match):
+        preprocess_serve_args(args)
 
 
 @pytest.mark.parametrize(
@@ -293,6 +412,19 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
                 async def close(self):
                     return None
 
+            class MockTokenizer:
+                vocab_size = 256
+                all_special_ids = []
+
+                def num_special_tokens_to_add(self, *args, **kwargs):
+                    return 0
+
+                def decode(self, token_ids, *args, **kwargs):
+                    return " ".join(str(token_id) for token_id in token_ids)
+
+                def encode(self, text, *args, **kwargs):
+                    return [int(token_id) for token_id in text.split()]
+
             # Patch globally so modules loaded after this also see the mock
             import aiohttp
             aiohttp.ClientSession = MockClientSession
@@ -302,6 +434,11 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
             import vllm_omni.benchmarks.patch.patch as patch_mod
             patch_mod.aiohttp.ClientSession = MockClientSession
             patch_mod.aiohttp.TCPConnector = lambda *args, **kwargs: object()
+
+            # This test exercises CLI and HTTP routing, not model tokenization.
+            # Keep its subprocess independent of hub access and model caches.
+            import vllm.benchmarks.serve as benchmark_serve
+            benchmark_serve.get_tokenizer = lambda *args, **kwargs: MockTokenizer()
 
             calls_file = os.environ.get("VLLM_OMNI_TEST_POST_CALLS_FILE")
 
@@ -319,6 +456,9 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     env = os.environ.copy()
     env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env.get("PYTHONPATH", "")
     env["VLLM_OMNI_TEST_POST_CALLS_FILE"] = str(calls_path)
+    env["HF_HOME"] = str(tmp_path / "hf-cache")
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
 
     cmd = [
         "vllm",
@@ -393,3 +533,10 @@ def test_omni_request_timeout_s_flag_defaults_and_parses() -> None:
 
     args = parser.parse_args(["--omni-request-timeout-s", "3600"])
     assert args.omni_request_timeout_s == 3600.0
+
+
+def test_realtime_chat_choice_is_available_without_importing_runtime() -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--backend", choices=["openai-chat-omni"])
+    extend_omni_choices(parser)
+    assert parser.parse_args(["--backend", "openai-realtime-chat"]).backend == "openai-realtime-chat"

@@ -14,12 +14,13 @@ from tests.diffusion.models.magi2.test_native_packing import (
 )
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.magi2.sampler_magi2 import CFGConfig
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
     pytest.mark.diffusion,
     pytest.mark.core_model,
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA"),
 ]
 
 

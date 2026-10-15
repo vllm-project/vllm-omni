@@ -7,6 +7,8 @@ online serving stack (CLI arg parsing, subprocess, API routing, response
 encoding) using tiny models.
 """
 
+from pathlib import Path
+
 import pytest
 from xdist import is_xdist_worker
 
@@ -29,8 +31,8 @@ from tests.model_tests.diffusion.task_runners import (
 )
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-# NOTE : Hardware marks are added dynamically based on test requirements
-pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
+# NOTE: Hardware and model type marks are added dynamically based on test requirements and model type
+pytestmark = [pytest.mark.xdist]
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +70,10 @@ def test_online_on_supported_tasks(
     model_path = tiny_model_paths[model_name]
     server_args = build_server_args_from_diff_accelerations(accelerations)
     server_args.append("--enforce-eager")
+    settings = DIFFUSION_TEST_SETTINGS[model_name]
+    if settings.checkpoint_filename is not None:
+        model_path = str(Path(model_path) / settings.checkpoint_filename)
+        server_args.extend(["--model-class-name", model_name])
 
     with OmniServer(model_path, server_args) as server:
         # TODO: We may want to revisit run_level validation here,

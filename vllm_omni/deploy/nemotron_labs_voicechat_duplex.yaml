@@ -58,7 +58,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_chunk_frames: 1
       # PARITY: delete this line together with the stage-1 hf_overrides
       # below (the vendored talker drains chunks model-side and keeps the

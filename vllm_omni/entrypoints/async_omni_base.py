@@ -24,7 +24,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
@@ -33,12 +33,11 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
-_FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
-# Blocking-wait interval for the event-driven final-output drain
-# (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): a message wakes the drain immediately via
-# the janus queue's condition variable; this timeout only bounds how often the
-# orchestrator liveness check runs while the pipeline is idle.
-_FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
+# A queued output wakes the final-output loop immediately; this wait only
+# bounds how often the orchestrator liveness check runs while idle.
+_FINAL_OUTPUT_WAIT_S = 1.0
+# Longest the final-output loop dispatches a batch before yielding the loop.
+_FINAL_OUTPUT_YIELD_INTERVAL_S = 0.001
 # Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
 ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 
@@ -71,6 +70,9 @@ class AsyncEventResolver:
 
         if tid is None and isinstance(ack, dict):
             tid = ack.get("task_id")
+        if tid is None:
+            logger.warning("Received ACK without a task_id")
+            return
 
         async with self._lock:
             task_info = self._pending_tasks.get(tid)
@@ -155,13 +157,13 @@ class AsyncOmniBase(OmniBase):
 
     def _get_comprehension_stage_index(self) -> int | None:
         fallback_idx: int | None = None
-        for idx, stage_client in enumerate(self.engine.stage_clients):
+        for idx, stage_config in enumerate(self.engine.stage_configs):
             stage_vllm_config = self.engine.stage_vllm_configs[idx]
             if stage_vllm_config is None:
                 continue
             if fallback_idx is None:
                 fallback_idx = idx
-            if stage_client.is_comprehension:
+            if stage_config.is_comprehension:
                 return idx
         return fallback_idx
 
@@ -171,6 +173,17 @@ class AsyncOmniBase(OmniBase):
         if self.input_processor is None:
             return None
         return self.input_processor.renderer
+
+    def resolve_entry_stage_id(self, input_modalities: Iterable[str]) -> int:
+        """Return the stage a request with ``input_modalities`` enters at: 1 when stage 0 declares
+        ``bypass_without_modalities`` and the request carries none of them, else 0."""
+        stage_configs = self.engine.stage_configs
+        bypass_without = set(getattr(stage_configs[0], "bypass_without_modalities", ())) if stage_configs else set()
+        return 1 if bypass_without and bypass_without.isdisjoint(input_modalities) else 0
+
+    def get_stage_renderer(self, stage_id: int):
+        """Return the renderer for chat requests that bypass stage 0 and enter at ``stage_id``."""
+        return self.engine.get_stage_renderer(stage_id)
 
     @property
     def vllm_config(self):
@@ -186,12 +199,10 @@ class AsyncOmniBase(OmniBase):
 
     def get_diffusion_od_config(self) -> Any | None:
         """Return the diffusion-stage config when the pipeline has one."""
-        saw_diffusion_stage = False
+        saw_diffusion_stage = any(stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs)
         for stage_client in self.engine.stage_clients:
             if getattr(stage_client, "stage_type", None) != "diffusion":
                 continue
-
-            saw_diffusion_stage = True
 
             od_config = getattr(stage_client, "od_config", None)
             if od_config is not None:
@@ -313,79 +324,74 @@ class AsyncOmniBase(OmniBase):
 
         engine = self.engine
 
-        # Event-driven drain (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): block on the
-        # queue's condition variable in a dedicated thread instead of the
-        # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
-        # event-driven loop (vllm_omni/engine/orchestrator.py).
-        from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
-
-        event_driven_drain = _event_driven_orch_enabled() and hasattr(engine, "get_output_blocking_async")
-
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
             try:
+                last_yield = time.monotonic()
                 while True:
-                    if event_driven_drain:
-                        msg = await engine.get_output_blocking_async(timeout=_FINAL_OUTPUT_BLOCKING_WAIT_S)
-                        if msg is None:
-                            # Timed out with the orchestrator alive; loop for
-                            # the periodic liveness check.
-                            continue
-                    else:
-                        msg = await engine.try_get_output_async()
-                        if msg is None:
-                            await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
-                            continue
-
-                    if self._route_engine_message(msg):
+                    msgs: list[EngineQueueMessage] = await engine.get_outputs_async(timeout=_FINAL_OUTPUT_WAIT_S)
+                    if not msgs:
+                        # Timed out with the orchestrator alive; loop for the
+                        # periodic liveness check.
                         continue
 
-                    if isinstance(msg, dict) and msg.get("type") == "ack":
-                        ack_data = msg.get("ack")
-                        tid = getattr(ack_data, "task_id", "unknown")
-                        logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid}")
-                        await self.event_resolver.resolve(ack_data)
-                        continue
-                    if isinstance(msg, OmniACK):
-                        logger.info(f"[{self._name}] Intercepted raw ACK object: {msg.task_id}")
-                        await self.event_resolver.resolve(msg)
-                        continue
-                    if hasattr(msg, "task_id"):
-                        tid = getattr(msg, "task_id")
-                        logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
-                        await self.event_resolver.resolve(msg)
-                        continue
-
-                    if isinstance(msg, ErrorMessage):
-                        # Route request-scoped errors to that request's queue and
-                        # keep the loop alive. A request whose stage replica died
-                        # and was evicted gets a fatal error delivered here; only
-                        # that request fails (its consumer raises), the server
-                        # stays up for other stages/requests (#4285). A fatal
-                        # error without a request_id is a genuine engine-wide
-                        # death and falls through to the except handler below.
-                        if msg.request_id is not None:
-                            req_state = self.request_states.get(msg.request_id)
-                            if req_state is not None:
-                                await req_state.queue.put(msg)
-                            else:
-                                logger.warning(
-                                    "[%s] dropping error for unknown req %s",
-                                    self._name,
-                                    msg.request_id,
-                                )
-                            continue
-                        if not msg.fatal:
+                    for msg in msgs:
+                        if time.monotonic() - last_yield >= _FINAL_OUTPUT_YIELD_INTERVAL_S:
+                            await asyncio.sleep(0)
+                            last_yield = time.monotonic()
+                        if self._route_engine_message(msg):
                             continue
 
-                    should_continue, _, stage_id, req_state = self._handle_output_message(msg)
-                    if should_continue:
-                        continue
+                        if isinstance(msg, dict) and msg.get("type") == "ack":
+                            ack_data = msg.get("ack")
+                            tid = getattr(ack_data, "task_id", "unknown")
+                            logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid}")
+                            await self.event_resolver.resolve(ack_data)
+                            continue
+                        if isinstance(msg, OmniACK):
+                            logger.info(f"[{self._name}] Intercepted raw ACK object: {msg.task_id}")
+                            await self.event_resolver.resolve(msg)
+                            continue
+                        if hasattr(msg, "task_id"):
+                            tid = getattr(msg, "task_id")
+                            logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
+                            await self.event_resolver.resolve(msg)
+                            continue
 
-                    req_state.stage_id = stage_id
+                        if isinstance(msg, ErrorMessage):
+                            # Route request-scoped errors to that request's queue and
+                            # keep the loop alive. A request whose stage replica died
+                            # and was evicted gets a fatal error delivered here; only
+                            # that request fails (its consumer raises), the server
+                            # stays up for other stages/requests (#4285). A fatal
+                            # error without a request_id is a genuine engine-wide
+                            # death and falls through to the except handler below.
+                            if msg.request_id is not None:
+                                req_state = self.request_states.get(msg.request_id)
+                                if req_state is not None:
+                                    await req_state.queue.put(msg)
+                                else:
+                                    logger.warning(
+                                        "[%s] dropping error for unknown req %s",
+                                        self._name,
+                                        msg.request_id,
+                                    )
+                                continue
+                            if not msg.fatal:
+                                continue
 
-                    # Route to the per-request queue
-                    await req_state.queue.put(msg)
+                        should_continue, _, stage_id, req_state = self._handle_output_message(msg)
+                        if should_continue:
+                            continue
+
+                        assert req_state is not None
+                        req_state.stage_id = stage_id
+
+                        # Route to the per-request queue
+                        await req_state.queue.put(msg)
+
+                    await asyncio.sleep(0)
+                    last_yield = time.monotonic()
 
             except asyncio.CancelledError:
                 raise
@@ -479,7 +485,22 @@ class AsyncOmniBase(OmniBase):
             if state is not None and rid not in delivered:
                 queue = getattr(state, "queue", None)
                 if queue is not None:
-                    await state.queue.put(self._synthetic_abort_output_message(rid))
+                    final_stage_id = getattr(state, "final_stage_id", None)
+                    if final_stage_id is None:
+                        final_stage_id = 0
+                    stage_metadata = getattr(self, "_stage_meta_list", ())
+                    final_output_type = (
+                        getattr(stage_metadata[final_stage_id], "final_output_type", None)
+                        if final_stage_id < len(stage_metadata)
+                        else None
+                    ) or "text"
+                    await state.queue.put(
+                        self._synthetic_abort_output_message(
+                            rid,
+                            stage_id=final_stage_id,
+                            final_output_type=final_output_type,
+                        )
+                    )
                     delivered.add(rid)
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
@@ -491,13 +512,18 @@ class AsyncOmniBase(OmniBase):
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
     @staticmethod
-    def _synthetic_abort_output_message(request_id: str) -> OutputMessage:
+    def _synthetic_abort_output_message(
+        request_id: str,
+        *,
+        stage_id: int,
+        final_output_type: str,
+    ) -> OutputMessage:
         """Terminal abort OutputMessage used when the engine returned none."""
         engine_output = OmniRequestOutput(
             request_id=request_id,
             finished=True,
-            stage_id=0,
-            final_output_type="text",
+            stage_id=stage_id,
+            final_output_type=final_output_type,
             outputs=[
                 CompletionOutput(
                     index=0,
@@ -512,7 +538,7 @@ class AsyncOmniBase(OmniBase):
         )
         return OutputMessage(
             request_id=request_id,
-            stage_id=0,
+            stage_id=stage_id,
             replica_id=None,
             engine_outputs=engine_output,
             metrics=None,
@@ -543,7 +569,8 @@ class AsyncOmniBase(OmniBase):
 
     # ==================== EngineClient Interface ====================
 
-    async def check_health(self) -> None:
+    # The async entrypoints expose the synchronous base health check as an awaitable.
+    async def check_health(self) -> None:  # type: ignore[override]
         """Check engine health by verifying the Orchestrator process is alive."""
         OmniBase.check_health(self)
 

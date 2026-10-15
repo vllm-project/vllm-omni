@@ -113,6 +113,19 @@ class SessionControl:
         except ValueError as exc:
             self._out.emit_error("bad_audio", str(exc))
             return None
+        if result.speech_started or result.speech_stopped:
+            logger.info(
+                "Duplex VAD session=%s started=%s stopped=%s active=%s probability=%.3f "
+                "start_ms=%s end_ms=%s commit=%s",
+                self._ctx.session.session_id,
+                result.speech_started,
+                result.speech_stopped,
+                result.speech_active,
+                result.speech_probability,
+                result.audio_start_ms,
+                result.audio_end_ms,
+                result.should_commit,
+            )
         apply_turn_detection_result(event, result)
         return result
 
@@ -310,6 +323,47 @@ class SessionControl:
                 name="duplex-continue",
             )
             return
+        item_payload = item if isinstance(item, dict) else None
+        raw_parts = item_payload.get("content", []) if item_payload is not None else []
+        parts: list[object] = [part for part in raw_parts] if isinstance(raw_parts, list) else []
+        images = [p for p in parts if isinstance(p, dict) and p.get("type") == "input_image"]
+        if images:
+            if item_payload is None or item_payload.get("role") != "user":
+                self._out.emit_error("invalid_image", "input_image is supported only in user messages")
+                return
+            if not session.capabilities.supports_image_input:
+                self._out.emit_error("unsupported", "This model does not support input_image conversation items")
+                return
+            from vllm_omni.engine.duplex.realtime_commands import validate_realtime_video_frames
+
+            urls: list[str] = []
+            for part in images:
+                url = part.get("image_url")
+                if not isinstance(url, str) or not url.startswith(
+                    ("data:image/jpeg;base64,", "data:image/png;base64,")
+                ):
+                    self._out.emit_error("invalid_image", "input_image requires a JPEG or PNG base64 data URL")
+                    return
+                error = validate_realtime_video_frames([url.split(",", 1)[1]], None)
+                if error:
+                    self._out.emit_error("invalid_image", error)
+                    return
+                urls.append(url)
+            existing: list[str] = []
+            for history_message in session.history:
+                content = history_message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "image_url":
+                        continue
+                    image_url = part.get("image_url")
+                    nested_url = image_url.get("url") if isinstance(image_url, dict) else None
+                    if isinstance(nested_url, str):
+                        existing.append(nested_url)
+            if len(existing) + len(urls) > 8 or sum(map(len, existing + urls)) > 4 * 1024 * 1024:
+                self._out.emit_error("input_backpressure", "Image context exceeds 8 images or 4 MiB; delete old items")
+                return
         message = realtime_item_to_history_message(item)
         item_id = item.get("id") if isinstance(item, dict) else None
         if message is not None:
