@@ -166,7 +166,7 @@ upload_pipeline() {
 
     FAIL_FAST=$(fail_fast)
 
-    if [[ "$BUILDKITE_BRANCH" == "main" && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+    if is_release_line_branch && [[ "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
         # AMD checkouts are depth one. Read the first-parent object ID from
         # the commit header without requiring the parent object locally.
         VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
@@ -253,7 +253,7 @@ get_diff_main() {
 }
 
 file_diff=$(get_diff)
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
+if is_release_line_branch; then
     file_diff=$(get_diff_main)
 fi
 
@@ -324,7 +324,7 @@ fi
 
 
 LIST_FILE_DIFF=$(get_diff | tr ' ' '|')
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
+if is_release_line_branch; then
     LIST_FILE_DIFF=$(get_diff_main | tr ' ' '|')
 fi
 upload_pipeline

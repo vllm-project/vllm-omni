@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import importlib.util
 import json
 import sys
@@ -13,6 +16,7 @@ def _load_excel_module():
     repo_root = Path(__file__).resolve().parents[2]
     module_path = repo_root / "tools" / "nightly" / "generate_nightly_perf_excel.py"
     spec = importlib.util.spec_from_file_location("generate_nightly_perf_excel", module_path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -57,6 +61,7 @@ def test_generate_excel_report_with_perf_templates(tmp_path: Path):
         commit_sha="test_commit_sha",
         build_id="test_build_id",
         build_url="https://example.com/build/123",
+        branch="0.30.0",
     )
 
     assert output_file.exists()
@@ -69,6 +74,7 @@ def test_generate_excel_report_with_perf_templates(tmp_path: Path):
     assert baseline_cell == json.dumps(omni_record["baseline"], ensure_ascii=False, sort_keys=True)
 
     ws_omni_summary = wb["omni_summary"]
+    assert _cell_value_by_header(ws_omni_summary, "branch") == "0.30.0"
     assert _cell_value_by_header(ws_omni_summary, "commit_sha") == "test_commit_sha"
     assert _cell_value_by_header(ws_omni_summary, "build_id") == "test_build_id"
 
