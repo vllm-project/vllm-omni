@@ -19,7 +19,7 @@ from vllm_omni.data_entry_keys import CodesStruct, EmbeddingsStruct, MetaStruct,
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
-from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, ORIGINAL_MAX_NEW_TOKENS, ChatterboxConfig
+from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, ChatterboxConfig
 
 # S3Gen's constants, the same for every checkpoint that decodes with it.
 SPEECH_TOKEN_LIMIT = ChatterboxConfig().speech_token_limit
@@ -30,16 +30,11 @@ PRE_LOOKAHEAD = ChatterboxConfig().pre_lookahead_len
 
 
 def prepare_original_prompt(prompt: dict, sampling_params_list: list[SamplingParams]) -> dict:
-    """Reject unsupported speech budgets before stage-0 input processing.
+    """Tag stage 0's sampling parameters with the request's guidance pair.
 
     This admission hook also runs for unguided and stage-0-only requests.
-    A larger engine context cannot enlarge Original's learned position table.
     """
     params = sampling_params_list[0]
-    if params.min_tokens > ORIGINAL_MAX_NEW_TOKENS:
-        raise ValueError(f"Chatterbox Original min_tokens must be at most {ORIGINAL_MAX_NEW_TOKENS}")
-    if params.max_tokens is None or params.max_tokens > ORIGINAL_MAX_NEW_TOKENS:
-        raise ValueError(f"Chatterbox Original supports at most {ORIGINAL_MAX_NEW_TOKENS} new speech tokens")
     # InputProcessor clones these parameters immediately after this transform.
     info = prompt["additional_information"]["chatterbox"]
     params.extra_args = {

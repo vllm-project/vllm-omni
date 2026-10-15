@@ -1060,8 +1060,8 @@ are unsupported by this adapter.
 Original accepts nonnegative finite `extra_params.exaggeration` and
 `extra_params.cfg_weight` (both default 0.5). Turbo rejects those fields.
 Both reject VoiceDesign, free-form instructions and multilingual synthesis.
-`max_new_tokens` defaults to 1000 speech tokens and is bounded by context;
-the API ceiling is 4096. Admission capacity does not guarantee real-time playback.
+`max_new_tokens` accepts 1 to 1000 speech tokens, upstream's generation cap,
+and defaults to 1000. Admission capacity does not guarantee real-time playback.
 
 See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original),
 [A5000 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-A5000.md) and

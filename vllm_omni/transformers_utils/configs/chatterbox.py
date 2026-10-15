@@ -19,9 +19,6 @@ import operator
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
-# Original's supported generation budget leaves room for its learned speech
-# boundary positions, regardless of the engine's configured context length.
-ORIGINAL_MAX_NEW_TOKENS = 4096
 # Upstream's ``ChatterboxTTS.generate`` defaults for its two controls.
 ORIGINAL_DEFAULT_EXAGGERATION = 0.5
 ORIGINAL_DEFAULT_CFG_WEIGHT = 0.5
@@ -119,6 +116,8 @@ class ChatterboxConfig(PretrainedConfig):
         self.num_key_value_heads = 16
         self.intermediate_size = 4096
         self.layer_norm_epsilon = 1e-5
+        # Upstream's generation cap for both checkpoints: ``inference_turbo``'s
+        # ``max_gen_len`` and ``generate``'s ``max_new_tokens``.
         self.max_new_tokens = 1000
 
         # Reference conditioning.

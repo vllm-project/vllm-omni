@@ -107,8 +107,6 @@ def original_prefill_embeds(
     speaker, reference and emotion; only text content embeddings are zeroed.
     Both initial speech tokens use learned speech position zero upstream.
     """
-    if text_ids.shape[0] > ORIGINAL_MAX_TEXT_TOKENS:
-        raise ValueError(f"Chatterbox Original supports at most {ORIGINAL_MAX_TEXT_TOKENS} text tokens")
     device = text_ids.device
     text_ids = torch.cat((text_ids.new_tensor([255]), text_ids, text_ids.new_tensor([0])))
     text = heads.text_emb(text_ids)

@@ -33,7 +33,6 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
 from vllm_omni.transformers_utils.configs.chatterbox import (
     ORIGINAL_DEFAULT_CFG_WEIGHT,
     ORIGINAL_DEFAULT_EXAGGERATION,
-    ORIGINAL_MAX_NEW_TOKENS,
     ChatterboxConfig,
 )
 
@@ -55,6 +54,7 @@ class ChatterboxAdapter(ARTTSAdapter):
     def __init__(self, ctx: SpeechServingContext) -> None:
         super().__init__(ctx)
         self.config = ChatterboxConfig(self.variant)
+        self.max_new_tokens_max = self.config.max_new_tokens
         # The deploy file's stage 0 ``additional_config`` names where the
         # reference encoders run; the API process must see that device.
         self.conditioning_device = torch.device(
@@ -187,8 +187,9 @@ class ChatterboxAdapter(ARTTSAdapter):
             return error
         if not request.input.strip():
             return "Input text cannot be empty"
-        if request.max_new_tokens is not None and request.max_new_tokens > self.max_new_tokens_max:
-            return f"Chatterbox Turbo supports at most {self.max_new_tokens_max} new speech tokens"
+        error = self._validate_max_new_tokens(request)
+        if error:
+            return error
         if request.language is not None and request.language.lower() not in {"auto", "en", "english"}:
             return "Chatterbox Turbo supports English only"
         if request.instructions:
@@ -282,7 +283,6 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
     stage_keys = frozenset({"chatterbox_original_t3"})
     variant = "original"
     sequences_per_request = 2
-    max_new_tokens_max = ORIGINAL_MAX_NEW_TOKENS
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         error = super().validate(request)

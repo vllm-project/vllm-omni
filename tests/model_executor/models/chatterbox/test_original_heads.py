@@ -97,9 +97,5 @@ def test_original_text_position_boundary():
     reference, speaker = torch.tensor([1, 2, 3]), torch.zeros(1, 2)
     prompt = original_prefill_embeds(heads, text, reference, speaker)
     assert prompt.shape == (ORIGINAL_MAX_TEXT_TOKENS + 38, 4)
-    # Invalid vocabulary IDs prove the length error happens before embedding.
-    overflow = torch.full((ORIGINAL_MAX_TEXT_TOKENS + 1,), 99999, dtype=torch.long)
-    with pytest.raises(ValueError, match="at most 2048 text tokens"):
-        original_prefill_embeds(heads, overflow, reference, speaker)
     last_speech = original_speech_embeds(heads, torch.tensor([1]), torch.tensor([ORIGINAL_SPEECH_POSITIONS - 1]))
     torch.testing.assert_close(last_speech, heads.speech_emb(torch.tensor([1])) + heads.speech_pos_emb.emb.weight[-1:])

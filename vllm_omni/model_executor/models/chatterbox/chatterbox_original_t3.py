@@ -15,6 +15,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxCFGSampler, ChatterboxMRv2CFGSampler
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import ChatterboxT3ForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.original_heads import (
+    ORIGINAL_SPEECH_POSITIONS,
     OriginalHeads,
     original_prefill_embeds,
     original_speech_embeds,
@@ -33,6 +34,10 @@ class ChatterboxOriginalT3(ChatterboxT3ForConditionalGeneration):
         nn.Module.__init__(self)
         if vllm_config.cache_config.enable_prefix_caching:
             raise ValueError("Chatterbox requires enable_prefix_caching=False for conditioned placeholder prompts")
+        # A request's speech positions stay below its context, so a context
+        # within the checkpoint's speech position table bounds every request.
+        if vllm_config.model_config.max_model_len > ORIGINAL_SPEECH_POSITIONS:
+            raise ValueError(f"Chatterbox Original supports max_model_len up to {ORIGINAL_SPEECH_POSITIONS}")
         config: ChatterboxConfig = vllm_config.model_config.hf_config
         self.config = config
         # Upstream's LLAMA_520M_CONFIG_DICT: the checkpoint's own eight-row

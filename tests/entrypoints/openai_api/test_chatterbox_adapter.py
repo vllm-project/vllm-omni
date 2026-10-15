@@ -446,7 +446,8 @@ def test_unsupported_conditioning_device_is_rejected(
 
 
 @pytest.mark.parametrize("adapter_cls", [ChatterboxAdapter, ChatterboxOriginalAdapter])
-def test_public_speech_token_cap_is_enforced_before_admission(adapter, adapter_cls):
+def test_public_speech_token_cap_is_upstreams_generation_cap(adapter, adapter_cls):
+    """Both checkpoints accept at most 1000 new speech tokens, the cap upstream generates with."""
     configured = adapter_cls(adapter.ctx)
-    assert configured.validate(OpenAICreateSpeechRequest(input="Hello.", max_new_tokens=4096)) is None
-    assert "4096" in configured.validate(OpenAICreateSpeechRequest(input="Hello.", max_new_tokens=4097))
+    assert configured.validate(OpenAICreateSpeechRequest(input="Hello.", max_new_tokens=1000)) is None
+    assert "cannot exceed 1000" in configured.validate(OpenAICreateSpeechRequest(input="Hello.", max_new_tokens=1001))

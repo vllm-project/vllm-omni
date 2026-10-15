@@ -8,10 +8,15 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
+from tests.model_executor.models.chatterbox.helpers import DEPLOY, build_stage, stage_vllm_config
 from vllm_omni.model_executor.models.chatterbox.chatterbox import ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
-from vllm_omni.model_executor.models.chatterbox.original_heads import original_prefill_embeds, original_speech_embeds
+from vllm_omni.model_executor.models.chatterbox.original_heads import (
+    ORIGINAL_SPEECH_POSITIONS,
+    original_prefill_embeds,
+    original_speech_embeds,
+)
 from vllm_omni.model_executor.stage_input_processors.chatterbox import (
     expand_original_cfg_prompts,
     prepare_original_prompt,
@@ -98,6 +103,22 @@ def test_cfg_registration_uses_external_pair_id_and_cleans_finished_requests(mod
     assert set(model.cfg_pairs) == {"internal-b"}
     model.on_requests_finished({"internal-b"})
     assert model.cfg_pairs == {}
+
+
+def test_a_context_beyond_the_speech_position_table_is_refused(
+    model_dir: str, built_stage: Callable[[str, int], ChatterboxForConditionalGeneration]
+) -> None:
+    """A request's speech positions stay below its context; a longer context would index past the table.
+
+    ``built_stage`` keeps vLLM's process groups up, which the backbone reads
+    when it is built.
+    """
+    context = ORIGINAL_SPEECH_POSITIONS + 1
+    config = stage_vllm_config(
+        model_dir, DEPLOY["original"], 0, max_model_len=context, max_num_batched_tokens=2 * context
+    )
+    with pytest.raises(ValueError, match=f"max_model_len up to {ORIGINAL_SPEECH_POSITIONS}"):
+        build_stage(config, "cpu")
 
 
 def test_prompt_length_mismatch_fails(model, metadata):
