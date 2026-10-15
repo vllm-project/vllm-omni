@@ -99,6 +99,13 @@ class SupportsStepExecution(Protocol):
     serving-scheduler cycle in between (a capability, not a policy: the runner
     that owns the scheduling decision chooses whether to group steps). It is
     optional so it does not become part of the runtime protocol check.
+
+    An optional ``group_step_states(states)`` hook may partition the prepared
+    states into compatible physical batches before ``InputBatch`` gathers
+    tensors. Every state must appear exactly once. This supports request-local
+    shape changes, such as Helios pyramid progression, within one Scheduler
+    wave. The runner retains these pipelines' updated per-request tensors and
+    rebuilds their execution views on the next tick.
     """
 
     supports_step_execution: ClassVar[bool] = True

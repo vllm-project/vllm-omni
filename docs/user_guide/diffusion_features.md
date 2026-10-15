@@ -214,8 +214,11 @@ The following tables show which models support each feature:
 > an all-gather before every GDN block. The remaining ❌ columns are simply
 > unvalidated on this model, not known-broken.
 
-> **Step execution note:** Helios supports single-request step execution only;
-> use `max_num_seqs=1`.
+> **Helios batching note:** Step continuous batching supports `max_num_seqs > 1`;
+> request-level batching is available with step execution disabled. Requests must
+> have compatible structural chunk, modality and guidance options. Current pyramid
+> states are grouped before `InputBatch` construction as their latent shapes change.
+
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines

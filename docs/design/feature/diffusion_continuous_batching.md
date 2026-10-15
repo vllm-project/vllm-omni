@@ -167,8 +167,10 @@ Configure `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or
 `diffusion_attention_config.default.backend=TORCH_SDPA` when
 `max_num_seqs>1`. See the
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
-for its validated configuration. Helios supports only a single active step
-request and must use `max_num_seqs=1`.
+for its validated configuration. Helios supports batched step states and
+request-level batches when requests have matching structural chunk and
+modality options. Request-local prompts, seeds, latent state, and chunk
+progress remain isolated per request.
 
 ### Continuous Batching
 

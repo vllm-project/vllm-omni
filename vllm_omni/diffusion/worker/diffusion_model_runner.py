@@ -1177,6 +1177,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
+        *,
+        build_batch: bool = True,
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
         pipeline = self.pipeline
@@ -1249,7 +1251,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     continue
             prepared_states.append(state)
 
-        if not prepared_states:
+        if not prepared_states or not build_batch:
             return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
@@ -1265,18 +1267,25 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         interrupted: bool = False,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
+        if callable(getattr(self.pipeline, "group_step_states", None)):
+            # Pyramid/chunk transitions can change each request's shape after
+            # denoise. Retain request-owned tensors and rebuild execution views
+            # from the new states on the next tick instead of scattering one
+            # dense tensor across now-incompatible requests.
+            self.input_batch = None
         else:
-            input_batch.latents = gathered_latents.clone()
+            gathered_latents = torch.cat([state.latents for state in states], dim=0)
+            if (
+                input_batch.latents.size() == gathered_latents.size()
+                and input_batch.latents.dtype == gathered_latents.dtype
+                and input_batch.latents.device == gathered_latents.device
+            ):
+                input_batch.latents.copy_(gathered_latents)
+            else:
+                input_batch.latents = gathered_latents.clone()
 
-        self.input_batch = input_batch
-        scatter_latents(states, input_batch)
+            self.input_batch = input_batch
+            scatter_latents(states, input_batch)
 
         # Include per-request errors, whose cache entries were already removed.
         self.release_step_requests(
@@ -1420,142 +1429,181 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 and current_omni_platform.is_available()
             ):
                 current_omni_platform.reset_peak_memory_stats()
-            states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
-            if input_batch is None:
+            group_step_states = getattr(pipeline, "group_step_states", None)
+            grouped_execution = callable(group_step_states)
+            if grouped_execution:
+                states, input_batch, runner_output_list = self._prepare_batch_inputs(
+                    states, new_request_ids, build_batch=False
+                )
+            else:
+                states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
+            if not states:
                 return BatchRunnerOutput.from_list(runner_output_list)
-            attn_metadata: dict[str, Any] = {}
+            if callable(group_step_states):
+                groups = group_step_states(states)
+            else:
+                groups = [states]
+            for group in groups:
+                group_input_batch = InputBatch.make_batch(group) if grouped_execution else input_batch
+                assert group_input_batch is not None
+                group_output = self._execute_prepared_step_batch(
+                    group,
+                    group_input_batch,
+                    record_output_peak_memory=record_output_peak_memory,
+                    in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+                )
+                runner_output_list.extend(group_output.runner_outputs)
+            if not grouped_execution:
+                return BatchRunnerOutput.from_list(runner_output_list)
+            outputs_by_id = {output.request_id: output for output in runner_output_list}
+            return BatchRunnerOutput.from_list(
+                [outputs_by_id[request_id] for request_id in scheduler_output.scheduled_request_ids]
+            )
 
-            kv_backend = getattr(self, "diffusion_kv_backend", None)
-            paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-                paged_kv_runtime=paged_kv_runtime,
-                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
-            ):
-                clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
-                denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
+    def _execute_prepared_step_batch(
+        self,
+        states: list[StepRequestState],
+        input_batch: InputBatch,
+        *,
+        record_output_peak_memory: bool,
+        in_diffusion_kv_memory_profile: bool,
+    ) -> BatchRunnerOutput:
+        """Execute one physical batch within the Scheduler's logical wave."""
+        pipeline = self.pipeline
+        assert pipeline is not None
+        is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        runner_output_list: list[RunnerOutput] = []
+        attn_metadata: dict[str, Any] = {}
+
+        kv_backend = getattr(self, "diffusion_kv_backend", None)
+        paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
+        with set_forward_context(
+            vllm_config=self.vllm_config,
+            omni_diffusion_config=self.od_config,
+            attn_metadata=attn_metadata,
+            paged_kv_runtime=paged_kv_runtime,
+            in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+        ):
+            clear_pipeline_stage_durations(pipeline)
+            noise_pred = pipeline.denoise_step(input_batch, states=states)
+            denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
+            for state in states:
+                merge_stage_durations(
+                    state,
+                    denoise_stage_durations,
+                )
+
+            pipeline_interrupted = getattr(pipeline, "interrupt", False)
+            if noise_pred is None and pipeline_interrupted:
                 for state in states:
-                    merge_stage_durations(
-                        state,
-                        denoise_stage_durations,
+                    runner_output_list.append(
+                        RunnerOutput(
+                            request_id=state.request_id,
+                            step_index=state.step_index,
+                            finished=True,
+                            result=DiffusionOutput(error="stepwise denoise interrupted"),
+                        )
                     )
 
-                pipeline_interrupted = getattr(pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
-                    for state in states:
+            else:
+                offset = 0
+                for req in states:
+                    if req.latents is None:
+                        raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
+                    row_num = req.latents.shape[0]
+                    try:
+                        pipeline.step_scheduler(
+                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                        )
+                        if self.od_config.streaming_output:
+                            should_decode = req.chunk_denoise_completed or req.request_denoise_completed
+                        else:
+                            should_decode = req.denoise_completed
+
+                        if should_decode:
+                            clear_pipeline_stage_durations(pipeline)
+                            result = pipeline.post_decode(req)
+                            if result is not None:
+                                result = self._prepare_output_for_transport(result, req.sampling)
+                                self._attach_stepwise_metadata(
+                                    req,
+                                    result,
+                                )
+                                # After consuming this chunk's interaction metadata, apply pending interactions and
+                                # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
+                                if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
+                                    pipe = cast(SupportsInteractionApply, pipeline)
+                                    pipe.apply_interaction_at_chunk_boundary(req)
+                                    pipe.prepare_next_chunk(req)
+                        else:
+                            result = None
+                        # finished should be computed after post_decode() advanced chunk_index
+                        finished = (
+                            req.request_denoise_completed if self.od_config.streaming_output else req.denoise_completed
+                        )
+                        if finished and result is not None:
+                            self._maybe_send_stage_payload([req], [result])  # type: ignore[list-item]
                         runner_output_list.append(
                             RunnerOutput(
-                                request_id=state.request_id,
-                                step_index=state.step_index,
+                                request_id=req.request_id,
+                                step_index=req.step_index,
+                                finished=finished,
+                                result=result,
+                            )
+                        )
+                        offset = offset + row_num
+                    except Exception as per_req_exc:
+                        offset = offset + row_num
+                        self.state_cache.pop(req.request_id, None)
+                        logger.error(
+                            "Stepwise per-request error for %s: %s",
+                            req.request_id,
+                            per_req_exc,
+                            exc_info=True,
+                        )
+                        runner_output_list.append(
+                            RunnerOutput(
+                                request_id=req.request_id,
+                                step_index=req.step_index,
                                 finished=True,
-                                result=DiffusionOutput(error="stepwise denoise interrupted"),
+                                result=DiffusionOutput.from_exception(per_req_exc),
                             )
                         )
 
-                else:
-                    offset = 0
-                    for req in states:
-                        if req.latents is None:
-                            raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
-                        row_num = req.latents.shape[0]
-                        try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
-                            if self.od_config.streaming_output:
-                                should_decode = req.chunk_denoise_completed or req.request_denoise_completed
-                            else:
-                                should_decode = req.denoise_completed
+                if noise_pred is not None and offset != noise_pred.shape[0]:
+                    raise ValueError(
+                        f"Stepwise noise_pred consumed {offset} rows, "
+                        f"but batched noise_pred has {noise_pred.shape[0]} rows."
+                    )
 
-                            if should_decode:
-                                clear_pipeline_stage_durations(pipeline)
-                                result = pipeline.post_decode(req)
-                                if result is not None:
-                                    result = self._prepare_output_for_transport(result, req.sampling)
-                                    self._attach_stepwise_metadata(
-                                        req,
-                                        result,
-                                    )
-                                    # After consuming this chunk's interaction metadata, apply pending interactions and
-                                    # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
-                                    if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
-                                        pipe = cast(SupportsInteractionApply, pipeline)
-                                        pipe.apply_interaction_at_chunk_boundary(req)
-                                        pipe.prepare_next_chunk(req)
-                            else:
-                                result = None
-                            # finished should be computed after post_decode() advanced chunk_index
-                            finished = (
-                                req.request_denoise_completed
-                                if self.od_config.streaming_output
-                                else req.denoise_completed
-                            )
-                            if finished and result is not None:
-                                self._maybe_send_stage_payload([req], [result])  # type: ignore[list-item]
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=finished,
-                                    result=result,
-                                )
-                            )
-                            offset = offset + row_num
-                        except Exception as per_req_exc:
-                            offset = offset + row_num
-                            self.state_cache.pop(req.request_id, None)
-                            logger.error(
-                                "Stepwise per-request error for %s: %s",
-                                req.request_id,
-                                per_req_exc,
-                                exc_info=True,
-                            )
-                            runner_output_list.append(
-                                RunnerOutput(
-                                    request_id=req.request_id,
-                                    step_index=req.step_index,
-                                    finished=True,
-                                    result=DiffusionOutput.from_exception(per_req_exc),
-                                )
-                            )
+            if is_primary and record_output_peak_memory:
+                batch_peak_memory_mb = self._sample_peak_memory_mb()
+                states_by_id = {state.request_id: state for state in states}
+                for state in states:
+                    state.peak_memory_mb = max(state.peak_memory_mb, batch_peak_memory_mb)
+                for runner_output in runner_output_list:
+                    if runner_output.result is None:
+                        continue
+                    matched_state = states_by_id.get(runner_output.request_id)
+                    if matched_state is None:
+                        continue
+                    runner_output.result.peak_memory_mb = max(
+                        runner_output.result.peak_memory_mb,
+                        matched_state.peak_memory_mb,
+                    )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
+            terminal_request_ids = [
+                runner_output.request_id for runner_output in runner_output_list if runner_output.finished
+            ]
+            self._update_states_after(states, input_batch, pipeline_interrupted)
+            if (
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                is DiffusionKVCacheMode.PAGED_SCHEDULER
+                and terminal_request_ids
+            ):
+                self.remove_diffusion_kv_requests(terminal_request_ids)
 
-                if is_primary and record_output_peak_memory:
-                    batch_peak_memory_mb = self._sample_peak_memory_mb()
-                    states_by_id = {state.request_id: state for state in states}
-                    for state in states:
-                        state.peak_memory_mb = max(state.peak_memory_mb, batch_peak_memory_mb)
-                    for runner_output in runner_output_list:
-                        if runner_output.result is None:
-                            continue
-                        matched_state = states_by_id.get(runner_output.request_id)
-                        if matched_state is None:
-                            continue
-                        runner_output.result.peak_memory_mb = max(
-                            runner_output.result.peak_memory_mb,
-                            matched_state.peak_memory_mb,
-                        )
-
-                terminal_request_ids = [
-                    runner_output.request_id for runner_output in runner_output_list if runner_output.finished
-                ]
-                self._update_states_after(states, input_batch, pipeline_interrupted)
-                if (
-                    getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-                    is DiffusionKVCacheMode.PAGED_SCHEDULER
-                    and terminal_request_ids
-                ):
-                    self.remove_diffusion_kv_requests(terminal_request_ids)
-
-                return BatchRunnerOutput.from_list(runner_output_list)
+            return BatchRunnerOutput.from_list(runner_output_list)
 
     def submit_interaction(
         self,

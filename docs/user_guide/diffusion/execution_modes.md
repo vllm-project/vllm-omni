@@ -112,9 +112,10 @@ for its validated configuration. For HunyuanImage3, this step-execution
 support applies to the `dense_legacy` path; `paged_scheduler` currently
 supports request-level execution only. See the
 [Scheduler-Managed Paged KV Cache guide](paged_kv_cache.md) for its required
-backend and configuration. Helios supports single-request step
-execution only: use
-`--step-execution --max-num-seqs 1` for Helios. MiniMax H3 supports step-wise
+backend and configuration. Helios supports step-wise continuous batching and
+request-level batching when requests have matching structural chunk and
+modality options. Request-local prompts, seeds, and state remain independent.
+MiniMax H3 supports step-wise
 continuous batching by packing co-batched requests into one sequence that keeps
 a separate attention document per request; that layout needs a backend which
 honors the packed `cu_seqlens` metadata, so run it with
