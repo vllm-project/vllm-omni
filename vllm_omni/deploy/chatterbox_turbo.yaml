@@ -31,7 +31,8 @@
 # work. Stage 1 decodes each chunk with the last codec_left_context_frames
 # tokens already played, which keeps a chunk's cost constant.
 #
-# Sized on one 24 GB card (see the recipe for the measurements). TUNE PER
+# The one Turbo profile, sized on one 24 GB card for the real-time envelope
+# the H100 recipe measured with the built-in voice (32 clients). TUNE PER
 # GPU: on a slower card lower max_num_seqs before raising the chunk size.
 pipeline: chatterbox_turbo
 model_runner: v2
@@ -51,7 +52,7 @@ stages:
     # Halves the backbone's weights. Its logits are only sampled from, and
     # the end-to-end transcripts pass with it.
     dtype: bfloat16
-    max_num_seqs: 8
+    max_num_seqs: 32
     # 1 speaker slot + up to 375 prompt tokens + text + 1 start token + 1000
     # output tokens: a text of up to 671 tokens has the full 1000-token
     # output. A longer text is accepted and ends at whatever the 2048 leave
@@ -61,11 +62,11 @@ stages:
     # prefill over steps, which stage 0 handles: later first token, steadier
     # decode steps for the requests already speaking.
     max_num_batched_tokens: 2048
-    # Measured on H100: 0.80 GiB of weights, 1.12 GiB with vLLM's own, 0.08 GiB
-    # of activations, 0.04 GiB of graphs, and 96 KiB of KV cache per token; the
-    # 8 slots at 2048 tokens need 1.5 GiB, so a 24 GB card has about 1.8 GiB
-    # to spare at this fraction.
-    gpu_memory_utilization: 0.20
+    # Measured on H100: 1.12 GiB of weights with vLLM's own, 0.08 GiB of
+    # activations, 0.06 GiB of graphs and 96 KiB of KV cache per token. The
+    # 32 slots at 2048 tokens need 6.0 GiB of KV cache, about 7.3 GiB in all;
+    # 0.35 of a 24 GB card (23.6 GiB) is 8.3 GiB.
+    gpu_memory_utilization: 0.35
     enforce_eager: false
     enable_prefix_caching: false
     skip_tokenizer_init: true
@@ -88,7 +89,8 @@ stages:
     dtype: float32
     # Seeds the flow-noise buffer, so every process draws the same one.
     seed: 0
-    max_num_seqs: 8
+    # One utterance per stage 0 request.
+    max_num_seqs: 32
     # The longest utterance this stage is built for: its noise buffer and
     # the budget below are sized from it. It must not be smaller than stage
     # 0's max_model_len, which is what bounds an utterance whatever
@@ -96,11 +98,11 @@ stages:
     # chunk with this value, so a smaller one would let an utterance outgrow
     # both with no error.
     max_model_len: 2048
-    # At least max_num_seqs * max_model_len (8 * 2048); the stage refuses to
+    # At least max_num_seqs * max_model_len (32 * 2048); the stage refuses to
     # start with less. A new request the step's budget cannot cover is
     # scheduled with part of its tokens, and the decoder would take that
     # part for the utterance.
-    max_num_batched_tokens: 16384
+    max_num_batched_tokens: 65536
     # This stage keeps no KV cache; the fraction bounds the flow's and HiFT's
     # activations for max_num_seqs utterances.
     gpu_memory_utilization: 0.15

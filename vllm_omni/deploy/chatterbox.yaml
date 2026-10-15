@@ -2,6 +2,10 @@
 # Each guided request occupies two stage-0 sequence slots. The atomic CFG
 # scheduler requires enough token budget to prefill a whole pair, and disables
 # asynchronous scheduling, chunked prefill, and prefix caching.
+#
+# The one Original profile, sized on one 24 GB card for the real-time
+# envelope the H100 recipe measured with the built-in voice (8 clients):
+# 16 stage 0 sequences are 8 guided requests.
 pipeline: chatterbox
 model_runner: v2
 async_chunk: true
@@ -19,13 +23,13 @@ stages:
     hf_overrides:
       variant: original
     dtype: bfloat16
-    max_num_seqs: 8
+    max_num_seqs: 16
     max_model_len: 2048
     max_num_batched_tokens: 4096
-    # Measured on H100: 1.01 GiB of weights, 1.30 GiB with vLLM's own, 0.16 GiB
-    # of activations, 0.04 GiB of graphs, and 120 KiB of KV cache per token;
-    # the 16 sequences (8 guided requests) at 2048 tokens need 3.75 GiB, so a
-    # 24 GB card has about 1.8 GiB to spare at this fraction.
+    # Measured on H100: 1.32 GiB of weights with vLLM's own, 0.16 GiB of
+    # activations, 0.08 GiB of graphs and 120 KiB of KV cache per token. The
+    # 16 sequences at 2048 tokens need 3.75 GiB of KV cache, about 5.3 GiB in
+    # all; 0.30 of a 24 GB card (23.6 GiB) is 7.1 GiB.
     gpu_memory_utilization: 0.30
     enforce_eager: false
     enable_prefix_caching: false
@@ -57,8 +61,10 @@ stages:
     dtype: float32
     # Seeds the flow-noise buffer, so every process draws the same one.
     seed: 0
+    # One utterance per guided request.
     max_num_seqs: 8
     max_model_len: 2048
+    # max_num_seqs * max_model_len, as the stage requires.
     max_num_batched_tokens: 16384
     # This stage keeps no KV cache; the fraction bounds the flow's and HiFT's
     # activations for max_num_seqs utterances.

@@ -43,12 +43,10 @@ predictor.
 
 import math
 from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 from torch import nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
@@ -59,7 +57,7 @@ from vllm_omni.model_executor.models.chatterbox.s3gen_core.upsample_encoder impo
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.glm_tts.vocoder import ConvRNNF0Predictor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig, validate_flow_settings
+from vllm_omni.transformers_utils.configs.chatterbox import FLOW_DTYPES, ChatterboxConfig
 
 # CosyVoice 2's caches: eight mel frames, and HiFT's 480 samples per frame
 # (upsample rates 8 * 5 * 3 times an iSTFT hop of 4).
@@ -247,15 +245,15 @@ class S3GenDecoder(nn.Module):
             serves the stage draws the same one.
 
     Raises:
-        ValueError: If the config's flow precision and attention backend are
-            not a pair the decoder runs, see ``validate_flow_settings``.
+        ValueError: If the config's flow precision is not one the decoder runs.
     """
 
     def __init__(
         self, config: ChatterboxConfig, max_utterance_tokens: int, left_context_tokens: int, noise_seed: int
     ) -> None:
         super().__init__()
-        validate_flow_settings(config.flow_dtype, config.flow_attention_backend)
+        if config.flow_dtype not in FLOW_DTYPES:
+            raise ValueError(f"Chatterbox flow_dtype must be one of {sorted(FLOW_DTYPES)}, got {config.flow_dtype!r}")
         self.config = config
         self.left_context_tokens = left_context_tokens
         # The architecture ``S3Token2Mel`` and ``S3Token2Wav`` build (0.1.7).
@@ -414,19 +412,11 @@ class S3GenDecoder(nn.Module):
             offsets.append(offset)
             # (F_i, 80), the layout pad_sequence pads.
             noise.append(torch.cat([self.flow_noise[0, :, :prompt_frames], self.flow_noise[0, :, start:end]], dim=1).T)
-        if self.config.flow_attention_backend == "cudnn" and not self.flow_noise.is_cuda:
-            raise ValueError("Chatterbox cuDNN flow attention requires CUDA")
-        attention = (
-            sdpa_kernel(SDPBackend.CUDNN_ATTENTION) if self.config.flow_attention_backend == "cudnn" else nullcontext()
-        )
-        # HiFT is FP32-only; flow precision and SDPA are independent choices.
-        with (
-            torch.autocast(
-                device_type=self.flow_noise.device.type,
-                dtype=torch.bfloat16,
-                enabled=self.config.flow_dtype == "bfloat16",
-            ),
-            attention,
+        # HiFT is FP32-only; only the flow runs under autocast.
+        with torch.autocast(
+            device_type=self.flow_noise.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.config.flow_dtype == "bfloat16",
         ):
             mels = flow_mels(
                 self.flow,

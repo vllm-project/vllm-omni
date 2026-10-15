@@ -47,10 +47,6 @@ x-chatterbox: &chatterbox
   - vllm_omni/transformers_utils/configs/chatterbox.py
   - vllm_omni/deploy/chatterbox.yaml
   - vllm_omni/deploy/chatterbox_turbo.yaml
-  - vllm_omni/deploy/chatterbox_high_concurrency.yaml
-  - vllm_omni/deploy/chatterbox_turbo_high_concurrency.yaml
-  - vllm_omni/deploy/chatterbox_high_concurrency_cudnn_mps.yaml
-  - vllm_omni/deploy/chatterbox_turbo_high_concurrency_cudnn_mps.yaml
 
 x-qwen3-tts: &qwen3_tts
   - vllm_omni/engine/async_omni_engine.py

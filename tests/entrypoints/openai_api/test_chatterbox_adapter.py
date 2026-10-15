@@ -23,7 +23,6 @@ import numpy as np
 import pytest
 import soundfile
 import torch
-import yaml
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from torch import nn
@@ -41,7 +40,7 @@ from tests.model_executor.models.chatterbox.helpers import (
 )
 from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.config.speech_cache import SpeechCacheConfig
-from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy, resolve_deploy_yaml
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type
@@ -134,7 +133,7 @@ def server(
     ``clean_speaker_cache`` fixture resets around the test.
     """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"], tmp_path)))
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"])))
     yield speech
     speech.shutdown()
 
@@ -157,7 +156,7 @@ def original(
     directory = write_model_dir(tmp_path / "chatterbox")
     (Path(directory) / "conds.pt").write_bytes((Path(model_dir) / "conds.pt").read_bytes())
     Tokenizer(WordLevel({"[UNK]": 0, "Hello.": 7}, unk_token="[UNK]")).save(str(Path(directory) / "tokenizer.json"))
-    speech = serving(engine_client(directory, deploy_on_cpu(DEPLOY["original"], tmp_path)))
+    speech = serving(engine_client(directory, deploy_on_cpu(DEPLOY["original"])))
     yield speech._adapter
     speech.shutdown()
 
@@ -170,17 +169,14 @@ def reference(seconds: float, seed: int, sample_rate: int = 24000, mime: str = "
     return f"data:{mime};base64,{base64.b64encode(buffer.getvalue()).decode()}"
 
 
-def deploy_on_cpu(name: str, directory: Path) -> str:
-    """A copy of deploy file ``name``, inheritance resolved, with its reference encoders on this host's CPU.
+def deploy_on_cpu(name: str) -> str:
+    """A copy of deploy file ``name`` with its reference encoders on this host's CPU.
 
-    Every profile conditions on ``cuda:0``; these tests build servers on a CPU host.
+    Every CUDA profile conditions on ``cuda:0``; these tests build servers on a CPU host.
     """
-    deploy = resolve_deploy_yaml(get_deploy_config_path(name))
-    (stage0,) = [stage for stage in deploy["stages"] if stage["stage_id"] == 0]
-    stage0["additional_config"]["conditioning_device"] = "cpu"
-    path = directory / f"cpu-{name}"
-    path.write_text(yaml.safe_dump(deploy))
-    return str(path)
+    return modify_stage_config(
+        get_deploy_config_path(name), updates={"stages": {0: {"additional_config.conditioning_device": "cpu"}}}
+    )
 
 
 def encoder(adapter: ChatterboxAdapter) -> VoiceConditioner:
@@ -313,16 +309,16 @@ async def test_original_controls_default_to_the_deploy_files(original, extra_par
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("variant", "adapter_cls", "seconds"),
-    [("turbo", ChatterboxAdapter, 5.04), ("original", ChatterboxOriginalAdapter, 1.0)],
+    ("variant", "adapter_cls", "seconds", "admission"),
+    [("turbo", ChatterboxAdapter, 5.04, 32), ("original", ChatterboxOriginalAdapter, 1.0, 8)],
 )
-async def test_64_distinct_references_are_encoded_together_and_cached(
-    model_dir, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds
+async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
+    model_dir, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, admission
 ):
-    """Everything queued while the encoders are busy goes through them as one batch.
+    """Everything queued while the encoders are busy goes through them as one batch, with no cap of its own.
 
-    The high-concurrency overlays admit 64 requests (Original's 128 sequences
-    are 64 guided pairs), so 64 references arriving together are one
+    The profile admits ``admission`` requests (Original's 16 sequences are 8
+    guided pairs), so that many references arriving together are one
     admission. The first batch is held so that the other references queue
     behind it; the batch after it is all of them. Each clip is 40 ms (one
     prompt token) longer than the one before, so the prompt lengths show
@@ -330,23 +326,16 @@ async def test_64_distinct_references_are_encoded_together_and_cached(
     is served from the cache.
     """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(
-        engine_client(
-            model_dir,
-            deploy_on_cpu(
-                f"{'chatterbox_turbo' if variant == 'turbo' else 'chatterbox'}_high_concurrency.yaml", tmp_path
-            ),
-        )
-    )
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY[variant])))
     concurrent = speech._adapter
     assert isinstance(concurrent, adapter_cls)
-    assert concurrent.conditioning_capacity == 64
+    assert concurrent.conditioning_capacity == admission
     batches = EncoderBatches(encoder(concurrent), hold=True)
-    sources = [reference(seconds + 0.04 * index, seed=index) for index in range(64)]
+    sources = [reference(seconds + 0.04 * index, seed=index) for index in range(admission)]
     try:
         requests = [asyncio.create_task(concurrent.resolve_voice(source)) for source in sources]
         await asyncio.to_thread(batches.started.wait, 30)
-        while len(concurrent.conditioning_pending) < 64:
+        while len(concurrent.conditioning_pending) < admission:
             await asyncio.sleep(0.01)
         batches.released.set()
         voices = await asyncio.wait_for(asyncio.gather(*requests), 120)
@@ -357,8 +346,8 @@ async def test_64_distinct_references_are_encoded_together_and_cached(
         speech.shutdown()
 
     lengths = [voice.prompt_token.shape[1] for voice in voices]
-    assert lengths == list(range(lengths[0], lengths[0] + 64))
-    assert len(encoded) == 2 and sum(encoded) == 64
+    assert lengths == list(range(lengths[0], lengths[0] + admission))
+    assert encoded == [encoded[0], admission - encoded[0]]
     assert batches.most_active == 1
     # Served from the speaker cache: the same tensors, and no further encoder batch.
     assert all(left.prompt_feat is right.prompt_feat for left, right in zip(voices, cached, strict=True))
@@ -428,9 +417,7 @@ async def test_a_zero_speaker_cache_budget_encodes_every_request(
 ) -> None:
     """The deploy file's ``speech_cache.speaker_max_bytes`` bounds the conditioning cache; zero disables it."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(
-        engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"], tmp_path)), SpeechCacheConfig(speaker_max_bytes=0)
-    )
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"])), SpeechCacheConfig(speaker_max_bytes=0))
     batches = EncoderBatches(encoder(speech._adapter))
     source = reference(6, seed=6)
     try:
@@ -447,20 +434,24 @@ async def test_a_zero_speaker_cache_budget_encodes_every_request(
 async def test_cancelled_wave_cannot_overfill_encoder_queue(model_dir, tmp_path, monkeypatch, clean_speaker_cache):
     """Cancelled waiters keep their encoder work, and with it the slots a new wave would take."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, deploy_on_cpu("chatterbox_high_concurrency.yaml", tmp_path)))
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["original"])))
     original = speech._adapter
-    assert isinstance(original, ChatterboxOriginalAdapter) and original.conditioning_capacity == 64
+    assert isinstance(original, ChatterboxOriginalAdapter)
+    admission = original.conditioning_capacity
     batches = EncoderBatches(encoder(original), hold=True)
     try:
-        first = [asyncio.create_task(original.resolve_voice(reference(1, seed=index))) for index in range(64)]
+        first = [asyncio.create_task(original.resolve_voice(reference(1, seed=index))) for index in range(admission)]
         await asyncio.to_thread(batches.started.wait, 30)
         for request in first:
             request.cancel()
         await asyncio.gather(*first, return_exceptions=True)
-        second = [asyncio.create_task(original.resolve_voice(reference(1, seed=index))) for index in range(64, 128)]
+        second = [
+            asyncio.create_task(original.resolve_voice(reference(1, seed=index)))
+            for index in range(admission, 2 * admission)
+        ]
         await asyncio.sleep(0.1)
-        assert len(original.conditioning_pending) == 64
-        assert original.conditioning_queue.qsize() <= 64
+        assert len(original.conditioning_pending) == admission
+        assert original.conditioning_queue.qsize() <= admission
         assert not any(request.done() for request in second)
         batches.released.set()
         voices = await asyncio.wait_for(asyncio.gather(*second), 60)

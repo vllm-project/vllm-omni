@@ -21,7 +21,7 @@ needs a distinct reference per request: a repeated reference is a
 conditioning-cache hit after its first use and measures cached traffic.
 `chatterbox_conditioning.py` encodes 64 references serially and as one batch
 on CPU or an explicit CUDA device, times both and checks real-weight
-serial/batch parity. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#concurrent-http-clients-high-concurrency-profiles)
+serial/batch parity. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#concurrent-http-clients)
 for measured 8- to 64-client results and their capacity and quality limitations.
 
 `chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech
@@ -37,8 +37,6 @@ compare flow precision. Each precision run
 also saves paired `.fp32.wav` and `.selected.wav` replay chunks beside the
 JSON report for listening. Numerical similarity and these short clips do not
 replace end-to-end intelligibility and speaker-quality evaluation.
-Add `--cudnn-attention` to a BF16 run for a separate native SDPA backend ablation;
-unsupported attention shapes fail rather than silently selecting another kernel.
 
 Both Chatterbox variants are also registered in `bench_tts.py`. For a Qwen3-TTS
 comparison, run its `voice_clone` task and Chatterbox's `voice_clone` task against

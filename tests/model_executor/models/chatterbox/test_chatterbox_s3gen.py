@@ -144,15 +144,6 @@ def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder: S3GenDecoder)
     assert next(bf16.flow.parameters()).dtype == torch.float32
 
 
-def test_cudnn_attention_rejects_cpu_execution(model_dir: str) -> None:
-    """The cuDNN MPS deploy file asks for cuDNN attention, which a CPU decoder cannot give."""
-    stage = build_stage(stage_vllm_config(model_dir, "chatterbox_turbo_high_concurrency_cudnn_mps.yaml", 1), "cpu")
-    assert (stage.config.flow_dtype, stage.config.flow_attention_backend) == ("bfloat16", "cudnn")
-
-    with pytest.raises(ValueError, match="requires CUDA"):
-        stage.chunk_mels([Chunk(torch.arange(15), 0, reference(2), None, True)])
-
-
 def test_window_keeps_the_left_context_and_rebases_the_offset() -> None:
     tokens = torch.arange(200)
     kept, offset = window(tokens, 120, LEFT_CONTEXT)
@@ -776,9 +767,9 @@ def test_a_live_stream_and_a_first_chunk_in_one_step(decoder: S3GenDecoder, refe
 @pytest.mark.parametrize(
     ("max_num_batched_tokens", "max_num_scheduled_tokens", "names"),
     [
-        (16383, None, "max_num_batched_tokens >= max_num_seqs (8) * max_model_len (2048) = 16384, got 16383"),
-        (16384, 8000, "max_num_scheduled_tokens >= max_num_seqs (8) * max_model_len (2048) = 16384, got 8000"),
-        (16384, 0, "max_num_scheduled_tokens >= max_num_seqs (8) * max_model_len (2048) = 16384, got 0"),
+        (65535, None, "max_num_batched_tokens >= max_num_seqs (32) * max_model_len (2048) = 65536, got 65535"),
+        (65536, 8000, "max_num_scheduled_tokens >= max_num_seqs (32) * max_model_len (2048) = 65536, got 8000"),
+        (65536, 0, "max_num_scheduled_tokens >= max_num_seqs (32) * max_model_len (2048) = 65536, got 0"),
     ],
     ids=["batched tokens", "scheduled tokens", "scheduled tokens set to 0"],
 )
@@ -788,8 +779,8 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
     """A new request the step's budget cannot cover is scheduled with part of its tokens.
 
     The decoder would take that part for the whole utterance. An utterance is
-    at most the stage's own context long, so eight slots of a 2048-token
-    context need 16384, whatever ``max_tokens`` a request asks for. The
+    at most the stage's own context long, so 32 slots of a 2048-token
+    context need 65536, whatever ``max_tokens`` a request asks for. The
     scheduler's budget is its scheduled-token limit whenever one is set, 0
     included, and the message names the field it read. The deploy file's
     stage 1 gets the budget as ``--stage-overrides`` would give it.
@@ -801,7 +792,7 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_scheduled_tokens=max_num_scheduled_tokens,
     )
-    assert (config.scheduler_config.max_num_seqs, config.model_config.max_model_len) == (8, 2048)
+    assert (config.scheduler_config.max_num_seqs, config.model_config.max_model_len) == (32, 2048)
 
     with pytest.raises(ValueError, match=re.escape(names)):
         build_stage(config, "cpu")
@@ -1029,22 +1020,14 @@ def test_profile_with_64_slots_skips_neural_decode(decoder: S3GenDecoder) -> Non
     assert all(audio.numel() == 0 for audio in audios)
 
 
-@pytest.mark.parametrize(
-    "deploy",
-    [
-        "chatterbox_high_concurrency.yaml",
-        "chatterbox_turbo_high_concurrency.yaml",
-        "chatterbox_high_concurrency_cudnn_mps.yaml",
-        "chatterbox_turbo_high_concurrency_cudnn_mps.yaml",
-    ],
-)
-def test_every_high_concurrency_stage_1_passes_its_startup_budget_check(model_dir: str, deploy: str) -> None:
-    """Stage 1 refuses at startup a step budget that could split an utterance; each overlay's must pass.
+@pytest.mark.parametrize("variant", ["turbo", "original"])
+def test_each_profiles_stage_1_passes_its_startup_budget_check(model_dir: str, variant: str) -> None:
+    """Stage 1 refuses at startup a step budget that could split an utterance; each profile's must pass.
 
     Stage 0 admits a request per stage 1 slot, Original's guided pairs taking two sequences each.
     """
-    stage1 = stage_vllm_config(model_dir, deploy, 1)
-    stage0 = stage_vllm_config(model_dir, deploy, 0)
+    stage1 = stage_vllm_config(model_dir, DEPLOY[variant], 1)
+    stage0 = stage_vllm_config(model_dir, DEPLOY[variant], 0)
 
     build_stage(stage1, "cpu")
 

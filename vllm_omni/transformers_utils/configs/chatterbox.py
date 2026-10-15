@@ -26,7 +26,6 @@ STOP_SPEECH_TOKEN = 6562
 CFG_UNCOND_SUFFIX = "__cfg_uncond"
 
 FLOW_DTYPES = frozenset({"float32", "bfloat16"})
-FLOW_ATTENTION_BACKENDS = frozenset({"auto", "cudnn"})
 
 # What differs between the checkpoints. The speech vocabulary sizes the
 # sampler (``vocab_size``): no tokenizer is loaded for these stages, and the
@@ -70,39 +69,21 @@ VARIANT_FIELDS: dict[str, dict[str, object]] = {
 }
 
 
-def validate_flow_settings(dtype: str, backend: str) -> None:
-    """Reject a flow precision and attention backend the decoder cannot run.
-
-    Raises:
-        ValueError: If either value is unknown, or cuDNN attention is asked
-            for without BF16 flow.
-    """
-    if dtype not in FLOW_DTYPES:
-        raise ValueError("Chatterbox flow_dtype must be 'float32' or 'bfloat16'")
-    if backend not in FLOW_ATTENTION_BACKENDS:
-        raise ValueError("Chatterbox flow_attention_backend must be 'auto' or 'cudnn'")
-    if backend == "cudnn" and dtype != "bfloat16":
-        raise ValueError("Chatterbox cuDNN flow attention requires flow_dtype='bfloat16'")
-
-
 class ChatterboxConfig(PretrainedConfig):
     """Constants for both Chatterbox stages of one checkpoint."""
 
     model_type = "chatterbox"
 
-    def __init__(
-        self, variant: str = "turbo", flow_dtype: str = "bfloat16", flow_attention_backend: str = "auto", **kwargs
-    ):
+    def __init__(self, variant: str = "turbo", flow_dtype: str = "bfloat16", **kwargs):
         if variant not in VARIANT_FIELDS:
             raise ValueError("Chatterbox variant must be 'turbo' or 'original'")
         kwargs.setdefault("eos_token_id", STOP_SPEECH_TOKEN)
         super().__init__(**kwargs)
         self.variant = variant
         # Stage 1's flow runs under bfloat16 autocast unless a deploy file
-        # overrides it; HiFT always runs in float32. Stage 1 validates the
-        # pair when it is built.
+        # overrides it; HiFT always runs in float32. Stage 1 validates it
+        # when it is built.
         self.flow_dtype = flow_dtype
-        self.flow_attention_backend = flow_attention_backend
 
         # Ids at or above this are control tokens the decoder must never see.
         self.speech_token_limit = START_SPEECH_TOKEN

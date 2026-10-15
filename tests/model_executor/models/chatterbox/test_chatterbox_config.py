@@ -81,17 +81,9 @@ def test_checkpoint_fields_cannot_be_overridden_one_by_one() -> None:
         config.update({"num_hidden_layers": 30})
 
 
-@pytest.mark.parametrize(
-    ("settings", "match"),
-    [
-        ({"flow_dtype": "float16"}, "flow_dtype"),
-        ({"flow_attention_backend": "flash"}, "flow_attention_backend"),
-        ({"flow_dtype": "float32", "flow_attention_backend": "cudnn"}, "cuDNN"),
-    ],
-)
-def test_the_decoder_refuses_flow_settings_it_cannot_run(settings: dict, match: str) -> None:
-    """A deploy file's hf_overrides arrive one key at a time, so stage 1 checks the pair when it is built."""
+def test_the_decoder_refuses_a_flow_precision_it_cannot_run() -> None:
+    """A deploy file's hf_overrides reach the config after construction, so stage 1 checks it when it is built."""
     config = ChatterboxConfig()
-    config.update(settings)
-    with pytest.raises(ValueError, match=match):
+    config.update({"flow_dtype": "float16"})
+    with pytest.raises(ValueError, match="flow_dtype"):
         S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT, SEED)
