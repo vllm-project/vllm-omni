@@ -74,11 +74,17 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
     def tile_exec(self, task: TileTask) -> torch.Tensor:
         """Decode a single latent tile into RGB space."""
         self.clear_cache()
+        reuse_gates = bool(getattr(self, "reuse_residual_gates", False))
         time = []
         for k in range(len(task.tensor)):
             self._conv_idx = [0]
             tile = self.post_quant_conv(task.tensor[k])
-            decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx)
+            decoded = self.decoder(
+                tile,
+                feat_cache=self._feat_map,
+                feat_idx=self._conv_idx,
+                _reuse_gates=reuse_gates,
+            )
             time.append(decoded)
         result = torch.cat(time, dim=2)
         return result
