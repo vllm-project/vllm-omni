@@ -190,6 +190,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
     layers, pre-norm, no convolution module and no macaron feed-forward.
 
     Args:
+        pre_lookahead_len (int): Tokens the look-ahead convolution reads past each token.
         input_size (int): Input dimension.
         output_size (int): Attention dimension.
         attention_heads (int): Number of attention heads.
@@ -202,6 +203,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
 
     def __init__(
         self,
+        pre_lookahead_len: int,
         input_size: int = 512,
         output_size: int = 512,
         attention_heads: int = 8,
@@ -236,7 +238,9 @@ class UpsampleConformerEncoder(torch.nn.Module):
             dropout_rate,
             activation,
         )
-        self.pre_lookahead_layer = PreLookaheadLayer(in_channels=output_size, channels=output_size, pre_lookahead_len=3)
+        self.pre_lookahead_layer = PreLookaheadLayer(
+            in_channels=output_size, channels=output_size, pre_lookahead_len=pre_lookahead_len
+        )
         self.encoders = torch.nn.ModuleList(
             [
                 WenetConformerEncoderLayer(

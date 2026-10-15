@@ -260,6 +260,7 @@ class S3GenDecoder(nn.Module):
         self.left_context_tokens = left_context_tokens
         # The architecture ``S3Token2Mel`` and ``S3Token2Wav`` build (0.1.7).
         encoder = UpsampleConformerEncoder(
+            pre_lookahead_len=config.pre_lookahead_len,
             output_size=512,
             attention_heads=8,
             linear_units=2048,
