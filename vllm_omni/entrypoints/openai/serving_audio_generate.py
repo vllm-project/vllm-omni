@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 
 import torch
@@ -109,6 +112,7 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
                 output_modalities=["audio"],
+                watermarking=request.watermarking,
             )
 
             final_output: OmniRequestOutput | None = None

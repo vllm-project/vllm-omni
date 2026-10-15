@@ -243,6 +243,7 @@ def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(mock_engine_cl
         true_cfg_scale=2.0,
         quality="high",
         extra_body={"extra_args": {"solver": "ddim"}},
+        watermarking=False,
     )
 
     response = asyncio.run(serving_chat._create_chat_completion(request))
@@ -258,6 +259,7 @@ def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(mock_engine_cl
     assert sampling_params.quality == "high"
     assert (sampling_params.height, sampling_params.width) == (512, 768)
     assert captured["prompt"]["negative_prompt"] == "avoid blur"
+    assert captured["watermarking"] is False
     assert response.error.message == "No output generated from AsyncOmni"
 
 
@@ -376,6 +378,7 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engi
         model="test",
         messages=[{"role": "user", "content": "describe this image"}],
         modalities=["text"],
+        watermarking=False,
     )
 
     assert asyncio.run(serving_chat._create_chat_completion(request)) == "done"
@@ -384,6 +387,7 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engi
     assert sampling_params_list[0].extra_args == {"ar_task_mode": "comprehension"}
     assert sampling_params_list[1].extra_args == {}
     assert captured["output_modalities"] == ["text"]
+    assert captured["watermarking"] is False
 
 
 @pytest.fixture

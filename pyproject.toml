@@ -35,6 +35,10 @@ classifiers = [
 
 [project.optional-dependencies]
 
+watermarking = [
+    "audioseal>=0.2,<1.0",
+]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
@@ -69,6 +73,7 @@ dev = [
     "zhon==2.1.1",
     "zhconv==1.4.3",
     "funasr==1.3.29",
+    "audioseal==0.2.0", # for audio watermarking tests
     "lpips==0.1.4", # for quantization fp8
     "orjson==3.11.9", # to make v1/embeddings API fast
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests

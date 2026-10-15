@@ -13,6 +13,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
@@ -545,6 +546,9 @@ class OrchestratorArgs:
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
+
+    # === Output Processing ===
+    watermark_config: WatermarkConfig | None = None
 
     # === Forced aligner (orchestrator injects a pooling stage; never a per-stage knob) ===
     forced_aligner: str | None = None

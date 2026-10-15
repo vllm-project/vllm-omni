@@ -9,6 +9,7 @@ import anyio
 import pytest
 from vllm.engine.protocol import StreamingInput
 from vllm.lora.request import LoRARequest
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.kv_hints import KvHintsEnvelope
 
@@ -18,6 +19,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -168,6 +170,36 @@ def test_generate_forwards_kv_hints_on_initial_stage_submission(streaming):
             pass
         assert len(submissions) == 1
         assert submissions[0]["kv_hints"] is hints
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_generate_watermarking_opt_out_disables_every_stage():
+    """Ensure opting out disables watermarking on all stages without mutating the default params."""
+
+    async def run():
+        submitted_params_lists: list[list[SamplingParams | OmniDiffusionSamplingParams | PoolingParams]] = []
+
+        async def add_request_async(*, sampling_params_list, **kwargs):
+            submitted_params_lists.append(sampling_params_list)
+
+        omni = get_async_omni_instance(fake_add_request=add_request_async)
+        defaults = [SamplingParams(), OmniDiffusionSamplingParams(), PoolingParams()]
+        omni.engine.num_stages = len(defaults)
+        omni.default_sampling_params_list = defaults
+        # For now, watermark is passed as a kwarg. In the future, this will be collapsed and the
+        # sampling param building will be centralized to better align with vLLM.
+        async for _ in omni.generate(
+            prompt={"prompt": "test"}, request_id="watermark-req", sampling_params_list=defaults, watermarking=False
+        ):
+            pass
+
+        llm_params, diffusion_params, pooling_params = submitted_params_lists[0]
+        assert not llm_params.watermarking
+        assert not diffusion_params.watermarking
+        assert pooling_params is defaults[2]
+        assert defaults[0].watermarking and defaults[1].watermarking
 
     asyncio.run(run())
 
