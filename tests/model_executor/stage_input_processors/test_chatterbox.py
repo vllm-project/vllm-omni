@@ -28,9 +28,13 @@ from tests.model_executor.models.chatterbox.helpers import (
     stage_vllm_config,
     write_model_dir,
 )
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+    _OmniConnectorPayloadTransportMixin as Transport,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME, S3GenDecoder
@@ -428,30 +432,21 @@ def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length(
     assert decoder.streams == {}
 
 
-@pytest.mark.parametrize("side", PLANES)
-def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
-    side: str,
-    adapter: OmniChunkTransferAdapter,
-    plane: OmniRunnerDataPlane,
-    receiver: SharedMemoryConnector,
-    stage_configs: list,
-) -> None:
-    """Stage 1 was started on a placeholder prompt, and only an explicit empty ``codes.audio`` clears it.
-
-    The terminal payload is handed to stage 1's own scheduler-side transport,
-    which receives it as it receives any chunk: the request's prompt becomes
-    empty and its upstream is done.
-    """
-    (terminal,) = streamed_payloads(side, adapter, plane, receiver, request_prompt(250), [])
-    assert terminal.codes.audio.numel() == 0 and bool(terminal.meta.finished)
-
-    stage1_request = OmniRequest(
-        request_id="r",
-        prompt_token_ids=[0] * 88,
-        sampling_params=SamplingParams(max_tokens=1),
-        pooling_params=None,
-        external_req_id=f"stage-1-{uuid.uuid4().hex}",
+def receive_on_the_runner_side(terminal: OmniPayloadStruct, stage1_request: OmniRequest) -> None:
+    """Model Runner V2's native data plane: its transport's metadata extraction and the scheduler's update."""
+    payload = to_dict(terminal)
+    assert not Transport._payload_is_consumable(payload)
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    coordinator.update_request_metadata(
+        {"r": stage1_request}, {"r": Transport._extract_scheduling_metadata(payload)}, model_mode="generation"
     )
+    assert "r" in coordinator.input_terminal_req_ids
+
+
+def receive_on_the_scheduler_side(
+    terminal: OmniPayloadStruct, stage1_request: OmniRequest, stage_configs: list, receiver: SharedMemoryConnector
+) -> None:
+    """The default runner: stage 1's OmniChunkTransferAdapter reads the chunk from its connector."""
     stage1 = OmniChunkTransferAdapter(stage_configs[1])
     try:
         receiver.put("0", "1", f"{stage1_request.external_req_id}_0_0", to_dict(terminal))
@@ -463,7 +458,39 @@ def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
     finally:
         stage1.shutdown()
 
-    assert stage1_request.prompt_token_ids == []
+
+@pytest.mark.parametrize("receiving_side", PLANES)
+@pytest.mark.parametrize("side", PLANES)
+def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
+    side: str,
+    receiving_side: str,
+    adapter: OmniChunkTransferAdapter,
+    plane: OmniRunnerDataPlane,
+    receiver: SharedMemoryConnector,
+    stage_configs: list,
+) -> None:
+    """Stage 1 was started on a placeholder prompt, and only an explicit empty ``codes.audio`` clears it.
+
+    The terminal payload is received as stage 1 receives any chunk, on
+    either data plane: the request's prompt becomes empty and its upstream
+    is done.
+    """
+    (terminal,) = streamed_payloads(side, adapter, plane, receiver, request_prompt(250), [])
+    assert terminal.codes.audio.numel() == 0 and bool(terminal.meta.finished)
+    stage1_request = OmniRequest(
+        request_id="r",
+        prompt_token_ids=[0] * 88,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        external_req_id=f"stage-1-{uuid.uuid4().hex}",
+    )
+
+    if receiving_side == "runner-side":
+        receive_on_the_runner_side(terminal, stage1_request)
+    else:
+        receive_on_the_scheduler_side(terminal, stage1_request, stage_configs, receiver)
+
+    assert stage1_request.prompt_token_ids == [] and stage1_request.num_prompt_tokens == 0
 
 
 def test_a_stream_aborted_between_chunks_is_flushed_and_freed(
