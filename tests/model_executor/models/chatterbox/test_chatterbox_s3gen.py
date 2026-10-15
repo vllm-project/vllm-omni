@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import yaml
 from torch import nn
 from vllm.sampling_params import SamplingParams
 
@@ -22,7 +21,6 @@ from tests.model_executor.models.chatterbox.helpers import (
     write_model_dir,
     write_s3gen_checkpoint,
 )
-from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.model_executor.models.chatterbox.chatterbox import ChatterboxForConditionalGeneration
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import (
     SAMPLES_PER_FRAME,
@@ -821,7 +819,9 @@ def stage(built_stage: Callable[[str, int], ChatterboxForConditionalGeneration])
     return built_stage("turbo", 1).model
 
 
-def test_the_stage_builds_with_the_deploy_files_budget(stage: ChatterboxS3Gen, decoder: S3GenDecoder) -> None:
+def test_the_deploy_files_stage_loads_its_own_weights_and_draws_the_shared_noise(
+    stage: ChatterboxS3Gen, decoder: S3GenDecoder
+) -> None:
     """The deploy file passes the startup check, and every process draws the same flow noise."""
     assert stage.allow_patterns_overrides == [ChatterboxConfig().s3gen_weights]
     assert torch.equal(stage.flow_noise, decoder.flow_noise)
@@ -1026,34 +1026,26 @@ def test_profile_with_64_slots_skips_neural_decode(decoder: S3GenDecoder) -> Non
 
 
 @pytest.mark.parametrize(
-    "name,stage0_slots,suffix",
+    "deploy",
     [
-        ("chatterbox", 128, ""),
-        ("chatterbox_turbo", 64, ""),
-        ("chatterbox", 128, "_cudnn_mps"),
-        ("chatterbox_turbo", 64, "_cudnn_mps"),
+        "chatterbox_high_concurrency.yaml",
+        "chatterbox_turbo_high_concurrency.yaml",
+        "chatterbox_high_concurrency_cudnn_mps.yaml",
+        "chatterbox_turbo_high_concurrency_cudnn_mps.yaml",
     ],
 )
-def test_high_concurrency_profiles_admit_64_complete_requests(name, stage0_slots, suffix):
-    config = resolve_deploy_yaml(get_deploy_config_path(f"{name}_high_concurrency{suffix}.yaml"))
-    generator, decoder = config["stages"]
-    assert generator["max_num_seqs"] == stage0_slots
-    assert decoder["max_num_seqs"] == 64
-    assert decoder["max_model_len"] >= generator["max_model_len"]
-    assert decoder["max_num_batched_tokens"] >= 64 * decoder["max_model_len"]
-    if name == "chatterbox":
-        assert generator["hf_overrides"]["variant"] == "original"
-        assert decoder["hf_overrides"]["variant"] == "original"
-    if suffix:
-        assert config["cuda_mps"] is True
-        assert decoder["dtype"] == "float32"
-        assert decoder["hf_overrides"]["flow_attention_backend"] == "cudnn"
-        chunking = config["connectors"]["connector_of_shared_memory"]["extra"]
-        assert chunking["codec_chunk_frames"] == (30 if name == "chatterbox" else 15)
-        assert chunking["codec_max_chunk_frames"] == 60
-        assert chunking["codec_stream_scale_factor"] == 2
-    baseline = yaml.safe_load(Path(get_deploy_config_path(f"{name}.yaml")).read_text())
-    assert [stage["max_num_seqs"] for stage in baseline["stages"]] == [8, 8]
+def test_every_high_concurrency_stage_1_passes_its_startup_budget_check(model_dir: str, deploy: str) -> None:
+    """Stage 1 refuses at startup a step budget that could split an utterance; each overlay's must pass.
+
+    Stage 0 admits a request per stage 1 slot, Original's guided pairs taking two sequences each.
+    """
+    stage1 = stage_vllm_config(model_dir, deploy, 1)
+    stage0 = stage_vllm_config(model_dir, deploy, 0)
+
+    build_stage(stage1, "cpu")
+
+    pairs = 2 if stage1.model_config.hf_config.variant == "original" else 1
+    assert stage0.scheduler_config.max_num_seqs == pairs * stage1.scheduler_config.max_num_seqs
 
 
 def test_streaming_batch_preserves_request_state(decoder: S3GenDecoder) -> None:

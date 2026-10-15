@@ -8,7 +8,6 @@ import torch
 from vllm_omni.model_executor.models.chatterbox.original_heads import (
     ORIGINAL_MAX_TEXT_TOKENS,
     ORIGINAL_SPEECH_POSITIONS,
-    ORIGINAL_TEXT_POSITIONS,
     OriginalHeads,
     original_prefill_embeds,
     original_speech_embeds,
@@ -19,7 +18,7 @@ from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_original_prompt_layout_and_cfg():
+def test_original_prompt_rows_and_guidance_zero_only_the_text_content():
     config = ChatterboxConfig("original")
     config.update({"hidden_size": 4, "speaker_embed_size": 2})
     heads = OriginalHeads(config)
@@ -87,12 +86,10 @@ def test_original_weight_routes_are_complete_and_strict():
         split_original_weights([("speech_head.bias", marker)])
 
 
-def test_original_text_position_boundary():
+def test_the_longest_text_and_the_last_speech_position_fit_their_tables():
     config = ChatterboxConfig("original")
     config.update({"hidden_size": 4, "speaker_embed_size": 2})
     heads = OriginalHeads(config).eval()
-    assert heads.text_pos_emb.emb.num_embeddings == ORIGINAL_TEXT_POSITIONS == 2050
-    assert heads.speech_pos_emb.emb.num_embeddings == ORIGINAL_SPEECH_POSITIONS == 4100
     text = torch.ones(ORIGINAL_MAX_TEXT_TOKENS, dtype=torch.long)
     reference, speaker = torch.tensor([1, 2, 3]), torch.zeros(1, 2)
     prompt = original_prefill_embeds(heads, text, reference, speaker, exaggeration=0.5)

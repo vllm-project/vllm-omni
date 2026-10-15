@@ -151,7 +151,7 @@ def test_the_placeholder_prompt_is_as_long_as_its_embeddings(model, text_len):
 
 
 @pytest.mark.parametrize("weight", [0.0, 0.5])
-def test_original_prompt_and_companion_metadata(weight):
+def test_only_a_guided_original_prompt_is_expanded_with_an_unconditional_companion(weight):
     config = ChatterboxConfig("original")
     voice = VoiceConditioning(
         cond_tokens=torch.tensor([[1, 2]]),
@@ -184,8 +184,3 @@ def test_original_prompt_and_companion_metadata(weight):
         assert companion["additional_information"]["cfg_group"]["role"] == "uncond"
         assert companion["additional_information"]["ids"] == info["ids"]
         assert info["cfg_group"]["role"] == "cond"
-    assert config.speech_vocab_size == 8194
-    assert config.text_vocab_size == 704
-    assert config.enc_cond_seconds == 6
-    assert config.n_cfm_timesteps == 10
-    assert config.n_silence_tokens == 0

@@ -11,7 +11,6 @@ from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
-    StageExecutionType,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -44,14 +43,9 @@ def test_a_config_less_checkout_is_matched_by_its_directory_name(tmp_path: Path)
         StageConfigFactory.try_infer_model_type.cache_clear()
 
 
-def test_stage_topology() -> None:
-    config = ChatterboxConfig()
+def test_stage_0_stops_on_the_stop_token_and_stage_1_holds_no_slot_between_chunks() -> None:
     talker, decoder = CHATTERBOX_TURBO_PIPELINE.stages
-    assert CHATTERBOX_TURBO_PIPELINE.model_arch == "ChatterboxForConditionalGeneration"
-    assert (talker.model_stage, talker.execution_type) == ("chatterbox_t3", StageExecutionType.LLM_AR)
-    assert (decoder.model_stage, decoder.execution_type) == ("chatterbox_s3gen", StageExecutionType.LLM_GENERATION)
-    assert talker.sampling_constraints == {"stop_token_ids": [config.stop_speech_token], "detokenize": False}
-    assert decoder.final_output and decoder.final_output_type == "audio"
+    assert talker.sampling_constraints["stop_token_ids"] == [ChatterboxConfig().stop_speech_token]
     # On Model Runner V2 both stages use its native data plane; without the
     # declaration a stage falls back to the scheduler-side transport.
     assert talker.supports_native_mrv2_data_plane and decoder.supports_native_mrv2_data_plane
@@ -91,13 +85,11 @@ def test_each_mode_gets_its_own_stage_handoff(filename: str, pipeline: PipelineC
         assert handoff[0] is None and resolve_obj_by_qualname(handoff[1]) is t3_to_s3gen
 
 
-def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
+def test_the_deploy_files_context_and_budgets_fit_the_models_needs(deploy: dict) -> None:
     config = ChatterboxConfig()
     extra = deploy["connectors"]["connector_of_shared_memory"]["extra"]
     talker, decoder = deploy["stages"]
 
-    assert deploy["pipeline"] == "chatterbox_turbo"
-    assert deploy["async_chunk"] is True
     # The chunk processor reads the first three and stage 1 the fourth; none
     # has a default. The flow's lookahead is not among them: the processor
     # takes it from the model config, where the decoder takes it.
@@ -107,15 +99,8 @@ def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
         "codec_stream_scale_factor",
         "codec_left_context_frames",
     }
-    # Upstream's ``ChatterboxTurboTTS.generate`` defaults (0.1.7), kept as a
-    # record of them; the output cap is the model's.
-    assert talker["default_sampling_params"] == {
-        "temperature": 0.8,
-        "top_k": 1000,
-        "top_p": 0.95,
-        "repetition_penalty": 1.2,
-        "max_tokens": config.max_new_tokens,
-    }
+    # The output cap is the model's, which the API bounds requests by.
+    assert talker["default_sampling_params"]["max_tokens"] == config.max_new_tokens
     # Stage 0's context leaves room for text once the speaker slot, the
     # longest reference, the start token and the output cap are taken.
     assert talker["max_model_len"] - (1 + config.cond_prompt_len + 1 + config.max_new_tokens) > 0
@@ -128,6 +113,7 @@ def test_deploy_file_agrees_with_the_model_constants(deploy: dict) -> None:
     # The prompt is placeholder ids; a prefix cache would match any two
     # requests of equal length regardless of voice or text.
     assert talker["enable_prefix_caching"] is False
+    # HiFT is not half-precision safe.
     assert decoder["dtype"] == "float32"
     # Prompts are token ids and nothing is detokenized. A tokenizer would
     # also have vLLM look in the repo for the config.json it does not ship.

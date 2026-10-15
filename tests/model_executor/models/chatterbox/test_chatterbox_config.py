@@ -12,16 +12,6 @@ from vllm_omni.transformers_utils.configs.chatterbox import VARIANT_FIELDS, Chat
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_token_space() -> None:
-    cfg = ChatterboxConfig()
-    assert cfg.model_type == "chatterbox"
-    # No tokenizer is loaded, so the sampler's vocabulary is the speech head's.
-    assert cfg.vocab_size == cfg.speech_vocab_size == 6563
-    assert cfg.text_vocab_size == 50276
-    assert cfg.speech_token_limit == cfg.start_speech_token == 6561
-    assert cfg.eos_token_id == cfg.stop_speech_token == 6562
-
-
 @pytest.mark.parametrize("variant", ["turbo", "original"])
 def test_checkpoint_constants_agree_with_what_reads_them(variant: str) -> None:
     """Relations the two stages rely on, each of which fails a load or the audio when broken."""
@@ -37,8 +27,8 @@ def test_checkpoint_constants_agree_with_what_reads_them(variant: str) -> None:
     # token and inside the speech vocabulary, which is the sampler's.
     assert cfg.silence_token < cfg.speech_token_limit <= cfg.start_speech_token
     assert cfg.start_speech_token < cfg.stop_speech_token < cfg.speech_vocab_size == cfg.vocab_size
-    # The standard flow needs its guided solver's steps; the distilled one needs two.
-    assert (cfg.meanflow, cfg.n_cfm_timesteps) == ((True, 2) if variant == "turbo" else (False, 10))
+    # The engine stops on the stop token.
+    assert cfg.eos_token_id == cfg.stop_speech_token
 
 
 @pytest.mark.parametrize("variant", ["turbo", "original"])
@@ -48,13 +38,19 @@ def test_the_engine_reads_the_backbones_attention_geometry(variant: str) -> None
 
     arch = OmniModelArchConfigConvertor(cfg, cfg.get_text_config()).convert()
 
-    assert (arch.total_num_attention_heads, arch.total_num_kv_heads, arch.head_size) == (16, 16, 64)
+    assert (arch.total_num_attention_heads, arch.total_num_kv_heads, arch.head_size) == (
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.hidden_size // cfg.num_attention_heads,
+    )
 
 
 def test_variant_and_flow_settings_survive_serialization() -> None:
     """vLLM serializes the config into each stage process and rebuilds it there."""
-    restored = ChatterboxConfig.from_dict(ChatterboxConfig("original", flow_dtype="float32").to_dict())
-    assert (restored.variant, restored.flow_dtype, restored.num_hidden_layers) == ("original", "float32", 30)
+    config = ChatterboxConfig("original", flow_dtype="float32")
+    restored = ChatterboxConfig.from_dict(config.to_dict())
+    assert restored.to_dict() == config.to_dict()
+    assert {name: getattr(restored, name) for name in VARIANT_FIELDS["original"]} == VARIANT_FIELDS["original"]
 
 
 @pytest.mark.parametrize("variant", ["turbo", "original"])

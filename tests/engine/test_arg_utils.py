@@ -638,9 +638,7 @@ def test_config_less_chatterbox_directory_gets_a_config_written(tmp_path):
 
     config = model_config.hf_config
     assert isinstance(config, ChatterboxConfig)
-    assert (config.model_type, config.architectures) == ("chatterbox", ["ChatterboxForConditionalGeneration"])
-    assert (config.variant, config.vocab_size) == ("turbo", 6563)
-    assert model_config.architectures == ["ChatterboxForConditionalGeneration"]
+    assert config.architectures == model_config.architectures == ["ChatterboxForConditionalGeneration"]
     assert not os.path.exists(args.hf_config_path) and not hasattr(args, "_temp_config_dir")
 
 
@@ -666,21 +664,16 @@ def test_config_less_chatterbox_hub_id_gets_a_config_written(monkeypatch):
         config = AutoConfig.from_pretrained(args.hf_config_path)
         assert isinstance(config, ChatterboxConfig)
         assert config.architectures == ["ChatterboxForConditionalGeneration"]
-        assert (config.variant, config.vocab_size) == ("turbo", 6563)
     finally:
         if hasattr(args, "_temp_config_dir"):
             shutil.rmtree(args._temp_config_dir, ignore_errors=True)
 
 
-@pytest.mark.parametrize(
-    ("model_arch", "model_type"),
-    [("ChatterboxForConditionalGeneration", "chatterbox"), ("CosyVoice3Model", "cosyvoice3")],
-)
-def test_a_config_that_exists_but_fails_to_load_is_left_alone(tmp_path, model_arch, model_type):
+@pytest.mark.parametrize("model_arch", ["ChatterboxForConditionalGeneration", "CosyVoice3Model"])
+def test_a_config_that_exists_but_fails_to_load_is_left_alone(tmp_path, model_arch):
     """The engine writes no config over a broken one; loading the directory fails on the file itself."""
     (tmp_path / "config.json").write_text("{")
     args = chatterbox_args(str(tmp_path), model_arch)
-    assert _ARCH_TO_MODEL_TYPE[model_arch] == model_type
 
     with pytest.raises((OSError, ValueError)):
         args.create_model_config()

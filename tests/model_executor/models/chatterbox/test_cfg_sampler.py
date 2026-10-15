@@ -100,7 +100,7 @@ def test_guidance_precedes_delegate_and_tokens_follow_conditional(v1_sampler: Sa
     assert seeded.sampled_token_ids.tolist() == [[conditional], [conditional]]
 
 
-def test_batch_reordering_and_registry_cleanup(v1_sampler: Sampler) -> None:
+def test_pairs_are_found_by_request_id_in_any_row_order_and_in_the_current_registry(v1_sampler: Sampler) -> None:
     registry = {"c": ("a", "cond", 0.5), "u": ("a", "uncond", 0.5)}
     sampler = ChatterboxCFGSampler(v1_sampler, registry)
     logits = torch.zeros(2, STOP_SPEECH_TOKEN + 1)
