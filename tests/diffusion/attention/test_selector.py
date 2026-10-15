@@ -105,9 +105,7 @@ def test_backend_class_resolution_is_cached(monkeypatch):
         platform_calls.append(kwargs)
         return "fake.module.Backend"
 
-    fake_platform = SimpleNamespace(get_diffusion_attn_backend_cls=fake_get_cls)
-
-    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", fake_platform)
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.resolve_diffusion_attn_backend", fake_get_cls)
 
     def fake_load_backend(path):
         load_calls.append(path)
@@ -136,8 +134,7 @@ def test_capability_query_loads_explicit_cudnn_without_platform(monkeypatch):
         platform_calls.append(kwargs)
         return "fake.module.MustNotBeCalled"
 
-    fake_platform = SimpleNamespace(get_diffusion_attn_backend_cls=fake_get_cls)
-    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", fake_platform)
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.resolve_diffusion_attn_backend", fake_get_cls)
 
     config = AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN"))
     backend = selector.get_attn_backend_for_capability(role="self", attention_config=config)
@@ -172,3 +169,140 @@ def test_load_backend_cls_reports_missing_class(monkeypatch):
 
     with pytest.raises(AttributeError, match="Class MissingBackend not found in module"):
         selector._load_backend_cls("fake.module.MissingBackend")
+
+
+@pytest.fixture
+def sparse_platform(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+
+    class Platform(OmniPlatform):
+        _omni_enum = OmniPlatformEnum.CUDA
+
+        @classmethod
+        def get_diffusion_attn_backend_cls(cls, *args, **kwargs):
+            pytest.fail("Sparse resolution must not run dense provider checks")
+
+    calls = []
+
+    class Adapter:
+        @staticmethod
+        def validate_selection(implementation, head_size):
+            calls.append((implementation, head_size))
+
+    class Backend(_ConfiguredBackend):
+        @classmethod
+        def get_block_sparse_adapter(cls):
+            return Adapter
+
+    monkeypatch.setattr(DiffusionAttentionBackendEnum, "get_class", lambda self: Backend)
+    monkeypatch.setattr(DiffusionAttentionBackendEnum, "get_path", lambda self: "fake.module.Backend")
+    monkeypatch.setattr("vllm_omni.platforms.current_omni_platform", Platform)
+    return Platform, Backend, Adapter, calls
+
+
+@pytest.mark.parametrize("capability_query", [False, True])
+def test_sparse_resolution_uses_platform_and_preserves_method(monkeypatch, sparse_platform, capability_query):
+    from vllm_omni.diffusion.attention.block_sparse import BlockSparseBackend
+
+    platform, backend, _, calls = sparse_platform
+    loaded = []
+
+    def load(path):
+        loaded.append(path)
+        return backend
+
+    monkeypatch.setattr(selector, "_load_backend_cls", load)
+    config = AttentionConfig(
+        default={
+            "name": "block_sparse",
+            "config": {"backend": {"require": "FLASH_ATTN", "implementation": "future-provider-id"}},
+        }
+    )
+    if capability_query:
+        result = selector.get_attn_backend_for_capability("self", config)
+        assert result is BlockSparseBackend
+    else:
+        result, spec = selector.get_attn_backend_for_role("self", 192, config)
+        assert result is backend
+        assert spec is config.default
+    assert calls == [("future-provider-id", -1 if capability_query else 192)]
+    assert loaded == ["fake.module.Backend"]
+
+    # A platform-specific rejection must be honored on both selection paths.
+    def reject(cls, *args, **kwargs):
+        raise ValueError("platform policy rejected sparse execution")
+
+    monkeypatch.setattr(platform, "resolve_diffusion_attn_backend", classmethod(reject))
+    with pytest.raises(ValueError, match="platform policy rejected"):
+        if capability_query:
+            selector.get_attn_backend_for_capability("self", config)
+        else:
+            selector.get_attn_backend_for_role("self", 192, config)
+
+
+@pytest.mark.parametrize("platform_name", ["ROCM", "NPU", "XPU", "MUSA", "UNSPECIFIED"])
+def test_sparse_platform_rejects_before_loading_provider(monkeypatch, sparse_platform, platform_name):
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.platforms.interface import OmniPlatformEnum
+
+    platform, _, _, calls = sparse_platform
+    monkeypatch.setattr(platform, "_omni_enum", OmniPlatformEnum[platform_name])
+
+    def unexpected_load(self):
+        pytest.fail("Unsupported method/platform must fail before importing a provider")
+
+    monkeypatch.setattr(DiffusionAttentionBackendEnum, "get_class", unexpected_load)
+    with pytest.raises(ValueError, match="block_sparse requires CUDA"):
+        platform.resolve_diffusion_attn_backend("FLASH_ATTN", 128, method="block_sparse")
+    assert calls == []
+
+
+def test_sparse_platform_requires_adapter(monkeypatch, sparse_platform):
+    platform, backend, _, calls = sparse_platform
+    monkeypatch.setattr(backend, "get_block_sparse_adapter", classmethod(lambda cls: None))
+    with pytest.raises(ValueError, match="FLASH_ATTN: no adapter"):
+        platform.resolve_diffusion_attn_backend("FLASH_ATTN", 128, method="block_sparse")
+    assert calls == []
+
+
+@pytest.mark.parametrize("error_type", [ImportError, ValueError, RuntimeError])
+def test_sparse_platform_preserves_adapter_errors(monkeypatch, sparse_platform, error_type):
+    platform, _, adapter, _ = sparse_platform
+    error = error_type("provider failure")
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setattr(adapter, "validate_selection", staticmethod(fail))
+    with pytest.raises(error_type) as caught:
+        platform.resolve_diffusion_attn_backend("FLASH_ATTN", 128, method="block_sparse")
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("backend", [None, "FLASH_ATTN"])
+@pytest.mark.parametrize("allow_default", [False, True])
+def test_method_resolution_preserves_dense_platform_policy(backend, allow_default):
+    from vllm_omni.platforms.interface import OmniPlatform
+
+    calls = []
+
+    class Platform(OmniPlatform):
+        @classmethod
+        def get_diffusion_attn_backend_cls(cls, selected_backend, head_size, allow_trtllm_default):
+            calls.append((selected_backend, head_size, allow_trtllm_default))
+            return "platform.override.Backend"
+
+    assert Platform.resolve_diffusion_attn_backend(backend, 128, allow_default) == "platform.override.Backend"
+    assert calls == [(backend, 128, allow_default)]
+
+
+@pytest.mark.parametrize(
+    ("backend", "method", "message"),
+    [(None, "block_sparse", "requires an explicit backend"), ("FLASH_ATTN", "unknown", "Unknown diffusion")],
+)
+def test_method_resolution_rejects_invalid_requests(sparse_platform, backend, method, message):
+    platform, _, _, calls = sparse_platform
+    with pytest.raises(ValueError, match=message):
+        platform.resolve_diffusion_attn_backend(backend, 128, method=method)
+    assert calls == []

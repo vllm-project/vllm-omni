@@ -225,9 +225,13 @@ class VDNCheckpoint:
         path = getattr(od_config, "lora_path", None)
         if isinstance(path, (list, tuple)):
             path = path[0] if len(path) == 1 else None
-        vdn_backend = _resolve_dit_attention_backend(od_config) == "VDNH3_ATTN"
+        attention_config = getattr(od_config, "diffusion_attention_config", None)
+        strategy_active = getattr(attention_config, "strategy", None) is not None
+        vdn_backend = not strategy_active and _resolve_dit_attention_backend(od_config) == "VDNH3_ATTN"
         root = _checkpoint_dir(path, from_hub=vdn_backend) if path else None
         checkpoint = cls.from_path(root, head_dim=transformer.arch.attention_head_dim) if root is not None else None
+        if checkpoint is not None and strategy_active:
+            raise ValueError("VDN-H3 checkpoints do not support attention strategies")
         if checkpoint is None and vdn_backend:
             raise ValueError(
                 f"VDNH3_ATTN runs VDN-H3 checkpoints: pass OpenVDN/vdn-minimax-h3 or its {VDN_CHECKPOINT} "

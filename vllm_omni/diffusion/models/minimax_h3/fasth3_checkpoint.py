@@ -15,7 +15,7 @@ from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-from .fasth3 import FASTH3_BASE_MODEL, _resolve_dit_attention_backend
+from .fasth3 import FASTH3_BASE_MODEL, _resolve_dit_attention_backend, _resolve_dit_attention_spec
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -96,9 +96,7 @@ class FastH3CheckpointSpec:
             raise ValueError("FastH3 V2 is a full checkpoint; additional LoRA adapters are unsupported")
         if _resolve_dit_attention_backend(od_config) != "FASTVIDEO_VSA":
             raise ValueError("FastH3 V2 requires --diffusion-attention-backend FASTVIDEO_VSA")
-        attention_config = getattr(od_config, "diffusion_attention_config", None)
-        per_role = getattr(attention_config, "per_role", None) or {}
-        spec = per_role.get("self") or getattr(attention_config, "default", None)
+        spec = _resolve_dit_attention_spec(od_config)
         if getattr(spec, "fastvideo_vsa_topk", None) is not None:
             raise ValueError("FastH3 V2 pins VSA sparsity=0.8; remove the fixed fastvideo_vsa_topk override")
         parallel = getattr(od_config, "parallel_config", None)

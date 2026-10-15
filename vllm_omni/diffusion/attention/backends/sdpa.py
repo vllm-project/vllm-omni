@@ -12,6 +12,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.utils.attn_runtime_selector import can_sdpa_use_fused_gqa
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 
 logger = init_logger(__name__)
 
@@ -53,6 +54,8 @@ def _maybe_reshape_attn_mask(
 
 
 class SDPABackend(AttentionBackend):
+    strategy_capabilities = MethodCapabilities(local_execution=True)
+
     accept_output_buffer: bool = True
 
     @classmethod
