@@ -255,6 +255,7 @@ class TestDiffusion:
             "s",
             "r",
             total_underrun_s=0.25,
+            max_single_underrun_s=0.2,
             event_count=2,
             underrun_ratio=1 / 3,
             events_per_minute=240,
