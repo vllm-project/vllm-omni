@@ -36,7 +36,7 @@ class CausalConditionalCFM(torch.nn.Module):
         self.estimator = estimator
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, spks=None, cond=None, noised_mels=None, meanflow=False):
+    def forward(self, mu, mask, n_timesteps, noised_mels, spks=None, cond=None, meanflow=False):
         """Forward diffusion
 
         Args:
@@ -48,8 +48,7 @@ class CausalConditionalCFM(torch.nn.Module):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond (torch.Tensor, optional): Conditioning mel, the reference prompt's frames.
-            noised_mels (torch.Tensor, optional): The noise the last frames start from; the
-                frames before them are drawn here.
+            noised_mels (torch.Tensor): The noise every frame starts from, shape (batch_size, n_feats, mel_timesteps).
             meanflow (bool, optional): Whether the estimator is a meanflow model. Defaults to False.
 
         Returns:
@@ -57,11 +56,7 @@ class CausalConditionalCFM(torch.nn.Module):
                 (batch_size, n_feats, mel_timesteps), and None.
         """
 
-        z = torch.randn_like(mu)
-
-        if noised_mels is not None:
-            prompt_len = mu.size(2) - noised_mels.size(2)
-            z[..., prompt_len:] = noised_mels
+        z = noised_mels.to(mu.dtype)
 
         # time steps for reverse diffusion
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)

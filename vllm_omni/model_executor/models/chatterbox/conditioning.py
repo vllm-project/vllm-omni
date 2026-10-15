@@ -6,7 +6,7 @@
 (chatterbox 0.1.7) step for step, without ``librosa`` and without the model
 object it hangs off upstream, with one deliberate difference: the decoder's
 prompt mel is cut to exactly two frames per prompt token (see
-``VoiceConditioner.from_resampled``). The result travels with the request in
+``VoiceConditioner.from_resampled_batch``). The result travels with the request in
 ``additional_information``: stage 0 reads ``ids.prompt``, ``ids.speech_token``
 and ``embed.voice`` in its ``preprocess``; stage 1 reads ``embed.speech_token``,
 ``embed.speech_feat`` and ``embed.embedding``, which the stage handoff
@@ -338,19 +338,6 @@ class VoiceConditioner:
         return wav24, wav16
 
     @torch.inference_mode()
-    def from_resampled(self, wav24: np.ndarray, wav16: np.ndarray) -> VoiceConditioning:
-        """Condition on a clip already normalized and at both rates.
-
-        Split from ``prepare`` so the port can be compared with upstream from
-        identical samples, independent of the resampler.
-
-        Args:
-            wav24: The loudness-normalized clip at 24 kHz.
-            wav16: The same clip at 16 kHz.
-        """
-        return self.from_resampled_batch([(wav24, wav16)])[0]
-
-    @torch.inference_mode()
     @torch.backends.cudnn.flags(
         enabled=None, benchmark=None, benchmark_limit=None, deterministic=None, allow_tf32=False
     )
@@ -411,14 +398,6 @@ class VoiceConditioner:
                 )
             )
         return results
-
-    def tokenize(self, wav16: torch.Tensor, max_tokens: int | None) -> torch.Tensor:
-        """Port of ``chatterbox.models.s3tokenizer.S3Tokenizer.forward`` for one clip.
-
-        Returns:
-            Speech tokens of shape (1, T), long; ``T <= max_tokens`` when given.
-        """
-        return self.tokenize_batch([wav16], max_tokens)[0]
 
     def tokenize_batch(self, wavs16: list[torch.Tensor], max_tokens: int | None) -> list[torch.Tensor]:
         """Quantize a padded mel batch, retaining each clip's code length."""

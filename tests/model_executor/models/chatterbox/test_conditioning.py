@@ -157,12 +157,9 @@ def test_voice_encoder_padded_batch_matches_individual_references() -> None:
     # One partial window, then several; 520 frames is a clip just over five seconds.
     mels = [torch.rand(length, encoder.hp.num_mels) for length in (90, 205, 317, 520)]
     with torch.inference_mode():
-        individual = torch.cat([encoder.inference(mel[None], [len(mel)], batch_size=32, rate=1.3) for mel in mels])
+        individual = torch.cat([encoder.inference(mel[None], [len(mel)], rate=1.3) for mel in mels])
         batched = encoder.inference(
-            torch.nn.utils.rnn.pad_sequence(mels, batch_first=True),
-            [len(mel) for mel in mels],
-            batch_size=32,
-            rate=1.3,
+            torch.nn.utils.rnn.pad_sequence(mels, batch_first=True), [len(mel) for mel in mels], rate=1.3
         )
     assert batched.shape == (4, 256)
     torch.testing.assert_close(batched.norm(dim=1), torch.ones(4), atol=1e-5, rtol=1e-5)
@@ -321,7 +318,7 @@ def test_the_prompt_mel_is_cut_to_two_frames_per_prompt_token(
     (tokens,) = conditioner.tokenize_batch([torchaudio.functional.resample(clip, 24000, 16000)], None)
     assert tokens.shape[1] - mel.shape[1] // config.token_mel_ratio == extra
 
-    conditioning = conditioner.from_resampled(wav24, wav16)
+    (conditioning,) = conditioner.from_resampled_batch([(wav24, wav16)])
 
     kept = min(tokens.shape[1], mel.shape[1] // config.token_mel_ratio)
     assert conditioning.prompt_feat.shape[1] == config.token_mel_ratio * conditioning.prompt_token.shape[1]

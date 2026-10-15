@@ -162,7 +162,7 @@ def flow_mels(
     finalize: list[bool],
     n_timesteps: int,
     meanflow: bool,
-    noise: torch.Tensor | None = None,
+    noise: torch.Tensor,
 ) -> list[torch.Tensor]:
     """Mels for a batch of token rows in one flow call.
 
@@ -180,11 +180,9 @@ def flow_mels(
         meanflow: Whether the checkpoint is a distilled meanflow model (plain
             Euler steps) or a standard one (Euler steps with the flow's own
             classifier-free guidance, on a cosine schedule).
-        noise: Shape (B, 80, F) covering the last F mel frames of the flow's
-            input; the flow draws the frames before them. None lets it draw
-            them all, which is the distribution upstream's ``flow_inference``
-            samples from. ``S3GenDecoder`` passes the whole input, taken by
-            position from its buffer.
+        noise: Shape (B, 80, F), the noise every frame of the flow's input
+            starts from, prompt frames included. ``S3GenDecoder`` takes it by
+            position from its buffer; upstream's ``flow_inference`` draws it.
 
     Returns:
         B mels of shape (1, 80, F_i) with ``F_i = 2 * N_i``, minus the
@@ -516,7 +514,8 @@ class S3GenDecoder(nn.Module):
             counts: Tokens per request, in batch order.
             payloads: Per request, the inter-stage payload of its chunk;
                 empty for a request the runner holds none for. Only a
-                request's first chunk has to carry its voice.
+                request's first chunk has to carry its voice. None on the
+                engine's profiling run, and only then.
             request_ids: Per request, the scheduler's id. None on the
                 engine's profiling run, and only then.
 
@@ -531,16 +530,14 @@ class S3GenDecoder(nn.Module):
         """
         device, dtype = self.trim_fade.device, self.trim_fade.dtype
         audios = [torch.zeros(0, device=input_ids.device)] * len(counts)
-        if request_ids is None:
+        if request_ids is None or payloads is None:
             return audios
 
         flat = input_ids.reshape(-1)
         chunks: list[Chunk] = []
         owners: list[tuple[int, str]] = []
         start = 0
-        for idx, (count, raw, request_id) in enumerate(
-            zip(counts, payloads or [{}] * len(counts), request_ids, strict=True)
-        ):
+        for idx, (count, raw, request_id) in enumerate(zip(counts, payloads, request_ids, strict=True)):
             tokens = flat[start : start + count].long()
             start += count
             # The async processor's terminal payload carries no tokens.
@@ -548,13 +545,13 @@ class S3GenDecoder(nn.Module):
                 continue
             # Read by section: beside the chunk's payload the runner keeps
             # keys of its own in the same dict (the request id, the sampling
-            # parameters), which are not payload fields.
-            meta, embed = raw.get("meta") or {}, raw.get("embed") or {}
-            offset, final = meta.get("left_context_size"), meta.get("stream_finished")
-            if offset is None or final is None:
+            # parameters), which are not payload fields. Both stage handoffs
+            # set the two stream fields.
+            if "meta" not in raw:
                 raise RuntimeError(
                     f"chatterbox_s3gen got {count} tokens for request {request_id} without stream metadata"
                 )
+            offset, final = raw["meta"]["left_context_size"], raw["meta"]["stream_finished"]
             # A stream has state from the end of its first chunk to its
             # last, so a chunk without state is a first chunk and brings the
             # voice. A later chunk decodes in the voice the stream began
@@ -564,9 +561,9 @@ class S3GenDecoder(nn.Module):
                 state.reference
                 if state is not None
                 else Reference(
-                    prompt_token=embed["speech_token"].to(device),
-                    prompt_feat=embed["speech_feat"].to(device=device, dtype=dtype),
-                    embedding=embed["embedding"].to(device=device, dtype=dtype),
+                    prompt_token=raw["embed"]["speech_token"].to(device),
+                    prompt_feat=raw["embed"]["speech_feat"].to(device=device, dtype=dtype),
+                    embedding=raw["embed"]["embedding"].to(device=device, dtype=dtype),
                 )
             )
             chunks.append(

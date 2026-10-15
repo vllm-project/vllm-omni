@@ -571,6 +571,22 @@ def test_a_deploy_file_without_a_chunk_setting_is_an_error(stage_configs: list, 
         adapter.shutdown()
 
 
+def test_a_largest_chunk_below_the_first_is_an_error(stage_configs: list) -> None:
+    """The schedule grows from codec_chunk_frames to codec_max_chunk_frames; a cap below the start is a typo."""
+    deploy = modify_stage_config(
+        get_deploy_config_path(DEPLOY["turbo"]),
+        updates={"connectors.connector_of_shared_memory.extra.codec_max_chunk_frames": 10},
+    )
+    adapter = OmniChunkTransferAdapter(stage_vllm_config(stage_configs[0].model_config.model, deploy, 0))
+    request = stage0_request(request_prompt(250), f"external-{uuid.uuid4().hex}")
+    request.append_output_token_ids(10)
+    try:
+        with pytest.raises(ValueError, match="codec_max_chunk_frames"):
+            t3_to_s3gen_async_chunk(adapter, None, request)
+    finally:
+        adapter.shutdown()
+
+
 def test_two_requests_interleaved_keep_their_own_schedule_and_voice(
     adapter: OmniChunkTransferAdapter, receiver: SharedMemoryConnector
 ) -> None:
