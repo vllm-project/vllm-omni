@@ -45,6 +45,20 @@ the same Seed-TTS metadata, references, output cap, and concurrency list after
 restarting the server for each model. The universal benchmark reports audio RTF
 and playback underruns as well as first-audio latency; use these to evaluate
 streaming real-time performance rather than request completion alone.
+Pass `--output-len 1000` for Chatterbox: the API accepts at most upstream's
+1000 new speech tokens, and the Seed-TTS dataset's default request of 2048
+is refused with a 400.
+
+```bash
+python benchmarks/tts/bench_tts.py \
+  --model ResembleAI/chatterbox-turbo \
+  --task voice_clone --locale en \
+  --dataset-path /data/seed-tts-eval-ref5s \
+  --host 127.0.0.1 --port 8091 \
+  --concurrency 8 --num-prompts 32 \
+  --output-len 1000 --output-dir results/turbo-c8
+```
+
 See the [H100 profiling report](../../recipes/ResembleAI/Chatterbox-H100.md)
 for the full-load warmup protocol and measured batch-size tradeoffs.
 
