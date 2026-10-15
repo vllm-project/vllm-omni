@@ -1065,7 +1065,6 @@ Both reject VoiceDesign, free-form instructions and multilingual synthesis.
 and defaults to 1000. Admission capacity does not guarantee real-time playback.
 
 See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original),
-[A5000 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-A5000.md) and
 [H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).
 
 ## Error Responses

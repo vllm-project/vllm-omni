@@ -5,7 +5,7 @@
 - Vendor: Resemble AI
 - Model: `ResembleAI/chatterbox-turbo` (Turbo) and `ResembleAI/chatterbox` (English Original)
 - Task: English text-to-speech with the checkpoint's built-in voice or a voice cloned from one recording
-- Mode: online `/v1/audio/speech` with the high-concurrency profiles, which admit 64 requests. Real-time playback holds up to 16 cloned-voice or 32 built-in clients for Turbo, and up to 8 built-in clients for Original (16 with the cuDNN/MPS overlay) but at no measured cloned-voice load. Offline and default-profile serving as in the [A5000 recipe](Chatterbox-A5000.md)
+- Mode: online `/v1/audio/speech` with the high-concurrency profiles, which admit 64 requests. Real-time playback holds up to 16 cloned-voice or 32 built-in clients for Turbo, and up to 8 built-in clients for Original (16 with the cuDNN/MPS overlay) but at no measured cloned-voice load. Offline use and the default profiles are covered below
 - Hardware: 1x NVIDIA H100 SXM 80 GB
 - Maintainer: @will-rice
 
@@ -22,9 +22,26 @@ upstream implementation.
 
 ## Supported model contract
 
+| Task | Entrypoint |
+| --- | --- |
+| Built-in voice | `voice: "default"` on `/v1/audio/speech`; `VoiceConditioning.from_builtin` offline |
+| Voice cloning | one `ref_audio` recording (URL or data URL), no transcript; `VoiceConditioner.prepare` offline |
+| Long text | the shared WebSocket frontend with `split_granularity: "sentence"` ([speech API](../../docs/serving/speech_api.md#streaming-text-input-websocket)) |
+
+| Input | Limit |
+| --- | --- |
+| Text | English; stage 0's 2048-token context holds the prompt and the output |
+| Reference recording | mono; Turbo: longer than 5 s; Original: the shared 1 s minimum. T3 conditions on the first 15 s (Turbo) or 6 s (Original), S3Gen on the first 10 s |
+| Original controls | `extra_params.exaggeration` and `extra_params.cfg_weight`, finite and nonnegative; the deploy file's defaults are 0.5; Turbo rejects them |
+| Speech tokens | `max_new_tokens` 1 to 1000, upstream's generation cap, default 1000 (40 s at 25 tokens/s) |
+
+| Output | Value |
+| --- | --- |
+| Audio | mono, 24 kHz, float32 offline; WAV, PCM, MP3 or FLAC online; streamed PCM or WAV as delta chunks |
+| Streaming | first chunk 15 tokens plus reference alignment, then 30 and 60 (`codec_chunk_frames`), a `codec_left_context_frames` of 50 tokens and position-aligned flow noise keep chunks consistent |
+
 The request contract is the one in the
-[speech API](../../docs/serving/speech_api.md#chatterbox-turbo-and-original)
-and the [A5000 recipe](Chatterbox-A5000.md#supported-model-contract).
+[speech API](../../docs/serving/speech_api.md#chatterbox-turbo-and-original).
 
 | Profile on this hardware | Status |
 | --- | --- |
@@ -40,7 +57,6 @@ row.
 ## References
 
 - [Upstream implementation](https://github.com/resemble-ai/chatterbox) (`chatterbox-tts` 0.1.7, `5de7a54aa4e5e2baadb0182dde554908b48b85c2`)
-- [A5000 recipe](Chatterbox-A5000.md): commands, offline use, limitations
 - [Online examples](../../examples/online_serving/text_to_speech/README.md#chatterbox-turbo-and-original)
 - [TTS benchmark README](../../benchmarks/tts/README.md): the shared `bench_tts.py` driver, `chatterbox_reference.py` and `chatterbox_conditioning.py`
 - [Nightly perf configuration](../../tests/dfx/perf/tests/test_tts.json)
@@ -107,6 +123,40 @@ python benchmarks/tts/bench_tts.py \
 The comparison with upstream uses `benchmarks/tts/chatterbox_reference.py`;
 its commands are in the [TTS benchmark README](../../benchmarks/tts/README.md#matched-chatterbox-reference-qualification).
 
+Offline, with the same tokenizer, prompt and conditioning code serving uses:
+
+```bash
+uv run python - <<'PYTHON'
+import soundfile as sf
+import torch
+from vllm_omni import Omni
+from vllm_omni.model_executor.models.chatterbox.conditioning import (
+    VoiceConditioning, build_prompt, load_text_tokenizer, tokenize_text,
+)
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+
+model, variant = "ResembleAI/chatterbox-turbo", "turbo"
+# For Original: model, variant = "ResembleAI/chatterbox", "original"
+config = ChatterboxConfig(variant)
+tokenizer = load_text_tokenizer(model, variant)
+voice = VoiceConditioning.from_builtin(model)
+ids = tokenize_text("Hello, this is Chatterbox speaking.", tokenizer, variant)
+prompt = build_prompt(ids, voice, config)
+engine = Omni(model=model)
+try:
+    output = list(engine.generate([prompt]))[0].outputs[0].multimodal_output
+    audio = output["audio"]
+    if isinstance(audio, list):
+        audio = torch.cat([chunk.flatten() for chunk in audio])
+    sf.write("output.wav", audio.flatten().numpy(force=True), config.sample_rate)
+finally:
+    engine.close()
+PYTHON
+```
+
+To clone offline, read a recording with `soundfile.read` and replace `voice`
+with `VoiceConditioner(model, config, torch.device("cpu")).prepare(wav, sample_rate)`.
+
 ## Verification
 
 ```bash
@@ -122,14 +172,16 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
 
 ## Notes
 
-- Memory usage: stage 0 reserves 35 % of the card (Turbo, and the default
-  Original) or 40 % (high-concurrency Original). From the stage-0 startup
-  lines: Turbo's 26.5 GiB of KV cache holds about 289,000 tokens, 141
-  sequences of 2048 tokens; the high-concurrency Original's 30.1 GiB holds
-  262,592 tokens, 128.2 sequences, just above its 128 guidance sequences.
-  Stage 1 allocates no KV cache. Whole-device usage after startup was 30.2
-  GB (Turbo) and 34.1 GB (Original) with the high-concurrency profiles, and
-  about 32 GB during the single-request comparison.
+- Memory usage: the fractions in the deploy files are set from the stage-0
+  startup lines of this run (weights 0.80 GiB Turbo / 1.01 GiB Original,
+  96 / 120 KiB of KV cache per token): the default profiles reserve 20 %
+  (Turbo) and 30 % (Original) of the card for stage 0, which leaves a 24 GB
+  card about 1.8 GiB over its 8 slots; the high-concurrency Original
+  reserves 45 %, since its 128 guidance sequences need 30.0 GiB of KV cache
+  and the measured 40 % fitted them exactly. Stage 1 allocates no KV cache;
+  its 15 % bounds the flow's and HiFT's activations. The tables below were
+  measured with the earlier fractions (35 % / 40 %), which only reserved
+  more.
 - Key flags: `conditioning_device: cuda:0` under stage 0
   `additional_config` puts the reference encoders on the GPU;
   `flow_dtype: bfloat16` under stage 1 `hf_overrides` (the default in both
@@ -140,8 +192,13 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
   stages.
 - Known limitations: cloned voices add the reference encoding to first
   audio (about 0.9 s at 8 Turbo clients, 5.7 s at 64); Original is not
-  real-time for cloned voices at 8 clients on either overlay. Everything in
-  the A5000 recipe's limitations applies.
+  real-time for cloned voices at 8 clients on either overlay. English only
+  (the multilingual checkpoint is not served); no VoiceDesign or free-form
+  instructions; no prefix caching (prompts are placeholder ids whose
+  embeddings differ per request). Text that needs more than 1000 speech
+  tokens is cut at the cap, as upstream's `generate` is; both Omni and
+  upstream produce repetition or unrelated speech on unsplit narration of
+  several hundred words, so send long text through the sentence frontend.
 
 ## Supported features
 

@@ -60,9 +60,8 @@ uv run apps/tts_streaming_player/gradio_demo.py --sample-rate 24000
 It does not sentence-segment long text; use the shared WebSocket speech
 frontend for long narration. Multilingual is unsupported.
 
-See the [A5000 recipe](../../../recipes/ResembleAI/Chatterbox-A5000.md) and
-[H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for profiles,
-qualification scope and concurrency limitations.
+See the [H100 recipe](../../../recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
 
 ---
 
