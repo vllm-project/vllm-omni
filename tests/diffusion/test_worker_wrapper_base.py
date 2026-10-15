@@ -522,8 +522,8 @@ class TestWorkerWrapperBaseDelegation:
     ):
         destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
         shutdown_connector = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
-        allocator_factory = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance")
-        release = allocator_factory.return_value.release_pools
+        allocator = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance").return_value
+        release = allocator.release_pools
         mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_cuda",
             return_value=platform == "cuda",
