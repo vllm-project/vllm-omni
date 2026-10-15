@@ -7,6 +7,8 @@
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
 - [Batch Parallel Decode](#batch-parallel-decode)
+- [Spatially-Sharded Decode (Wan)](#spatially-sharded-decode-wan)
+- [Distributed Encode Split (Wan)](#distributed-encode-split-wan)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
 - [Summary](#summary)
@@ -228,6 +230,68 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
     --endpoint /v1/videos --dataset random --task t2v --num-prompts 1 \
     --height 480 --width 832 --num-frames 17 --max-concurrency 1
 ```
+
+---
+
+## Distributed Encode Split (Wan)
+
+When the Wan VAE **encodes** across ranks, `VLLM_OMNI_WAN_VAE_ENCODE_SPLIT`
+selects how the frame is divided:
+
+| Value | Split | Pixels encoded | Seams |
+| ----- | ----- | -------------- | ----- |
+| `tile` (default) | diffusers' overlapping 256/192 tiles, distributed across ranks (28 tiles at 1280x720) | ~1.65x the frame (each overlap is encoded twice) | blended |
+| `rank` | one latent-aligned piece per rank, on the most nearly square grid for the rank count (2x4 for 8 ranks at 720p) | ~1x the frame, plus a context margin on inner edges | margin cropped off, pieces concatenated |
+
+`VLLM_OMNI_WAN_VAE_ENCODE_MARGIN` (latent pixels, default `2`, must be `>= 0`)
+sets the context each `rank` piece reads beyond its edges. A latent pixel is
+8 sample pixels for the Wan2.1-style VAE.
+
+**When it applies.** The split runs only when all of the following hold:
+
+- The pipeline uses the Wan VAE and encodes an input image or video, as Wan2.2
+  I2V, TI2V, S2V and VACE do. Text-to-video does not encode and is unaffected.
+- `vae_patch_parallel_size > 1` with `vae_parallel_mode="tile"` or
+  `"spatial_shard_*"`. `batch` mode encodes locally, and spatial-shard modes
+  shard only the decode.
+- VAE tiling is enabled (automatic for these modes) and the input is larger
+  than one tile (256 sample px in height or width). Smaller inputs use the local
+  encode.
+
+Both variables are read at each encode. Set them in the environment of the
+process that starts vLLM-Omni; spawned diffusion workers inherit it:
+
+```bash
+VLLM_OMNI_WAN_VAE_ENCODE_SPLIT=rank \
+vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers --omni \
+    --tensor-parallel-size 2 \
+    --vae-patch-parallel-size 2 \
+    --vae-parallel-mode spatial_shard_height
+```
+
+**Quality and approximation limits.** Neither split reproduces a single-GPU
+un-tiled encode exactly:
+
+- `tile` blends overlapping tiles.
+- A `rank` piece sees only `margin` latent pixels of context beyond its edges,
+  which is less than the encoder's receptive field. Smaller margins are faster
+  but less accurate.
+- With `margin=0`, pieces get no context at all, and the result is **less
+  accurate than the default `tile` split**. Keep the margin at `1` or more.
+
+Measured on Intel Arc Pro B70 with the Wan2.1-style VAE (as used by
+Wan2.2-I2V-A14B), 1280x720, 81 frames, bf16, against a single-GPU un-tiled
+encode. Time is the slowest rank; rel_l2 covers all latent frames:
+
+| Ranks | `tile` | `rank`, margin 0 | `rank`, margin 1 | `rank`, margin 2 (default) | `rank`, margin 4 |
+| ----- | ------ | ---------------- | ---------------- | -------------------------- | ---------------- |
+| 2 | 8.58 s, rel_l2 9.5e-3 | 5.43 s, 2.4e-2 | 5.76 s, 4.1e-3 | 5.89 s, 2.2e-3 | 5.92 s, 1.6e-3 |
+| 3 | 5.83 s, rel_l2 9.5e-3 | 3.88 s, 3.4e-2 | 3.96 s, 5.7e-3 | 4.08 s, 2.8e-3 | 4.34 s, 2.0e-3 |
+| 4 | 4.46 s, rel_l2 9.5e-3 | 2.76 s, 4.2e-2 | 3.01 s, 5.9e-3 | 3.16 s, 3.0e-3 | 3.25 s, 2.1e-3 |
+
+The error grows slightly with the rank count, because more pieces means more
+inner edges. Validate generated outputs for your model and resolution before
+changing the default.
 
 ---
 
