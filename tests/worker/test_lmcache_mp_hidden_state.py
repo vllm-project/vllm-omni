@@ -155,17 +155,33 @@ def test_retrieve_returns_none_on_a_miss():
     assert backend.retrieve(list(range(CHUNK_SIZE)), "req") is None
 
 
-def test_retrieve_survives_an_rpc_failure():
+@pytest.mark.parametrize("error", [TimeoutError, ConnectionError])
+def test_an_unreachable_cache_is_a_miss(error):
     adapter = _FakeAdapter()
     backend = MPHiddenStateBackend(adapter)
 
     def boom(key, instance_id):
-        raise RuntimeError("server gone")
+        raise error("server gone")
 
     adapter.req_client.retrieve_hidden_state = boom
 
     # A cache that cannot be reached is a miss, not a failed step.
     assert backend.retrieve(list(range(CHUNK_SIZE)), "req") is None
+
+
+def test_a_programming_error_is_not_swallowed_as_a_miss():
+    """Catching broadly here once turned a server-side TypeError into a miss,
+    so the symptom surfaced two layers away as an incomplete restore."""
+    adapter = _FakeAdapter()
+    backend = MPHiddenStateBackend(adapter)
+
+    def boom(key, instance_id):
+        raise TypeError("'PrefetchResult' object is not subscriptable")
+
+    adapter.req_client.retrieve_hidden_state = boom
+
+    with pytest.raises(TypeError):
+        backend.retrieve(list(range(CHUNK_SIZE)), "req")
 
 
 def test_lookup_returns_the_covered_token_count():

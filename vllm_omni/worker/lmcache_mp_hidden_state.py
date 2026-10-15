@@ -21,6 +21,11 @@ logger = init_logger(__name__)
 # server within this budget should fall back to recompute, not stall a step.
 _RPC_TIMEOUT_S = 10.0
 
+# An unreachable cache is a miss. Anything else is a bug and must not be
+# turned into one: LMCacheTimeoutError subclasses TimeoutError, and a dead
+# socket raises ConnectionError.
+_UNREACHABLE = (TimeoutError, ConnectionError)
+
 
 def layer_order(mm_keys: tuple[str, ...]) -> tuple[str, ...]:
     """Return the layer keys in the order they are packed along dim 1.
@@ -115,8 +120,8 @@ class MPHiddenStateBackend:
                 hidden_size,
                 dtype_name,
             ).result(timeout=_RPC_TIMEOUT_S)
-        except Exception:
-            logger.exception("LMCache MP: register_hidden_state failed")
+        except _UNREACHABLE:
+            logger.warning("LMCache MP: cache unreachable on register", exc_info=True)
             return False
         if not ok:
             logger.error("LMCache MP: server refused the hidden-state layout %s", shape)
@@ -164,9 +169,9 @@ class MPHiddenStateBackend:
                     key, self._adapter.instance_id, pickle.dumps(chunks)
                 ).result(timeout=_RPC_TIMEOUT_S)
             )
-        except Exception:
-            logger.exception(
-                "LMCache MP: store_hidden_state failed (req_id=%s)", request_id
+        except _UNREACHABLE:
+            logger.warning(
+                "LMCache MP: cache unreachable on store (req_id=%s)", request_id
             )
             return False
 
@@ -181,9 +186,9 @@ class MPHiddenStateBackend:
             data, num_tokens = self._adapter.req_client.retrieve_hidden_state(
                 key, self._adapter.instance_id
             ).result(timeout=_RPC_TIMEOUT_S)
-        except Exception:
-            logger.exception(
-                "LMCache MP: retrieve_hidden_state failed (req_id=%s)", request_id
+        except _UNREACHABLE:
+            logger.warning(
+                "LMCache MP: cache unreachable on retrieve (req_id=%s)", request_id
             )
             return None
         if not num_tokens or not data:
@@ -199,9 +204,9 @@ class MPHiddenStateBackend:
                     key, self._adapter.instance_id
                 ).result(timeout=_RPC_TIMEOUT_S)
             )
-        except Exception:
-            logger.exception(
-                "LMCache MP: lookup_hidden_state failed (req_id=%s)", request_id
+        except _UNREACHABLE:
+            logger.warning(
+                "LMCache MP: cache unreachable on lookup (req_id=%s)", request_id
             )
             return 0
 
@@ -217,15 +222,15 @@ def find_mp_backend() -> MPHiddenStateBackend | None:
             get_kv_transfer_group,
             has_kv_transfer_group,
         )
+    except ImportError:
+        return None
 
-        if not has_kv_transfer_group():
-            return None
-        connector = get_kv_transfer_group()
-        candidates = getattr(connector, "_connectors", None) or [connector]
-        for candidate in candidates:
-            adapter = getattr(candidate, "worker_adapter", None)
-            if adapter is not None and hasattr(adapter, "req_client"):
-                return MPHiddenStateBackend(adapter)
-    except Exception:
-        logger.debug("LMCache MP: no MP worker adapter found", exc_info=True)
+    if not has_kv_transfer_group():
+        return None
+    connector = get_kv_transfer_group()
+    candidates = getattr(connector, "_connectors", None) or [connector]
+    for candidate in candidates:
+        adapter = getattr(candidate, "worker_adapter", None)
+        if adapter is not None and hasattr(adapter, "req_client"):
+            return MPHiddenStateBackend(adapter)
     return None
