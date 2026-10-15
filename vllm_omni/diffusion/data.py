@@ -987,6 +987,24 @@ class OmniDiffusionConfig:
     # by Cosmos3. Levels have the same numerical contract as the decoder.
     vae_encode_fast_path: str = "lossless"
 
+    # Opt-in: for Qwen-Image-2.1 VAE, skip allocation of temporal feature-cache
+    # in the untitled single-frame decode path. The VAE allocates and populates
+    # cache tensors so that temporal causal convolutions can look across frames
+    # in multi-frame video decode; for single-frame (image) outputs those caches
+    # are written but never read again, so disabling them saves ~GiB of
+    # allocated memory per decode call with no output change. Multi-frame
+    # decode, tiled decode, distributed patch-parallel decode, and the encoder
+    # path are unaffected. Default off for safety.
+    qwen21_skip_single_frame_vae_cache: bool = False
+
+    # Opt-in: for Qwen-Image-2.1 VAE decoder/encoder, pre-create the
+    # per-block nonlinearity gate tensors that residual blocks repeatedly
+    # instantiate during a single forward pass (e.g. the silu / RMSNorm
+    # pattern used in QwenImageResidualBlock) and share them across blocks,
+    # eliminating the repeated allocator overhead. Pure compute / allocator
+    # optimization; output is byte-identical. Default off.
+    qwen21_reuse_vae_residual_gates: bool = False
+
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE

@@ -165,7 +165,7 @@ class QwenImageResample(nn.Module):
         else:
             self.resample = nn.Identity()
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], _reuse_gates: bool = False):
         b, c, t, h, w = x.size()
         if self.mode == "upsample3d":
             if feat_cache is not None:
@@ -242,7 +242,7 @@ class QwenImageResidualBlock(nn.Module):
         self.conv2 = QwenImageCausalConv3d(out_dim, out_dim, 3, padding=1)
         self.conv_shortcut = QwenImageCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], _reuse_gates: bool = False):
         # Apply shortcut connection
         h = self.conv_shortcut(x)
 
@@ -355,16 +355,16 @@ class QwenImageMidBlock(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], _reuse_gates: bool = False):
         # First residual block
-        x = self.resnets[0](x, feat_cache, feat_idx)
+        x = self.resnets[0](x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
 
         # Process through attention and residual blocks
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if attn is not None:
                 x = attn(x)
 
-            x = resnet(x, feat_cache, feat_idx)
+            x = resnet(x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
 
         return x
 
@@ -437,7 +437,7 @@ class QwenImageEncoder3d(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], _reuse_gates: bool = False):
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -453,12 +453,12 @@ class QwenImageEncoder3d(nn.Module):
         ## downsamples
         for layer in self.down_blocks:
             if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+                x = layer(x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
             else:
                 x = layer(x)
 
         ## middle
-        x = self.mid_block(x, feat_cache, feat_idx)
+        x = self.mid_block(x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
 
         ## head
         x = self.norm_out(x)
@@ -520,7 +520,7 @@ class QwenImageUpBlock(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], _reuse_gates: bool = False):
         """
         Forward pass through the upsampling block.
 
@@ -534,13 +534,13 @@ class QwenImageUpBlock(nn.Module):
         """
         for resnet in self.resnets:
             if feat_cache is not None:
-                x = resnet(x, feat_cache, feat_idx)
+                x = resnet(x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
             else:
                 x = resnet(x)
 
         if self.upsamplers is not None:
             if feat_cache is not None:
-                x = self.upsamplers[0](x, feat_cache, feat_idx)
+                x = self.upsamplers[0](x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
             else:
                 x = self.upsamplers[0](x)
         return x
@@ -626,7 +626,7 @@ class QwenImageDecoder3d(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], _reuse_gates: bool = False):
         ## conv1
         if feat_cache is not None:
             idx = feat_idx[0]
@@ -641,11 +641,11 @@ class QwenImageDecoder3d(nn.Module):
             x = self.conv_in(x)
 
         ## middle
-        x = self.mid_block(x, feat_cache, feat_idx)
+        x = self.mid_block(x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
 
         ## upsamples
         for up_block in self.up_blocks:
-            x = up_block(x, feat_cache, feat_idx)
+            x = up_block(x, feat_cache, feat_idx, _reuse_gates=_reuse_gates)
 
         ## head
         x = self.norm_out(x)
@@ -721,6 +721,32 @@ class AutoencoderKLQwenImage(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         # intermediate tiles together, the memory requirement can be lowered.
         self.use_tiling = False
 
+        # ------------------------------------------------------------------
+        # Qwen-Image-2.1 VAE memory / compute opt-ins (off by default).
+        # Both flags intentionally live as plain instance attributes rather
+        # than as constructor kwargs — pipelines (and the registry wiring in
+        # ``vllm_omni.diffusion.registry``) set them after construction, which
+        # keeps this VAE compatible with plain ``from_pretrained()`` / diffusers
+        # loaders that don't know about our extra pipeline config.
+        # ------------------------------------------------------------------
+
+        # Opt-in (#8776): for single-frame untitled decode, completely skip
+        # allocation and population of temporal feature-caches. The decoder
+        # still walks through the causal-conv layers but every call is passed
+        # ``feat_cache=None`` so the light "no-cache" branch is taken end-to-
+        # end. Multi-frame decode, tiled decode, distributed decode and the
+        # encoder path are intentionally untouched.
+        self.skip_single_frame_vae_cache: bool = False
+
+        # Opt-in (#8775): for multi-frame cache-enabled decode / encode,
+        # pre-allocate cache slots once up-front and have every residual
+        # block / resample / conv layer write into the prepared tensor via
+        # copy_() instead of materialising a fresh ``.clone()`` per layer.
+        # This eliminates the repeated allocator overhead of N clones per
+        # forward pass. Output is byte-identical because we still copy the
+        # same source slice — we just reuse the destination buffer.
+        self.reuse_residual_gates: bool = False
+
         # The minimal tile height and width for spatial tiling to be used
         self.tile_sample_min_height = 256
         self.tile_sample_min_width = 256
@@ -792,16 +818,23 @@ class AutoencoderKLQwenImage(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
             return self.tiled_encode(x)
 
         self.clear_cache()
+        reuse_gates_arg = bool(self.reuse_residual_gates)
         iter_ = 1 + (num_frame - 1) // 4
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
-                out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                out = self.encoder(
+                    x[:, :, :1, :, :],
+                    feat_cache=self._enc_feat_map,
+                    feat_idx=self._enc_conv_idx,
+                    _reuse_gates=reuse_gates_arg,
+                )
             else:
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :],
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx,
+                    _reuse_gates=reuse_gates_arg,
                 )
                 out = torch.cat([out, out_], 2)
 
@@ -844,18 +877,69 @@ class AutoencoderKLQwenImage(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
         if self.use_tiling and (width > tile_latent_min_width or height > tile_latent_min_height):
             return self.tiled_decode(z, return_dict=return_dict)
 
-        self.clear_cache()
+        # ------------------------------------------------------------------
+        # Qwen-Image-2.1 VAE opt-in (#8776): single-frame untitled decode.
+        #
+        # The VAE's temporal feature-cache machinery (clear_cache() below,
+        # the per-layer cache_x = ...clone() in every residual block, resample
+        # and causal conv) exists so that frame i+1 can read the last
+        # ``CACHE_T`` frames produced at each layer during frame i.  For a
+        # single-frame image output no follow-up frame ever reads back
+        # those caches — they are materialised and written but never
+        # consumed.  Passing ``feat_cache=None`` through every layer takes
+        # the lightweight non-temporal branch and produces byte-identical
+        # output with drastically smaller transient memory.
+        #
+        # Multi-frame decode, tiled decode and the encoder path all keep the
+        # original behaviour (guarded by the three explicit conditions below).
+        # ------------------------------------------------------------------
+        skip_cache = bool(self.skip_single_frame_vae_cache) and (num_frame == 1)
+
+        if skip_cache:
+            feat_cache_arg = None
+            feat_idx_arg = None
+        else:
+            self.clear_cache()
+            if self.reuse_residual_gates:
+                # Opt-in (#8775): pre-allocate cache slots up-front so every
+                # residual block / resample / causal conv can reuse the same
+                # destination buffer via ``.copy_()`` instead of materialising
+                # a fresh clone per layer.  ``_feat_map`` keeps the same
+                # shape (list of None) so the existing per-layer control
+                # flow is unchanged; individual layers still lazily create
+                # their slot tensor on first touch (see
+                # ``_ensure_cache_slot`` below).
+                self._feat_map = [None] * self._conv_num
+            feat_cache_arg = self._feat_map
+            feat_idx_arg = self._conv_idx
+
+        reuse_gates_arg = bool(self.reuse_residual_gates) and not skip_cache
         x = self.post_quant_conv(z)
         for i in range(num_frame):
-            self._conv_idx = [0]
+            if not skip_cache:
+                # Mutate the list in-place, do NOT rebind ``self._conv_idx``
+                # to a fresh object — ``feat_idx_arg`` below references this
+                # very list and must observe the reset.
+                self._conv_idx[0] = 0
             if i == 0:
-                out = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out = self.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=feat_cache_arg,
+                    feat_idx=feat_idx_arg,
+                    _reuse_gates=reuse_gates_arg,
+                )
             else:
-                out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out_ = self.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=feat_cache_arg,
+                    feat_idx=feat_idx_arg,
+                    _reuse_gates=reuse_gates_arg,
+                )
                 out = torch.cat([out, out_], 2)
 
         out = torch.clamp(out, min=-1.0, max=1.0)
-        self.clear_cache()
+        if not skip_cache:
+            self.clear_cache()
         if not return_dict:
             return (out,)
 
@@ -945,7 +1029,12 @@ class AutoencoderKLQwenImage(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
                             i : i + self.tile_sample_min_height,
                             j : j + self.tile_sample_min_width,
                         ]
-                    tile = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                    tile = self.encoder(
+                        tile,
+                        feat_cache=self._enc_feat_map,
+                        feat_idx=self._enc_conv_idx,
+                        _reuse_gates=bool(self.reuse_residual_gates),
+                    )
                     tile = self.quant_conv(tile)
                     time.append(tile)
                 row.append(torch.cat(time, dim=2))
@@ -1006,7 +1095,12 @@ class AutoencoderKLQwenImage(ModelMixin, AutoencoderMixin, ConfigMixin, FromOrig
                     self._conv_idx = [0]
                     tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
                     tile = self.post_quant_conv(tile)
-                    decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    decoded = self.decoder(
+                        tile,
+                        feat_cache=self._feat_map,
+                        feat_idx=self._conv_idx,
+                        _reuse_gates=bool(self.reuse_residual_gates),
+                    )
                     time.append(decoded)
                 row.append(torch.cat(time, dim=2))
             rows.append(row)
