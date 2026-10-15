@@ -3,6 +3,7 @@
 
 from vllm.v1.worker.workspace import init_workspace_manager
 
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.platforms.npu.worker.base import OmniNPUWorkerBase
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import NPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
@@ -17,5 +18,10 @@ class NPUARWorker(OmniWorkerMixin, OmniNPUWorkerBase):
         self.device = self._init_device()
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
+
+        # Install platform-specific AR runtime patches before model loading;
+        # MOSS stage 0 runs on this worker, whose init_device never reaches
+        # NPUOmniPlatform.set_device.
+        current_omni_platform.init_ar_worker_runtime(self.vllm_config, self.device)
 
         self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
