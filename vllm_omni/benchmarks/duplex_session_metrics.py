@@ -91,6 +91,14 @@ def collect_duplex_session_metrics(
         if isinstance(raw_metric, dict):
             metric.update(raw_metric)
             metric["rtf"] = audio_rtf_from_raw_metric(raw_metric)
+            client_rtf = audio_rtf_from_raw_metric(
+                {
+                    "audio_generation_ms": raw_metric.get("client_audio_generation_ms"),
+                    "audio_duration_ms": raw_metric.get("audio_duration_ms"),
+                }
+            )
+            if client_rtf is not None:
+                metric["client_rtf"] = client_rtf
         copied_stages: dict[str, dict[str, object]] = {}
         if isinstance(stages, dict):
             for stage_id, stage_snapshot in stages.items():

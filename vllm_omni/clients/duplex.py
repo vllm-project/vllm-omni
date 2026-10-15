@@ -43,6 +43,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -672,6 +673,11 @@ class DuplexClientBase(ABC):
         self._closed = asyncio.Event()
         self._closed_marker: _ClosedMarker | None = None
         self._last_error_reason: str | None = None
+        self._event_collector: EventCollector | None = None
+
+    def attach_event_collector(self, collector: EventCollector) -> None:
+        """Record successful append sends on ``collector`` (probe / bench)."""
+        self._event_collector = collector
 
     # -- transport hooks ------------------------------------------------------
 
@@ -966,6 +972,18 @@ class DuplexClientBase(ABC):
             raise
         except Exception as exc:
             raise DuplexConnectionError(f"send failed: {exc}") from exc
+        collector = self._event_collector
+        if collector is not None and payload.get("type") == "input_audio_buffer.append":
+            frames = payload.get("video_frames")
+            is_speech = payload.get("is_speech")
+            collector.note_client_append(
+                {
+                    "sent_at_s": time.monotonic(),
+                    "event_id": event_id,
+                    "is_speech": is_speech if isinstance(is_speech, bool) else None,
+                    "has_video": isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames),
+                }
+            )
         return event_id
 
     # -- internals ---------------------------------------------------------------
@@ -1420,6 +1438,26 @@ def _event_response_request_metrics(event: dict[str, object]) -> dict[str, objec
     return None
 
 
+class ClientAppendStamp(TypedDict):
+    """One successful ``input_audio_buffer.append`` send on the client clock."""
+
+    sent_at_s: float
+    event_id: str
+    is_speech: bool | None
+    has_video: bool
+
+
+_CLIENT_APPEND_TTFP_ORIGIN = (
+    "last input_audio_buffer.append client send before this response.created receive "
+    "(after the previous response.created receive or after_s) to first audio packet"
+)
+_CLIENT_APPEND_RTF_ORIGIN = (
+    "last input_audio_buffer.append client send before this response.created receive "
+    "(after the previous response.created receive or after_s) to last audio packet "
+    "divided by emitted audio duration"
+)
+
+
 class EventCollector:
     """Accumulate events for assertions and latency summaries (tests/benchmarks).
 
@@ -1433,6 +1471,39 @@ class EventCollector:
         self.response_audio: dict[str, list[bytes]] = {}
         self.response_ids: list[str] = []
         self.output_sample_rate_hz = 24_000
+        self.client_appends: list[ClientAppendStamp] = []
+
+    def note_client_append(self, record: ClientAppendStamp) -> None:
+        """Record one successful append send (same monotonic clock as ``add``)."""
+        self.client_appends.append(record)
+
+    def _client_append_origin_s(
+        self,
+        *,
+        after_s: float,
+        response_created_at_s: float | None,
+        response_id: str | None,
+    ) -> float | None:
+        if response_created_at_s is None:
+            return None
+        prev_created_at_s = after_s
+        if response_id is not None:
+            try:
+                previous_index = self.response_ids.index(response_id) - 1
+            except ValueError:
+                previous_index = -1
+            if previous_index >= 0:
+                previous_id = self.response_ids[previous_index]
+                for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
+                    if event.get("type") == "response.created" and wrap_event(event).response_id == previous_id:
+                        prev_created_at_s = received_at_s
+                        break
+        started_at_s: float | None = None
+        for record in self.client_appends:
+            sent_at_s = float(record["sent_at_s"])
+            if prev_created_at_s <= sent_at_s <= response_created_at_s:
+                started_at_s = sent_at_s
+        return started_at_s
 
     async def consume(self, client: DuplexClientBase) -> None:
         """Subscribe to ``client`` and collect until the session ends."""
@@ -1778,6 +1849,24 @@ class EventCollector:
                         stage0_metrics.get("vllm_tpot_ms"),
                         nonnegative=True,
                     )
+                client_started_at_s = self._client_append_origin_s(
+                    after_s=after_s,
+                    response_created_at_s=response_created_at_s,
+                    response_id=response_id,
+                )
+                if client_started_at_s is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["client_ttfp_ms"] = _rounded_ms(
+                        (audio_received_at_s[0] - client_started_at_s) * 1000.0
+                    )
+                    request_metrics["client_audio_generation_ms"] = _rounded_ms(
+                        max(0.0, (audio_received_at_s[-1] - client_started_at_s) * 1000.0)
+                    )
+                    request_metrics["client_measurement_origin"] = {
+                        "ttfp": _CLIENT_APPEND_TTFP_ORIGIN,
+                        "rtf": _CLIENT_APPEND_RTF_ORIGIN,
+                    }
         return result
 
     def _format_for_bytes(self) -> AudioFormat:
@@ -1921,6 +2010,10 @@ def summarize_session_request_metrics(
         "ttfp_ms": distribution_summary(_finite_metric_values(request_metrics, "ttfp_ms")),
         "rtf": distribution_summary(_finite_metric_values(request_metrics, "rtf"), digits=6),
     }
+    if (client_ttfp := distribution_summary(_finite_metric_values(request_metrics, "client_ttfp_ms"))) is not None:
+        summary["client_ttfp_ms"] = client_ttfp
+    if (client_rtf := distribution_summary(_finite_metric_values(request_metrics, "client_rtf"), digits=6)) is not None:
+        summary["client_rtf"] = client_rtf
     if (tpot := distribution_summary(_finite_metric_values(request_metrics, "tpot_ms", positive=True))) is not None:
         summary["tpot_ms"] = tpot
     if (stages := summarize_stage_metrics(request_metrics)) is not None:
