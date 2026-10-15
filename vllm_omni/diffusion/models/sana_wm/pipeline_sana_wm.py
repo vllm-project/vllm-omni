@@ -634,7 +634,7 @@ class SanaWmPipeline(
             )
         # Return RAW Gemma hidden states: the transformer's ``attention_y_norm``
         # RMSNorm does the normalisation, so normalising here double-normalises.
-        prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
+        prompt_attention_mask = attention_mask.to(device=device, dtype=torch.bool)
         # An all-ones mask carries no information. Keep it ``None`` so
         # cross-attention takes the mask-free attention path instead of handing
         # every block, on every step, a mask the backend must reshape to no
