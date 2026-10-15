@@ -67,6 +67,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.base import validate_tts_request
 from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
@@ -1235,7 +1236,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         adapter = self._get_tts_adapter()
         if adapter is not None:
             adapter.normalize(request)
-            return adapter.validate(request)
+            return validate_tts_request(adapter, request)
 
         adapter_cls = resolve_adapter("qwen3_tts")
         if adapter_cls is None:
@@ -1247,7 +1248,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         adapter = adapter_cls(ctx)
         adapter.normalize(request)
-        return adapter.validate(request)
+        return validate_tts_request(adapter, request)
 
     def _validate_speech_sample_rate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if request.sample_rate is None:
@@ -2042,7 +2043,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if (adapter := self._get_tts_adapter()) is not None:
             adapter.normalize(request)
-            validation_error = adapter.validate(request)
+            validation_error = validate_tts_request(adapter, request)
             if validation_error:
                 raise ValueError(validation_error)
             prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
@@ -2409,7 +2410,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             # Assume that this will follow the same adapter pattern
             # once all RFC is implemented
-            validation_error = self._adapter.validate(request)
+            validation_error = validate_tts_request(self._adapter, request)
             if validation_error is not None:
                 raise ValueError(validation_error)
 
