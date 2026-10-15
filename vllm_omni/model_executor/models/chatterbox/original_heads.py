@@ -7,7 +7,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_DEFAULT_EXAGGERATION, START_SPEECH_TOKEN
+from vllm_omni.transformers_utils.configs.chatterbox import START_SPEECH_TOKEN
 
 # Fixed by the English Original checkpoint, including text BOS/EOS positions.
 ORIGINAL_MAX_TEXT_TOKENS = 2048
@@ -106,7 +106,7 @@ def original_prefill_embeds(
     text_ids: torch.Tensor,
     cond_tokens: torch.Tensor,
     speaker_emb: torch.Tensor,
-    exaggeration: float = ORIGINAL_DEFAULT_EXAGGERATION,
+    exaggeration: float,
     unconditional: bool = False,
 ) -> torch.Tensor:
     """Build one raw-text request's exact Original prompt, shape (T + ORIGINAL_PROMPT_EXTRA_ROWS, H).

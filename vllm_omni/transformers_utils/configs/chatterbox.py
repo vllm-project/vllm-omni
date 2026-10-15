@@ -19,9 +19,6 @@ import operator
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
-# Upstream's ``ChatterboxTTS.generate`` defaults for its two controls.
-ORIGINAL_DEFAULT_EXAGGERATION = 0.5
-ORIGINAL_DEFAULT_CFG_WEIGHT = 0.5
 # Control ids shared by every checkpoint: the start-of-speech and stop tokens.
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562

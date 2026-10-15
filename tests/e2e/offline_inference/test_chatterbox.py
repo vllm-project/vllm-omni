@@ -40,7 +40,9 @@ def test_text_to_audio_001(omni_runner, offline_client):
     tokenizer = load_text_tokenizer(model, variant)
     text_ids = [tokenize_text(text, tokenizer, variant) for text in texts]
     voice = VoiceConditioning.from_builtin(model)
-    prompts = [build_prompt(ids, voice, ChatterboxConfig(variant)) for ids in text_ids]
+    # Upstream's defaults for Original's controls, as its deploy file sets them for serving.
+    controls = {"exaggeration": 0.5, "cfg_weight": 0.5} if variant == "original" else {}
+    prompts = [build_prompt(ids, voice, ChatterboxConfig(variant), **controls) for ids in text_ids]
     offline_client.send_tokenized_tts_request(
         {
             "prompt_token_ids": [prompt["prompt_token_ids"] for prompt in prompts],

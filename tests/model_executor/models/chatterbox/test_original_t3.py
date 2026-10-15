@@ -136,7 +136,7 @@ def test_the_placeholder_prompt_is_as_long_as_its_embeddings(model, text_len):
         prompt_feat=torch.randn(1, 500, 80),
         embedding=torch.randn(1, 192),
     )
-    prompt = build_prompt([5] * text_len, conditioning, model.config)
+    prompt = build_prompt([5] * text_len, conditioning, model.config, exaggeration=0.5, cfg_weight=0.5)
     info = prompt["additional_information"]
 
     embeds = original_prefill_embeds(
@@ -144,6 +144,7 @@ def test_the_placeholder_prompt_is_as_long_as_its_embeddings(model, text_len):
         torch.tensor(info["ids"]["prompt"]),
         torch.tensor(info["ids"]["speech_token"]),
         info["embed"]["voice"].to(model.heads.text_emb.weight.dtype),
+        exaggeration=info["chatterbox"]["exaggeration"],
     )
 
     assert len(prompt["prompt_token_ids"]) == embeds.shape[0]

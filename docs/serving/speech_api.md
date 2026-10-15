@@ -1058,7 +1058,8 @@ PCM is mono signed 16-bit little-endian at 24 kHz. Other output sample rates
 are unsupported by this adapter.
 
 Original accepts nonnegative finite `extra_params.exaggeration` and
-`extra_params.cfg_weight` (both default 0.5). Turbo rejects those fields.
+`extra_params.cfg_weight`; a request without them gets the deploy file's stage 0
+`additional_config` values (0.5 each, upstream's defaults). Turbo rejects those fields.
 Both reject VoiceDesign, free-form instructions and multilingual synthesis.
 `max_new_tokens` accepts 1 to 1000 speech tokens, upstream's generation cap,
 and defaults to 1000. Admission capacity does not guarantee real-time playback.

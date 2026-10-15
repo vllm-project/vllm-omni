@@ -188,7 +188,8 @@ def make_backend(args):
             wav, rate = sf.read(reference, dtype="float32", always_2d=True)
             voice = conditioner.prepare(wav.mean(axis=1), rate)
         ids = tokenize_text(text, tokenizer, args.variant)
-        prompt = build_prompt(ids, voice, config)
+        # Original's controls come from stage 0's additional_config, as serving reads them.
+        prompt = build_prompt(ids, voice, config, **settings["stages"][0].get("additional_config", {}))
         sampling = engine.default_sampling_params_list[0].clone()
         sampling.seed = seed
         params = [sampling, *engine.default_sampling_params_list[1:]]

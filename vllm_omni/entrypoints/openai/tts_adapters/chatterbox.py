@@ -27,11 +27,10 @@ from vllm_omni.model_executor.models.chatterbox.conditioning import (
     load_text_tokenizer,
     tokenize_text,
 )
-from vllm_omni.transformers_utils.configs.chatterbox import (
-    ORIGINAL_DEFAULT_CFG_WEIGHT,
-    ORIGINAL_DEFAULT_EXAGGERATION,
-    ChatterboxConfig,
-)
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+
+# Original's per-request controls, read from ``extra_params``.
+CONTROLS = frozenset({"exaggeration", "cfg_weight"})
 
 
 @register_tts_adapter
@@ -44,16 +43,19 @@ class ChatterboxAdapter(ARTTSAdapter):
     variant = "turbo"
     # Stage 0 sequences one request holds: Original's guided requests run in pairs.
     sequences_per_request = 1
+    # The request controls the checkpoint honors.
+    controls: frozenset[str] = frozenset()
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         super().__init__(ctx)
         self.config = ChatterboxConfig(self.variant)
         self.max_new_tokens_max = self.config.max_new_tokens
         # The deploy file's stage 0 ``additional_config`` names where the
-        # reference encoders run; the API process must see that device.
-        self.conditioning_device = torch.device(
-            (self.stage_setting("runtime_config", "additional_config") or {}).get("conditioning_device", "cpu")
-        )
+        # reference encoders run (the API process must see that device) and
+        # the controls' request defaults.
+        additional_config = self.stage_setting("runtime_config", "additional_config") or {}
+        self.conditioning_device = torch.device(additional_config.get("conditioning_device", "cpu"))
+        self.default_controls = {name: additional_config[name] for name in self.controls}
         # As many references are encoded together as stage 0 admits requests:
         # the deploy profile sizes that for its card, and nothing here divides it.
         max_num_seqs = self.stage_setting("scheduler_config", "max_num_seqs")
@@ -169,7 +171,7 @@ class ChatterboxAdapter(ARTTSAdapter):
             return "Chatterbox Turbo does not support VoiceDesign"
         if request.x_vector_only_mode:
             return "Chatterbox Turbo requires full reference conditioning"
-        if self.variant == "turbo" and {"exaggeration", "cfg_weight"}.intersection(request.extra_params or {}):
+        if (CONTROLS - self.controls).intersection(request.extra_params or {}):
             return "Exaggeration and CFG controls require Chatterbox Original"
         if request.ref_audio_2 is not None or request.speaker_embedding is not None:
             return "Chatterbox Turbo accepts one reference recording"
@@ -194,13 +196,7 @@ class ChatterboxAdapter(ARTTSAdapter):
                 self.tokenizer = load_text_tokenizer(model, self.variant)
         return tokenize_text(text, self.tokenizer, self.variant)
 
-    def prepare_prompt(
-        self,
-        text: str,
-        exaggeration: float = ORIGINAL_DEFAULT_EXAGGERATION,
-        cfg_weight: float = ORIGINAL_DEFAULT_CFG_WEIGHT,
-        voice: VoiceConditioning | None = None,
-    ) -> dict:
+    def prepare_prompt(self, text: str, voice: VoiceConditioning | None, controls: dict[str, float]) -> dict:
         """Load and condition on a worker thread, outside the API event loop."""
         model = resolve_stage_model_path(self.ctx.engine_client)
         if model is None:
@@ -211,7 +207,7 @@ class ChatterboxAdapter(ARTTSAdapter):
                     self.builtin_voice = VoiceConditioning.from_builtin(model)
                 voice = self.builtin_voice
         text_ids = self.encode_text(model, text)
-        return build_prompt(text_ids, voice, self.config, exaggeration=exaggeration, cfg_weight=cfg_weight)
+        return build_prompt(text_ids, voice, self.config, **controls)
 
     async def build(
         self, request: OpenAICreateSpeechRequest, sampling_params_list: list, has_inline_ref_audio: bool
@@ -221,13 +217,9 @@ class ChatterboxAdapter(ARTTSAdapter):
         if request.ref_audio is not None:
             source = request.ref_audio[0] if isinstance(request.ref_audio, list) else request.ref_audio
             voice = await self.resolve_voice(source)
-        controls = request.extra_params or {}
-        prompt = await self.build_async(
-            request.input,
-            controls.get("exaggeration", ORIGINAL_DEFAULT_EXAGGERATION),
-            controls.get("cfg_weight", ORIGINAL_DEFAULT_CFG_WEIGHT),
-            voice,
-        )
+        requested = request.extra_params or {}
+        controls = {name: requested.get(name, default) for name, default in self.default_controls.items()}
+        prompt = await self.build_async(request.input, voice, controls)
         return PreparedRequest(prompt=prompt, model_type=self.name)
 
     def apply_sampling_overrides(
@@ -254,6 +246,7 @@ class ChatterboxOriginalAdapter(ChatterboxAdapter):
     stage_keys = frozenset({"chatterbox_original_t3"})
     variant = "original"
     sequences_per_request = 2
+    controls = CONTROLS
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         error = super().validate(request)

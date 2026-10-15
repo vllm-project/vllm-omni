@@ -59,7 +59,7 @@ def original_admission_prompt(weight: float) -> dict:
         prompt_feat=torch.zeros(1, 4, 80),
         embedding=torch.ones(1, 192),
     )
-    return build_prompt([12, 13, 14], voice, ChatterboxConfig("original"), cfg_weight=weight)
+    return build_prompt([12, 13, 14], voice, ChatterboxConfig("original"), exaggeration=0.5, cfg_weight=weight)
 
 
 # A guided request gets its companion whatever stage it ends at: the atomic

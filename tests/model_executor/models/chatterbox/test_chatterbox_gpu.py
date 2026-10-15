@@ -173,7 +173,7 @@ def original_prompts(
     external_id: str, weight: float, params: SamplingParams | None = None
 ) -> list[tuple[dict, SamplingParams, str]]:
     """An Original request admitted as the engine admits it: with its companion when guided."""
-    prompt = build_prompt([12, 13, 14], voice(8), ChatterboxConfig("original"), cfg_weight=weight)
+    prompt = build_prompt([12, 13, 14], voice(8), ChatterboxConfig("original"), exaggeration=0.5, cfg_weight=weight)
     prompt["additional_information"]["global_request_id"] = [external_id]
     params = params or greedy()
     prepare_original_prompt(prompt, [params])

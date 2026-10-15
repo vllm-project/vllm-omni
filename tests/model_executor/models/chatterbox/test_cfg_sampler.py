@@ -15,7 +15,6 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.chatterbox.cfg_sampler import ChatterboxCFGSampler
-from vllm_omni.transformers_utils.configs.chatterbox import ORIGINAL_DEFAULT_CFG_WEIGHT as DEFAULT_CFG_WEIGHT
 from vllm_omni.transformers_utils.configs.chatterbox import START_SPEECH_TOKEN, STOP_SPEECH_TOKEN
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -70,7 +69,7 @@ def test_guidance_precedes_delegate_and_tokens_follow_conditional(v1_sampler: Sa
     Seeded: each row draws from its own generator, and the unconditional row
     still ends with the token the conditional row draws by itself.
     """
-    registry = {"c": ("pair", "cond", DEFAULT_CFG_WEIGHT), "u": ("pair", "uncond", DEFAULT_CFG_WEIGHT)}
+    registry = {"c": ("pair", "cond", 0.5), "u": ("pair", "uncond", 0.5)}
     sampler = ChatterboxCFGSampler(v1_sampler, registry)
     extra_args = [{"chatterbox_cfg": registry[rid]} for rid in ("u", "c")]
     logits = torch.zeros(2, STOP_SPEECH_TOKEN + 3)

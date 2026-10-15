@@ -33,7 +33,8 @@ reference recording. No reference transcript is needed. Install the conditioning
 extra with `uv pip install -e '.[chatterbox]'`.
 
 Use the production `load_text_tokenizer`, `tokenize_text`, `build_prompt`, and
-`VoiceConditioning` helpers with `Omni.generate`. The [offline command in the
+`VoiceConditioning` helpers with `Omni.generate`; Original's `build_prompt` takes
+`exaggeration` and `cfg_weight` (upstream's defaults are 0.5 each). The [offline command in the
 A5000 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-A5000.md#offline-inference)
 saves a complete mono 24 kHz WAV and uses the same preparation as serving.
 

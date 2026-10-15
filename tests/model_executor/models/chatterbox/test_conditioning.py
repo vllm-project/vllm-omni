@@ -260,7 +260,12 @@ def test_original_prompt_rejects_text_beyond_learned_positions():
 def test_original_prompt_rejects_invalid_guidance_controls(control: str, value: object) -> None:
     """The serving adapter passes a request's ``extra_params`` through unchecked; this is their one check."""
     with pytest.raises(ValueError, match=f"{control} must be a finite nonnegative number"):
-        build_prompt([5], conditioning(10, 125), ChatterboxConfig("original"), **{control: value})
+        build_prompt(
+            [5],
+            conditioning(10, 125),
+            ChatterboxConfig("original"),
+            **{"exaggeration": 0.5, "cfg_weight": 0.5, control: value},
+        )
 
 
 def test_original_text_helper_loads_local_tokenizer_and_normalizes_spaces(tmp_path):

@@ -36,12 +36,7 @@ from vllm_omni.model_executor.models.chatterbox.voice_encoder import VoiceEncCon
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.indextts2.preprocess_utils import compute_fbank
 from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPPlus
-from vllm_omni.transformers_utils.configs.chatterbox import (
-    CFG_UNCOND_SUFFIX,
-    ORIGINAL_DEFAULT_CFG_WEIGHT,
-    ORIGINAL_DEFAULT_EXAGGERATION,
-    ChatterboxConfig,
-)
+from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, ChatterboxConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.audio import mel_filter_bank
 
@@ -440,8 +435,8 @@ def build_prompt(
     conditioning: VoiceConditioning,
     config: ChatterboxConfig,
     *,
-    exaggeration: float = ORIGINAL_DEFAULT_EXAGGERATION,
-    cfg_weight: float = ORIGINAL_DEFAULT_CFG_WEIGHT,
+    exaggeration: float | None = None,
+    cfg_weight: float | None = None,
 ) -> dict:
     """The engine prompt for one utterance.
 
@@ -451,12 +446,20 @@ def build_prompt(
     ``[speaker | prompt tokens | text | start-of-speech]`` embeddings.
 
     Args:
-        text_ids: GPT-2 ids of ``punc_norm(text)``.
+        text_ids: Text tokenizer ids of ``punc_norm(text)``.
         conditioning: The reference clip's conditioning.
         config: The model config.
+        exaggeration: Original's emotion control; Turbo has none. The
+            serving default is the deploy file's.
+        cfg_weight: Original's guidance weight, 0 for no guidance; Turbo
+            has none. The serving default is the deploy file's.
 
     Returns:
         A token prompt carrying the conditioning in ``additional_information``.
+
+    Raises:
+        ValueError: For Original, if the text is longer than its position
+            table or a control is not a finite nonnegative number.
     """
     if config.variant == "original":
         if len(text_ids) > ORIGINAL_MAX_TEXT_TOKENS:
@@ -473,6 +476,6 @@ def build_prompt(
     prompt["additional_information"] = conditioning.additional_information(text_ids)
     if config.variant == "original":
         prompt["additional_information"]["chatterbox"] = {"exaggeration": exaggeration, "cfg_weight": cfg_weight}
-        if cfg_weight > 0:
+        if cfg_weight:
             prompt["additional_information"]["cfg_group"] = {"role": "cond", "uncond_suffix": CFG_UNCOND_SUFFIX}
     return prompt

@@ -23,6 +23,8 @@ import numpy as np
 import pytest
 import soundfile
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 from torch import nn
 from vllm import SamplingParams
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
@@ -139,6 +141,24 @@ def server(
 @pytest.fixture
 def adapter(server: OmniOpenAIServingSpeech) -> ChatterboxAdapter:
     return server._adapter
+
+
+@pytest.fixture
+def original(
+    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
+) -> Iterator[ChatterboxOriginalAdapter]:
+    """Original's adapter in the speech server for its deploy file, with its released tokenizer's format.
+
+    The model directory is Original's own: ``tokenizer.json`` would take the
+    place of Turbo's GPT-2 files.
+    """
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+    directory = write_model_dir(tmp_path / "chatterbox")
+    (Path(directory) / "conds.pt").write_bytes((Path(model_dir) / "conds.pt").read_bytes())
+    Tokenizer(WordLevel({"[UNK]": 0, "Hello.": 7}, unk_token="[UNK]")).save(str(Path(directory) / "tokenizer.json"))
+    speech = serving(engine_client(directory, DEPLOY["original"]))
+    yield speech._adapter
+    speech.shutdown()
 
 
 def reference(seconds: float, seed: int, sample_rate: int = 24000, mime: str = "audio/wav") -> str:
@@ -270,12 +290,23 @@ def test_request_token_cap_does_not_mutate_deploy_defaults(adapter):
     assert defaults[0].max_tokens == 1000
 
 
-def test_original_owns_its_stage_and_controls(adapter):
+def test_original_owns_its_stage_and_controls(original):
     assert detect_tts_model_type("chatterbox_original_t3", None) == "chatterbox_original"
-    original = ChatterboxOriginalAdapter(adapter.ctx)
-    assert original.config.variant == "original"
+    assert isinstance(original, ChatterboxOriginalAdapter) and original.config.variant == "original"
     request = OpenAICreateSpeechRequest(input="Hello.", extra_params={"cfg_weight": 0, "exaggeration": 0.7})
     assert original.validate(request) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra_params", "controls"),
+    [(None, {"exaggeration": 0.5, "cfg_weight": 0.5}), ({"cfg_weight": 0}, {"exaggeration": 0.5, "cfg_weight": 0})],
+    ids=["deploy defaults", "request override"],
+)
+async def test_original_controls_default_to_the_deploy_files(original, extra_params, controls):
+    """A request's missing controls come from stage 0's ``additional_config``, upstream's defaults there."""
+    prepared = await original.build(OpenAICreateSpeechRequest(input="hello", extra_params=extra_params), [], False)
+    assert prepared.prompt["additional_information"]["chatterbox"] == controls
 
 
 @pytest.mark.asyncio
@@ -462,9 +493,9 @@ def test_unsupported_conditioning_device_is_rejected(
         serving(client)
 
 
-@pytest.mark.parametrize("adapter_cls", [ChatterboxAdapter, ChatterboxOriginalAdapter])
-def test_public_speech_token_cap_is_upstreams_generation_cap(adapter, adapter_cls):
+@pytest.mark.parametrize("variant", ["adapter", "original"])
+def test_public_speech_token_cap_is_upstreams_generation_cap(request, variant):
     """Both checkpoints accept at most 1000 new speech tokens, the cap upstream generates with."""
-    configured = adapter_cls(adapter.ctx)
+    configured = request.getfixturevalue(variant)
     assert configured.validate(OpenAICreateSpeechRequest(input="Hello.", max_new_tokens=1000)) is None
     assert "cannot exceed 1000" in configured.validate(OpenAICreateSpeechRequest(input="Hello.", max_new_tokens=1001))
