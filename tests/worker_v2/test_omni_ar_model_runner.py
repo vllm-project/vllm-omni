@@ -103,6 +103,7 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
     np.testing.assert_array_equal(copied[0][1], [2, 0])
 
 
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
