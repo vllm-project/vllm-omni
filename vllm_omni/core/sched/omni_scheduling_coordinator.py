@@ -443,8 +443,9 @@ class OmniSchedulingCoordinator:
         target_status: RequestStatus,
         chunk_ready_req_ids: set[str],
     ) -> None:
-        queue_snapshot = list(queue)
-        for request in queue_snapshot:
+        moved: list[Any] = []
+
+        for request in queue:
             request_can_run = self._request_can_run(request, chunk_ready_req_ids)
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request_can_run:
@@ -461,6 +462,7 @@ class OmniSchedulingCoordinator:
                 )
                 request.status = RequestStatus.WAITING_FOR_CHUNK
                 self._waiting_since.setdefault(request.request_id, time.monotonic())
+                moved.append(request)
             else:
                 if request_can_run:
                     request.status = target_status
@@ -468,11 +470,15 @@ class OmniSchedulingCoordinator:
                         self.requests_with_ready_chunks.add(request.request_id)
                     self._waiting_since.pop(request.request_id, None)
                     continue
+                moved.append(request)
+
+        if moved:
             if isinstance(queue, list):
-                queue.remove(request)
+                moved_set = set(moved)
+                queue[:] = [req for req in queue if req not in moved_set]
             else:
-                queue.remove_request(request)
-            waiting_for_chunk_list.append(request)
+                queue.remove_requests(moved)
+            waiting_for_chunk_list.extend(moved)
 
     def _request_can_run(
         self,
