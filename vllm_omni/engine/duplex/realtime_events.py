@@ -113,6 +113,10 @@ class _ResponseProjection:
     text_parts: list[str] = field(default_factory=list)
     audio_duration_ms: int | None = None
     audio_text_marks: list[dict[str, int]] = field(default_factory=list)
+    #: ``True`` once ``audio_text_marks`` has been deduped+sorted (O(k log k)).
+    #: Marks are appended raw on every delta; merge happens once on the first
+    #: consumer read, giving O(1) per delta instead of O(n^2) total.
+    marks_merged: bool = False
     audio_delta_emitted: bool = False
     audio_done_emitted: bool = False
     audio_part_added: bool = False
@@ -132,6 +136,19 @@ class _ResponseProjection:
     @property
     def text(self) -> str:
         return "".join(self.text_parts)
+
+    def merge_marks(self) -> None:
+        """Dedupe + sort accumulated ``audio_text_marks`` once (no-op if already done)."""
+        if self.marks_merged:
+            return
+        if self.audio_text_marks:
+            deduped: dict[tuple[int, int], dict[str, int]] = {}
+            for mark in self.audio_text_marks:
+                deduped[(int(mark["audio_end_ms"]), int(mark["text_chars"]))] = mark
+            self.audio_text_marks = sorted(
+                deduped.values(), key=lambda mark: (mark["audio_end_ms"], mark["text_chars"])
+            )
+        self.marks_merged = True
 
 
 @dataclass(slots=True)
@@ -153,6 +170,10 @@ class RealtimeProjectionState:
     conversation_items: dict[str, dict[str, object]] = field(default_factory=dict)
     last_conversation_item_id: str | None = None
     pending_commit_item_ids: list[str] = field(default_factory=list)
+    #: Response item ids whose ``conversation_items`` entry is out of date with
+    #: the accumulated projection (deltas arrived since last materialization).
+    #: Rebuilt lazily on the first actual consumer read.
+    _dirty_response_item_ids: set[str] = field(default_factory=set)
     # ---- input buffer projection (was on the input translator) ----
     input_speech_started: bool = False
     active_input_item_id: str | None = None
@@ -283,6 +304,8 @@ def _conversation_item_done_event(state: RealtimeProjectionState, item: dict[str
     if isinstance(item_id, str) and item_id:
         state.conversation_items[item_id] = item
         state.last_conversation_item_id = item_id
+        # Terminal write supersedes any pending lazy-materialization.
+        state._dirty_response_item_ids.discard(item_id)
     return ItemDone(previous_item_id=previous_item_id, item=item)
 
 
@@ -292,6 +315,7 @@ def _remove_conversation_item(state: RealtimeProjectionState, item_id: str) -> b
         remaining_ids = list(state.conversation_items)
         state.last_conversation_item_id = remaining_ids[-1] if remaining_ids else None
     state.item_truncation_cursors.pop(item_id, None)
+    state._dirty_response_item_ids.discard(item_id)
     return removed
 
 
@@ -311,6 +335,8 @@ def _response_done_output_item(
 ) -> dict[str, object]:
     item_id = _response_item_id(state, response_id)
     projection = _response_state(state, response_id)
+    if projection is not None:
+        projection.merge_marks()
     transcript = projection.transcript if projection is not None else ""
     text = projection.text if projection is not None else ""
     audio_duration_ms = projection.audio_duration_ms if projection is not None else None
@@ -352,6 +378,8 @@ def _refresh_in_progress_response_item(state: RealtimeProjectionState, response_
     projection = _response_state(state, response_id)
     if projection is None:
         return
+    # Merge marks on the first consumer read (not per-delta).
+    projection.merge_marks()
     transcript = projection.transcript
     audio_duration_ms = projection.audio_duration_ms
     audio_text_marks = projection.audio_text_marks
@@ -381,6 +409,26 @@ def _refresh_in_progress_response_item(state: RealtimeProjectionState, response_
         else:
             content.insert(text_index, text_part)
     _apply_pending_item_truncation(state, item)
+
+
+def _mark_response_item_dirty(state: RealtimeProjectionState, response_id: object) -> None:
+    """Mark a response's ``conversation_items`` entry out of date (no O(n) rebuild here)."""
+    if isinstance(response_id, str) and response_id:
+        item_id = _response_item_id(state, response_id)
+        state._dirty_response_item_ids.add(item_id)
+
+
+def _ensure_response_item_materialized(state: RealtimeProjectionState, item_id: str) -> None:
+    """If ``item_id`` is a dirty response item, rebuild it from the projection now."""
+    if item_id not in state._dirty_response_item_ids:
+        return
+    for response_id_str, projection in state.response_states.items():
+        if isinstance(response_id_str, str) and projection.item_id == item_id:
+            _refresh_in_progress_response_item(state, response_id_str)
+            state._dirty_response_item_ids.discard(item_id)
+            return
+    # Stale dirty flag — no projection left; just clear it.
+    state._dirty_response_item_ids.discard(item_id)
 
 
 def _append_response_transcript(state: RealtimeProjectionState, response_id: object, text: str) -> None:
@@ -444,14 +492,10 @@ def _remember_response_audio_metadata(
             continue
         clean_marks.append({"text_chars": max(0, int(text_chars)), "audio_end_ms": max(0, int(audio_end_ms))})
     if clean_marks:
-        merged = list(projection.audio_text_marks)
-        merged.extend(clean_marks)
-        deduped: dict[tuple[int, int], dict[str, int]] = {}
-        for mark in merged:
-            deduped[(int(mark["audio_end_ms"]), int(mark["text_chars"]))] = mark
-        projection.audio_text_marks = sorted(
-            deduped.values(), key=lambda mark: (mark["audio_end_ms"], mark["text_chars"])
-        )
+        # Append raw; merge is deferred to the first consumer read
+        # (``projection.merge_marks()`` inside ``_refresh_in_progress_response_item``).
+        projection.audio_text_marks.extend(clean_marks)
+        projection.marks_merged = False
 
 
 def _response_created_event(event: Mapping[str, object]) -> ResponseCreated:
@@ -839,13 +883,14 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         if isinstance(audio, str) and audio:
             events.extend(_ensure_response_audio_part_added(state, response_id))
             events.extend(_realtime_audio_delta_events(state, event, response_id, audio))
-            _refresh_in_progress_response_item(state, response_id)
+            # Delta only marks the item dirty — full rebuild happens on consumer read.
+            _mark_response_item_dirty(state, response_id)
         text = event.get("text")
         has_text = isinstance(text, str) and bool(text)
         has_audio_delta = isinstance(audio, str) and bool(audio)
         if has_text:
             _append_response_transcript(state, response_id, cast("str", text))
-            _refresh_in_progress_response_item(state, response_id)
+            _mark_response_item_dirty(state, response_id)
         # Keep the audio.delta + transcript.delta pair invariant even for
         # text-less units so clients that treat the pair as unit-complete work.
         if has_text or has_audio_delta:
@@ -875,7 +920,8 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         projection = _response_state(state, response_id)
         if projection is not None and isinstance(text, str) and text:
             projection.text_parts.append(text)
-            _refresh_in_progress_response_item(state, response_id)
+            # Delta only marks the item dirty — full rebuild happens on consumer read.
+            _mark_response_item_dirty(state, response_id)
         events = _ensure_response_text_part_added(state, response_id)
         events.append(
             TextDelta(
@@ -996,6 +1042,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             item_id = _response_item_id(state, response_id)
             committed_audio_ms = max(0, int(committed_ms))
             state.item_truncation_cursors[item_id] = (0, committed_audio_ms)
+            _ensure_response_item_materialized(state, item_id)
             cancelled_item = state.conversation_items.get(item_id)
             if cancelled_item is not None:
                 truncate_realtime_item_content(cancelled_item, content_index=0, audio_end_ms=committed_audio_ms)
@@ -1038,6 +1085,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         audio_end_ms = event.get("audio_end_ms")
         content_index = event.get("content_index", 0)
         if isinstance(truncated_item_id, str):
+            _ensure_response_item_materialized(state, truncated_item_id)
             truncated_item = state.conversation_items.get(truncated_item_id)
             if truncated_item is not None:
                 truncate_realtime_item_content(
@@ -1150,6 +1198,7 @@ def retrieve_item_events(state: RealtimeProjectionState, payload: Mapping[str, o
     item_id = payload.get("item_id")
     if not isinstance(item_id, str) or not item_id:
         return [error_event("missing_item_id", "conversation.item.retrieve requires item_id", event_id=event_id)]
+    _ensure_response_item_materialized(state, item_id)
     item = state.conversation_items.get(item_id)
     if item is None:
         return [error_event("item_not_found", f"Conversation item not found: {item_id}", event_id=event_id)]
@@ -1402,6 +1451,7 @@ def resolve_delete_item(state: RealtimeProjectionState, command: DeleteItem) -> 
 
 
 def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem) -> ResolvedControl:
+    _ensure_response_item_materialized(state, command.item_id)
     item = state.conversation_items.get(command.item_id)
     if not isinstance(item, dict):
         return ResolvedControl(
