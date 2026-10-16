@@ -2451,6 +2451,27 @@ def test_h3_multipart_maps_pillow_pixel_limit_error(field, test_client, monkeypa
     assert "decoder pixel limit" in response.json()["detail"]
 
 
+def test_cosmos3_multiview_upload_rejects_shared_negative_prompt(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    extra_params = {
+        "multiview": {
+            "views": [
+                {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_reference_index": 0}
+            ]
+        },
+        "wsm": {},
+    }
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Driving.", "negative_prompt": "Blurry.", "extra_params": json.dumps(extra_params)},
+        files=[("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+    )
+
+    assert response.status_code == 400
+    assert "does not support request.negative_prompt" in response.json()["detail"]
+
+
 @pytest.mark.asyncio
 async def test_h3_upload_limit_checks_declared_size_before_read():
     class OversizedUpload:
