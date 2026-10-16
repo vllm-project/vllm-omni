@@ -146,6 +146,7 @@ def test_code2wav_full_graph_dummy_forward_uses_exact_batched_decode(monkeypatch
     model._decode_left_context_frames = 25
     model._decode_batch_max_size = 0
     model._decoder_state_cache = {}
+    model._streaming_codec = None
     model._decoder_state_cache_warn_entries = 512
     model._logged_codec_stats = True
     model._logged_malformed_codec_lengths = set()
