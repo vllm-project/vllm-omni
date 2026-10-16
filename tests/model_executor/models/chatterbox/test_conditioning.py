@@ -257,30 +257,33 @@ def test_prepare_batch_encodes_every_reference_together_and_keeps_order(
     assert lengths == list(range(lengths[0], lengths[0] + count))
     assert torch.equal(voices[3].cond_tokens, alone.cond_tokens)
     assert torch.equal(voices[3].prompt_token, alone.prompt_token)
-    assert torch.equal(voices[3].prompt_feat, alone.prompt_feat)
+    # The batched STFT is not bit-identical to the clip's own on every BLAS.
+    torch.testing.assert_close(voices[3].prompt_feat, alone.prompt_feat, atol=1e-5, rtol=1e-5)
     assert torch.equal(voices[3].embedding, alone.embedding)
     torch.testing.assert_close(voices[3].speaker_emb, alone.speaker_emb, atol=1e-6, rtol=1e-5)
     assert conditioner.prepare_batch([]) == []
 
 
 def test_a_refused_reference_leaves_the_rest_of_its_batch(conditioners: dict[str, VoiceConditioner]) -> None:
-    """A clip Turbo refuses gets its error in its place; the others are encoded in one batch."""
+    """A clip the conditioner refuses gets its error in its place; the others are encoded in one batch."""
     conditioner = conditioners["turbo"]
     rng = np.random.default_rng(5)
     good = [((0.05 * rng.standard_normal(6 * 24000 + 960 * index)).astype(np.float32), 24000) for index in range(2)]
-    short = (np.zeros(24000, dtype=np.float32), 24000)
+    stereo = (np.zeros((6 * 24000, 2), dtype=np.float32), 24000)
     calls, hook = tokenizer_calls(conditioner)
     try:
-        first, refused, last = conditioner.prepare_batch([good[0], short, good[1]])
+        first, refused, last = conditioner.prepare_batch([good[0], stereo, good[1]])
     finally:
         hook.remove()
 
-    assert isinstance(refused, ValueError) and "longer than 5 s" in str(refused)
+    assert isinstance(refused, ValueError) and "mono" in str(refused)
     assert calls == [2, 2]
     assert torch.equal(first.prompt_token, conditioner.prepare(*good[0]).prompt_token)
     assert torch.equal(last.prompt_token, conditioner.prepare(*good[1]).prompt_token)
-    with pytest.raises(ValueError, match="longer than 5 s"):
-        conditioner.prepare(*short)
+    with pytest.raises(ValueError, match="mono"):
+        conditioner.prepare(*stereo)
+    with pytest.raises(ValueError, match="samples in it"):
+        conditioner.prepare(np.zeros(0, dtype=np.float32), 24000)
 
 
 def test_original_prompt_rejects_text_beyond_learned_positions():
@@ -320,19 +323,27 @@ def test_a_reference_that_is_not_mono_is_refused_by_its_shape(conditioners: dict
         conditioners["turbo"].resample(np.zeros((2, 24000), dtype=np.float32), 24000)
 
 
-def test_turbo_needs_a_reference_longer_than_five_seconds_and_normalizes_it(
+def test_turbo_repeats_a_reference_of_five_seconds_or_less_and_normalizes_it(
     conditioners: dict[str, VoiceConditioner],
 ) -> None:
-    """Upstream asserts the bound and normalizes the clip to -27 LUFS before encoding it."""
+    """Upstream refuses a clip of five seconds or less; here it is repeated past five seconds.
+
+    Every clip is then normalized to -27 LUFS, as upstream normalizes its clips.
+    """
     conditioner = conditioners["turbo"]
     wav = (0.05 * np.random.default_rng(1).standard_normal(5 * 24000 + 1)).astype(np.float32)
-    with pytest.raises(ValueError, match="longer than 5 s, got 5.00 s"):
-        conditioner.resample(wav[:-1], 24000)
 
     wav24, wav16 = conditioner.resample(wav, 24000)
-
+    assert wav24.shape == wav.shape
     assert abs(pyloudnorm.Meter(24000).integrated_loudness(wav24) - (-27.0)) < 1e-3
     assert wav16.shape == (round(wav24.shape[0] * 16000 / 24000),)
+
+    # Exactly five seconds is repeated once; two seconds, three times.
+    five, _ = conditioner.resample(wav[:-1], 24000)
+    assert five.shape == (2 * 5 * 24000,) and np.array_equal(five[: 5 * 24000], five[5 * 24000 :])
+    two, _ = conditioner.resample(wav[: 2 * 24000], 24000)
+    assert two.shape == (3 * 2 * 24000,) and np.array_equal(two[: 2 * 24000], two[4 * 24000 :])
+    assert abs(pyloudnorm.Meter(24000).integrated_loudness(two) - (-27.0)) < 1e-3
 
 
 def test_original_takes_a_short_reference_as_it_is(conditioners: dict[str, VoiceConditioner]) -> None:
