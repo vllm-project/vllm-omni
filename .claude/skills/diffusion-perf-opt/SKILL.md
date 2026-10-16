@@ -7,6 +7,8 @@ description: Diagnose and optimize vLLM Omni diffusion workloads, especially Wan
 
 Use this skill to run a disciplined optimization loop for vLLM Omni diffusion workloads. Keep two ideas separate: real performance baselines are collected with low overhead, while torch profiler traces are diagnostic artifacts and may distort latency.
 
+When the task is to add or extend CI performance coverage (a benchmark config plus its Buildkite Perf step) rather than diagnose an optimization, use [diffusion-perf-test](../diffusion-perf-test/SKILL.md). This skill's baseline and stage-attribution guidance still applies once an optimization needs to be watched in CI.
+
 ## First Questions
 
 Before proposing changes, ask for the optimization scene if it is not already known:
