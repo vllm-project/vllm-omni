@@ -17,11 +17,19 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from vllm.v1.engine import EngineCoreOutputs, FinishReason
 
-from tests.engine.test_orchestrator import FakeStageClient, _build_stage_pools
+from tests.engine.test_orchestrator import (
+    FakeOutputProcessor,
+    FakeStageClient,
+    _build_request_output,
+    _build_stage_pools,
+    _sampling_params,
+)
+from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import StageSubmissionMessage
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_runtime import StageRuntimeInfo
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -63,7 +71,9 @@ def test_inbound_headers_do_not_skip_active_http_span(recording):
     context = TraceContextTextMapPropagator().extract(HEADERS)
     with tracer.start_as_current_span("HTTP", context=context) as http:
         carrier = capture_trace_headers(HEADERS)
+        assert carrier["baggage"] == HEADERS["baggage"]
         request = RequestTrace(tracer, "req", carrier)
+        assert request.headers()["baggage"] == HEADERS["baggage"]
         request.end()
     pipeline = next(s for s in exporter.get_finished_spans() if s.name == "omni.pipeline")
     assert pipeline.parent.span_id == http.get_span_context().span_id
@@ -262,3 +272,83 @@ async def test_keepalive_uploads_keep_independent_trace_parents() -> None:
     assert [span.context.trace_id for span in spans] == [1, 3]
     assert all(span.parent.span_id == int("1234567890123456", 16) for span in spans)
     assert all(span.context.trace_state.get("vendor") == "state" for span in spans)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("segment_finished", [False, True])
+@pytest.mark.parametrize("has_processed_output", [False, True])
+async def test_raw_terminal_stage_trace_survives_downstream_failure(recording, segment_finished, has_processed_output):
+    tracer, exporter = recording
+    request_id = "raw-terminal"
+    processed = [_build_request_output(request_id)] if has_processed_output else []
+    orch = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=_build_stage_pools(
+            [[FakeStageClient()], [FakeStageClient(final_output=True)]],
+            output_processors=[FakeOutputProcessor(request_outputs=processed), FakeOutputProcessor()],
+        ),
+        tracer=tracer,
+    )
+    request_trace = RequestTrace(tracer, request_id, HEADERS)
+    for stage_id in (0, 1):
+        request_trace.start_stage(stage_id, 0, "llm")
+    req_state = OrchestratorRequestState(
+        request_id=request_id,
+        final_stage_id=1,
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        stage_submit_ts={0: time.time(), 1: time.time()},
+        skip_legacy_stage_forward=True,
+        trace=request_trace,
+    )
+    req_state.streaming.enabled = True
+    orch.request_states[request_id] = req_state
+    raw = EngineCoreOutputs(
+        outputs=[
+            OmniEngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.STOP,
+                is_segment_finished=segment_finished,
+            )
+        ]
+    )
+    terminal_ids: set[str] = set()
+
+    outputs = await orch._process_llm_stage_outputs(0, 0, raw, terminal_ids)
+    await orch._handle_processed_outputs(0, 0, outputs)
+    await orch._finish_raw_terminal_requests(0, 0, terminal_ids)
+    await orch._finish_raw_terminal_requests(0, 0, terminal_ids)
+
+    assert terminal_ids == (set() if segment_finished else {request_id})
+    assert len(exporter.get_finished_spans()) == (0 if segment_finished else 1)
+    assert request_id in orch.request_states
+
+    await orch._process_llm_stage_outputs(
+        1,
+        0,
+        EngineCoreOutputs(
+            outputs=[
+                OmniEngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason="downstream failed",
+                )
+            ]
+        ),
+        set(),
+    )
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 3
+    stages = {span.attributes["omni.stage.id"]: span for span in spans if span.name == "omni.stage"}
+    pipeline = next(span for span in spans if span.name == "omni.pipeline")
+    upstream = stages[0]
+    assert upstream.status.status_code == (trace.StatusCode.ERROR if segment_finished else trace.StatusCode.UNSET)
+    assert ("error.type" in upstream.attributes) == segment_finished
+    assert [event.name for event in upstream.events] == (["omni.stage.first_output"] if has_processed_output else [])
+    assert stages[1].status.status_code == trace.StatusCode.ERROR
+    assert pipeline.status.status_code == trace.StatusCode.ERROR
+    assert not orch.request_states

@@ -23,7 +23,7 @@ def capture_trace_headers(headers: Mapping[str, str] | None = None) -> dict[str,
     remote = trace.get_current_span(context).get_span_context()
     # Upstream serving can pass inbound headers even inside an active HTTP span.
     if current.is_valid and (not remote.is_valid or current.trace_id == remote.trace_id):
-        context = None
+        context = trace.set_span_in_context(trace.get_current_span(), context)
     _PROPAGATOR.inject(carrier, context=context)
     return carrier
 

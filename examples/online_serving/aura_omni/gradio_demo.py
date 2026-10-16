@@ -69,7 +69,17 @@ def _audio_to_data_url(audio_file: Any | None) -> str | None:
             if audio_np.ndim > 1:
                 audio_np = audio_np[:, 0]
             if audio_np.dtype != np.int16:
-                audio_np = np.clip(audio_np.astype(np.float32), -1.0, 1.0)
+                if np.issubdtype(audio_np.dtype, np.floating):
+                    audio_np = np.clip(audio_np.astype(np.float32), -1.0, 1.0)
+                else:
+                    # Integer PCM uses the full dtype range as full scale;
+                    # normalize before clipping or every nonzero sample
+                    # saturates to +/-1.0.
+                    audio_np = np.clip(
+                        audio_np.astype(np.float32) / (1 << (np.iinfo(audio_np.dtype).bits - 1)),
+                        -1.0,
+                        1.0,
+                    )
             buf = io.BytesIO()
             sf.write(buf, audio_np, int(sample_rate), format="WAV")
             return f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"

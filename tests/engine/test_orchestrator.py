@@ -15,6 +15,8 @@ from typing import Any
 
 import janus
 import pytest
+import torch
+from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, FinishReason
@@ -30,6 +32,7 @@ from vllm_omni.engine.messages import (
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
     ErrorMessage,
+    InteractionMessage,
     OutputMessage,
     ShutdownRequestMessage,
     StageSubmissionMessage,
@@ -40,7 +43,8 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
@@ -105,6 +109,8 @@ class FakePromptRequest:
 
 
 class FakeStageClient:
+    sample_rate: int
+
     def __init__(
         self,
         *,
@@ -134,8 +140,8 @@ class FakeStageClient:
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
-        self._engine_core_outputs = queue.Queue()
-        self._diffusion_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
+        self._diffusion_outputs: queue.Queue[Any] = queue.Queue()
 
     # Orchestrator-facing interface.
     async def add_request_async(self, *args, **kwargs) -> None:
@@ -230,7 +236,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 
 
 class FakeOutputProcessor:
-    def __init__(self, *, request_outputs: list[object] | None = None) -> None:
+    def __init__(self, *, request_outputs: list[Any] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
@@ -313,16 +319,40 @@ def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
     return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None, finished_requests=None)
 
 
-def _terminal_engine_core_outputs(request_id: str, timestamp: float = 1.0) -> EngineCoreOutputs:
+def _terminal_engine_core_outputs(
+    request_id: str,
+    timestamp: float = 1.0,
+    *,
+    finish_reason: FinishReason = FinishReason.STOP,
+) -> EngineCoreOutputs:
     return EngineCoreOutputs(
         outputs=[
             EngineCoreOutput(
                 request_id=request_id,
                 new_token_ids=[],
-                finish_reason=FinishReason.STOP,
+                finish_reason=finish_reason,
             )
         ],
         timestamp=timestamp,
+        finished_requests={request_id},
+    )
+
+
+def _error_engine_core_outputs(
+    request_id: str,
+    reason: str,
+) -> EngineCoreOutputs:
+    """Terminal ERROR output as emitted by the oversized-chunk rejection."""
+    return EngineCoreOutputs(
+        outputs=[
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=reason,
+            )
+        ],
+        timestamp=1.0,
         finished_requests={request_id},
     )
 
@@ -391,9 +421,9 @@ def _build_stage_pools(
 
 
 def _build_harness(
-    stage_clients: list[object],
+    stage_clients: list[FakeStageClient],
     *,
-    output_processors: list[object] | None = None,
+    output_processors: list[FakeOutputProcessor] | None = None,
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
     log_stats: bool = False,
@@ -498,6 +528,21 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
             return msg
 
 
+async def _get_error_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> ErrorMessage:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            msg = orchestrator_fixture.output_sync_q.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if isinstance(msg, ErrorMessage):
+            return msg
+        if isinstance(msg, OutputMessage):
+            raise AssertionError("Received OutputMessage instead of ErrorMessage")
+    raise AssertionError("Timed out waiting for orchestrator error")
+
+
 async def _get_rpc_message(
     orchestrator_fixture: OrchestratorFixture,
     *,
@@ -523,6 +568,8 @@ async def _enqueue_add_request(
     sampling_params_list,
     final_stage_id: int,
     final_output_stage_ids: list[int] | None = None,
+    entry_stage_id: int = 0,
+    lora_request: LoRARequest | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -537,6 +584,8 @@ async def _enqueue_add_request(
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
+            entry_stage_id=entry_stage_id,
+            lora_request=lora_request,
         )
     )
 
@@ -545,12 +594,15 @@ async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, requ
     orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=request_ids))
 
 
-@pytest.fixture
-def orchestrator_factory():
+@pytest.fixture(params=["0", "1"], ids=["legacy", "event-driven"])
+def orchestrator_factory(request, monkeypatch):
+    # Every scenario runs on both orchestration loops, which must behave identically.
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", request.param)
     fixtures: list[OrchestratorFixture] = []
 
     def _factory(*args, **kwargs) -> OrchestratorFixture:
         fixture = _build_harness(*args, **kwargs)
+        assert fixture.orchestrator._event_driven_orch is (request.param == "1")
         fixtures.append(fixture)
         return fixture
 
@@ -613,6 +665,157 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+def _processed_request(request_id: str, params) -> EngineCoreRequest:
+    """What a stage input processor returns for a raw prompt in the entry-stage tests."""
+    return EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=[4, 5, 6],
+        mm_features=None,
+        sampling_params=params,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factory) -> None:
+    """A raw prompt with ``entry_stage_id=1`` is processed by stage 1's input processor
+    (the one that also prepares prompts forwarded to it) with the request's LoRA, and
+    never reaches stage 0."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    processors = [
+        FakeOutputProcessor(request_outputs=[]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-bypass", token_ids=[10, 11], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
+    raw_prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}
+    lora = LoRARequest("adapter", 1, "/adapters/adapter")
+    processed_prompts: list[Any] = []
+
+    def process_inputs(*, request_id, prompt, params, **kwargs):
+        processed_prompts.append((prompt, kwargs.get("lora_request")))
+        return _processed_request(request_id, params)
+
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=process_inputs, renderer=SimpleNamespace(mm_processor_cache=None)
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-bypass",
+            prompt=raw_prompt,
+            original_prompt=raw_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            entry_stage_id=1,
+            lora_request=lora,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        assert processed_prompts == [(raw_prompt, lora)]
+        assert stage1.add_request_calls[0][0].prompt_token_ids == [4, 5, 6]
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 1.0))
+
+        output_msg = await _get_output_message(orchestrator_fixture)
+        assert (output_msg.request_id, output_msg.stage_id, output_msg.finished) == ("req-bypass", 1, True)
+        assert stage0.add_request_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_prewarms_after_the_entry_stage(orchestrator_factory) -> None:
+    """With stage 0 bypassed, async-chunk prewarm starts after the entry stage."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage2 = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory([stage0, stage1, stage2], async_chunk=True)
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params),
+        renderer=SimpleNamespace(mm_processor_cache=None),
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-bypass-async",
+            prompt={"prompt_token_ids": [1, 2, 3]},
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[_sampling_params(), _sampling_params(), _sampling_params()],
+            final_stage_id=2,
+            entry_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage2.add_request_calls) == 1)
+        assert stage1.add_request_calls[0][0].prompt_token_ids == [4, 5, 6]
+        assert all(token_id == 0 for token_id in stage2.add_request_calls[0][0].prompt_token_ids)
+        assert stage0.add_request_calls == []
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
+    """The same image reaching a replicated stage 1 by either path is keyed per receiving
+    replica; binding fails while no replica is serviceable and is skipped without a sender cache."""
+    orchestrator = object.__new__(Orchestrator)
+    mm_config = SimpleNamespace(mm_processor_cache_gb=4)
+    orchestrator.stage_pools = [
+        StagePool(0, [FakeStageClient()]),
+        StagePool(
+            1,
+            [FakeStageClient(final_output=True), FakeStageClient(final_output=True)],
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(multimodal_config=mm_config)),
+        ),
+    ]
+    seen_uuids: dict[str, str] = {}
+
+    def process_inputs(*, request_id, prompt, params, **kwargs):
+        seen_uuids[request_id] = prompt["multi_modal_uuids"]["image"][0]
+        return _processed_request(request_id, params)
+
+    orchestrator._stage_input_processors = {1: SimpleNamespace(process_inputs=process_inputs)}
+    orchestrator._prompt_processing_lock = threading.RLock()
+    req_state = SimpleNamespace(
+        sampling_params_list=[_sampling_params(), _sampling_params()], request_timestamp=0.0, final_stage_id=1
+    )
+    orchestrator.request_states = {"req-bypass": req_state, "req-forwarded": req_state}
+    bypass_prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}
+    forwarded_prompt = {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}
+    await orchestrator._build_entry_stage_request(
+        "req-bypass",
+        1,
+        bypass_prompt,
+        req_state,
+        replica_id=orchestrator._preselect_stage_mm_cache_replica("req-bypass", 1, bypass_prompt),
+    )
+    await orchestrator._build_next_stage_request(
+        "req-forwarded",
+        1,
+        forwarded_prompt,
+        _sampling_params(),
+        replica_id=orchestrator._preselect_stage_mm_cache_replica("req-forwarded", 1, forwarded_prompt),
+    )
+
+    stage1_pool = orchestrator.stage_pools[1]
+    for req_id, uuid in seen_uuids.items():
+        assert uuid.startswith(f"stage1:rep{stage1_pool.get_bound_replica_id(req_id)}:")
+    assert seen_uuids["req-bypass"] != seen_uuids["req-forwarded"]
+    assert seen_uuids["req-bypass"].split(":", 2)[2] == seen_uuids["req-forwarded"].split(":", 2)[2]
+
+    # A distributed pool whose snapshot has no UP replica yet cannot bind one.
+    stage1_pool.preselect_replica_id = lambda req_id: None
+    with pytest.raises(StageUnavailableError):
+        orchestrator._preselect_stage_mm_cache_replica("req-unbound", 1, forwarded_prompt)
+    mm_config.mm_processor_cache_gb = 0
+    assert orchestrator._preselect_stage_mm_cache_replica("req-unbound", 1, forwarded_prompt) is None
 
 
 @pytest.mark.asyncio
@@ -942,6 +1145,205 @@ async def test_async_chunk_processed_terminal_and_raw_terminal_finishes_once(orc
         assert terminal_msg.engine_outputs is processed_terminal
         assert terminal_msg.finished is True
         await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_raw_terminal_error_preserved_and_finishes_once(orchestrator_factory, mocker) -> None:
+    """An oversized-chunk ERROR terminal reaches the client as an error.
+
+    The unified stage-error handler must preserve the scheduler rejection
+    before normal terminal finishing can emit an empty successful output.
+    """
+    request_id = "req-stream-error-terminal"
+    reason = "async chunk requires 65552 tokens, but max_num_scheduled_tokens is 65536"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    handle_stage_error = mocker.spy(orchestrator_fixture.orchestrator, "_handle_stage_error")
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        raw_outputs = _error_engine_core_outputs(request_id, reason)
+        stage1.push_engine_core_outputs(raw_outputs)
+
+        error_msg = await _get_error_message(orchestrator_fixture)
+
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 1, reason)
+        assert error_msg.fatal is False
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        handle_stage_error.assert_awaited_once_with(1, raw_outputs.outputs[0], error=reason)
+        # abort=True cleanup reached every stage holding the request.
+        assert stage0.abort_calls == [[request_id]]
+        assert stage1.abort_calls == [[request_id]]
+        assert all(
+            pool.get_bound_replica_id(request_id) is None for pool in orchestrator_fixture.orchestrator.stage_pools
+        )
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_raw_terminal_error_multi_final_stage_fails_fast(orchestrator_factory) -> None:
+    """A final-stage ERROR fails fast instead of waiting for the other final stage."""
+    request_id = "req-stream-error-multi-final"
+    reason = "async chunk requires 65552 tokens, but max_num_scheduled_tokens is 65536"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    stage2 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1, stage2],
+        output_processors=[
+            FakeOutputProcessor(),
+            FakeOutputProcessor(),
+            FakeOutputProcessor(),
+        ],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params(), _sampling_params()],
+            final_stage_id=2,
+            final_output_stage_ids=[1, 2],
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1 and len(stage2.add_request_calls) == 1)
+        # Only stage-1 terminates, with ERROR; stage-2 never finishes.
+        stage1.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
+
+        # Normal terminal finishing would wait for stage-2 forever without
+        # the earlier unified error handler, and this get would time out.
+        error_msg = await _get_error_message(orchestrator_fixture)
+
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 1, reason)
+        assert error_msg.fatal is False
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        # The still-running final stage was aborted with the request.
+        assert stage2.abort_calls == [[request_id]]
+        await asyncio.sleep(0.05)
+        with pytest.raises(queue.Empty):
+            orchestrator_fixture.output_sync_q.get_nowait()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_raw_terminal_length_keeps_empty_fallback(orchestrator_factory) -> None:
+    """Non-ERROR raw terminals keep the existing empty-output fallback."""
+    request_id = "req-stream-length-terminal"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1.push_engine_core_outputs(_terminal_engine_core_outputs(request_id, finish_reason=FinishReason.LENGTH))
+
+        terminal_msg = await _get_output_message(orchestrator_fixture)
+
+        assert terminal_msg.request_id == request_id
+        assert terminal_msg.stage_id == 1
+        assert terminal_msg.finished is True
+        engine_output = terminal_msg.engine_outputs
+        assert getattr(engine_output, "error", None) is None
+        assert engine_output.outputs[0].finish_reason == "stop"
+        assert engine_output.outputs[0].multimodal_output["audio"].numel() == 0
+        assert engine_output.finished is True
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_non_final_stage_error_fails_request(orchestrator_factory) -> None:
+    """An ERROR terminal from a non-final stage fails the whole request."""
+    request_id = "req-stream-error-stage0"
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        async_chunk=True,
+    )
+    request = FakePromptRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 2, 3, 4],
+    )
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id=request_id,
+            prompt=request,
+            original_prompt={"prompt": "stream audio"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        reason = "stage 0 blew up"
+        stage0.push_engine_core_outputs(_error_engine_core_outputs(request_id, reason))
+
+        error_msg = await _get_error_message(orchestrator_fixture)
+
+        assert isinstance(error_msg, ErrorMessage)
+        assert (error_msg.request_id, error_msg.stage_id, error_msg.error) == (request_id, 0, reason)
+        assert error_msg.fatal is False
+        await _wait_for(lambda: request_id not in orchestrator_fixture.orchestrator.request_states)
+        assert stage0.abort_calls == [[request_id]]
+        assert stage1.abort_calls == [[request_id]]
         await asyncio.sleep(0.05)
         with pytest.raises(queue.Empty):
             orchestrator_fixture.output_sync_q.get_nowait()
@@ -2063,6 +2465,33 @@ async def test_orchestrator_records_scheduler_stats_without_outputs(orchestrator
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_rehydrates_mrv2_pooling_payload_before_output_processing(orchestrator_factory) -> None:
+    """A dict pooling output shipped as the MR V2 bytes carrier reaches the output processor as a dict."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    processor = RecordingOutputProcessor()
+    orchestrator_fixture = orchestrator_factory([stage0], output_processors=[processor])
+    codes = torch.tensor([[1, 2, 3]])
+    engine_output = SimpleNamespace(
+        request_id="req-mrv2-payload",
+        pooling_output=None,
+        pooling_output_payload=serialize_additional_information({"codes.audio": codes}),
+    )
+
+    try:
+        stage0.push_engine_core_outputs(
+            SimpleNamespace(outputs=[engine_output], timestamp=1.0, scheduler_stats=None, finished_requests=None)
+        )
+
+        await _wait_for(lambda: len(processor.process_calls) == 1)
+        (seen,) = processor.process_calls[0][0][0]
+        assert seen.pooling_output_payload is None
+        assert set(seen.pooling_output) == {"codes.audio"}
+        assert torch.equal(seen.pooling_output["codes.audio"], codes)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_does_not_build_iteration_stats_for_finished_only_batch(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=True)
     processor = RecordingOutputProcessor()
@@ -2179,7 +2608,17 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage_id", [0, 1])
-async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(mocker, stage_id):
+@pytest.mark.parametrize(
+    ("reason", "expected_error"),
+    [
+        ("Timed out waiting for connector input after 5s", "Timed out waiting for connector input after 5s"),
+        (None, "Stage request failed"),
+        ("", "Stage request failed"),
+        (17, "Stage request failed"),
+    ],
+    ids=["reason", "missing-reason", "empty-reason", "non-string-reason"],
+)
+async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(mocker, stage_id, reason, expected_error):
     pools = _build_stage_pools([[FakeStageClient()], [FakeStageClient()]])
     for pool in pools:
         mocker.patch.object(pool, "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[])
@@ -2197,7 +2636,6 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
     normal_terminal = mocker.patch.object(
         orchestrator, "_apply_raw_terminal_stage_finish", new_callable=mocker.AsyncMock
     )
-    reason = "Timed out waiting for connector input after 5s"
     raw = EngineCoreOutputs(
         outputs=[
             OmniEngineCoreOutput(
@@ -2205,16 +2643,17 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
             )
         ]
     )
-    terminal_ids: set[str] = set()
+    terminal_request_ids: set[str] = set()
 
-    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_ids)
+    await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal_request_ids)
 
     error = output_queue.get_nowait()
     assert isinstance(error, ErrorMessage)
-    assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, reason)
+    assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, expected_error)
+    assert error.fatal is False
     cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True)
     normal_terminal.assert_not_awaited()
-    assert not terminal_ids
+    assert not terminal_request_ids
     assert output_queue.empty()
 
 
@@ -2274,3 +2713,118 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         plain_state,
     )
     assert output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_interaction_wait_does_not_block_playback_or_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=requests,
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    feedback = asyncio.Event()
+    aborted = asyncio.Event()
+    second = asyncio.Event()
+    calls = []
+
+    async def interaction(msg):
+        calls.append(msg.interaction["event_id"])
+        entered.set()
+        if len(calls) == 1:
+            await release.wait()
+        else:
+            second.set()
+
+    async def playback(msg):
+        assert msg.method == "update_streaming_playback"
+        feedback.set()
+
+    async def abort(msg):
+        aborted.set()
+
+    monkeypatch.setattr(orchestrator, "_handle_interaction", interaction)
+    monkeypatch.setattr(orchestrator, "_handle_collective_rpc", playback)
+    monkeypatch.setattr(orchestrator, "_handle_abort", abort)
+    tasks = [asyncio.create_task(coro) for coro in orchestrator._background_tasks()]
+    tasks.append(asyncio.create_task(orchestrator._request_handler()))
+    try:
+        await requests.put(InteractionMessage(request_id="video", interaction={"event_id": "press", "event": {}}))
+        await asyncio.wait_for(entered.wait(), 1)
+        await requests.put(InteractionMessage(request_id="video", interaction={"event_id": "release", "event": {}}))
+        await requests.put(
+            CollectiveRPCRequestMessage(
+                rpc_id="feedback", method="update_streaming_playback", args=(), kwargs={}, stage_ids=[0]
+            )
+        )
+        await requests.put(AbortRequestMessage(request_ids=["video"]))
+        await asyncio.wait_for(feedback.wait(), 1)
+        await asyncio.wait_for(aborted.wait(), 1)
+        assert calls == ["press"]
+        release.set()
+        await asyncio.wait_for(second.wait(), 1)
+        assert calls == ["press", "release"]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_interaction_worker_shutdown_cancels_inflight_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked(msg):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(orchestrator, "_handle_interaction", blocked)
+    task = asyncio.create_task(orchestrator._interaction_worker())
+    try:
+        await orchestrator._dispatch_message(InteractionMessage(request_id="video", interaction={"event": {}}))
+        await asyncio.wait_for(entered.wait(), 1)
+        orchestrator._shutdown_event.set()
+        await asyncio.wait_for(task, 1)
+        assert cancelled.is_set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> None:
+    errors: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=errors,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[],
+    )
+    for index in range(65):
+        await orchestrator._dispatch_message(
+            InteractionMessage(request_id="video", interaction={"event_id": str(index), "event": {}})
+        )
+    error = errors.get_nowait()
+    assert error.event_id == "64"
+    assert error.fatal is False
+    assert error.error == "Too many pending interactions"
+
+    # fatal=False preserves the engine, not the overflowing video request.
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    consumer = object.__new__(AsyncOmni)
+    with pytest.raises(RuntimeError, match="Too many pending interactions"):
+        consumer._handle_output_message(error)

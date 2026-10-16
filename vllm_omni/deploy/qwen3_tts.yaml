@@ -162,5 +162,9 @@ platforms:
           cudagraph_mode: PIECEWISE
   xpu:
     model_runner: v1
+    stages:
+      - stage_id: 1
+        # Level Zero cannot capture the Code2Wav graph.
+        enforce_eager: true
   musa:
     model_runner: v1

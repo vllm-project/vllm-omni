@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '../../examples/online_serving/realtime_web/app/static');
 const context = vm.createContext({ URL });
-for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
+for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt', 'joyai_turn']) {
   vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), context);
 }
 const profiles = context.OmniRealtimeProfiles;
@@ -114,6 +114,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   let timerId = 0;
   const sockets = [];
   const nodes = [];
+  const mediaRequests = [];
   class Socket {
     static OPEN = 1;
     constructor() {
@@ -156,7 +157,10 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   }
   const ctx = vm.createContext({
     URL, document, AudioContext, AudioWorkletNode, WebSocket: Socket,
-    navigator: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } },
+    navigator: { mediaDevices: { getUserMedia: async (constraints) => {
+      mediaRequests.push(constraints);
+      return { getTracks: () => [{ stop() {} }] };
+    } } },
     location: { href: 'https://localhost/' },
     OMNI_REALTIME_CONFIG: { ...config, profile: profileName, turnMode },
     addEventListener() {},
@@ -167,7 +171,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
   });
   ctx.window = ctx;
-  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt']) {
+  for (const name of ['common', 'minicpm_native', 'qwen3_turn', 'aura_ptt', 'joyai_turn']) {
     vm.runInContext(fs.readFileSync(path.join(root, `profiles/${name}.js`), 'utf8'), ctx);
   }
   // Expose closure controls only in the test VM; production has no test API.
@@ -180,7 +184,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
     };
   })();`);
   vm.runInContext(source, ctx);
-  return { ui: ctx.testUI, elements, sockets, nodes,
+  return { ui: ctx.testUI, elements, sockets, nodes, mediaRequests,
     timeout() { for (const timer of timers.values()) if (timer.ms === 15000) timer.fn(); },
     async echo() {
       for (const [id, timer] of timers) if (timer.ms === 300) { timers.delete(id); await timer.fn(); }
@@ -190,6 +194,69 @@ function shell(profileName, turnMode = 'manual', options = {}) {
     },
   };
 }
+
+test('JoyAI profile sends camera commits and playback acknowledgements', () => {
+  const profile = profiles['joyai-turn']();
+  const url = new URL(profile.url({}, 'https://localhost/'));
+  assert.equal(url.searchParams.get('duplex'), '1');
+  assert.equal(url.searchParams.get('model'), 'jdopensource/JoyAI-VL-Interaction-Preview');
+  assert.deepEqual(plain(profile.initialMessages({}, 'Watch the pot.')), [{
+    type: 'session.update', session: { modalities: ['audio', 'text'], instructions: 'Watch the pot.',
+      extra_body: { auto_response: false } },
+  }]);
+  assert.deepEqual(plain(profile.append(null, 'JPEG')), { type: 'input_audio_buffer.append', video_frames: ['JPEG'] });
+  assert.deepEqual(plain(profile.commitMessages()), [{ type: 'input_audio_buffer.commit', final: true, create_response: true }]);
+  assert.deepEqual(plain(profile.ack('r1', 1000)), { type: 'playback.ack', response_id: 'r1',
+    item_id: 'item_r1', played_ms: 1000, committed_ms: 1000 });
+  assert.equal(profile.mapEvent({ type: 'response.output_text.delta', delta: 'Smoke!' }).text, 'Smoke!');
+  assert.equal(profile.mapEvent({ type: 'response.output_text.done', text: 'Smoke!' }).kind, 'text-final');
+});
+
+test('JoyAI observes without a microphone and waits for both response.done and playback', async () => {
+  const app = shell('joyai-turn');
+  await app.ui.startSession();
+  assert.equal(app.mediaRequests.length, 0);
+  assert.equal(app.nodes.some(node => node.name === 'fullduplex-pcm-capture'), false);
+  assert.equal(app.elements.get('muteButton').hidden, true);
+  assert.equal(app.elements.get('microphoneMeter').hidden, true);
+  const socket = app.sockets[0];
+  app.elements.get('sendTurnButton').listeners.click();
+  assert.equal(socket.sent.length, 1, 'no commit without a frame');
+  app.ui.setPendingFrame('frame-a'); app.ui.flushCapture();
+  assert.deepEqual(socket.sent.slice(-2), [
+    { type: 'input_audio_buffer.append', video_frames: ['frame-a'] },
+    { type: 'input_audio_buffer.commit', final: true, create_response: true },
+  ]);
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'r1' } });
+  app.ui.setPendingFrame('frame-b'); app.ui.flushCapture();
+  assert.equal(socket.sent.length, 3, 'busy observations stay local');
+  await app.ui.handleEvent({ type: 'response.output_audio.delta', delta: 'AAAAAA==', response_id: 'r1' });
+  await app.ui.handleEvent({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+  await app.echo(); app.ui.flushCapture();
+  assert.equal(socket.sent.filter(e => e.type === 'input_audio_buffer.commit').length, 1);
+  app.ui.playbackDrained({ responseId: 'r1', playedMs: 1000 });
+  assert.equal(socket.sent.at(-1).type, 'playback.ack');
+  await app.echo();
+  app.ui.setPendingFrame('frame-c'); app.ui.flushCapture();
+  assert.deepEqual(socket.sent.at(-2).video_frames, ['frame-c'], 'only the latest frame is submitted');
+  assert.equal(socket.sent.filter(e => e.type === 'input_audio_buffer.commit').length, 2);
+  assert.equal(socket.sent.some(e => 'audio' in e), false);
+});
+
+test('JoyAI resumes after a silent decision and supports manual observations', async () => {
+  const app = shell('joyai-turn');
+  await app.ui.startSession();
+  app.ui.setPendingFrame('frame-a');
+  app.elements.get('sendTurnButton').listeners.click();
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'r1' } });
+  await app.ui.handleEvent({ type: 'response.listen', response_id: 'r1' });
+  await app.ui.handleEvent({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+  await app.echo();
+  app.elements.get('sendTurnButton').listeners.click();
+  assert.equal(app.sockets[0].sent.filter(e => e.type === 'input_audio_buffer.commit').length, 2);
+  assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['frame-a']);
+  assert.equal(app.sockets.length, 1);
+});
 
 test('shared shell sends standard manual turns and keeps the Realtime session open', async () => {
   const app = shell('qwen3-turn');

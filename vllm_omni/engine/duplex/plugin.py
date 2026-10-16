@@ -337,6 +337,9 @@ class DuplexModelPlugin(ABC):
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
         return self.plan_append(**kwargs)
 
+    def commit_append_plan(self, request_id: str) -> None:
+        """Commit model-owned context after the stage accepts a fenced append."""
+
     @abstractmethod
     def plan_append(
         self,

@@ -54,6 +54,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -106,6 +107,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     app = FastAPI()
+    app.add_middleware(CORSMiddleware, allow_origins=["http://client"])
 
     @app.get("/trace")
     async def trace_context():
@@ -137,8 +139,12 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
             for sampled in ("01", "00"):
                 parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
-                response = await client.get("/trace", headers={"traceparent": parent, "tracestate": "vendor=state"})
+                response = await client.get(
+                    "/trace",
+                    headers={"traceparent": parent, "tracestate": "vendor=state", "origin": "http://client"},
+                )
                 assert response.status_code == 200
+                assert response.headers["access-control-allow-origin"] == "http://client"
                 carrier = response.json()
                 if tracing_enabled:
                     assert carrier["traceparent"].split("-")[1] == parent.split("-")[1]
@@ -700,12 +706,12 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
         ("1", "duplex"),
         ("true", "duplex"),
         ("on", "duplex"),
-        ("0", "legacy"),
-        ("false", "legacy"),
+        ("0", "turn_based"),
+        ("false", "turn_based"),
     ],
 )
 async def test_realtime_route_defaults_to_configured_duplex_handler(
-    monkeypatch, duplex_query: str | None, expected_handler: str
+    duplex_query: str | None, expected_handler: str
 ) -> None:
     calls: list[str] = []
 
@@ -713,15 +719,16 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_realtime_session(self, _websocket) -> None:
             calls.append("duplex")
 
-    async def _dispatch_turn_based(_websocket) -> None:
-        calls.append("legacy")
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
 
-    monkeypatch.setattr(api_server, "dispatch_realtime_websocket", _dispatch_turn_based)
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
                 openai_serving_duplex=_DuplexHandler(),
+                openai_realtime_handler=_TurnBasedHandler(),
             )
         ),
         query_params=query_params,
@@ -904,22 +911,23 @@ def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multi_api_rejects_runtime_voice_upload() -> None:
+async def test_multi_api_allows_runtime_voice_upload_and_deletion() -> None:
+    # The speaker directory is shared by every API process, so these routes
+    # are not process-local; without a speech handler they report 404.
     app = FastAPI()
     app.state.api_server_count = 2
-    raw_request = _request_for(app, method="POST", path="/v1/audio/voices")
+    app.state.openai_serving_speech = None
 
-    with pytest.raises(HTTPException) as exc_info:
-        await api_server.upload_voice(
-            raw_request,
-            audio_sample=None,
-            speaker_embedding=None,
-            consent="consent-id",
-            name="probe",
-        )
+    upload = await api_server.upload_voice(
+        _request_for(app, method="POST", path="/v1/audio/voices"),
+        audio_sample=None,
+        speaker_embedding=None,
+        consent="consent-id",
+        name="probe",
+    )
+    deletion = await api_server.delete_voice("probe", _request_for(app, method="DELETE", path="/v1/audio/voices/probe"))
 
-    assert exc_info.value.status_code == 409
-    assert "process-local frontend state" in exc_info.value.detail
+    assert upload.status_code == deletion.status_code == 404
 
 
 @pytest.mark.asyncio

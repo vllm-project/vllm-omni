@@ -141,6 +141,13 @@ class MossLocalModelState(OmniModelState):
         else:
             super().set_first_audio_sink(sink)
 
+    def close_first_audio_sender(self) -> None:
+        try:
+            if self._early_first_audio is not None and self._first_audio_sender is not None:
+                self._first_audio_sender.close()
+        finally:
+            super().close_first_audio_sender()
+
     def _init_slot_buffers(self, capacity, hidden_size, device, dtype):
         self._hidden_pool = torch.zeros((capacity, hidden_size), dtype=dtype, device=device)
         self._codes_pool = torch.full(

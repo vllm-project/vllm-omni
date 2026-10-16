@@ -1527,6 +1527,63 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
         assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_minicpmo_talker_multi_frame_is_npu_scoped(self, platform: str):
+        """Stage 1's K-frame decode needs the NPU worker to inject constant
+        continue drafts, so the deploy block that arms it must not sit in the
+        platform-shared stage.
+
+        On NPU the ``speculative_config`` is a fingerprint: the worker replays
+        the decode graph and vLLM's n-gram proposer is never consulted. On CUDA
+        the same block hands the Talker to the real proposer plus the rejection
+        sampler, which asserts on its codec ids (device-side assert out of
+        ``get_token_bin_counts_and_mask``).
+
+        Stage 0's prefix caching is NPU-scoped for the same reason: a CUDA
+        stage-0 prefix hit hands the Thinker an empty tts handoff, and the
+        Talker then indexes past the codec vocab.
+        """
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
+            platform=platform,
+        )
+        # Check the deploy-side stop id before the merge: afterwards it is
+        # unioned with the pipeline's codec-EOS default.
+        deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
+
+        if platform == "npu":
+            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+            # The armed head ends on 1; the union keeps the codec EOS inert
+            # (the collapsed head cannot sample it).
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+            # The duplex KV-window contract requires prefix caching off, and the
+            # NPU overlay states that explicitly so a stage-level value can
+            # never turn it back on for this stage.
+            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+            assert stages[1].yaml_engine_args["speculative_config"] == {
+                "method": "ngram",
+                "num_speculative_tokens": 7,
+                "prompt_lookup_min": 1,
+                "prompt_lookup_max": 1,
+            }
+            assert stages[1].yaml_engine_args["async_scheduling"] is False
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
+        else:
+            assert "stop_token_ids" not in (deploy_stage1.default_sampling_params or {})
+            # Without the block the head is the full codec vocabulary, so the
+            # codec EOS is the only stop id -- the marker would end a request
+            # on an ordinary codec id.
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+            # Either absent (falls back to the top-level false) or explicitly
+            # false; the regression this guards against is true.
+            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+            assert "speculative_config" not in stages[1].yaml_engine_args
+            assert stages[1].yaml_engine_args["async_scheduling"] is True
+            # Base concurrency stays 16; only the NPU overlay lowers it to 8,
+            # so a CUDA deployment keeps the pipeline default.
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
+
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
         [
@@ -2890,10 +2947,10 @@ class TestPlatformOverrides:
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
         base = load_deploy_config(deploy_path)
-        assert base.stages[0].engine_extras["attention_backend"] == "FLASHINFER"
+        assert base.stages[0].attention_backend == "FLASHINFER"
 
         rocm = _apply_platform_overrides(base, platform="rocm")
-        assert rocm.stages[0].engine_extras["attention_backend"] == "TRITON_ATTN"
+        assert rocm.stages[0].attention_backend == "TRITON_ATTN"
 
         pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
         assert isinstance(pipeline, PipelineConfig)
@@ -2944,20 +3001,20 @@ class TestPlatformOverrides:
             assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
             assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
 
-    def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
 
-        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
-        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        # Both single-device profiles reserve headroom for colocated Code2Wav.
+        assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
-        # The CUDA memory budget must not leak into the existing NPU profile.
-        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
-        npu_stages = merge_pipeline_deploy(pipeline, npu)
-        assert "kv_cache_memory_bytes" not in npu_stages[1].yaml_engine_args
-
+    def test_minicpmo_4_5_cuda_replicas_use_automatic_talker_kv_cache(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
         # Multi-GPU replica profiles place Talker on dedicated devices and
         # preserve their previous automatic KV-cache sizing.
         for filename in (

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends import trtllm_attn as tg
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -16,7 +17,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionImpl
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def _has_trtllm_attn() -> bool:
@@ -49,6 +50,7 @@ def _packed_padding(cu_seqlens_q, cu_seqlens_k, q_length, kv_length):
     )
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_config_pure_resolution():
     from vllm_omni.diffusion.attention.backends.trtllm_attn import SkipSoftmaxConfig
 
@@ -62,6 +64,7 @@ def test_skip_config_pure_resolution():
     assert cfg.resolve_factor(4096, timestep=None) == pytest.approx(0.01 * 4096)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_quant_config_from_backend_kwargs():
     from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig
 
@@ -72,11 +75,13 @@ def test_quant_config_from_backend_kwargs():
     assert qc.enabled and (qc.dtype_qk, qc.q_block_size, qc.k_block_size) == ("int8", 4, 16)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_quant_rejects_non_sage_dtype():
     with pytest.raises(RuntimeError, match="supports dtype_qk"):
         _impl(quant={"dtype_qk": "bfloat16"})
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_quant_quantize_calls_routine_and_shapes_sfs():
     from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig
 
@@ -124,6 +129,7 @@ def test_quant_quantize_calls_routine_and_shapes_sfs():
     }
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_factor_none_without_curve():
     assert _impl(target_sparsity=0.5)._resolve_skip_factor(4096) is None
 
@@ -134,16 +140,19 @@ def _calibrated(a, b, **bk):
     return impl
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_factor_from_curve():
     assert _calibrated(100.0, 0.0, target_sparsity=0.5)._resolve_skip_factor(4096) == pytest.approx(100.0)
     f2 = _calibrated(2.0, 1.0, target_sparsity=0.5)._resolve_skip_factor(4096)
     assert f2 == pytest.approx(2.0 * math.exp(0.5))
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_factor_none_until_stamped():
     assert _impl(target_sparsity=0.5)._resolve_skip_factor(4096) is None
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_factor_from_threshold_no_calibration():
     impl = _impl(skip_softmax_threshold=0.01)
     assert impl._resolve_skip_factor(4096) == pytest.approx(0.01 * 4096)
@@ -153,6 +162,7 @@ def test_skip_factor_from_threshold_no_calibration():
     assert impl2._resolve_skip_factor(4096) == pytest.approx(0.02 * 4096)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_timestep_gate(monkeypatch):
     from vllm_omni.diffusion import forward_context as fc
 
@@ -164,6 +174,7 @@ def test_skip_timestep_gate(monkeypatch):
     assert impl._resolve_skip_factor(4096) == pytest.approx(100.0)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_denoise_progress_mixin(monkeypatch):
     import types
 
@@ -185,6 +196,7 @@ def test_denoise_progress_mixin(monkeypatch):
     assert ctx.denoise_step_idx == 5 and ctx.denoise_timestep == pytest.approx(0.7)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @pytest.mark.parametrize(
     "bk, field",
     [
@@ -203,6 +215,7 @@ def test_skip_control_validation_rejects_out_of_range(bk, field):
         SkipSoftmaxConfig.from_backend_kwargs(bk)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_control_validation_accepts_valid():
     from vllm_omni.diffusion.attention.backends.trtllm_attn import SkipSoftmaxConfig
 
@@ -214,6 +227,7 @@ def test_skip_control_validation_accepts_valid():
     assert cfg.threshold == pytest.approx(0.01)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_ring_sp_with_skip_softmax_rejected():
     import types
 
@@ -224,6 +238,7 @@ def test_ring_sp_with_skip_softmax_rejected():
         Attention._run_ring_attention(fake, None, None, None, None)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_mask_free_allowlist_gates_trtllm_default():
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata as meta
 
@@ -234,6 +249,7 @@ def test_mask_free_allowlist_gates_trtllm_default():
     assert meta(None).attention_mask_free is False
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_masked_layer_raises():
     b, s, h, d = 1, 8, 8, 128
     q, k, v = (torch.zeros(b, s, h, d) for _ in range(3))
@@ -247,6 +263,7 @@ def test_masked_layer_raises():
         _impl().forward_cuda(q, k, v, _Meta())
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_generic_packed_metadata_preserves_ragged_batch(monkeypatch):
     b, h, d = 1, 8, 128
     q = torch.zeros(b, 5, h, d)
@@ -276,6 +293,7 @@ def test_generic_packed_metadata_preserves_ragged_batch(monkeypatch):
     assert tg.TrtllmAttentionBackend.supports_multi_doc_packed_varlen()
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_packed_padding_metadata_trims_without_mask(monkeypatch):
     q_len, kv_len = 8, 9
     valid_q_tokens, valid_kv_tokens = 5, 6
@@ -323,6 +341,7 @@ def test_packed_padding_metadata_trims_without_mask(monkeypatch):
     assert torch.count_nonzero(out[:, valid_q_tokens:]) == 0
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_packed_metadata_must_be_complete():
     b, s, h, d = 1, 8, 8, 128
     q, k, v = (torch.zeros(b, s, h, d) for _ in range(3))
@@ -332,6 +351,7 @@ def test_packed_metadata_must_be_complete():
         _impl().forward_cuda(q, k, v, metadata)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_packed_metadata_must_cover_inputs(monkeypatch):
     b, s, h, d = 1, 8, 8, 128
     q, k, v = (torch.zeros(b, s, h, d) for _ in range(3))
@@ -350,6 +370,7 @@ def test_packed_metadata_must_cover_inputs(monkeypatch):
         _impl().forward_cuda(q, k, v, metadata)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_propagate_calibration_045_schema(monkeypatch):
     import types
 
@@ -398,6 +419,7 @@ def test_propagate_calibration_045_schema(monkeypatch):
     assert "transformer_2" not in spec.skip_calibration["by_expert"]
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_target_sparsity_without_calibration_raises():
     import types
 
@@ -429,6 +451,7 @@ def _sdpa_ref(q, k, v, scale):
     return F.scaled_dot_product_attention(qp, kp, vp, is_causal=False, scale=scale).permute(0, 2, 1, 3).float()
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_trtllm_attn
 def test_bf16_dense_matches_sdpa():
     torch.manual_seed(0)
@@ -441,6 +464,7 @@ def test_bf16_dense_matches_sdpa():
     assert rel < 0.01, f"BF16 dense rel err {rel:.4f} too high"
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_trtllm_attn
 def test_bf16_packed_padding_matches_sdpa():
     torch.manual_seed(0)
@@ -472,6 +496,7 @@ requires_sage = pytest.mark.skipif(
 )
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_sage
 @pytest.mark.parametrize("dtype_qk", ["fp8_e4m3", "int8"])
 def test_sage_quant_matches_sdpa(dtype_qk):
@@ -492,6 +517,7 @@ def test_sage_quant_matches_sdpa(dtype_qk):
     assert rel < 0.1, f"SAGE({dtype_qk}) rel err {rel:.4f} too high"
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_sage
 def test_sage_packed_non_aligned_length_matches_sdpa():
     torch.manual_seed(0)
@@ -518,6 +544,7 @@ def test_sage_packed_non_aligned_length_matches_sdpa():
     assert torch.count_nonzero(out[:, used:]) == 0
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_trtllm_attn
 def test_skip_tiny_threshold_matches_dense():
     torch.manual_seed(0)
@@ -531,6 +558,7 @@ def test_skip_tiny_threshold_matches_dense():
     assert rel < 0.02, f"skip(tiny) rel err {rel:.4f} should be ~dense"
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_trtllm_attn
 def test_skip_threshold_engages():
     torch.manual_seed(0)
@@ -542,6 +570,7 @@ def test_skip_threshold_engages():
     assert (skipped - dense).abs().mean() / dense.abs().mean() > 0.02
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_trtllm_attn
 def test_gqa_matches_sdpa():
     torch.manual_seed(0)
@@ -565,6 +594,7 @@ def test_gqa_matches_sdpa():
     assert rel < 0.01, f"GQA rel err {rel:.4f} vs SDPA(GQA) too high"
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 @requires_trtllm_attn
 def test_unsupported_head_dim_raises():
     q = k = v = torch.randn(1, 32, 8, 64, device="cuda", dtype=torch.bfloat16)
@@ -572,6 +602,7 @@ def test_unsupported_head_dim_raises():
         _impl().forward_cuda(q, k, v, None)
 
 
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_end_to_end_config_path(monkeypatch):
     import types
 
@@ -619,6 +650,7 @@ def test_skip_end_to_end_config_path(monkeypatch):
     assert impl._resolve_skip_factor(4096) == pytest.approx(expected)
 
 
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
 @requires_trtllm_attn
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
