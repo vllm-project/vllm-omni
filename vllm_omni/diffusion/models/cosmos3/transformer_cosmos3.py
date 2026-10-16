@@ -37,7 +37,6 @@ from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
@@ -54,6 +53,7 @@ from .mixed_precision import (
     Cosmos3MixedPrecisionRuntime,
     resolve_mixed_precision_config,
 )
+from .norm import RMSNorm
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -106,19 +106,6 @@ def _resolve_cosmos3_quant_configs(
         _pathway_quant_config(components, "language_model", transformer_config),
         _pathway_quant_config(components, "gen_layers", transformer_config),
     )
-
-
-class RMSNorm(_VllmRMSNorm):
-    """Cosmos3-local RMSNorm that uses the FP32 native implementation."""
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
 
 
 def _get_ulysses_state() -> tuple[int, int, dist.ProcessGroup | None]:

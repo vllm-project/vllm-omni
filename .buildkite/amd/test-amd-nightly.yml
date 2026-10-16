@@ -192,6 +192,93 @@ steps:
             mkdir -p "$$artifact_dir"
             cp -v /tmp/lingbot-pytest.xml "$$artifact_dir/"
 
+  - group: ":full_moon: MiniMax-H3 MI300 Nightly"
+    steps:
+      - label: "MiniMax-H3 Official T2VA Smoke"
+        agent_pool: mi300_4
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        artifact_paths:
+          - artifacts/rocm-minimax-h3-nightly/**/*
+        commands:
+          - export VLLM_ROCM_USE_AITER=1
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+          - export MINIMAX_H3_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-minimax-h3-nightly"
+          - mkdir -p "$$MINIMAX_H3_ARTIFACT_DIR"
+          - |
+            {
+              echo "commit=$$(git rev-parse HEAD)"
+              echo "hf_home=$${HF_HOME:-unset}"
+              echo "--- rocm-smi"
+              rocm-smi
+              echo "--- rocminfo"
+              rocminfo
+              echo "--- PyTorch"
+              python -c 'import torch; print(f"torch={torch.__version__}"); print(f"hip={torch.version.hip}"); print(f"gpus={torch.cuda.device_count()}"); [print(f"gpu[{index}]={torch.cuda.get_device_name(index)}") for index in range(torch.cuda.device_count())]'
+            } > "$$MINIMAX_H3_ARTIFACT_DIR/runtime-inventory.txt" 2>&1
+          - >-
+            ps -eo pid=,ppid=,lstart=,stat=,comm=,args= >
+            "$$MINIMAX_H3_ARTIFACT_DIR/processes-before.txt"
+          - >-
+            rocm-smi --showpids >
+            "$$MINIMAX_H3_ARTIFACT_DIR/gpu-holders-before.txt" 2>&1
+          - |
+            if pytest --collect-only -q \
+              'tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py::test_minimax_h3_rocm_t2va[minimax_h3_rocm_t2va]' \
+              -m 'full_model and diffusion and rocm and MI325 and cards_4' \
+              --run-level full_model \
+              2>&1 | tee "$$MINIMAX_H3_ARTIFACT_DIR/collection.txt"; then
+              collection_count=$$(awk '/::/ { count += 1 } END { print count + 0 }' \
+                "$$MINIMAX_H3_ARTIFACT_DIR/collection.txt")
+              if (( collection_count != 1 )); then
+                echo "Expected exactly one MiniMax-H3 ROCm test, collected $$collection_count." >&2
+                exit 5
+              fi
+            else
+              exit $$?
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 105m
+            pytest -s -v -ra
+            'tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py::test_minimax_h3_rocm_t2va[minimax_h3_rocm_t2va]'
+            -m 'full_model and diffusion and rocm and MI325 and cards_4'
+            --run-level full_model
+            --durations=0
+            --junitxml="$$MINIMAX_H3_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$MINIMAX_H3_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 200 "$$MINIMAX_H3_ARTIFACT_DIR/pytest.log" >
+            "$$MINIMAX_H3_ARTIFACT_DIR/pytest-summary.txt"
+          - |
+            sleep 5
+            ps -eo pid=,ppid=,lstart=,stat=,comm=,args= > "$$MINIMAX_H3_ARTIFACT_DIR/processes-after.txt"
+            rocm-smi --showpids > "$$MINIMAX_H3_ARTIFACT_DIR/gpu-holders-after.txt" 2>&1
+            awk '
+              NR == FNR {
+                if ($$9 != "ps") {
+                  baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+                }
+                next
+              }
+              $$9 != "ps" {
+                identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+                if (!(identity in baseline)) {
+                  print
+                  leaked = 1
+                }
+              }
+              END {
+                if (leaked) {
+                  print "status=FAIL leaked_processes_detected=1"
+                  exit 1
+                }
+                print "status=PASS leaked_processes=0"
+              }
+            ' "$$MINIMAX_H3_ARTIFACT_DIR/processes-before.txt" \
+              "$$MINIMAX_H3_ARTIFACT_DIR/processes-after.txt" \
+              2>&1 | tee "$$MINIMAX_H3_ARTIFACT_DIR/process-cleanup.txt"
+
   - group: ":full_moon: Cosmos3 MI300 Nightly"
     steps:
       - label: "Cosmos3 T2I Function"

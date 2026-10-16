@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
     from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
-    from vllm_omni.engine.messages import EngineQueueMessage
+    from vllm_omni.engine.messages import EngineQueueMessage, OutputQueueWriter
 
 logger = init_logger(__name__)
 
@@ -105,7 +105,7 @@ class DuplexSessionManager:
         *,
         plugin: DuplexModelPlugin,
         stage_port: DuplexStagePort,
-        output_sink: janus.AsyncQueue[EngineQueueMessage],
+        output_sink: OutputQueueWriter,
         result_sink: janus.AsyncQueue[EngineQueueMessage],
         runtime_config: DuplexSessionRuntimeConfig,
         model_config: ModelConfig | None,
@@ -415,12 +415,7 @@ class DuplexSessionManager:
             return
         # Only closure notifications and errors without a live session use the
         # engine-wide queue. Audio never accumulates there before the bounded buffer.
-        message = DuplexSessionEventMessage(session_id=session_id, event=event)
-        put_nowait = getattr(self._output_sink, "put_nowait", None)
-        if callable(put_nowait):
-            put_nowait(message)
-        else:  # pragma: no cover - sink without put_nowait
-            asyncio.ensure_future(self._output_sink.put(message))
+        self._output_sink.put_nowait(DuplexSessionEventMessage(session_id=session_id, event=event))
 
     async def _put_result(
         self,
@@ -505,6 +500,7 @@ class DuplexSessionManager:
         *,
         stage_id: int,
         fence: DuplexFence | None = None,
+        final_stage_id: int | None = None,
     ) -> DuplexStageRequestContext | None:
         """Reserve the session's stage request id and register it with the stage port."""
         if stage_id >= self.stage_port.stage_count:
@@ -518,7 +514,7 @@ class DuplexSessionManager:
             session_id=session.session_id,
             fence=effective_fence,
             stage_id=stage_id,
-            final_stage_id=self.stage_port.stage_count - 1,
+            final_stage_id=self.stage_port.stage_count - 1 if final_stage_id is None else final_stage_id,
             config_generation=session.config_generation,
             sampling_params=self.sampling_params_for(session),
             session_config=session.config.as_dict(),

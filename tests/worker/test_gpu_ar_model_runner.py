@@ -250,7 +250,6 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving.model_config = SimpleNamespace(async_chunk=True)
     serving._tts_model_type = "higgs_audio_v3"
     serving._get_tts_adapter = lambda: Adapter()
-    serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
     serving._speech_output_policies = {}
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
@@ -1799,6 +1798,7 @@ class TestDownstreamPayloadMemoization:
 
     def _runner(self, stages):
         runner = object.__new__(GPUARModelRunner)
+        runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
         runner._downstream_payload_cache = {}
         runner._request_final_stage_id = lambda rid: stages[rid]
         return runner
@@ -2188,3 +2188,17 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     assert output.req_id_to_index == {"r1": 0, "r2": 1}
     torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
     torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])
+
+
+def test_shutdown_drops_cached_sampled_token_override(mocker):
+    """The cached bound model method must not keep the model alive after shutdown."""
+    runner = object.__new__(GPUARModelRunner)
+    runner.omni_prefix_cache = None
+    runner._sampled_token_ids_cpu_override = mocker.Mock()
+    mocker.patch.object(runner, "_clear_duplex_sampling")
+    upstream = mocker.patch.object(gpu_ar_model_runner.OmniGPUModelRunner, "shutdown")
+
+    runner.shutdown()
+
+    assert runner._sampled_token_ids_cpu_override is None
+    upstream.assert_called_once()

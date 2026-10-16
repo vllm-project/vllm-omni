@@ -23,7 +23,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 
 MODEL_ID = "jdopensource/JoyAI-Image-Edit-Diffusers"
@@ -58,9 +58,10 @@ def _local_files_only(model: str) -> bool:
 def _joy_image_edit_pipeline_cls() -> type[Any]:
     diffusers = pytest.importorskip("diffusers")
     pipeline_cls = getattr(diffusers, "JoyImageEditPipeline", None)
-    if pipeline_cls is None:
-        pytest.skip("diffusers.JoyImageEditPipeline is required for JoyAI-Image-Edit parity testing.")
-    return pipeline_cls
+    if isinstance(pipeline_cls, type):
+        return pipeline_cls
+    pytest.skip("diffusers.JoyImageEditPipeline is required for JoyAI-Image-Edit parity testing.")
+    raise AssertionError("unreachable")
 
 
 def _load_input_image() -> Image.Image:
@@ -357,7 +358,7 @@ def _run_diffusers_joy_image_edit(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_joy_image_edit_matches_diffusers(accuracy_artifact_root: Path) -> None:
     _joy_image_edit_pipeline_cls()
     model = _model_name()

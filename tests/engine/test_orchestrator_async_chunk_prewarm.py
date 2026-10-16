@@ -61,7 +61,7 @@ class _FakePool:
     def live_replica_ids(self) -> list[int]:
         return [0]
 
-    async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
+    async def submit_initial(self, request_id, _req_state, request, prompt_text=None, expected_replica_id=None):
         self.submitted.append(request)
         return 0
 

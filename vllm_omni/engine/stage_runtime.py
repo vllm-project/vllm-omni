@@ -30,6 +30,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.cuda_mps import CudaMPSServer, physical_gpu_uuid
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -397,6 +398,13 @@ class StageRuntime:
         locked_devices: set[int] = set()
         launch: StageEngineLaunch | None = None
         exited_contexts = 0
+        # With several API servers every replica is spawned before the first
+        # handshake, and handshakes complete in launch order. A replica may
+        # then wait for every earlier replica to initialize before the
+        # front-end answers it, so its handshake wait covers all of them.
+        handshake_timeout_s = (
+            float(timeout) * sum(len(plan.replicas) for plan in stage_plans) if num_api_servers > 1 else None
+        )
 
         try:
             for plan in stage_plans:
@@ -439,6 +447,7 @@ class StageRuntime:
                         omni_parallel_stage_init=self._parallel_stage_init,
                         num_api_servers=num_api_servers,
                         watched_frontend_processes=watched_frontend_processes if num_api_servers > 1 else None,
+                        handshake_timeout_s=handshake_timeout_s,
                     )
                     # Environment overlays are process-global. Serialize spawn;
                     # parallel initialization waits for READY outside this lock.
@@ -1349,12 +1358,15 @@ class DistStageRuntime(StageRuntime):
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
-        return super()._prepare_stage_plans()
+        stage_plans = super()._prepare_stage_plans()
+        if all(replica.launch_mode == "remote" for plan in stage_plans for replica in plan.replicas):
+            logger.info("All stage replicas are remote; running only the frontend (API server + orchestrator)")
+        return stage_plans
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
         """Apply --omni-dp-size-local to the local typed stage runtime config."""
         target_stage_id = self._single_stage_id_filter
-        if target_stage_id is None:
+        if target_stage_id is None or is_frontend_only(target_stage_id):
             return
 
         for stage_cfg in self._stage_configs:
@@ -1390,7 +1402,8 @@ class DistStageRuntime(StageRuntime):
     # ---- Distributed overrides ----
 
     def _get_launch_mode(self, stage_id: int) -> str:
-        if self._single_stage_id_filter is not None and stage_id != self._single_stage_id_filter:
+        stage_id_filter = self._single_stage_id_filter
+        if is_frontend_only(stage_id_filter) or (stage_id_filter is not None and stage_id != stage_id_filter):
             return "remote"
         return "local"
 

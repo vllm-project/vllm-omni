@@ -14,10 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import diffusers
 import huggingface_hub
+import numpy as np
 import torch
 from PIL import Image
 from pydantic import model_validator
 from typing_extensions import Self
+from vllm.config import KernelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -834,6 +836,19 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Multi-stage diffusion role. ``None``/"dit"/"diffusion" run the full
+    # pipeline (text-encode + denoise + decode) in one stage. "text_encode"
+    # runs only the text encoder and emits prompt embeddings for a downstream
+    # diffusion stage (Encode/Generation (EG) disaggregation).
+    model_stage: str | None = None
+
+    # Structured diffusion stage role (encode / denoise / decode / full).
+    # This supersedes the free-form ``model_stage`` string: it is the
+    # model-agnostic axis that drives role-based component loading and stage
+    # dispatch so any DiT model can be disaggregated via config. When ``None``
+    # it is derived from ``model_stage`` (see ``resolve_diffusion_stage_role``).
+    stage_role: str | None = None
+
     # Optional model-defined startup task. Pipelines may use this to select
     # task-specific components or weights before serving requests.
     task_type: str | None = None
@@ -977,8 +992,9 @@ class OmniDiffusionConfig:
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
-    # MoE kernel backend selection
+    # Reuse upstream kernel selection; "auto" preserves platform defaults.
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
 
     # Compilation
     enforce_eager: bool = False
@@ -1101,6 +1117,7 @@ class OmniDiffusionConfig:
     # rather than carried inline through the orchestrator. Empty disables the
     # worker-side connector receive path.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
 
     # Keys handed to the next stage over the omni connector. Empty disables the
     # worker-side connector send path.
@@ -1234,9 +1251,14 @@ class OmniDiffusionConfig:
         )
 
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_input_optional_payload_keys = tuple(self.stage_input_optional_payload_keys)
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
+
         if self.vae_encode_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(
                 f"vae_encode_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_encode_fast_path!r}"
@@ -1782,6 +1804,11 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi05Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":
+                    # The official ABot checkpoint uses its native single-directory
+                    # layout and intentionally has no Diffusers pipeline index.
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry
@@ -1837,6 +1864,8 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    # Internal non-final-stage payload consumed by StagePool.
+    custom_output: dict[str, Any] = field(default_factory=dict)
     async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
@@ -1884,6 +1913,38 @@ class DiffusionOutput:
     # transport optimizations; unmarked legacy outputs retain their old path.
     video_output_index: int | None = None
 
+    # Host-side playback diagnostics; carried through the existing output metadata.
+    streaming_metrics: dict[str, float | int] = field(default_factory=dict)
+
+    def output_nbytes(self) -> int:
+        """Payload bytes retained by one decoded output, excluding model workspace."""
+
+        def size(value: Any) -> int:
+            if isinstance(value, torch.Tensor):
+                return value.untyped_storage().nbytes()
+            if isinstance(value, np.ndarray):
+                return value.nbytes
+            if isinstance(value, Image.Image):
+                return value.width * value.height * len(value.getbands())
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return len(value)
+            if isinstance(value, dict):
+                return sum(size(item) for item in value.values())
+            if isinstance(value, (tuple, list)):
+                return sum(size(item) for item in value)
+            return 0
+
+        return sum(
+            size(value)
+            for value in (
+                self.media.video.tensor if self.media is not None else self.output,
+                self.trajectory_timesteps,
+                self.trajectory_latents,
+                self.trajectory_log_probs,
+                self.trajectory_decoded,
+            )
+        )
+
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
             raise TypeError(f"media must be DiffusionMediaOutput, got {type(self.media).__name__}")
@@ -1913,6 +1974,7 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        self.custom_output = _maybe_to_cpu(self.custom_output)
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":

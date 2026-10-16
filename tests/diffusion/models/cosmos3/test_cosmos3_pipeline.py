@@ -1420,6 +1420,29 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert "preprocessed_video" not in additional
 
 
+def test_transfer_resize_antialiases_downscales_like_reference() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # One-pixel stripes shrunk 3x. The reference's torchvision resize (and the
+    # training loader) averages them; plain bilinear samples single columns,
+    # which would return the stripes as alternating 0 and 255.
+    stripes = torch.zeros(3, 2, 6, 18, dtype=torch.uint8)
+    stripes[..., 1::2] = 255
+    resized = transfer.resize_center_crop_uint8_cthw(stripes, 2, 6)
+    assert tuple(resized.shape) == (3, 2, 2, 6)
+    assert resized.min() >= 100 and resized.max() <= 155
+
+
+def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # Cropping 7 rows to 4 leaves 3. torchvision rounds the 1.5-row offset to 2,
+    # as for 1720x1080 fisheye inputs at 480p (43 spare rows, offset 22).
+    rows = torch.arange(0, 70, 10, dtype=torch.uint8).reshape(1, 1, 7, 1).expand(3, 1, 7, 4).contiguous()
+    cropped = transfer.resize_center_crop_uint8_cthw(rows, 4, 4)
+    assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
+
+
 def test_transfer_control_weight_validation_and_normalization() -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
 
@@ -2444,6 +2467,29 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
+@pytest.mark.parametrize("guidance_scale", [0.0, 1.0, 3.0, 5.0])
+@pytest.mark.parametrize("cfg_normalize", [False, True])
+def test_transfer_control_delta_is_independent_of_text_guidance(
+    make_cosmos3_pipeline, guidance_scale, cfg_normalize
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    cond_no_control = torch.tensor([2.0, 4.0])
+    cond_full = torch.tensor([6.0, 10.0])
+    uncond_full = torch.tensor([1.0, 3.0])
+    expected = uncond_full + guidance_scale * (cond_no_control - uncond_full)
+    if guidance_scale != 0.0:
+        expected += 1.5 * (cond_full - cond_no_control)
+    if cfg_normalize:
+        expected = pipeline.cfg_normalize_function(cond_full, expected)
+
+    actual = pipeline.combine_multi_branch_cfg_noise(
+        [cond_full, cond_no_control, uncond_full],
+        {"mode": "cosmos3_transfer", "guidance_scale": guidance_scale, "control_guidance": 1.5},
+        cfg_normalize=cfg_normalize,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -2474,7 +2520,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
-    torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+    torch.testing.assert_close(result, torch.full_like(latents, -46.0))
 
 
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2625,7 +2671,7 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
         (2, False),
         (2, True),
     ]
-    torch.testing.assert_close(result, torch.full_like(latents, 508.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 208.0))
 
 
 @pytest.mark.parametrize(

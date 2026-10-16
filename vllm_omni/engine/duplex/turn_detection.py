@@ -224,6 +224,16 @@ class ServerTurnDetector:
     def vad(self) -> SileroStreamingVAD:
         return self._vad
 
+    def reconfigure(self, config: TurnDetectionConfig) -> None:
+        """Apply updated settings without discarding the current audio stream state."""
+        self.config = config
+        self._vad.config = SileroVADConfig(
+            threshold=float(config.threshold),
+            prefix_padding_ms=int(config.prefix_padding_ms),
+            silence_duration_ms=int(config.silence_duration_ms),
+            min_speech_duration_ms=max(32, int(config.min_speech_duration_ms)),
+        )
+
     def reset(self) -> None:
         self._vad.reset()
 

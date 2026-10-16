@@ -431,6 +431,26 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
     assert typed_args["profiler_config"].profiler == "cuda"
 
 
+def test_typed_ar_engine_args_preserve_speculative_mapping(tmp_path):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    speculative_config = {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 1,
+    }
+    deploy.stages[0].engine_extras["speculative_config"] = speculative_config
+    stage = _typed_stages(pipeline, deploy, model).stage_by_id(0)
+
+    projected = project_engine_args(stage, model)
+    assert isinstance(projected["speculative_config"], dict)
+    assert projected["speculative_config"] == speculative_config
+    assert projected["speculative_config"] is not stage.speculative_config
+    projected["speculative_config"]["num_speculative_tokens"] = 1
+    assert stage.speculative_config["num_speculative_tokens"] == 7
+    assert speculative_config["num_speculative_tokens"] == 7
+
+
 def test_typed_llm_engine_args_project_backend_settings(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     omni_config = _typed_stages(pipeline, deploy, model)

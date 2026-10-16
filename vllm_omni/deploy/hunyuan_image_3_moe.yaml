@@ -75,12 +75,6 @@ stages:
       num_inference_steps: 50
       guidance_scale: 0
 
-edges:
-  - from: 0
-    to: 1
-    window_size: -1
-    max_inflight: 1
-
 platforms:
   npu:
     stages:

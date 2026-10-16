@@ -16,6 +16,17 @@ import numpy as np
 import pybase64 as base64
 from fastapi import WebSocket, WebSocketDisconnect
 from openai.types import realtime as types
+from openai.types.chat import (
+    ChatCompletionContentPartImageParam,
+    ChatCompletionContentPartInputAudioParam,
+    ChatCompletionContentPartParam,
+    ChatCompletionContentPartTextParam,
+    ChatCompletionMessageParam,
+    ChatCompletionUserMessageParam,
+)
+from openai.types.chat.chat_completion_content_part_image_param import ImageURL
+from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
+from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
 from pydantic import TypeAdapter
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -30,6 +41,13 @@ from vllm.tool_parsers import ToolParserManager
 if TYPE_CHECKING:
     from vllm.inputs import EngineInput
 
+from vllm_omni.engine.duplex.turn_detection import (
+    ServerTurnDetector,
+    ServerVADUnavailableError,
+    SileroVADBackendProvider,
+    TurnDetectionConfig,
+    TurnDetectionResult,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.realtime.session import (
     ActiveResponse,
@@ -55,6 +73,9 @@ MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
 
 AUTO_TRUNCATION_TRIGGER_RATIO = 0.8
 AUTO_TRUNCATION_TARGET_RATIO = 0.5
+
+# OpenAI's error code for a cancel when no matching response is in progress.
+RESPONSE_CANCEL_NOT_ACTIVE = "response_cancel_not_active"
 
 
 def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
@@ -87,6 +108,7 @@ class OpenAIFullDuplexConnection:
         chat_handler: Any,
         tool_call_parser: str | None = None,
         enable_auto_tool_choice: bool = False,
+        vad_backend_provider: SileroVADBackendProvider | None = None,
     ):
         self.ws = websocket
         self.engine = engine
@@ -94,6 +116,9 @@ class OpenAIFullDuplexConnection:
         self.chat_handler = chat_handler
         self._tokenizer = chat_handler.renderer.get_tokenizer()
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
+        self._vad_backend_provider = vad_backend_provider
+        self._turn_detector: ServerTurnDetector | None = None
+        self._speech_item_id: str | None = None
 
         self.session = AudioFullDuplexSessionState()
         self.session.config.model = model_name
@@ -112,7 +137,6 @@ class OpenAIFullDuplexConnection:
             await self.ws.accept()
             logger.info("[realtime] connection opened, session_id=%s", self.session.session_id)
             await self._send_session_created()
-            await self._send_conversation_created()
 
             while self._connected:
                 try:
@@ -120,7 +144,7 @@ class OpenAIFullDuplexConnection:
                 except WebSocketDisconnect:
                     break
                 try:
-                    event = _CLIENT_EVENT_ADAPTER.validate_json(text)
+                    event = _CLIENT_EVENT_ADAPTER.validate_json(text, extra="ignore")
                 except Exception:
                     await self._send_error(
                         "Invalid or unrecognized client event",
@@ -189,50 +213,98 @@ class OpenAIFullDuplexConnection:
 
     async def _handle_session_update(self, event: types.SessionUpdateEvent):
         s = self.session
+        candidate_config = merge_session_config(s.config, event.session)
         try:
-            cfg = self._sanitize_session_config(event.session)
+            candidate_config = self._sanitize_session_config(candidate_config, s.config)
         except _UnsupportedAudioFormatError as exc:
             await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
             return
-        s.config = merge_session_config(s.config, cfg)
+        try:
+            turn_detection_config = self._build_turn_detection_config(candidate_config)
+        except ValueError as exc:
+            await self._send_error(str(exc), "unsupported_turn_detection", event_id=event.event_id)
+            return
+
+        turn_detector = self._turn_detector
+        if turn_detection_config is None:
+            # Keep buffered audio available for manual commit or clear, but
+            # discard speech state owned by the detector being disabled.
+            self._reset_turn_detection()
+            turn_detector = None
+        elif turn_detector is None:
+            turn_detector = turn_detection_config.build_detector(self._vad_backend_provider)
+        elif turn_detector.config != turn_detection_config:
+            turn_detector.reconfigure(turn_detection_config)
+
+        s.config = candidate_config
+        self._turn_detector = turn_detector
         await self._send_session_updated()
 
-    def _sanitize_session_config(self, cfg: Any) -> types.RealtimeSessionCreateRequest:
-        """Drop any session.update fields this server doesn't support instead
-        of rejecting the whole update, so clients that always send their full
-        default config (transcription, noise reduction, server-side VAD, MCP
-        tools, ...) still get a working session rather than a hard error.
-        """
-        data = cfg.model_dump(exclude_unset=True)
+    def _sanitize_session_config(
+        self,
+        config: types.RealtimeSessionCreateRequest,
+        previous: types.RealtimeSessionCreateRequest,
+    ) -> types.RealtimeSessionCreateRequest:
+        """Normalize supported session settings while keeping Pydantic models intact."""
+        sanitized = config.model_copy(deep=True)
 
-        if "model" in data and data["model"] != self.model_name:
-            data.pop("model")
+        if sanitized.model != self.model_name:
+            sanitized.model = previous.model
 
-        if "tools" in data:
-            data["tools"] = [t for t in data["tools"] if (t or {}).get("type") != "mcp"]
-        if (data.get("tool_choice") or {}).get("type") == "mcp" if isinstance(data.get("tool_choice"), dict) else False:
-            data.pop("tool_choice")
+        if sanitized.tools is not None:
+            sanitized.tools = [tool for tool in sanitized.tools if getattr(tool, "type", None) != "mcp"]
+        if getattr(sanitized.tool_choice, "type", None) == "mcp":
+            sanitized.tool_choice = previous.tool_choice
 
-        audio = data.get("audio")
-        if audio is not None:
-            inp = audio.get("input")
-            if inp is not None:
-                inp.pop("transcription", None)
-                inp.pop("noise_reduction", None)
-                if not self._is_pcm16_24khz_format(inp.get("format")):
-                    raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 input audio is supported")
-                td = inp.get("turn_detection")
-                if isinstance(td, dict) and td.get("type") in ("server_vad", "semantic_vad"):
-                    inp["turn_detection"] = None
+        audio = sanitized.audio
+        if audio is None:
+            return sanitized
 
-            out = audio.get("output")
-            if out is not None:
-                if out.get("speed") not in (None, 1):
-                    out.pop("speed", None)
-                if not self._is_pcm16_24khz_format(out.get("format")):
-                    raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
+        audio_input = audio.input
+        if audio_input is not None:
+            # These options are accepted for compatibility but are not implemented.
+            audio_input.transcription = None
+            audio_input.noise_reduction = None
+            if not self._is_pcm16_24khz_format(audio_input.format):
+                raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 input audio is supported")
 
-        return types.RealtimeSessionCreateRequest.model_validate(data)
+        audio_output = audio.output
+        if audio_output is not None:
+            if audio_output.speed not in (None, 1):
+                previous_output = previous.audio.output if previous.audio is not None else None
+                audio_output.speed = previous_output.speed if previous_output is not None else None
+            if not self._is_pcm16_24khz_format(audio_output.format):
+                raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
+
+        return sanitized
+
+    def _build_turn_detection_config(self, config: types.RealtimeSessionCreateRequest) -> TurnDetectionConfig | None:
+        audio_input = config.audio.input if config.audio is not None else None
+        turn_detection = audio_input.turn_detection if audio_input is not None else None
+        if turn_detection is None:
+            return None
+        if not isinstance(turn_detection, ServerVad):
+            raise ValueError("Only server_vad turn detection is supported")
+
+        detector_config = TurnDetectionConfig(
+            threshold=0.5 if turn_detection.threshold is None else float(turn_detection.threshold),
+            prefix_padding_ms=(
+                300 if turn_detection.prefix_padding_ms is None else int(turn_detection.prefix_padding_ms)
+            ),
+            silence_duration_ms=(
+                500 if turn_detection.silence_duration_ms is None else int(turn_detection.silence_duration_ms)
+            ),
+            create_response=True if turn_detection.create_response is None else turn_detection.create_response,
+            interrupt_response=(
+                True if turn_detection.interrupt_response is None else turn_detection.interrupt_response
+            ),
+        )
+        return detector_config
+
+    def _reset_turn_detection(self) -> None:
+        if self._turn_detector is not None:
+            self._turn_detector.reset()
+        self._speech_item_id = None
 
     @staticmethod
     def _unsupported_audio_option(audio: Any) -> str | None:
@@ -258,22 +330,15 @@ class OpenAIFullDuplexConnection:
             return True
         if isinstance(audio_format, str):
             return audio_format in ("audio/pcm", "pcm16")
-        if isinstance(audio_format, dict):
-            format_type = audio_format.get("type")
-            rate = audio_format.get("rate", SAMPLE_RATE_HZ)
-        else:
-            format_type = getattr(audio_format, "type", None)
-            rate = getattr(audio_format, "rate", SAMPLE_RATE_HZ)
+        format_type = getattr(audio_format, "type", None)
+        rate = getattr(audio_format, "rate", SAMPLE_RATE_HZ)
         return format_type in ("audio/pcm", "pcm16") and rate == SAMPLE_RATE_HZ
 
     @staticmethod
     def _uses_mcp(config: Any) -> bool:
-        def object_type(value: Any) -> Any:
-            return value.get("type") if isinstance(value, dict) else getattr(value, "type", None)
-
         return (
-            any(object_type(tool) == "mcp" for tool in (getattr(config, "tools", None) or []))
-            or object_type(getattr(config, "tool_choice", None)) == "mcp"
+            any(getattr(tool, "type", None) == "mcp" for tool in (getattr(config, "tools", None) or []))
+            or getattr(getattr(config, "tool_choice", None), "type", None) == "mcp"
         )
 
     async def _send_unsupported_mcp(self, event_id: str | None) -> None:
@@ -298,7 +363,92 @@ class OpenAIFullDuplexConnection:
         except ValueError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
+
+        detector = self._turn_detector
+        result: TurnDetectionResult | None = None
+        if detector is not None:
+            try:
+                result = await asyncio.to_thread(
+                    detector.process,
+                    event.audio,
+                    fmt="pcm16",
+                    sample_rate_hz=SAMPLE_RATE_HZ,
+                )
+            except ServerVADUnavailableError as exc:
+                self._turn_detector = None
+                self._speech_item_id = None
+                await self._send_error(str(exc), "server_vad_unavailable", event_id=event.event_id)
+                return
+            except ValueError as exc:
+                await self._send_error(str(exc), "bad_audio", event_id=event.event_id)
+                return
+
+        # Limitation: this buffer retains all appended audio until commit.
+        # prefix_padding_ms only adjusts speech_started.audio_start_ms; it does
+        # not trim earlier silence from the audio item.
         self.session.input_audio_buffer.extend(audio_bytes)
+        if result is not None:
+            await self._handle_turn_detection_result(result)
+
+    async def _handle_turn_detection_result(self, result: TurnDetectionResult) -> None:
+        detector = self._turn_detector
+        assert detector is not None, "turn detection results require an active detector"
+
+        coalesced_stop_restart = result.speech_started and result.speech_stopped and result.speech_active
+        if coalesced_stop_restart and self._speech_item_id is not None:
+            # Keep the existing item open; a later standalone stop will close it.
+            return
+
+        if result.speech_started and self._speech_item_id is None:
+            self._speech_item_id = _gen_id("item")
+            await self._send_event(
+                types.InputAudioBufferSpeechStartedEvent(
+                    event_id=_gen_id("evt"),
+                    type="input_audio_buffer.speech_started",
+                    audio_start_ms=result.audio_start_ms or 0,
+                    item_id=self._speech_item_id,
+                )
+            )
+            if detector.config.interrupt_response:
+                await self._cancel_active_response()
+
+        if coalesced_stop_restart:
+            # The normal start path above opened an item. Keep it open because
+            # speech is active again; a later standalone stop will close it.
+            return
+
+        if not result.speech_stopped:
+            return
+
+        item_id = self._speech_item_id or _gen_id("item")
+        await self._send_event(
+            types.InputAudioBufferSpeechStoppedEvent(
+                event_id=_gen_id("evt"),
+                type="input_audio_buffer.speech_stopped",
+                audio_end_ms=result.audio_end_ms or 0,
+                item_id=item_id,
+            )
+        )
+        if not result.should_commit:
+            return
+
+        item = await self._commit_audio_buffer(item_id=item_id)
+        if item is None:
+            return
+        if result.create_response:
+            if self.session.active_response is not None and not detector.config.interrupt_response:
+                await self._send_error(
+                    "Cannot create an automatic response while another response is still in progress",
+                    "invalid_request_error",
+                )
+                return
+            await self._handle_response_create(
+                types.ResponseCreateEvent(
+                    type="response.create",
+                    event_id=None,
+                    response=None,
+                )
+            )
 
     @staticmethod
     def _decode_pcm16(audio: str, max_bytes: int = MAX_AUDIO_APPEND_BYTES) -> bytes:
@@ -327,39 +477,44 @@ class OpenAIFullDuplexConnection:
     async def _commit_audio_buffer(
         self,
         event_id: str | None = None,
+        item_id: str | None = None,
     ) -> types.RealtimeConversationItemUserMessage | None:
         """Commit buffered audio and announce the conversation item."""
-        s = self.session
-        if len(s.input_audio_buffer) == 0:
-            return None
-        audio = base64.b64encode(s.input_audio_buffer).decode("ascii")
-        item = types.RealtimeConversationItemUserMessage(
-            type="message",
-            role="user",
-            status="completed",
-            content=[{"type": "input_audio", "audio": audio}],
-        )
         try:
-            s.insert_item(item)
-        except HistoryLimitError as exc:
-            s.input_audio_buffer.clear()
-            await self._send_error(str(exc), "invalid_request_error", event_id=event_id)
-            return None
-        s.input_audio_buffer.clear()
-        idx = self.session.find_item_index(item.id)
-        previous_item_id = self.session.items[idx - 1].id if idx else None
-        await self._send_event(
-            types.InputAudioBufferCommittedEvent(
-                event_id=_gen_id("evt"),
-                type="input_audio_buffer.committed",
-                item_id=item.id,
-                previous_item_id=previous_item_id,
+            s = self.session
+            if len(s.input_audio_buffer) == 0:
+                return None
+            audio = base64.b64encode(s.input_audio_buffer).decode("ascii")
+            item = types.RealtimeConversationItemUserMessage(
+                type="message",
+                role="user",
+                status="completed",
+                id=item_id,
+                content=[{"type": "input_audio", "audio": audio}],
             )
-        )
-        # Do not echo the client's potentially large audio payload.
-        wire_item = item.model_copy(update={"content": []})
-        await self._send_conversation_item_added_and_done(wire_item, previous_item_id)
-        return item
+            try:
+                s.insert_item(item)
+            except HistoryLimitError as exc:
+                s.input_audio_buffer.clear()
+                await self._send_error(str(exc), "invalid_request_error", event_id=event_id)
+                return None
+            s.input_audio_buffer.clear()
+            idx = self.session.find_item_index(item.id)
+            previous_item_id = self.session.items[idx - 1].id if idx else None
+            await self._send_event(
+                types.InputAudioBufferCommittedEvent(
+                    event_id=_gen_id("evt"),
+                    type="input_audio_buffer.committed",
+                    item_id=item.id,
+                    previous_item_id=previous_item_id,
+                )
+            )
+            # Do not echo the client's potentially large audio payload.
+            wire_item = item.model_copy(update={"content": []})
+            await self._send_conversation_item_added_and_done(wire_item, previous_item_id)
+            return item
+        finally:
+            self._reset_turn_detection()
 
     async def _handle_audio_commit(self, event: types.InputAudioBufferCommitEvent):
         s = self.session
@@ -371,10 +526,11 @@ class OpenAIFullDuplexConnection:
             )
             return
 
-        await self._commit_audio_buffer(event.event_id)
+        await self._commit_audio_buffer(event.event_id, item_id=self._speech_item_id)
 
     async def _handle_audio_clear(self, event: types.InputAudioBufferClearEvent):
         self.session.input_audio_buffer.clear()
+        self._reset_turn_detection()
         await self._send_event(
             types.InputAudioBufferClearedEvent(
                 event_id=_gen_id("evt"),
@@ -1275,7 +1431,7 @@ class OpenAIFullDuplexConnection:
         if active is None:
             await self._send_error(
                 "No response is in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return
@@ -1283,7 +1439,7 @@ class OpenAIFullDuplexConnection:
         if response_id is not None and response_id != active.response_id:
             await self._send_error(
                 f"Response '{response_id}' is not in progress",
-                "invalid_request_error",
+                RESPONSE_CANCEL_NOT_ACTIVE,
                 event_id=event.event_id,
             )
             return
@@ -1335,16 +1491,16 @@ class OpenAIFullDuplexConnection:
         await self._send_conversation_item_added_and_done(item, prev_id)
 
     def _validate_input_item(self, item: types.ConversationItem) -> None:
-        for part in getattr(item, "content", None) or []:
-            part_type = getattr(part, "type", None)
-            if part_type == "input_image":
-                raise ValueError("Image input is not supported")
-            if part_type == "input_audio":
-                audio = getattr(part, "audio", None)
-                if audio:
-                    self._decode_pcm16(audio)
-            if part_type == "output_audio" and getattr(part, "audio", None):
-                raise ValueError("Client-provided assistant audio is not supported")
+        if isinstance(item, types.RealtimeConversationItemUserMessage):
+            for part in item.content:
+                if part.type == "input_image" and not part.image_url:
+                    raise ValueError("input_image requires an image_url")
+                if part.type == "input_audio" and part.audio:
+                    self._decode_pcm16(part.audio)
+        elif isinstance(item, types.RealtimeConversationItemAssistantMessage):
+            for part in item.content:
+                if part.type == "output_audio" and part.audio:
+                    raise ValueError("Client-provided assistant audio is not supported")
 
     # ------------------------------------------------------------------ #
     #  conversation.item.delete                                           #
@@ -1555,12 +1711,8 @@ class OpenAIFullDuplexConnection:
     ) -> str | ChatCompletionNamedToolChoiceParam:
         if isinstance(tool_choice, str):
             return tool_choice
-        if isinstance(tool_choice, dict):
-            choice_type = tool_choice.get("type")
-            name = tool_choice.get("name")
-        else:
-            choice_type = getattr(tool_choice, "type", None)
-            name = getattr(tool_choice, "name", None)
+        choice_type = getattr(tool_choice, "type", None)
+        name = getattr(tool_choice, "name", None)
         if choice_type == "function" and name:
             return ChatCompletionNamedToolChoiceParam(
                 type="function",
@@ -1617,7 +1769,7 @@ class OpenAIFullDuplexConnection:
         s = self.session
         effective_instructions = instructions if instructions is not None else s.config.instructions
         effective_items = items if items is not None else s.items
-        messages: list[dict[str, Any]] = []
+        messages: list[ChatCompletionMessageParam] = []
         converted_tools = self._convert_tools(tools) if tools else None
 
         if effective_instructions:
@@ -1646,23 +1798,28 @@ class OpenAIFullDuplexConnection:
 
             role = getattr(item, "role", None)
             if role == "user":
-                content = []
+                content: list[ChatCompletionContentPartParam] = []
                 for part in item.content:
                     if part.type == "input_audio" and part.audio:
                         audio_bytes = self._decode_pcm16(part.audio, MAX_INPUT_AUDIO_BUFFER_BYTES)
                         content.append(
-                            {
-                                "type": "input_audio",
-                                "input_audio": {
-                                    "data": self._pcm16_wav_b64(audio_bytes),
-                                    "format": "wav",
-                                },
-                            }
+                            ChatCompletionContentPartInputAudioParam(
+                                type="input_audio",
+                                input_audio=InputAudio(
+                                    data=self._pcm16_wav_b64(audio_bytes),
+                                    format="wav",
+                                ),
+                            )
                         )
                     elif part.type == "input_text" and part.text:
-                        content.append({"type": "text", "text": part.text})
+                        content.append(ChatCompletionContentPartTextParam(type="text", text=part.text))
+                    elif part.type == "input_image" and part.image_url:
+                        image_url = ImageURL(url=part.image_url)
+                        if part.detail is not None:
+                            image_url["detail"] = part.detail
+                        content.append(ChatCompletionContentPartImageParam(type="image_url", image_url=image_url))
                 if content:
-                    messages.append({"role": "user", "content": content})
+                    messages.append(ChatCompletionUserMessageParam(role="user", content=content))
             elif role == "assistant":
                 text = self._assistant_item_text(item)
                 if text:
@@ -1851,18 +2008,6 @@ class OpenAIFullDuplexConnection:
                 event_id=_gen_id("evt"),
                 type="session.updated",
                 session=session_obj,  # type: ignore[arg-type]
-            )
-        )
-
-    async def _send_conversation_created(self) -> None:
-        await self._send_event(
-            types.ConversationCreatedEvent(
-                event_id=_gen_id("evt"),
-                type="conversation.created",
-                conversation={  # type: ignore[arg-type]
-                    "id": self.session.conversation_id,
-                    "object": "realtime.conversation",
-                },
             )
         )
 

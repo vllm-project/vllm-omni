@@ -74,5 +74,3 @@ stages:
 edges:
   - from: 0
     to: 1
-    window_size: -1
-    max_inflight: 1

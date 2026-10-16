@@ -32,6 +32,8 @@ from vllm_omni.engine.duplex.contracts import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import PipelineConfig
+
 
 class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
@@ -303,6 +305,22 @@ class DuplexModelPlugin(ABC):
         # Constructor-only: concrete plugins hand the encoder to their data plane.
         del encode_audio
 
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        """Bind model policy to the resolved deployment topology before admission."""
+
+    def input_stage_id(self, payload: object) -> int:
+        """Select the entry stage for one append before reserving its request."""
+        return 0
+
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        """Separate the next ASR-only input from a batched response input.
+
+        The remaining committed payload resumes after this item's transcript
+        has reached conversation history. Models without an ASR entry stage
+        consume their input normally.
+        """
+        return payload, None
+
     def silence_unit_payload(self) -> dict[str, object]:
         """One silence unit as an append payload (``pcm_f32le`` zeros).
 
@@ -336,6 +354,9 @@ class DuplexModelPlugin(ABC):
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
         return self.plan_append(**kwargs)
+
+    def commit_append_plan(self, request_id: str) -> None:
+        """Commit model-owned context after the stage accepts a fenced append."""
 
     @abstractmethod
     def plan_append(
