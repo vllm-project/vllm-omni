@@ -40,7 +40,7 @@ from tests.model_executor.models.chatterbox.helpers import (
 )
 from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.config.speech_cache import SpeechCacheConfig
-from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy, resolve_deploy_yaml
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type
@@ -143,20 +143,28 @@ def adapter(server: OmniOpenAIServingSpeech) -> ChatterboxAdapter:
     return server._adapter
 
 
+@pytest.fixture(scope="module")
+def original_model_dir(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Original's own model directory: ``tokenizer.json`` takes the place of Turbo's GPT-2 files.
+
+    The two cannot share a directory, since Turbo's AutoTokenizer would read a
+    ``tokenizer.json`` in preference to the GPT-2 files.
+    """
+    directory = write_model_dir(tmp_path_factory.mktemp("chatterbox-original"))
+    torch.save(BUILTIN, Path(directory) / "conds.pt")
+    Tokenizer(WordLevel({"[UNK]": 0, "Hello.": 7}, unk_token="[UNK]")).save(str(Path(directory) / "tokenizer.json"))
+    write_voice_encoder(directory, seed=0)
+    write_s3gen_checkpoint(directory, ChatterboxConfig("original"), seed=1)
+    return directory
+
+
 @pytest.fixture
 def original(
-    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
+    original_model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
 ) -> Iterator[ChatterboxOriginalAdapter]:
-    """Original's adapter in the speech server for its deploy file, with its released tokenizer's format.
-
-    The model directory is Original's own: ``tokenizer.json`` would take the
-    place of Turbo's GPT-2 files.
-    """
+    """Original's adapter in the speech server for its deploy file."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    directory = write_model_dir(tmp_path / "chatterbox")
-    (Path(directory) / "conds.pt").write_bytes((Path(model_dir) / "conds.pt").read_bytes())
-    Tokenizer(WordLevel({"[UNK]": 0, "Hello.": 7}, unk_token="[UNK]")).save(str(Path(directory) / "tokenizer.json"))
-    speech = serving(engine_client(directory, deploy_on_cpu(DEPLOY["original"])))
+    speech = serving(engine_client(original_model_dir, deploy_on_cpu(DEPLOY["original"])))
     yield speech._adapter
     speech.shutdown()
 
@@ -180,8 +188,7 @@ def deploy_on_cpu(name: str) -> str:
 
 
 def encoder(adapter: ChatterboxAdapter) -> VoiceConditioner:
-    """The adapter's reference encoders, loaded as its first encoder batch loads them."""
-    assert adapter.prepare_voices([]) == []
+    """The adapter's reference encoders."""
     return adapter.conditioner
 
 
@@ -274,7 +281,7 @@ async def test_builtin_request_uses_shared_prompt_builder_without_reference_enco
     prepared = await adapter.build(request, [SamplingParams()], False)
     assert prepared.prompt["prompt_token_ids"] == [6561] * 7
     assert prepared.prompt["additional_information"]["ids"] == {"prompt": [42, 43], "speech_token": [1, 2, 3]}
-    assert adapter.conditioner is None
+    assert adapter.conditioning_queue.empty() and not adapter.conditioning_pending
     assert prepared.model_type == "chatterbox"
 
 
@@ -313,7 +320,7 @@ async def test_original_controls_default_to_the_deploy_files(original, extra_par
     [("turbo", ChatterboxAdapter, 5.04, 32), ("original", ChatterboxOriginalAdapter, 1.0, 8)],
 )
 async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
-    model_dir, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, admission
+    request, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, admission
 ):
     """Everything queued while the encoders are busy goes through them as one batch, with no cap of its own.
 
@@ -326,6 +333,7 @@ async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
     is served from the cache.
     """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+    model_dir = request.getfixturevalue("original_model_dir" if variant == "original" else "model_dir")
     speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY[variant])))
     concurrent = speech._adapter
     assert isinstance(concurrent, adapter_cls)
@@ -444,10 +452,12 @@ async def test_a_zero_speaker_cache_budget_encodes_every_request(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_wave_cannot_overfill_encoder_queue(model_dir, tmp_path, monkeypatch, clean_speaker_cache):
+async def test_cancelled_wave_cannot_overfill_encoder_queue(
+    original_model_dir, tmp_path, monkeypatch, clean_speaker_cache
+):
     """Cancelled waiters keep their encoder work, and with it the slots a new wave would take."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["original"])))
+    speech = serving(engine_client(original_model_dir, deploy_on_cpu(DEPLOY["original"])))
     original = speech._adapter
     assert isinstance(original, ChatterboxOriginalAdapter)
     admission = original.conditioning_capacity
@@ -494,18 +504,22 @@ async def test_shutdown_cancels_encoder_waiters(adapter):
     assert adapter.conditioning_queue.empty()
 
 
+@pytest.mark.parametrize("deploy", list(DEPLOY.values()), ids=list(DEPLOY))
+def test_shipped_profiles_condition_on_the_stages_gpu(deploy: str) -> None:
+    """Both deploy files put the reference encoders on the stages' GPU."""
+    stage = resolve_deploy_yaml(get_deploy_config_path(deploy))["stages"][0]
+    assert stage["additional_config"]["conditioning_device"] == "cuda:0"
+
+
 @pytest.mark.parametrize("legacy", [False, True], ids=["runtime_config", "engine_args"])
-def test_conditioning_device_is_explicit_in_stage_config(
+def test_conditioning_device_comes_from_either_stage_config_form(
     model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None, legacy: bool
 ) -> None:
-    """The deploy file puts the reference encoders on the stages' GPU, in either stage config form.
-
-    Nothing is encoded, so no device is needed.
-    """
+    """The deploy file's device reaches the adapter whether the stage config is typed or legacy."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(model_dir, DEPLOY["turbo"], legacy))
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"]), legacy))
     try:
-        assert speech._adapter.conditioning_device == torch.device("cuda:0")
+        assert speech._adapter.conditioning_device == torch.device("cpu")
     finally:
         speech.shutdown()
 

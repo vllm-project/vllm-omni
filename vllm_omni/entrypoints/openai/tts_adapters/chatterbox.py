@@ -4,12 +4,9 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
 
 import numpy as np
 import torch
-from tokenizers import Tokenizer
-from transformers import PreTrainedTokenizerBase
 from vllm.utils.async_utils import make_async
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -72,11 +69,13 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.conditioning_capacity = max_num_seqs // self.sequences_per_request
         if self.conditioning_device.type not in {"cpu", "cuda"}:
             raise ValueError("Chatterbox conditioning_device must be cpu or cuda")
-        self.tokenizer: PreTrainedTokenizerBase | Tokenizer | None = None
-        self.builtin_voice: VoiceConditioning | None = None
-        self.conditioner: VoiceConditioner | None = None
-        # Publish fully initialized components before concurrent requests use them.
-        self.initialization_lock = Lock()
+        model = resolve_stage_model_path(ctx.engine_client)
+        if model is None:
+            raise ValueError("Chatterbox requires a stage model path")
+        # Loaded with the server, so no request waits on a first-use load.
+        self.tokenizer = load_text_tokenizer(model, self.variant)
+        self.builtin_voice = VoiceConditioning.from_builtin(model)
+        self.conditioner = VoiceConditioner(model, self.config, self.conditioning_device)
         self.build_async = make_async(self.prepare_prompt, executor=ctx.server._tts_executor)
         # Encoder batches get a thread of their own, so a prompt build (the
         # built-in voice, a cached reference) never waits behind one; the
@@ -102,16 +101,7 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.encoder_executor.shutdown(wait=False, cancel_futures=True)
 
     def prepare_voices(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning | ValueError]:
-        """Run one encoder batch on the adapter's encoder thread.
-
-        Only that thread touches the conditioner, so loading the encoders
-        holds no lock and no prompt build waits behind it.
-        """
-        model = resolve_stage_model_path(self.ctx.engine_client)
-        if model is None:
-            raise ValueError("Chatterbox requires a stage model path")
-        if self.conditioner is None:
-            self.conditioner = VoiceConditioner(model, self.config, self.conditioning_device)
+        """Run one encoder batch on the adapter's encoder thread."""
         return self.conditioner.prepare_batch(references)
 
     async def drain_conditioning(self) -> None:
@@ -205,25 +195,11 @@ class ChatterboxAdapter(ARTTSAdapter):
                 return error
         return None
 
-    def encode_text(self, model: str, text: str) -> list[int]:
-        """Load the variant tokenizer once and encode outside the event loop."""
-        with self.initialization_lock:
-            if self.tokenizer is None:
-                self.tokenizer = load_text_tokenizer(model, self.variant)
-        return tokenize_text(text, self.tokenizer, self.variant)
-
     def prepare_prompt(self, text: str, voice: VoiceConditioning | None, controls: dict[str, float]) -> dict:
-        """Load and condition on a worker thread, outside the API event loop."""
-        model = resolve_stage_model_path(self.ctx.engine_client)
-        if model is None:
-            raise ValueError("Chatterbox requires a stage model path")
+        """Build the conditioned prompt on a worker thread, outside the API event loop."""
         if voice is None:
-            with self.initialization_lock:
-                if self.builtin_voice is None:
-                    self.builtin_voice = VoiceConditioning.from_builtin(model)
-                voice = self.builtin_voice
-        text_ids = self.encode_text(model, text)
-        return build_prompt(text_ids, voice, self.config, **controls)
+            voice = self.builtin_voice
+        return build_prompt(tokenize_text(text, self.tokenizer, self.variant), voice, self.config, **controls)
 
     async def build(
         self, request: OpenAICreateSpeechRequest, sampling_params_list: list, has_inline_ref_audio: bool
