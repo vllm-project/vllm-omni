@@ -68,7 +68,74 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
-                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
+                    '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration", '
+                    '"audio_underrun", "audio_max_single_underrun", "total_underrun", "audio_underrun_event_count", '
+                    '"audio_underrun_ratio", "audio_underrun_events_per_minute", "audio_continuity_rate". '
+
+### Streaming audio continuity
+
+Add `audio_underrun,audio_continuity_rate` to `--percentile-metrics` for
+`openai-chat-omni` (also its `daily-omni` alias), `openai-realtime-duplex`,
+or `openai-audio-speech`. For example, append the following to an existing
+audio-output benchmark command:
+
+```bash
+--percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_underrun,audio_max_single_underrun,total_underrun,audio_underrun_event_count,audio_underrun_ratio,audio_underrun_events_per_minute,audio_continuity_rate
+```
+
+`audio_underrun` preserves its legacy cumulative-deficit meaning and
+equals `total_underrun`. The new `audio_max_single_underrun` measures the
+largest **individual playback stall** in seconds per response.
+Let chunk `i` arrive at `t_i`, contain `d_i` seconds, and let `E_i` be its
+scheduled playback end. Start with `E_0 = t_0 + d_0`, then compute:
+
+```text
+g_i = max(0, t_i - E_(i-1))
+E_i = max(t_i, E_(i-1)) + d_i
+audio_max_single_underrun = max(g_i)
+audio_underrun = total_underrun = sum(g_i)
+audio_underrun_event_count = count(g_i > 0)
+audio_underrun_ratio = total_underrun / (sum(d_i) + total_underrun)
+audio_underrun_events_per_minute = event_count / (sum(d_i) / 60)
+```
+
+Playback starts at the first non-empty audio chunk. First-packet waiting and
+waiting for EOF / `response.done` are excluded. This simulates FIFO playback;
+it does not measure an actual audio device or detect acoustic artifacts.
+Gaps at or below `1e-9` seconds are ignored to avoid roundoff-generated stalls.
+All time metrics and their saved statistics use `_s`, in seconds. Counts,
+ratios and events/minute have no time suffix. All means and percentiles are
+computed from response values with equal response weights; the event sum is
+also saved as `total_audio_underrun_events`. Ratios are in the range 0-1.
+
+`audio_continuity_rate` remains the fraction of measured responses whose
+**total_underrun**, rather than their largest individual stall, is at most
+`VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S` (default: `0.1` seconds).
+It prints as a percentage; `audio_continuity_ok_rate` is an accepted selector
+alias and the saved JSON key (a value from 0 to 1). A rate has no latency
+percentiles. Use the same threshold when comparing runs.
+
+Measurement scope:
+
+- Chat: one sample per successful request with decodable WAV audio deltas.
+  WAV headers are excluded from audio duration. Non-WAV formats, absent audio,
+  or invalid/inconsistent WAV chunks are unmeasured. Request audio output,
+  for example with `--extra-body '{"modalities":["text","audio"],"response_format":"wav"}'`.
+- Duplex: one sample per completed PCM16 audio reply (`response_id`), including
+  OmniInteract sessions. Replies are evaluated independently, so listening
+  periods between replies do not count as underruns. Cancelled, failed,
+  incomplete, LISTEN-only and invalid-audio replies are excluded. A session
+  with multiple replies contributes multiple samples.
+- A single audio chunk produces zero underrun because it has no inter-chunk
+  gap; use `audio_ttfp` alongside continuity to assess startup latency.
+
+The console reports the measured sample count. With no measured samples the
+rate is `N/A`, saved as JSON `null`, rather than 100%. Saved results include
+`num_audio_continuity_samples` and `audio_continuity_samples` with request
+indices, duplex response IDs where applicable, maximum/total stalls, event count,
+ratio, events per minute, audio duration, pass/fail, chunk count and threshold. Failed benchmark requests do not enter this rollup.
+
+### Additional parameters
 
 - `--print-stage`
 Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.

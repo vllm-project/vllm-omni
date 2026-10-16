@@ -242,6 +242,7 @@ data/
 datasets/
 *.csv
 *.json
+!tests/benchmarks/audio_continuity_cases.json
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json

@@ -43,7 +43,11 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
+from vllm_omni.benchmarks.audio_continuity import (
+    audio_continuity_threshold_s,
+    collect_duplex_audio_continuity,
+    continuity_sample,
+)
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
     DailyOmniDataset,
     DailyOmniSampleRequest,
@@ -115,7 +119,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
     {
@@ -167,27 +170,7 @@ def set_print_stage(enabled: bool) -> None:
     _PRINT_STAGE = bool(enabled)
 
 
-def _audio_continuity_threshold_s() -> float:
-    """Return the per-request underrun budget (s).
-
-    Read from ``VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S`` so users can
-    re-aim the SLO without rebuilding. Defaults to 100 ms - the standard
-    "audible gap" budget for streaming TTS.
-    """
-    raw = os.environ.get(_AUDIO_CONTINUITY_THRESHOLD_ENV)
-    if not raw:
-        return defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r; using default %.3fs",
-            _AUDIO_CONTINUITY_THRESHOLD_ENV,
-            raw,
-            defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S,
-        )
-        return defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S
-    return max(value, 0.0)
+_audio_continuity_threshold_s = audio_continuity_threshold_s
 
 
 def _pcm_s16le_to_seed_tts_wer_bytes(
@@ -965,16 +948,21 @@ class MixRequestFuncOutput(RequestFuncOutput):
     peak_memory_mb: float = 0.0
     text_latency: float = 0.0
     tpot_measured: bool = True
-    #: Worst-case streaming-audio underrun (wall-clock seconds the player
-    #: would have been starved). Populated by the audio-speech backend; ``0.0``
-    #: for backends that do not run continuity analysis.
-    audio_underrun_s: float = 0.0
+    #: Legacy cumulative playback deficit, in seconds. None means unmeasured.
+    audio_underrun_s: float | None = None
+    #: Largest individual playback stall, in seconds.
+    audio_max_single_underrun_s: float | None = None
+    #: Cumulative playback stall time (the legacy audio_underrun definition).
+    total_underrun_s: float | None = None
+    audio_underrun_ratio: float | None = None
+    audio_underrun_events_per_minute: float | None = None
     #: Whether the request stayed under the continuity threshold (default
-    #: 100 ms). Mirrors ``audio_underrun_s <= threshold``.
-    audio_continuity_ok: bool = True
-    #: Number of inter-chunk intervals during which the player buffer went
-    #: negative.
-    audio_underrun_event_count: int = 0
+    #: 100 ms). Mirrors ``total_underrun_s <= threshold``.
+    audio_continuity_ok: bool | None = None
+    #: One sample per measured audio reply, including multi-reply duplex sessions.
+    audio_continuity_samples: list[dict[str, object]] | None = None
+    #: Number of new playback stalls; an existing lag is not counted again.
+    audio_underrun_event_count: int | None = None
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -1990,6 +1978,10 @@ async def async_request_openai_chat_omni_completions(
         output.denoise_step_latency_ms = 0.0
         output.peak_memory_mb = 0.0
         output.stage_durations = None
+        continuity_arrivals: list[float] = []
+        continuity_durations: list[float] = []
+        continuity_valid = response_format == "wav"
+        output.audio_continuity_samples = None
         completion_tokens_seen = 0
         streaming_error_received = False
         try:
@@ -2005,6 +1997,7 @@ async def async_request_openai_chat_omni_completions(
                         if not chunk_bytes:
                             continue
 
+                        chunk_received_at = time.perf_counter()
                         messages = handler.add_chunk(chunk_bytes)
                         for message in messages:
                             if type(message) is bytes:
@@ -2084,14 +2077,25 @@ async def async_request_openai_chat_omni_completions(
                                                         if wav_audio_params is None:
                                                             wav_audio_params = params
                                                         elif wav_audio_params != params:
+                                                            continuity_valid = False
                                                             wav_inconsistent_chunk_count += 1
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        pcm_chunk = wav_reader.readframes(wav_reader.getnframes())
+                                                        if (
+                                                            len(pcm_chunk)
+                                                            != wav_reader.getnframes() * params[0] * params[1]
+                                                        ):
+                                                            continuity_valid = False
+                                                        wav_pcm_buffer.extend(pcm_chunk)
+                                                        if pcm_chunk:
+                                                            continuity_arrivals.append(chunk_received_at)
+                                                            continuity_durations.append(
+                                                                len(pcm_chunk) / (params[0] * params[1] * params[2])
+                                                            )
                                                 except Exception as ex:
+                                                    continuity_valid = False
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
                                                 audio_bytes_buffer.extend(audio_bytes)
@@ -2126,6 +2130,13 @@ async def async_request_openai_chat_omni_completions(
                             first_inconsistent_wav_params,
                         )
 
+                    if continuity_valid:
+                        sample = continuity_sample(
+                            continuity_arrivals,
+                            continuity_durations,
+                            threshold_s=_audio_continuity_threshold_s(),
+                        )
+                        output.audio_continuity_samples = [dict(sample)] if sample is not None else None
                     output.latency = timestamp - st
                     output.generated_text = generated_text
                     if output.output_tokens > 1 and not any(
@@ -2703,17 +2714,20 @@ async def async_request_openai_audio_speech(
                 if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
-                continuity = compute_continuity_stats(
-                    chunk_arrival_times_s=chunk_arrival_times_s,
-                    chunk_bytes=chunk_sizes,
-                    sample_rate=sample_rate,
-                    sample_width=sample_width,
-                    channels=channels,
+                sample = continuity_sample(
+                    chunk_arrival_times_s,
+                    [size / (sample_rate * sample_width * channels) for size in chunk_sizes],
                     threshold_s=_audio_continuity_threshold_s(),
                 )
-                output.audio_underrun_s = continuity.max_underrun_s
-                output.audio_continuity_ok = continuity.is_continuous
-                output.audio_underrun_event_count = continuity.underrun_event_count
+                if sample is not None:
+                    output.audio_continuity_samples = [dict(sample)]
+                    output.audio_underrun_s = sample["audio_underrun_s"]
+                    output.audio_max_single_underrun_s = sample["audio_max_single_underrun_s"]
+                    output.total_underrun_s = sample["total_underrun_s"]
+                    output.audio_underrun_ratio = sample["audio_underrun_ratio"]
+                    output.audio_underrun_events_per_minute = sample["audio_underrun_events_per_minute"]
+                    output.audio_continuity_ok = sample["audio_continuity_ok"]
+                    output.audio_underrun_event_count = sample["audio_underrun_event_count"]
                 if pcm_capture is not None and pcm_capture:
                     try:
                         output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
@@ -2939,6 +2953,11 @@ async def _async_request_omniinteract(
                     "OmniInteract session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
                     case_result.session_id,
                 )
+        output.audio_continuity_samples = [
+            audio_sample
+            for metric in case_result.duplex_request_metrics
+            if isinstance((audio_sample := metric.get("audio_continuity")), dict)
+        ]
         output.duplex_request_metrics = case_result.duplex_request_metrics
         output.duplex_session_metrics = session_metrics
         output.success = case_result.success
@@ -3260,6 +3279,11 @@ async def async_request_openai_realtime_duplex(
                 request_metrics = timing.get("request_metrics")
                 if not isinstance(request_metrics, dict):
                     raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
+                continuity_rows = collect_duplex_audio_continuity(
+                    client.events.events, client.events.event_received_at_s, after_s=turn_started_at_s
+                )
+                if response_id in continuity_rows:
+                    request_metrics["audio_continuity"] = continuity_rows[response_id]
                 turn_timings.append(timing)
                 turn_metrics.append(
                     {
@@ -3301,6 +3325,11 @@ async def async_request_openai_realtime_duplex(
         )
         output.audio_frames = int(output.audio_duration * _SEED_TTS_OUTPUT_SAMPLE_RATE_HZ)
         output.latency = request_finished_at - output.start_time
+        output.audio_continuity_samples = [
+            audio_sample
+            for metric in turn_metrics
+            if isinstance((audio_sample := metric.get("audio_continuity")), dict)
+        ]
         output.tts_turn_pcm_bytes = turn_pcm_bytes
         output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
         if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
@@ -3795,6 +3824,7 @@ async def benchmark(
             "num_itl_samples",
             "num_audio_ttfp_samples",
             "num_audio_rtf_samples",
+            "num_audio_continuity_samples",
         ):
             result[sample_count] = getattr(metrics, sample_count)
     else:
@@ -3809,6 +3839,18 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    if isinstance(metrics, MultiModalsBenchmarkMetrics):
+        result[defs.AUDIO_CONTINUITY_OK_RATE] = getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE)
+        result["total_audio_underrun_events"] = metrics.total_audio_underrun_events
+        for metric in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES:
+            if metric != defs.AUDIO_UNDERRUN:
+                result[f"num_{metric}_samples"] = getattr(metrics, f"num_{metric}_samples")
+        result["audio_continuity_samples"] = [
+            {"request_index": index, **sample}
+            for index, output in enumerate(outputs)
+            if output.success
+            for sample in (getattr(output, "audio_continuity_samples", None) or [])
+        ]
     # Preserve request order, including missing snapshots, so CI can verify
     # fixed stage workloads without parsing logs or storing audio payloads.
     request_stage_metrics = [
@@ -3918,7 +3960,9 @@ async def benchmark(
     if "e2el" in selected_percentile_metrics:
         result_percentile_metrics.append("e2el")
     for metric in selected_percentile_metrics:
-        if metric.startswith("audio") and metric not in result_percentile_metrics:
+        if (metric.startswith("audio") or metric in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES) and (
+            metric not in result_percentile_metrics
+        ):
             result_percentile_metrics.append(metric)
 
     def process_one_metric(
@@ -3929,20 +3973,32 @@ async def benchmark(
         # metric.
         if metric_attribute_name not in result_percentile_metrics:
             return
+        if metric_attribute_name in {"audio_continuity_rate", defs.AUDIO_CONTINUITY_OK_RATE}:
+            result[defs.AUDIO_CONTINUITY_OK_RATE] = getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE)
+            return
         if not has_metric_samples(metrics, metric_attribute_name):
             return
         # No text tokens generated (e.g. pure TTS speech endpoint): per-token
         # latency metrics (ttft/tpot/itl) are undefined, so skip them.
-        is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
+        is_text_token_metric = not (
+            metric_attribute_name == "e2el"
+            or metric_attribute_name.startswith("audio")
+            or metric_attribute_name in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES
+        )
         if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
             return
         is_audio_rtf = metric_attribute_name == defs.AUDIO_RTF
-        is_audio_duration_or_underrun = metric_attribute_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN)
+        is_audio_duration_or_underrun = metric_attribute_name in (
+            defs.AUDIO_DURATION,
+            defs.AUDIO_UNDERRUN,
+            defs.TOTAL_UNDERRUN,
+            defs.AUDIO_MAX_SINGLE_UNDERRUN,
+        )
 
         suffix = "_ms"
         if is_audio_duration_or_underrun:
             suffix = "_s"
-        elif is_audio_rtf:
+        elif is_audio_rtf or metric_attribute_name in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES:
             suffix = ""
         mean_attr_name = f"mean_{metric_attribute_name}{suffix}"
         mean_value = getattr(metrics, mean_attr_name, 0.0)

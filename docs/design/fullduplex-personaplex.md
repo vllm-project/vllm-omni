@@ -339,7 +339,11 @@ turn real audio into a zero-output measurement.
 | `frame_deficit` | Integer input-frame minus output-frame count from the shared session validation; missing when valid whole-frame accounting is unavailable. |
 | `output_frames`, `voiced_frames`, `silent_frames`, `frame_coverage_ratio`, `audio_rms`, `audio_chunks` | Session-validation statistics retained on success and on acceptance failure once computed. |
 | `acceptance_check` | Failed local check, with numeric diagnostics in `error`; other exceptions retain phase/type only, without remote handshake or metadata text. |
-| `audio_underrun_s`, `audio_underrun_event_count`, `audio_continuity_ok` | Shared `compute_continuity_stats` on valid PCM16 packet arrivals, with its default 100 ms underrun threshold; absent audio gives missing values rather than a continuity pass. |
+| `audio_underrun_s`, `audio_underrun_event_count`, `audio_continuity_ok` | Shared `compute_continuity_stats` on valid PCM16 packet arrivals, with its default 100 ms total-stall threshold; absent audio gives missing values rather than a continuity pass. |
+
+These load-probe diagnostics use the session packet timeline. The
+`openai-realtime-duplex` benchmark instead evaluates completed responses
+independently by `response_id`, excluding listening gaps between responses.
 
 No output gives missing latency/RTF values, not zero. By default RTF is
 diagnostic; `--max-client-rtf` adds an explicit ceiling. The existing frame

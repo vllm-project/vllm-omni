@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from vllm_omni.benchmarks.audio_continuity import collect_duplex_audio_continuity
 from vllm_omni.metrics.definitions import compute_audio_rtf
 
 if TYPE_CHECKING:
@@ -73,6 +74,9 @@ def collect_duplex_session_metrics(
 
     request_metrics: list[dict[str, object]] = []
     output_tokens = 0
+    continuity_rows = collect_duplex_audio_continuity(
+        collector.events, collector.event_received_at_s, after_s=stream_start
+    )
     for request_index, response_id in enumerate(collector.response_ids):
         timing = collector.timing_summary(
             after_s=stream_start,
@@ -88,6 +92,8 @@ def collect_duplex_session_metrics(
             "request_index": request_index,
             "response_id": response_id,
         }
+        if response_id in continuity_rows:
+            metric["audio_continuity"] = continuity_rows[response_id]
         if isinstance(raw_metric, dict):
             metric.update(raw_metric)
             metric["rtf"] = audio_rtf_from_raw_metric(raw_metric)
@@ -101,7 +107,7 @@ def collect_duplex_session_metrics(
         if isinstance(stage0, dict):
             metric["stage0_tokens"] = dict(stage0)
             output_tokens += int(stage0.get("output_token_count") or 0)
-        if isinstance(raw_metric, dict) or copied_stages or isinstance(stage0, dict):
+        if isinstance(raw_metric, dict) or copied_stages or isinstance(stage0, dict) or "audio_continuity" in metric:
             request_metrics.append(metric)
     session_metrics = summarize_session_request_metrics(
         request_metrics,

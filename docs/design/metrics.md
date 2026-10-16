@@ -83,11 +83,11 @@ Zero and missing values have different meanings. Valid zero-duration queue obser
 
 #### Path 3: Audio modality metrics (`vllm_omni:audio_*`)
 
-`OmniModalityMetrics` registers seven audio families with `{model_name, stage, replica}` (plus an extra `threshold_ms` / `reason` label on the two extra-cardinality Counters). Three observation sites:
+`OmniModalityMetrics` registers twelve audio families with `{model_name, stage, replica}` (plus an extra `threshold_ms` / `reason` label on the two extra-cardinality Counters). Three observation sites:
 
 - `observe_modality_at_finalize(...)` — called from `omni_base._process_single_result` inside the existing `e2e_done` finalize guard. For `output_type == "audio"` it emits `audio_frames_total`, `audio_duration_s`, `audio_rtf` (or `audio_skipped_requests_total{reason="no_audio_data"}` when no audio was produced). Sample rate is resolved from `engine_outputs.multimodal_output` via `definitions.resolve_audio_sample_rate(...)` (fallback chain mirrors `serving_chat.py`'s audio response path).
 - `observe_audio_first_packet(...)` — called from the OpenAI SSE audio branch in `serving_chat.py` and the streaming TTS output paths in `serving_speech.py` on the first non-empty audio payload for a request. Streaming Speech observes the first PCM payload rather than a header-only WAV chunk. HTTP carries the middleware request timestamp through response generation; WebSocket uses the start of each sentence synthesis request. Non-streaming Speech does not emit TTFP and uses `e2e_request_latency_s` for overall latency instead.
-- `observe_audio_streaming_finalize(...)` — called from `serving_chat.py` and `serving_speech.py` after a streaming chunk loop exhausts normally. It runs the per-chunk player simulation from `vllm_omni/benchmarks/audio_continuity.py` to compute the worst-case underrun and emits `audio_underrun_s` plus (when the request stayed below the threshold) `audio_continuity_ok_total{threshold_ms}`. Per-chunk PCM byte counts and arrival timestamps are recorded by the same output paths that update TTFP. Speech records raw PCM payloads before raw/SSE/WebSocket encoding, excludes WAV headers and empty chunks, and does not emit continuity samples for failed, cancelled, or non-streaming requests.
+- `observe_audio_streaming_finalize(...)` — called from `serving_chat.py` and `serving_speech.py` after a streaming chunk loop exhausts normally. It runs the per-chunk player simulation from `vllm_omni/benchmarks/audio_continuity.py` to compute individual and total playback stalls, emits `audio_underrun_s`, `total_underrun_s`, event count, ratio and events per minute, plus (when total stalls stayed within the threshold) `audio_continuity_ok_total{threshold_ms}`. Per-chunk PCM byte counts and arrival timestamps are recorded by the same output paths that update TTFP. Speech records raw PCM payloads before raw/SSE/WebSocket encoding, excludes WAV headers and empty chunks, and does not emit continuity samples for failed, cancelled, or non-streaming requests.
 
 #### Path 4: Cross-stage transfer metrics (`vllm_omni:transfer_*`)
 
@@ -215,7 +215,7 @@ Labels: `{model_name, stage, replica}`.
 
 The optional breakdown and memory families are sparse by design: when an engine does not produce the source measurement, no sample is emitted. This differs from queue timings, where an explicitly measured zero is meaningful and is retained.
 
-### Audio (7)
+### Audio (12)
 
 Labels: `{model_name, stage, replica}` plus the listed extra label.
 
@@ -225,8 +225,13 @@ Labels: `{model_name, stage, replica}` plus the listed extra label.
 | `vllm_omni:audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm_omni:audio_rtf` | Histogram | — | Real-time factor `stage_gen_time_s / audio_duration_s` (SLO `< 1`); uses `RTF_BUCKETS` |
 | `vllm_omni:audio_frames_total` | Counter | — | Cumulative audio frames generated |
-| `vllm_omni:audio_underrun_s` | Histogram | — | Per-request worst-case player deficit; `> 0` indicates listener heard silent gaps |
-| `vllm_omni:audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when the request's worst underrun stayed below `threshold_ms` |
+| `vllm_omni:audio_underrun_s` | Histogram | — | Legacy maximum cumulative playback deficit; equals total stalls |
+| `vllm_omni:audio_max_single_underrun_s` | Histogram | — | Largest individual playback stall per response, in seconds |
+| `vllm_omni:total_underrun_s` | Histogram | — | Sum of playback stalls per response, excluding first-packet wait |
+| `vllm_omni:audio_underrun_event_count` | Histogram | — | Actual new stalls per response; `_sum` gives total event count |
+| `vllm_omni:audio_underrun_ratio` | Histogram | — | Total stalls / (audio content duration + total stalls), per response |
+| `vllm_omni:audio_underrun_events_per_minute` | Histogram | — | Stall count / (audio content seconds / 60), per response |
+| `vllm_omni:audio_continuity_ok_total` | Counter | `threshold_ms` | Incremented when total response stalls stay within the threshold |
 | `vllm_omni:audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
 ### Speech streaming (2)
@@ -278,6 +283,8 @@ After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency,
 
 The separation follows upstream vLLM's pattern of `LoggingStatLogger` vs. `PrometheusStatLogger` — same underlying data, different consumption models.
 
+For playback accounting, sample populations and deterministic regression commands,
+see [Streaming audio continuity](audio_continuity_testing.md).
 ### LLM-stage phase split in `StageRequestStats`
 
 With `--log-stats`, a stage served by a vLLM engine core (AR and generation stages) adds the engine-core phase split of the finished request to its `StageRequestStats` row:

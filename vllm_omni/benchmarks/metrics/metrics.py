@@ -26,6 +26,7 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     ("num_itl_samples", int, field(default=0)),
     ("num_audio_ttfp_samples", int, field(default=0)),
     ("num_audio_rtf_samples", int, field(default=0)),
+    ("num_audio_continuity_samples", int, field(default=0)),
     (defs.MEAN_AUDIO_TTFP_MS, float, field(default=0.0)),
     (defs.MEDIAN_AUDIO_TTFP_MS, float, field(default=0.0)),
     (defs.STD_AUDIO_TTFP_MS, float, field(default=0.0)),
@@ -45,7 +46,7 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_AUDIO_UNDERRUN_S, float, field(default=0.0)),
     (defs.STD_AUDIO_UNDERRUN_S, float, field(default=0.0)),
     (defs.PERCENTILES_AUDIO_UNDERRUN_S, _PERCENTILE_ROWS_TYPE, field(default=None)),
-    (defs.AUDIO_CONTINUITY_OK_RATE, float, field(default=1.0)),
+    (defs.AUDIO_CONTINUITY_OK_RATE, float | None, field(default=None)),
     (defs.TOTAL_IMAGES, int, field(default=0)),
     (defs.IMAGE_THROUGHPUT, float, field(default=0.0)),
     (defs.AVERAGE_PIXELS_PER_IMAGE, float, field(default=0.0)),
@@ -74,6 +75,15 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.STAGE_DURATIONS_P99, _STAGE_DURATION_MAP_TYPE, field(default=None)),
 ]
 
+for _metric, _suffix in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES.items():
+    if _metric == defs.AUDIO_UNDERRUN:
+        continue  # Existing fields above retain their public names.
+    _MULTIMODAL_BENCHMARK_FIELDS.append((f"num_{_metric}_samples", int, field(default=0)))
+    for _stat in ("mean", "median", "std"):
+        _MULTIMODAL_BENCHMARK_FIELDS.append((f"{_stat}_{_metric}{_suffix}", float, field(default=float("nan"))))
+    _MULTIMODAL_BENCHMARK_FIELDS.append((f"percentiles_{_metric}{_suffix}", _PERCENTILE_ROWS_TYPE, field(default=None)))
+_MULTIMODAL_BENCHMARK_FIELDS.append(("total_audio_underrun_events", int, field(default=0)))
+
 # ``make_dataclass`` returns a runtime class that mypy treats as a variable, not
 # a type. Annotate as Any so call sites can use these names in annotations.
 MultiModalsBenchmarkMetrics: Any = make_dataclass(
@@ -81,6 +91,24 @@ MultiModalsBenchmarkMetrics: Any = make_dataclass(
     _MULTIMODAL_BENCHMARK_FIELDS,
     bases=(BenchmarkMetrics,),
 )
+
+
+def _summarize_stall_details(
+    values_by_metric: dict[str, list[float]], percentiles: Sequence[float]
+) -> dict[str, int | float | list[tuple[float, float]]]:
+    result: dict[str, int | float | list[tuple[float, float]]] = {}
+    for metric, suffix in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES.items():
+        if metric == defs.AUDIO_UNDERRUN:
+            continue
+        values = values_by_metric[metric]
+        result[f"num_{metric}_samples"] = len(values)
+        for name, summarize in (("mean", np.mean), ("median", np.median), ("std", np.std)):
+            result[f"{name}_{metric}{suffix}"] = float(summarize(values)) if values else float("nan")
+        result[f"percentiles_{metric}{suffix}"] = (
+            [(p, float(np.percentile(values, p))) for p in percentiles] if values else []
+        )
+    return result
+
 
 _STAGE_BENCHMARK_FIELDS = [
     ("stage_id", int, field(default=0)),
@@ -180,12 +208,15 @@ def _wants_stream_icl(metrics: list[str]) -> bool:
 
 
 def has_metric_samples(metrics: object, metric_name: str) -> bool:
+    if metric_name in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES and metric_name != defs.AUDIO_UNDERRUN:
+        return getattr(metrics, f"num_{metric_name}_samples", 0) > 0
     sample_count_attr = {
         "ttft": "num_ttft_samples",
         "tpot": "num_tpot_samples",
         "itl": "num_itl_samples",
         defs.AUDIO_TTFP: "num_audio_ttfp_samples",
         defs.AUDIO_RTF: "num_audio_rtf_samples",
+        defs.AUDIO_UNDERRUN: "num_audio_continuity_samples",
     }.get(metric_name)
     return sample_count_attr is None or getattr(metrics, sample_count_attr, 0) > 0
 
@@ -295,14 +326,14 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     )
     print("{:<40} {:<10}".format("Total audio frames generated:", getattr(metrics, defs.TOTAL_AUDIO_FRAMES)))
     print("{:<40} {:<10.2f}".format("Audio throughput(audio duration/s):", getattr(metrics, defs.AUDIO_THROUGHPUT)))
-    print(
-        "{:<40} {:<10.2%}".format(
-            "Streaming continuity OK rate:",
-            getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE),
-        )
-    )
+    rate = getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE)
+    print("{:<40} {}".format("Audio continuity samples:", metrics.num_audio_continuity_samples))
+    print("{:<40} {}".format("Streaming continuity OK rate:", f"{rate:.2%}" if rate is not None else "N/A"))
+    print("{:<40} {}".format("Total audio underrun events:", metrics.total_audio_underrun_events))
     for metric in selected_percentile_metrics:
-        if metric.startswith("audio"):
+        if metric in {"audio_continuity_rate", defs.AUDIO_CONTINUITY_OK_RATE}:
+            continue  # A pass rate, not a latency percentile distribution.
+        if metric.startswith("audio") or metric in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES:
             process_one_metric(metric, metrics)
 
 
@@ -484,14 +515,24 @@ def process_one_metric(
         defs.AUDIO_TTFP: "Time to First Packet",
         defs.AUDIO_RTF: "Real Time Factor",
         defs.AUDIO_DURATION: "Audio Duration",
-        defs.AUDIO_UNDERRUN: "Streaming Audio Underrun",
+        defs.AUDIO_UNDERRUN: "Streaming Audio Underrun (Cumulative)",
+        defs.AUDIO_MAX_SINGLE_UNDERRUN: "Maximum Single Audio Underrun",
+        defs.TOTAL_UNDERRUN: "Total Audio Underrun per Response",
+        defs.AUDIO_UNDERRUN_EVENT_COUNT: "Audio Underrun Events per Response",
+        defs.AUDIO_UNDERRUN_RATIO: "Audio Underrun Ratio",
+        defs.AUDIO_UNDERRUN_EVENTS_PER_MINUTE: "Audio Underrun Events per Audio Minute",
     }
 
     header = metric_header_map.get(metric_attribute_name, metric_attribute_name)
     print("{s:{c}^{n}}".format(s=header, n=50, c="-"))
 
     is_audio_rtf = metric_attribute_name == defs.AUDIO_RTF
-    is_audio_duration_or_underrun = metric_attribute_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN)
+    is_audio_duration_or_underrun = metric_attribute_name in (
+        defs.AUDIO_DURATION,
+        defs.AUDIO_UNDERRUN,
+        defs.TOTAL_UNDERRUN,
+        defs.AUDIO_MAX_SINGLE_UNDERRUN,
+    )
 
     suffix = "_ms"
     unit_suffix = " (ms)"
@@ -501,6 +542,13 @@ def process_one_metric(
     elif is_audio_rtf:
         suffix = ""
         unit_suffix = ""
+    elif metric_attribute_name in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES:
+        suffix = ""
+        unit_suffix = {
+            defs.AUDIO_UNDERRUN_EVENT_COUNT: " (events)",
+            defs.AUDIO_UNDERRUN_RATIO: " (ratio)",
+            defs.AUDIO_UNDERRUN_EVENTS_PER_MINUTE: " (events/min)",
+        }[metric_attribute_name]
     field_names = _AGGREGATE_PERCENTILE_FIELD_NAMES.get(metric_attribute_name)
     mean_attr_name = field_names[0] if field_names else f"mean_{metric_attribute_name}{suffix}"
     mean_value = getattr(metrics, mean_attr_name, 0.0)
@@ -920,7 +968,8 @@ def calculate_metrics(
     total_video_frames = 0
     video_generation_times_ms: list[float] = []
     peak_memories_mb: list[float] = []
-    audio_underruns: list[float] = []
+    continuity_values: dict[str, list[float]] = {metric: [] for metric in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES}
+    audio_underruns = continuity_values[defs.AUDIO_UNDERRUN]
     audio_continuity_ok: list[bool] = []
     input_audio_duration = 0.0
     for i in range(len(outputs)):
@@ -1015,8 +1064,49 @@ def calculate_metrics(
             peak_memory_mb = float(getattr(outputs[i], defs.PEAK_MEMORY_MB, 0.0) or 0.0)
             if peak_memory_mb > 0:
                 peak_memories_mb.append(peak_memory_mb)
-            audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
-            audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
+            samples = getattr(outputs[i], "audio_continuity_samples", None)
+            if samples is None:
+                # Preserve explicit scalar samples from older backend adapters;
+                # unmeasured defaults are None, not a fabricated passing sample.
+                samples = [
+                    {
+                        "audio_underrun_s": getattr(outputs[i], "audio_underrun_s", None),
+                        "audio_continuity_ok": getattr(outputs[i], "audio_continuity_ok", None),
+                        **{
+                            metric + suffix: getattr(outputs[i], metric + suffix, None)
+                            for metric, suffix in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES.items()
+                            if metric != defs.AUDIO_UNDERRUN
+                        },
+                    }
+                ]
+            for sample in samples:
+                underrun = sample.get("audio_underrun_s")
+                continuous = sample.get("audio_continuity_ok")
+                if (
+                    isinstance(underrun, (int, float))
+                    and not isinstance(underrun, bool)
+                    and np.isfinite(underrun)
+                    and underrun >= 0
+                    and isinstance(continuous, bool)
+                ):
+                    audio_underruns.append(float(underrun))
+                    audio_continuity_ok.append(continuous)
+                    for metric, suffix in defs.AUDIO_CONTINUITY_METRIC_SUFFIXES.items():
+                        if metric == defs.AUDIO_UNDERRUN:
+                            continue
+                        value = sample.get(metric + suffix)
+                        if not (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and np.isfinite(value)
+                            and value >= 0
+                        ):
+                            continue
+                        if metric == defs.AUDIO_UNDERRUN_RATIO and value > 1:
+                            continue
+                        if metric == defs.AUDIO_UNDERRUN_EVENT_COUNT and int(value) != value:
+                            continue
+                        continuity_values[metric].append(float(value))
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
@@ -1231,15 +1321,18 @@ def calculate_metrics(
             defs.PERCENTILES_PEAK_MEMORY_MB: [
                 (p, np.percentile(peak_memories_mb or 0, p)) for p in selected_percentiles
             ],
-            defs.MEAN_AUDIO_UNDERRUN_S: np.mean(audio_underruns or 0),
-            defs.STD_AUDIO_UNDERRUN_S: np.std(audio_underruns or 0),
-            defs.MEDIAN_AUDIO_UNDERRUN_S: np.median(audio_underruns or 0),
-            defs.PERCENTILES_AUDIO_UNDERRUN_S: [
-                (p, np.percentile(audio_underruns or 0, p)) for p in selected_percentiles
-            ],
+            "num_audio_continuity_samples": len(audio_underruns),
+            defs.MEAN_AUDIO_UNDERRUN_S: np.mean(audio_underruns) if audio_underruns else float("nan"),
+            defs.STD_AUDIO_UNDERRUN_S: np.std(audio_underruns) if audio_underruns else float("nan"),
+            defs.MEDIAN_AUDIO_UNDERRUN_S: np.median(audio_underruns) if audio_underruns else float("nan"),
+            defs.PERCENTILES_AUDIO_UNDERRUN_S: [(p, np.percentile(audio_underruns, p)) for p in selected_percentiles]
+            if audio_underruns
+            else [],
             defs.AUDIO_CONTINUITY_OK_RATE: (
-                (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
+                (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else None
             ),
+            **_summarize_stall_details(continuity_values, selected_percentiles),
+            "total_audio_underrun_events": int(sum(continuity_values[defs.AUDIO_UNDERRUN_EVENT_COUNT])),
             defs.STAGE_DURATIONS_MEAN: stage_duration_summaries.get(defs.STAGE_DURATIONS_MEAN) or {},
             defs.STAGE_DURATIONS_P50: stage_duration_summaries.get(defs.STAGE_DURATIONS_P50) or {},
             defs.STAGE_DURATIONS_P99: stage_duration_summaries.get(defs.STAGE_DURATIONS_P99) or {},
