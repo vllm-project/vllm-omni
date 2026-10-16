@@ -536,34 +536,14 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
         if reason is None:
             reason = self._fa3_fp8_device_unsupported_reason(query.device)
-        if reason is None and query.device.type == "cuda":
-            # Reuse vLLM's own FA capability matrix and version selector so
-            # this stays aligned with the kernel selected by vLLM 0.31.
-            try:
-                from vllm.v1.attention.backends.fa_utils import (
-                    flash_attn_supports_kv_cache_dtype,
-                    flash_attn_supports_quant_query_input,
-                    get_flash_attn_version,
-                )
+        if reason is None:
+            from vllm_omni.diffusion.attention.backends.utils.fa import (
+                FLASH_ATTN_SUPPORTS_FP8,
+                flash_attn_func,
+            )
 
-                if not flash_attn_supports_quant_query_input():
-                    reason = "vLLM reports quantized query input is unsupported on this platform"
-                elif (
-                    get_flash_attn_version(
-                        head_size=query.shape[-1],
-                        head_size_v=value.shape[-1],
-                    )
-                    != 3
-                ):
-                    reason = "vLLM selected an attention version other than FA3"
-                elif not flash_attn_supports_kv_cache_dtype(
-                    "fp8",
-                    head_size=query.shape[-1],
-                    head_size_v=value.shape[-1],
-                ):
-                    reason = "vLLM reports no supported FA3 FP8 kernel for this device or head size"
-            except ImportError:
-                reason = "the installed vLLM build has no FA capability probe"
+            if not FLASH_ATTN_SUPPORTS_FP8 or flash_attn_func is None:
+                reason = "the selected diffusion FlashAttention implementation has no dense FA3 FP8 support"
         if reason is not None:
             raise ValueError(
                 f"CUDA attention precision 'fp8' is unavailable: {reason}. "
@@ -584,6 +564,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             return f"FA3 FP8 kernels require SM90 (Hopper); current device is SM{capability[0]}{capability[1]}"
         return None
 
+    @staticmethod
+    def _fa3_fp8_num_splits(kv_seq_len: int) -> int:
+        """Bound long FP8 reductions using FA3's split-combine path."""
+        # fa3-fwd 0.0.3 loses constant-V accuracy with long single splits.
+        # At most 2560 KV tokens per split keeps the tested 19K/75K cases
+        # within their original tolerance; short inputs keep one split.
+        required_splits = (kv_seq_len + 2559) // 2560
+        return 1 << (required_splits - 1).bit_length()
+
     def forward_fa_quant_cuda(
         self,
         query: torch.Tensor,
@@ -594,29 +583,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """FP8 (e4m3) FlashAttention-3 path for CUDA (SM90).
 
         vLLM computes one dynamic scale for each of Q, K and V on every
-        forward. No calibration data or stored state is involved. Layout
-        conversion mirrors ``_forward_varlen_dense``.
+        forward. Omni's selected dense FA3 consumes the FP8 tensors in BSHD
+        layout. No calibration data or stored state is involved.
         """
         self._validate_quant_request_cuda(query, key, value, attn_metadata)
-        try:
-            # vLLM exposes the FA dispatcher from ``fa_utils``.  Keep the
-            # version-specific import out of Omni: vLLM 0.31 selects the
-            # vendored FA3 implementation there and keeps the public call
-            # contract stable across its FA3 builds.
-            from vllm.v1.attention.backends.fa_utils import (
-                flash_attn_varlen_func as fa3_varlen_func,
-            )
-        except ImportError as exc:
-            raise ImportError(
-                "CUDA attention precision 'fp8' requires vLLM's FlashAttention-3 dispatcher "
-                "(vllm.v1.attention.backends.fa_utils). Set diffusion_kv_cache_dtype='auto' or install a "
-                "compatible vLLM build."
-            ) from exc
-        if fa3_varlen_func is None:
-            raise ImportError(
-                "CUDA attention precision 'fp8' requires vLLM's FlashAttention-3 dispatcher. "
-                "Set diffusion_kv_cache_dtype='auto' or install a compatible vLLM build."
-            )
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_func
+
+        assert flash_attn_func is not None  # Checked by _validate_quant_request_cuda.
 
         from vllm import _custom_ops as ops
 
@@ -629,14 +602,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "FA3 FP8 requires positive Q/KV head counts with Q heads divisible by KV heads; "
                 f"got {q_heads} Q heads and {kv_heads} KV heads"
             )
-        device = query.device
-        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=device)
-        cu_seqlens_k = (
-            cu_seqlens_q
-            if k_len == q_len
-            else torch.arange(0, (batch_size + 1) * k_len, step=k_len, dtype=torch.int32, device=device)
-        )
-
         # The upstream dynamic per-tensor op computes and returns the scale
         # used for its FP8 conversion. Q/K/V each have an independent scale;
         # no head reordering or GQA-specific scale grouping is needed.
@@ -650,26 +615,21 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         k_fp8, k_descale = ops.scaled_fp8_quant(k_input if k_input.stride(-1) == 1 else k_input.contiguous())
         v_fp8, v_descale = ops.scaled_fp8_quant(v_input if v_input.stride(-1) == 1 else v_input.contiguous())
 
-        out = fa3_varlen_func(
-            q=q_fp8.view(batch_size * q_len, q_heads, head_dim),
-            k=k_fp8.view(batch_size * k_len, kv_heads, head_dim),
-            v=v_fp8.view(batch_size * k_len, kv_heads, head_dim),
-            max_seqlen_q=q_len,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_k=k_len,
-            cu_seqlens_k=cu_seqlens_k,
+        out = flash_attn_func(
+            q=q_fp8.view(batch_size, q_len, q_heads, head_dim),
+            k=k_fp8.view(batch_size, k_len, kv_heads, head_dim),
+            v=v_fp8.view(batch_size, k_len, kv_heads, head_dim),
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            deterministic=self.fa_deterministic,
+            num_splits=self._fa3_fp8_num_splits(k_len),
             # FA3 indexes descales by sequence and KV head. Broadcast each
             # tensor's scalar scale to that interface, including for GQA/MQA.
             q_descale=q_descale.expand(batch_size, kv_heads),
             k_descale=k_descale.expand(batch_size, kv_heads),
             v_descale=v_descale.expand(batch_size, kv_heads),
-            fa_version=3,
         )
-        out = self._unwrap_flash_output(out)
-        # (b s) h d -> b s h d
-        return out.reshape(batch_size, q_len, *out.shape[1:])
+        return self._unwrap_flash_output(out)
 
     def forward_xpu(
         self,

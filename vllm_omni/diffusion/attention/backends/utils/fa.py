@@ -59,6 +59,8 @@ def is_flash_attn_4_available() -> bool:
 # Bind via aliases so mypy does not treat each candidate import as a redefinition.
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
+# FP8 descales are supported by the dense FA3 interfaces below, not FA2.
+FLASH_ATTN_SUPPORTS_FP8 = False
 
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
@@ -117,6 +119,7 @@ else:
 
                 flash_attn_func = _fa_func
                 flash_attn_varlen_func = _fa_varlen
+                FLASH_ATTN_SUPPORTS_FP8 = True
             except (ImportError, ModuleNotFoundError):
                 pass
 
@@ -128,6 +131,7 @@ else:
 
                 flash_attn_func = _fa_func
                 flash_attn_varlen_func = _fa_varlen
+                FLASH_ATTN_SUPPORTS_FP8 = True
             except (ImportError, ModuleNotFoundError):
                 pass
 

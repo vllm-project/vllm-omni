@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.attention.backends.utils import fa as fa_utils
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -37,6 +38,15 @@ def cpu_fp8_quant(monkeypatch, mocker):
     quantize = mocker.Mock(wraps=quantizer.forward_native)
     monkeypatch.setattr(ops, "scaled_fp8_quant", quantize)
     return quantize
+
+
+@pytest.fixture
+def dense_fa3(monkeypatch):
+    fake = _FakeFa3Fp8Kernel()
+    monkeypatch.setattr(FlashAttentionImpl, "_fa3_fp8_device_unsupported_reason", staticmethod(lambda device: None))
+    monkeypatch.setattr(fa_utils, "FLASH_ATTN_SUPPORTS_FP8", True)
+    monkeypatch.setattr(fa_utils, "flash_attn_func", fake)
+    return fake
 
 
 class TestForwardCudaQuantDispatch:
@@ -77,8 +87,6 @@ class TestForwardCudaQuantDispatch:
         monkeypatch.setattr(FlashAttentionImpl, "forward_fa_quant_cuda", _fail)
         monkeypatch.setattr(FlashAttentionImpl, "_forward_varlen_dense", lambda self, q, k, v: q)
         # flash_attn_func may or may not exist on CPU; force the varlen-dense fallback.
-        import vllm_omni.diffusion.attention.backends.utils.fa as fa_utils
-
         monkeypatch.setattr(fa_utils, "HAS_FLASH_ATTN", True)
         monkeypatch.setattr(fa_utils, "flash_attn_func", None)
         extra = {} if dtype_value is None else {"kv_cache_dtype": dtype_value}
@@ -144,13 +152,27 @@ class TestQuantValidation:
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
         assert FlashAttentionImpl._fa3_fp8_device_unsupported_reason(torch.device("cuda")) is None
 
+    @pytest.mark.parametrize("kv_seq_len,expected", [(1, 1), (256, 1), (2560, 1), (2561, 2), (19320, 8), (75600, 32)])
+    def test_fp8_split_count_scales_with_kv_length(self, kv_seq_len, expected):
+        assert FlashAttentionImpl._fa3_fp8_num_splits(kv_seq_len) == expected
+
     @pytest.mark.parametrize("q_heads,kv_heads", [(3, 2), (2, 4), (4, 0), (0, 2)])
-    def test_rejects_invalid_gqa_head_counts(self, monkeypatch, q_heads, kv_heads):
-        monkeypatch.setattr(FlashAttentionImpl, "_fa3_fp8_device_unsupported_reason", staticmethod(lambda device: None))
+    def test_rejects_invalid_gqa_head_counts(self, dense_fa3, q_heads, kv_heads):
         with pytest.raises(ValueError, match="Q heads divisible by KV heads"):
             _make_impl().forward_fa_quant_cuda(
                 _randn_bshd(1, 8, q_heads), _randn_bshd(1, 8, kv_heads), _randn_bshd(1, 8, kv_heads)
             )
+
+    @pytest.mark.parametrize("supports_fp8,has_dense", [(False, True), (False, False), (True, False)])
+    def test_rejects_unsupported_provider_before_quantization(
+        self, monkeypatch, cpu_fp8_quant, supports_fp8, has_dense
+    ):
+        monkeypatch.setattr(FlashAttentionImpl, "_fa3_fp8_device_unsupported_reason", staticmethod(lambda device: None))
+        monkeypatch.setattr(fa_utils, "FLASH_ATTN_SUPPORTS_FP8", supports_fp8)
+        monkeypatch.setattr(fa_utils, "flash_attn_func", _FakeFa3Fp8Kernel() if has_dense else None)
+        with pytest.raises(ValueError, match="selected diffusion FlashAttention implementation has no dense FA3 FP8"):
+            _make_impl().forward_fa_quant_cuda(_randn_bshd(1, 8), _randn_bshd(1, 8), _randn_bshd(1, 8))
+        cpu_fp8_quant.assert_not_called()
 
 
 class _FakeFa3Fp8Kernel:
@@ -165,31 +187,28 @@ class _FakeFa3Fp8Kernel:
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
         softmax_scale,
         causal,
+        deterministic,
         q_descale,
         k_descale,
         v_descale,
-        fa_version,
-        **kwargs,
+        num_splits,
     ):
         self.calls.append(
             dict(
-                fa_version=fa_version,
+                qkv_shapes=tuple(tuple(t.shape) for t in (q, k, v)),
+                deterministic=deterministic,
                 q_descale_shape=tuple(q_descale.shape),
                 k_descale_shape=tuple(k_descale.shape),
                 v_descale_shape=tuple(v_descale.shape),
+                num_splits=num_splits,
                 descales=tuple(scale.clone() for scale in (q_descale, k_descale, v_descale)),
             )
         )
-        assert fa_version == 3
-        batch = cu_seqlens_q.shape[0] - 1
-        kv_heads = k.shape[1]
-        assert q.shape[1] % kv_heads == 0
+        batch, q_len, q_heads, _ = q.shape
+        k_len, kv_heads = k.shape[1:3]
+        assert q_heads % kv_heads == 0
         for descale in (q_descale, k_descale, v_descale):
             assert descale.shape == (batch, kv_heads)
             assert descale.dtype == torch.float32
@@ -197,22 +216,22 @@ class _FakeFa3Fp8Kernel:
         for tensor in (q, k, v):
             assert tensor.dtype == torch.float8_e4m3fn
         # FA3 indexes Q descales by KV head, including when GQA is not packed.
-        repeat = q.shape[1] // kv_heads
+        repeat = q_heads // kv_heads
         q_scales = q_descale.repeat_interleave(repeat, dim=1)
-        qf = q.float().view(batch, max_seqlen_q, *q.shape[1:]) * q_scales[:, None, :, None]
-        kf = k.float().view(batch, max_seqlen_k, *k.shape[1:]) * k_descale[:, None, :, None]
-        vf = v.float().view(batch, max_seqlen_k, *v.shape[1:]) * v_descale[:, None, :, None]
+        qf = q.float() * q_scales[:, None, :, None]
+        kf = k.float() * k_descale[:, None, :, None]
+        vf = v.float() * v_descale[:, None, :, None]
         if kf.shape[2] != qf.shape[2]:  # GQA/MQA: replicate KV heads like the real kernel
             kf = kf.repeat_interleave(repeat, dim=2)
             vf = vf.repeat_interleave(repeat, dim=2)
         scores = torch.einsum("bqhd,bkhd->bhqk", qf, kf) * softmax_scale
         if causal:
-            q_pos = torch.arange(max_seqlen_q).unsqueeze(1)
-            k_pos = torch.arange(max_seqlen_k).unsqueeze(0)
-            scores = scores.masked_fill(k_pos > q_pos + (max_seqlen_k - max_seqlen_q), float("-inf"))
+            q_pos = torch.arange(q_len).unsqueeze(1)
+            k_pos = torch.arange(k_len).unsqueeze(0)
+            scores = scores.masked_fill(k_pos > q_pos + (k_len - q_len), float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         out = torch.einsum("bhqk,bkhd->bqhd", probs, vf)
-        return out.reshape(q.shape[0], *q.shape[1:]).to(torch.bfloat16)
+        return out.to(torch.bfloat16)
 
 
 def _reference_attention(q, k, v, scale, causal=False):
@@ -228,21 +247,13 @@ def _reference_attention(q, k, v, scale, causal=False):
 @pytest.mark.usefixtures("cpu_fp8_quant")
 class TestForwardFaQuantCudaNumerics:
     @pytest.mark.parametrize("causal", [False, True])
-    def test_matches_float_reference_within_fp8_tolerance(self, monkeypatch, causal):
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_matches_float_reference_within_fp8_tolerance(self, dense_fa3, causal, deterministic):
         torch.manual_seed(0)
         batch, seq, heads, head_dim = 2, 64, 4, 64
         scale = head_dim**-0.5
         impl = FlashAttentionImpl(num_heads=heads, head_size=head_dim, softmax_scale=scale, causal=causal)
-
-        fake = _FakeFa3Fp8Kernel()
-        monkeypatch.setattr(
-            FlashAttentionImpl,
-            "_fa3_fp8_device_unsupported_reason",
-            staticmethod(lambda device: None),
-        )
-        import vllm.v1.attention.backends.fa_utils as fa3_interface
-
-        monkeypatch.setattr(fa3_interface, "flash_attn_varlen_func", fake)
+        impl.fa_deterministic = deterministic
 
         query = _randn_bshd(batch, seq, heads, head_dim)
         key = _randn_bshd(batch, seq, heads, head_dim)
@@ -251,10 +262,12 @@ class TestForwardFaQuantCudaNumerics:
 
         assert out.shape == (batch, seq, heads, head_dim)
         assert out.dtype == torch.bfloat16  # FA3 FP8 kernels return BF16.
-        assert fake.calls[0]["fa_version"] == 3
-        assert fake.calls[0]["q_descale_shape"] == (batch, heads)
-        assert fake.calls[0]["k_descale_shape"] == (batch, heads)
-        assert fake.calls[0]["v_descale_shape"] == (batch, heads)
+        assert dense_fa3.calls[0]["qkv_shapes"] == (tuple(query.shape), tuple(key.shape), tuple(value.shape))
+        assert dense_fa3.calls[0]["deterministic"] == deterministic
+        assert dense_fa3.calls[0]["num_splits"] == 1
+        assert dense_fa3.calls[0]["q_descale_shape"] == (batch, heads)
+        assert dense_fa3.calls[0]["k_descale_shape"] == (batch, heads)
+        assert dense_fa3.calls[0]["v_descale_shape"] == (batch, heads)
 
         expected = _reference_attention(query, key, value, scale, causal=causal)
         rel_err = (out.float() - expected).abs().mean() / expected.abs().mean()
@@ -262,7 +275,7 @@ class TestForwardFaQuantCudaNumerics:
 
     @pytest.mark.parametrize("q_heads,kv_heads", [(4, 2), (8, 2), (4, 1)])
     @pytest.mark.parametrize("causal", [False, True])
-    def test_gqa_tensor_scales_match_reference(self, monkeypatch, cpu_fp8_quant, q_heads, kv_heads, causal):
+    def test_gqa_tensor_scales_match_reference(self, dense_fa3, cpu_fp8_quant, q_heads, kv_heads, causal):
         torch.manual_seed(1)
         batch, q_len, k_len, head_dim = 2, 32, 48, 64
         impl = FlashAttentionImpl(
@@ -272,16 +285,6 @@ class TestForwardFaQuantCudaNumerics:
             softmax_scale=head_dim**-0.5,
             causal=causal,
         )
-
-        fake = _FakeFa3Fp8Kernel()
-        monkeypatch.setattr(
-            FlashAttentionImpl,
-            "_fa3_fp8_device_unsupported_reason",
-            staticmethod(lambda device: None),
-        )
-        import vllm.v1.attention.backends.fa_utils as fa3_interface
-
-        monkeypatch.setattr(fa3_interface, "flash_attn_varlen_func", fake)
 
         # Signed powers of two map exactly to E4M3 under amax / 448 scaling.
         # This isolates scale broadcasting from lossy rounding/softmax amplification.
@@ -299,14 +302,14 @@ class TestForwardFaQuantCudaNumerics:
         impl_out = impl.forward_fa_quant_cuda(query, key, value, AttentionMetadata(extra={"kv_cache_dtype": "fp8"}))
         assert impl_out.shape == query.shape
         for name in ("q_descale_shape", "k_descale_shape", "v_descale_shape"):
-            assert fake.calls[0][name] == (batch, kv_heads)
+            assert dense_fa3.calls[0][name] == (batch, kv_heads)
         assert cpu_fp8_quant.call_count == 3
         # Flattening preserves each tensor's data without head permutations.
         for call, tensor in zip(cpu_fp8_quant.call_args_list, (query, key, value)):
             assert not call.kwargs  # vLLM computes dynamic per-tensor scales.
             assert call.args[0].is_contiguous()
             torch.testing.assert_close(call.args[0], tensor.reshape(batch * tensor.shape[1], -1))
-        for descale, tensor in zip(fake.calls[0]["descales"], (query, key, value)):
+        for descale, tensor in zip(dense_fa3.calls[0]["descales"], (query, key, value)):
             expected_scale = tensor.float().abs().amax() / torch.finfo(torch.float8_e4m3fn).max
             torch.testing.assert_close(descale, expected_scale.expand(batch, kv_heads))
         repeat = q_heads // kv_heads

@@ -14,7 +14,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @hardware_test(res={"cuda": ["H100", "H200"]}, num_cards=1)
-@pytest.mark.parametrize("seq_len", [256, 75600])
+@pytest.mark.parametrize("seq_len", [256, 19320, 75600])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @torch.inference_mode()
 def test_fp8_constant_v_native(seq_len, head_dim):
