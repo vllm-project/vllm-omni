@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 from transformers import Qwen3OmniMoeThinkerConfig
-from vllm.config import DeviceConfig, ModelConfig, MultiModalConfig, SchedulerConfig, VllmConfig
+from vllm.config import CompilationConfig, DeviceConfig, ModelConfig, MultiModalConfig, SchedulerConfig, VllmConfig
 from vllm.model_executor.models.utils import StageMissingLayer
 
 import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker as thinker_module
@@ -43,6 +43,7 @@ def test_deepstack_buffers_use_execution_device(mocker, vision_limit, num_tokens
     vllm_config = mocker.Mock(
         spec=VllmConfig,
         model_config=model_config,
+        compilation_config=CompilationConfig(),
         device_config=DeviceConfig(device="cpu"),
         scheduler_config=mocker.Mock(spec=SchedulerConfig, max_num_batched_tokens=4),
         quant_config=None,

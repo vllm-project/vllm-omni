@@ -1194,13 +1194,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        if (
-            getattr(vllm_config.model_config, "use_v2_model_runner", False)
-            and vllm_config.compilation_config.cudagraph_mm_encoder
+        # Only OmniModelConfig declares use_v2_model_runner. Upstream runners
+        # (plain `vllm serve`, V1 or MRv2) build the plain encoder manager,
+        # which never checks encoder_cudagraph_replay_supported.
+        if vllm_config.compilation_config.cudagraph_mm_encoder and getattr(
+            vllm_config.model_config, "use_v2_model_runner", True
         ):
             raise ValueError(
-                "Qwen3-Omni encoder graphs require model_runner=v1; MRv2 does not apply "
-                "the encoder replay bounds. Set cudagraph_mm_encoder=false for model_runner=v2."
+                "Qwen3-Omni encoder graphs require the vLLM-Omni V1 runner (--omni with "
+                "model_runner=v1); upstream runners and MRv2 do not apply the encoder replay "
+                "bounds. Set cudagraph_mm_encoder=false otherwise."
             )
         self.vllm_config = vllm_config  # needed for torch compile forward context
         hf_config = vllm_config.model_config.hf_config
