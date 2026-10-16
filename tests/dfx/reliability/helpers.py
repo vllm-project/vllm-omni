@@ -867,45 +867,36 @@ def post_fault_health_exception_is_terminal(exc: BaseException) -> bool:
 
 
 def assert_post_fault_health_503(online_client: Any, *, scenario: str) -> None:
-    """Poll until ``/health`` is 503. The API process must stay up.
+    """Wait 20s, then require one ``/health`` response of HTTP 503.
 
-    No ``err_code`` accepts only HTTP 200, which means the engine is not dead yet.
-    Any other status is checked with ``err_code=503``; that helper asserts on a mismatch.
-    A connection error propagates.
+    The API process must still be listening. A connection error propagates.
     """
-    deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline:
-        try:
-            online_client.send_health_http_request({"timeout": 5})
-        except AssertionError:
-            online_client.send_health_http_request({"timeout": 5}, err_code=503)
-            return
-        time.sleep(0.5)
-    pytest.fail(f"[{scenario} health] /health stayed HTTP 200 for 20s; expected 503")
+    time.sleep(20.0)
+    status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+    assert status == 503, f"[{scenario} health] expected /health 503 after 20s, got status={status}"
 
 
 def assert_post_fault_api_unreachable(online_client: Any, *, scenario: str) -> None:
-    """Poll until a follow-up ``/health`` fails to connect after the API process is killed.
+    """Poll ``/health`` until it fails to connect, or until 20s elapse.
 
-    HTTP 200 means the process is still up, so the poll continues. Any exception
-    triggers one more request, which must fail to connect.
+    HTTP 200 and HTTP 503 both mean a process is still listening, so polling
+    continues. A connection failure means the API process is gone.
     """
     deadline = time.monotonic() + 20.0
+    last_observation = "no response"
     while time.monotonic() < deadline:
         try:
-            online_client.send_health_http_request({"timeout": 5})
-        except Exception:  # noqa: BLE001
-            try:
-                time.sleep(0.5)
-                online_client.send_health_http_request({"timeout": 5})
-            except Exception as exc:  # noqa: BLE001
-                assert post_fault_health_exception_is_terminal(exc), (
-                    f"[{scenario} health] follow-up /health did not fail to connect: {exc!r}"
-                )
+            status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+            last_observation = f"http={status}"
+        except Exception as exc:  # noqa: BLE001
+            if post_fault_health_exception_is_terminal(exc):
                 return
-            raise AssertionError(f"[{scenario} health] follow-up /health still connected after the API was killed")
+            last_observation = f"exception={exc!r}"
         time.sleep(0.5)
-    pytest.fail(f"[{scenario} health] /health stayed HTTP 200 for 20s after the API process was killed")
+    pytest.fail(
+        f"[{scenario} health] /health stayed reachable for 20s after the API process was killed; "
+        f"last_observation={last_observation}"
+    )
 
 
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:

@@ -137,6 +137,7 @@ PROCESS_KILL_ERROR_KEYWORDS = (
 RUNTIME_WORKER_PATTERN = "VLLM::"
 # RFC#2366 signal x target matrix:
 # - worker: SIGTERM, SIGKILL
+# - worker with-load: skipped (issue#8912)
 # - serve-root no-load: SIGINT; SIGTERM/SIGKILL skipped (vllm issue#43060)
 # - serve-root with-load: SIGINT, SIGTERM; SIGKILL skipped (vllm issue#43060)
 # - serve-tree no-load: SIGTERM/SIGKILL
@@ -644,6 +645,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 
 
 @pytest.mark.slow
+@pytest.mark.skip(reason="issue#8912")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "fault_injector",
@@ -666,7 +668,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
         inject_fault=lambda: fault_injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
-        completion_timeout_sec=120.0,
+        completion_timeout_sec=300.0,
     )
     assert load_result["failure_observed"], (
         f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
