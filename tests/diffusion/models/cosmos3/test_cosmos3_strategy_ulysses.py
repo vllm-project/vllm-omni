@@ -14,6 +14,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model]
 
 
@@ -276,9 +278,9 @@ def _worker(rank, device_type, offload_mode, init_method):
     ("device_type", "offload_mode"),
     [
         pytest.param("cpu", "none", marks=pytest.mark.cpu),
-        pytest.param("cuda", "none", marks=pytest.mark.cuda),
-        pytest.param("cuda", "model", marks=pytest.mark.cuda),
-        pytest.param("cuda", "layerwise", marks=pytest.mark.cuda),
+        pytest.param("cuda", "none", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
+        pytest.param("cuda", "model", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
+        pytest.param("cuda", "layerwise", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
     ],
 )
 def test_strategy_ulysses_two_rank_parity(tmp_path, device_type, offload_mode):
