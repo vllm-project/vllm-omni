@@ -298,7 +298,7 @@ def test_joint_launch_matches_per_stream_then_cat(txt_len, img_len, force_always
     assert torch.equal(joint_v, torch.cat([txt_v, img_v], dim=1))
 
 
-def test_packed_table_skipped_when_fused_path_unavailable():
+def test_packed_table_skipped_when_fused_path_unavailable(force_always_fuse):
     """No table, no allocation, where the CUDA kernel cannot run."""
     from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
 
@@ -310,3 +310,20 @@ def test_packed_table_skipped_when_fused_path_unavailable():
         assert _packed_qk_norm_rope_table(vid, txt, 1, torch.float16) is None  # non-bf16 activations
         table = _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16)
         assert table is not None and table.dtype == torch.float32  # same dtype as the per-stream table
+        expected = torch.cat((torch.cat((txt, vid)).real, torch.cat((txt, vid)).imag), dim=-1)
+        assert torch.equal(table, expected)  # text first, as the eager cat
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_table_respects_token_gate(monkeypatch):
+    """The joint launch keeps the per-stream gate: below it main's eager chain runs."""
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    vid = torch.polar(torch.ones(64, HEAD_DIM // 2), torch.randn(64, HEAD_DIM // 2)).cuda()
+    txt = torch.polar(torch.ones(16, HEAD_DIM // 2), torch.randn(16, HEAD_DIM // 2)).cuda()
+    assert 2 * 80 < _FUSED_MIN_TOKENS
+    assert _packed_qk_norm_rope_table(vid, txt, 2, torch.bfloat16) is None
+    monkeypatch.setattr(qwen_mod, "_FUSED_MIN_TOKENS", 160)
+    assert _packed_qk_norm_rope_table(vid, txt, 2, torch.bfloat16).shape == (160, HEAD_DIM)
+    assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16) is None

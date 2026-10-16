@@ -50,7 +50,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
-    fused_qk_norm_rope_available,
+    pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     can_use_qwen_select01_triton,
@@ -72,19 +72,17 @@ def _packed_qk_norm_rope_table(
     batch_size: int,
     activation_dtype: torch.dtype,
 ) -> torch.Tensor | None:
-    """Pack text/image frequencies into a text-first ``[B*S, D]`` table.
+    """Pack text/image frequencies into a text-first ``[B*S, D]`` FP32 table.
 
-    Keep FP32 coefficients, as in the per-stream fusion. Return ``None``
-    for unsupported CUDA inputs.
+    Same coefficients and token gate as the per-stream fusion. ``None`` when
+    the CUDA kernel would not run or the joint sequence is below the gate.
     """
-    rotary_dim = 2 * vid_freqs.shape[-1]
-    if not fused_qk_norm_rope_available(vid_freqs.device, activation_dtype, rotary_dim, rotary_dim):
-        return None
     freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
-    table = torch.cat((freqs.real, freqs.imag), dim=-1)
-    if batch_size > 1:
-        table = table.unsqueeze(0).expand(batch_size, -1, -1).reshape(batch_size * freqs.shape[0], -1)
-    return table
+    if batch_size * freqs.shape[0] < _FUSED_MIN_TOKENS:
+        return None
+    return pack_qk_norm_rope_table(
+        freqs.real, freqs.imag, batch_size, dtype=torch.float32, activation_dtype=activation_dtype
+    )
 
 
 def _qwen_image_qk_norm_rope(
@@ -723,19 +721,13 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
         seq_len_txt = encoder_hidden_states.shape[1]
-        use_sp_joint_attention = (
-            self.parallel_config is not None
-            and self.parallel_config.sequence_parallel_size > 1
-            and not get_forward_context().split_text_embed_in_sp
-        )
+        sp_active = self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1
+        use_sp_joint_attention = sp_active and not get_forward_context().split_text_embed_in_sp
         # One launch for both streams, writing the joint [B, S_txt+S_img, H, D]
-        # Q/K/V attention consumes — no per-stream launches and no cats. The SP
-        # path routes the text stream through joint_* metadata, so it keeps the
-        # per-stream chain.
-        # Any sequence parallelism keeps the per-stream chain: `vid_freqs` is
+        # Q/K/V attention consumes — no per-stream launches and no cats. Any
+        # sequence parallelism keeps the per-stream chain: `vid_freqs` is
         # sharded by `_sp_plan` while `txt_freqs` stays replicated, so a joint
         # table built from the two would not line up with the local tokens.
-        sp_active = self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1
         use_fused_joint = (
             self.qk_norm
             and qk_norm_rope_table is not None
