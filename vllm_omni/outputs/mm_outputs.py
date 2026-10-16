@@ -167,6 +167,13 @@ class MultimodalPayload(Mapping):
         # Capture before merging: incoming may be this payload. Store these
         # snapshots in only one partition even if their representation changes.
         snapshots = {key: incoming[key] for key in _METADATA_TENSOR_KEYS if key in incoming}
+        # 0-d tensors cannot be concatenated, so they are per-step snapshots
+        # too. Replacing them here (not only in consolidate_tensors) keeps a
+        # key's classification stable when consolidation runs between merges.
+        for key, value in incoming.tensors.items():
+            latest = value[-1] if isinstance(value, list) and value else value
+            if key not in snapshots and isinstance(latest, torch.Tensor) and latest.ndim == 0:
+                snapshots[key] = latest
         _append_entries(self.tensors, incoming.tensors)
         _append_entries(self.metadata, incoming.metadata)
         for key, value in snapshots.items():
