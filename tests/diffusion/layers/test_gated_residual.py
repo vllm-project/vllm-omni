@@ -102,7 +102,7 @@ def test_gated_residual_supports_torch_compile(dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens", [1, 17])
 @pytest.mark.parametrize("view", ["chunk", "unbind"])
-def test_gated_residual_supports_strided_modulation_gate(dtype, tokens, view):
+def test_gated_residual_supports_strided_modulation_gate(dtype, tokens, view, mocker):
     residual = torch.randn(2, 17, 128, device="cuda", dtype=dtype)
     branch = torch.randn_like(residual)
     if view == "chunk":
@@ -112,9 +112,12 @@ def test_gated_residual_supports_strided_modulation_gate(dtype, tokens, view):
         gate_storage = torch.randn(2, tokens, 3, 128, device="cuda", dtype=dtype)
         gate = gate_storage.unbind(dim=-2)[1]
     assert not gate.is_contiguous()
+    custom_op = mocker.spy(torch.ops.vllm_omni, "gated_residual")
 
     actual = gated_residual(residual, branch, gate)
 
+    # The eager fallback gives the same values, so check that these views reach the fused op.
+    custom_op.assert_called_once()
     torch.testing.assert_close(actual, residual + branch * gate, rtol=0, atol=0)
 
 
@@ -122,7 +125,7 @@ def test_gated_residual_supports_strided_modulation_gate(dtype, tokens, view):
 @_CUDA_ONLY
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compiled", [False, True])
-def test_gated_residual_preserves_product_rounding(dtype: torch.dtype, compiled: bool):
+def test_gated_residual_preserves_product_rounding(dtype: torch.dtype, compiled: bool, mocker):
     # The low-precision product rounds to 1 + 2 * eps. An FMA instead
     # retains eps**2 after cancellation with the residual.
     eps = torch.finfo(dtype).eps
@@ -133,8 +136,14 @@ def test_gated_residual_preserves_product_rounding(dtype: torch.dtype, compiled:
     single_round = (residual.float() + branch.float() * gate.float()).to(dtype)
     assert not torch.equal(expected, single_round)
 
-    function = torch.compile(gated_residual, fullgraph=True) if compiled else gated_residual
-    actual = function(residual, branch, gate)
+    if compiled:
+        # A mock cannot be traced with fullgraph=True, so dispatch is checked in the eager case.
+        actual = torch.compile(gated_residual, fullgraph=True)(residual, branch, gate)
+    else:
+        # The eager fallback also rounds the product, so check that the fused op ran.
+        custom_op = mocker.spy(torch.ops.vllm_omni, "gated_residual")
+        actual = gated_residual(residual, branch, gate)
+        custom_op.assert_called_once()
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

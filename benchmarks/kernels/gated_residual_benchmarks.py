@@ -14,6 +14,7 @@ import argparse
 import statistics
 from collections.abc import Callable
 from importlib.metadata import version
+from unittest import mock
 
 import torch
 from vllm.platforms import current_platform
@@ -68,7 +69,7 @@ def _gate_shape(layout: str, batch_size: int, tokens: int, hidden_size: int) -> 
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--tokens", type=int, default=32760)
     parser.add_argument("--hidden-size", type=int, default=5120)
     parser.add_argument("--gate-layout", choices=("global", "batch", "token"), default="batch")
@@ -95,7 +96,12 @@ def main() -> None:
     def shared() -> torch.Tensor:
         return gated_residual(residual, branch, gate)
 
-    torch.testing.assert_close(shared(), eager(), rtol=0, atol=0)
+    # The eager fallback also matches exactly, so require the fused op before timing it.
+    fused_op = torch.ops.vllm_omni.gated_residual
+    with mock.patch.object(torch.ops.vllm_omni, "gated_residual", wraps=fused_op) as custom_op:
+        torch.testing.assert_close(shared(), eager(), rtol=0, atol=0)
+    if custom_op.call_count != 1:
+        raise RuntimeError(f"Gate {gate_shape} took the eager fallback, so there is no fused op to time")
     print("Correctness: exact match with eager PyTorch")
     print(f"GPU: {current_platform.get_device_name()}")
     print(

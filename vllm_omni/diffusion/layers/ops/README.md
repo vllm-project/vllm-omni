@@ -96,12 +96,13 @@ pytest -q tests/diffusion/layers/test_gated_residual.py \
 ```
 
 The [microbenchmark](../../../../benchmarks/kernels/gated_residual_benchmarks.py)
-checks equality before timing and reports the workload, environment, warmed mean
-and standard deviation, and peak extra tensor allocation:
+checks equality and fused-op dispatch before timing, and reports the workload,
+environment, warmed mean and standard deviation, and peak extra tensor
+allocation:
 
 ```bash
 python -m benchmarks.kernels.gated_residual_benchmarks \
-  --batch-size 1 --tokens 32760 --hidden-size 5120 \
+  --batch-size 2 --tokens 32760 --hidden-size 5120 \
   --gate-layout batch --dtype bfloat16 --seed 17 \
   --warmup 25 --iterations 100 --repeats 20
 ```
