@@ -15,7 +15,7 @@ class SinusoidalPosEmb(torch.nn.Module):
         dim: Embedding width, even: half sines, half cosines.
     """
 
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
@@ -41,7 +41,7 @@ class Block1D(torch.nn.Module):
         groups: GroupNorm groups.
     """
 
-    def __init__(self, dim, dim_out, groups=8):
+    def __init__(self, dim: int, dim_out: int, groups: int = 8):
         super().__init__()
         self.block = torch.nn.Sequential(
             torch.nn.Conv1d(dim, dim_out, 3, padding=1),
@@ -65,7 +65,7 @@ class ResnetBlock1D(torch.nn.Module):
         groups: GroupNorm groups.
     """
 
-    def __init__(self, dim, dim_out, time_emb_dim, groups=8):
+    def __init__(self, dim: int, dim_out: int, time_emb_dim: int, groups: int = 8):
         super().__init__()
         self.mlp = torch.nn.Sequential(nn.Mish(), torch.nn.Linear(time_emb_dim, dim_out))
 

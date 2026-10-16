@@ -271,7 +271,7 @@ class S3GenDecoder(nn.Module):
         estimator = ConditionalDecoder(
             in_channels=320,
             out_channels=80,
-            channels=[256],
+            channels=(256,),
             dropout=0.0,
             attention_head_dim=64,
             n_blocks=4,

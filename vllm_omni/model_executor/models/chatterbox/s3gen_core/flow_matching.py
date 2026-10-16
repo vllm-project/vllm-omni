@@ -65,7 +65,15 @@ class CausalConditionalCFM(torch.nn.Module):
         t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
 
-    def solve_euler(self, x, t_span, mu, mask, spks, cond):
+    def solve_euler(
+        self,
+        x: torch.Tensor,
+        t_span: torch.Tensor,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
         """Euler steps with classifier-free guidance, the conditional and unconditional rows in one batch.
 
         Args:
@@ -115,7 +123,15 @@ class CausalConditionalCFM(torch.nn.Module):
 
         return x.to(in_dtype)
 
-    def basic_euler(self, x, t_span, mu, mask, spks, cond):
+    def basic_euler(
+        self,
+        x: torch.Tensor,
+        t_span: torch.Tensor,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
         """Plain Euler steps, each also giving the estimator its end time, as meanflow needs.
 
         Args:

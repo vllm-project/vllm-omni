@@ -113,16 +113,16 @@ class ConditionalDecoder(nn.Module):
 
     def __init__(
         self,
-        in_channels=320,
-        out_channels=80,
-        channels=[256],
-        dropout=0.0,
-        attention_head_dim=64,
-        n_blocks=4,
-        num_mid_blocks=12,
-        num_heads=8,
-        act_fn="gelu",
-        meanflow=False,
+        in_channels: int = 320,
+        out_channels: int = 80,
+        channels: tuple[int, ...] = (256,),
+        dropout: float = 0.0,
+        attention_head_dim: int = 64,
+        n_blocks: int = 4,
+        num_mid_blocks: int = 12,
+        num_heads: int = 8,
+        act_fn: str = "gelu",
+        meanflow: bool = False,
     ):
         super().__init__()
         if len(channels) != 1:
