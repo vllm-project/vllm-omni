@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """
-Cosmos3-Nano T2V stability: OmniServer (diffusion) + ``diffusion_benchmark_serving.py`` / ``v1/videos``.
-
+Cosmos3-Nano T2V stability: OmniServer (diffusion) + ``diffusion_benchmark_serving.py``.
 Configuration: ``tests/dfx/stability/tests/test_cosmos3.json``.
 """
 
