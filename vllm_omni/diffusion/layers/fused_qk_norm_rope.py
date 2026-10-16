@@ -27,6 +27,13 @@ two); the half-split mode keeps the pre-existing kernel and its MiniMax-H3
 geometry contract (``head_dim == 128``, ``rotary_dim == 96``). Ascend
 composes its RMSNorm and rotary fused primitives on the MiniMax-H3 geometry;
 unsupported inputs use the eager reference.
+
+``cuda_rms_norm=True`` (single-stream and joint ops) reproduces the vLLM CUDA
+RMSNorm reduction order and keeps the rotation free of FMA contraction, so for
+BF16 ``head_dim == rotary_dim == 128`` the fused output is bit-identical to
+vLLM ``RMSNorm`` followed by eager RoPE. Consumers whose eager chain is that
+CUDA kernel pass it; consumers whose reference is the Triton reduction (the
+per-stream fused path) keep the default.
 """
 
 from __future__ import annotations
@@ -429,7 +436,7 @@ if HAS_TRITON:
         heads_per_program: tl.constexpr,
         q_head_groups: tl.constexpr,
         kv_head_groups: tl.constexpr,
-        interleaved: tl.constexpr,
+        cuda_rms_norm: tl.constexpr,
     ):
         """Two-stream Q/K RMSNorm + RoPE and V gather, written in attention's
         joint input layout.
@@ -446,9 +453,10 @@ if HAS_TRITON:
 
         Grid axis 0 enumerates joint output rows; axis 1 assigns Q, then K,
         then V head groups (V programs only gather). Q/K use
-        ``_norm_rope_tile`` — ``_qk_norm_rope_kernel``'s arithmetic unchanged;
-        the row selects its stream's pointer, weights and strides.
-        ``rope_table`` is indexed by the joint output row.
+        ``_norm_rope_tile`` in its interleaved mode — ``_qk_norm_rope_kernel``'s
+        arithmetic unchanged, including ``cuda_rms_norm``; the row selects its
+        stream's pointer, weights and strides. ``rope_table`` is indexed by the
+        joint output row.
         """
         # Preserve 64-bit addressing when a stream's projection view spans 2**31 elements.
         token = tl.program_id(0).to(tl.int64)
@@ -522,7 +530,8 @@ if HAS_TRITON:
                 head_dim,
                 rotary_half,
                 eps,
-                interleaved,
+                True,
+                cuda_rms_norm,
             )
         else:
             offsets = in_row * in_stride_t + heads[:, None] * in_stride_h + dims[None, :] * in_stride_d
@@ -861,7 +870,7 @@ def _launch_fused_joint_qkv_norm_rope(
     k1_weight: torch.Tensor,
     rope_table: torch.Tensor,
     eps: float,
-    interleaved: bool,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch the two-stream kernel; ``q_i``/``k_i``/``v_i`` are ``[B, S_i, H, D]``."""
     batch, seq_len_0, q_heads, head_dim = q0.shape
@@ -883,12 +892,7 @@ def _launch_fused_joint_qkv_norm_rope(
     out_q_v = out_q.view(tokens, q_heads, head_dim)
     out_k_v = out_k.view(tokens, kv_heads, head_dim)
     out_v_v = out_v.view(tokens, kv_heads, head_dim)
-    if interleaved:
-        heads_per_program = _INTERLEAVED_HEADS_PER_PROGRAM
-        num_warps, num_stages = 1, 2
-    else:
-        heads_per_program = _HEADS_PER_PROGRAM
-        num_warps, num_stages = 8, 3
+    heads_per_program = _INTERLEAVED_HEADS_PER_PROGRAM
     q_head_groups = triton.cdiv(q_heads, heads_per_program)
     kv_head_groups = triton.cdiv(kv_heads, heads_per_program)
     grid = (tokens, q_head_groups + 2 * kv_head_groups)
@@ -928,9 +932,10 @@ def _launch_fused_joint_qkv_norm_rope(
         heads_per_program=heads_per_program,
         q_head_groups=q_head_groups,
         kv_head_groups=kv_head_groups,
-        interleaved=interleaved,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        cuda_rms_norm=cuda_rms_norm,
+        num_warps=1,
+        num_stages=2,
+        enable_fp_fusion=not cuda_rms_norm,
     )
     return out_q, out_k, out_v
 
@@ -950,20 +955,18 @@ def _eager_joint_qkv_norm_rope(
     eps: float,
     head_dim: int,
     rotary_dim: int,
-    interleaved: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference: per-stream RMSNorm, concatenate along the sequence, RoPE."""
+    """Reference: per-stream RMSNorm, concatenate along the sequence, interleaved RoPE."""
     q = torch.cat((F.rms_norm(q0, (head_dim,), q0_weight, eps), F.rms_norm(q1, (head_dim,), q1_weight, eps)), dim=1)
     k = torch.cat((F.rms_norm(k0, (head_dim,), k0_weight, eps), F.rms_norm(k1, (head_dim,), k1_weight, eps)), dim=1)
     v = torch.cat((v0, v1), dim=1)
     batch, seq_total, q_heads, _ = q.shape
     kv_heads = k.shape[2]
-    rope_dtype = torch.float32 if interleaved else None
     q = _apply_rope_table(
-        q.reshape(-1, q_heads, head_dim), rope_table, rotary_dim, interleaved=interleaved, dtype=rope_dtype
+        q.reshape(-1, q_heads, head_dim), rope_table, rotary_dim, interleaved=True, dtype=torch.float32
     )
     k = _apply_rope_table(
-        k.reshape(-1, kv_heads, head_dim), rope_table, rotary_dim, interleaved=interleaved, dtype=rope_dtype
+        k.reshape(-1, kv_heads, head_dim), rope_table, rotary_dim, interleaved=True, dtype=torch.float32
     )
     return q.view(batch, seq_total, q_heads, head_dim), k.view(batch, seq_total, kv_heads, head_dim), v
 
@@ -983,12 +986,9 @@ def _fused_joint_qkv_norm_rope_impl(
     eps: float,
     head_dim: int,
     rotary_dim: int,
-    interleaved: bool,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not _fused_cuda_supported(q0, k0, head_dim, rotary_dim, interleaved) or not interleaved:
-        # The half-split geometry gate above is the MiniMax-H3 contract of the
-        # per-tensor kernel; the joint kernel takes any even rotary width, but
-        # its half-split mode is test-covered only, like the single-stream one.
+    if not _fused_cuda_supported(q0, k0, head_dim, rotary_dim, interleaved=True):
         return _eager_joint_qkv_norm_rope(
             q0,
             k0,
@@ -1004,10 +1004,9 @@ def _fused_joint_qkv_norm_rope_impl(
             eps,
             head_dim,
             rotary_dim,
-            interleaved,
         )
     return _launch_fused_joint_qkv_norm_rope(
-        q0, k0, v0, q1, k1, v1, q0_weight, k0_weight, q1_weight, k1_weight, rope_table, eps, interleaved=True
+        q0, k0, v0, q1, k1, v1, q0_weight, k0_weight, q1_weight, k1_weight, rope_table, eps, cuda_rms_norm
     )
 
 
@@ -1026,9 +1025,9 @@ def _fused_joint_qkv_norm_rope_fake(
     eps: float,
     head_dim: int,
     rotary_dim: int,
-    interleaved: bool,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    del q0_weight, k0_weight, q1_weight, k1_weight, rope_table, eps, head_dim, rotary_dim, interleaved
+    del q0_weight, k0_weight, q1_weight, k1_weight, rope_table, eps, head_dim, rotary_dim, cuda_rms_norm
     seq_total = q0.shape[1] + q1.shape[1]
     return tuple(t.new_empty((t.shape[0], seq_total, t.shape[2], t.shape[3])) for t in (q0, k0, v0))
 
@@ -1058,9 +1057,9 @@ def fused_joint_qkv_norm_rope(
     eps: float,
     *,
     rotary_dim: int | None = None,
-    interleaved: bool = True,
+    cuda_rms_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused two-stream Q/K RMSNorm + RoPE (and V gather) into the joint sequence.
+    """Fused two-stream Q/K RMSNorm + interleaved RoPE (and V gather) into the joint sequence.
 
     ``q_i``/``k_i``/``v_i`` are ``[B, S_i, H, D]`` (stream 0 = text, stream
     1 = image for Flux.2); each stream's Q/K is normalized with its own
@@ -1071,7 +1070,9 @@ def fused_joint_qkv_norm_rope(
     ``[B * (S_0 + S_1), rotary_dim]`` in joint token order
     (``[cos(theta) | sin(theta)]``, activation dtype or float32), so the
     same per-forward table serves this op and ``fused_qk_norm_rope`` on the
-    single-stream blocks that follow.
+    single-stream blocks that follow. ``cuda_rms_norm`` is the single-stream
+    op's: bit-identical to vLLM's CUDA RMSNorm + eager RoPE for BF16
+    ``head_dim == rotary_dim == 128``.
     """
     streams = (q0, k0, v0, q1, k1, v1)
     if any(t.ndim != 4 for t in streams):
@@ -1105,13 +1106,19 @@ def fused_joint_qkv_norm_rope(
     tokens = batch * (seq_len_0 + seq_len_1)
     if rope_table.shape != (tokens, rotary_dim):
         raise ValueError(f"Expected rope_table [{tokens}, {rotary_dim}], got {tuple(rope_table.shape)}")
+    if cuda_rms_norm and not (
+        _fused_cuda_supported(q0, k0, head_dim, rotary_dim, interleaved=True)
+        and head_dim == rotary_dim == 128
+        and all(w.dtype == torch.bfloat16 for w in weights)
+    ):
+        raise ValueError("cuda_rms_norm requires BF16 CUDA inputs/weights and head_dim=rotary_dim=128")
 
     weights = tuple(w.contiguous() for w in weights)
     rope_table = rope_table.contiguous()
-    if not _fused_cuda_supported(q0, k0, head_dim, rotary_dim, interleaved) or not interleaved:
-        return _fused_joint_qkv_norm_rope_impl(*streams, *weights, rope_table, eps, head_dim, rotary_dim, interleaved)
+    if not _fused_cuda_supported(q0, k0, head_dim, rotary_dim, interleaved=True):
+        return _fused_joint_qkv_norm_rope_impl(*streams, *weights, rope_table, eps, head_dim, rotary_dim, cuda_rms_norm)
     return torch.ops.vllm_omni.fused_joint_qkv_norm_rope(
-        *streams, *weights, rope_table, eps, head_dim, rotary_dim, interleaved
+        *streams, *weights, rope_table, eps, head_dim, rotary_dim, cuda_rms_norm
     )
 
 
@@ -1142,19 +1149,24 @@ def pack_qk_norm_rope_table(
     head_dim: int | None = None,
     sequence_parallel_size: int | None = None,
     identity_rows: int = 0,
+    cuda_rms_norm: bool = False,
 ) -> torch.Tensor | None:
     """Pack shared ``[S, D/2]`` coefficients into a ``[B*S, D]`` table.
 
     Append identity rotations for trailing unrotated tokens, then repeat
     the table per batch. Return ``None`` for unsupported CUDA inputs or
     sequence parallelism, where attention keeps its per-stream path.
+    ``cuda_rms_norm`` additionally requires the geometry the CUDA-matching
+    reduction supports (``head_dim == rotary_dim == 128``), so consumers
+    passing it to the ops never fuse outside that contract.
     """
     if sequence_parallel_size is not None and sequence_parallel_size > 1:
         return None
     rotary_dim = 2 * cos.shape[-1]
-    if not fused_qk_norm_rope_available(
-        cos.device, activation_dtype or dtype, head_dim if head_dim is not None else rotary_dim, rotary_dim
-    ):
+    head_dim = rotary_dim if head_dim is None else head_dim
+    if not fused_qk_norm_rope_available(cos.device, activation_dtype or dtype, head_dim, rotary_dim):
+        return None
+    if cuda_rms_norm and not head_dim == rotary_dim == 128:
         return None
     tokens = batch_size * (cos.shape[0] + identity_rows)
     table = torch.cat((cos, sin), dim=-1).to(dtype)
