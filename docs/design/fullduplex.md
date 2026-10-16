@@ -691,8 +691,10 @@ consulted. `unit_output_complete(unit, final_stage_id, new_output, new_context,
 state, runtime_config) -> bool` says when the oldest speaking unit's
 final-stage output is complete; `unit` carries only its session-wide index,
 its epoch and its ordinal in that epoch, and two flags (the stage before the
-final one ended its segment; a final-stage output credited to it marked a
-segment end), and the engine keeps no output history (default: the final
+final one ended its segment; the final stage ended its segment for it: the
+final stage's segment ends go to the speaking units in order, so a unit that
+still waits for its upstream segment end does not take the next unit's), and
+the engine keeps no output history (default: the final
 stage marks one segment end per unit; a final stage that streams across unit
 boundaries keeps its own markers or coverage in `state`, which the engine
 replaces with an empty dict whenever a cancel starts a new epoch, so frame

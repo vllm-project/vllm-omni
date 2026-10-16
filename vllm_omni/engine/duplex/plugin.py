@@ -331,7 +331,9 @@ class DuplexUnitOutputs:
     index: int
     #: Whether the stage just before the final stage reported its segment end for this unit.
     upstream_segment_finished: bool
-    #: Whether a final-stage output credited to this unit marked a segment end.
+    #: Whether this unit's final-stage segment end arrived: the final stage's n-th segment end
+    #: of the epoch goes to the n-th speaking unit (held until that unit speaks), even while
+    #: an older unit still waits for its upstream segment end.
     final_segment_finished: bool
     #: Session epoch the unit was submitted in (a cancel starts a new one).
     epoch: int = 0
@@ -659,7 +661,9 @@ class DuplexModelPlugin(ABC):
         """Input clock: is the final-stage output of ``unit`` (the oldest speaking unit) complete?
 
         Called after every final-stage output (``new_output`` / ``new_context``,
-        credited to ``unit``), after the segment end of the stage just before
+        credited to ``unit``; a final-stage segment end sets
+        ``final_segment_finished`` on the unit it belongs to, which may be a
+        later speaking unit), after the segment end of the stage just before
         the final stage, and, once a unit completed, again for the next one
         with no new output (so one output may complete several units). The
         engine only calls it with a speaking unit (``unit`` is never None; the
