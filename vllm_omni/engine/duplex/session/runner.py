@@ -21,9 +21,11 @@ orchestrator loop (the session is never touched from another thread):
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
@@ -385,7 +387,7 @@ class DuplexSessionRunner:
             return
         self._begin_close(reason)
         self.model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         self.model_state.input_since_commit = False
         self.model_state.speech_since_commit = False
         self.model_state.clear_committed_audio()
@@ -504,7 +506,7 @@ class DuplexSessionRunner:
                 session.release_pending_turn()
             elif isinstance(item, AppendAudio):
                 admission = len(item.audio) + sum(len(frame) for frame in item.video_frames)
-                session.release_input_bytes(admission)
+                session.release_input_bytes(admission, queued=True)
             return
         await self._on_command(item)
 
@@ -562,12 +564,13 @@ class DuplexSessionRunner:
         session = self.session
         projector = self._require_projector()
         if isinstance(command, AppendAudio):
-            # The manager reserved the wire size (audio + video) at admission.
-            # Release that full amount as the command leaves the mailbox; the
-            # handler re-reserves whatever the input buffer actually retains.
+            # The manager charged the wire size (audio + video) at admission.
+            # Keep it charged across decoding/VAD and release it once: at the
+            # PCM handoff, or on an earlier return, error or cancellation.
             admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
-            session.release_input_bytes(admission)
-            await self._on_append_audio(command.payload())
+            with ExitStack() as reservation:
+                reservation.callback(session.release_input_bytes, admission, queued=True)
+                await self._on_append_audio(command.payload(), release_queued_input=reservation.close)
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
             self._emit_error(
@@ -685,7 +688,7 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
@@ -819,7 +822,13 @@ class DuplexSessionRunner:
         self.tasks.active_response_task = None
         return True
 
-    async def _on_append_audio(self, event: dict[str, object]) -> None:
+    async def _on_append_audio(
+        self,
+        event: dict[str, object],
+        *,
+        release_queued_input: Callable[[], None] | None = None,
+    ) -> None:
+        """Prepare audio, then replace its admission charge with a PCM reservation."""
         session = self.session
         model_state = self.model_state
         session.mark_user_input_activity()
@@ -979,17 +988,24 @@ class DuplexSessionRunner:
             self._maybe_schedule_vad_commit(vad_result)
             return
         session.mark_user_input_activity()
-        model_state.input_since_commit = True
-        model_state.speech_since_commit = model_state.speech_since_commit or overlap_policy.input_looks_like_speech(
+        speech_since_commit = model_state.speech_since_commit or overlap_policy.input_looks_like_speech(
             self.session, event, payload
         )
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
         pending_before = model_state.audio_buffer.pending_byte_count
+        limit = int(self.manager.runtime_config.max_pending_input_bytes_per_session)
+        # No await between releasing admission bytes and reserving PCM bytes.
+        if release_queued_input is not None:
+            release_queued_input()
+            # Admission already applied backpressure; the handoff only converts
+            # the wire charge into decoded PCM bytes, which can be larger
+            # (pcm16 -> f32, resampling), so it must not drop admitted audio.
+            # This is a soft limit: pending PCM can overshoot by the decode
+            # expansion of the queued backlog (up to 8x for 8 kHz G.711) until
+            # admission sees it; charge admission in PCM units if that matters.
+            limit = sys.maxsize
         try:
-            if not session.reserve_input_bytes(
-                raw_audio_bytes,
-                limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
-            ):
+            if not session.reserve_input_bytes(raw_audio_bytes, limit=limit):
                 self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
                 return
             # Full-duplex: emit each ~chunk_period of audio so the model runs
@@ -1005,16 +1021,16 @@ class DuplexSessionRunner:
             session.release_input_bytes(raw_audio_bytes)
             self._emit_error("bad_event", str(exc))
             return
+        # Only audio the buffer actually took counts as input for the next commit.
+        model_state.input_since_commit = True
+        model_state.speech_since_commit = speech_since_commit
         if pcm_reservation is None:
             # Commit-only buffers (AURA) accumulate in place and return None.
             # Undo the speculative audio reserve and re-apply the exact pending
             # delta so retained video frames are counted (and later released).
             session.release_input_bytes(raw_audio_bytes)
             pending_delta = model_state.audio_buffer.pending_byte_count - pending_before
-            if pending_delta > 0 and not session.reserve_input_bytes(
-                pending_delta,
-                limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
-            ):
+            if pending_delta > 0 and not session.reserve_input_bytes(pending_delta, limit=limit):
                 self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
                 return
             if pending_delta < 0:
@@ -1361,7 +1377,7 @@ class DuplexSessionRunner:
         playback_was_active = helpers.assistant_playback_active(self.session)
         if event_type in {"input.cancel", "barge_in"}:
             model_state.audio_buffer.clear()
-            session.release_all_input_bytes()
+            session.release_buffered_input_bytes()
             model_state.input_since_commit = False
             model_state.speech_since_commit = False
             model_state.clear_committed_audio()
@@ -1766,7 +1782,7 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
@@ -1909,7 +1925,7 @@ class DuplexSessionRunner:
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         model_state.audio_buffer.clear()
-        session.release_all_input_bytes()
+        session.release_buffered_input_bytes()
         model_state.clear_committed_audio()
         self.emit(
             {

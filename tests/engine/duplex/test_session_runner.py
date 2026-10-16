@@ -550,6 +550,203 @@ async def test_clear_input_drops_buffered_audio() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["decode", "vad"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch, phase, fails) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=64_000),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    owner = h.runner if phase == "decode" else h.runner.control
+    method = "offload" if phase == "decode" else "run_turn_detection"
+    original = getattr(owner, method)
+    on_command = h.runner._on_command
+
+    async def track_command(command):
+        try:
+            await on_command(command)
+        finally:
+            finished.set()
+
+    async def blocked(*args, **kwargs):
+        started.set()
+        await release.wait()
+        if fails:
+            raise ValueError("preprocessing failed")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, blocked)
+    monkeypatch.setattr(h.runner, "_on_command", track_command)
+    try:
+        h.submit(append_audio(samples=8000))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 32_000
+        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        events = await h.settle()
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=2.0)
+        events = await h.settle()
+        assert h.session.pending_input_bytes == (0 if fails else 32_000)
+        assert h.session._input.queued_input_bytes == 0
+        if fails:
+            assert any(event.type == "error" and "preprocessing failed" in event.message for event in events)
+        else:
+            assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_clear_input_preserves_queued_append_byte_reservations(monkeypatch, committed) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=64_000),
+    )
+    blocked = asyncio.Event()
+    resume = asyncio.Event()
+    on_command = h.runner._on_command
+
+    async def pause_queued_append(command):
+        if command.event_id == "queued":
+            blocked.set()
+            await resume.wait()
+        await on_command(command)
+
+    try:
+        await h.run(append_audio(samples=8000))
+        if committed:
+            await h.run(commands.Commit(create_response=False))
+            assert h.runner.model_state.committed_audio_reserved_bytes == 32_000
+        assert h.session.pending_input_bytes == 32_000
+        monkeypatch.setattr(h.runner, "_on_command", pause_queued_append)
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(samples=8000, event_id="queued"))
+        assert h.session.pending_input_bytes == 64_000
+        await asyncio.wait_for(blocked.wait(), timeout=2.0)
+
+        # Only the old buffer was cleared; the later append still owns its budget.
+        assert h.session.pending_input_bytes == 32_000
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert h.runner.model_state.committed_audio_reserved_bytes == 0
+        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        events = await h.settle()
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        resume.set()
+        await h.settle()
+        assert h.session.pending_input_bytes == 32_000
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        resume.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cleared_in_flight_append_cannot_release_later_audio(monkeypatch) -> None:
+    h = await open_harness()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    processed = asyncio.Event()
+    submit = h.port.submit
+    on_command = h.runner._on_command
+
+    async def blocked_submit(submission):
+        started.set()
+        await release.wait()
+        return await submit(submission)
+
+    async def observe_command(command):
+        await on_command(command)
+        if command.event_id == "later":
+            processed.set()
+
+    monkeypatch.setattr(h.port, "submit", blocked_submit)
+    monkeypatch.setattr(h.runner, "_on_command", observe_command)
+    try:
+        h.submit(append_audio())
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 64_000
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(samples=8000, event_id="later"))
+        await asyncio.wait_for(processed.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 32_000
+        release.set()
+        await h.settle()
+        assert h.session.pending_input_bytes == 32_000
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_append_chained_behind_a_cleared_append_still_submits() -> None:
+    h = await open_harness()
+    h.port.submit_gate = asyncio.Event()
+    try:
+        before = len(h.port.submissions)
+        h.submit(append_audio(event_id="in-flight"))
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        h.submit(append_audio(event_id="cleared"))
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(event_id="after-clear"))
+        for _ in range(200):
+            if h.runner._mailbox.empty() and len(h.runner.tasks.append_tasks) == 3:
+                break
+            await asyncio.sleep(0.005)
+        assert len(h.runner.tasks.append_tasks) == 3
+
+        h.port.submit_gate.set()
+        await h.settle()
+        # The cleared append is called off; the one behind it is not rolled back.
+        assert len(h.port.submissions) == before + 2
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert h.session.pending_input_bytes == 0
+    finally:
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_admitted_pcm16_append_is_not_dropped_when_decoding_grows_it() -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=40_000),
+    )
+    try:
+        pcm16 = np.full(16000, 1600, dtype="<i2").tobytes()  # 32_000 wire bytes, 64_000 as f32
+        events = await h.run(commands.AppendAudio(audio=pcm16, format="pcm16", sample_rate_hz=16000, is_speech=True))
+        assert [event for event in events if event.type == "error"] == []
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 64_000
+        assert h.runner.model_state.input_since_commit
+        # The overshoot is charged, so the next append is refused at admission.
+        events = await h.run(append_audio(samples=10, event_id="next"))
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "next"
+            for event in events
+        )
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commit_without_audio_is_rejected() -> None:
     h = await open_harness()
     try:
@@ -1558,7 +1755,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
         await orchestrator.session_manager.shutdown()
 
 
-def _response_request_metrics_of(event: object) -> dict[str, object]:
+def _response_request_metrics_of(event: DuplexEvent) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")
@@ -1831,7 +2028,7 @@ async def test_input_clear_racing_a_queued_append_drops_it_as_the_clients_doing(
 
         h.port.submit_gate.set()
         events = await h.settle()
-        assert queued.done() and queued.result() is False, "the cleared append never ran"
+        assert queued.done() and queued.result() is True, "called off, not failed: later appends still run"
         assert len(h.port.submissions) == 1, "only the append that was already in flight reached the stage"
         assert [event.type for event in events if event.type in {"error", "response.done", "session.closed"}] == []
         assert h.session.pending_input_bytes == 0
