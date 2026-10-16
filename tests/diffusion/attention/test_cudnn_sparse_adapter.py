@@ -12,6 +12,7 @@ from tests.helpers.block_sparse import (
     make_attention_inputs,
     selected_attention_reference,
 )
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.cudnn_attn import CuDNNAttentionBackend, CuDNNSparseAdapter
 from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
 
@@ -89,7 +90,7 @@ def hopper_bsa():
     torch.compiler.reset()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_native_ignored_selection_padding(hopper_bsa):
     q, k, v = make_attention_inputs(heads=4, kv_heads=1, q_len=128, kv_len=193)
@@ -103,7 +104,7 @@ def test_native_ignored_selection_padding(hopper_bsa):
     torch.testing.assert_close(actual.float(), expected, atol=0.004, rtol=0.02)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_native_role_dispatch_request_preparation_and_fullgraph(hopper_bsa, monkeypatch):
     from vllm_omni.diffusion.attention import layer as layer_mod
@@ -162,7 +163,7 @@ def test_native_role_dispatch_request_preparation_and_fullgraph(hopper_bsa, monk
     assert torch.count_nonzero(output[:, 128:]) == 0
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
 @torch.inference_mode()
 def test_dynamic_fullgraph_patterns_and_owners(hopper_bsa, kv_heads):
@@ -175,7 +176,7 @@ def test_dynamic_fullgraph_patterns_and_owners(hopper_bsa, kv_heads):
         torch.compiler.reset()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @torch.inference_mode()
 def test_native_dynamic_rejection_preserves_provider_error(hopper_bsa):
     adapter = CuDNNSparseAdapter()
