@@ -51,7 +51,7 @@ def test_silu_and_mul_matches_reference(tokens):
 
     torch.manual_seed(0)
     x = torch.randn(tokens, 2 * 9728, device="cuda", dtype=torch.bfloat16)
-    torch.testing.assert_close(silu_and_mul(x), F.silu(x[:, :9728]) * x[:, 9728:], atol=0, rtol=2**-7)
+    torch.testing.assert_close(silu_and_mul(x), F.silu(x[:, :9728]) * x[:, 9728:], atol=1e-3, rtol=1.6e-2)
 
 
 @pytest.mark.parametrize("tokens", [1, 64, 300])

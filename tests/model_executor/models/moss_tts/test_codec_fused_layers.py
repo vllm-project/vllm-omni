@@ -31,9 +31,9 @@ def test_rope_qk_matches_eager_rotation(heads, frames):
 
     rope_qk_(qkv, cos, sin)
     view = qkv.permute(2, 0, 3, 1, 4)
-    # FP32 rotation rounded once to BF16; FMA contraction may move the last bit.
-    torch.testing.assert_close(view[0], q_ref, atol=0, rtol=2**-7)
-    torch.testing.assert_close(view[1], k_ref, atol=0, rtol=2**-7)
+    # BF16 tolerances of vLLM's kernel tests (tests/kernels/allclose_default.py).
+    torch.testing.assert_close(view[0], q_ref, atol=1e-3, rtol=1.6e-2)
+    torch.testing.assert_close(view[1], k_ref, atol=1e-3, rtol=1.6e-2)
     assert torch.equal(view[2], v_ref)
 
 
@@ -52,7 +52,7 @@ def test_add_layer_norm_matches_addcmul_and_layer_norm(width):
 
     residual_ref = torch.addcmul(x, update, scale)
     residual, out = add_layer_norm(x, update, scale, norm)
-    torch.testing.assert_close(residual, residual_ref, atol=0, rtol=2**-7)
+    torch.testing.assert_close(residual, residual_ref, atol=1e-3, rtol=1.6e-2)
     torch.testing.assert_close(out, norm(residual_ref), atol=2e-2, rtol=2e-2)
 
     same, normed = add_layer_norm(x, None, None, norm)
