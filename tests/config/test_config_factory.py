@@ -3174,7 +3174,14 @@ class TestPlatformOverrides:
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
             "local_compile_audio_sampler": True,
+            "mrv2_eager_mtp": True,
         }
+        inductor_tuning = {
+            "triton.enable_pdl": True,
+            "coordinate_descent_tuning": True,
+            "max_autotune_pointwise": True,
+        }
+        assert args["compilation_config"]["inductor_compile_config"] == inductor_tuning
         extra = deploy.connectors["shm"]["extra"]
         assert extra["initial_codec_chunk_frames"] == 1
         assert extra["codec_chunk_frames"] == 15
@@ -3190,7 +3197,11 @@ class TestPlatformOverrides:
         assert compilation["mode"] == 3 and compilation["backend"] == "inductor"
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
-        assert compilation["inductor_compile_config"] == {"combo_kernels": False, "benchmark_combo_kernel": False}
+        assert compilation["inductor_compile_config"] == {
+            **inductor_tuning,
+            "combo_kernels": False,
+            "benchmark_combo_kernel": False,
+        }
         for variant in ("moss_tts_delay", "moss_tts_realtime"):
             assert not any(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config(variant).stages)
 

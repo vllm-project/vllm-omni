@@ -132,9 +132,9 @@ PROCESS_KILL_ERROR_KEYWORDS = (
     "500",
     "503",
 )
-# Prefix match for vLLM-titled children (``VLLM::Worker``, ``VLLM::StageEngineCoreProc_*``, …).
-# Must be a literal substring of ``name``/``cmdline`` — no trailing whitespace (would break match).
-RUNTIME_WORKER_PATTERN = "VLLM::"
+# Text chat is the thinker, stage 0. ``VLLM::`` with limit=1 can kill stage 1
+# first and leave the request path alive. Match the stage name literally.
+RUNTIME_WORKER_PATTERN = "StageEngineCoreProc_stage0"
 # RFC#2366 signal x target matrix:
 # - worker: SIGTERM, SIGKILL
 # - worker with-load: skipped (issue#8912)

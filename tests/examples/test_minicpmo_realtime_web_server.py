@@ -113,6 +113,7 @@ def test_qwen_config_does_not_inject_reference_voice():
     assert '"profile": "qwen3-turn"' in page
     assert '"turnMode": "vad"' in page
     assert '"refAudio": null' in page
+    assert '"speechInput": false' in page
     for name in ("common", "minicpm_native", "qwen3_turn", "aura_ptt"):
         assert client.get(f"/static/profiles/{name}.js").status_code == 200
     with pytest.raises(ValueError, match="ref-audio"):
@@ -146,6 +147,9 @@ def test_joyai_profile_defaults_and_static_asset():
     assert client.get("/static/profiles/joyai_turn.js").status_code == 200
     with pytest.raises(ValueError, match="ref-audio"):
         build_app(profile="joyai-turn", ref_audio="unused.wav")
+    speech = TestClient(build_app(profile="joyai-turn", speech_input=True, turn_mode="vad"))
+    assert '"speechInput": true' in speech.get("/").text
+    assert '"turnMode": "vad"' in speech.get("/").text
 
 
 def test_proxy_reports_unreachable_backend(monkeypatch):

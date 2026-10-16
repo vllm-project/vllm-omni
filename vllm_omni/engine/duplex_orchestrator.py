@@ -163,14 +163,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             prompt=getattr(req_state, "prompt", None),
             finished=finished,
         )
-        if isinstance(transcript, str) and transcript:
-            payload: dict[str, object] = {"type": "input.transcribed", "transcript": transcript}
-            prompt = getattr(req_state, "prompt", None)
-            info = prompt.get("additional_information") if isinstance(prompt, dict) else None
-            item_id = info.get("realtime_item_id") if isinstance(info, dict) else None
-            if isinstance(item_id, str) and item_id:
-                payload["realtime_item_id"] = item_id
-            runner.emit(payload)
+        prompt = getattr(req_state, "prompt", None)
+        info = prompt.get("additional_information") if isinstance(prompt, dict) else None
+        item_id = info.get("realtime_item_id") if isinstance(info, dict) else None
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=req_state.session_id,
@@ -187,6 +182,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_metrics,
             request_id=request_id,
             context=context,
+            input_transcript=transcript,
+            input_item_id=item_id if isinstance(item_id, str) else None,
         )
 
     async def _report_duplex_session_request_error(
@@ -342,6 +339,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 prompt=None,
                 sampling_params_list=list(context.sampling_params),
                 final_stage_id=context.final_stage_id,
+                entry_stage_id=context.stage_id,
                 request_timestamp=_time.time(),
                 session_owned=True,
                 session_id=context.session_id,

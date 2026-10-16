@@ -255,17 +255,23 @@ def _record_raw_first_audio(transfer_manager: Any, req_id: str, multimodal_outpu
         transfer_manager.request_payload[req_id] = {"first_audio": True}
 
 
-def _raw_new_frames(multimodal_output: Any) -> torch.Tensor | None:
+def _raw_new_frames(multimodal_output: Any) -> torch.Tensor | np.ndarray | None:
+    # MRV2 Local runners hand over host rows as NumPy views of one owned copy.
     if isinstance(multimodal_output, Mapping):
         codes_dict = multimodal_output.get("codes", {}) or {}
         new_frames = codes_dict.get("audio")
         if isinstance(new_frames, torch.Tensor) and new_frames.numel() > 0:
             return new_frames
+        if isinstance(new_frames, np.ndarray) and new_frames.size > 0:
+            return new_frames
     return None
 
 
-def _raw_frames_np(new_frames: torch.Tensor) -> np.ndarray:
-    frames_np = new_frames.detach().cpu().numpy()
+def _raw_frames_np(new_frames: torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(new_frames, np.ndarray):
+        frames_np = new_frames
+    else:
+        frames_np = new_frames.detach().cpu().numpy()
     if frames_np.ndim == 1:
         frames_np = frames_np.reshape(1, -1)
     if frames_np.ndim != 2:
@@ -345,7 +351,7 @@ def _raw_emit_chunk(
     emit_frames = pending if is_finished else threshold
     chunk_rows = pending_frames[:emit_frames]
     del pending_frames[:emit_frames]
-    chunk_np = np.stack([np.asarray(row, dtype=np.int64) for row in chunk_rows])
+    chunk_np = np.asarray(chunk_rows, dtype=np.int64)
     finished = bool(is_finished and len(pending_frames) == 0)
 
     codec_flat = torch.from_numpy(np.ascontiguousarray(chunk_np.T).reshape(-1))
@@ -422,7 +428,7 @@ def talker2codec_raw_async_chunk_batch(
     req_ids = [_raw_request_id(request) for request in requests]
     pending_by_req = transfer_manager.code_prompt_token_ids
     present: list[int] = []
-    tensors: list[torch.Tensor] = []
+    tensors: list[torch.Tensor | np.ndarray] = []
     for index, output in enumerate(pooling_outputs):
         _record_raw_first_audio(transfer_manager, req_ids[index], output)
         new_frames = _raw_new_frames(output)
@@ -431,7 +437,9 @@ def talker2codec_raw_async_chunk_batch(
             tensors.append(new_frames)
     if present:
         arrays = [
-            tensor.numpy()
+            tensor
+            if isinstance(tensor, np.ndarray)
+            else tensor.numpy()
             if tensor.device.type == "cpu" and not tensor.requires_grad
             else tensor.detach().cpu().numpy()
             for tensor in tensors

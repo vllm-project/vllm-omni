@@ -23,6 +23,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
@@ -47,6 +48,13 @@ def _should_emit_engine_output(
         and bool(getattr(model_config, "async_chunk", False))
         and not bool(getattr(model_config, "final_output", False))
     )
+
+
+def _num_generation_tokens(request: Request) -> int:
+    output_token_ids: Any = getattr(request, "output_token_ids", None)
+    if output_token_ids is None:
+        output_token_ids = getattr(request, "_output_token_ids", ())
+    return len(output_token_ids)
 
 
 def _holds_payloadless_outputs(model_config: object) -> bool:
@@ -134,6 +142,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        install_decode_allocate_fast_path(self.kv_cache_manager)
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -882,15 +891,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # The per-request emit policy only varies with stop/control state: look the config up once.
+        emit_every_step: bool | None = None
+        spec_decode_tokens = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+        # Plain decode rows (one sampled token, nothing but the token and the
+        # step's audio to publish) take a short path below when this step
+        # carries none of the features the general path handles.
+        fast_decode = not (
+            failed_kv_load_req_ids
+            or spec_decode_tokens
+            or getattr(self, "kv_transfer_criteria", None)
+            or self.chunk_transfer_adapter is not None
+            or getattr(self, "is_mm_encoder_only", False)
+            or num_nans_in_logits is not None
+            or prompt_logprobs_dict
+            or prompt_token_id_logprobs_dict
+            or pooler_outputs
+        )
+        new_prompt_len_snapshot = self._new_prompt_len_snapshot
         # One processor call per step when the next-stage processor has an
         # opted-in batch form (``per_step_batch``; it needs per-request finish
         # flags, not step tokens).
         batch_saves: list[dict[str, Any]] | None = (
             []
             if inspect.isfunction(
-                getattr(
-                    getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_batch_func", None
-                )
+                getattr(self.chunk_transfer_adapter, "custom_process_next_stage_input_batch_func", None)
             )
             and not requires_token_updates
             else None
@@ -963,6 +988,43 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
 
             status_before_stop = request.status
+            pre_updated = None
+            if (
+                fast_decode
+                and generated_token_ids
+                and not output_is_stale
+                and not (self._hold_payloadless_outputs and not (mm_outputs and mm_outputs[req_index]))
+                and not request.has_encoder_inputs
+                and not request.use_structured_output
+                and request.sampling_params is not None
+                and request.sampling_params.num_logprobs is None
+                and not request.pooling_params
+            ):
+                new_token_ids, stopped = self._update_request_with_output(request, generated_token_ids)
+                if not stopped:
+                    prefill_stats = request.take_prefill_stats()
+                    if prefill_stats is not None:
+                        prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
+                    if emit_every_step is None:
+                        emit_every_step = _should_emit_engine_output(
+                            self.vllm_config.model_config, stopped=False, has_control=False
+                        )
+                    if emit_every_step:
+                        OmniSchedulerMixin._append_request_output(
+                            self,
+                            outputs,
+                            request,
+                            new_token_ids=new_token_ids,
+                            multimodal_output=mm_outputs[req_index] if mm_outputs else None,
+                            stop_reason=request.stop_reason,
+                            prefill_stats=prefill_stats,
+                            num_nans_in_logits=request.num_nans_in_logits,
+                            new_prompt_len_snapshot=new_prompt_len_snapshot.get(req_id),
+                            num_generation_tokens=_num_generation_tokens(request),
+                        )
+                    continue
+                # Stopped this step: the general path below finishes the request.
+                pre_updated = new_token_ids, stopped
             new_logprobs = None
             logprob_validation_failed = False
 
@@ -984,7 +1046,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     generated_token_ids = []
                     logprob_validation_failed = True
 
-            scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            scheduled_spec_token_ids = spec_decode_tokens.get(req_id) if spec_decode_tokens else None
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -1088,7 +1150,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.resumable = False
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if pre_updated is not None:
+                new_token_ids, stopped = pre_updated
+            elif new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
                 if output_is_stale:
                     new_token_ids, stopped = self._update_request_with_output(request, new_token_ids, is_stale=True)
@@ -1149,10 +1213,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ):
                 omits_chunk_transfer = self._request_omits_chunk_transfer_to_next_stage(request)
             # Capture before resumable stop handling can clear token history.
-            output_token_ids: Any = getattr(request, "output_token_ids", None)
-            if output_token_ids is None:
-                output_token_ids = getattr(request, "_output_token_ids", ())
-            num_generation_tokens = len(output_token_ids)
+            num_generation_tokens = _num_generation_tokens(request)
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
@@ -1261,11 +1322,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # instead of sending one output per decode step.
                 self._held_token_ids.setdefault(req_id, []).extend(new_token_ids)
                 has_stage_output = False
-            if has_stage_output and _should_emit_engine_output(
-                self.vllm_config.model_config,
-                stopped=stopped,
-                has_control=kv_transfer_params is not None,
-            ):
+            if has_stage_output and emit_every_step is None and not stopped and kv_transfer_params is None:
+                emit_every_step = _should_emit_engine_output(
+                    self.vllm_config.model_config, stopped=False, has_control=False
+                )
+            if has_stage_output and (stopped or kv_transfer_params is not None or emit_every_step):
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,

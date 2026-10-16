@@ -162,6 +162,7 @@ class DuplexRequestResource:
     request_id: str
     fence: DuplexFence
     submitted: bool = False
+    input_audio_part: dict[str, object] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -746,6 +747,44 @@ class DuplexEngineSession:
             epoch=self.epoch,
             input_commit_seq=self._input.commit_seq,
         )
+
+    def input_audio_part(self, item_id: str) -> dict[str, object] | None:
+        """Return the native audio part whose identity owns this item's ASR."""
+        message = self._conversation.item_ids.get(item_id)
+        if message is None or message.get("role") != "user":
+            return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "audio_url"
+                and part.get("audio_url") == {"url": "native-duplex:input-audio"}
+            ):
+                return part
+        return None
+
+    def update_input_transcript(
+        self,
+        item_id: str,
+        transcript: str,
+        *,
+        audio_part: dict[str, object] | None,
+    ) -> bool:
+        """Attach ASR text only to the audio part captured for this request.
+
+        Public item IDs can be deleted and reused. A fresh native placeholder
+        has the same value, but must not receive the old audio's transcript.
+        """
+        if audio_part is None or self.input_audio_part(item_id) is not audio_part:
+            return False
+        message = self._conversation.item_ids[item_id]
+        if "transcript" in message or "transcript" in audio_part:
+            return False
+        audio_part["transcript"] = transcript
+        message["transcript"] = transcript
+        return True
 
     def complete_model_turn(self, turn_id: int) -> None:
         """Advance the model-owned output identity after its terminal signal."""

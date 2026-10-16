@@ -1229,7 +1229,19 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         if self.gating is None:
             assert self.linear1 is not None
             assert self.linear2 is not None
-            update = self.linear2(self.activation(self.linear1(x)))
+            gelu_bias = getattr(self, "_gelu_epilogue_bias", None)
+            if gelu_bias is not None:
+                # GELU in the up-projection GEMM
+                # epilogue (cuBLASLt, tanh form, applied before bf16 rounding)
+                # instead of a separate pass over the FFN activations. Under
+                # the decoder's bf16 autocast the norm output is FP32; round it
+                # here as autocast does for linear1, so Inductor fuses the cast
+                # into the norm kernel.
+                weight = self.linear1.weight
+                hidden = linear_gelu_epilogue(x.reshape(-1, x.shape[-1]).to(weight.dtype), weight, gelu_bias)
+                update = self.linear2(hidden.view(*x.shape[:-1], hidden.shape[-1]))
+            else:
+                update = self.linear2(self.activation(self.linear1(x)))
         else:
             if self.weights_per_step:
                 assert isinstance(self.gating, nn.ModuleList)
@@ -1266,6 +1278,46 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
             assert isinstance(state, LayerState)
             state.offset_cpu += x.shape[1]
         return x
+
+
+@torch.library.custom_op("vllm_omni::moss_linear_gelu_epilogue", mutates_args=())
+def linear_gelu_epilogue(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    """``gelu(x @ weight.T)`` with GELU (tanh form) in the cuBLASLt epilogue.
+
+    Custom ops are not autocast-aware, so callers pass ``x`` in the weight
+    dtype; other input is rounded to it here, as autocast would for a GEMM.
+    """
+    return torch._addmm_activation(zero_bias, x.to(weight.dtype), weight.t(), use_gelu=True)
+
+
+@linear_gelu_epilogue.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=weight.dtype)
+
+
+def enable_gelu_epilogue(model: nn.Module) -> int:
+    """Fuse each eligible CUDA FFN GELU into its up-projection GEMM.
+
+    Eligible layers use the plain GELU FFN with a bias-free half-precision
+    CUDA ``linear1``. cuBLASLt's GELU epilogue uses the tanh form on the FP32
+    accumulator, so outputs change at bf16-rounding level (not bitwise).
+    Returns the number of layers switched.
+    """
+    switched = 0
+    for module in model.modules():
+        if not isinstance(module, MossAudioTokenizerTransformerLayer):
+            continue
+        linear1 = module.linear1
+        if module.gating is not None or module.weights_per_step or module.activation is not F.gelu:
+            continue
+        if not isinstance(linear1, nn.Linear) or linear1.bias is not None:
+            continue
+        weight = linear1.weight
+        if weight.device.type != "cuda" or weight.dtype not in (torch.bfloat16, torch.float16):
+            continue
+        module._gelu_epilogue_bias = torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
+        switched += 1
+    return switched
 
 
 # =============================================================================

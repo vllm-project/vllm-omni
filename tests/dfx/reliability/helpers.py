@@ -551,6 +551,27 @@ def _resolve_runtime_worker_markers(
     return tuple(dict.fromkeys(merged))
 
 
+def _pid_is_dead(pid: int) -> bool:
+    """True when ``pid`` is gone or only a zombie remains."""
+    if not psutil.pid_exists(pid):
+        return True
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return True
+
+
+def _wait_until_pid_dead(pid: int, timeout_sec: float) -> bool:
+    """Poll until ``pid`` is dead or ``timeout_sec`` elapses."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        if _pid_is_dead(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def _pid_looks_like_runtime_worker(pid: int, markers: Sequence[str]) -> bool:
     """True when process name or argv contains any resolved worker marker substring."""
     if not markers:
@@ -1090,6 +1111,17 @@ def make_server_tree_kill_fault_injector(
     return _inject
 
 
+def _server_is_single_process_uniproc(server: Any) -> bool:
+    """True when the server tree holds only the root process (UniProc inline worker).
+
+    The UniProc executor runs the diffusion worker inside the API-server process,
+    so there is no dedicated worker process to kill; killing the root would take
+    the whole server down. Multi-process deployments (``mp``/``ray``) spawn worker
+    subprocesses as descendants of the root.
+    """
+    return len(_list_server_process_tree(server)) <= 1
+
+
 def make_process_kill_fault_injector(
     *,
     grep_patterns: str | Sequence[str],
@@ -1098,6 +1130,11 @@ def make_process_kill_fault_injector(
     post_kill_wait_seconds: float = 0.0,
 ) -> FaultInjector:
     """Build a post-ready injector that kills processes matched by ordered ``grep_patterns``.
+
+    The worker-kill scenario needs a dedicated worker process: when the server
+    tree holds only the root (UniProc / single process), the injector skips
+    unconditionally — there is no worker to kill, and matching the serving
+    process would tear the whole server down.
 
     Matching is tried in two phases per pattern (first hit wins):
 
@@ -1120,6 +1157,11 @@ def make_process_kill_fault_injector(
 
     def _inject(server: Any) -> None:
         _log_server_process_tree(server)
+        if _server_is_single_process_uniproc(server):
+            pytest.skip(
+                "worker-kill scenario invalid: UniProc single-process deployment has no "
+                "dedicated worker process to kill"
+            )
         server_tree = set(_list_server_process_tree(server))
         if not server_tree:
             logger.warning(
@@ -1138,17 +1180,36 @@ def make_process_kill_fault_injector(
                     flush=True,
                 )
                 os.kill(pid, sig)
+                waited_from = time.monotonic()
+                dead = _wait_until_pid_dead(pid, post_kill_wait_seconds)
+                remaining = post_kill_wait_seconds - (time.monotonic() - waited_from)
+                if dead and remaining > 0:
+                    time.sleep(remaining)
+                print(
+                    f"[reliability][process-kill] killed pid={pid} stage={name} signal={signal_name} dead={int(dead)}",
+                    flush=True,
+                )
+                if signal_name == "SIGKILL" and not dead:
+                    raise RuntimeError(f"pid {pid} ({name}) still alive after SIGKILL")
+            host = getattr(server, "host", None)
+            port = getattr(server, "port", None)
+            if host is not None and port is not None:
+                try:
+                    status, _body = get_health_raw(str(host), int(port), timeout_sec=5)
+                    print(
+                        f"[reliability][process-kill] post-kill health status={status}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - log the probe, do not hide the kill
+                    print(
+                        f"[reliability][process-kill] post-kill health error={exc!r}",
+                        flush=True,
+                    )
             print(
                 f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
                 f"killed_pids={filtered} killed_count={len(filtered)}",
                 flush=True,
             )
-            if post_kill_wait_seconds > 0:
-                print(
-                    f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
-                    flush=True,
-                )
-                time.sleep(post_kill_wait_seconds)
 
         for pattern in patterns:
             print(

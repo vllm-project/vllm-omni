@@ -146,6 +146,10 @@ def load_codec(
     # The v1 quantizer emits FP32 tensors, so its decoder must remain FP32.
     if device.type != "cpu" and isinstance(codec, MossAudioTokenizerV2Model):
         codec.decoder.to(dtype=torch.bfloat16)
+    if device.type == "cuda" and isinstance(codec, MossAudioTokenizerV2Model):
+        from .audio_tokenizer_v2 import enable_gelu_epilogue
+
+        logger.info("MOSS codec GELU GEMM epilogue: %d decoder layers", enable_gelu_epilogue(codec.decoder))
     if attention_backend != "sdpa":
         if attention_backend not in {"triton", "triton_slot"} or device.type != "cuda":
             raise ValueError(f"Unsupported codec attention backend/device: {attention_backend}/{device.type}")
@@ -154,13 +158,15 @@ def load_codec(
 
         if attention_backend == "triton_slot":
             from vllm_omni.model_executor.models.moss_tts.slot_attention import (
-                slot_ring_attention,
-                slot_ring_attention_rows,
+                slot_ring_flash_attention as slot_ring_attention,
+            )
+            from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+                slot_ring_flash_attention_rows as slot_ring_attention_rows,
             )
 
             slot_ring_attention = partial(slot_ring_attention, skip_empty_tiles=True)
             slot_ring_attention_rows = partial(slot_ring_attention_rows, skip_empty_tiles=True)
-            logger.info("MOSS codec slot attention: skipping empty tiles for T <= 32")
+            logger.info("MOSS codec slot attention: single-pass flash ring kernel")
 
         for module in codec.decoder.modules():
             if isinstance(module, MossAudioTokenizerMultiheadAttention):

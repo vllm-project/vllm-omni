@@ -112,8 +112,9 @@ class EmptyHistoryAttention(nn.Module):
         self.dim = original.embed_dim
         self.heads = original.num_heads
         self.max_period = original.rope.max_period
+        self._cached_attn_bias = None
 
-    def forward(self, query, key, value, execution_context=None):
+    def forward(self, query, key, value, execution_context=None, attn_bias=None):
         if query.shape[1] == 1:
             # The sole causal key has probability one. Its state is discarded.
             attended = F.linear(query, self.in_proj.weight[2 * self.dim :])
