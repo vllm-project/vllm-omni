@@ -41,7 +41,7 @@ steps:
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
 
       - label: "Reliability Test · hunyuan-image"
         source_file_dependencies: diffusion_hunyuan_image3_reliability

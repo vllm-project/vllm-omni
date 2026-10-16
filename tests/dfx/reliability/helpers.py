@@ -30,12 +30,30 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import psutil
 import pytest
 
 logger = logging.getLogger(__name__)
+
+
+class GpuOomInjectionConfig(TypedDict, total=False):
+    """Fields read by :func:`inject_gpu_oom` and ``resolve_oom_device_spec``."""
+
+    device: str
+    target_mem_ratio: float
+    hold_seconds: int
+    startup_timeout_sec: int
+    strict: bool
+
+
+class ServerFaultSnapshot(TypedDict):
+    root_pids: list[int]
+    tree_pids: list[int]
+    worker_pids: list[int]
+    worker_markers: list[str]
+
 
 # Substrings matched against ``psutil.Process.name`` + argv text for classifying GPU
 # workers under the test server tree. Extend per-suite via
@@ -75,17 +93,6 @@ def post_chat_completions_raw(
         resp = conn.getresponse()
         data = resp.read()
         return resp.status, data
-    finally:
-        conn.close()
-
-
-def get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int, bytes]:
-    """GET /health with stdlib HTTP client; returns (status, body)."""
-    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
-    try:
-        conn.request("GET", "/health")
-        resp = conn.getresponse()
-        return resp.status, resp.read()
     finally:
         conn.close()
 
@@ -851,6 +858,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     snapshot = getattr(server, "reliability_fault_snapshot", None)
     if not isinstance(snapshot, dict):
         pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+        raise RuntimeError
     assert isinstance(snapshot, dict)
     tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
     if not tree_pids:
@@ -903,7 +911,7 @@ def _capture_server_fault_snapshot(
     server: Any,
     *,
     worker_markers_extra: Sequence[str] | None = None,
-) -> dict[str, list[int] | list[str]]:
+) -> ServerFaultSnapshot:
     """Capture current server process snapshot for post-fault assertions.
 
     ``tree_pids`` is ``[root, ...descendants]`` and is used by
@@ -919,7 +927,7 @@ def _capture_server_fault_snapshot(
             continue
         if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
-    snapshot: dict[str, list[int] | list[str]] = {
+    snapshot: ServerFaultSnapshot = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,
