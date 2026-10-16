@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     )
     from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSessionState
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
     from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
     from vllm_omni.metrics.stats import StageRequestStats
 
@@ -96,6 +97,7 @@ class DuplexSessionContext:
     tasks: DuplexSessionTasks
     run: DuplexRunState
     services: RunnerServices
+    history_calibration: HistoryCalibration | None = None
 
 
 # --------------------------------------------------------------------------- #

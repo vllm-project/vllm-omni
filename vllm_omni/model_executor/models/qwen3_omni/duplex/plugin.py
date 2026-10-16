@@ -41,6 +41,7 @@ class QwenDataPlane(DuplexDataPlane):
     def __init__(self, encode_audio):
         self.encode_audio = encode_audio
         self.terminal: set[str] = set()
+        self.retain_history_audio = False
 
     def begin_request(self, request_id):
         self.terminal.discard(request_id)
@@ -109,6 +110,10 @@ class QwenDataPlane(DuplexDataPlane):
                 "text_requires_complete_audio": "audio" in context.get("modalities", ()),
                 "audio_complete": bool(output.finished) and stage_id == 2,
                 "sample_rate_hz": rate,
+                "history_audio_pcm": audio.astype("<f4", copy=False).tobytes()
+                if encoded and self.retain_history_audio
+                else None,
+                "history_audio_supported": context.get("speed") in (None, 1, 1.0),
                 "end_of_turn": bool(output.finished),
                 "model_turn_id": context.get("active_response_turn_id")
                 if context.get("active_response_turn_id") is not None
@@ -127,6 +132,34 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.data_plane = QwenDataPlane(encode_audio)
         self.processor = None
         self._processor_lock = asyncio.Lock()
+        self._history_calibrator = None
+
+    def history_calibrator(self, runtime_config):
+        if runtime_config.history_asr_url is None and runtime_config.history_ms_per_token is None:
+            return None
+        if self._history_calibrator is None:
+            from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+
+            if runtime_config.history_ms_per_token is not None:
+                from vllm_omni.model_executor.models.qwen3_omni.duplex.history_rate import QwenTokenRateCalibration
+
+                self._history_calibrator = HistoryCalibrationPolicy(
+                    QwenTokenRateCalibration(self.processor.tokenizer, runtime_config.history_ms_per_token),
+                    requires_audio=False,
+                )
+            else:
+                from vllm_omni.model_executor.models.qwen3_omni.duplex.history_asr import QwenAsrCalibration
+
+                self._history_calibrator = HistoryCalibrationPolicy(
+                    QwenAsrCalibration(
+                        runtime_config.history_asr_url,
+                        runtime_config.history_asr_model,
+                        runtime_config.history_calibration_timeout_ms / 1000,
+                        max_concurrency=runtime_config.history_asr_max_concurrency,
+                    )
+                )
+                self.data_plane.retain_history_audio = True
+        return self._history_calibrator
 
     def capabilities(self, *, max_sessions):
         return DuplexCapabilities(

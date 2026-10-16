@@ -929,7 +929,12 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def record_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", record_summary)
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -1097,7 +1102,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     wall = {"t": 1_000.0}
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def record_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", record_summary)
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -1117,7 +1127,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def record_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", record_summary)
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))
@@ -1191,3 +1206,43 @@ def test_finished_drain_keeps_sent_audio_ackable() -> None:
     session.release_finished_drain_response(silent)
     assert silent not in session._conversation.assistant_response_snapshots
     assert f"item_{silent}" not in session._conversation.history_item_placeholders
+
+
+@pytest.mark.parametrize("draining", [False, True])
+def test_deleting_a_live_item_preserves_its_output_playback_cursor(draining):
+    from vllm_omni.engine.duplex.events import ErrorEvent
+
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.reserve_history_item(item_id)
+    session.append_assistant_text("still generating")
+    session.mark_audio_sent(duration_ms=1000)
+    if draining:
+        session.snapshot_active_response_for_drain()
+        session.bind_draining_request("drain", response_id)
+        session.begin_response()
+    session.delete_history_item(item_id)
+    # Item deletion does not cancel an in-flight model request. Its next audio
+    # chunk still needs the previous duration for response-local offsets.
+    assert session.playback_for_response(response_id).sent_ms == 1000
+    if draining:
+        active_response_id = session.active_response_id
+        session.mark_audio_sent(duration_ms=250)
+        assert session.pop_draining_request("drain") == response_id
+        session.release_finished_drain_response(response_id)
+        assert response_id not in session._playback.by_response
+        assert session.active_response_id == active_response_id
+        assert session.playback.sent_ms == 250
+        events = apply_playback_ack(
+            session,
+            {
+                "type": "playback.ack",
+                "response_id": response_id,
+                "item_id": item_id,
+                "played_ms": 1000,
+                "committed_ms": 1000,
+            },
+        )
+        assert any(isinstance(event, ErrorEvent) and event.code == "playback_item_not_found" for event in events)
+        assert response_id not in session._playback.by_response
