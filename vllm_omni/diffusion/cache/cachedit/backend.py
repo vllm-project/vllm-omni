@@ -204,6 +204,10 @@ def enable_cache_for_dit(
     transformer = get_pipeline_transformer(pipeline)
     if block_adapter is not None:
         block_adapter.has_separate_cfg = resolve_has_separate_cfg(block_adapter.has_separate_cfg)
+    elif not resolve_has_separate_cfg(True):
+        # Cache-DiT's built-in registry adapters (e.g. QwenImage) hard-code has_separate_cfg=True; an
+        # explicit enable_separate_cfg on the cache config takes precedence over the adapter's value.
+        db_cache_config.enable_separate_cfg = False
     cache_target = transformer if block_adapter is None else block_adapter
     if adapter_cls is not None:
         adapter_cls.apply(

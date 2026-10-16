@@ -295,6 +295,24 @@ def test_enable_cache_for_dit_drops_separate_cfg_under_cfg_parallel(mock_cache_d
     assert mock_cache_dit.enable_cache.call_args.args[0] is block_adapter
 
 
+@pytest.mark.parametrize(("cfg_world_size", "expected"), [(None, None), (1, None), (2, False)])
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+def test_enable_cache_for_dit_builtin_adapter_drops_separate_cfg_under_cfg_parallel(
+    mock_cache_dit,
+    cfg_world_size,
+    expected,
+):
+    """Without a declared adapter, Cache-DiT's registry adapter (e.g. QwenImage) would pair calls."""
+    transformer = Mock()
+    with _cfg_parallel(cfg_world_size):
+        cd_backend.enable_cache_for_dit(
+            Mock(), SAMPLE_CACHE_CONFIG, get_pipeline_transformer=lambda pipeline: transformer
+        )
+
+    assert mock_cache_dit.enable_cache.call_args.args[0] is transformer
+    assert mock_cache_dit.enable_cache.call_args.kwargs["cache_config"].enable_separate_cfg is expected
+
+
 @pytest.mark.parametrize("has_transformer_2", [False, True])
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.cache_dit")
