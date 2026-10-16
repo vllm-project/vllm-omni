@@ -35,7 +35,8 @@ npu_device = pytest.param("npu", marks=[npu_only, *hardware_marks(res={"npu": "A
         pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
         npu_device,
     ],
-    ids=["cpu", "cuda", "npu"],)
+    ids=["cpu", "cuda", "npu"],
+)
 def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")

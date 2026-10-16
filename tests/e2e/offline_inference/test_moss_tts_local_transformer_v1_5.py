@@ -2,11 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for MOSS-TTS-Local-Transformer-v1.5.
 
-MOSS-TTS-Local-Transformer-v1.5 (``MossTTSLocalModel``) is the Qwen3-backbone
-variant with a 1-layer GPT2-style local depth transformer (n_vq=12, 48 kHz
-stereo codec). It ships its own ``AutoProcessor`` (``processing_moss_tts.py``)
-and reuses the same delay-style voice_clone code path as MOSS-TTS-v1.5 —
-just a different n_vq/codec and output sample rate (48 kHz vs 24 kHz).
+Note on naming: "Local" here is part of the *model variant name*
+(``MOSS-TTS-Local-Transformer-v1.5``, ``MossTTSLocalModel``), referring to its
+1-layer GPT2-style *local depth transformer* — it is **not** an indication that
+this test only runs on a developer machine. This is a regular CI E2E test
+(``full_model`` / ``tts``) executed in the NPU nightly pipeline.
+
+MOSS-TTS-Local-Transformer-v1.5 is the Qwen3-backbone variant with a 1-layer
+GPT2-style local depth transformer (n_vq=12, 48 kHz stereo codec). It ships its
+own ``AutoProcessor`` (``processing_moss_tts.py``) and reuses the same
+delay-style voice_clone code path as MOSS-TTS-v1.5 — just a different n_vq/codec
+and output sample rate (48 kHz vs 24 kHz).
 """
 
 from __future__ import annotations
@@ -85,7 +91,7 @@ def _write_synthetic_reference_wav(path: Path) -> None:
 
 @pytest.fixture(scope="session")
 def ref_audio_path(tmp_path_factory) -> str:
-    target = tmp_path_factory.mktemp("moss_tts_local_ref") / "zh_reference.wav"
+    target = tmp_path_factory.mktemp("moss_tts_local_transformer_ref") / "zh_reference.wav"
     _write_synthetic_reference_wav(target)
     return str(target)
 
@@ -139,7 +145,7 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
 
 
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"})
-def test_moss_tts_v15_local_voice_clone(omni_runner: OmniRunner, ref_audio_path) -> None:
+def test_moss_tts_local_transformer_v15_voice_clone(omni_runner: OmniRunner, ref_audio_path) -> None:
     """MOSS-TTS-Local-Transformer-v1.5: voice_clone produces non-empty 48 kHz audio."""
     req = _build_request("Hello, this is a MOSS-TTS Local voice cloning test.", ref_audio_path)
     audio, sr = _collect_audio(omni_runner, req)
@@ -150,7 +156,7 @@ def test_moss_tts_v15_local_voice_clone(omni_runner: OmniRunner, ref_audio_path)
 
 
 @hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"})
-def test_moss_tts_v15_local_voice_clone_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
+def test_moss_tts_local_transformer_v15_voice_clone_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Chinese text produces non-empty 48 kHz audio."""
     req = _build_request("你好，这是本地延迟模型的语音克隆测试。", ref_audio_path, language="Chinese")
     audio, sr = _collect_audio(omni_runner, req)
