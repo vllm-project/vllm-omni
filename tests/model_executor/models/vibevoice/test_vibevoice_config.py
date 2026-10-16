@@ -22,7 +22,8 @@ from vllm.multimodal.processing.context import TimingContext
 from vllm.multimodal.processing.inputs import ProcessorInputs
 
 from vllm_omni.config.model import OmniModelConfig
-from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.stage_config import _DEPLOY_DIR, load_deploy_config
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.model_executor.models.vibevoice.pipeline import VIBEVOICE_PIPELINE
 from vllm_omni.model_executor.models.vibevoice.prompt import (
@@ -90,11 +91,16 @@ def test_native_config_and_legacy_rejection():
 def test_registration_and_deploy():
     model_cls = OmniModelRegistry._try_load_model_cls(ARCH)
     assert model_cls is not None and model_cls.get_placeholder_str("audio", 0) == AUDIO_TOKEN
-    stage = merge_pipeline_deploy(VIBEVOICE_PIPELINE, load_deploy_config(_DEPLOY_DIR / "vibevoice.yaml"))[0]
-    args = stage.yaml_engine_args
+    stage = VllmOmniConfig.from_pipeline_config(
+        VIBEVOICE_PIPELINE, user_deploy_config=load_deploy_config(_DEPLOY_DIR / "vibevoice.yaml")
+    ).stage_configs[0]
     # VibeVoice is eager-only: graph, async scheduling and prefix caching must stay off.
-    assert args["enforce_eager"] and not args["async_scheduling"] and not args["enable_prefix_caching"]
-    assert not args["use_v2_model_runner"] and args["max_num_seqs"] == 4
+    assert (
+        stage.model_config.enforce_eager
+        and not stage.scheduler_config.async_scheduling
+        and not stage.cache_config.enable_prefix_caching
+    )
+    assert not stage.model_config.use_v2_model_runner and stage.scheduler_config.max_num_seqs == 4
 
 
 def test_prompt():

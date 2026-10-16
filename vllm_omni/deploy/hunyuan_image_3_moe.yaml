@@ -30,6 +30,10 @@ connectors:
 
 stages:
   - stage_id: 0
+    # Stage 0 owns the tokenizer and emits the cot+ratio token sequence
+    # consumed by stage 1.  That topology is declared by the registered
+    # ``hunyuan_image_3_moe`` pipeline rather than duplicated in this deploy
+    # override.
     max_num_seqs: 1
     gpu_memory_utilization: 0.95
     enforce_eager: true

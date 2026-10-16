@@ -15,12 +15,9 @@ from vllm_omni.config.stage_config import (
     StageDeployConfig,
     StageExecutionType,
     StagePipelineConfig,
-    merge_pipeline_deploy,
 )
 from vllm_omni.engine.stage_init_utils import (
-    extract_legacy_stage_metadata,
     extract_stage_metadata,
-    extract_stage_metadata_from_omni_stage_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -89,51 +86,23 @@ def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
     return pipeline, deploy
 
 
-def test_extract_stage_metadata_matches_legacy_projection():
+def test_extract_stage_metadata_projects_runtime_fields():
     pipeline, deploy = _metadata_inputs()
     omni_config = VllmOmniConfig.from_pipeline_config(
         pipeline,
         user_deploy_config=copy.deepcopy(deploy),
     )
-    legacy_configs = [
-        stage.to_omegaconf()
-        for stage in merge_pipeline_deploy(
-            pipeline,
-            copy.deepcopy(deploy),
-        )
-    ]
+    for stage in omni_config.stage_configs:
+        metadata = extract_stage_metadata(stage)
+        assert metadata.stage_id == stage.stage_id
+        assert metadata.engine_input_source == stage.input_sources
+        assert metadata.runtime_cfg is stage.runtime_config
+        assert metadata.final_output == stage.final_output
+    assert extract_stage_metadata(omni_config.stage_by_id(0)).engine_input_source == []
 
-    parity_fields = (
-        "stage_id",
-        "stage_type",
-        "engine_output_type",
-        "is_comprehension",
-        "requires_multimodal_data",
-        "engine_input_source",
-        "final_output",
-        "final_output_type",
-        "custom_process_input_func",
-        "model_stage",
-        "prompt_expand_func",
-        "cfg_kv_collect_func",
-    )
-    for legacy_config in legacy_configs:
-        stage_id = legacy_config.stage_id
-        omni_stage_config = omni_config.stage_by_id(stage_id)
-        structured = extract_stage_metadata_from_omni_stage_config(omni_stage_config)
-        legacy = extract_legacy_stage_metadata(legacy_config)
-
-        assert {field: getattr(structured, field) for field in parity_fields} == {
-            field: getattr(legacy, field) for field in parity_fields
-        }
-        assert type(structured.default_sampling_params) is type(legacy.default_sampling_params)
-        assert structured.runtime_cfg is omni_stage_config.runtime_config
-        for runtime_field in ("devices", "num_replicas", "env"):
-            assert getattr(structured.runtime_cfg, runtime_field) == getattr(legacy.runtime_cfg, runtime_field)
-
-    thinker = extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(0))
-    talker = extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(1))
-    diffusion = extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(2))
+    thinker = extract_stage_metadata(omni_config.stage_by_id(0))
+    talker = extract_stage_metadata(omni_config.stage_by_id(1))
+    diffusion = extract_stage_metadata(omni_config.stage_by_id(2))
 
     assert isinstance(thinker.default_sampling_params, SamplingParams)
     assert thinker.default_sampling_params.temperature == 0.25
@@ -150,20 +119,6 @@ def test_extract_stage_metadata_matches_legacy_projection():
     assert diffusion.cfg_kv_collect_func is operator.concat
 
 
-def test_extract_stage_metadata_preserves_legacy_one_argument_api():
-    pipeline, deploy = _metadata_inputs()
-    legacy_config = merge_pipeline_deploy(
-        pipeline,
-        deploy,
-    )[0].to_omegaconf()
-
-    metadata = extract_stage_metadata(legacy_config)
-
-    assert metadata.stage_id == 0
-    assert metadata.model_stage == "thinker"
-    assert metadata.custom_process_input_func is operator.add
-
-
 @pytest.mark.parametrize("engine_output_type", [None, "", "latent", "token_ids", "text+token_ids", "text+audio"])
 def test_extract_stage_metadata_preserves_declared_engine_output_type(engine_output_type):
     pipeline, deploy = _metadata_inputs()
@@ -171,27 +126,7 @@ def test_extract_stage_metadata_preserves_declared_engine_output_type(engine_out
         pipeline,
         stages=(replace(pipeline.stages[0], engine_output_type=engine_output_type), *pipeline.stages[1:]),
     )
-    omni_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=copy.deepcopy(deploy))
-    legacy_config = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-
-    # An explicit empty value must reach the output processor, where it is
-    # rejected during startup, instead of silently becoming the None default.
-    assert legacy_config.engine_args.get("engine_output_type") == engine_output_type
-    assert extract_legacy_stage_metadata(legacy_config).engine_output_type == engine_output_type
-    assert (
-        extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(0)).engine_output_type
-        == engine_output_type
-    )
-
-
-def test_extract_stage_metadata_defaults_missing_engine_input_source():
-    pipeline, deploy = _metadata_inputs()
-    legacy_config = merge_pipeline_deploy(
-        pipeline,
-        deploy,
-    )[0].to_omegaconf()
-    del legacy_config["engine_input_source"]
-
-    metadata = extract_stage_metadata(legacy_config)
-
-    assert metadata.engine_input_source == []
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    # Preserve explicit empty values so the output processor can reject them
+    # during startup instead of silently substituting its None default.
+    assert extract_stage_metadata(config.stage_by_id(0)).engine_output_type == engine_output_type

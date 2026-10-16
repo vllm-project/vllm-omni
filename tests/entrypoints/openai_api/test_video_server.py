@@ -163,21 +163,14 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     handler.shutdown()
 
 
-@pytest.mark.parametrize("typed_stage", [False, True], ids=["legacy", "typed"])
-def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses(
-    mocker: MockerFixture, typed_stage: bool
-):
+def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses(mocker: MockerFixture):
     from vllm_omni.config.config_factory import StageConfigFactory
 
     options = {
         "model_class_name": "MiniMaxH3Pipeline",
         "video_output_transport": {"enable_borrowed_frames": True},
     }
-    stage = (
-        StageConfigFactory.create_typed_default_diffusion("test-model", options).stage_configs[0]
-        if typed_stage
-        else StageConfigFactory.create_default_diffusion(options)[0]
-    )
+    stage = StageConfigFactory.create_typed_default_diffusion("test-model", options).stage_configs[0]
     # Like StageDiffusionClient, this frontend engine exposes metadata but no
     # worker od_config. The effective setting is available in stage_configs.
     engine = FakeAsyncOmni()
@@ -286,7 +279,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
-    supported_control_upload_types = frozenset()
+    supported_control_upload_types: frozenset[str] = frozenset()
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -977,6 +970,7 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A fox walks through snow"), "defaults"))
 
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (896, 512)
     assert sampling.num_frames == 125
@@ -1023,6 +1017,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (864, 480)
     assert sampling.num_frames == 125
@@ -1037,6 +1032,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
             "explicit",
         )
     )
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[-1]
     assert (sampling.width, sampling.height) == (512, 320)
     assert sampling.num_frames == 25

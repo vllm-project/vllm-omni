@@ -5,35 +5,35 @@ In vLLM-Omni, the `composable_parallel` system layers a declarative *parallel st
 Strategies are intentionally narrow: each one only writes the axes it declares, leaving every other engine arg untouched. This makes a strategy file a small, reusable overlay you can swap independently of the deploy YAML (see `configuration/stage_configs.md`).
 
 !!! note
-    Composable parallel is **opt-in**. Passing `--strategy-config <path/to/strategy.yaml>` overlays the derived sizing onto the registry-merged stages *before* any CLI overrides are applied. When `--strategy-config` is omitted, stages remain exactly as their deploy YAML produces them.
+    Composable parallel is **opt-in**. Passing `--strategy-config <path/to/strategy.yaml>` overlays the derived sizing onto the deploy settings *before* any CLI overrides are applied. When `--strategy-config` is omitted, typed stages remain exactly as their deploy YAML produces them.
 
 ## Top-level schema reference
 
 A strategy file has a single top-level mapping, `strategies`, keyed by the `model_stage` name of each stage you want to overlay. Each value is a list of axis declarations (see [StrategySpec fields](#strategyspec-fields) below).
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `strategies` | `dict[str, list]` | required | — | Maps `model_stage` name (e.g. `thinker`, `talker`, `code2wav`, `dit`) to a list of axis declarations. The key MUST be the stage name, not the integer `stage_id`. See `vllm_omni/config/composable_parallel/strategy_loader.py`. |
+| Field        | Type              | Required   | Default   | Description                                                                                                                                                                                                                      |
+| ------------ | ----------------- | ---------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strategies` | `dict[str, list]` | required   | —         | Maps `model_stage` name (e.g. `thinker`, `talker`, `code2wav`, `dit`) to a list of axis declarations. The key MUST be the stage name, not the integer `stage_id`. See `vllm_omni/config/composable_parallel/strategy_loader.py`. |
 
 ### StrategySpec fields
 
 Each entry in a stage's list becomes one `StrategySpec` (see `vllm_omni/config/composable_parallel/spec.py`). The loader fills in `routing` and `aggregation` from per-kind defaults, so the file stays compact.
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `axis` | str | required | — | Mesh-axis kind. One of `tp`, `dp`, `pp`, `ep`, `stage_replica` (wired today) or `sp_ulysses`, `sp_ring`, `cfg`, `vae_pp`, `hsdp`, `stage_pp`, `cp` (reserved; declaring one raises `AxisTranslationError` at translate time). See `MeshAxisKind` in `vllm_omni/config/composable_parallel/spec.py`. |
-| `size` | int | required | — | Axis degree. Must be `> 0`. |
-| `routing` | str | optional | per-kind default | Stateless routing policy. Accepted only for `dp` / `stage_replica`; other kinds reject it. Values: `random`, `round_robin`, `least_queue`. (`hash` is recognised but currently raises `NotImplementedError`.) See `RouteByStage` in `vllm_omni/config/composable_parallel/routing.py`. |
-| `l1_owner` | str | optional | per-kind default | Overrides which layer owns request routing for this axis. `engine` for `tp`/`dp`/`pp`/`ep`, `delegated` for `stage_replica`. Recorded into `shard_extension`. |
-| `name` | str | optional | axis kind | Human-readable label for this spec, used in error messages. |
+| Field      | Type   | Required   | Default          | Description                                                                                                                                                                                                                                                                                         |
+| ---------- | ------ | ---------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `axis`     | str    | required   | —                | Mesh-axis kind. One of `tp`, `dp`, `pp`, `ep`, `stage_replica` (wired today) or `sp_ulysses`, `sp_ring`, `cfg`, `vae_pp`, `hsdp`, `stage_pp`, `cp` (reserved; declaring one raises `AxisTranslationError` at translate time). See `MeshAxisKind` in `vllm_omni/config/composable_parallel/spec.py`. |
+| `size`     | int    | required   | —                | Axis degree. Must be `> 0`.                                                                                                                                                                                                                                                                         |
+| `routing`  | str    | optional   | per-kind default | Stateless routing policy. Accepted only for `dp` / `stage_replica`; other kinds reject it. Values: `random`, `round_robin`, `least_queue`. (`hash` is recognised but currently raises `NotImplementedError`.) See `RouteByStage` in `vllm_omni/config/composable_parallel/routing.py`.              |
+| `l1_owner` | str    | optional   | per-kind default | Overrides which layer owns request routing for this axis. `engine` for `tp`/`dp`/`pp`/`ep`, `delegated` for `stage_replica`. Recorded into `shard_extension`.                                                                                                                                       |
+| `name`     | str    | optional   | axis kind        | Human-readable label for this spec, used in error messages.                                                                                                                                                                                                                                         |
 
 Two additional `StrategySpec` slots — `layer_hook_specs` and `kernel_specs` — let advanced authors bind layer-walker hook IDs (`LayerHookSpec`) or kernel IDs (`KernelSpec`) onto an axis. These are not exposed by the YAML loader today and are intended for programmatic construction. See `vllm_omni/config/composable_parallel/spec.py` for the dataclasses.
 
 ### CLI flags
 
-| Flag | Description |
-|------|-------------|
-| `--strategy-config PATH` | Path to a `strategy.yaml`. Only takes effect on registry-based deploy paths (`--deploy-config` or the bundled default deploy YAML). Its derived sizing is overlaid onto the merged stages *before* CLI overrides. |
+| Flag                      | Description                                                                                                                                                                                                                       |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--strategy-config PATH`  | Path to a `strategy.yaml`. Only takes effect on registry-based deploy paths (`--deploy-config` or the bundled default deploy YAML). Its derived sizing is overlaid onto deploy settings *before* CLI overrides.                   |
 | `--omni-lb-policy POLICY` | Orchestrator-wide load-balancer policy. Strategy-derived from any `stage_replica` axis; an explicit CLI value wins and must match the derived one or `AsyncOmniEngine` raises `Conflicting load-balancer policy` at construction. |
 
 ## Sub-schemas
@@ -75,12 +75,12 @@ routing: least_queue    # send to the replica with the smallest backlog
 
 Aggregation is filled in automatically by the loader (`_default_aggregation` in `vllm_omni/config/composable_parallel/strategy_loader.py`) from the axis kind, so users do not author it:
 
-| Axis kind | Aggregation pattern |
-|-----------|---------------------|
-| `tp`, `ep` | `TakeRank` (all ranks agree; pick one) |
-| `dp`, ep (in some flows) | `Union` (disjoint replica results) |
-| `pp` | `StitchPipeline` |
-| `stage_replica` | `FanInByStage` |
+| Axis kind                | Aggregation pattern                    |
+| ------------------------ | -------------------------------------- |
+| `tp`, `ep`               | `TakeRank` (all ranks agree; pick one) |
+| `dp`, ep (in some flows) | `Union` (disjoint replica results)     |
+| `pp`                     | `StitchPipeline`                       |
+| `stage_replica`          | `FanInByStage`                         |
 
 Full pattern hierarchy: `TakeRank`, `Union`, `GatherDim`, `AllGather`, `StitchSpatial`, `StitchPipeline`, `Combine`, `FanInByStage` (see `vllm_omni/config/composable_parallel/aggregation.py`).
 
@@ -88,12 +88,12 @@ Full pattern hierarchy: `TakeRank`, `Union`, `GatherDim`, `AllGather`, `StitchSp
 
 From highest to lowest, when the same axis is touched by multiple layers:
 
-1. **CLI overrides** (`--tensor-parallel-size`, `--stage-overrides`, `--omni-lb-policy`, etc.). A CLI value always wins; a warning is emitted whenever it overrides a strategy-declared axis (see `_reconcile_strategy_with_cli` in `vllm_omni/config/config_factory.py`).
-2. **Strategy YAML** (`--strategy-config`). Derived sizing is written onto the merged stages with *conflict-on-explicit* semantics — if the deploy YAML already set a value to something different, application raises `StrategyApplyError`.
+1. **CLI overrides** (`--tensor-parallel-size`, `--stage-overrides`, `--omni-lb-policy`, etc.). A CLI value always wins; a warning is emitted whenever it overrides a strategy-declared axis while `VllmOmniConfig.from_pipeline_config` builds the typed stage configs.
+2. **Strategy YAML** (`--strategy-config`). Derived sizing is written onto deploy settings with *conflict-on-explicit* semantics — if the deploy YAML already set a value to something different, application raises `StrategyApplyError`.
 3. **Deploy YAML** (`--deploy-config` or the bundled `vllm_omni/deploy/<model_type>.yaml`).
 4. **Parser defaults.**
 
-After CLI overrides land, the device-layout guard re-runs (`check_device_layout`, called from `_reconcile_strategy_with_cli`) against the *effective* `tp * dp * pp * num_replicas` and the resolved `devices` string, so a `devices` value passed through `--stage-overrides` or a `--tensor-parallel-size` value that conflicts with the strategy's world size cannot slip past the pre-spawn check.
+After CLI overrides land, the device-layout guard re-runs (`check_device_layout`) against the *effective* `tp * dp * pp * num_replicas` and the resolved `devices` string, so a `devices` value passed through `--stage-overrides` or a `--tensor-parallel-size` value that conflicts with the strategy's world size cannot slip past the pre-spawn check.
 
 ## Worked example
 
@@ -119,11 +119,11 @@ python3 end2end.py --query-type text --num-prompts 6 \
 
 Effective `OmniParallelConfig` per stage after the overlay (see `OmniParallelConfig` in `vllm_omni/config/composable_parallel/translator.py`):
 
-| Stage (`model_stage`) | `tensor_parallel_size` | `data_parallel_size` | `pipeline_parallel_size` | `stage_replica_size` | `omni_lb_policy` |
-|-----------------------|------------------------|----------------------|--------------------------|----------------------|------------------|
-| `thinker`             | **2** (from strategy)  | 1                    | 1                        | 1                    | —                |
-| `talker`              | 1                      | 1                    | 1                        | 1                    | —                |
-| `code2wav`            | 1                      | 1                    | 1                        | 1                    | —                |
+| Stage (`model_stage`)   | `tensor_parallel_size`   | `data_parallel_size`   | `pipeline_parallel_size`   | `stage_replica_size`   | `omni_lb_policy`   |
+| ----------------------- | ------------------------ | ---------------------- | -------------------------- | ---------------------- | ------------------ |
+| `thinker`               | **2** (from strategy)    | 1                      | 1                          | 1                      | —                  |
+| `talker`                | 1                        | 1                      | 1                          | 1                      | —                  |
+| `code2wav`              | 1                        | 1                      | 1                          | 1                      | —                  |
 
 ### Example 2 — `strategy_stage_replica.yaml`
 
@@ -148,11 +148,11 @@ python3 end2end.py --query-type text --num-prompts 6 \
 
 Effective per-stage config and the derived orchestrator knob:
 
-| Stage (`model_stage`) | `tensor_parallel_size` | `stage_replica_size` | `omni_lb_policy` (derived) |
-|-----------------------|------------------------|----------------------|----------------------------|
-| `thinker`             | 1                      | **2**                | **`round-robin`**          |
-| `talker`              | 1                      | 1                    | —                          |
-| `code2wav`            | 1                      | 1                    | —                          |
+| Stage (`model_stage`)   | `tensor_parallel_size`   | `stage_replica_size`   | `omni_lb_policy` (derived)   |
+| ----------------------- | ------------------------ | ---------------------- | ---------------------------- |
+| `thinker`               | 1                        | **2**                  | **`round-robin`**            |
+| `talker`                | 1                        | 1                      | —                            |
+| `code2wav`              | 1                        | 1                      | —                            |
 
 The derived `omni_lb_policy = round-robin` is **not** written into any stage's engine args. Instead it is surfaced on `StrategyApplyResult.omni_lb_policy` and applied once at orchestrator construction by `AsyncOmniEngine._apply_strategy_lb_policy` (see `vllm_omni/engine/async_omni_engine.py`, lines 1107–1134). If you also pass `--omni-lb-policy round-robin` the values must match; passing a different value raises `Conflicting load-balancer policy`.
 
@@ -210,7 +210,7 @@ Strategy keys MUST be `model_stage` *names* (strings), the same labels defined b
     Use the `model_stage` name (e.g. `thinker`) instead.
 
 !!! warning "Mixing CLI overrides with a strategy on the same axis"
-    A strategy is meant to be the single writer for the axes it declares. If a CLI override (`--tensor-parallel-size 2`, `--stage-overrides '{"0": {"tensor_parallel_size": 2}}'`) sets the same axis, the **CLI value wins** and a warning is emitted from `_reconcile_strategy_with_cli`. The device-layout guard then re-runs against the effective layout, so a CLI override that breaks `tp * dp * pp * num_replicas` will still fail fast at config time.
+    A strategy is meant to be the single writer for the axes it declares. If a CLI override (`--tensor-parallel-size 2`, `--stage-overrides '{"0": {"tensor_parallel_size": 2}}'`) sets the same axis, the **CLI value wins** and a warning is emitted while `VllmOmniConfig.from_pipeline_config` resolves the typed stages. The device-layout guard then re-runs against the effective layout, so a CLI override that breaks `tp * dp * pp * num_replicas` will still fail fast at config time.
 
 !!! warning "Conflicting `omni_lb_policy` across stages"
     `omni_lb_policy` is a single pipeline-wide knob. If two `stage_replica` axes in different stages derive different policies, `apply_strategy_specs` raises:

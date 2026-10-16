@@ -44,7 +44,7 @@ _VISION_BLOCK = f"{VISION_START}{VIDEO_PAD}{VISION_END}"
 
 # Lance is single-stage diffusion — no deploy YAML.  Pass the engine
 # knobs that used to live in ``vllm_omni/deploy/lance.yaml`` via CLI
-# flags so ``create_default_diffusion`` builds the stage config.
+# flags so the typed generic diffusion resolver builds the stage config.
 _LANCE_SERVE_ARGS = [
     "--pipeline",
     "lance",

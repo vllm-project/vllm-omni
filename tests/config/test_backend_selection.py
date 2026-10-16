@@ -25,17 +25,12 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     _apply_platform_overrides,
-    build_stage_runtime_overrides,
     load_deploy_config,
-    merge_pipeline_deploy,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.stage_init_utils import (
-    build_engine_args_dict_from_omni_stage_config,
-    build_legacy_engine_args_dict,
-)
+from vllm_omni.engine.stage_init_utils import project_engine_args
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -70,8 +65,7 @@ def tiny_ar_model(tmp_path):
 
 
 @pytest.mark.parametrize("execution_type", [StageExecutionType.LLM_AR, StageExecutionType.DIFFUSION])
-@pytest.mark.parametrize("typed", [False, True])
-def test_deploy_backends_reach_final_engine_config(tmp_path, tiny_ar_model, execution_type, typed):
+def test_deploy_backends_reach_final_engine_config(tmp_path, tiny_ar_model, execution_type):
     attention = (
         "diffusion_attention_backend: torch_sdpa"
         if execution_type == StageExecutionType.DIFFUSION
@@ -82,12 +76,8 @@ def test_deploy_backends_reach_final_engine_config(tmp_path, tiny_ar_model, exec
     deploy = load_deploy_config(str(path))
     pipeline = _pipeline(execution_type)
 
-    if typed:
-        stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
-        args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
-    else:
-        stage = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
-        args = build_legacy_engine_args_dict(stage, model="unused")
+    stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
+    args = project_engine_args(stage, model="unused")
 
     assert args["linear_backend"] == "torch"
     assert args["moe_backend"] == "triton"
@@ -110,9 +100,8 @@ def test_deploy_backends_reach_final_engine_config(tmp_path, tiny_ar_model, exec
 
 
 @pytest.mark.parametrize("execution_type", [StageExecutionType.LLM_AR, StageExecutionType.DIFFUSION])
-@pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize("stage_scoped", [False, True])
-def test_backend_cli_overrides_deploy_yaml(tmp_path, execution_type, typed, stage_scoped):
+def test_backend_cli_overrides_deploy_yaml(tmp_path, execution_type, stage_scoped):
     attention_field = (
         "diffusion_attention_backend" if execution_type == StageExecutionType.DIFFUSION else "attention_backend"
     )
@@ -132,15 +121,8 @@ def test_backend_cli_overrides_deploy_yaml(tmp_path, execution_type, typed, stag
         f"{prefix}{attention_field}": cli_attention,
     }
 
-    if typed:
-        stage = VllmOmniConfig.from_pipeline_config(
-            pipeline, user_deploy_config=deploy, cli_overrides=cli
-        ).stage_configs[0]
-        args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
-    else:
-        stage = merge_pipeline_deploy(pipeline, deploy)[0]
-        stage.runtime_overrides = build_stage_runtime_overrides(stage.stage_id, cli)
-        args = build_legacy_engine_args_dict(stage.to_omegaconf(), model="unused")
+    stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy, cli_overrides=cli).stage_configs[0]
+    args = project_engine_args(stage, model="unused")
 
     assert args["linear_backend"] == "torch"
     assert args["moe_backend"] == "triton"
@@ -156,8 +138,7 @@ def test_backend_cli_overrides_deploy_yaml(tmp_path, execution_type, typed, stag
 
 
 @pytest.mark.parametrize("execution_type", [StageExecutionType.LLM_AR, StageExecutionType.DIFFUSION])
-@pytest.mark.parametrize("typed", [False, True])
-def test_deploy_backends_are_independent_per_stage(tmp_path, execution_type, typed):
+def test_deploy_backends_are_independent_per_stage(tmp_path, execution_type):
     attention_field = (
         "diffusion_attention_backend" if execution_type == StageExecutionType.DIFFUSION else "attention_backend"
     )
@@ -187,12 +168,8 @@ def test_deploy_backends_are_independent_per_stage(tmp_path, execution_type, typ
             for stage_id in range(2)
         ),
     )
-    if typed:
-        stages = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs
-        args = [build_engine_args_dict_from_omni_stage_config(stage, model="unused") for stage in stages]
-    else:
-        stages = merge_pipeline_deploy(pipeline, deploy)
-        args = [build_legacy_engine_args_dict(stage.to_omegaconf(), model="unused") for stage in stages]
+    stages = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs
+    args = [project_engine_args(stage, model="unused") for stage in stages]
 
     for stage_id, (linear, moe) in enumerate((("torch", "triton"), ("cutlass", "auto"))):
         assert args[stage_id]["linear_backend"] == linear
@@ -290,20 +267,16 @@ def test_first_class_backend_wins_over_engine_extras(execution_type, backend):
             ]
         )
     pipeline = _pipeline(execution_type)
-    legacy = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
     typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
-    assert build_legacy_engine_args_dict(legacy, model="unused")["linear_backend"] == backend
-    assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")["linear_backend"] == backend
+    assert project_engine_args(typed, model="unused")["linear_backend"] == backend
 
 
 @pytest.mark.parametrize("execution_type", [StageExecutionType.LLM_AR, StageExecutionType.DIFFUSION])
 def test_extras_only_backend_is_preserved(execution_type):
     pipeline = _pipeline(execution_type)
     deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras={"linear_backend": "torch"})])
-    legacy = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
     typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
-    assert build_legacy_engine_args_dict(legacy, model="unused")["linear_backend"] == "torch"
-    assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")["linear_backend"] == "torch"
+    assert project_engine_args(typed, model="unused")["linear_backend"] == "torch"
 
 
 def test_platform_backend_override_replaces_legacy_extra():
@@ -313,10 +286,8 @@ def test_platform_backend_override_replaces_legacy_extra():
     )
     deploy = _apply_platform_overrides(deploy, platform="rocm")
     pipeline = _pipeline(StageExecutionType.LLM_AR)
-    legacy = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
     typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
-    assert build_legacy_engine_args_dict(legacy, model="unused")["attention_backend"] == "TRITON_ATTN"
-    assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")["attention_backend"] == "TRITON_ATTN"
+    assert project_engine_args(typed, model="unused")["attention_backend"] == "TRITON_ATTN"
 
 
 @pytest.mark.parametrize(
@@ -336,12 +307,10 @@ def test_nested_platform_engine_extras_cannot_override_first_class_backend(field
         deploy = _apply_platform_overrides(deploy, platform="rocm")
 
     pipeline = _pipeline(StageExecutionType.LLM_AR)
-    legacy = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
     typed = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs[0]
     assert deploy.stages[0].engine_extras.get(field) is None
     expected = first_class if field == "attention_backend" else first_class.lower()
-    assert build_legacy_engine_args_dict(legacy, model="unused")[field] == expected
-    assert build_engine_args_dict_from_omni_stage_config(typed, model="unused")[field] == expected
+    assert project_engine_args(typed, model="unused")[field] == expected
 
 
 @pytest.mark.parametrize("field", ["linear_backend", "moe_backend"])
@@ -354,7 +323,7 @@ def test_diffusion_model_config_conflict_warns_and_model_wins(field):
         ),
     )
     with pytest.warns(UserWarning, match=f"model_config.*{field}.*diffusion_config"):
-        args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+        args = project_engine_args(stage, model="unused")
     assert args[field] == ("torch" if field == "linear_backend" else "triton")
 
 
@@ -368,7 +337,7 @@ def test_diffusion_equal_normalized_explicit_backends_do_not_warn(field):
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+        args = project_engine_args(stage, model="unused")
     assert not [warning for warning in caught if "model_config" in str(warning.message)]
     assert args[field] == value
 
@@ -379,6 +348,6 @@ def test_diffusion_explicit_backend_is_not_overwritten_by_defaults(config_field)
         stage_pipeline_config=_pipeline(StageExecutionType.DIFFUSION).stages[0],
         **{config_field: {"linear_backend": "torch", "moe_backend": "triton"}},
     )
-    args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+    args = project_engine_args(stage, model="unused")
     assert args["linear_backend"] == "torch"
     assert args["moe_backend"] == "triton"

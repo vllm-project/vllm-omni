@@ -27,7 +27,8 @@ from tests.engine.test_duplex_orchestrator import SESSION_ID as ORCHESTRATOR_SES
 from tests.engine.test_duplex_orchestrator import _build, _close, _open, _submit
 from tests.engine.test_orchestrator import _processed_request
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, load_deploy_config
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
@@ -314,9 +315,9 @@ def test_opt_in_profile_preserves_turn_pipeline():
     assert normal.stages == duplex.stages
     assert normal.connectors == duplex.connectors
     assert not duplex.async_chunk
-    stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, duplex)
+    stages = VllmOmniConfig.from_pipeline_config(JOYAI_VL_INTERACTION_PIPELINE, user_deploy_config=duplex).stage_configs
     assert len(stages) == 3
-    assert all(stage.session_mode == "duplex" for stage in stages)
+    assert all(stage.model_config.session_mode == "duplex" for stage in stages)
 
 
 def test_asr_profile_and_sampling_keep_joyai_ownership():

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Integration tests: strategy overlay on the real merge_pipeline_deploy seam."""
+"""Integration tests for strategy deployment and typed stage resolution."""
 
 from __future__ import annotations
 
@@ -19,10 +19,9 @@ from vllm_omni.config.composable_parallel import (
     TakeRank,
     apply_strategy_specs,
 )
-from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.stage_config import load_deploy_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -40,59 +39,55 @@ def _stage_replica(size: int, policy: str = "round_robin") -> StrategySpec:
 def _qwen_stages():
     pipeline = OMNI_PIPELINES["qwen2_5_omni"]
     deploy = load_deploy_config(_DEPLOY)
-    return merge_pipeline_deploy(pipeline, deploy)
+    return pipeline, deploy
 
 
-def _stage(stages, role):
-    return next(s for s in stages if s.model_stage == role)
+def _stage(pipeline, deploy, role):
+    stage_id = next(s.stage_id for s in pipeline.stages if s.model_stage == role)
+    return next(s for s in deploy.stages if s.stage_id == stage_id)
 
 
 def test_overlay_tp_on_thinker():
-    stages = _qwen_stages()
+    pipeline, deploy = _qwen_stages()
     # The bundled deploy pins the thinker to one GPU; a TP=2 strategy needs a
     # matching 2-GPU layout (mirrors what a TP2 deploy would declare).
-    _stage(stages, "thinker").yaml_runtime["devices"] = "0,1"
-    result = apply_strategy_specs(stages, {"thinker": [_tp(2)]})
-    assert _stage(result.stages, "thinker").yaml_engine_args["tensor_parallel_size"] == 2
+    _stage(pipeline, deploy, "thinker").devices = "0,1"
+    apply_strategy_specs(pipeline, deploy, {"thinker": [_tp(2)]})
+    assert _stage(pipeline, deploy, "thinker").tensor_parallel_size == 2
 
 
 def test_device_guard_rejects_tp_on_single_gpu_deploy():
     # The bundled deploy pins the thinker to a single GPU, so the pre-spawn
     # device check must refuse a TP=2 strategy on it.
-    stages = _qwen_stages()
+    pipeline, deploy = _qwen_stages()
     with pytest.raises(StrategyApplyError):
-        apply_strategy_specs(stages, {"thinker": [_tp(2)]})
+        apply_strategy_specs(pipeline, deploy, {"thinker": [_tp(2)]})
 
 
 def test_overlay_stage_replica_on_talker():
-    stages = _qwen_stages()
-    result = apply_strategy_specs(stages, {"talker": [_stage_replica(2, "round_robin")]})
-    assert _stage(result.stages, "talker").yaml_runtime["num_replicas"] == 2
+    pipeline, deploy = _qwen_stages()
+    result = apply_strategy_specs(pipeline, deploy, {"talker": [_stage_replica(2, "round_robin")]})
+    assert _stage(pipeline, deploy, "talker").num_replicas == 2
     assert result.omni_lb_policy == "round-robin"
 
 
 def test_overlay_mixed_roles():
-    stages = _qwen_stages()
-    _stage(stages, "thinker").yaml_runtime["devices"] = "0,1"
+    pipeline, deploy = _qwen_stages()
+    _stage(pipeline, deploy, "thinker").devices = "0,1"
     result = apply_strategy_specs(
-        stages,
+        pipeline,
+        deploy,
         {
             "thinker": [_tp(2)],
             "talker": [_stage_replica(2, "round_robin")],
             "code2wav": [_stage_replica(2, "round_robin")],
         },
     )
-    by_role = {s.model_stage: s for s in result.stages}
-    assert by_role["thinker"].yaml_engine_args["tensor_parallel_size"] == 2
-    assert by_role["talker"].yaml_runtime["num_replicas"] == 2
-    assert by_role["code2wav"].yaml_runtime["num_replicas"] == 2
+    by_role = {s.model_stage: _stage(pipeline, deploy, s.model_stage) for s in pipeline.stages}
+    assert by_role["thinker"].tensor_parallel_size == 2
+    assert by_role["talker"].num_replicas == 2
+    assert by_role["code2wav"].num_replicas == 2
     assert result.omni_lb_policy == "round-robin"
-
-
-def _resolved(stages, role):
-    """Return a role's fully-resolved (post-CLI) OmegaConf stage config."""
-    stage = next(s for s in stages if s.model_stage == role)
-    return stage.to_omegaconf()
 
 
 def test_device_check_survives_cli_override():
@@ -101,7 +96,7 @@ def test_device_check_survives_cli_override():
     # guard: effective world=1, replicas=2 admits only 1 or 2 device ids.
     pipeline_cfg = OMNI_PIPELINES["qwen2_5_omni"]
     with pytest.raises(StrategyApplyError):
-        StageConfigFactory._create_legacy_from_registry(
+        VllmOmniConfig.from_pipeline_config(
             pipeline_cfg,
             cli_overrides={"stage_1_devices": "0,1,2"},
             strategy_specs={"talker": [_stage_replica(2, "round_robin")]},
@@ -121,12 +116,12 @@ def test_cli_overrides_strategy_with_warning():
         def emit(self, record: logging.LogRecord) -> None:
             messages.append(record.getMessage())
 
-    log = logging.getLogger("vllm_omni.config.config_factory")
+    log = logging.getLogger("vllm_omni.config.omni_config")
     handler = _Capture(level=logging.WARNING)
     log.addHandler(handler)
     try:
         pipeline_cfg = OMNI_PIPELINES["qwen2_5_omni"]
-        stages, _ = StageConfigFactory._create_legacy_from_registry(
+        config = VllmOmniConfig.from_pipeline_config(
             pipeline_cfg,
             cli_overrides={"stage_1_num_replicas": 3},
             strategy_specs={"talker": [_stage_replica(2, "round_robin")]},
@@ -135,7 +130,7 @@ def test_cli_overrides_strategy_with_warning():
         log.removeHandler(handler)
 
     # CLI value wins in the resolved config.
-    assert _resolved(stages, "talker").runtime.num_replicas == 3
+    assert config.stage_by_id(1).runtime_config.num_replicas == 3
     # ...and the override was warned about, naming the conflicting field.
     assert any("num_replicas" in m and "overrides the strategy-derived" in m for m in messages)
 

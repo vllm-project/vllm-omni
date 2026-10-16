@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -27,7 +28,6 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
     _apply_platform_overrides,
     load_deploy_config,
-    merge_pipeline_deploy,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import (
     _CODEC_EOS_TOKEN_ID,
@@ -156,18 +156,18 @@ class TestDeployTopology:
     def test_deploy_resolves_three_stage_pipeline(self, filename: str, devices: list[str]) -> None:
         deploy = load_deploy_config(_DEPLOY_DIR / filename)
         pipeline = OMNI_PIPELINES[deploy.pipeline]
-        stages = merge_pipeline_deploy(pipeline, deploy)
+        stages = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_configs
 
         assert deploy.pipeline == _PIPELINE_KEY
         assert deploy.async_chunk is True
         assert [stage.stage_id for stage in stages] == [0, 1, 2]
-        assert [stage.yaml_runtime["devices"] for stage in stages] == devices
-        assert "additional_config" not in stages[1].yaml_engine_args
-        assert "skip_mm_profiling" not in stages[0].yaml_engine_args
-        assert stages[1].yaml_engine_args["skip_mm_profiling"] is True
-        assert stages[2].yaml_engine_args["skip_mm_profiling"] is True
-        assert stages[1].yaml_extras["output_connectors"]["to_stage_2"] == "connector_of_shared_memory"
-        assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
+        assert [stage.runtime_config.devices for stage in stages] == devices
+        assert not stages[1].runtime_config.additional_config
+        assert not stages[0].load_config.skip_mm_profiling
+        assert stages[1].load_config.skip_mm_profiling is True
+        assert stages[2].load_config.skip_mm_profiling is True
+        assert stages[1].connector_config.output_connectors["to_stage_2"] == "connector_of_shared_memory"
+        assert stages[2].connector_config.input_connectors["from_stage_1"] == "connector_of_shared_memory"
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["name"] == "SharedMemoryConnector"
         # One payload window for every chunk: the single-card deploy no longer
@@ -179,28 +179,28 @@ class TestDeployTopology:
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
         assert connector["extra"]["connector_get_max_wait"] == 300
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
-        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
-        assert "hf_overrides" not in stages[1].yaml_engine_args
+        assert stages[1].custom_process_next_stage_input_func.endswith(expected_processor)
+        assert not stages[1].model_config.hf_overrides
         if filename == "minicpmo_4_5.yaml":
             # The NPU overlay caps all three stages at 8 so the top tier is not
             # gated by a single stage; every other platform keeps the base 16.
             is_npu = (current_omni_platform.device_name or "").lower() == "npu"
             expected_seqs = 8 if is_npu else 16
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [expected_seqs] * 3
-            memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
+            assert [stage.scheduler_config.max_num_seqs for stage in stages] == [expected_seqs] * 3
+            memory_utilizations = [stage.cache_config.gpu_memory_utilization for stage in stages]
             # The NPU overlay also retunes the per-stage memory budget for the
             # 910B single-card layout; every other platform keeps the base one.
             expected_utils = [0.50, 0.10, 0.22] if is_npu else [0.55, 0.15, 0.18]
             assert memory_utilizations == expected_utils
             assert sum(memory_utilizations) <= 0.9 + 1e-6
-            # Keep the default Daily-Omni budget; Video-MME overrides stage 0 explicitly.
-            assert stages[0].yaml_engine_args["limit_mm_per_prompt"] == {
+            # Daily-Omni minicpm-interleave: up to 64 image/audio items (+ optional video).
+            assert stages[0].model_config.limit_mm_per_prompt == {
                 "image": 64,
                 "audio": 64,
                 "video": 1,
             }
         elif filename in {"minicpmo_4_5_2gpu.yaml"}:
-            assert [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages] == [
+            assert [stage.cache_config.gpu_memory_utilization for stage in stages] == [
                 0.9,
                 0.55,
                 0.35,
@@ -221,29 +221,31 @@ class TestDeployTopology:
         assert "code2wav_max_npu_graphs" not in connector_extra
 
         deploy = _apply_platform_overrides(deploy, platform="npu")
-        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+        stages = VllmOmniConfig.from_pipeline_config(
+            OMNI_PIPELINES[deploy.pipeline], user_deploy_config=deploy
+        ).stage_configs
         # vLLM 0.30.0 cannot run FULL_DECODE_ONLY on the NPU stage-0 engine,
         # so every variant pins PIECEWISE there. The single-card deploy keeps
         # the Talker (stage 1) on a full decode graph, which preserves
         # in-graph sampling and multi-frame expansion; multi-card variants
         # keep the base mode.
-        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+        assert stages[0].compilation_config.cudagraph_mode.name == "PIECEWISE"
         expected_graph_mode = "FULL_DECODE_ONLY" if filename == "minicpmo_4_5.yaml" else "PIECEWISE"
-        assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
-        assert stages[2].yaml_engine_args["enforce_eager"] is True
+        assert stages[1].compilation_config.cudagraph_mode.name == expected_graph_mode
+        assert stages[2].model_config.enforce_eager is True
         # Every variant keeps the Code2Wav graph pool at 32: a larger pool OOMs
         # the single-card deploy at 8-way concurrency, because captured graph
         # buffers sit outside the gpu_memory_utilization budget. The single-card
         # deploy is the only one that rounds batches up to a capture bucket, so
         # 32 entries cover its shape space; the multi-card variants leave the
         # buckets unset.
-        expected_graph_config = {
+        expected_graph_config: dict[str, bool | int | list[int]] = {
             "code2wav_enable_npu_graph": True,
             "code2wav_max_npu_graphs": 32,
         }
         if filename == "minicpmo_4_5.yaml":
             expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
-        assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
+        assert stages[2].runtime_config.additional_config == expected_graph_config
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
@@ -264,10 +266,12 @@ class TestDeployTopology:
     def test_no_async_chunk_selects_full_payload_processor(self) -> None:
         deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
         deploy.async_chunk = False
-        stages = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+        stages = VllmOmniConfig.from_pipeline_config(
+            OMNI_PIPELINES[_PIPELINE_KEY], user_deploy_config=deploy
+        ).stage_configs
 
-        assert stages[1].yaml_engine_args["async_chunk"] is False
-        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_full_payload")
+        assert stages[1].connector_config.async_chunk is False
+        assert stages[1].custom_process_next_stage_input_func.endswith(".tts2code2wav_full_payload")
 
 
 def test_code2wav_model_is_lazily_registered() -> None:

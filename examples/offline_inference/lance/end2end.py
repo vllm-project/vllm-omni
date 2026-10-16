@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Lance-3B offline inference (single-stage).
 
 Lance is BAGEL-lineage; this example covers the single-stage paths wired in
@@ -79,8 +79,8 @@ def parse_args():
     )
     # Lance is single-stage diffusion — no deploy YAML needed.  Required
     # engine knobs (``pipeline``, ``enforce_eager``, ``trust_remote_code``,
-    # ``max_num_seqs=1`` …) are passed as flat kwargs to ``Omni`` below
-    # and ``create_default_diffusion`` materializes the stage config.
+    # ``max_num_seqs=1`` …) are passed as flat kwargs to ``Omni`` below and
+    # resolved into the typed diffusion stage config.
 
     return p.parse_args()
 
