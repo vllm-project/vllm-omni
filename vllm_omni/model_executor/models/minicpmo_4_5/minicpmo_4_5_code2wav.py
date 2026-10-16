@@ -1507,6 +1507,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()
             logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
+        elif current_omni_platform.is_npu():
+            # CAM++ speaker embedding on device via torch (weights loaded from
+            # the same campplus.onnx) — replaces the per-request CPU
+            # onnxruntime run that blocks the host ~120-155ms per request.
+            token2wav.enable_device_spk_embedding()
+            logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
