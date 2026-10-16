@@ -35,6 +35,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
@@ -51,7 +52,7 @@ from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import (
     get_best_mot_config,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -122,9 +123,9 @@ def _parse_dtype(dtype_str: str) -> DTypeConfig:
         "w16a16_bf16": DTypeConfig(torch_dtype=torch.bfloat16),
         "w16a16_fp16": DTypeConfig(torch_dtype=torch.float16),
     }
-    if dtype_str in supported:
-        return supported[dtype_str]
-    pytest.skip(f"Quantized dtype '{dtype_str}' not yet implemented in layer test")
+    if dtype_str not in supported:
+        pytest.skip(f"Quantized dtype '{dtype_str}' not yet implemented in layer test")
+    return supported[dtype_str]
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +153,8 @@ def _make_indices(image_num: int, vae_chunk_size: int, device: str = "cuda") -> 
     Pattern per image like: [1 Text] + [4096 VAE] + [1 Text]
     Returns text_indices, vae_indices, and the exact total M.
     """
-    text_idx_list = []
-    vae_idx_list = []
+    text_idx_list: list[int] = []
+    vae_idx_list: list[int] = []
 
     current_idx = 0
     for _ in range(image_num):

@@ -229,6 +229,46 @@ def test_realtime_duplex_demo_pair_launches_demo_processes_concurrently(tmp_path
         assert len(session["audio_delta_timings"]) == 2
 
 
+def test_realtime_duplex_demo_pair_omits_ref_audio_for_model_default(monkeypatch):
+    demo = _load_pair_demo_module()
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_exec(*command, **kwargs):
+        captured["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(demo.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(demo, "_summarize_session", lambda **kwargs: {"ok": True})
+
+    result = asyncio.run(
+        demo._run_demo_process(
+            label="a",
+            args=SimpleNamespace(
+                url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
+                model="openbmb/MiniCPM-o-4_5",
+                chunk_ms=200,
+                timeout_s=5.0,
+                no_realtime_pacing=False,
+                require_audio=False,
+                ref_audio=None,
+            ),
+            input_wav="input.wav",
+            output_dir="out",
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--ref-audio" not in command
+    assert result["ok"] is True
+
+
 def test_realtime_duplex_demo_pair_rejects_false_green_audio_contract(tmp_path):
     demo = _load_pair_demo_module()
     output = tmp_path / "session"
@@ -289,7 +329,7 @@ def test_realtime_duplex_demo_pair_default_requires_multiple_audio_deltas(monkey
     assert args.min_audio_deltas_per_session == 2
 
 
-def test_realtime_duplex_demo_pair_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_demo_pair_allows_model_default_ref_audio(monkeypatch):
     demo = _load_pair_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -307,11 +347,12 @@ def test_realtime_duplex_demo_pair_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
-def test_realtime_duplex_soft_interrupt_requires_ref_audio(monkeypatch):
+def test_realtime_duplex_soft_interrupt_allows_model_default_ref_audio(monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     monkeypatch.setattr(
         demo.sys,
@@ -325,8 +366,9 @@ def test_realtime_duplex_soft_interrupt_requires_ref_audio(monkeypatch):
         ],
     )
 
-    with pytest.raises(SystemExit):
-        demo.parse_args()
+    args = demo.parse_args()
+
+    assert args.ref_audio is None
 
 
 def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
@@ -360,8 +402,6 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
         wav_file.setsampwidth(2)
         wav_file.setframerate(16_000)
         wav_file.writeframes(b"\x00\x00" * 320)
-    ref_audio = tmp_path / "ref.wav"
-    ref_audio.write_bytes(b"ref")
     output_dir = tmp_path / "out"
     output_dir.mkdir()
     captured: dict[str, object] = {}
@@ -392,7 +432,7 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
                 url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
                 model="openbmb/MiniCPM-o-4_5",
                 input_wav=str(input_wav),
-                ref_audio=str(ref_audio),
+                ref_audio=None,
                 output_dir=str(output_dir),
                 summary_output=None,
                 chunk_ms=200,
@@ -411,6 +451,7 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
 
     command = captured["command"]
     assert isinstance(command, list)
+    assert "--ref-audio" not in command
     assert "--temperature" in command
     assert command[command.index("--temperature") + 1] == "0.0"
     assert result["ok"] is True
@@ -2006,19 +2047,18 @@ def test_realtime_duplex_demo_streams_one_video_frame_per_model_unit():
     messages = _send_seconds_of_audio(demo, seconds=3, frames=["f0", "f1", "f2", "f3"])
 
     # Frame k rides the append that closes model unit k, so Stage0 can bind it
-    # to that unit's audio. 3 s of audio closes units at 1030 ms and 2030 ms and
-    # leaves a residual too short for a third, so only two frames go out.
-    assert _sent_video_frames(messages) == [["f0"], ["f1"]]
+    # to that unit's audio. 3 s of audio closes units at 1000, 2000, and 3000 ms.
+    assert _sent_video_frames(messages) == [["f0"], ["f1"], ["f2"]]
     frame_indices = [index for index, message in enumerate(messages) if "video_frames" in message]
-    assert frame_indices == [5, 10]
+    assert frame_indices == [4, 9, 14]
     # The carrying appends are exactly the ones that reach a unit boundary.
-    assert [messages[index]["audio_end_ms"] for index in frame_indices] == [1200, 2200]
+    assert [messages[index]["audio_end_ms"] for index in frame_indices] == [1000, 2000, 3000]
 
 
 def test_realtime_duplex_demo_never_sends_a_frame_before_its_unit_can_close():
     """Regression: frame 0 used to ride the very first 200 ms append.
 
-    Stage0 cannot close a unit until 1030 ms of audio has arrived, and it does
+    Stage0 cannot close a unit until 1000 ms of audio has arrived, and it does
     not carry frames across appends, so a frame sent that early was silently
     dropped and every later frame ended up one unit ahead of its audio.
     """
@@ -2035,11 +2075,19 @@ def test_realtime_duplex_demo_never_sends_a_frame_before_its_unit_can_close():
 def test_realtime_duplex_demo_holds_the_last_video_frame_when_audio_outlives_the_clip():
     demo = _load_demo_module()
 
-    # 4 s of audio closes three units (1030/2030/3030 ms); the two-frame clip
-    # holds its last frame for the third.
-    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=4, frames=["a", "b"])) == [["a"], ["b"], ["b"]]
+    # 4 s of audio closes four units; the two-frame clip holds its last frame.
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=4, frames=["a", "b"])) == [
+        ["a"],
+        ["b"],
+        ["b"],
+        ["b"],
+    ]
     # A still image is a one-element clip and therefore repeats every unit.
-    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=3, frames=["still"])) == [["still"], ["still"]]
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=3, frames=["still"])) == [
+        ["still"],
+        ["still"],
+        ["still"],
+    ]
 
 
 def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_base_frame():
@@ -2055,7 +2103,7 @@ def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_bas
     # Official pairing is frame_list=[base, composite of that unit's interior],
     # so the composite belongs to the same unit as the base beside it -- never
     # to the previous one. A unit without interior sub-frames sends base alone.
-    assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"]]
+    assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"], ["f2"]]
 
 
 def test_minicpmo_duplex_camera_fixture_returns_flat_base_frame_track(tmp_path, monkeypatch):

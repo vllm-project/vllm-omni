@@ -21,6 +21,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.multimodal_accumulation import (
@@ -46,6 +47,8 @@ def _modality_to_type_string(modality: OutputModality) -> str:
             return "image"
         if OutputModality.LATENT in modality:
             return "latent"
+        if OutputModality.TOKEN_IDS in modality:
+            return "token_ids"
     except TypeError:
         # Flag identity mismatch (e.g. after module reload in tests).
         name = getattr(modality, "name", "") or ""
@@ -56,6 +59,8 @@ def _modality_to_type_string(modality: OutputModality) -> str:
             return "image"
         if "latent" in lowered:
             return "latent"
+        if "token_ids" in lowered:
+            return "token_ids"
     return "text"
 
 
@@ -80,6 +85,32 @@ def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, ne
     record[_TPOT_ELAPSED_MS] = total_elapsed_ms
     record[_TPOT_INTERVALS] = total_intervals
     record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
+
+
+def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
+    """Return the observed queue/prefill/decode split of a finished request.
+
+    The intervals match vLLM's ``FinishedRequestStats`` (queued_time,
+    prefill_time, decode_time). vLLM leaves a timestamp at 0.0 when its
+    engine-core event never arrived; subtracting it would invent a duration,
+    so such intervals, and any that would be negative, are omitted instead
+    of reported as 0.
+    """
+    metrics: dict[str, float | int] = {}
+    queued_ts, scheduled_ts = stats.queued_ts, stats.scheduled_ts
+    first_ts, last_ts = stats.first_token_ts, stats.last_token_ts
+    if queued_ts > 0 and scheduled_ts >= queued_ts:
+        metrics[defs.VLLM_QUEUED_MS] = (scheduled_ts - queued_ts) * 1000.0
+    if scheduled_ts > 0 and first_ts >= scheduled_ts:
+        metrics[defs.VLLM_PREFILL_MS] = (first_ts - scheduled_ts) * 1000.0
+    if first_ts > 0 and last_ts >= first_ts:
+        metrics[defs.VLLM_DECODE_MS] = (last_ts - first_ts) * 1000.0
+    if queued_ts > 0 or scheduled_ts > 0:
+        # PREEMPTED rides the same engine-core event stream as QUEUED and
+        # SCHEDULED, so a zero count only means something once that stream
+        # was observed.
+        metrics[defs.VLLM_NUM_PREEMPTIONS] = int(stats.num_preemptions)
+    return metrics
 
 
 class OmniRequestState(RequestState):
@@ -410,7 +441,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats: Whether to log statistics
             stream_interval: Stream interval for output generation
             engine_core_output_type: Optional output type string (e.g.,
-                "image", "audio", "latent"). Converted to OutputModality
+                "image", "audio", "latent", "token_ids"). Converted to OutputModality
                 internally. Kept for backward compatibility with
                 stage_init_utils.
             output_modality: Type-safe output modality flag. Used to tag
@@ -828,6 +859,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if iteration_stats is None or engine_core_timestamp is None or native_stats is None:
             return
 
+        is_coalesced = getattr(engine_core_output, "is_coalesced", False) is True
+        num_itls_before = len(iteration_stats.inter_token_latencies_iter) if is_coalesced else 0
         iteration_stats.update_from_output(
             engine_core_output,
             engine_core_timestamp,
@@ -836,6 +869,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self.lora_states,
             req_state.lora_name,
         )
+        if is_coalesced:
+            # Keep all upstream state updates, but not the batched interval as one ITL.
+            del iteration_stats.inter_token_latencies_iter[num_itls_before:]
         record = self._native_text_metric_record(req_state.external_req_id)
         record["num_generation_tokens"] = (
             reported_count
@@ -848,9 +884,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
         if previous_last_token_ts > 0:
             itl_ms = max((engine_core_timestamp - previous_last_token_ts) * 1000.0, 0.0)
-            itls_ms = record.setdefault("vllm_itls_ms", [])
-            itls_ms.append(itl_ms)
-            record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
+            if not is_coalesced:
+                itls_ms = record.setdefault("vllm_itls_ms", [])
+                itls_ms.append(itl_ms)
+                record["vllm_itl_ms"] = sum(itls_ms) / float(len(itls_ms))
             _accumulate_segment_tpot(
                 record,
                 elapsed_ms=itl_ms,
@@ -879,6 +916,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_stats=native_stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
+        self._native_text_metric_record(req_state.external_req_id).update(_native_phase_metrics(native_stats))
         if not iteration_stats.finished_requests:
             return
 

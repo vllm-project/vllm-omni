@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Tests for AsyncOmniEngine.try_get_output and try_get_output_async.
+"""Tests for AsyncOmniEngine.try_get_output.
 
-Focuses on the critical behavior: when the orchestrator thread dies it enqueues
-a fatal ``ErrorMessage`` and then shuts the output queue down. Readers must
-drain the fatal message first (so the caller sees ``fatal=True``) and then
-raise ``RuntimeError`` instead of hanging -- including a reader already parked
-on an empty queue, which ``shutdown()`` wakes.
+Focuses on the critical behavior: when the orchestrator thread dies,
+subsequent attempts to collect output raise RuntimeError.
 """
 
 import asyncio
@@ -21,7 +18,7 @@ import janus
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.engine.async_engine_utils import weak_shutdown_async_omni_engine
+from vllm_omni.engine.async_engine_utils import OutputQueueSink, weak_shutdown_async_omni_engine
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     CollectiveRPCResultMessage,
@@ -35,7 +32,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_engine(output_queue, mocker: MockerFixture, *, thread_alive: bool = True) -> AsyncOmniEngine:
-    """Create an AsyncOmniEngine bypassing __init__ (with a mocked queue)."""
+    """Create an AsyncOmniEngine bypassing __init__."""
     engine = object.__new__(AsyncOmniEngine)
     engine.output_queue = output_queue
     engine.orchestrator_thread = mocker.MagicMock(
@@ -45,19 +42,12 @@ def _make_engine(output_queue, mocker: MockerFixture, *, thread_alive: bool = Tr
 
 
 def _make_real_engine(output_queue: janus.Queue) -> AsyncOmniEngine:
-    """Engine wired to a real janus queue so the async tests exercise the real
-    ``async_q.get()`` / ``shutdown()`` path across the sync/async boundary."""
+    """Engine over a real janus queue and sink, with a live orchestrator thread."""
     engine = object.__new__(AsyncOmniEngine)
     engine.output_queue = output_queue
+    engine._output_sink = OutputQueueSink(output_queue.sync_q)
+    engine.orchestrator_thread = SimpleNamespace(is_alive=lambda: True)
     return engine
-
-
-def _safe_shutdown(q: janus.Queue) -> None:
-    """Idempotent shutdown for test cleanup (a test may have shut it down)."""
-    try:
-        q.shutdown()
-    except Exception:
-        pass
 
 
 def test_weak_shutdown_closes_rpc_router_before_joining_orchestrator(mocker: MockerFixture):
@@ -115,17 +105,75 @@ def test_try_get_output_raises_after_orchestrator_dies(mocker: MockerFixture):
 
 
 def test_try_get_output_raises_on_queue_shutdown():
-    """A real shut-down output queue must surface as RuntimeError, not leak the
-    raw janus exception. Uses a real janus queue (not a mocked side_effect): the
-    sync side raises ``janus.ShutDown``, which differs from the async side's
-    ``janus.QueueShutDown``, so both must be mapped."""
+    """A shut-down output queue surfaces as the orchestrator-dead RuntimeError,
+    not the raw janus exception, even while ``is_alive()`` still says True."""
     real_queue = janus.Queue()
     engine = _make_real_engine(real_queue)
-    real_queue.shutdown()
+    try:
+        engine._output_sink.shutdown()
+        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
+            engine.try_get_output(timeout=0.1)
+    finally:
+        real_queue.close()
 
-    with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
-        engine.try_get_output(timeout=0.1)
-    _safe_shutdown(real_queue)
+
+# --------------- bootstrap: death signaling on ANY thread exit ---------------
+
+
+def _bootstrap_engine(exc: BaseException, mocker: MockerFixture) -> AsyncOmniEngine:
+    """Engine whose stage init raises ``exc``, wired to real queues, so
+    ``_bootstrap_orchestrator``'s except/finally death signaling actually runs."""
+    engine = object.__new__(AsyncOmniEngine)
+    engine.output_queue = janus.Queue()
+    engine._output_sink = OutputQueueSink(engine.output_queue.sync_q)
+    engine.rpc_output_queue = janus.Queue()
+    engine._initialize_stages = mocker.MagicMock(side_effect=exc)
+    return engine
+
+
+@pytest.mark.parametrize("exc", [SystemExit("boom"), asyncio.CancelledError()])
+def test_bootstrap_shuts_output_queue_when_thread_exits_via_base_exception(exc, mocker: MockerFixture):
+    """A BaseException (SystemExit / CancelledError) skips ``except Exception``,
+    so ``finally`` must still shut the output sink down; otherwise a waiting
+    reader only learns of the exit from its liveness timeout. No fatal
+    message is enqueued."""
+    engine = _bootstrap_engine(exc, mocker)
+    startup_future: concurrent.futures.Future = concurrent.futures.Future()
+    try:
+        with pytest.raises(type(exc)):
+            engine._bootstrap_orchestrator(0, startup_future)
+
+        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
+            engine.try_get_output(timeout=0.1)
+        # The RPC queue is not shut down (its router thread keeps polling with
+        # a timeout and is closed by ``shutdown()``); nothing was enqueued on it.
+        with pytest.raises(queue.Empty):
+            engine.rpc_output_queue.sync_q.get_nowait()
+    finally:
+        engine.output_queue.close()
+        engine.rpc_output_queue.close()
+
+
+def test_bootstrap_enqueues_fatal_then_shuts_down_on_exception(mocker: MockerFixture):
+    """A regular Exception surfaces the real error as a fatal message on both
+    queues (drained first), then the output sink is shut down."""
+    engine = _bootstrap_engine(RuntimeError("stage boom"), mocker)
+    startup_future: concurrent.futures.Future = concurrent.futures.Future()
+    try:
+        with pytest.raises(RuntimeError, match="stage boom"):
+            engine._bootstrap_orchestrator(0, startup_future)
+
+        msg = engine.try_get_output(timeout=0.1)
+        assert isinstance(msg, ErrorMessage) and msg.fatal
+        assert "stage boom" in msg.error
+        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
+            engine.try_get_output(timeout=0.1)
+        rpc_msg = engine.rpc_output_queue.sync_q.get_nowait()
+        assert isinstance(rpc_msg, ErrorMessage) and rpc_msg.fatal
+        assert "stage boom" in rpc_msg.error
+    finally:
+        engine.output_queue.close()
+        engine.rpc_output_queue.close()
 
 
 def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixture):
@@ -146,143 +194,6 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
     assert msg.type == "error"
     assert msg.fatal is True
     assert "crashed" in msg.error
-
-
-# -------------------------- async: try_get_output_async --------------------------
-
-
-@pytest.mark.asyncio
-async def test_try_get_output_async_is_event_driven():
-    """The async reader parks on an empty queue and wakes the instant a producer
-    enqueues, rather than busy-polling. Uses a real janus queue across the sync
-    (producer) / async (consumer) boundary, mirroring production: the
-    orchestrator puts via ``sync_q`` and the engine consumes via ``async_q``.
-    """
-    real_queue = janus.Queue()
-    engine = _make_real_engine(real_queue)
-    try:
-        getter = asyncio.ensure_future(engine.try_get_output_async())
-        await asyncio.sleep(0.05)
-        # Nothing queued yet: the coroutine must still be parked, not return.
-        assert not getter.done()
-
-        produced = OutputMessage(
-            request_id="r2",
-            stage_id=0,
-            engine_outputs=OmniRequestOutput(request_id="r2"),
-            finished=False,
-        )
-        real_queue.sync_q.put_nowait(produced)
-
-        result = await asyncio.wait_for(getter, timeout=1.0)
-        assert result.request_id == "r2"
-
-        # An already-queued message is returned promptly on the next call.
-        real_queue.sync_q.put_nowait(produced)
-        again = await asyncio.wait_for(engine.try_get_output_async(), timeout=1.0)
-        assert again.request_id == "r2"
-    finally:
-        _safe_shutdown(real_queue)
-
-
-@pytest.mark.asyncio
-async def test_try_get_output_async_drains_fatal_then_raises_on_shutdown():
-    """Mirrors a crash: the orchestrator enqueues a fatal ErrorMessage and then
-    shuts the queue down. The reader must drain the fatal message first (so the
-    caller can detect ``fatal=True``), then raise RuntimeError on the next read.
-    """
-    real_queue = janus.Queue()
-    engine = _make_real_engine(real_queue)
-    try:
-        real_queue.sync_q.put_nowait(ErrorMessage(error="Orchestrator thread crashed", fatal=True))
-        real_queue.shutdown()  # immediate=False: queued items drain before QueueShutDown
-
-        msg = await asyncio.wait_for(engine.try_get_output_async(), timeout=1.0)
-        assert msg is not None
-        assert msg.type == "error"
-        assert msg.fatal is True
-        assert "crashed" in msg.error
-
-        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
-            await asyncio.wait_for(engine.try_get_output_async(), timeout=1.0)
-    finally:
-        _safe_shutdown(real_queue)
-
-
-@pytest.mark.asyncio
-async def test_shutdown_wakes_parked_getter():
-    """The key guarantee behind dropping the is_alive() precheck: a reader
-    already parked on an EMPTY queue is woken by shutdown() -- i.e. a crash that
-    enqueued nothing still surfaces as RuntimeError instead of hanging forever.
-    """
-    real_queue = janus.Queue()
-    engine = _make_real_engine(real_queue)
-    try:
-        getter = asyncio.ensure_future(engine.try_get_output_async())
-        await asyncio.sleep(0.05)
-        assert not getter.done()  # parked, nothing to read
-
-        real_queue.shutdown()  # orchestrator died without enqueuing anything
-
-        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
-            await asyncio.wait_for(getter, timeout=1.0)
-    finally:
-        _safe_shutdown(real_queue)
-
-
-# --------------- bootstrap: death signaling on ANY thread exit ---------------
-
-
-def _bootstrap_engine(exc: BaseException, mocker: MockerFixture) -> AsyncOmniEngine:
-    """Engine whose stage init raises ``exc``, wired to real janus queues, so
-    ``_bootstrap_orchestrator``'s except/finally death-signaling actually runs."""
-    engine = object.__new__(AsyncOmniEngine)
-    engine.output_queue = janus.Queue()
-    engine.rpc_output_queue = janus.Queue()
-    engine._initialize_stages = mocker.MagicMock(side_effect=exc)
-    return engine
-
-
-@pytest.mark.parametrize("exc", [SystemExit("boom"), asyncio.CancelledError()])
-def test_bootstrap_shuts_output_queue_when_thread_exits_via_base_exception(exc, mocker: MockerFixture):
-    """A BaseException (SystemExit / CancelledError) skips ``except Exception``,
-    so ``finally`` must still shut the output queue down -- otherwise a parked
-    ``await async_q.get()`` would hang forever. No fatal message is enqueued."""
-    engine = _bootstrap_engine(exc, mocker)
-    startup_future: concurrent.futures.Future = concurrent.futures.Future()
-
-    with pytest.raises(type(exc)):
-        engine._bootstrap_orchestrator(0, startup_future)
-
-    # Output queue shut down -> a reader unparks with RuntimeError, not a hang.
-    with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
-        engine.try_get_output(timeout=0.1)
-    # The RPC queue is not shut down (its router thread keeps polling with a
-    # timeout and is closed by ``shutdown()``); nothing was enqueued on it.
-    with pytest.raises(queue.Empty):
-        engine.rpc_output_queue.sync_q.get_nowait()
-
-
-def test_bootstrap_enqueues_fatal_then_shuts_down_on_exception(mocker: MockerFixture):
-    """A regular Exception still surfaces the real error as a fatal message
-    (drained first) on both queues, then shuts the output queue down."""
-    engine = _bootstrap_engine(RuntimeError("stage boom"), mocker)
-    startup_future: concurrent.futures.Future = concurrent.futures.Future()
-
-    with pytest.raises(RuntimeError, match="stage boom"):
-        engine._bootstrap_orchestrator(0, startup_future)
-
-    # Fatal message drains first (caller sees the real error) ...
-    msg = engine.output_queue.sync_q.get_nowait()
-    assert isinstance(msg, ErrorMessage) and msg.fatal
-    assert "stage boom" in msg.error
-    # ... then the queue is shut down (sync side raises ShutDown).
-    with pytest.raises(janus.ShutDown):
-        engine.output_queue.sync_q.get_nowait()
-    # RPC waiters get the same fatal message via the result router.
-    rpc_msg = engine.rpc_output_queue.sync_q.get_nowait()
-    assert isinstance(rpc_msg, ErrorMessage) and rpc_msg.fatal
-    assert "stage boom" in rpc_msg.error
 
 
 def test_output_remains_on_shared_output_path(mocker: MockerFixture):

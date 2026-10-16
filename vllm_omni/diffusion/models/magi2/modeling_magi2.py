@@ -806,6 +806,10 @@ class Magi2PreviewTransformer(nn.Module):
                 module.router.expert_bias.copy_(module.router.expert_bias_ema)
                 loaded.add(f"{module_name}.router.expert_bias")
 
+        for module in self.modules():
+            if isinstance(module, Magi2MultiHeadMoE):
+                module.prepare_bf16_weights()
+
         missing = set(targets) - loaded
         if missing:
             raise ValueError(f"MAGI-2 preview checkpoint is missing {len(missing)} weights: {sorted(missing)[:8]}")

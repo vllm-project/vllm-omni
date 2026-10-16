@@ -15,6 +15,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmission,
     duplex_ephemeral_stage_request_id,
 )
+from vllm_omni.engine.duplex.session.context import DuplexRunState
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -370,6 +371,7 @@ def test_draining_empty_eos_completes_owning_response_before_shortcut() -> None:
             stage_port=port,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
+            run=DuplexRunState(),
         ),
         out,
         close_from_runtime=_noop,
@@ -461,6 +463,7 @@ def test_draining_completion_drops_finished_response_books_only() -> None:
             stage_port=_Port(),
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
+            run=DuplexRunState(),
         ),
         out,
         close_from_runtime=_noop,
@@ -530,7 +533,7 @@ def test_stale_continue_does_not_close_the_new_response() -> None:
             stage_port=SimpleNamespace(),
             model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
-            run=SimpleNamespace(closing=False),
+            run=DuplexRunState(),
         ),
         out,
         close_from_runtime=_noop,
@@ -621,7 +624,7 @@ def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
                 continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None
             ),
             services=SimpleNamespace(spawn=lambda coro, **_k: spawned.append(coro)),
-            run=SimpleNamespace(closing=False),
+            run=DuplexRunState(),
         ),
         out,
         close_from_runtime=_noop,
@@ -702,7 +705,7 @@ def test_silent_listen_aborts_data_plane_request_with_full_id() -> None:
                 continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None
             ),
             services=SimpleNamespace(spawn=lambda coro, **_k: None),
-            run=SimpleNamespace(closing=False),
+            run=DuplexRunState(),
         ),
         _Out(),
         close_from_runtime=_noop,

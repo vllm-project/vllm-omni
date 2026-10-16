@@ -181,11 +181,16 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.cuda.memory_reserved(device))
+
+    @classmethod
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
-        os.environ["HIP_VISIBLE_DEVICES"] = devices
-        os.environ["CUDA_VISIBLE_DEVICES"] = devices
+        visible = "" if devices is None else str(devices)
+        os.environ["HIP_VISIBLE_DEVICES"] = visible
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible
 
     @classmethod
     def unset_device_control_env_var(cls) -> None:

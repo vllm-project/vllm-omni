@@ -218,14 +218,17 @@ def test_the_error_code_vocabulary_is_tier3() -> None:
     assert not hasattr(realtime_errors, "REALTIME_ERROR_TYPES_BY_CODE")
 
 
-def test_the_tier1_error_event_reports_only_openai_classes() -> None:
+@pytest.mark.parametrize("code", ["resource_exhausted", "output_backpressure"])
+def test_the_tier1_error_event_reports_only_openai_classes(code: str) -> None:
     from vllm_omni.protocol.duplex import events as duplex_wire_events
     from vllm_omni.protocol.realtime import events as realtime_events
 
     # Tier 1 knows the envelope shape but not our code vocabulary.
-    assert realtime_events.ErrorEvent(code="resource_exhausted").error_type == "invalid_request_error"
+    assert realtime_events.ErrorEvent(code=code).error_type == "invalid_request_error"
     # Tier 2 resolves it through our table.
-    assert duplex_wire_events.ErrorEvent(code="resource_exhausted").error_type == "rate_limit_error"
+    error = duplex_wire_events.ErrorEvent(code=code)
+    assert error.error_type == "rate_limit_error"
+    assert error.to_realtime()["error"]["type"] == "rate_limit_error"
 
 
 @pytest.mark.parametrize("name", _TIER1_COMMANDS + _TIER2_COMMANDS + _TIER3_COMMANDS)

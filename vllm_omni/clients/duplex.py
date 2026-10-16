@@ -40,7 +40,7 @@ import random
 import time
 import wave
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -111,13 +111,10 @@ __all__ = [
 PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
 
-# Server-side model unit boundaries, in cumulative appended audio.
-# Stage0 configures the streaming mel processor with first_chunk_ms=1035 and
-# chunk_ms=1000; the processor aligns the first chunk down to a hop_length (160
-# samples) multiple, so unit 0 closes at 16480 samples and every later unit
-# closes 16000 samples after it. Camera frames must ride the append that closes
-# a unit, otherwise Stage0 cannot bind them to that unit's audio.
-DUPLEX_FIRST_UNIT_MS = 1030
+# The native PCM reservation closes every 1000 ms, including the first unit.
+# Stage0 adds the first mel window's padding internally; the camera frame must
+# arrive with the reservation, before that internal padding is applied.
+DUPLEX_FIRST_UNIT_MS = 1000
 DUPLEX_UNIT_MS = 1000
 
 
@@ -246,6 +243,9 @@ class SessionConfig:
     playback_commit_policy: str | None = None
     turn_detection: dict[str, object] | None = None
     idle_timeout_s: float | None = None
+    #: Caps the response length for every turn in the session. Left unset the
+    #: server decides, so existing callers send exactly what they sent before.
+    max_output_tokens: int | None = None
     extra_body: dict[str, object] = field(default_factory=dict)
 
     def to_session_payload(self, *, model: str) -> dict[str, object]:
@@ -279,6 +279,8 @@ class SessionConfig:
             payload["playback_commit_policy"] = self.playback_commit_policy
         if self.idle_timeout_s is not None:
             payload["idle_timeout_s"] = self.idle_timeout_s
+        if self.max_output_tokens is not None:
+            payload["max_output_tokens"] = self.max_output_tokens
         extra_body: dict[str, object] = {"auto_response": self.auto_response}
         extra_body.update(self.extra_body)
         payload["extra_body"] = extra_body
@@ -806,10 +808,9 @@ class DuplexClientBase(ABC):
         model unit ``k`` (see :func:`duplex_unit_boundary_ms`), which
         reproduces the official ``streaming_prefill(audio_waveform=<1 s>,
         frame_list=[frame])`` pairing: a second of audio and the picture
-        captured during it enter the same unit. Sending on whole-second
-        boundaries instead would strand frame 0 on an append that cannot
-        close a unit yet, and shift every later frame one unit ahead of its
-        audio.
+        captured during it enter the same unit. Sending a frame before its
+        whole-second unit boundary would strand it on an append that cannot
+        close the unit yet.
 
         ``stacked_video_frames`` is the optional parallel track of composites
         (see ``vllm_omni.experimental.fullduplex.video_stacking``): entry ``k``
@@ -955,7 +956,8 @@ class DuplexClientBase(ABC):
             marker = self._closed_marker
             raise DuplexSessionClosedError(marker.reason if marker else "closed")
         payload = dict(event)
-        payload.setdefault("event_id", f"evt_{uuid4().hex}")
+        # setdefault returns the caller's id when it supplied one, ours otherwise.
+        event_id = str(payload.setdefault("event_id", f"evt_{uuid4().hex}"))
         try:
             await self._send_command(payload)
         except asyncio.CancelledError:
@@ -964,7 +966,7 @@ class DuplexClientBase(ABC):
             raise
         except Exception as exc:
             raise DuplexConnectionError(f"send failed: {exc}") from exc
-        return payload["event_id"]
+        return event_id
 
     # -- internals ---------------------------------------------------------------
 
@@ -1030,6 +1032,9 @@ class DuplexClientBase(ABC):
         if not self._accept_event(data):
             return
         event = wrap_event(data)
+        # Shared across the branches below: created makes one, the rest look an
+        # existing one up and may not find it.
+        handle: ResponseHandle | None
 
         if isinstance(event, SessionResumed):
             self._adopt_session(event)
@@ -1114,12 +1119,20 @@ class DuplexClientBase(ABC):
         for handle in self._responses.values():
             handle._finish(None)
         self._responses.clear()
-        for queue in (*self._subscribers, self._response_queue):
+        # Subscriber and response queues carry different item types; the marker
+        # goes to both, so widen to the common Queue rather than to object.
+        queues: tuple[asyncio.Queue, ...] = (*self._subscribers, self._response_queue)
+        for queue in queues:
             _put_drop_oldest(queue, marker)
 
 
 class DuplexClient(DuplexClientBase):
-    """Async client for one duplex session over ``/v1/realtime?duplex=1``."""
+    """Async client for one duplex session over ``/v1/realtime?duplex=1``.
+
+    ``extra_headers`` are sent on initial and resumed WebSocket handshakes by
+    the built-in transport. A custom ``connect`` callback owns its connection
+    options, including headers.
+    """
 
     def __init__(
         self,
@@ -1127,6 +1140,7 @@ class DuplexClient(DuplexClientBase):
         *,
         model: str,
         config: SessionConfig | None = None,
+        extra_headers: Mapping[str, str] | None = None,
         reconnect: ReconnectPolicy | None = ReconnectPolicy(),
         heartbeat_interval_s: float | None = 30.0,
         handshake_timeout_s: float = 30.0,
@@ -1134,6 +1148,7 @@ class DuplexClient(DuplexClientBase):
     ) -> None:
         super().__init__(model=model, config=config, handshake_timeout_s=handshake_timeout_s)
         self.url = url
+        self._extra_headers = dict(extra_headers) if extra_headers is not None else None
         self.resume_token: str | None = None
         self._reconnect = reconnect
         self._heartbeat_interval_s = heartbeat_interval_s
@@ -1197,7 +1212,7 @@ class DuplexClient(DuplexClientBase):
         except ImportError as exc:  # pragma: no cover - websockets is a pinned dep
             raise DuplexConnectionError("The duplex client requires the 'websockets' package") from exc
         try:
-            return await websockets.connect(url, max_size=_MAX_FRAME_BYTES)
+            return await websockets.connect(url, additional_headers=self._extra_headers, max_size=_MAX_FRAME_BYTES)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1237,7 +1252,13 @@ class DuplexClient(DuplexClientBase):
         while True:
             try:
                 while True:
-                    raw = await self._ws.recv()
+                    # Re-read per message: _attempt_resume swaps the transport.
+                    # Raising here lands in the same handler an AttributeError
+                    # on a missing transport used to.
+                    ws = self._ws
+                    if ws is None:
+                        raise DuplexConnectionError("transport is not connected")
+                    raw = await ws.recv()
                     if isinstance(raw, (bytes, bytearray)):
                         continue
                     try:

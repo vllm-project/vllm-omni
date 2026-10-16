@@ -39,6 +39,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class MockConnector:
+    sender_host: str | None = None
+    sender_zmq_port: int | None = None
+
     """In-memory connector for testing (mimics OmniConnectorBase)."""
 
     def __init__(self, stage_id: int = 0):
@@ -187,7 +190,7 @@ def test_init_payload_connector_ownership(role, custom_func, expected):
 
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
+def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank, mocker):
     host = MixinHost()
     host.init_omni_connectors(_make_model_config(async_chunk=async_chunk))
     # No background threads: deterministic interleaved polling.
@@ -196,7 +199,7 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
     connector = host._omni_connector
     connector.sender_host = "configured-host"
     connector.sender_zmq_port = 50051
-    connector.get = MagicMock(return_value=None)
+    get = mocker.patch.object(connector, "get", return_value=None)
     first = _make_request("r1", "external1")
     first.payload_sender_info = {"host": "producer-a", "zmq_port": "50101"}
     second = _make_request("r2", "external2")
@@ -209,14 +212,14 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
             for req_id in ("r2", "r1", "r2"):
                 assert not host._poll_single_request(req_id)
             if rank == 1:
-                connector.get.assert_not_called()
+                get.assert_not_called()
             else:
-                assert connector.get.call_args_list == [
+                assert get.call_args_list == [
                     unittest.mock.call("0", "1", "external2_0_0", {"source_host": "producer-b", "source_port": 51101}),
                     unittest.mock.call("0", "1", "external1_0_0", {"source_host": "producer-a", "source_port": 50101}),
                     unittest.mock.call("0", "1", "external2_0_0", {"source_host": "producer-b", "source_port": 51101}),
                 ]
-                connector.get.return_value = ({"ids": {"output": [1]}, "meta": {"finished": True}}, 1)
+                get.return_value = ({"ids": {"output": [1]}, "meta": {"finished": True}}, 1)
                 assert host._poll_single_request("r2")
                 assert "r2" not in host._pending_load_reqs
                 assert "r1" in host._pending_load_reqs
@@ -225,14 +228,14 @@ def test_split_request_endpoint_retry_completion_and_cleanup(async_chunk, rank):
             assert not host._pending_load_reqs
             # Reused internal ID without sender info cannot inherit either endpoint.
             replacement = _make_request("r1", "external-new")
-            connector.get.reset_mock(return_value=True)
-            connector.get.return_value = None
+            get.reset_mock(return_value=True)
+            get.return_value = None
             host.register_chunk_recv(replacement)
             assert not host._poll_single_request("r1")
             if rank == 0:
-                connector.get.assert_called_once_with("0", "1", "external-new_0_0")
+                get.assert_called_once_with("0", "1", "external-new_0_0")
             else:
-                connector.get.assert_not_called()
+                get.assert_not_called()
             assert connector.sender_host == "configured-host"
             assert connector.sender_zmq_port == 50051
             assert first.payload_sender_info == {"host": "producer-a", "zmq_port": "50101"}
@@ -1480,6 +1483,30 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host.shutdown_omni_connectors()
 
 
+def test_cancelled_chunk_receive_does_not_recreate_delivery_state(mocker):
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=True, worker_type="gen"))
+    host._stage_id = 1
+    host._omni_connector = mocker.MagicMock()
+    host.register_chunk_recv(_make_request("r1"))
+    payload = {"codes": {"audio": [1, 2]}, "meta": {"finished": torch.tensor(False)}}
+
+    def get(*args, **kwargs):
+        host.cleanup_finished_request("r1")
+        return payload, 1
+
+    host._omni_connector.get.side_effect = get
+    try:
+        assert not host._poll_single_request("r1")
+        assert host.get_local_stage_payload("r1") is None
+        assert "r1" not in host._get_req_chunk
+        assert "r1" not in host._pending_load_reqs
+        output = host.get_omni_connector_output()
+        assert output.chunk_ready_req_ids == set() and output.request_metadata == {}
+    finally:
+        host.shutdown_omni_connectors()
+
+
 class TestRankAwareKVRouting(unittest.TestCase):
     def _make_host(self, *, from_tp: int, to_tp: int, local_rank: int) -> MixinHost:
         host = MixinHost()
@@ -1899,3 +1926,26 @@ def test_resolve_request_id_requires_internal_or_external_id(fallback, external,
             OmniConnectorModelRunnerMixin._resolve_external_req_id(host, request, fallback)
     else:
         assert OmniConnectorModelRunnerMixin._resolve_external_req_id(host, request, fallback) == expected
+
+
+@pytest.mark.parametrize("legacy_entry", [False, True])
+def test_full_payload_replace_overrides_codec_validity_accumulation(legacy_entry):
+    """Explicit snapshots must replace even keys normally accumulated per row."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    host = _OmniConnectorPayloadTransportMixin()
+    host._pending_full_payload_send = {}
+    host._full_payload_replace_keys_cached = frozenset({"meta.codec_frame_valid"})
+    request = SimpleNamespace(request_id="r")
+    first = {"meta.codec_frame_valid": torch.tensor([True, True])}
+    if legacy_entry:
+        host._pending_full_payload_send["r"] = (first, request)
+    else:
+        host.accumulate_full_payload_output("r", first, request)
+    for valid in ([False], [True, False, True]):
+        host.accumulate_full_payload_output("r", {"meta.codec_frame_valid": torch.tensor(valid)}, request)
+        output, actual_request = host._materialize_full_payload_entry(host._pending_full_payload_send["r"])
+        assert output["meta.codec_frame_valid"].tolist() == valid
+        assert actual_request is request

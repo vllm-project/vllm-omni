@@ -8,7 +8,7 @@ measurable on its own.
 
 Quantifies the Orchestrator → server handoff over the janus output queue, the
 path changed when the server's output reader moved from a 1 ms busy-poll to an
-event-driven `await`.
+event-driven wakeup.
 
 It mirrors production: a producer **thread** (the Orchestrator runs in its own
 thread) emits messages to an **async consumer** (the server event loop), and
@@ -16,7 +16,9 @@ compares two consumer strategies:
 
 - **OLD** — `sync_q.get_nowait()`, return `None` on empty, `asyncio.sleep(1ms)`,
   retry.
-- **NEW** — `await async_q.get()`, park until a message arrives.
+- **NEW** — the production `OutputQueueSink`: `arm_wakeup()`, drain, then park
+  on the event the producer thread sets via `call_soon_threadsafe`, exactly as
+  `OmniEngineBase.get_outputs_async` does.
 
 ```bash
 python benchmarks/engine/queue_handoff_latency.py
@@ -27,20 +29,20 @@ python benchmarks/engine/queue_handoff_latency.py --poll-ms 1.0 --messages 3000 
 
 ```text
 == per-message wakeup latency (producer thread -> async consumer) ==
-  OLD poll : mean=  573.8us  p50=  574.7us  p99= 1103.6us  max= 1280.8us
-  NEW await: mean=  144.7us  p50=   96.3us  p99=  398.3us  max=  585.1us
+  OLD poll : mean=  575.7us  p50=  581.6us  p99= 1079.6us  max= 1284.7us
+  NEW sink : mean=   96.8us  p50=   63.3us  p99=  337.8us  max=  678.0us
 
 == idle cost (no messages flowing) ==
-  OLD poll : wakeups=  1795 (  897.5/s)  cpu= 111.6 ms over 2s idle
-  NEW await: wakeups=     1 (    0.5/s)  cpu=   0.4 ms over 2s idle
+  OLD poll : wakeups=  1828 (  914.0/s)  cpu=  78.4 ms over 2s idle
+  NEW sink : wakeups=     1 (    0.5/s)  cpu=   0.3 ms over 2s idle
 ```
 
 ### How to read it
 
 - **Latency** — the old poll adds ~0.5 ms on average and up to ~1 ms per message
   (a message arriving at a uniformly random point in a 1 ms poll cycle waits
-  half a cycle, hence p50 ≈ 0.5 ms, p99 ≈ the full interval). The new path cuts
-  mean latency ~4× and p50 ~6×. The residual ~100 µs in the new path is the
+  half a cycle, hence p50 ≈ 0.5 ms, p99 ≈ the full interval). The sink cuts mean
+  latency ~6× and p50 ~9×. The residual ~60–100 µs in the new path is the
   inherent cost of waking an asyncio task from another thread; polling cannot
   beat that.
 - **Idle cost** — the old loop wakes ~900×/s and burns ~5% of a core per idle

@@ -17,6 +17,7 @@ list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- | --- |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | — | continuation (`--ref-audio` + `--ref-text`) | 48 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ (`async_chunk: true` default) | — | 22.05 kHz |
+| Fish Audio Drama 3 | `fishaudio/drama-3` | 2 (AR + DAC codec) | ✓ | ✓ (online) | speaker and event tags; no example script | 44.1 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ (`--streaming`) | — | 44.1 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design (`--instruct`), language (`--lang`) | 24 kHz |
@@ -130,8 +131,52 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
-- Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+- H200 automatically selects `cosyvoice3_packed_streaming_optimized_standard.yaml` when the CUDA MPS control tool is available; other devices and environments use `cosyvoice3.yaml`. See the [serving defaults and tradeoffs](../online_serving/text_to_speech.md#cosyvoice3). Pass `--deploy-config cosyvoice3.yaml` for the previous profile or `--deploy-config <path>` to override. The example uses the resolved profile's sampling parameters.
 - `async_chunk: true` is the default; pass `--no-async-chunk` to switch to the legacy synchronous path.
+
+---
+
+## Fish Audio Drama 3
+
+35B-total / 3B-active MoE TTS at 44.1 kHz with the same DAC codec stage as
+Fish Speech S2 Pro. There is no separate example script: build the request
+with `additional_information` and size the placeholder prompt with
+`estimate_prompt_len_from_additional_information`, which returns the exact
+prompt row count. See the [Drama 3 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/fishaudio/Drama-3.md) for details.
+
+```python
+import soundfile as sf
+import torch
+from transformers import AutoTokenizer
+
+from vllm_omni import Omni
+from vllm_omni.model_executor.models.fish_omni.fish_omni_model import FishOmniForConditionalGeneration
+
+
+def main() -> None:
+    model = "fishaudio/drama-3"
+    wav, sample_rate = sf.read("reference.wav", dtype="float32")
+    info = {
+        "text": "The quarterly report is due on Thursday, so please finish it by noon.",
+        "ref_text": "Transcript of the reference audio.",
+        "ref_audio_wav": torch.from_numpy(wav),
+        "ref_audio_sr": sample_rate,
+    }
+    prompt_len = FishOmniForConditionalGeneration.estimate_prompt_len_from_additional_information(
+        info, tokenizer=AutoTokenizer.from_pretrained(model)
+    )
+    omni = Omni(model=model)
+    for output in omni.generate([{"prompt_token_ids": [1] * prompt_len, "additional_information": info}]):
+        audio = output.outputs[0].multimodal_output["audio"]
+        audio = torch.cat(audio, dim=-1) if isinstance(audio, list) else audio
+        sf.write("output.wav", audio.float().cpu().numpy().reshape(-1), samplerate=44100)
+
+
+if __name__ == "__main__":  # Omni starts its stages in subprocesses.
+    main()
+```
+
+Leave out `ref_text`, `ref_audio_wav` and `ref_audio_sr` for synthesis without a reference voice.
 
 ---
 

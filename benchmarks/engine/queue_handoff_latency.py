@@ -8,9 +8,11 @@ model or GPU required) to quantify the difference between two consumer
 strategies:
 
 * ``OLD``  -- ``sync_q.get_nowait()`` returning ``None`` on empty, then
-  ``asyncio.sleep(poll_interval)`` before retrying (the pre-change behaviour,
+  ``asyncio.sleep(poll_interval)`` before retrying (the legacy serving loop,
   ``_FINAL_OUTPUT_IDLE_SLEEP_S = 1ms``).
-* ``NEW``  -- ``await async_q.get()``, parking until a message arrives.
+* ``NEW``  -- the production ``OutputQueueSink``: ``arm_wakeup()`` then park
+  on the returned event, which the producer thread sets through
+  ``call_soon_threadsafe`` (what ``OmniEngineBase.get_outputs_async`` does).
 
 It mirrors production: a producer **thread** (the Orchestrator runs in its own
 thread) emits messages to an **async consumer** (the server event loop). Two
@@ -39,8 +41,10 @@ import time
 
 import janus
 
+from vllm_omni.engine.async_engine_utils import OutputQueueSink
 
-def _producer(q: janus.Queue, n: int, gap_max_s: float, emit_ts: list[float], ready: threading.Event) -> None:
+
+def _producer(sink: OutputQueueSink, n: int, gap_max_s: float, emit_ts: list[float], ready: threading.Event) -> None:
     """Emit ``n`` messages from a background thread, like the Orchestrator."""
     ready.wait()
     for i in range(n):
@@ -48,10 +52,10 @@ def _producer(q: janus.Queue, n: int, gap_max_s: float, emit_ts: list[float], re
         # queue ops, so the consumer is genuinely waiting most of the time.
         time.sleep(random.uniform(0.0, gap_max_s))
         emit_ts.append(time.perf_counter())
-        q.sync_q.put_nowait(i)
+        sink.put_nowait(i)
 
 
-async def _consume_old(q: janus.Queue, n: int, poll_s: float, recv_ts: list[float]) -> None:
+async def _consume_old(q: janus.Queue, sink: OutputQueueSink, n: int, poll_s: float, recv_ts: list[float]) -> None:
     got = 0
     while got < n:
         try:
@@ -63,20 +67,31 @@ async def _consume_old(q: janus.Queue, n: int, poll_s: float, recv_ts: list[floa
         got += 1
 
 
-async def _consume_new(q: janus.Queue, n: int, poll_s: float, recv_ts: list[float]) -> None:
-    for _ in range(n):
-        await q.async_q.get()
-        recv_ts.append(time.perf_counter())
+async def _consume_new(q: janus.Queue, sink: OutputQueueSink, n: int, poll_s: float, recv_ts: list[float]) -> None:
+    # Same arm / drain / wait sequence as OmniEngineBase.get_outputs_async.
+    got = 0
+    while got < n:
+        msgs = sink.drain(256)
+        if not msgs:
+            ready = sink.arm_wakeup()
+            msgs = sink.drain(256)
+            if not msgs:
+                await ready.wait()
+                msgs = sink.drain(256)
+        now = time.perf_counter()
+        recv_ts.extend([now] * len(msgs))
+        got += len(msgs)
 
 
 async def _measure_latency(consumer, *, n: int, poll_s: float, gap_max_s: float) -> list[float]:
     q: janus.Queue = janus.Queue()
+    sink = OutputQueueSink(q.sync_q)
     emit_ts: list[float] = []
     recv_ts: list[float] = []
     ready = threading.Event()
-    th = threading.Thread(target=_producer, args=(q, n, gap_max_s, emit_ts, ready), daemon=True)
+    th = threading.Thread(target=_producer, args=(sink, n, gap_max_s, emit_ts, ready), daemon=True)
     th.start()
-    task = asyncio.ensure_future(consumer(q, n, poll_s, recv_ts))
+    task = asyncio.ensure_future(consumer(q, sink, n, poll_s, recv_ts))
     ready.set()
     await task
     th.join()
@@ -86,6 +101,7 @@ async def _measure_latency(consumer, *, n: int, poll_s: float, gap_max_s: float)
 
 async def _measure_idle(strategy: str, *, poll_s: float, secs: float) -> tuple[int, float]:
     q: janus.Queue = janus.Queue()
+    sink = OutputQueueSink(q.sync_q)
     wakeups = 0
     cpu0 = time.process_time()
     if strategy == "old":
@@ -97,7 +113,7 @@ async def _measure_idle(strategy: str, *, poll_s: float, secs: float) -> tuple[i
                 wakeups += 1
             await asyncio.sleep(poll_s)
     else:
-        task = asyncio.ensure_future(q.async_q.get())  # parks once, never wakes
+        task = asyncio.ensure_future(sink.arm_wakeup().wait())  # parks once, never wakes
         wakeups = 1
         await asyncio.sleep(secs)
         task.cancel()
@@ -126,14 +142,14 @@ async def _main_async(args: argparse.Namespace) -> None:
     )
 
     print("== per-message wakeup latency (producer thread -> async consumer) ==")
-    for label, consumer in (("OLD poll ", _consume_old), ("NEW await", _consume_new)):
+    for label, consumer in (("OLD poll ", _consume_old), ("NEW sink ", _consume_new)):
         agg: list[float] = []
         for _ in range(args.runs):
             agg.extend(await _measure_latency(consumer, n=args.messages, poll_s=poll_s, gap_max_s=gap_max_s))
         _summarize(label, sorted(agg))
 
     print("\n== idle cost (no messages flowing) ==")
-    for label, strategy in (("OLD poll ", "old"), ("NEW await", "new")):
+    for label, strategy in (("OLD poll ", "old"), ("NEW sink ", "new")):
         wakeups, cpu_ms = await _measure_idle(strategy, poll_s=poll_s, secs=args.idle_secs)
         print(
             f"  {label}: wakeups={wakeups:6d} ({wakeups / args.idle_secs:7.1f}/s)  "

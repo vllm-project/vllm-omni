@@ -4,6 +4,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -86,6 +87,7 @@ _REQUEST_OUTPUT_CONTENT_ATTRS = (
     "prompt",
     "prompt_token_ids",
     "prompt_logprobs",
+    "prompt_token_id_logprobs",
     "outputs",
     "finished",
     "lora_request",
@@ -149,6 +151,7 @@ class OmniRequestOutput(RequestOutput):
     prompt: OmniPromptType | None = None
     prompt_token_ids: list[int] | None = None
     prompt_logprobs: Any = None
+    prompt_token_id_logprobs: np.ndarray | None = None
     outputs: list[CompletionOutput] = field(default_factory=list)
     finished: bool = True
     metrics: Any = field(default_factory=dict)

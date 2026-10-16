@@ -14,10 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import diffusers
 import huggingface_hub
+import numpy as np
 import torch
 from PIL import Image
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from typing_extensions import Self
+from vllm.config import KernelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -267,8 +269,7 @@ class DiffusionParallelConfig:
 
     sequence_parallel_size: int | None = None
     """Number of sequence parallel groups.
-    sequence_parallel_size = ulysses_degree * ring_degree, or allgather_degree
-    when AllGather-KV is enabled."""
+    sequence_parallel_size = ulysses_degree * ring_degree * allgather_degree."""
 
     ulysses_degree: int = 1
     """Number of GPUs used for ulysses sequence parallelism."""
@@ -277,7 +278,8 @@ class DiffusionParallelConfig:
     """Number of GPUs used for ring sequence parallelism."""
 
     allgather_degree: int = 1
-    """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only)."""
+    """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only).
+    Composable with ``ulysses_degree``; not with ``ring_degree > 1``."""
 
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
@@ -317,6 +319,8 @@ class DiffusionParallelConfig:
 
     - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
       of spatial tiles and the results are stitched on rank 0.
+    - "batch": Decode complete images on different ranks, preserving their
+      batch order. Requires AutoencoderKL/Flux2 and DP/PP/CFG sizes of 1.
     - "spatial_shard_height": Spatially-sharded decode that splits decoder
       feature maps along height and exchanges halo rows around spatial
       convolutions.
@@ -357,19 +361,23 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
-            "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+        assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
-        if self.allgather_degree > 1:
-            assert self.ulysses_degree == 1 and self.ring_degree == 1, (
-                "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size not in (None, 1) or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
+        if self.allgather_degree > 1 and self.ring_degree > 1:
+            raise ValueError(
+                "AllGather-KV (allgather_degree>1) cannot be composed with Ring (ring_degree>1). "
+                "The supported two-dimensional topology is Ulysses x AllGather-KV "
+                "(ulysses_degree > 1 with ring_degree == 1). "
                 f"Got ulysses_degree={self.ulysses_degree}, ring_degree={self.ring_degree}, "
                 f"allgather_degree={self.allgather_degree}."
             )
-        expected_sp_size = (
-            self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-        )
+        expected_sp_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
         assert self.sequence_parallel_size == expected_sp_size, (
             f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
         )
@@ -385,9 +393,7 @@ class DiffusionParallelConfig:
 
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
-            self.sequence_parallel_size = (
-                self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
-            )
+            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree * self.allgather_degree
 
         # Until the runtime WORLD size is known, an omitted DP dimension means
         # one replica. OmniDiffusionConfig resolves it against num_gpus below.
@@ -478,6 +484,8 @@ class DiffusionParallelConfig:
         if world_size % non_dp_size != 0:
             raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
         inferred_data_parallel_size = world_size // non_dp_size
+        if self.vae_parallel_mode == "batch" and inferred_data_parallel_size != 1:
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
         if self.data_parallel_size is not None and self.data_parallel_size != inferred_data_parallel_size:
             raise ValueError(
                 f"data_parallel_size ({self.data_parallel_size}) does not match WORLD-derived value "
@@ -807,10 +815,16 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 @dataclass
 class VideoOutputTransportConfig:
     enable_device_postprocess: bool = False
+    enable_registered_shm: bool = False
+    enable_borrowed_frames: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enable_device_postprocess, bool):
             raise TypeError("enable_device_postprocess must be a bool")
+        if not isinstance(self.enable_registered_shm, bool):
+            raise TypeError("enable_registered_shm must be a bool")
+        if not isinstance(self.enable_borrowed_frames, bool):
+            raise TypeError("enable_borrowed_frames must be a bool")
 
 
 @dataclass
@@ -821,6 +835,19 @@ class OmniDiffusionConfig:
     model: str | None = None
 
     model_class_name: str | None = None
+
+    # Multi-stage diffusion role. ``None``/"dit"/"diffusion" run the full
+    # pipeline (text-encode + denoise + decode) in one stage. "text_encode"
+    # runs only the text encoder and emits prompt embeddings for a downstream
+    # diffusion stage (Encode/Generation (EG) disaggregation).
+    model_stage: str | None = None
+
+    # Structured diffusion stage role (encode / denoise / decode / full).
+    # This supersedes the free-form ``model_stage`` string: it is the
+    # model-agnostic axis that drives role-based component loading and stage
+    # dispatch so any DiT model can be disaggregated via config. When ``None``
+    # it is derived from ``model_stage`` (see ``resolve_diffusion_stage_role``).
+    stage_role: str | None = None
 
     # Optional model-defined startup task. Pipelines may use this to select
     # task-specific components or weights before serving requests.
@@ -956,17 +983,34 @@ class OmniDiffusionConfig:
     # fuses RMSNorm+SiLU (faster, not bit-exact), ``"off"`` keeps the reference
     # diffusers implementation.
     vae_fast_path: str = "lossless"
+    # Independent encoder fast path for the residual, patchified Wan VAE used
+    # by Cosmos3. Levels have the same numerical contract as the decoder.
+    vae_encode_fast_path: str = "lossless"
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
-    # MoE kernel backend selection
+    # Reuse upstream kernel selection; "auto" preserves platform defaults.
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
 
     # Compilation
     enforce_eager: bool = False
+    # Capture fixed-shape KV-cache decode (denoising) steps into CUDA graphs.
+    # Currently only Qwen-Image-2.1's transformer implements this; other models
+    # ignore the flag. This is a per-model diffusion path, independent of the
+    # AR engine's ``compilation_config.cudagraph_mode`` (which does not apply
+    # to diffusion stages). It stacks with ``diffusion_compile_granularity``:
+    # the DiT blocks are still torch.compile'd and graph capture records the
+    # compiled (fused) kernels, while inductor's own cudagraphs stay off.
+    # ``enforce_eager=True`` forces eager decode and
+    # disables capture regardless of this flag; unsupported configurations
+    # (SP/TP, ring, HSDP, dynamic LoRA, padded masks, quantized prefix KV, or
+    # a second in-flight request aliasing the same graph key) log and fall
+    # back to eager decode.
+    enable_cuda_graph_decode: bool = True
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
@@ -976,6 +1020,9 @@ class OmniDiffusionConfig:
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
+
+    # Shard meta parameters before reading rank-local HF safetensors slices.
+    hsdp_weight_load_strategy: str = "full"
 
     # Enable sleep mode
     enable_sleep_mode: bool = False
@@ -995,6 +1042,9 @@ class OmniDiffusionConfig:
 
     # Worker extension class for custom functionality
     worker_extension_cls: str | None = None
+
+    # Internal transport of explicit stage runtime.env to remote Ray actors.
+    ray_worker_env: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
@@ -1067,6 +1117,7 @@ class OmniDiffusionConfig:
     # rather than carried inline through the orchestrator. Empty disables the
     # worker-side connector receive path.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
 
     # Keys handed to the next stage over the omni connector. Empty disables the
     # worker-side connector send path.
@@ -1120,7 +1171,7 @@ class OmniDiffusionConfig:
     request_batch_max_wait_ms: float = 0.0
 
     # Supplementary model specific parameters
-    extras: dict[str, Any] = Field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_moe(self) -> bool:
@@ -1190,15 +1241,28 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
+            raise ValueError(
+                f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
+            )
         from vllm_omni.diffusion.offloader.config import (
             OffloadStrategy,
             materialize_legacy_offload_flags,
         )
 
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_input_optional_payload_keys = tuple(self.stage_input_optional_payload_keys)
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
+
+        if self.vae_encode_fast_path not in VAE_FAST_PATH_LEVELS:
+            raise ValueError(
+                f"vae_encode_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_encode_fast_path!r}"
+            )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1583,6 +1647,12 @@ class OmniDiffusionConfig:
                         self.model_class_name = "DiffusersAdapterPipeline"
                 self.update_multimodal_support()
 
+                # Model-level sampling grid (e.g. Qwen-Image-2.1-Turbo; see
+                # diffusers PR #14950). An explicit extras value wins.
+                sample_sigmas = config_dict.get("sample_sigmas")
+                if sample_sigmas is not None and self.extras.get("sample_sigmas") is None:
+                    self.extras["sample_sigmas"] = sample_sigmas
+
                 # Skip transformer config loading for diffusers adapter
                 # (non-DiT models don't have a separate transformer folder/config)
                 if self.diffusion_load_format == "diffusers":
@@ -1734,6 +1804,11 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi05Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":
+                    # The official ABot checkpoint uses its native single-directory
+                    # layout and intentionally has no Diffusers pipeline index.
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]
                     from vllm_omni.diffusion.registry import DiffusionModelRegistry
@@ -1789,6 +1864,8 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    # Internal non-final-stage payload consumed by StagePool.
+    custom_output: dict[str, Any] = field(default_factory=dict)
     async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
@@ -1826,10 +1903,47 @@ class DiffusionOutput:
     # Internal control-plane event emitted on first scheduler admission.
     request_started: bool = False
 
-    # Typed video-media contract. Declared last so the pre-existing positional
+    # Typed video-media contract. Appended so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
     # pipelines rely on is preserved. Mutually exclusive with ``output``.
     media: DiffusionMediaOutput | None = None
+
+    # Compatibility adapter for joint (video, audio) outputs that have not
+    # migrated to typed media. Only this tuple entry is eligible for video
+    # transport optimizations; unmarked legacy outputs retain their old path.
+    video_output_index: int | None = None
+
+    # Host-side playback diagnostics; carried through the existing output metadata.
+    streaming_metrics: dict[str, float | int] = field(default_factory=dict)
+
+    def output_nbytes(self) -> int:
+        """Payload bytes retained by one decoded output, excluding model workspace."""
+
+        def size(value: Any) -> int:
+            if isinstance(value, torch.Tensor):
+                return value.untyped_storage().nbytes()
+            if isinstance(value, np.ndarray):
+                return value.nbytes
+            if isinstance(value, Image.Image):
+                return value.width * value.height * len(value.getbands())
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return len(value)
+            if isinstance(value, dict):
+                return sum(size(item) for item in value.values())
+            if isinstance(value, (tuple, list)):
+                return sum(size(item) for item in value)
+            return 0
+
+        return sum(
+            size(value)
+            for value in (
+                self.media.video.tensor if self.media is not None else self.output,
+                self.trajectory_timesteps,
+                self.trajectory_latents,
+                self.trajectory_log_probs,
+                self.trajectory_decoded,
+            )
+        )
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
@@ -1860,6 +1974,7 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        self.custom_output = _maybe_to_cpu(self.custom_output)
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
@@ -2030,6 +2145,8 @@ class AttentionSpec:
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
+    fastvideo_vsa_provider: str = "auto"
+    fastvideo_vsa_precision: str = "bf16"
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -2049,6 +2166,16 @@ class AttentionSpec:
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
+        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer"):
+            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo or flashinfer")
+        if self.fastvideo_vsa_precision not in ("bf16", "sage"):
+            raise ValueError("fastvideo_vsa_precision must be bf16 or sage")
+        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider == "fastvideo":
+            raise ValueError("Sage VSA precision requires the FlashInfer provider")
+        if self.backend.upper() != "FASTVIDEO_VSA" and (
+            self.fastvideo_vsa_provider not in ("auto", "fastvideo") or self.fastvideo_vsa_precision != "bf16"
+        ):
+            raise ValueError("VSA provider/precision require the FASTVIDEO_VSA backend")
         if self.fastvideo_vsa_topk is not None:
             if self.backend.upper() != "FASTVIDEO_VSA":
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
@@ -2075,6 +2202,10 @@ class AttentionSpec:
     def backend_kwargs(self) -> dict[str, Any] | None:
         """Serialize typed backend config into the kwargs dict the backend impl consumes."""
         kw: dict[str, Any] = {}
+        if self.backend.upper() == "FASTVIDEO_VSA" and self.fastvideo_vsa_provider != "auto":
+            kw["provider"] = self.fastvideo_vsa_provider
+        if self.fastvideo_vsa_precision != "bf16":
+            kw["precision"] = self.fastvideo_vsa_precision
         if self.skip_softmax is not None:
             ss = self.skip_softmax
             if ss.threshold is not None:
@@ -2176,7 +2307,15 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse"}
+        spec_keys = {
+            "backend",
+            "skip_softmax",
+            "quant",
+            "fastvideo_vsa_topk",
+            "fastvideo_vsa_provider",
+            "fastvideo_vsa_precision",
+            "block_sparse",
+        }
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:
@@ -2261,7 +2400,7 @@ def build_attention_config(
 
     Called exactly once in ``OmniDiffusionConfig.__post_init__``.
     Handles type-conversion **and** env-var fallback
-    (``DIFFUSION_ATTENTION_BACKEND``).
+    (``DIFFUSION_ATTENTION_BACKEND`` and ``DIFFUSION_ATTENTION_QUANT``).
     """
     normalized = parse_attention_config(attention_config)
 
@@ -2275,7 +2414,30 @@ def build_attention_config(
     if env_attention_backend.lower() == "auto":
         return normalized
 
-    normalized.default = AttentionSpec(backend=env_attention_backend)
+    # If config file doesn't explicitly setup quantization specs, optionally set
+    # from the env-var.
+    quant = None
+    env_attention_quant = os.environ.get("DIFFUSION_ATTENTION_QUANT")
+    if env_attention_quant is not None:
+        fields = [field.strip() for field in env_attention_quant.split(":")]
+        if len(fields) not in (2, 4) or not all(fields):
+            raise ValueError(
+                "DIFFUSION_ATTENTION_QUANT must have the format <dtype_qk>:<dtype_vo>[:<q_block_size>:<k_block_size>]."
+            )
+        quant_kwargs: dict[str, Any] = {
+            "dtype_qk": fields[0],
+            "dtype_vo": fields[1],
+        }
+        if len(fields) == 4:
+            q_block_size, k_block_size = int(fields[2]), int(fields[3])
+            if (q_block_size, k_block_size) != (0, 0):
+                quant_kwargs.update(
+                    q_block_size=q_block_size,
+                    k_block_size=k_block_size,
+                )
+        quant = AttnQuantSpec(**quant_kwargs)
+
+    normalized.default = AttentionSpec(backend=env_attention_backend, quant=quant)
     logger.info(
         "Parsed attention config from DIFFUSION_ATTENTION_BACKEND '%s': default=%s, per_role=%s",
         env_attention_backend,

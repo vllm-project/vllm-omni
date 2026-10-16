@@ -7,8 +7,10 @@ from types import SimpleNamespace
 
 import anyio
 import pytest
+from vllm.engine.protocol import StreamingInput
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.kv_hints import KvHintsEnvelope
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
@@ -16,6 +18,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -67,6 +70,7 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
     omni._paused = False
     omni.engine = SimpleNamespace(
         num_stages=1,
+        stage_configs=[],
         add_request_async=fake_add_request,
         abort_async=fake_abort_request,
     )
@@ -132,6 +136,39 @@ def test_generate_forwards_lora_request_to_engine():
         assert len(submitted_ids) == 1
         assert len(submitted_loras) == 1
         assert submitted_loras[0] is lora
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("streaming", [None, "chunk", "empty"])
+def test_generate_forwards_kv_hints_on_initial_stage_submission(streaming):
+    async def run():
+        submissions = []
+
+        async def add(**kwargs):
+            submissions.append(kwargs)
+
+        omni = get_async_omni_instance(fake_add_request=add)
+        omni.engine.add_streaming_update_async = _noop
+        omni.engine.stage_configs = [SimpleNamespace(is_comprehension=True, stage_type="llm")]
+        omni.engine.stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))]
+        hints = KvHintsEnvelope("1", "message", [])
+        params = SamplingParams(max_tokens=2, output_kind=RequestOutputKind.DELTA)
+
+        async def chunks():
+            if streaming == "chunk":
+                yield StreamingInput(prompt={"prompt_token_ids": [1]})
+
+        async for _ in omni.generate(
+            prompt=chunks() if streaming else {"prompt_token_ids": [1]},
+            request_id="hints",
+            sampling_params_list=[params],
+            kv_hints=hints,
+        ):
+            pass
+        assert len(submissions) == 1
+        assert submissions[0]["kv_hints"] is hints
 
     asyncio.run(run())
 
@@ -469,6 +506,61 @@ def test_generate_accepts_request_after_repeated_cancellations():
         for batch, prefix in zip(aborted_request_batches, ["cancel-0-", "cancel-1-", "cancel-2-"]):
             assert len(batch) == 1
             assert batch[0].startswith(prefix)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("has_chunk", [False, True])
+@pytest.mark.parametrize("input_fails", [False, True])
+def test_streaming_input_terminal_submit_failure_reaches_generate(mocker, has_chunk, input_fails):
+    async def run_test():
+        submissions: list[tuple[str, bool]] = []
+
+        async def add_request_async(*, resumable, **kwargs):
+            del kwargs
+            submissions.append(("add", resumable))
+            if not resumable:
+                raise RuntimeError("terminal streaming submit failed")
+
+        async def add_streaming_update_async(*, resumable, **kwargs):
+            del kwargs
+            submissions.append(("update", resumable))
+            assert not resumable
+            raise RuntimeError("terminal streaming submit failed")
+
+        omni = get_async_omni_instance(fake_add_request=add_request_async)
+        omni.engine.add_streaming_update_async = add_streaming_update_async
+        omni.engine.stage_clients = []
+        omni.engine.model_config = object()
+        del omni._process_orchestrator_results
+        mocker.patch(
+            "vllm_omni.entrypoints.async_omni.extract_prompt_components",
+            return_value=(None, None, None),
+        )
+        error_metadata = mocker.spy(async_omni_mod, "client_error_metadata")
+
+        async def input_stream():
+            if has_chunk:
+                yield StreamingInput(prompt={"prompt": "chunk"})
+            if input_fails:
+                raise RuntimeError("streaming input failed")
+
+        async def consume():
+            async for _ in omni.generate(
+                prompt=input_stream(),
+                request_id="stream-submit-error",
+                sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.DELTA)],
+                output_modalities=["text"],
+            ):
+                pass
+
+        expected_error = "streaming input failed" if input_fails else "terminal streaming submit failed"
+        with pytest.raises(RuntimeError, match=expected_error):
+            await asyncio.wait_for(consume(), timeout=1.0)
+        assert error_metadata.call_count == 1
+        assert submissions == ([("add", True), ("update", False)] if has_chunk else [("add", False)])
+        assert omni.request_states == {}
 
     asyncio.run(run_test())
 
@@ -814,3 +906,34 @@ async def test_omni_generate_request_id():
             assert output.request_id != ""
     finally:
         engine.shutdown()
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_paced_output_credit_waits_for_consumer(mocker):
+    submitted = []
+
+    async def add_request(**kwargs):
+        submitted.append(kwargs)
+
+    omni = get_async_omni_instance(fake_add_request=add_request)
+    omni.engine.get_stage_metadata = lambda _: SimpleNamespace(stage_type="diffusion")
+    rpc = mocker.patch.object(omni, "_engine_core_rpc", new=mocker.AsyncMock())
+
+    async def results(*args):
+        for index in range(2):
+            yield SimpleNamespace(multimodal_output={"metadata": {"stream": {"output_chunk_index": index}}})
+
+    omni._process_orchestrator_results = results
+    params = OmniDiffusionSamplingParams(streaming_buffer_seconds=1.5)
+    outputs = omni.generate(prompt={"prompt": "test"}, request_id="paced", sampling_params_list=[params])
+    await anext(outputs)
+    assert submitted[0]["sampling_params_list"][0].streaming_output_ack is True
+    assert params.streaming_output_ack is False
+    rpc.assert_not_awaited()
+    await anext(outputs)
+    rpc.assert_awaited_once_with("release_streaming_output", stage_ids=[0], args=(submitted[0]["request_id"], 0))
+    with pytest.raises(StopAsyncIteration):
+        await anext(outputs)
+    assert rpc.await_count == 2
+    assert rpc.call_args.kwargs["args"] == (submitted[0]["request_id"], 1)

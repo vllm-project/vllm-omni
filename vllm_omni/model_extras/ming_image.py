@@ -10,8 +10,6 @@ MING_IMAGE_EXTRA_BODY_PARAMS = frozenset(
     {
         "height",
         "width",
-        "steps",
-        "cfg",
         "seed",
         "num_layers",
         "negative_prompt",

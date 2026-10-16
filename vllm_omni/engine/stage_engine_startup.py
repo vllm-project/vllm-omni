@@ -1141,6 +1141,7 @@ def launch_stage_replica(
     omni_parallel_stage_init: bool = False,
     num_api_servers: int = 1,
     watched_frontend_processes: list[BaseProcess] | None = None,
+    handshake_timeout_s: float | None = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -1204,6 +1205,7 @@ def launch_stage_replica(
             omni_coordinator_address=omni_coordinator_address,
             omni_replica_base_id=replica_id,
             omni_parallel_stage_init=omni_parallel_stage_init,
+            omni_handshake_timeout_s=handshake_timeout_s,
         )
 
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
@@ -1620,11 +1622,17 @@ def launch_diffusion_stage_replica(
         world_size = max(1, int(world_size))
     except (TypeError, ValueError):
         world_size = 1
-    lock_fds = acquire_device_locks(
-        metadata.stage_id,
-        {"tensor_parallel_size": world_size},
-        stage_init_timeout,
-        visible_devices=stage_visible_devices,
+    # These locks coordinate local stage initialization; the orchestrator cannot
+    # acquire them on other hosts where Ray workers may run.
+    lock_fds = (
+        []
+        if od_config.distributed_executor_backend == "ray"
+        else acquire_device_locks(
+            metadata.stage_id,
+            {"tensor_parallel_size": world_size},
+            stage_init_timeout,
+            visible_devices=stage_visible_devices,
+        )
     )
     proc_manager = None
     try:

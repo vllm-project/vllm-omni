@@ -7,14 +7,16 @@ import asyncio
 import concurrent.futures
 import copy
 import inspect
+import math
 import os
 import queue
 import threading
 import time
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from types import AsyncGeneratorType
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import PIL.Image
@@ -25,6 +27,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
@@ -43,7 +46,11 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
-from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    any_selected_component_uses_allgather,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
@@ -58,7 +65,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus, DiffusionSchedulerOutput
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionRequestStatus, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -180,6 +187,19 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return 1
 
 
+def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
+    """Whether the local pipeline checks cooperative cancellation boundaries."""
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is None:
+        name = (
+            "DiffusersAdapterPipeline"
+            if uses_diffusers_adapter(od_config)
+            else getattr(od_config, "model_class_name", None)
+        )
+        model_cls = DiffusionModelRegistry._try_load_model_cls(name)
+    return getattr(model_cls, "supports_request_cancellation", False) is True
+
+
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
     parallel_config = getattr(od_config, "parallel_config", None)
     dp_size = getattr(parallel_config, "data_parallel_size", 1)
@@ -210,9 +230,61 @@ class _RpcTask:
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
 
 
+@dataclass
+class _StreamingPlayback:
+    buffer_seconds: float
+    generated_seconds: float = 0.0
+    played_seconds: float = 0.0
+    boundary_at: float | None = None
+    next_ready_at: float = 0.0
+    pending_boundary: bool = True
+    next_media_duration: float = 0.0
+    max_output_bytes: int = 64 * 1024 * 1024
+    idle_timeout_s: float = 30.0
+    output_ack: bool = False
+    outstanding_chunk: int | None = None
+    retained_bytes: int = 0
+    finished: bool = False
+    idle_since: float | None = None
+    wait_started_at: float | None = None
+    wait_seconds: float = 0.0
+
+
 class DiffusionExecutionMode(str, Enum):
     REQUEST_BATCH = "request_batch"
     STEP_BATCH = "step_batch"
+
+
+class _ClosingOutputStream(AsyncGenerator[DiffusionOutput, None]):
+    """Close queue registration even if the underlying generator never starts."""
+
+    def __init__(self, stream: AsyncGenerator[DiffusionOutput, None], on_close: Callable[[], None]) -> None:
+        self._stream = stream
+        self._on_close: Callable[[], None] | None = on_close
+
+    def _release_if_closed(self) -> None:
+        # Distinguish a closed native generator from rejected concurrent use.
+        if cast(AsyncGeneratorType, self._stream).ag_frame is None and self._on_close is not None:
+            on_close, self._on_close = self._on_close, None
+            on_close()
+
+    async def asend(self, value: None) -> DiffusionOutput:
+        try:
+            return await self._stream.asend(value)
+        finally:
+            self._release_if_closed()
+
+    async def athrow(self, *args: Any) -> DiffusionOutput:
+        try:
+            return await self._stream.athrow(*args)
+        finally:
+            self._release_if_closed()
+
+    async def aclose(self) -> None:
+        try:
+            await self._stream.aclose()
+        finally:
+            self._release_if_closed()
 
 
 class DiffusionEngine:
@@ -230,6 +302,9 @@ class DiffusionEngine:
     # don't hit AttributeError when _busy_loop accesses them.
     dp_concurrent: bool = False
     _scheduling_paused: bool = False
+    # Disabled until runtime initialization resolves the pipeline capability.
+    _request_cancellations: RequestCancellationRegistry | None = None
+    _streaming_playback: dict[str, _StreamingPlayback] | None = None
 
     def __init__(
         self,
@@ -393,9 +468,13 @@ class DiffusionEngine:
         self._shutting_down = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
+        self._request_cancellations = (
+            RequestCancellationRegistry() if supports_request_cancellation(self.od_config) else None
+        )
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         # pause_scheduler(mode="keep"): no new batch is scheduled while set.
         self._scheduling_paused = False
+        self._streaming_playback = {}
         # Copied onto the existing output metrics payload so queue monitoring
         # reuses the normal diffusion result path without additional IPC.
         self._scheduler_num_waiting_reqs = 0
@@ -551,10 +630,23 @@ class DiffusionEngine:
                 custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
             )
 
+        if output.media is None and output.output is None:
+            # Encode-only stages carry forward prompt embeddings in custom_output
+            # even though they do not emit media.
+            custom_output = output.custom_output or {}
+            if not custom_output:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+            return format_empty_diffusion_outputs(
+                request,
+                finished=output.finished,
+                custom_output=custom_output,
+            )
+
         if output.media is not None:
             if output.output is not None:
                 raise ValueError("DiffusionOutput cannot contain both media and legacy output")
-            media = output.media.to_cpu() if self.od_config.enable_cpu_offload else output.media
+            model_level = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+            media = output.media.to_cpu() if model_level else output.media
             output_data = media.video.tensor
             outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
         else:
@@ -566,7 +658,7 @@ class DiffusionEngine:
             # post-processing to avoid device OOM — model weights may still
             # reside on the device and leave no headroom for intermediates.
             output_data = output.output
-            if self.od_config.enable_cpu_offload:
+            if resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL:
                 output_data = _move_tensor_tree_to_cpu(output_data)
 
             if self.post_process_func is not None:
@@ -594,26 +686,40 @@ class DiffusionEngine:
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
-            if self._scheduling_paused:
-                # No wave runs while paused, so requests finished by an abort
-                # would otherwise wait for the resume to surface.
+            self._expire_streaming_idle()
+            if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
+                # A paused/idle engine has no next wave to deliver an abort.
+                # This also covers an abort of the last request when no later
+                # scheduler wave exists to surface its terminal output.
                 with self._cv:
                     pending_finished = self.scheduler.pending_finished_request_ids()
                 self._emit_finished_outputs(pending_finished, None)
 
             with self._cv:
                 while (
-                    (self._scheduling_paused or not self.scheduler.has_requests())
+                    (self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests())
                     and self._rpc_queue.empty()
                     and self.abort_queue.empty()
                     and not self.stop_event.is_set()
                 ):
-                    self._cv.wait(timeout=1.0)
+                    now = time.monotonic()
+                    deadlines = [
+                        state.next_ready_at - now
+                        for state in (self._streaming_playback or {}).values()
+                        if state.pending_boundary and state.next_ready_at > now
+                    ]
+                    deadlines.extend(
+                        max(0.0, state.idle_since + state.idle_timeout_s - now)
+                        for state in (self._streaming_playback or {}).values()
+                        if state.idle_since is not None
+                    )
+                    self._cv.wait(timeout=min(1.0, *deadlines) if deadlines else 1.0)
+                    break  # Recheck idle expiry even when no client message arrives.
 
                 if self.stop_event.is_set():
                     break
 
-                if self._scheduling_paused or not self.scheduler.has_requests():
+                if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
@@ -624,6 +730,13 @@ class DiffusionEngine:
 
                 try:
                     sched_output = self.scheduler.schedule()
+                    for request_id in sched_output.scheduled_request_ids:
+                        playback = (self._streaming_playback or {}).get(request_id)
+                        if playback is not None and playback.pending_boundary:
+                            now = time.monotonic()
+                            playback.boundary_at = now
+                            playback.next_ready_at = 0.0
+                            playback.pending_boundary = False
                 except Exception as exc:
                     self._fail_engine(exc)
                     return
@@ -632,7 +745,12 @@ class DiffusionEngine:
             self._emit_request_started_outputs(sched_output)
 
             if sched_output.is_empty:
-                self._emit_finished_outputs(sched_output.finished_req_ids, None)
+                finished_ids = {
+                    rid
+                    for rid in sched_output.finished_req_ids
+                    if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
+                }
+                self._emit_finished_outputs(finished_ids, None)
                 continue
 
             try:
@@ -645,8 +763,10 @@ class DiffusionEngine:
                 self._poll_native_kv()
                 worker_execution_completed = True
             except Exception as exc:
+                # Shutdown can interrupt an in-flight executor call. Exit through
+                # the loop tail so pending RPCs are failed instead of left waiting.
                 if self._closed:
-                    return
+                    break
                 worker_execution_completed = False
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
@@ -741,6 +861,99 @@ class DiffusionEngine:
                 decision.max_batch,
                 waited_ms,
             )
+
+    def _playback_blocked(self) -> bool:
+        # shortcut: one active stream per engine; move this to scheduler admission
+        # when concurrent paced streams are supported.
+        with self._cv:
+            now = time.monotonic()
+            blocked = False
+            for state in (self._streaming_playback or {}).values():
+                waiting = (
+                    state.outstanding_chunk is not None
+                    or (
+                        state.pending_boundary
+                        and state.generated_seconds + state.next_media_duration - state.played_seconds
+                        > state.buffer_seconds + 1e-9
+                    )
+                    or (state.pending_boundary and now < state.next_ready_at)
+                )
+                if waiting:
+                    blocked = True
+                    if state.wait_started_at is None:
+                        state.wait_started_at = now
+                    # Only client-controlled progress can expire a request.
+                    # A media deadline is internal
+                    # pacing and must not look like an idle consumer.
+                    client_blocked = state.outstanding_chunk is not None or (
+                        state.pending_boundary
+                        and now >= state.next_ready_at
+                        and state.generated_seconds + state.next_media_duration - state.played_seconds
+                        > state.buffer_seconds + 1e-9
+                    )
+                    if client_blocked:
+                        if state.idle_since is None:
+                            state.idle_since = now
+                    else:
+                        state.idle_since = None
+                else:
+                    if state.wait_started_at is not None:
+                        state.wait_seconds += now - state.wait_started_at
+                        state.wait_started_at = None
+                    state.idle_since = None
+            return blocked
+
+    def release_streaming_output(self, request_id: str, chunk_index: int) -> None:
+        """Release the single output credit only after its downstream consumer resumes."""
+        with self._cv:
+            state = (self._streaming_playback or {}).get(request_id)
+            if state is None or state.outstanding_chunk != chunk_index:
+                return
+            state.outstanding_chunk = None
+            state.retained_bytes = 0
+            if state.finished:
+                assert self._streaming_playback is not None
+                self._streaming_playback.pop(request_id, None)
+            elif state.idle_since is not None:
+                state.idle_since = time.monotonic()
+            self._cv.notify_all()
+
+    def _expire_streaming_idle(self) -> None:
+        with self._cv:
+            now = time.monotonic()
+            expired = [
+                request_id
+                for request_id, state in (self._streaming_playback or {}).items()
+                if state.idle_since is not None and now - state.idle_since >= state.idle_timeout_s
+            ]
+            for request_id in expired:
+                assert self._streaming_playback is not None
+                self._streaming_playback.pop(request_id, None)
+                state = self.scheduler.get_request_state(request_id)
+                if state is not None:
+                    self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ERROR)
+                    state.error = "Streaming idle timeout: no playback or output consumption progress"
+            if expired:
+                self._cv.notify_all()
+
+    def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
+        if (
+            isinstance(position_seconds, bool)
+            or not isinstance(position_seconds, (int, float))
+            or not math.isfinite(position_seconds)
+            or position_seconds < 0
+        ):
+            raise ValueError("playback position_seconds must be finite and non-negative")
+        with self._cv:
+            state = (self._streaming_playback or {}).get(request_id)
+            if state is not None:
+                # Ignore reordered feedback and never grant credit for media
+                # that has not been generated. Late feedback is a harmless no-op.
+                played_seconds = max(state.played_seconds, min(position_seconds, state.generated_seconds))
+                if played_seconds > state.played_seconds and state.idle_since is not None:
+                    state.idle_since = time.monotonic()
+                state.played_seconds = played_seconds
+                self._cv.notify_all()
 
     def _process_rpc_queue(self) -> None:
         """Execute pending collective_rpc tasks from the busy-loop thread.
@@ -913,6 +1126,8 @@ class DiffusionEngine:
             # path, and repeating executor.shutdown() is unsafe.
             self._shutting_down = True
             self._closed = True
+            if self._request_cancellations is not None:
+                self._request_cancellations.cancel_all()
             if self.stop_event is not None:
                 self.stop_event.set()
             streams = list(self._out_streams.values())
@@ -925,8 +1140,39 @@ class DiffusionEngine:
         # If Worker shutdown fails, retain the Scheduler reservations. A
         # remote producer may still be writing into those allocations.
         self.executor.shutdown()
-        self.scheduler.close()
+        try:
+            self.scheduler.close()
+        finally:
+            # Workers are down, so readers cannot attach or use the signals.
+            # Release them even if scheduler cleanup itself fails.
+            if self._request_cancellations is not None:
+                self._request_cancellations.close()
         self._shutdown_complete = True
+
+    def _cleanup_stepwise_requests(self, request_ids: Iterable[str]) -> None:
+        finished = set(request_ids)
+        if not finished or self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
+            return
+        # Reuse the scheduler cleanup path on every rank, without a new forward.
+        try:
+            self.executor.collective_rpc(
+                "execute_stepwise",
+                args=(
+                    DiffusionSchedulerOutput(
+                        step_id=0,
+                        scheduled_new_reqs=[],
+                        scheduled_cached_reqs=CachedRequestData.make_empty(),
+                        finished_req_ids=finished,
+                        num_running_reqs=0,
+                        num_waiting_reqs=0,
+                    ),
+                ),
+                unique_reply_rank=0,
+                exec_all_ranks=True,
+            )
+        except Exception as exc:
+            self._fail_engine(exc)
+            raise
 
     def _emit_finished_outputs(
         self,
@@ -935,14 +1181,28 @@ class DiffusionEngine:
         missing_result_error: str = "Diffusion execution finished without a final output",
         worker_cleaned_ids: set[str] | None = None,
     ) -> None:
+        self._cleanup_stepwise_requests(finished_ids - (worker_cleaned_ids or set()))
         self._remove_diffusion_kv_requests(finished_ids - (worker_cleaned_ids or set()))
         for rid in finished_ids:
             if runner_output is not None:
                 _output = runner_output.get_request_output(rid)
             else:
                 _output = None
-            out = self._finalize_finished_request(rid, _output, missing_result_error)
-            self._put_output(rid, out)
+            self._emit_finished_request(rid, _output, missing_result_error)
+
+    def _emit_finished_request(
+        self,
+        request_id: str,
+        runner_output: RunnerOutput | None,
+        missing_result_error: str,
+    ) -> None:
+        # Capture the old stream before finalization permits ID reuse. Only
+        # the busy loop removes request state, so it cannot change in between.
+        with self._cv:
+            stream = self._out_streams.get(request_id)
+        out = self._finalize_finished_request(request_id, runner_output, missing_result_error)
+        if stream is not None:
+            self._put_queue_output(stream, out)
 
     def _emit_outputs(
         self,
@@ -954,7 +1214,15 @@ class DiffusionEngine:
     ) -> None:
         """Emit output chunks for every request through the unified output stream."""
         finished_ids = set(finished_ids)
-        worker_cleaned_ids = finished_ids.intersection(scheduled_request_ids) if worker_execution_completed else set()
+        worker_cleaned_ids = (
+            {
+                request_id
+                for request_id in finished_ids.intersection(scheduled_request_ids)
+                if (output := runner_output.get_request_output(request_id)) is not None and output.finished
+            }
+            if worker_execution_completed
+            else set()
+        )
         if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
             self._emit_finished_outputs(
                 finished_ids,
@@ -963,6 +1231,7 @@ class DiffusionEngine:
             )
             return
 
+        self._cleanup_stepwise_requests(finished_ids - worker_cleaned_ids)
         self._remove_diffusion_kv_requests(finished_ids - worker_cleaned_ids)
 
         delivered_finished_req_ids: set[str] = set()
@@ -971,14 +1240,44 @@ class DiffusionEngine:
         # First handle this-round requests.
         for request_id in scheduled_request_ids:
             req_output = runner_output.get_request_output(request_id)
+            playback = (self._streaming_playback or {}).get(request_id)
+            if playback is not None and req_output is not None and req_output.result is not None:
+                result = req_output.result
+                if not result.error and not result.aborted:
+                    output_bytes = result.output_nbytes()
+                    violation = None
+                    if output_bytes > playback.max_output_bytes:
+                        violation = "Decoded streaming output exceeds streaming_max_output_bytes"
+                    elif req_output.streaming_next_media_duration > playback.buffer_seconds:
+                        violation = "streaming_buffer_seconds must fit a complete media chunk"
+                    if violation is not None:
+                        self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ERROR)
+                        self._cleanup_stepwise_requests([request_id])
+                        self._remove_diffusion_kv_requests([request_id])
+                        req_output.result = DiffusionOutput(error=violation)
+                        finished_ids.add(request_id)
+                    else:
+                        with self._cv:
+                            playback.generated_seconds += req_output.streaming_media_duration
+                            playback.next_media_duration = req_output.streaming_next_media_duration
+                            if req_output.streaming_media_duration > 0 and playback.boundary_at is not None:
+                                playback.next_ready_at = playback.boundary_at + req_output.streaming_media_duration
+                                playback.pending_boundary = True
+                            playback.outstanding_chunk = result.chunk_index
+                            playback.retained_bytes = output_bytes
+                            playback.finished = request_id in finished_ids
+                            result.streaming_metrics = {
+                                "lead_seconds": playback.generated_seconds - playback.played_seconds,
+                                "wait_seconds": playback.wait_seconds,
+                                "retained_bytes": output_bytes,
+                            }
             if request_id in finished_ids:
                 # This entire request is finished (this is the last chunk)
-                out = self._finalize_finished_request(
+                self._emit_finished_request(
                     request_id,
                     req_output,
                     missing_result_error="Diffusion step execution finished without a final output.",
                 )
-                self._put_output(request_id, out)
                 delivered_finished_req_ids.add(request_id)
             elif req_output is not None and req_output.result is not None:
                 # This is a non-terminal chunk. It is not in scheduler's
@@ -987,11 +1286,11 @@ class DiffusionEngine:
 
         # Then handle other requests that are finished in this round.
         for request_id in finished_ids - delivered_finished_req_ids:
-            out = self._finalize_finished_request(
+            self._emit_finished_request(
                 request_id,
+                None,
                 missing_result_error="Diffusion step request finished without execution output.",
             )
-            self._put_output(request_id, out)
 
     def _has_output_stream(self, request_id: str) -> bool:
         with self._cv:
@@ -1102,11 +1401,36 @@ class DiffusionEngine:
     def _add_prepared_request(self, request: OmniDiffusionRequest) -> str:
         """Admit a request whose model-owned preprocessing is complete."""
 
+        buffer_seconds = getattr(request.sampling_params, "streaming_buffer_seconds", None)
+        if buffer_seconds is not None:
+            if (
+                not self.od_config.streaming_output
+                or self.execution_mode != DiffusionExecutionMode.STEP_BATCH
+                or self.od_config.max_num_seqs != 1
+                or not request.use_step_execution
+            ):
+                raise ValueError("playback feedback requires step execution, streaming_output=True and max_num_seqs=1")
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
-            request_id = self.scheduler.add_request(request)
+            if self._request_cancellations is not None:
+                request.cancellation_signal = self._request_cancellations.create(request.request_id)
+            try:
+                request_id = self.scheduler.add_request(request)
+            except BaseException:
+                if self._request_cancellations is not None:
+                    self._request_cancellations.finish(request.request_id)
+                    request.cancellation_signal = None
+                raise
+            if buffer_seconds is not None:
+                assert self._streaming_playback is not None
+                self._streaming_playback[request_id] = _StreamingPlayback(
+                    buffer_seconds,
+                    max_output_bytes=request.sampling_params.streaming_max_output_bytes,
+                    idle_timeout_s=request.sampling_params.streaming_idle_timeout_s,
+                    output_ack=request.sampling_params.streaming_output_ack,
+                )
             self._out_streams[request_id] = queue
             self._cv.notify_all()
 
@@ -1116,24 +1440,45 @@ class DiffusionEngine:
         request = self._prepare_request_for_admission(request)
         return self._add_prepared_request(request)
 
-    async def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+    def get_output_stream(self, request_id: str) -> AsyncGenerator[DiffusionOutput, None]:
+        """Bind a closable stream to the currently registered request queue."""
         with self._cv:
             queue = self._out_streams.get(request_id)
         if queue is None:
             raise RuntimeError(f"Request {request_id} not found in output queue.")
+        return _ClosingOutputStream(
+            self._iterate_output_stream(request_id, queue),
+            lambda: self._release_output_stream(request_id, queue),
+        )
+
+    async def _iterate_output_stream(
+        self, request_id: str, queue: asyncio.Queue[DiffusionOutput]
+    ) -> AsyncGenerator[DiffusionOutput, None]:
+        finished = False
         try:
             while True:
                 output: DiffusionOutput = await queue.get()
+                finished = output.finished
                 yield output
+                with self._cv:
+                    playback = (self._streaming_playback or {}).get(request_id)
+                    auto_release = playback is not None and not playback.output_ack
+                if auto_release and output.streaming_metrics:
+                    self.release_streaming_output(request_id, output.chunk_index)
                 if output.finished:
                     break
         except Exception as e:
             logger.error(f"Wait for response failed: {e}")
             raise
         finally:
-            with self._cv:
-                if self._out_streams.get(request_id) is queue:
-                    self._out_streams.pop(request_id, None)
+            self._release_output_stream(request_id, queue)
+            if not finished:
+                self.abort(request_id)
+
+    def _release_output_stream(self, request_id: str, queue: asyncio.Queue[DiffusionOutput]) -> None:
+        with self._cv:
+            if self._out_streams.get(request_id) is queue:
+                self._out_streams.pop(request_id, None)
 
     def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
         request_id = self.add_request(request)
@@ -1173,7 +1518,8 @@ class DiffusionEngine:
                     self._fail_engine(exc)
                     raise
                 if sched_output.is_empty:
-                    if target_request_id in sched_output.finished_req_ids:
+                    state = self.scheduler.get_request_state(target_request_id)
+                    if target_request_id in sched_output.finished_req_ids and state is not None and state.is_finished():
                         self._remove_diffusion_kv_requests([target_request_id])
                         return self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
@@ -1406,6 +1752,16 @@ class DiffusionEngine:
             unique_reply_rank=unique_reply_rank,
         )
         with self._cv:
+            # Feedback changes host-only state and must not wait behind a GPU
+            # chunk, otherwise its RPC reply would hold up the control channel.
+            if method == "update_streaming_playback":
+                self.update_streaming_playback(*args, **(kwargs or {}))
+                task.future.set_result(None)
+                return task
+            if method == "release_streaming_output":
+                self.release_streaming_output(*args, **(kwargs or {}))
+                task.future.set_result(None)
+                return task
             if method == "pause_scheduler":
                 self._check_pause_request(kwargs)
                 self._scheduling_paused = True
@@ -1453,6 +1809,10 @@ class DiffusionEngine:
                 if not self._loop_started:
                     if method in ("pause_scheduler", "resume_scheduler"):
                         return self._run_engine_control(method, timeout, kwargs)
+                    if method == "update_streaming_playback":
+                        return self.update_streaming_playback(*args, **(kwargs or {}))
+                    if method == "release_streaming_output":
+                        return self.release_streaming_output(*args, **(kwargs or {}))
                     return self.executor.collective_rpc(
                         method=method,
                         timeout=timeout,
@@ -1517,21 +1877,32 @@ class DiffusionEngine:
                 return
             if not self._closed:
                 self._closed = True
+                if self._request_cancellations is not None:
+                    self._request_cancellations.cancel_all()
                 if self.stop_event is not None:
                     self.stop_event.set()
                 pending_streams = list(self._out_streams.values())
                 self._out_streams.clear()
+                if self._streaming_playback is not None:
+                    self._streaming_playback.clear()
                 self._cv.notify_all()
 
         closed_output = DiffusionOutput(error="DiffusionEngine is closed.")
         for stream in pending_streams:
             self._put_queue_output(stream, closed_output)
 
+        # Interrupt remote inference before waiting for the thread blocked on Ray.
+        if self.od_config.distributed_executor_backend == "ray":
+            self.executor.shutdown()
+
         worker_thread = self.worker_thread
         if worker_thread is not None:
             if worker_thread.is_alive():
                 worker_thread.join(timeout=10)
             if worker_thread.is_alive():
+                # Keep cancellation names available: an in-flight worker may
+                # not have attached its readers yet. A later close releases
+                # them after execution and executor shutdown have completed.
                 logger.warning(
                     "Worker thread did not terminate within 10s; scheduler and executor shutdown will be deferred."
                 )
@@ -1550,6 +1921,8 @@ class DiffusionEngine:
         else:
             self.scheduler.close()
             self.executor.shutdown()
+        if self._request_cancellations is not None:
+            self._request_cancellations.close()
         self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
@@ -1558,6 +1931,10 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 return
+            if self._request_cancellations is not None:
+                # Do not queue this behind the full-forward executor call.
+                # Scheduler state is still mutated only by the busy loop.
+                self._request_cancellations.cancel(request_ids)
             for req_id in request_ids:
                 self.abort_queue.put(req_id)
             self._cv.notify_all()
@@ -1588,8 +1965,14 @@ class DiffusionEngine:
         self._poll_native_kv(drain_request_ids=request_ids)
 
         for request_id in request_ids:
+            if self._streaming_playback is not None:
+                self._streaming_playback.pop(request_id, None)
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        if getattr(self, "execution_mode", None) == DiffusionExecutionMode.STEP_BATCH and request_ids:
+            # Abort processing is serialized with execution. There may never be
+            # another scheduler wave to deliver finished_req_ids to the runner.
+            self.executor.collective_rpc("release_step_requests", args=(request_ids,))
         self._remove_diffusion_kv_requests(request_ids)
 
     def _finalize_finished_request(
@@ -1598,9 +1981,16 @@ class DiffusionEngine:
         runner_output: RunnerOutput | None = None,
         missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
     ) -> DiffusionOutput:
-        state = self.scheduler.get_request_state(request_id)
-        popped_state = self.scheduler.pop_request_state(request_id)
-        state = state or popped_state
+        with self._cv:
+            playback = (self._streaming_playback or {}).get(request_id)
+            if playback is not None and (not playback.finished or playback.outstanding_chunk is None):
+                assert self._streaming_playback is not None
+                self._streaming_playback.pop(request_id, None)
+            state = self.scheduler.get_request_state(request_id)
+            popped_state = self.scheduler.pop_request_state(request_id)
+            state = state or popped_state
+            if self._request_cancellations is not None:
+                self._request_cancellations.finish(request_id)
 
         if state is None:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")

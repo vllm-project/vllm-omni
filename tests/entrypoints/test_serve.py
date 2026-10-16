@@ -20,10 +20,12 @@ from vllm_omni.config.omni_config import (
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
 from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_runtime import StageEngineLaunch
 from vllm_omni.entrypoints.cli.serve import (
     OmniServeCommand,
+    _parse_stage_id,
     _parse_stage_overrides,
     run_headless,
 )
@@ -81,21 +83,23 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert "api_server_count" not in explicit
 
 
-def test_serve_parser_accepts_vae_fast_path() -> None:
+@pytest.mark.parametrize("option", ["vae_fast_path", "vae_encode_fast_path"])
+def test_serve_parser_accepts_vae_fast_path(option: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(["serve", "fake-model", "--omni"])
-    assert args.vae_fast_path == "lossless"
-    assert "vae_fast_path" not in args.get_explicit_kwargs_dict()
+    assert getattr(args, option) == "lossless"
+    assert option not in args.get_explicit_kwargs_dict()
 
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "channels_last"])
-    assert args.vae_fast_path == "channels_last"
-    assert args.get_explicit_kwargs_dict()["vae_fast_path"] == "channels_last"
+    flag = "--" + option.replace("_", "-")
+    args = parser.parse_args(["serve", "fake-model", "--omni", flag, "channels_last"])
+    assert getattr(args, option) == "channels_last"
+    assert args.get_explicit_kwargs_dict()[option] == "channels_last"
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "fast"])
+        parser.parse_args(["serve", "fake-model", "--omni", flag, "fast"])
 
 
 def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
@@ -105,6 +109,81 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
     return parser.parse_args(argv)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--log-stats"],
+        ["--api-server-count", "2"],
+    ],
+)
+def test_serve_rejects_log_stats_without_stage_metrics(flags: list[str]) -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--no-collect-stage-metrics", *flags])
+
+    with pytest.raises(ValueError, match="--no-collect-stage-metrics requires --disable-log-stats"):
+        OmniServeCommand().validate(args)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--disable-log-stats"],
+        ["--log-stats", "--disable-log-stats"],
+        ["--headless"],
+        ["--headless", "--log-stats"],
+        ["--headless", "--log-stats", "--disable-log-stats"],
+    ],
+)
+def test_serve_accepts_disabled_stage_metrics_when_logging_is_disabled_or_headless(
+    flags: list[str], mocker: MockerFixture
+) -> None:
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--no-collect-stage-metrics", *flags])
+
+    OmniServeCommand().validate(args)
+
+
+@pytest.mark.parametrize("value, expected", [("0", 0), ("none", FRONTEND_ONLY_ID_FILTER)])
+def test_parse_stage_id_valid_values(value: str, expected: int) -> None:
+    """Ensure --stage-id takes a non-negative int or an explicit 'none'."""
+    assert _parse_stage_id(value) == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "abc"])
+def test_parse_stage_id_invalid_values(value: str) -> None:
+    """Ensure --stage-id rejects negatives and non-integers."""
+    with pytest.raises(argparse.ArgumentTypeError, match="non-negative integer or 'none'"):
+        _parse_stage_id(value)
+
+
+@pytest.mark.parametrize(
+    "extra_argv, match",
+    [
+        (["--headless"], "--stage-id none cannot be used with --headless"),
+        (["--omni-dp-size-local", "2"], "requires a numeric --stage-id"),
+    ],
+)
+def test_serve_validate_rejects_stage_id_none_combinations(extra_argv: list[str], match: str) -> None:
+    """Ensure --stage-id none is rejected where a local stage is required."""
+    args = _parse_serve_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--stage-id",
+            "none",
+            "--omni-master-address",
+            "127.0.0.1",
+            "--omni-master-port",
+            "20000",
+            *extra_argv,
+        ]
+    )
+    with pytest.raises(ValueError, match=match):
+        OmniServeCommand().validate(args)
 
 
 def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) -> None:

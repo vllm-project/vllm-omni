@@ -64,7 +64,7 @@ class _MoveableModule(nn.Module):
         return [True, True, True]
 
 
-def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device):
+def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device, diffusion_offload_config=None):
     import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image as pipe_mod
     from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 
@@ -110,14 +110,21 @@ def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device):
         tf_model_config={},
         quantization_config=None,
         enable_cpu_offload=enable_cpu_offload,
+        diffusion_offload_config=diffusion_offload_config,
         enable_diffusion_pipeline_profiler=False,
     )
     return QwenImagePipeline(od_config=od_config)
 
 
-def test_pipeline_cpu_offload_parks_encoder_vae_on_cpu(monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_pipeline_cpu_offload_parks_encoder_vae_on_cpu(monkeypatch, compact):
     """#7555: cpu_offload keeps BF16 encoder/VAE off the GPU during DiT init."""
-    pipe = _run_pipeline_init(monkeypatch, enable_cpu_offload=True, loader_device="cuda")
+    pipe = _run_pipeline_init(
+        monkeypatch,
+        enable_cpu_offload=not compact,
+        loader_device="cuda",
+        diffusion_offload_config={"mode": "module", "components": ["dit"]} if compact else None,
+    )
     assert pipe.text_encoder.placed_device.type == "cpu"
     assert pipe.vae.placed_device.type == "cpu"
     assert pipe.transformer.probe_device_type == "cuda"

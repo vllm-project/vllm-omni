@@ -19,8 +19,17 @@ import msgspec
 import numpy as np
 import torch
 
+# Internal output routing markers shared by first-frame producers and orchestration.
+FIRST_AUDIO_KEY = "_omni_first_audio"
+FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
+
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
+# Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
+# an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
+# scalars (a dict holding a tensor would come back as a list); the receiving
+# scheduler pops these keys before the request reaches the model.
+ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
@@ -37,6 +46,8 @@ class Embeddings(TypedDict, total=False):
     prepared_prefill: torch.Tensor
     prefill: torch.Tensor
     decode: torch.Tensor
+    # [1, H] embedding of the token sampled by a row's final prefill step (MRv2 producers).
+    sampled: torch.Tensor
     decode_token_start: int
     decode_token_end: int
     cached_decode: torch.Tensor
@@ -84,6 +95,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     right_holdback_size: int
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
+    resumable: bool
     next_stage_prompt_len: int
     next_stage_generation_tokens: int
     replace_streaming_prompt: bool
@@ -101,6 +113,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     width: int
     decode_flag: bool
     codec_streaming: bool
+    first_audio: bool | torch.Tensor
     codec_frame_valid: bool | torch.Tensor
     ref_code_len: int
     ref_context_size: int
@@ -197,6 +210,8 @@ class MetaStruct(_StructBase):
     right_holdback_size: int | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
+    # The model runner sets this when a streaming request is resumed.
+    resumable: bool | None = None
     next_stage_prompt_len: int | None = None
     next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None
@@ -214,6 +229,7 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
+    first_audio: torch.Tensor | None = None
     codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
     # Expected FINAL length of a growing async-chunk sequence, when the
@@ -233,6 +249,12 @@ class MetaStruct(_StructBase):
     audio_seed: int | None = None
     token_role_ids: torch.Tensor | None = None
     minimax_h3_prepared_reference_videos: str | None = None
+    # Assistant text-token count the request's prompt has reached when this
+    # payload was produced: a running count over the request's text ids, which
+    # covers every segment a resumable request has been fed so far.  A consumer
+    # derives one segment's n_k as the increase between consecutive segment
+    # boundaries; the value itself is not segment-local.
+    request_text_tokens: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

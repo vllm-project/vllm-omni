@@ -45,6 +45,15 @@ def test_irregular_browser_packets_emit_exact_ordered_80ms_frame() -> None:
     np.testing.assert_array_equal(decoded, np.arange(1280, dtype=np.float32))
     assert buffer.pending_byte_count == 0
 
+    later = _append(buffer, np.ones(1280), "later")
+    later.commit()
+    later.rollback()
+    reservation.rollback()
+    assert not buffer.has_reserved()
+    retry = _append(buffer, [], "retry")
+    assert retry.payload == reservation.payload
+    assert not buffer.has_pending()
+
 
 def test_append_rejects_invalid_frame_contract() -> None:
     cases = (

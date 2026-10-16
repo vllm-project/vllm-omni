@@ -108,11 +108,12 @@ def test_build_app_exposes_realtime_websocket_and_static_assets():
 
 
 def test_qwen_config_does_not_inject_reference_voice():
-    client = TestClient(build_app(profile="qwen3-turn", adapter="vad", model="Qwen/Qwen3-Omni-30B-A3B-Instruct"))
+    client = TestClient(build_app(profile="qwen3-turn", turn_mode="vad", model="Qwen/Qwen3-Omni-30B-A3B-Instruct"))
     page = client.get("/").text
     assert '"profile": "qwen3-turn"' in page
-    assert '"adapter": "vad"' in page
+    assert '"turnMode": "vad"' in page
     assert '"refAudio": null' in page
+    assert '"speechInput": false' in page
     for name in ("common", "minicpm_native", "qwen3_turn", "aura_ptt"):
         assert client.get(f"/static/profiles/{name}.js").status_code == 200
     with pytest.raises(ValueError, match="ref-audio"):
@@ -134,6 +135,21 @@ def test_config_cannot_close_its_script_element():
     page = TestClient(build_app(model="</script><script>alert(1)</script>")).get("/").text
     assert "</script><script>alert(1)" not in page
     assert "\\u003c/script>" in page
+
+
+def test_joyai_profile_defaults_and_static_asset():
+    client = TestClient(build_app(profile="joyai-turn"))
+    page = client.get("/").text
+    assert '"profile": "joyai-turn"' in page
+    assert '"model": "jdopensource/JoyAI-VL-Interaction-Preview"' in page
+    assert '"refAudio": null' in page
+    assert "joyai_turn.js" in page
+    assert client.get("/static/profiles/joyai_turn.js").status_code == 200
+    with pytest.raises(ValueError, match="ref-audio"):
+        build_app(profile="joyai-turn", ref_audio="unused.wav")
+    speech = TestClient(build_app(profile="joyai-turn", speech_input=True, turn_mode="vad"))
+    assert '"speechInput": true' in speech.get("/").text
+    assert '"turnMode": "vad"' in speech.get("/").text
 
 
 def test_proxy_reports_unreachable_backend(monkeypatch):

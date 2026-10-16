@@ -71,6 +71,7 @@ class CUDAGraphDecoderWrapper:
         self.combined_states: dict[tuple[str, int, int], dict] = {}
         self.icl_prefix_states: dict[int, dict] = {}
         self.xvec_prefix_states: dict[int, dict] = {}
+        self.xvec_prefix_state_only_states: dict[int, dict] = {}
         self.stateless_states: dict[tuple[int, int], dict] = {}
 
         self._device = None
@@ -230,6 +231,7 @@ class CUDAGraphDecoderWrapper:
             *self._retained_kv_caches(self.combined_states),
             *self._retained_kv_caches(self.icl_prefix_states),
             *self._retained_kv_caches(self.xvec_prefix_states),
+            *self._retained_kv_caches(self.xvec_prefix_state_only_states),
         ]
         batched_captures = sum(rows for rows, _ in retained)
 
@@ -248,7 +250,7 @@ class CUDAGraphDecoderWrapper:
                 rows_reason=(
                     f"rows across {len(retained)} retained caches in "
                     f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
-                    f"{len(self.xvec_prefix_states)} xvec-prefix captures"
+                    f"{len(self.xvec_prefix_states) + len(self.xvec_prefix_state_only_states)} xvec-prefix captures"
                 ),
                 allocation_note=(
                     "counted from caches transformers has materialized; captures whose tensors are still "
@@ -424,6 +426,14 @@ class CUDAGraphDecoderWrapper:
                     logger.info("Captured xvec prefix CUDA Graph for batch=%d", batch_size)
                 except Exception:
                     logger.warning("Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+                if getattr(self.decoder, "capture_first_audio_state_only", False) and self.initial_chunk_frames == 1:
+                    try:
+                        self._capture_xvec_prefix(batch_size, device, dtype, state_only=True)
+                        logger.info("Captured xvec state-only CUDA Graph for batch=%d", batch_size)
+                    except Exception:
+                        logger.warning(
+                            "Failed to capture xvec state-only graph for batch=%d", batch_size, exc_info=True
+                        )
 
         logger.info(
             "Starting CUDA Graph warmup for %d shapes: batch_sizes=%s seq_lens=%s",
@@ -631,7 +641,9 @@ class CUDAGraphDecoderWrapper:
             "cache": caches,
         }
 
-    def _capture_xvec_prefix(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
+    def _capture_xvec_prefix(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype, *, state_only: bool = False
+    ) -> None:
         static_input = torch.zeros(
             batch_size,
             self.num_quantizers,
@@ -639,8 +651,13 @@ class CUDAGraphDecoderWrapper:
             dtype=dtype,
             device=device,
         )
+        # The Talker delivers exactly one frame upstream: a one-frame first
+        # chunk then only needs its state; a longer one keeps the other frames.
+        first_chunk = (
+            self.decoder._decode_xvec_first_chunk_state_only if state_only else self.decoder._decode_xvec_first_chunk
+        )
         with torch.no_grad():
-            _ = self.decoder._decode_xvec_first_chunk(static_input, {})
+            _ = first_chunk(static_input, {})
         torch.accelerator.synchronize(device)
 
         config = self.decoder.config
@@ -662,13 +679,15 @@ class CUDAGraphDecoderWrapper:
         graph = CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_output = self.decoder._decode_xvec_first_chunk(static_input, caches)
+                static_output = first_chunk(static_input, caches)
 
-        self.xvec_prefix_states[batch_size] = {
+        states = self.xvec_prefix_state_only_states if state_only else self.xvec_prefix_states
+        states[batch_size] = {
             "graph": graph,
             "input": {"codes": static_input},
             "output": static_output,
             "cache": caches,
+            "state_only": state_only,
         }
 
     def _ensure_suffix_buffers(self, caches: dict) -> None:
@@ -808,7 +827,14 @@ class CUDAGraphDecoderWrapper:
         codes_list: list[torch.Tensor],
         request_caches: list[dict],
     ) -> list[torch.Tensor] | None:
-        available = set(getattr(self, "xvec_prefix_states", {}))
+        skip_flags = [bool(cache.get("skip_first_audio", False)) for cache in request_caches]
+        # Full PCM graphs remain available even when the Talker cannot use
+        # direct delivery (or only some requests qualify). The option is only
+        # a capture hint; request metadata decides which audio is still owed.
+        states = getattr(self, "xvec_prefix_states", {})
+        if skip_flags and all(skip_flags):
+            states = getattr(self, "xvec_prefix_state_only_states", {}) or states
+        available = set(states)
         if not available:
             self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
             return None
@@ -835,7 +861,7 @@ class CUDAGraphDecoderWrapper:
             self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
             return None
 
-        state = self.xvec_prefix_states[batch_size]
+        state = states[batch_size]
         static_input = state["input"]["codes"]
         static_input.zero_()
         for row, codes in enumerate(codes_list):
@@ -855,7 +881,12 @@ class CUDAGraphDecoderWrapper:
             cache["suffix_conv"] = static_caches["suffix_conv"][row : row + 1].clone()
             cache["suffix_frames"] = self.initial_chunk_frames
             self._ensure_suffix_buffers(cache)
-            outputs.append(state["output"][row : row + 1].clone())
+            if state.get("state_only"):
+                outputs.append(static_input.new_zeros((1, 1, 0), dtype=torch.float32))
+            elif skip_flags[row]:
+                outputs.append(state["output"][row : row + 1, :, self.decoder.total_upsample :].clone())
+            else:
+                outputs.append(state["output"][row : row + 1].clone())
         return outputs
 
     def _decode_suffix_batch(
@@ -983,6 +1014,8 @@ class CUDAGraphDecoderWrapper:
     def _decode_request_fallback(self, codes: torch.Tensor, cache: dict) -> torch.Tensor:
         if "suffix_quantized" not in cache:
             if int(cache["prefix_frames"]) == 0:
+                if cache.get("skip_first_audio", False):
+                    return self.decoder._decode_stream_first_chunk(codes, cache)
                 return self.decoder._decode_xvec_first_chunk(codes, cache)
             prefix_frames = int(cache["prefix_frames"])
             output = self.decoder._decode_icl_first_chunk(codes, cache, prefix_frames)

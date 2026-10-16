@@ -19,6 +19,16 @@ class InvalidInputReferenceError(ValueError):
         super().__init__(message)
 
 
+class InvalidVoiceReferenceError(ValueError):
+    def __init__(self, message: str = "Reference to non existent voice.") -> None:
+        super().__init__(message)
+
+
+class InvalidPresetVoiceReferenceError(InvalidVoiceReferenceError):
+    def __init__(self, message: str = "Invalid reference to built-in voice.") -> None:
+        super().__init__(message)
+
+
 def _error_response_to_json_response(
     err: ErrorResponse,
     *,

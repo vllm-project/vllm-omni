@@ -28,6 +28,7 @@ from vllm_omni.diffusion.interaction.modality_handlers.prompt import (
     PromptSession,
 )
 from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -516,10 +517,13 @@ class TestPromptUpdateExecution:
         monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
         monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: False)
 
-        scheduler_output = SimpleNamespace(
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=0,
             finished_req_ids=set(),
-            scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req, diffusion_kv_metadata=None)],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+            scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Admit request and run first denoise step (no chunk boundary yet).
         DiffusionModelRunner.execute_stepwise(runner, scheduler_output)  # pyright: ignore[reportArgumentType]
@@ -528,10 +532,13 @@ class TestPromptUpdateExecution:
 
         runner.submit_interaction("req", _prompt_interaction("new scene", transition_chunks=2))
 
-        cached = SimpleNamespace(
+        cached = DiffusionSchedulerOutput(
+            step_id=1,
             finished_req_ids=set(),
             scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+            scheduled_cached_reqs=CachedRequestData(request_ids=["req"]),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
         )
         # Second step completes chunk 0: apply runs (no peek), metadata staged.
         chunk0 = DiffusionModelRunner.execute_stepwise(runner, cached).get_request_output("req")  # pyright: ignore[reportArgumentType]
@@ -569,7 +576,7 @@ class TestPromptUpdateIntegration:
         output_queue: asyncio.Queue[ErrorMessage] = asyncio.Queue()
         orchestrator = object.__new__(Orchestrator)
         orchestrator.stage_pools = [_RejectingStagePool()]  # pyright: ignore[reportAttributeAccessIssue]
-        orchestrator.output_sync_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
+        orchestrator.output_async_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
         orchestrator.request_states = {"req-1": OrchestratorRequestState(request_id="req-1")}
 
         await orchestrator._handle_interaction(
@@ -604,7 +611,7 @@ class TestPromptUpdateIntegration:
         orchestrator.stage_pools = [  # pyright: ignore[reportAttributeAccessIssue]
             StagePool(0, cast(StagePoolClient, inline_client))
         ]
-        orchestrator.output_sync_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
+        orchestrator.output_async_queue = output_queue  # pyright: ignore[reportAttributeAccessIssue]
         orchestrator.request_states = {"req-1": OrchestratorRequestState(request_id="req-1")}
 
         try:
@@ -714,6 +721,7 @@ class TestPromptUpdateIntegration:
         omni = object.__new__(AsyncOmni)
         omni.engine = engine  # pyright: ignore[reportAttributeAccessIssue]
         omni.log_stats = False
+        omni.collect_stage_metrics = True
         omni._pause_cond = asyncio.Condition()
         omni._paused = False
         omni.request_states = {}
@@ -814,16 +822,16 @@ class TestPromptUpdateIntegration:
                 )
             )
 
-        async def try_get_output_async(self) -> Any:
-            # Mirror the real engine: park until a message is available
-            # instead of returning None on empty. The AsyncOmni output loop no
-            # longer polls, so a synchronous None return would hot-spin the
-            # loop without yielding and starve the event loop.
-            while True:
+        async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+            msgs: list[Any] = []
+            while len(msgs) < max_messages:
                 try:
-                    return self._fixture.output_sync_q.get_nowait()
+                    msgs.append(self._fixture.output_sync_q.get_nowait())
                 except queue.Empty:
-                    await asyncio.sleep(0.001)
+                    break
+            if not msgs:
+                await asyncio.sleep(0.001)
+            return msgs
 
         def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
             return self.stage_metadata[stage_id]

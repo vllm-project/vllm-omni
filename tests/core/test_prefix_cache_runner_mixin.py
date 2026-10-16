@@ -30,6 +30,7 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
@@ -104,8 +105,8 @@ class _CacheStub:
         self.materialize_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
-    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded):
-        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded))
+    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
+        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, write_layout))
         return 7
 
     def materialize(self, step_id, req_ids):
@@ -160,6 +161,11 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     _patch_pp(monkeypatch, is_last=True)
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
+    r._prefix_cache_adapter = SimpleNamespace(
+        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
+    )
+    r._prefix_cache_group_view = SimpleNamespace()
+    r._prefix_cache_step = PrefixCacheStep((), ())
     r.is_pooling_model = True
     assert save() is None  # pooling stage never writes
     r.is_pooling_model = False
@@ -167,7 +173,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
     assert save() == 7
-    assert stub.save_calls == [(hidden, {}, 2, 2)]  # empty mm stays {}
+    assert stub.save_calls == [(hidden, {}, 2, 2, PrefixCacheWriteLayout((), 0))]  # empty mm stays {}
 
 
 def test_materialize_requires_explicit_step_and_snapshot_req_ids():
@@ -180,3 +186,154 @@ def test_materialize_requires_explicit_step_and_snapshot_req_ids():
     stub.outs = StageCacheOutputs(hidden_states=hidden, mm_outputs={})
     assert r._prefix_cache_materialize(7, ["a"]) == (hidden, None)  # empty mm -> None
     assert stub.materialize_calls == [(7, ["a"])]
+
+
+def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    runner = _Runner()
+    stub = _CacheStub()
+    steps = []
+    stub.new_step_starts = steps.append
+    runner.omni_prefix_cache = stub
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+    runner._prefix_cache_group_view = SimpleNamespace(
+        batch_req_ids=lambda: ["r"],
+        step_slots_cpu=lambda req_ids, counts: torch.arange(counts["r"], dtype=torch.long),
+    )
+    arrival = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r", num_computed_tokens=0)],
+        finished_req_ids=set(),
+        num_scheduled_tokens={"r": 2},
+    )
+    runner._prefix_cache_step_begin(arrival)
+    arrival.num_scheduled_tokens["r"] = 99
+    assert runner._prefix_cache_step is steps[0]
+    assert steps[0].scheduled_tokens == (("r", 2),)
+    runner._prefix_cache_save_step(torch.zeros(2, 2), None, num_tokens_unpadded=2, num_tokens_padded=2)
+    layout = stub.save_calls[-1][-1]
+    assert layout.total_rows == 2 and layout.slots_cpu.tolist() == [0, 1]
+
+    continuation = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["r"], resumed_req_ids=set()),
+        finished_req_ids=set(),
+        num_scheduled_tokens={"r": 1},
+    )
+    runner._prefix_cache_step_begin(continuation)
+    assert steps[-1].events == ()
+    assert steps[-1].extended_req_ids == ("r",)
+
+
+@pytest.mark.parametrize("missing", ["adapter", "view"])
+def test_step_begin_rejects_incomplete_cache_initialization(missing):
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+
+    runner = _Runner()
+    steps = []
+    runner.omni_prefix_cache = SimpleNamespace(new_step_starts=steps.append)
+    runner._prefix_cache_adapter = None if missing == "adapter" else PrefixCacheSchedulerAdapter()
+    runner._prefix_cache_group_view = None if missing == "view" else SimpleNamespace()
+    with pytest.raises(RuntimeError, match="adapter.*view.*initialized"):
+        runner._prefix_cache_step_begin(_sched())
+    assert steps == []
+    assert runner._prefix_cache_step is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_shutdown_clears_cache_unit_even_on_error(fail):
+    import weakref
+
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+
+    runner = _Runner(_cfg())
+    calls = []
+
+    def shutdown():
+        calls.append(True)
+        if fail:
+            raise RuntimeError("shutdown failed")
+
+    class View:
+        pass
+
+    view = View()
+    ref = weakref.ref(view)
+    runner.omni_prefix_cache = SimpleNamespace(shutdown=shutdown)
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+    runner._prefix_cache_group_view = view
+    runner._prefix_cache_step = PrefixCacheStep((), ())
+    del view
+    if fail:
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            runner._shutdown_omni_prefix_cache()
+    else:
+        runner._shutdown_omni_prefix_cache()
+    assert runner.omni_prefix_cache is None
+    assert runner._prefix_cache_adapter is None
+    assert runner._prefix_cache_group_view is None
+    assert runner._prefix_cache_step is None
+    assert runner._omni_prefix_cache_cfg is None
+    assert ref() is None
+    runner._shutdown_omni_prefix_cache()
+    runner._prefix_cache_step_begin(_sched())
+    assert calls == [True]
+
+
+def test_negative_non_hit_step_is_a_noop_through_manager(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    runner = _Runner(_cfg())
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r", num_computed_tokens=0)],
+        finished_req_ids=set(),
+        num_scheduled_tokens={"r": -512},
+    )
+    try:
+        runner._prefix_cache_step_begin(scheduler_output)
+        assert runner._prefix_cache_step.scheduled_tokens == (("r", 0),)
+        assert runner.omni_prefix_cache._cur_num_scheduled == {"r": 0}
+        assert runner.omni_prefix_cache._hit_spans == {}
+        assert not runner.omni_prefix_cache._prefetch_queue
+    finally:
+        runner._shutdown_omni_prefix_cache()
+
+
+def test_shared_runner_shutdown_releases_cache_before_upstream():
+    """Execute the production method without importing CUDA/NPU modules."""
+    import ast
+
+    root = Path(__file__).resolve().parents[2]
+    tree = ast.parse((root / "vllm_omni/worker/gpu_model_runner.py").read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "OmniGPUModelRunner")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
+    order = []
+
+    class Base:
+        def shutdown(self):
+            assert self.omni_prefix_cache is None
+            assert self._prefix_cache_group_view is None
+            order.append("upstream")
+
+    # Keep zero-argument super() semantics by compiling it inside a class.
+    cls.bases = [ast.Name(id="PrefixCacheRunnerMixin", ctx=ast.Load()), ast.Name(id="Base", ctx=ast.Load())]
+    cls.decorator_list = []
+    cls.body = [method]
+    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+    namespace = {"PrefixCacheRunnerMixin": PrefixCacheRunnerMixin, "Base": Base}
+    exec(compile(module, "<shared runner shutdown>", "exec"), namespace)
+    runner = namespace["OmniGPUModelRunner"]()
+    runner.omni_prefix_cache = SimpleNamespace(shutdown=lambda: order.append("cache"))
+    runner._prefix_cache_group_view = SimpleNamespace()
+    runner.shutdown()
+    assert order == ["cache", "upstream"]
+
+    ar_tree = ast.parse((root / "vllm_omni/worker/gpu_ar_model_runner.py").read_text(encoding="utf-8"))
+    ar_cls = next(node for node in ar_tree.body if isinstance(node, ast.ClassDef) and node.name == "GPUARModelRunner")
+    ar_shutdown = next(node for node in ar_cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_shutdown_omni_prefix_cache"
+        for node in ast.walk(ar_shutdown)
+    )

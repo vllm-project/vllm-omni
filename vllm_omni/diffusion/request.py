@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -76,11 +76,16 @@ class OmniDiffusionRequest:
     # A model preprocessor may keep selected requests on the legacy full-forward
     # path even when the engine is globally configured for step execution.
     use_step_execution: bool = True
+    # Whether first and later denoising steps may share a step batch.
+    allow_mixed_step_phases: bool = True
     # KV-recv wall-clock (ms), set by the runner's _prepare_request_for_forward
     # and carried to DiffusionOutput for the vllm_omni:diffusion_kv_load_s metric.
     kv_recv_ms: float = 0.0
     # Time spent waiting for initial admission by the diffusion scheduler.
     scheduler_queue_wait_ms: float | None = None
+    # Engine-owned shared-memory signal for cooperative full-forward workers.
+    # Only the engine creates/unlinks it; workers attach readers until return.
+    cancellation_signal: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

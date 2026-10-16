@@ -183,8 +183,8 @@ class OmniSchedulingCoordinator:
                 self.pending_input_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
-                        payload_sender_info=getattr(request, "payload_sender_info", None),
+                        external_req_id=request.external_req_id,
+                        payload_sender_info=request.payload_sender_info,
                     )
                 )
             elif request.status == RequestStatus.WAITING_FOR_INPUT:
@@ -197,8 +197,8 @@ class OmniSchedulingCoordinator:
                     self.pending_input_registrations.append(
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
-                            external_req_id=getattr(request, "external_req_id", None),
-                            payload_sender_info=getattr(request, "payload_sender_info", None),
+                            external_req_id=request.external_req_id,
+                            payload_sender_info=request.payload_sender_info,
                         )
                     )
         if to_remove:
@@ -379,14 +379,17 @@ class OmniSchedulingCoordinator:
                             )
 
             if model_mode != "ar":
-                new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
+                new_codes = metadata.get("code_predictor_codes")
+                new_ids = self._flatten_prompt_token_ids(new_codes)
                 runtime_seed = None
                 if "left_context_size" in metadata:
                     runtime_seed = {
                         "meta": {"left_context_size": metadata["left_context_size"]},
                     }
                 request._omni_initial_model_buffer = runtime_seed
-                if new_ids:
+                # An explicit empty snapshot clears a previous codec chunk
+                # or prewarmed placeholder. Missing codes leave it intact.
+                if new_codes is not None:
                     request.prompt_token_ids = new_ids
                     request.num_prompt_tokens = len(new_ids)
                     request._all_token_ids.clear()
@@ -453,7 +456,7 @@ class OmniSchedulingCoordinator:
                 self.pending_chunk_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
+                        external_req_id=request.external_req_id,
                     )
                 )
                 request.status = RequestStatus.WAITING_FOR_CHUNK

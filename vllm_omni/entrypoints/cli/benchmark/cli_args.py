@@ -32,6 +32,13 @@ def _positive_finite_float(value: str) -> float:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return parsed
+
+
 def _existing_file(value: str) -> str:
     path = Path(value).expanduser()
     if not path.is_file():
@@ -42,12 +49,42 @@ def _existing_file(value: str) -> str:
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
         DEFAULT_MAX_VIDEO_DURATION_S,
+        OMNIINTERACT_SCENARIO_TAGS,
         OMNIINTERACT_SUBSETS,
     )
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
     group.add_argument(
         "--omniinteract-subsets", nargs="+", choices=OMNIINTERACT_SUBSETS, default=list(OMNIINTERACT_SUBSETS)
+    )
+    group.add_argument(
+        "--omniinteract-scenario-tags",
+        nargs="+",
+        choices=OMNIINTERACT_SCENARIO_TAGS,
+        default=None,
+        help=(
+            "Scenario tags used when sampling cases: realtime, proactive, nested, interrupted, 1qna. "
+            "Default behavior covers each requested tag with at least one case (when available), "
+            "then fills remaining --num-prompts from the rest of the selected subsets."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-scenario-focus",
+        action="store_true",
+        help=(
+            "Only run cases matching --omniinteract-scenario-tags. "
+            "Without this flag, tags are used for coverage-first sampling."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-video-list",
+        type=_existing_file,
+        help=(
+            "JSONL of sampled OmniInteract cases (video_path, output_name, subset), "
+            "typically sampled_cases.jsonl from a prior run. Preserves list order. "
+            "Cannot be combined with --seed, --dataset-path, or --omniinteract-scenario-tags. "
+            "With this flag, --num-prompts caps the prefix of the list (0 or oversized = all)."
+        ),
     )
     group.add_argument(
         "--omniinteract-timeout-s", type=_positive_finite_float, default=900.0, help="Complete session timeout."
@@ -65,7 +102,9 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Reject media longer than this safety limit before decoding.",
     )
     group.add_argument(
-        "--omniinteract-ref-audio", type=_existing_file, help="Reference WAV for native-duplex audio output."
+        "--omniinteract-ref-audio",
+        type=_existing_file,
+        help="Required reference WAV to pin the assistant voice for reproducible native-duplex scoring.",
     )
     group.add_argument(
         "--omniinteract-require-response", action="store_true", help="Fail LISTEN-only functional E2E cases."
@@ -76,6 +115,83 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         default=Path("omniinteract-output"),
         help="Directory for case and evaluator artifacts.",
     )
+    group.add_argument(
+        "--omniinteract-evaluate",
+        action="store_true",
+        help="Run the text-only OmniInteract judge after generation and print an accuracy report.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-base-url",
+        default="http://127.0.0.1:8000",
+        help="Base URL of an already-running OpenAI-compatible judge server.",
+    )
+    group.add_argument("--omniinteract-judge-model", help="Model name exposed by the judge server.")
+    group.add_argument(
+        "--omniinteract-judge-api-key",
+        default="EMPTY",
+        help="Bearer token for the judge server.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-timeout-s",
+        type=_positive_finite_float,
+        default=60.0,
+        help="Timeout for each judge request.",
+    )
+    group.add_argument(
+        "--omniinteract-judge-max-tokens",
+        type=_positive_int,
+        default=512,
+        help="Maximum completion tokens for each judge request.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-workers",
+        type=_positive_int,
+        default=8,
+        help="Maximum number of concurrent judge requests.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-output-dir",
+        type=Path,
+        help="Accuracy artifact directory; defaults to OUTPUT_DIR/evaluation.",
+    )
+    group.add_argument(
+        "--omniinteract-eval-skip-existing",
+        action="store_true",
+        help="Reuse successful per-case evaluation artifacts.",
+    )
+
+
+def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("Omni-DuplexEval Benchmark Options")
+    group.add_argument("--duplex-eval-split", default="all")
+    group.add_argument("--duplex-eval-family", choices=("all", "rtd", "pr"), default="all")
+    group.add_argument("--duplex-eval-ids", nargs="+")
+    group.add_argument("--duplex-eval-media-root", type=Path)
+    group.add_argument("--duplex-eval-ref-audio", type=_existing_file)
+    group.add_argument("--duplex-eval-fps", type=_positive_finite_float, default=1.0)
+    group.add_argument(
+        "--duplex-eval-response-root",
+        type=Path,
+        default=Path("omni-duplex-eval-output"),
+        help="Parent directory for artifacts; each invocation creates a new run subdirectory.",
+    )
+    group.add_argument(
+        "--duplex-eval-evaluate",
+        action="store_true",
+        help="Run the existing Omni-DuplexEval judge after performance timing and print accuracy scores.",
+    )
+    group.add_argument(
+        "--duplex-eval-judge-base-url",
+        default="http://127.0.0.1:8001/v1",
+        help="Base URL of an already-running OpenAI-compatible judge server.",
+    )
+    group.add_argument("--duplex-eval-judge-model", help="Model name exposed by the judge server.")
+    group.add_argument("--duplex-eval-judge-api-key", default="EMPTY")
+    group.add_argument("--duplex-eval-judge-timeout-s", type=_positive_finite_float, default=600.0)
+    group.add_argument("--duplex-eval-judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
+    group.add_argument("--duplex-eval-judge-fps", type=_positive_int, default=2)
+    group.add_argument("--duplex-eval-window-size", type=_positive_finite_float, default=10.0)
+    group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
 
 
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -268,6 +384,13 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for Seed-TTS benchmarks."""
     group = parser.add_argument_group("Seed-TTS Dataset Options")
     group.add_argument(
+        "--seed-tts-reference-as-input",
+        action="store_true",
+        help="Send Seed-TTS reference speech as a real user audio turn alongside the target text, rather than as "
+        "ref_audio/ref_text voice-clone fields. Requires --backend openai-realtime-chat. Audio is normalized to "
+        "mono 24 kHz PCM16; a one-second silent tail is appended and streamed only in server-VAD mode.",
+    )
+    group.add_argument(
         "--seed-tts-locale",
         type=str,
         choices=["en", "zh"],
@@ -333,6 +456,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
     "omniinteract",
+    "omni-duplex-eval",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -356,7 +480,11 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
                 if extra:
                     action.choices = list(action.choices) + extra
             if action.dest == "backend" and action.choices is not None:
-                extra = [choice for choice in ("openai-image-edits-omni",) if choice not in action.choices]
+                extra = [
+                    choice
+                    for choice in ("openai-image-edits-omni", "openai-realtime-chat")
+                    if choice not in action.choices
+                ]
                 if extra:
                     action.choices = list(action.choices) + extra
 
@@ -366,8 +494,8 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
     for action in parser._actions:
         if action.dest == "num_prompts":
             action.help = (
-                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} when this option is omitted; "
-                "0 selects all available cases."
+                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} and Omni-DuplexEval uses 3 "
+                "when this option is omitted; 0 selects all available cases for either dataset."
             )
         if action.dest == "percentile_metrics":
             action.help = (
@@ -407,6 +535,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_daily_omni_cli_args(parser)
     add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
+    add_duplex_eval_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
@@ -414,13 +543,47 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if getattr(args, "dataset_name", None) == "omni-duplex-eval":
+        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
+            raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if not args.duplex_eval_ref_audio:
+            raise ValueError("Omni-DuplexEval requires --duplex-eval-ref-audio")
+        if args.duplex_eval_evaluate and not args.duplex_eval_judge_model:
+            raise ValueError("Omni-DuplexEval evaluation requires --duplex-eval-judge-model")
+        for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
+            if getattr(args, name, False):
+                raise ValueError(f"Omni-DuplexEval does not support --{name.replace('_', '-')}")
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = 3
+        if args.num_prompts < 0:
+            raise ValueError("Omni-DuplexEval --num-prompts must be non-negative (0 selects all)")
+        if args.max_concurrency is None:
+            args.max_concurrency = 1
+        elif args.max_concurrency <= 0:
+            raise ValueError("Omni-DuplexEval requires positive --max-concurrency")
     if getattr(args, "dataset_name", None) == "omniinteract":
         if getattr(args, "backend", None) != "openai-realtime-duplex":
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")
         if getattr(args, "endpoint", None) != "/v1/realtime":
             raise ValueError("OmniInteract requires --endpoint /v1/realtime")
         if not getattr(args, "omniinteract_ref_audio", None):
-            raise ValueError("OmniInteract requires --omniinteract-ref-audio")
+            raise ValueError("OmniInteract requires --omniinteract-ref-audio to pin the voice for reproducible scoring")
+        if getattr(args, "omniinteract_evaluate", False) and not getattr(args, "omniinteract_judge_model", None):
+            raise ValueError("OmniInteract evaluation requires --omniinteract-judge-model")
+        if getattr(args, "omniinteract_video_list", None):
+            explicit = getattr(args, "explicit_keys", ())
+            if "seed" in explicit:
+                raise ValueError("--omniinteract-video-list cannot be combined with --seed")
+            if "dataset_path" in explicit:
+                raise ValueError("--omniinteract-video-list cannot be combined with --dataset-path")
+            if getattr(args, "omniinteract_scenario_tags", None):
+                raise ValueError("--omniinteract-video-list cannot be combined with --omniinteract-scenario-tags")
+            if getattr(args, "omniinteract_scenario_focus", False):
+                raise ValueError("--omniinteract-video-list cannot be combined with --omniinteract-scenario-focus")
+        if getattr(args, "omniinteract_scenario_focus", False) and not getattr(
+            args, "omniinteract_scenario_tags", None
+        ):
+            raise ValueError("--omniinteract-scenario-focus requires --omniinteract-scenario-tags")
         if getattr(args, "ignore_eos", False):
             raise ValueError("OmniInteract does not support --ignore-eos")
         if getattr(args, "profile", False):

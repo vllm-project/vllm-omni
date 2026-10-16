@@ -97,6 +97,7 @@ def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[
 class OmniResponse:
     """Decoded multimodal / chat output from the OpenAI SDK or offline runner (not raw ``requests``)."""
 
+    request_id: str | None = None
     text_content: str | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
@@ -364,6 +365,24 @@ def _merge_ws_expectation_kwargs(
     return cfg
 
 
+def _ws_error_code(jb: Mapping[str, Any]) -> Any:
+    """Read an error code from a WebSocket JSON frame.
+
+    Speech and video frames put ``code`` on the envelope. OpenAI Realtime nests
+    it under ``error`` (``{"type": "error", "error": {"code": "invalid_event"}}``).
+    The envelope wins when both differ; Realtime frames are expected to omit
+    top-level ``code`` (as in the Buildkite failure) so a stale envelope field
+    does not mask the nested code.
+    """
+    code = jb.get("code")
+    if code is not None:
+        return code
+    error = jb.get("error")
+    if isinstance(error, dict):
+        return error.get("code")
+    return None
+
+
 def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocketJsonResponse) -> None:
     jb = resp.json_body
     want_type = cfg.get("ws_json_type")
@@ -371,7 +390,7 @@ def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocke
         assert jb.get("type") == want_type, (jb, want_type)
     want_code = cfg.get("ws_error_code")
     if want_code is not None:
-        assert jb.get("code") == want_code, (jb, want_code)
+        assert _ws_error_code(jb) == want_code, (jb, want_code)
     err_message = cfg.get("err_message")
     if err_message is not None:
         assert_http_error(resp, err_message=err_message, websocket_json_message=True)
@@ -421,6 +440,8 @@ class OnlineOmniClient:
             text_content = ""
             audio_data = []
             for chunk in chat_completion:
+                if result.request_id is None:
+                    result.request_id = getattr(chunk, "id", None)
                 for choice in chunk.choices:
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     modality = getattr(chunk, "modality", None)
@@ -453,6 +474,7 @@ class OnlineOmniClient:
         """Wall clock from *before* ``chat.completions.create`` through response parse + local decode."""
         result = OmniResponse()
         try:
+            result.request_id = getattr(chat_completion, "id", None)
             audio_data = None
             text_content = None
             for choice in chat_completion.choices:
@@ -1445,6 +1467,8 @@ class OnlineOmniClient:
           - min_audio_bytes: optional minimum ``len(audio_bytes)`` checked in ``assert_audio_speech_response``
           - transcript_expected_text: local expected spoken text; defaults to ``input``
           - transcript_model: primary Whisper model for content checks; defaults to ``small``
+          - transcript_pcm_sample_rate: local-only opt-in to transcribe mono int16 PCM;
+            must be the actual output sample rate, also used for HNR
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
 
@@ -1473,6 +1497,7 @@ class OnlineOmniClient:
             "max_new_tokens",
             "seed",
             "instructions",
+            "duration_seconds",
             "speed",
             "sample_rate",
             "extra_params",
