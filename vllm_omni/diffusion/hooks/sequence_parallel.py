@@ -399,6 +399,7 @@ class SequenceParallelSplitHook(ModelHook):
                     x,
                     sp_input.split_dim,
                     sp_input.shard_group,
+                    mask_free_padding=sp_input.mask_free_padding,
                 )
             else:
                 _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
@@ -434,6 +435,8 @@ class SequenceParallelSplitHook(ModelHook):
         x: torch.Tensor,
         dim: int,
         shard_group: str | None,
+        *,
+        mask_free_padding: bool = False,
     ) -> torch.Tensor:
         """Pad and shard a tensor while recording its global sequence length.
 
@@ -470,26 +473,27 @@ class SequenceParallelSplitHook(ModelHook):
             # Keyed groups record their length even when no padding is needed.
             return sp_shard(x, dim, validate=False)
 
-        # Check backend compatibility
-        attention_config = None
-        if is_forward_context_available():
-            od_config = get_forward_context().omni_diffusion_config
-            if od_config is not None:
-                attention_config = od_config.diffusion_attention_config
+        if not mask_free_padding:
+            # Check backend compatibility
+            attention_config = None
+            if is_forward_context_available():
+                od_config = get_forward_context().omni_diffusion_config
+                if od_config is not None:
+                    attention_config = od_config.diffusion_attention_config
 
-        attn_backend = get_attn_backend_for_capability(
-            role="self",
-            attention_config=attention_config,
-        )
-        attention_spec = None
-        if attention_config is not None:
-            attention_spec, _ = attention_config.resolve_with_source(role="self")
-        if not attn_backend.supports_attention_mask(attention_spec):
-            raise ValueError(
-                f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
-                f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
-                f"Please switch to SDPA or Ascend attention backend."
+            attn_backend = get_attn_backend_for_capability(
+                role="self",
+                attention_config=attention_config,
             )
+            attention_spec = None
+            if attention_config is not None:
+                attention_spec, _ = attention_config.resolve_with_source(role="self")
+            if not attn_backend.supports_attention_mask(attention_spec):
+                raise ValueError(
+                    f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
+                    f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
+                    f"Please switch to SDPA or Ascend attention backend."
+                )
 
         # Ring attention does not support attention_mask
         if get_ring_parallel_world_size() > 1:
