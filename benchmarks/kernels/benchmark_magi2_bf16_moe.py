@@ -276,7 +276,7 @@ def main():
         print(json.dumps({"status": "skip", "reason": "No visible CUDA/MUSA device"}))
         return
     import vllm_omni.diffusion.models.magi2.fused_moe_kernels as kernels
-    import vllm_omni.diffusion.models.magi2.mh_moe as moe
+    import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe as moe
 
     root = Path(__file__).resolve().parents[2]
     try:

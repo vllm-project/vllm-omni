@@ -15,6 +15,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfi
 from vllm_omni.diffusion.models.magi2 import attention
 from vllm_omni.diffusion.models.magi2 import pipeline_magi2 as pipeline
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
+from vllm_omni.diffusion.models.magi2.layers.cuda import attention_ops as cuda_attention
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer, Modality
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -26,6 +27,10 @@ def fake_platform(device_type: str, available: bool = True):
         is_available=lambda: available,
         is_cuda=lambda: device_type == "cuda",
         is_musa=lambda: device_type == "musa",
+        is_npu=lambda: device_type == "npu",
+        current_device=lambda: torch.accelerator.current_device_index(),
+        # The CPU test observes only str(device), without initializing a backend.
+        get_torch_device=lambda local_rank: f"{device_type}:{local_rank}",
     )
 
 
@@ -47,7 +52,7 @@ def stop_before_weights(monkeypatch):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("device_type", ["cuda", "musa"])
+@pytest.mark.parametrize("device_type", ["cuda", "musa", "npu"])
 def test_constructor_uses_selected_device(monkeypatch, device_type):
     monkeypatch.setattr(pipeline, "current_omni_platform", fake_platform(device_type))
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 2)
@@ -60,17 +65,19 @@ def test_constructor_uses_selected_device(monkeypatch, device_type):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("device_type,available", [("cuda", False), ("musa", False), ("cpu", True), ("xpu", True)])
+@pytest.mark.parametrize(
+    "device_type,available", [("cuda", False), ("musa", False), ("npu", False), ("cpu", True), ("xpu", True)]
+)
 def test_constructor_rejects_unsupported_or_unavailable(monkeypatch, device_type, available):
     monkeypatch.setattr(pipeline, "current_omni_platform", fake_platform(device_type, available))
     resolver = stop_before_weights(monkeypatch)
-    with pytest.raises(RuntimeError, match="available CUDA or MUSA"):
+    with pytest.raises(RuntimeError, match="available CUDA, MUSA, or Ascend NPU"):
         pipeline.Magi2Pipeline(od_config=config())
     resolver.assert_not_called()
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("device_type", ["cuda", "musa"])
+@pytest.mark.parametrize("device_type", ["cuda", "musa", "npu"])
 @pytest.mark.parametrize("profiling", [False, True])
 def test_forward_sync_and_memory_monitor(monkeypatch, device_type, profiling):
     monkeypatch.setattr(pipeline, "current_omni_platform", fake_platform(device_type))
@@ -120,7 +127,8 @@ def require_musa():
 @pytest.mark.cpu
 @pytest.mark.parametrize("device_type,is_cuda", [("cuda", True), ("musa", True), ("cuda", False)])
 def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type, is_cuda):
-    monkeypatch.setattr(attention, "current_omni_platform", fake_platform(device_type))
+    monkeypatch.setattr(cuda_attention, "current_omni_platform", fake_platform(device_type))
+    monkeypatch.setattr(attention, "varlen_attention_with_sink", cuda_attention.varlen_attention_with_sink)
     # Compatibility layers can expose is_cuda on non-CUDA tensors.
     q = SimpleNamespace(is_cuda=is_cuda, shape=(2, 1, 4), device=torch.device("cpu"))
     k = v = torch.empty(2, 1, 4)
@@ -130,9 +138,9 @@ def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type
     reference = Mock(return_value=expected)
     flash = Mock(return_value=(expected, torch.zeros(1, 2)))
     resolver = Mock(return_value=3)
-    monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", reference)
-    monkeypatch.setattr(attention, "vllm_flash_attn_varlen_with_lse", flash)
-    monkeypatch.setattr(attention, "_resolve_flash_attn_version", resolver)
+    monkeypatch.setattr(cuda_attention, "torch_varlen_attention_with_sink", reference)
+    monkeypatch.setattr(cuda_attention, "vllm_flash_attn_varlen_with_lse", flash)
+    monkeypatch.setattr(cuda_attention, "_resolve_flash_attn_version", resolver)
     assert attention.packed_attention_with_sink(q, k, v, varlen) is expected
     if device_type == "cuda" and is_cuda:
         flash.assert_called_once()

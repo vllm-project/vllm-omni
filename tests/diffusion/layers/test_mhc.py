@@ -134,7 +134,9 @@ def test_model_wiring_uses_fused_eager_path(monkeypatch):
             calls.append("native")
             return reference(args, **kwargs)
 
-    monkeypatch.setattr(model_layers, "_mhc_post_residual", Prepare())
+    from vllm_omni.diffusion.models.magi2 import common_layers as model_mhc
+
+    monkeypatch.setattr(model_mhc, "_mhc_post_residual", Prepare())
     handler = model_layers.MHCHandler(4, 16)
     post, residual, ap, bp, ar, br = coefficients()
     handler.compute_post_residual((ap, bp, post), (ar, br, residual), out_dtype=torch.float32)

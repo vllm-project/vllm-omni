@@ -17,8 +17,8 @@ import torch
 
 from tests.diffusion.models.magi2.test_bf16_moe_wiring import _gpu_device
 from tests.helpers.mark import hardware_marks
-from vllm_omni.diffusion.models.magi2 import mh_moe
-from vllm_omni.diffusion.models.magi2.mh_moe import (
+from vllm_omni.diffusion.models.magi2.layers.cuda import mh_moe
+from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import (
     Magi2MultiHeadMoE,
     Magi2MultiHeadMoEConfig,
 )

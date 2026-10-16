@@ -550,13 +550,18 @@ class Magi2Pipeline(
         if not od_config.model:
             raise ValueError("MAGI-2 requires od_config.model")
         _validate_native_topology(od_config)
-        supported_gpu = current_omni_platform.is_cuda() or current_omni_platform.is_musa()
-        if not supported_gpu or not current_omni_platform.is_available():
-            raise RuntimeError("MAGI-2 Preview requires available CUDA or MUSA GPUs")
+        supported_accelerator = (
+            current_omni_platform.is_cuda() or current_omni_platform.is_musa() or current_omni_platform.is_npu()
+        )
+        if not supported_accelerator or not current_omni_platform.is_available():
+            raise RuntimeError("MAGI-2 Preview requires available CUDA, MUSA, or Ascend NPU")
 
         self.od_config = od_config
         self.dtype = od_config.dtype or torch.bfloat16
-        self.device_str = f"{current_omni_platform.device_type}:{torch.accelerator.current_device_index()}"
+        if current_omni_platform.is_npu():
+            self.device_str = str(current_omni_platform.get_torch_device(current_omni_platform.current_device()))
+        else:
+            self.device_str = f"{current_omni_platform.device_type}:{torch.accelerator.current_device_index()}"
         self.checkpoint_root = _resolve_checkpoint_root(
             str(od_config.model),
             od_config.revision,
@@ -1086,9 +1091,16 @@ class Magi2Pipeline(
         _seed_request(seed)
 
         has_accelerator = (
-            current_omni_platform.is_cuda() or current_omni_platform.is_musa()
+            current_omni_platform.is_cuda() or current_omni_platform.is_musa() or current_omni_platform.is_npu()
         ) and current_omni_platform.is_available()
-        device_index = torch.accelerator.current_device_index() if has_accelerator else None
+        if has_accelerator:
+            device_index = (
+                current_omni_platform.current_device()
+                if current_omni_platform.is_npu()
+                else torch.accelerator.current_device_index()
+            )
+        else:
+            device_index = None
         # Sampling reserved memory is qualification instrumentation, not part
         # of ordinary serving. It starts only when the pipeline profiler is
         # explicitly enabled, so ordinary GPU requests avoid a 20 Hz thread.

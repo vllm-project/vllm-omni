@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import vllm_omni.diffusion.models.magi2.mh_moe as moe
+import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe as moe
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.magi2 import fused_moe_kernels
 from vllm_omni.diffusion.models.magi2.parallel import Magi2ParallelGroup

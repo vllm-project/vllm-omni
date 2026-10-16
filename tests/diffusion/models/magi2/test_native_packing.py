@@ -11,8 +11,7 @@ from vllm_omni.diffusion.models.magi2.configuration_magi2 import (
     Magi2MoEConfig,
     Magi2PreviewConfig,
 )
-from vllm_omni.diffusion.models.magi2.layers import MultiModalityRMSNorm
-from vllm_omni.diffusion.models.magi2.mh_moe import Magi2MultiHeadMoE
+from vllm_omni.diffusion.models.magi2.layers import Magi2MultiHeadMoE, MultiModalityRMSNorm
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer
 from vllm_omni.diffusion.models.magi2.preview_data_proxy import (
     Magi2DataProxy,

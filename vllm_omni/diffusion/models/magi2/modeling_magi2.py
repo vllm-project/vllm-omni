@@ -24,18 +24,20 @@ import torch.nn as nn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 
-from .attention import Magi2PackedAttentionKernel, VarlenHandler, apply_rotary_emb
+from .attention import Magi2PackedAttentionKernel, VarlenHandler
 from .configuration_magi2 import Magi2PreviewConfig
 from .layers import (
     ElementWiseFourierEmbed,
+    Magi2MultiHeadMoE,
+    Magi2MultiHeadMoEConfig,
     MHCHandler,
     MHCTensorTuple,
     ModalityDispatcher,
     MultiModalityRMSNorm,
+    apply_rotary_emb,
     make_grouped_linear,
     swiglu7,
 )
-from .mh_moe import Magi2MultiHeadMoE, Magi2MultiHeadMoEConfig
 from .parallel import Magi2SequenceDispatcher
 
 
