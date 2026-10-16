@@ -313,6 +313,25 @@ def test_enable_cache_for_dit_builtin_adapter_drops_separate_cfg_under_cfg_paral
     assert mock_cache_dit.enable_cache.call_args.kwargs["cache_config"].enable_separate_cfg is expected
 
 
+@pytest.mark.parametrize(("cfg_world_size", "expected"), [(None, False), (1, False), (2, True)])
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+def test_backend_marks_pipeline_one_call_per_cfg_rank(mock_cache_dit, cfg_world_size, expected):
+    """CFGParallelMixin reads the marker to reject multi-branch topologies with two calls on one rank."""
+    pipeline_cls = type("FakeCfgParallelPipeline", (), {})
+    pipeline = pipeline_cls()
+    pipeline.transformer = Mock()
+    backend = CacheDiTBackend(DiffusionCacheConfig())
+    with (
+        patch.dict(cd_backend.backend.CUSTOM_DIT_ENABLERS, {pipeline_cls.__name__: lambda *_: Mock()}),
+        _cfg_parallel(cfg_world_size),
+    ):
+        backend.enable(pipeline)
+    assert pipeline._cache_dit_one_call_per_cfg_rank is expected
+
+    backend.disable(pipeline)
+    assert pipeline._cache_dit_one_call_per_cfg_rank is False
+
+
 @pytest.mark.parametrize("has_transformer_2", [False, True])
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.cache_dit")
