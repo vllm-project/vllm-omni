@@ -2587,10 +2587,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             # Assume that this will follow the same adapter pattern
             # once all RFC is implemented
-            adapter = self._adapter
-            if adapter is None:
-                raise ValueError("Diffusion speech serving has no TTS adapter")
-            validation_error = validate_tts_request(adapter, request)
+            validation_error = validate_tts_request(self._adapter, request)
             if validation_error is not None:
                 raise ValueError(validation_error)
 
@@ -2600,7 +2597,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     return self._diffusion_error_response(fmt_err, status_code=400)
 
             request_id = f"speech-{random_uuid()}"
-            prepared_request = await adapter.build(
+            prepared_request = await self._adapter.build(
                 request, sampling_params_list=[], has_inline_ref_audio=has_inline_ref_audio
             )
             prompt = prepared_request.prompt
