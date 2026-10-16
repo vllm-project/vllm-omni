@@ -767,9 +767,9 @@ def test_a_live_stream_and_a_first_chunk_in_one_step(decoder: S3GenDecoder, refe
 @pytest.mark.parametrize(
     ("max_num_batched_tokens", "max_num_scheduled_tokens", "names"),
     [
-        (65535, None, "max_num_batched_tokens >= max_num_seqs (32) * max_model_len (2048) = 65536, got 65535"),
-        (65536, 8000, "max_num_scheduled_tokens >= max_num_seqs (32) * max_model_len (2048) = 65536, got 8000"),
-        (65536, 0, "max_num_scheduled_tokens >= max_num_seqs (32) * max_model_len (2048) = 65536, got 0"),
+        (131071, None, "max_num_batched_tokens >= max_num_seqs (64) * max_model_len (2048) = 131072, got 131071"),
+        (131072, 8000, "max_num_scheduled_tokens >= max_num_seqs (64) * max_model_len (2048) = 131072, got 8000"),
+        (131072, 0, "max_num_scheduled_tokens >= max_num_seqs (64) * max_model_len (2048) = 131072, got 0"),
     ],
     ids=["batched tokens", "scheduled tokens", "scheduled tokens set to 0"],
 )
@@ -792,7 +792,7 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_scheduled_tokens=max_num_scheduled_tokens,
     )
-    assert (config.scheduler_config.max_num_seqs, config.model_config.max_model_len) == (32, 2048)
+    assert (config.scheduler_config.max_num_seqs, config.model_config.max_model_len) == (64, 2048)
 
     with pytest.raises(ValueError, match=re.escape(names)):
         build_stage(config, "cpu")

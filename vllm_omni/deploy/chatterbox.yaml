@@ -3,10 +3,10 @@
 # scheduler requires enough token budget to prefill a whole pair, and disables
 # asynchronous scheduling, chunked prefill, and prefix caching.
 #
-# The one Original profile: admission at the real-time envelope the H100
-# recipe measured with the built-in voice (8 clients; 16 stage 0 sequences
-# are 8 guided requests), memory fractions derived for a 24 GB card from
-# H100 startup lines (not run on one).
+# The one Original profile: 64 guided requests at once (128 stage 0
+# sequences), what one H100 (79.6 GiB) fits with the memory arithmetic
+# below; the H100 recipe measures it from 8 to 64 clients. TUNE PER GPU: on
+# a smaller or slower card lower max_num_seqs (and the fractions with it).
 pipeline: chatterbox
 model_runner: v2
 async_chunk: true
@@ -24,14 +24,15 @@ stages:
     hf_overrides:
       variant: original
     dtype: bfloat16
-    max_num_seqs: 16
+    max_num_seqs: 128
     max_model_len: 2048
+    # One guided pair's prefill at once.
     max_num_batched_tokens: 4096
     # Measured on H100: 1.32 GiB of weights with vLLM's own, 0.16 GiB of
     # activations, 0.08 GiB of graphs and 120 KiB of KV cache per token. The
-    # 16 sequences at 2048 tokens need 3.75 GiB of KV cache, about 5.3 GiB in
-    # all; 0.30 of a 24 GB card (23.6 GiB) is 7.1 GiB.
-    gpu_memory_utilization: 0.30
+    # 128 sequences at 2048 tokens need 30.0 GiB of KV cache, about 31.6 GiB
+    # in all; 0.45 of the H100's 79.6 GiB is 35.8 GiB.
+    gpu_memory_utilization: 0.45
     enforce_eager: false
     enable_prefix_caching: false
     enable_chunked_prefill: false
@@ -63,12 +64,12 @@ stages:
     # Seeds the flow-noise buffer, so every process draws the same one.
     seed: 0
     # One utterance per guided request.
-    max_num_seqs: 8
+    max_num_seqs: 64
     max_model_len: 2048
     # max_num_seqs * max_model_len, as the stage requires.
-    max_num_batched_tokens: 16384
+    max_num_batched_tokens: 131072
     # This stage keeps no KV cache; the fraction bounds the flow's and HiFT's
-    # activations for max_num_seqs utterances.
+    # activations for max_num_seqs utterances (11.9 GiB of the H100).
     gpu_memory_utilization: 0.15
     enforce_eager: true
     skip_tokenizer_init: true

@@ -317,14 +317,14 @@ async def test_original_controls_default_to_the_deploy_files(original, extra_par
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("variant", "adapter_cls", "seconds", "admission"),
-    [("turbo", ChatterboxAdapter, 5.04, 32), ("original", ChatterboxOriginalAdapter, 1.0, 8)],
+    [("turbo", ChatterboxAdapter, 5.04, 64), ("original", ChatterboxOriginalAdapter, 1.0, 64)],
 )
 async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
     request, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, admission
 ):
     """Everything queued while the encoders are busy goes through them as one batch, with no cap of its own.
 
-    The profile admits ``admission`` requests (Original's 16 sequences are 8
+    The profile admits ``admission`` requests (Original's 128 sequences are 64
     guided pairs), so that many references arriving together are one
     admission. The first batch is held so that the other references queue
     behind it; the batch after it is all of them. Each clip is 40 ms (one
@@ -465,6 +465,9 @@ async def test_cancelled_wave_cannot_overfill_encoder_queue(
     try:
         first = [asyncio.create_task(original.resolve_voice(reference(1, seed=index))) for index in range(admission)]
         await asyncio.to_thread(batches.started.wait, 30)
+        # Every first-wave request holds a slot before the wave is cancelled.
+        while len(original.conditioning_pending) < admission:
+            await asyncio.sleep(0.01)
         for request in first:
             request.cancel()
         await asyncio.gather(*first, return_exceptions=True)

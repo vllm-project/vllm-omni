@@ -5,7 +5,7 @@
 - Vendor: Resemble AI
 - Model: `ResembleAI/chatterbox-turbo` (Turbo) and `ResembleAI/chatterbox` (English Original)
 - Task: English text-to-speech with the checkpoint's built-in voice or a voice cloned from one recording
-- Mode: online `/v1/audio/speech` with the one profile per model, which admits the real-time envelope measured with the built-in voice: 32 Turbo requests, 8 Original requests. Real-time playback held up to 16 cloned-voice or 32 built-in clients for Turbo, and up to 8 built-in clients for Original but at no measured cloned-voice load. Offline use is covered below
+- Mode: online `/v1/audio/speech` with the one profile per model, each admitting 64 requests at once (Original's as 128 guided sequences), what one H100 fits. Real-time playback held up to 16 cloned-voice or 32 built-in clients for Turbo, and up to 8 built-in clients for Original but at no measured cloned-voice load. Offline use is covered below
 - Hardware: 1x NVIDIA H100 SXM 80 GB
 - Maintainer: @will-rice
 
@@ -45,8 +45,8 @@ The request contract is the one in the
 
 | Profile on this hardware | Status |
 | --- | --- |
-| `chatterbox_turbo.yaml` (32 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | the 8–64-client grid below was measured with a 64-request overlay that no longer ships; the single profile is being re-measured at the head |
-| `chatterbox.yaml` (8 guided requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | as Turbo's row |
+| `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | the 8–64-client grid below was measured with a 64-request overlay that no longer ships; the single profile is being re-measured at the head |
+| `chatterbox.yaml` (64 guided requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | as Turbo's row |
 
 Real-time here means p95 real-time factor below 1 and every stream
 continuous (no playback underrun beyond 100 ms). Admission at 64 is a
@@ -204,7 +204,7 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
 | Feature | Status |
 | --- | --- |
 | Built-in voice, voice cloning, async streaming | both variants, measured at 8–64 HTTP clients with distinct references |
-| GPU reference conditioning | `conditioning_device: cuda:0`; every admitted reference is encoded in one batch, admission equal to stage 0's request capacity; 64 references, more than either profile admits at once, take 1.64–2.02 s (Turbo) or 0.51–0.68 s (Original) as one batch on H100 |
+| GPU reference conditioning | `conditioning_device: cuda:0`; every admitted reference is encoded in one batch, admission equal to stage 0's request capacity; 64 references, the admission of both profiles, take 1.64–2.02 s (Turbo) or 0.51–0.68 s (Original) as one batch on H100 |
 | AR CUDA graphs | on by default; graph versus eager measured below |
 | BF16 flow decoder, FP32 HiFT | default in every profile; quality and speed measured below |
 | Real-time with cloned voices | Turbo up to 16 clients; Original at no measured load |
@@ -290,8 +290,8 @@ listening scores.
 `benchmarks/tts/chatterbox_conditioning.py` on `cuda:0` at this head: 64
 references tiled from one 6.5 s Seed-TTS evaluation prompt
 (`common_voice_en_103675.wav`) to 6.1, 8.3, 10.1 and 16 s with distinct
-amplitude envelopes, encoded one at a time and then as one batch of 64 (more
-than either profile admits: 32 Turbo, 8 Original requests), three cycles. The same run at the commit before the batched device extraction
+amplitude envelopes, encoded one at a time and then as one batch of 64 (the
+admission of both profiles), three cycles. The same run at the commit before the batched device extraction
 (same host, same clip) is the "before" column.
 
 | Model | Serial before (s) | Serial (s) | One batch before (s) | One batch (s) | Peak allocated / reserved (MiB) | Serial/batch parity |
