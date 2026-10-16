@@ -208,6 +208,12 @@ x-minimax-h3: &minimax_h3
   - vllm_omni/diffusion/models/minimax_h3/
   - vllm_omni/diffusion/layers/indexed_modulation.py
 
+x-flux3: &flux3
+  - vllm_omni/diffusion/models/flux3/
+  - vllm_omni/diffusion/model_metadata.py
+  - vllm_omni/diffusion/registry.py
+  - vllm_omni/model_extras/registry.py
+
 x-hunyuan-video: &hunyuan_video
   - vllm_omni/diffusion/models/hunyuan_video/
   - vllm_omni/model_executor/models/hunyuan_video/
@@ -815,6 +821,23 @@ source_file_dependencies:
     - tests/e2e/online_serving/minimax_h3/rainfusion_trace.py
     - tests/e2e/online_serving/minimax_h3/test_minimax_h3_ref2va_rainfusion_npu.py
     - tests/diffusion/attention/test_rainfusion_plan.py
+
+  diffusion_flux3_function:
+    - *flux3
+    - tests/unit/flux3/
+    - tests/e2e/offline_inference/test_flux3.py
+    - tests/e2e/online_serving/test_flux3.py
+    - tests/e2e/online_serving/test_flux3_expansion.py
+    - vllm_omni/diffusion/attention/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/lora/
+    - vllm_omni/diffusion/model_loader/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/diffusion/quantization/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/entrypoints/openai/
+    - vllm_omni/quantization/
 
   diffusion_hunyuan_video_function:
     - *hunyuan_video
