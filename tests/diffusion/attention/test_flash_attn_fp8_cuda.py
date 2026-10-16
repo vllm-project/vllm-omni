@@ -25,8 +25,10 @@ def _make_impl(causal: bool = False) -> FlashAttentionImpl:
     return FlashAttentionImpl(num_heads=2, head_size=64, softmax_scale=64**-0.5, causal=causal)
 
 
-def _randn_bshd(batch: int, seq: int, heads: int = 2, head_dim: int = 64) -> torch.Tensor:
-    return torch.randn(batch, seq, heads, head_dim, dtype=torch.bfloat16)
+def _randn_bshd(
+    batch: int, seq: int, heads: int = 2, head_dim: int = 64, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    return torch.randn(batch, seq, heads, head_dim, dtype=dtype)
 
 
 @pytest.fixture
@@ -246,22 +248,23 @@ def _reference_attention(q, k, v, scale, causal=False):
 
 @pytest.mark.usefixtures("cpu_fp8_quant")
 class TestForwardFaQuantCudaNumerics:
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("causal", [False, True])
     @pytest.mark.parametrize("deterministic", [False, True])
-    def test_matches_float_reference_within_fp8_tolerance(self, dense_fa3, causal, deterministic):
+    def test_matches_float_reference_within_fp8_tolerance(self, dense_fa3, causal, deterministic, dtype):
         torch.manual_seed(0)
         batch, seq, heads, head_dim = 2, 64, 4, 64
         scale = head_dim**-0.5
         impl = FlashAttentionImpl(num_heads=heads, head_size=head_dim, softmax_scale=scale, causal=causal)
         impl.fa_deterministic = deterministic
 
-        query = _randn_bshd(batch, seq, heads, head_dim)
-        key = _randn_bshd(batch, seq, heads, head_dim)
-        value = _randn_bshd(batch, seq, heads, head_dim)
+        query = _randn_bshd(batch, seq, heads, head_dim, dtype=dtype)
+        key = _randn_bshd(batch, seq, heads, head_dim, dtype=dtype)
+        value = _randn_bshd(batch, seq, heads, head_dim, dtype=dtype)
         out = impl.forward_fa_quant_cuda(query, key, value, AttentionMetadata(extra={"kv_cache_dtype": "fp8"}))
 
         assert out.shape == (batch, seq, heads, head_dim)
-        assert out.dtype == torch.bfloat16  # FA3 FP8 kernels return BF16.
+        assert out.dtype == query.dtype
         assert dense_fa3.calls[0]["qkv_shapes"] == (tuple(query.shape), tuple(key.shape), tuple(value.shape))
         assert dense_fa3.calls[0]["deterministic"] == deterministic
         assert dense_fa3.calls[0]["num_splits"] == 1

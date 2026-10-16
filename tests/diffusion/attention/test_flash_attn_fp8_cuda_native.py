@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -62,7 +65,7 @@ def test_fp8_per_tensor_native(q_heads, kv_heads, causal, dtype, head_dim):
         causal=causal,
     )
     output = impl.forward_cuda(query, key, value, AttentionMetadata(extra={"kv_cache_dtype": "fp8"}))
-    assert output.shape == query.shape and output.dtype == torch.bfloat16
+    assert output.shape == query.shape and output.dtype == query.dtype
     assert torch.isfinite(output).all()
 
     # FA3 causal masking is bottom-right aligned for unequal Q/K lengths.
@@ -102,3 +105,45 @@ def test_fp8_fused_qkv_views_match_contiguous_inputs():
     actual = impl.forward_cuda(query, key, value, metadata)
     expected = impl.forward_cuda(query.contiguous(), key.contiguous(), value.contiguous(), metadata)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": ["H100", "H200"]}, num_cards=1)
+@pytest.mark.parametrize("kv_seq_len", [192, 2561])
+@torch.inference_mode()
+def test_fp8_fp16_attention_output_projection_native(mocker, kv_seq_len):
+    """FP8 attention must feed an FP16 projection without a model-side cast."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("FA3 FP8 requires SM90")
+
+    torch.manual_seed(17)
+    batch, q_len, q_heads, kv_heads, head_dim = 2, 128, 4, 2, 128
+    config = OmniDiffusionConfig(
+        dtype=torch.float16,
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN")),
+        diffusion_kv_cache_dtype="fp8",
+    )
+    with set_current_diffusion_config(config):
+        attention = Attention(
+            num_heads=q_heads,
+            num_kv_heads=kv_heads,
+            head_size=head_dim,
+            softmax_scale=head_dim**-0.5,
+            causal=False,
+            skip_sequence_parallel=True,
+        )
+    quant_forward = mocker.spy(attention.attention, "forward_fa_quant_cuda")
+    hidden_size = q_heads * head_dim
+    projection = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=config.dtype)
+    query = torch.randn(batch, q_len, q_heads, head_dim, device="cuda", dtype=config.dtype)
+    key = torch.randn(batch, kv_seq_len, kv_heads, head_dim, device="cuda", dtype=config.dtype)
+    value = torch.randn_like(key)
+
+    attn_output = attention(query, key, value)
+    # Keep the projection directly after attention so a dtype mismatch fails here.
+    output = projection(attn_output.flatten(2))
+
+    quant_forward.assert_called_once()
+    assert attn_output.shape == query.shape and attn_output.dtype == query.dtype
+    assert output.shape == (batch, q_len, hidden_size)
+    assert output.dtype == projection.weight.dtype == torch.float16
+    assert torch.isfinite(output).all()

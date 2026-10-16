@@ -629,7 +629,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             k_descale=k_descale.expand(batch_size, kv_heads),
             v_descale=v_descale.expand(batch_size, kv_heads),
         )
-        return self._unwrap_flash_output(out)
+        # FA3 FP8 returns BF16; preserve the dtype expected by the model's projection.
+        return self._unwrap_flash_output(out).to(query.dtype)
 
     def forward_xpu(
         self,

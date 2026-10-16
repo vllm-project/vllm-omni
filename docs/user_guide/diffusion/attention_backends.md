@@ -198,9 +198,9 @@ Backends not listed here reject the knob at startup with the list of compatible
 options. Quantization is lossy; validate image/video quality against the
 unquantized baseline before enabling it in production.
 
-The FA3 FP8 kernel returns BF16 output, including for FP16 inputs. This CUDA
-path currently accepts dense inputs without caller masks, packed-sequence
-metadata, or piecewise spans; incompatible requests fail explicitly.
+CUDA FP8 attention returns the input dtype (BF16 or FP16), casting FA3's BF16
+output when needed. This path currently accepts dense inputs without caller
+masks, packed-sequence metadata, or piecewise spans; incompatible requests fail explicitly.
 FP8 attention requires FA3 on SM90; unsupported FA implementations are rejected.
 
 Dynamic quantization adds reductions, FP8 conversion, and kernel launches.
