@@ -610,7 +610,15 @@ class InputClock:
             self._hold(progress)
             return
         if progress.segment_finished:
-            self._speaking[0].final_segment_finished = True
+            # The final stage's segment ends follow its units in order: this one belongs to the oldest
+            # speaking unit without one. That unit need not be the oldest speaking unit, which may
+            # still wait for its upstream segment end after its own final segment end arrived.
+            owner = next((unit for unit in self._speaking if not unit.final_segment_finished), None)
+            if owner is None:
+                # Every speaking unit has its final segment end: this one is of a unit not speaking yet.
+                self._hold(progress)
+                return
+            owner.final_segment_finished = True
         self._advance_speaking(progress.final_stage_id, progress.output, progress.context)
 
     def _hold(self, progress: StageProgress) -> None:
