@@ -31,9 +31,10 @@
 # work. Stage 1 decodes each chunk with the last codec_left_context_frames
 # tokens already played, which keeps a chunk's cost constant.
 #
-# The one Turbo profile, sized on one 24 GB card for the real-time envelope
-# the H100 recipe measured with the built-in voice (32 clients). TUNE PER
-# GPU: on a slower card lower max_num_seqs before raising the chunk size.
+# The one Turbo profile: admission at the real-time envelope the H100 recipe
+# measured with the built-in voice (32 clients), memory fractions derived for
+# a 24 GB card from H100 startup lines (not run on one). TUNE PER GPU: on a
+# slower card lower max_num_seqs before raising the chunk size.
 pipeline: chatterbox_turbo
 model_runner: v2
 async_chunk: true

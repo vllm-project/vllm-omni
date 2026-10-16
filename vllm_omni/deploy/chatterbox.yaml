@@ -3,9 +3,10 @@
 # scheduler requires enough token budget to prefill a whole pair, and disables
 # asynchronous scheduling, chunked prefill, and prefix caching.
 #
-# The one Original profile, sized on one 24 GB card for the real-time
-# envelope the H100 recipe measured with the built-in voice (8 clients):
-# 16 stage 0 sequences are 8 guided requests.
+# The one Original profile: admission at the real-time envelope the H100
+# recipe measured with the built-in voice (8 clients; 16 stage 0 sequences
+# are 8 guided requests), memory fractions derived for a 24 GB card from
+# H100 startup lines (not run on one).
 pipeline: chatterbox
 model_runner: v2
 async_chunk: true

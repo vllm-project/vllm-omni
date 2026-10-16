@@ -1049,8 +1049,9 @@ parity should be checked against the upstream adapter on your deployment.
 `ResembleAI/chatterbox-turbo` and `ResembleAI/chatterbox` serve English speech
 at 24 kHz through `/v1/audio/speech` and the shared sentence-segmented WebSocket
 frontend. Use `voice: "default"` for the built-in voice, or one `ref_audio`
-recording (URL or data URL) without `ref_text`. Turbo requires more than five
-seconds of reference audio; Original uses the shared one-second minimum.
+recording (URL or data URL) without `ref_text`. Both use the shared one-second
+minimum; Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it.
 
 Non-streaming formats are WAV, PCM, MP3 and FLAC. Streaming uses
 `stream: true`, `stream_format: "audio"` and `response_format: "pcm"` or `"wav"`.
@@ -1064,8 +1065,8 @@ Both reject VoiceDesign, free-form instructions and multilingual synthesis.
 `max_new_tokens` accepts 1 to 1000 speech tokens, upstream's generation cap,
 and defaults to 1000. Admission capacity does not guarantee real-time playback.
 
-See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original),
-[H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).
+See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original)
+and the [H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).
 
 ## Error Responses
 

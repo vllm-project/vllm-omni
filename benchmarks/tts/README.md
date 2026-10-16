@@ -21,7 +21,10 @@ needs a distinct reference per request: a repeated reference is a
 conditioning-cache hit after its first use and measures cached traffic.
 `chatterbox_conditioning.py` encodes 64 references serially and as one batch
 on CPU or an explicit CUDA device, times both and checks real-weight
-serial/batch parity. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#concurrent-http-clients)
+serial/batch parity: tokens must match exactly and features within 1e-4. On
+real Turbo weights one of the 64 references gets one different decoder
+prompt token in the batch, so that run exits nonzero and the recipe reports
+it. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#concurrent-http-clients)
 for measured 8- to 64-client results and their capacity and quality limitations.
 
 `chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech

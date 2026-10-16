@@ -169,8 +169,10 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
 
 ## Notes
 
-- Memory usage: the fractions in the deploy files are set for a 24 GB card
-  (23.6 GiB) from this run's stage-0 startup lines. Turbo: 1.12 GiB of
+- Memory usage: the fractions in the deploy files are derived for a 24 GB
+  card (23.6 GiB) from this run's H100 stage-0 startup lines; no 24 GB card
+  was run, and the API process's GPU conditioning (the reference
+  conditioning batch below) is not in the fractions. Turbo: 1.12 GiB of
   weights with vLLM's own, 0.08 GiB of activations, 0.06 GiB of graphs and
   96 KiB of KV cache per token; 32 slots at 2048 tokens need 6.0 GiB, about
   7.3 GiB in all, under the 35 % (8.3 GiB). Original: 1.32 GiB, 0.16 GiB,
@@ -186,8 +188,10 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
   is `ChatterboxConfig`'s default `flow_dtype`, and
   `hf_overrides: {flow_dtype: float32}` on stage 1 restores the FP32 flow.
 - Known limitations: cloned voices add the reference encoding to first
-  audio (about 0.9 s at 8 Turbo clients, 5.7 s at 64); Original is not
-  real-time for cloned voices at 8 clients. English only
+  audio (0.9 s at 8 Turbo clients and 5.7 s at 64 on the 64-request overlay
+  at `39d191c53`, before the batched device extraction; the single-profile
+  rows below are the current figures); Original is not real-time for cloned
+  voices at 8 clients. English only
   (the multilingual checkpoint is not served); no VoiceDesign or free-form
   instructions; no prefix caching (prompts are placeholder ids whose
   embeddings differ per request). Text that needs more than 1000 speech
@@ -200,7 +204,7 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
 | Feature | Status |
 | --- | --- |
 | Built-in voice, voice cloning, async streaming | both variants, measured at 8–64 HTTP clients with distinct references |
-| GPU reference conditioning | `conditioning_device: cuda:0`; every admitted reference is encoded in one batch, admission equal to stage 0's request capacity; 64 references take 3.3 s (Turbo) or 2.2 s (Original) on their own |
+| GPU reference conditioning | `conditioning_device: cuda:0`; every admitted reference is encoded in one batch, admission equal to stage 0's request capacity; 64 references, more than either profile admits at once, take 1.64–2.02 s (Turbo) or 0.51–0.68 s (Original) as one batch on H100 |
 | AR CUDA graphs | on by default; graph versus eager measured below |
 | BF16 flow decoder, FP32 HiFT | default in every profile; quality and speed measured below |
 | Real-time with cloned voices | Turbo up to 16 clients; Original at no measured load |
@@ -284,10 +288,10 @@ listening scores.
 ### Reference conditioning batch
 
 `benchmarks/tts/chatterbox_conditioning.py` on `cuda:0` at this head: 64
-references cut from one 6.5 s Seed-TTS evaluation prompt
-(`common_voice_en_103675.wav`) at 6.1, 8.3, 10.1 and 16 s with distinct
-amplitude envelopes, encoded one at a time and then as one batch, three
-cycles. The same run at the commit before the batched device extraction
+references tiled from one 6.5 s Seed-TTS evaluation prompt
+(`common_voice_en_103675.wav`) to 6.1, 8.3, 10.1 and 16 s with distinct
+amplitude envelopes, encoded one at a time and then as one batch of 64 (more
+than either profile admits: 32 Turbo, 8 Original requests), three cycles. The same run at the commit before the batched device extraction
 (same host, same clip) is the "before" column.
 
 | Model | Serial before (s) | Serial (s) | One batch before (s) | One batch (s) | Peak allocated / reserved (MiB) | Serial/batch parity |
@@ -391,7 +395,8 @@ request per client at full concurrency; a 1000-token allowance, streamed
 PCM, production sampling. Built-in rows use the bundled `seed_tts_smoke`
 texts (about 4 s of audio each). Cloned rows use the English Seed-TTS
 evaluation set, filtered to its 215 distinct prompt recordings longer than
-5 s (Turbo's minimum), with each recording's own target text. Every cloned
+5 s (upstream Turbo's bound, so no reference is repeated), with each
+recording's own target text. Every cloned
 request carries a different recording: 8 and 16 clients ran on one server
 with disjoint sets of 96, after that server's built-in rows; 32 and 64
 clients each ran on a fresh server. The only repeated reference in a run is
