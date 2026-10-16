@@ -20,6 +20,7 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_serving as adapter
+from vllm_omni.benchmarks.metrics.metrics import _build_stage_metrics_from_outputs
 from vllm_omni.benchmarks.patch import patch
 from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
@@ -859,3 +860,46 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, m
         else:
             assert accuracy["failed"] == 2 and "pr" not in accuracy
         assert "Omni-DuplexEval accuracy:" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("success", [False, True])
+async def test_adapter_retains_each_response_for_stage_aggregation(tmp_path, prepared, monkeypatch, success):
+    sample = _samples(tmp_path)[0]
+    rows = [
+        {
+            "response_id": f"r{index}",
+            "stage_metrics": {
+                "0": {
+                    "final_output_type": "text",
+                    "num_tokens_out": tokens,
+                    "stage_gen_time_ms": 10.0 * tokens,
+                },
+                "1": {"output_unit_type": "stream", "stage_gen_time_ms": 5.0 * tokens},
+            },
+        }
+        for index, tokens in enumerate((2, 3))
+    ]
+    result = replace(
+        _result(sample),
+        request_metrics=rows,
+        output_tokens=5,
+        metadata={"response_done": success},
+        error="" if success else "session failed",
+    )
+
+    async def generate(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(runner, "generate_sample", generate)
+    output = await patch.async_request_openai_realtime_duplex(_request(sample), session=None)
+    assert output.success is success
+    assert output.stage_metrics_by_response == {row["response_id"]: row["stage_metrics"] for row in rows}
+    stages = _build_stage_metrics_from_outputs([output])
+    if success:
+        assert [stage.stage_id for stage in stages] == [0, 1]
+        assert stages[0].total_output == 5
+        assert stages[0].stage_gen_times_ms == [20.0, 30.0]
+        assert stages[1].stage_gen_times_ms == [10.0, 15.0]
+    else:
+        assert stages == []

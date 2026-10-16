@@ -43,6 +43,7 @@ class GenerateSampleResult:
     audio_bytes: int = 0
     audio_sample_rate: int = 24_000
     error: str = ""
+    generated: bool = True
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,7 @@ async def generate_sample(
     clock: str = "media",
     overwrite: bool = False,
     unit_ms: int = 1000,
+    collect_stage_metrics: bool = False,
     prepared: PreparedSample | None = None,
     defer_artifacts: bool = False,
     additional_headers: dict[str, str] | None = None,
@@ -143,7 +145,7 @@ async def generate_sample(
     """
     output = Path(output_root) / sample.split / f"{sample.id}.json"
     if not defer_artifacts and output.exists() and not overwrite:
-        return GenerateSampleResult(output=output)
+        return GenerateSampleResult(output=output, generated=False)
     if mix != "question":
         raise NotImplementedError("v1 supports mix=question; soundtrack mixing is reserved for P1")
     if prepared is None:
@@ -162,6 +164,8 @@ async def generate_sample(
     drain_timeout = None
     close_timeout = None
     stream_start: float | None = None
+    if collect_stage_metrics:
+        extra_body = {**(extra_body or {}), "return_stage_metrics": True}
     async with client:
         await client.configure(
             model, ref_audio=prepared.ref_audio, instructions="Streaming Omni Conversation.", extra_body=extra_body

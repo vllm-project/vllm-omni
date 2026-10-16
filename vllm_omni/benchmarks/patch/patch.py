@@ -980,8 +980,11 @@ class MixRequestFuncOutput(RequestFuncOutput):
     tts_output_pcm_bytes: bytes | None = None
     #: Per-turn 24 kHz mono PCM for grouped Realtime Seed-TTS WER.
     tts_turn_pcm_bytes: list[bytes] | None = None
-    #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
+    #: Per-stage snapshot merged across SSE chunks.
     stage_metrics: dict[str, dict] | None = None
+    #: Final duplex snapshots keyed by response key, then stage_id. A response
+    #: key may include its request index when response IDs are session-scoped.
+    stage_metrics_by_response: dict[str, dict[str, dict[str, object]]] | None = None
     #: Diffusion pipeline profiler timings from response ``stage_durations``
     #: (e.g. diffuse / text_encoder.forward / vae.decode), when present.
     stage_durations: dict[str, float] | None = None
@@ -2940,6 +2943,12 @@ async def _async_request_omniinteract(
                     case_result.session_id,
                 )
         output.duplex_request_metrics = case_result.duplex_request_metrics
+        output.stage_metrics_by_response = {
+            response_id: snapshots
+            for metric in case_result.duplex_request_metrics
+            if isinstance((response_id := metric.get("response_id")), str)
+            and isinstance((snapshots := metric.get("stage_metrics")), dict)
+        }
         output.duplex_session_metrics = session_metrics
         output.success = case_result.success
         output.error = case_result.error
@@ -3008,6 +3017,11 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         output.audio_rtf = metric_mean(result.session_metrics.get("rtf")) or 0.0
         output.duplex_request_metrics = result.request_metrics
         output.duplex_session_metrics = result.session_metrics
+        output.stage_metrics_by_response = {
+            str(metric["response_id"]): snapshots
+            for metric in result.request_metrics
+            if metric.get("response_id") is not None and isinstance((snapshots := metric.get("stage_metrics")), dict)
+        }
         _apply_stage0_token_timings(
             output,
             [row.get("stage0_tokens") for row in result.request_metrics],
@@ -3192,6 +3206,7 @@ async def async_request_openai_realtime_duplex(
     turn_timings: list[dict[str, object]] = []
     turn_pcm_bytes: list[bytes] = []
     turn_transcripts: list[str] = []
+    output.stage_metrics_by_response = {}
     measurement_origin = {
         "ttft": "first silence append client send to first non-empty text delta",
         "ttfp": "first silence append client send to first audio packet",
@@ -3261,6 +3276,9 @@ async def async_request_openai_realtime_duplex(
                 if not isinstance(request_metrics, dict):
                     raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
                 turn_timings.append(timing)
+                if isinstance((snapshots := timing.get("stage_metrics")), dict):
+                    # Response IDs are scoped to each per-utterance session.
+                    output.stage_metrics_by_response[f"{request_index}:{response_id}"] = snapshots
                 turn_metrics.append(
                     {
                         "session_id": session_id,
