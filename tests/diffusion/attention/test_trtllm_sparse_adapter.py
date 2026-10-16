@@ -10,6 +10,7 @@ from tests.helpers.block_sparse import (
     make_attention_inputs,
     selected_attention_reference,
 )
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends import trtllm_attn as provider
 from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
 
@@ -159,14 +160,14 @@ def mock_sparse_provider(monkeypatch):
     return instances
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
 @torch.inference_mode()
 def test_mock_provider_conversion_and_compiled_boundary(mock_sparse_provider):
     _check_selected_execution()
     assert len(mock_sparse_provider) == 3  # Fake tracing does not plan; live calls own separate workspaces.
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
 @torch.inference_mode()
 def test_blackwell_kernel_selected_attention():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
@@ -175,7 +176,7 @@ def test_blackwell_kernel_selected_attention():
     _check_selected_execution()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
 @pytest.mark.parametrize("native", [False, True], ids=["mock-provider", "native-blackwell"])
 @torch.inference_mode()
 def test_dynamic_fullgraph_patterns_and_owners(request, native):
