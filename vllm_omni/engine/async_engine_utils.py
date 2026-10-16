@@ -184,10 +184,9 @@ class OutputQueueSink:
         is unconditional so a loop parked after ``arm_wakeup`` learns of the
         exit now instead of at its next liveness timeout.
         """
-        try:
-            self._sync_q.shutdown()
-        except Exception:
-            pass  # queue already shut down or closed
+        # janus>=2.0 (requirements/common.txt): shutdown() is idempotent and
+        # still valid after close(), so nothing here needs guarding.
+        self._sync_q.shutdown()
         self._wake_scheduled = True
         loop, ready = self._loop, self._ready
         if loop is not None and ready is not None:
