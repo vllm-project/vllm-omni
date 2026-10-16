@@ -175,8 +175,10 @@ def _apply_contiguous_kv_patch() -> None:
     def _contiguous_for_kstep(layer, vllm_config, spec, *args, **kwargs):
         # This code object is transplanted onto the consumer function, so it
         # runs with that module's globals: everything it needs is imported
-        # locally, and the fallback below re-states the platform-level
-        # contract instead of calling the (now self-referential) original.
+        # locally. The fallback rebuilds the pre-transplant stock function
+        # from the snapshot kept on the function object — calling
+        # requires_contiguous_pa_kv_cache itself would recurse into this
+        # very code.
         try:
             import logging
 
@@ -209,12 +211,30 @@ def _apply_contiguous_kv_patch() -> None:
             if armed and passed:
                 return True
         except Exception:
-            logging.getLogger("vllm_omni.npu.contiguous_kv").exception("[npu] contiguous KV probe failed")
-        # Same contract as the platform-level patch: keep the unpadded K/V
-        # layout unless the spec carries padded pages (V2's separate K/V
-        # allocation needs unpadded pages).
-        return spec.page_size_bytes == spec.real_page_size_bytes
+            logging.getLogger("vllm_omni.npu.contiguous_kv").exception(
+                "[npu] contiguous KV probe failed"
+            )
+        try:
+            import types
 
+            # Resolved in the consumer module's globals, where the name still
+            # points at this very function object (the transplant never
+            # rebinds it), carrying the pre-transplant code snapshot.
+            stock = types.FunctionType(
+                requires_contiguous_pa_kv_cache._vllm_omni_stock_code,  # noqa: F821
+                globals(),
+            )
+            return stock(layer, vllm_config, spec, *args, **kwargs)
+        except Exception:
+            logging.getLogger("vllm_omni.npu.contiguous_kv").exception(
+                "[npu] contiguous KV stock fallback failed"
+            )
+            # Same contract as the platform-level patch: keep the unpadded
+            # K/V layout unless the spec carries padded pages (V2's separate
+            # K/V allocation needs unpadded pages).
+            return spec.page_size_bytes == spec.real_page_size_bytes
+
+    original._vllm_omni_stock_code = original.__code__  # type: ignore[attr-defined]
     original.__code__ = _contiguous_for_kstep.__code__  # type: ignore[attr-defined]
     original._vllm_omni_contiguous = True  # type: ignore[attr-defined]
     logger.info(
