@@ -147,10 +147,11 @@ profile, one session at a time), most of its time was the model call, so:
   pass dropped from about 18 ms to about 8 ms in the pipeline. For the Qwen3
   judge, larger capture sizes showed no gain in a standalone test, so
   `aura_omni_judged.yaml` keeps the defaults.
-- **Poll stage outputs event-driven.** `VLLM_OMNI_EVENT_DRIVEN_ORCH=1` lets
-  the orchestrator pick up each stage's output as it arrives instead of on a
-  1 ms poll of every stage (this applies to all stages, not only the judge).
-  It cut the judge stage's output pickup from about 4 ms to about 1 ms.
+- **Keep event-driven orchestration on.** It is the default
+  (`VLLM_OMNI_EVENT_DRIVEN_ORCH=0` selects the legacy loop): the orchestrator
+  picks up each stage's output as it arrives instead of on a 1 ms poll of
+  every stage. It cut the judge stage's output pickup from about 4 ms to
+  about 1 ms.
 - **Expect host effects after idle gaps.** On a host with the `powersave` CPU
   governor, a judge call after a pause in the conversation was slower than
   back to back: about 3x for Qwen3 and up to 4x for LAYA. This
