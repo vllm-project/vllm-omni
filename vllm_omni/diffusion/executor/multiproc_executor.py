@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
+from vllm.utils.network_utils import aiter_requires_tcp_store, get_file_store_init_method
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
@@ -50,6 +51,17 @@ _WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
 # Upper bound on remembered dropped async_output_ids (see drop_output).
 _DROPPED_OUTPUT_IDS_MAX = 4096
+
+
+def _get_diffusion_worker_init_method() -> str:
+    """Select a rendezvous for the built-in, local diffusion worker pool.
+
+    FileStore avoids a TCP rendezvous port. AITER custom all-reduce requires
+    TCPStore, so retain ``env://`` when that implementation is in use.
+    """
+    if aiter_requires_tcp_store():
+        return "env://"
+    return get_file_store_init_method()
 
 
 class _DropPlaceholder(concurrent.futures.Future):
@@ -372,6 +384,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = cast(int, od_config.num_gpus)
+        distributed_init_method = _get_diffusion_worker_init_method()
         # Without this, every worker inherits one Torch thread per core, so an
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
@@ -401,6 +414,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
+                kwargs={"distributed_init_method": distributed_init_method},
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )

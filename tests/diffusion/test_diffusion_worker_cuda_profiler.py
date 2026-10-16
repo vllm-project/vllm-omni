@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 from pytest_mock import MockerFixture
@@ -40,7 +40,9 @@ class TestDiffusionWorkerCudaProfiler:
         )
         create_omni_profiler = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.create_omni_profiler")
 
-        worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True)
+        worker = DiffusionWorker(
+            local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True, distributed_init_method="env://"
+        )
 
         cuda_profiler.assert_called_once_with(mock_od_config.profiler_config)
         create_omni_profiler.assert_not_called()
@@ -60,7 +62,9 @@ class TestDiffusionWorkerCudaProfiler:
             return_value=fake_profiler,
         )
 
-        worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True)
+        worker = DiffusionWorker(
+            local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True, distributed_init_method="env://"
+        )
 
         assert worker.profile(is_start=True) is None
         assert worker.profile(is_start=False) is None
@@ -78,7 +82,9 @@ class TestDiffusionWorkerCudaProfiler:
         cuda_profiler = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.CudaProfilerWrapper")
         create_omni_profiler = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.create_omni_profiler")
 
-        worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True)
+        worker = DiffusionWorker(
+            local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True, distributed_init_method="env://"
+        )
 
         cuda_profiler.assert_not_called()
         create_omni_profiler.assert_not_called()
@@ -96,6 +102,8 @@ class TestDiffusionWorkerCudaProfiler:
         )
         create_omni_profiler = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.create_omni_profiler")
 
-        DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True)
+        DiffusionWorker(
+            local_rank=0, rank=0, od_config=mock_od_config, skip_load_model=True, distributed_init_method="env://"
+        )
 
         create_omni_profiler.assert_not_called()

@@ -119,7 +119,7 @@ def _worker(
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
     initialize_model_parallel(
         cfg_parallel_size=cfg_size,
         sequence_parallel_size=sp_size,
@@ -247,7 +247,7 @@ def _baseline_worker(
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
     initialize_model_parallel()
 
     od_config = _make_omni_config(1, 1, dtype)

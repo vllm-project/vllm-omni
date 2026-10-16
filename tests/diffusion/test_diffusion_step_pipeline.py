@@ -522,7 +522,7 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
     model_runner_module.set_forward_context = _noop_forward_context
 
     try:
-        init_distributed_environment()
+        init_distributed_environment(distributed_init_method="env://")
         if mode == "ulysses":
             initialize_model_parallel(ulysses_degree=world_size)
         elif mode == "ring":

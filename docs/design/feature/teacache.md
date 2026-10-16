@@ -347,7 +347,7 @@ if __name__ == "__main__":
     os.environ["WORLD_SIZE"] = "1"
 
     vllm_config = VllmConfig()
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
     initialize_model_parallel()
 
     # NOTE: you may have to pass an initialized OmniDiffusionConfig as a kwarg

@@ -652,7 +652,13 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
     dtype = torch.float32
 
     backend = current_omni_platform.dist_backend
-    init_distributed_environment(world_size=_SPATIAL_SHARD_WORLD_SIZE, rank=rank, local_rank=rank, backend=backend)
+    init_distributed_environment(
+        world_size=_SPATIAL_SHARD_WORLD_SIZE,
+        rank=rank,
+        local_rank=rank,
+        backend=backend,
+        distributed_init_method="env://",
+    )
     initialize_model_parallel(
         sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend
     )
@@ -728,7 +734,13 @@ def _streaming_shard_worker(rank: int, return_dict, master_port: str) -> None:
     current_omni_platform.set_device(device)
     dtype = torch.float32
     backend = current_omni_platform.dist_backend
-    init_distributed_environment(world_size=_SPATIAL_SHARD_WORLD_SIZE, rank=rank, local_rank=rank, backend=backend)
+    init_distributed_environment(
+        world_size=_SPATIAL_SHARD_WORLD_SIZE,
+        rank=rank,
+        local_rank=rank,
+        backend=backend,
+        distributed_init_method="env://",
+    )
     initialize_model_parallel(
         sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend
     )

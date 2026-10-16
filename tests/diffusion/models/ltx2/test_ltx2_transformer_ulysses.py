@@ -114,7 +114,7 @@ def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> Non
     )
 
     try:
-        init_distributed_environment()
+        init_distributed_environment(distributed_init_method="env://")
         initialize_model_parallel(sequence_parallel_size=world_size, ulysses_degree=world_size)
 
         sp_config = _omni_config(world_size)
