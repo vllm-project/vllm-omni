@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
+from vllm.config import KernelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
@@ -28,6 +29,40 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+
+def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
+    """Normalize promoted backends and enforce their precedence over extras."""
+    kernels = {
+        name: getattr(stage, name) for name in ("moe_backend", "linear_backend") if getattr(stage, name) is not None
+    }
+    normalized = KernelConfig(**kernels)
+    for name in kernels:
+        setattr(stage, name, getattr(normalized, name))
+
+    # Only backend selections gain this precedence rule; unrelated extras keep
+    # their existing merge behavior. Never retain a duplicate legacy key.
+    stage.engine_extras = dict(stage.engine_extras)
+    for name in ("attention_backend", "moe_backend", "linear_backend"):
+        value = getattr(stage, name)
+        if value is not None and name in stage.engine_extras:
+            extra = stage.engine_extras.pop(name)
+            comparable_extra = extra
+            if name in ("moe_backend", "linear_backend"):
+                # First-class fields have already gone through KernelConfig,
+                # while legacy extras may still use mixed case or hyphens.
+                # Compare the same canonical spelling before warning.
+                try:
+                    comparable_extra = getattr(KernelConfig(**{name: extra}), name)
+                except (TypeError, ValueError):
+                    # An invalid shadowed extra is still discarded, as before.
+                    comparable_extra = extra
+            if value != comparable_extra:
+                warnings.warn(
+                    f"stage {stage.stage_id}: {name}={value!r} overrides engine_extras[{name!r}]={extra!r}.",
+                    UserWarning,
+                    stacklevel=3,
+                )
 
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
@@ -198,6 +233,76 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
+class DiffusionStageRole(str, Enum):
+    """Role of a diffusion stage within a (possibly disaggregated) pipeline.
+
+    ``execution_type`` answers *which engine* runs a stage; ``stage_role`` is an
+    orthogonal axis that answers *which slice of a diffusion model* the stage
+    runs. Splitting a single diffusion model across stages by role lets many
+    DiT-style models become disaggregatable through configuration alone, with no
+    per-model source changes:
+
+    - ``FULL``:    run the whole pipeline (encode + denoise + decode) in one
+                   stage. This is the default / single-stage behavior.
+    - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
+                   embeddings for a downstream stage.
+    - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
+                   and emit latents for a downstream decode stage.
+    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
+                          generation stage of E/G disaggregation).
+    - ``DECODE``:  run only the VAE decode on upstream latents (the trailing
+                   stage of a 3-way E/G/D split).
+    """
+
+    FULL = "full"
+    ENCODE = "encode"
+    DENOISE = "denoise"
+    DENOISE_DECODE = "denoise_decode"
+    DECODE = "decode"
+
+
+# Legacy ``model_stage`` strings -> ``DiffusionStageRole``. ``model_stage`` was
+# a free-form string ("text_encode"/"dit") before roles existed; keep the map so
+# older stage configs and deploy YAML keep working.
+_MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
+    "text_encode": DiffusionStageRole.ENCODE,
+    "encode": DiffusionStageRole.ENCODE,
+    # Legacy single-stage configs (e.g. wan2_2_ti2v) use "dit" for the whole
+    # pipeline; disaggregated topologies set ``stage_role`` explicitly.
+    "dit": DiffusionStageRole.FULL,
+    "denoise": DiffusionStageRole.DENOISE,
+    "denoise_decode": DiffusionStageRole.DENOISE_DECODE,
+    "decode": DiffusionStageRole.DECODE,
+    "vae_decode": DiffusionStageRole.DECODE,
+    "diffusion": DiffusionStageRole.FULL,
+    "full": DiffusionStageRole.FULL,
+}
+
+
+def resolve_diffusion_stage_role(
+    stage_role: DiffusionStageRole | str | None,
+    model_stage: str | None = None,
+) -> DiffusionStageRole:
+    """Resolve the effective diffusion stage role.
+
+    Prefers an explicit ``stage_role`` and otherwise falls back to the legacy
+    free-form ``model_stage`` string. Unknown values resolve to ``FULL`` so a
+    plain single-stage diffusion model keeps running the whole pipeline.
+    """
+    if isinstance(stage_role, DiffusionStageRole):
+        return stage_role
+    if isinstance(stage_role, str) and stage_role:
+        try:
+            return DiffusionStageRole(stage_role)
+        except ValueError:
+            resolved = _MODEL_STAGE_TO_ROLE.get(stage_role)
+            if resolved is not None:
+                return resolved
+    if model_stage:
+        return _MODEL_STAGE_TO_ROLE.get(model_stage, DiffusionStageRole.FULL)
+    return DiffusionStageRole.FULL
+
+
 def _resolve_scheduler(
     execution_type: StageExecutionType,
     async_scheduling: bool = True,
@@ -232,6 +337,11 @@ class StagePipelineConfig:
     stage_id: int
     model_stage: str
     execution_type: StageExecutionType = StageExecutionType.LLM_AR
+    # Diffusion-only: which slice of a diffusion model this stage runs
+    # (encode / denoise / decode / full). Orthogonal to ``execution_type`` and
+    # only meaningful when ``execution_type == DIFFUSION``. ``None`` falls back
+    # to ``model_stage`` (legacy) and ultimately to ``FULL``.
+    stage_role: DiffusionStageRole | None = None
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
@@ -264,6 +374,7 @@ class StagePipelineConfig:
     # them is what enables the worker-side connector receive path, so an empty
     # tuple leaves existing deployments untouched.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
     # Mirror of the above on the producing side: keys this stage hands to the
     # next stage over the connector. Only diffusion producers need this; AR
     # stages already send through ``send_full_payload_outputs``.
@@ -291,6 +402,10 @@ class StagePipelineConfig:
     # Whether the non-async path waits for a complete upstream payload from
     # the model-runner connector before scheduling this stage.
     requires_full_payload_input: bool = False
+    # Stage 0 only: a chat request carrying none of these input modalities
+    # skips this stage and enters at stage 1 (e.g. Qwen3-ASR runs only for
+    # requests with audio). Empty means every request runs it.
+    bypass_without_modalities: tuple[str, ...] = ()
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -433,6 +548,12 @@ class StageDeployConfig:
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
 
+    # Upstream AR attention and shared AR/diffusion kernel selection.
+    # None means omitted, so model/platform defaults remain authoritative.
+    attention_backend: str | None = None
+    moe_backend: str | None = None
+    linear_backend: str | None = None
+
     # Generic execution, scheduling, and KV/cache behavior.
     enforce_eager: bool | None = None
     async_scheduling: bool | None = None
@@ -532,6 +653,9 @@ class StageDeployConfig:
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _normalize_stage_backend_fields(self)
 
 
 @dataclass(frozen=True)
@@ -959,6 +1083,11 @@ def _apply_platform_overrides(
                     type(po.env).__name__,
                 )
                 base.env = po.env
+        # Remove base legacy values before merging the entire overlay. Nested
+        # extras in the overlay must still be checked regardless of key order.
+        for key in ("attention_backend", "moe_backend", "linear_backend"):
+            if key in po.overrides:
+                base.engine_extras.pop(key, None)
         for key, val in po.overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
@@ -973,6 +1102,9 @@ def _apply_platform_overrides(
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
+        # Platform overlays run after construction and can reintroduce nested
+        # backend extras. Reapply normalization and first-class precedence.
+        _normalize_stage_backend_fields(base)
 
     # Validate the final values, including stage entries from the platform
     # overlay. A global V2 default may still apply to omitted pipeline stages.
@@ -1082,6 +1214,8 @@ def _build_engine_args(
     engine_args["inline_diffusion"] = ps.inline_diffusion
     if ps.stage_input_payload_keys:
         engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
+    if ps.stage_input_optional_payload_keys:
+        engine_args["stage_input_optional_payload_keys"] = tuple(ps.stage_input_optional_payload_keys)
     if ps.stage_output_payload_keys:
         engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
 
@@ -1300,6 +1434,7 @@ def merge_pipeline_deploy(
             StageConfig(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
+                stage_role=ps.stage_role.value if ps.stage_role is not None else None,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -1328,6 +1463,7 @@ class StageConfig:
 
     stage_id: int
     model_stage: str
+    stage_role: str | None = None
     session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
@@ -1352,6 +1488,11 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
+        # Diffusion disaggregation stage role (see DiffusionStageRole). Only
+        # surfaced when set so non-diffusion stages are unaffected; the payload
+        # key schema rides along in ``yaml_engine_args``.
+        if self.stage_role is not None:
+            engine_args["stage_role"] = self.stage_role
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:

@@ -110,7 +110,7 @@ def test_replay_matches_the_eager_encoder_exactly(fake_capture, rows, frames) ->
 @pytest.mark.cpu
 def test_other_shapes_and_layouts_run_eager(fake_capture, monkeypatch: pytest.MonkeyPatch) -> None:
     graphs, _ = _graphs("cpu")
-    for rows, width, frames in ((4, 6, 8), (1, 5, 8), (1, 6, 10)):  # never padded, never another shape
+    for rows, width, frames in ((1, 5, 8), (1, 6, 10)):  # never padded, never another shape
         assert graphs.run(*_inputs(rows, width, frames, "cpu")) is None
     tokens, cnn, att = _inputs(2, 6, 8, "cpu")
     assert graphs.run(tokens, cnn, [att[0], att[1].double()]) is None
@@ -858,3 +858,28 @@ def test_precision_change_recaptures_instead_of_reusing_previous_gemm():
             torch.testing.assert_close(actual, saved)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("rows", [5, 9, 32])
+def test_large_batch_reuses_small_arena_and_owns_outputs(fake_capture, rows):
+    graphs, encode = _graphs("cpu", rows=(1, 2, 3, 4))
+    tokens, cnn, att = _inputs(rows, 6, 18, "cpu")
+    actual = graphs.run(tokens, cnn, att)
+    expected = encode(tokens, cnn_cache=torch.cat(cnn), att_cache=torch.cat(att, dim=1))
+    assert actual is not None
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference)
+    # A later replay must not corrupt earlier groups or the returned batch.
+    graphs.run(tokens[:1], cnn[:1], att[:1])
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference)
+    assert max(key[0] for key in graphs.graphs) == 4
+
+
+@pytest.mark.cpu
+def test_large_batch_rejects_incompatible_cache_rows(fake_capture):
+    graphs, _ = _graphs("cpu", rows=(1, 2))
+    tokens, cnn, att = _inputs(5, 6, 18, "cpu")
+    att[-1] = att[-1].double()
+    assert graphs.run(tokens, cnn, att) is None

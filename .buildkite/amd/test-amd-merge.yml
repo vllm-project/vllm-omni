@@ -202,6 +202,9 @@ steps:
       commands:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        # Restore a provenance-checked Buildkite artifact into a job-local
+        # AITER_JIT_DIR. This consumer never publishes a duplicate artifact.
+        - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
         - >-
           pytest -s -v
           'tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
@@ -248,9 +251,20 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        # A cold Z-Image run spends about six minutes loading weights before
-        # the first-request AITER compilation, which can itself exceed 23m.
-        - timeout 55m pytest -s -v tests/e2e/offline_inference/test_z_image.py
+        # A miss still spends about six minutes loading weights and can spend
+        # more than 23 minutes compiling the unmasked BF16 AITER MHA module.
+        # A verified build-scoped artifact restores that module before pytest.
+        - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+        # The runner continues after a failed command. Publish only when
+        # pytest returns 0, and exit with that status otherwise. Buildkite
+        # scopes the artifact to this exact build and job.
+        - |
+          if timeout 55m pytest -s -v tests/e2e/offline_inference/test_z_image.py; then
+            python .buildkite/amd/scripts/aiter_mha_cache.py publish
+          else
+            pytest_status=$$?
+            exit "$${pytest_status}"
+          fi
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2

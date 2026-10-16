@@ -83,6 +83,8 @@ Before proposing changes, ask for the optimization scene if it is not already kn
    - Report comparison tables in ms. Include at least end-to-end client time, server `inference_time`, server stage generation time if available, `vae.encode`, `diffuse`, `vae.decode`, and peak memory.
 
 6. **Enforce the quality and precision gate for every optimization.**
+   - Reuse [diffusion-accuracy-test](../diffusion-accuracy-test/SKILL.md) for
+     baseline alignment, scoped thresholds, and retained accuracy evidence.
    - Do not mark an optimization ready until quality is checked on the same
      workload: model, prompt/media, seed, shape, steps, scheduler, dtype,
      backend, parallelism, and output encoding.

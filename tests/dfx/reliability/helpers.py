@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared reliability fault-injection helpers.
 
 This module keeps fault injection callable from tests directly:
@@ -18,6 +21,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import select
 import shlex
 import signal
@@ -154,7 +158,13 @@ def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] |
     return error_obj
 
 
-def _build_sidecar_cmd(device: int, target_mem_ratio: float, hold_seconds: int, strict: bool) -> list[str]:
+def _build_sidecar_cmd(
+    device: int,
+    target_mem_ratio: float,
+    hold_seconds: int,
+    strict: bool,
+    max_free_bytes: int | None,
+) -> list[str]:
     sidecar = r"""
 import sys
 import time
@@ -164,12 +174,16 @@ device = int(sys.argv[1])
 target_ratio = float(sys.argv[2])
 hold_seconds = int(sys.argv[3])
 strict = sys.argv[4] == "1"
+max_free_bytes_arg = int(sys.argv[5])
+max_free_bytes = None if max_free_bytes_arg < 0 else max_free_bytes_arg
 
 torch.cuda.init()
 torch.cuda.set_device(device)
 props = torch.cuda.get_device_properties(device)
 free_before, total_bytes = torch.cuda.mem_get_info(device)
-target_bytes = int(free_before * target_ratio)
+ratio_target_bytes = int(free_before * target_ratio)
+ceiling_target_bytes = 0 if max_free_bytes is None else max(0, int(free_before) - max_free_bytes)
+target_bytes = max(ratio_target_bytes, ceiling_target_bytes)
 chunk_bytes = 256 * 1024 * 1024
 chunks = []
 allocated = 0
@@ -201,7 +215,9 @@ if strict:
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
 free_after, _ = torch.cuda.mem_get_info(device)
-if strict and allocated < target_bytes:
+ratio_target_missed = strict and allocated < ratio_target_bytes
+free_ceiling_missed = max_free_bytes is not None and int(free_after) > max_free_bytes
+if ratio_target_missed or free_ceiling_missed:
     print(
         "ERROR:"
         f"achieved_free_ratio={achieved_free_ratio:.4f};"
@@ -209,6 +225,7 @@ if strict and allocated < target_bytes:
         f"free_before={int(free_before)};"
         f"free_after={int(free_after)};"
         f"target_bytes={target_bytes};"
+        f"max_free_bytes={max_free_bytes};"
         f"allocated={allocated}",
         flush=True,
     )
@@ -221,6 +238,7 @@ print(
     f"free_before={int(free_before)};"
     f"free_after={int(free_after)};"
     f"target_bytes={target_bytes};"
+    f"max_free_bytes={max_free_bytes};"
     f"allocated={allocated}",
     flush=True,
 )
@@ -239,6 +257,7 @@ print("DONE", flush=True)
         str(target_mem_ratio),
         str(hold_seconds),
         "1" if strict else "0",
+        str(max_free_bytes) if max_free_bytes is not None else "-1",
     ]
 
 
@@ -249,6 +268,7 @@ def start_gpu_oom_hog(
     hold_seconds: int = 60,
     startup_timeout_sec: int = 20,
     strict: bool = True,
+    max_free_bytes: int | None = None,
     poll_interval_sec: float = 0.2,
 ) -> OomHandle:
     """Start a CUDA sidecar process that occupies GPU memory to trigger OOM.
@@ -256,6 +276,9 @@ def start_gpu_oom_hog(
     Note:
         ``target_mem_ratio`` is evaluated against free memory at injection start
         (not total GPU memory), i.e. success gate is ``allocated / free_before``.
+        When ``max_free_bytes`` is set, the sidecar also allocates until no more
+        than that many bytes remain free and fails startup if it cannot reach the
+        ceiling.
         ``hold_seconds <= 0`` means keeping OOM pressure until the sidecar is
         explicitly stopped via ``stop_gpu_oom_hog(s)``.
     """
@@ -263,9 +286,11 @@ def start_gpu_oom_hog(
         raise RuntimeError("CUDA OOM sidecar is intended for Linux CI/runtime.")
     if not (0.0 <= target_mem_ratio < 1.0):
         raise ValueError("target_mem_ratio should be in [0.0, 1.0).")
+    if max_free_bytes is not None and max_free_bytes <= 0:
+        raise ValueError("max_free_bytes should be greater than 0 when set.")
 
     # Explicit opt-out for debugging: keep API shape stable while disabling injection.
-    if target_mem_ratio == 0.0:
+    if target_mem_ratio == 0.0 and max_free_bytes is None:
         print(f"[oom-sidecar][gpu={device}] DISABLED: target_mem_ratio=0.0 (no OOM injection)", flush=True)
         return OomHandle(
             proc=None,
@@ -274,7 +299,7 @@ def start_gpu_oom_hog(
             start_ts=time.time(),
         )
 
-    cmd = _build_sidecar_cmd(device, target_mem_ratio, hold_seconds, strict)
+    cmd = _build_sidecar_cmd(device, target_mem_ratio, hold_seconds, strict, max_free_bytes)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -334,6 +359,7 @@ def inject_gpu_oom(
     hold_seconds: int = 60,
     startup_timeout_sec: int = 20,
     strict: bool = True,
+    max_free_bytes: int | None = None,
 ) -> OomHandle | list[OomHandle]:
     """Convenience wrapper to start CUDA OOM sidecar(s).
 
@@ -342,6 +368,8 @@ def inject_gpu_oom(
             or a list of device ids (``[0, 1, 2]``).
         hold_seconds: OOM hold time in seconds; ``<=0`` keeps pressure until
             ``stop_gpu_oom_hogs`` is called.
+        max_free_bytes: Optional upper bound for free memory after injection.
+            Sidecar startup fails if this ceiling cannot be reached.
     """
     if isinstance(device, int):
         devices = [device]
@@ -359,6 +387,7 @@ def inject_gpu_oom(
             hold_seconds=hold_seconds,
             startup_timeout_sec=startup_timeout_sec,
             strict=strict,
+            max_free_bytes=max_free_bytes,
         )
         for dev in devices
     ]
@@ -512,6 +541,27 @@ def _resolve_runtime_worker_markers(
             )
         )
     return tuple(dict.fromkeys(merged))
+
+
+def _pid_is_dead(pid: int) -> bool:
+    """True when ``pid`` is gone or only a zombie remains."""
+    if not psutil.pid_exists(pid):
+        return True
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return True
+
+
+def _wait_until_pid_dead(pid: int, timeout_sec: float) -> bool:
+    """Poll until ``pid`` is dead or ``timeout_sec`` elapses."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        if _pid_is_dead(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _pid_looks_like_runtime_worker(pid: int, markers: Sequence[str]) -> bool:
@@ -676,23 +726,9 @@ def list_alive_pids(pids: Sequence[int]) -> list[int]:
     return out
 
 
-def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
-    """Query NVIDIA compute-process memory map (pid -> used MB).
-
-    Returns ``None`` when ``nvidia-smi`` is unavailable/unreadable on current host.
-    """
-    out = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        logger.warning("[reliability][gpu] nvidia-smi query failed: %s", out.stderr.strip())
-        return None
-
+def _parse_nvidia_compute_pid_used_memory_mb(output: str) -> dict[int, int]:
     pid_to_mem_mb: dict[int, int] = {}
-    for line in out.stdout.splitlines():
+    for line in output.splitlines():
         row = line.strip()
         if not row:
             continue
@@ -707,6 +743,99 @@ def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
             continue
         pid_to_mem_mb[int(pid_raw)] = int(mem_digits)
     return pid_to_mem_mb
+
+
+def _parse_rocm_compute_pid_used_memory_mb(output: str) -> dict[int, int]:
+    """Parse ``rocm-smi --showpids --json`` output into a PID -> used MiB map."""
+    payload = json.loads(output)
+    system = payload.get("system", {})
+    if not isinstance(system, dict):
+        return {}
+
+    pid_to_mem_mb: dict[int, int] = {}
+    for key, value in system.items():
+        pid_match = re.fullmatch(r"pid\s*(\d+)", str(key), flags=re.IGNORECASE)
+        if pid_match is None or not isinstance(value, str):
+            continue
+
+        # rocm-smi emits: process name, gpu count, VRAM bytes, SDMA bytes,
+        # CU occupancy. Split from the right so a process name containing a
+        # comma does not move the VRAM field.
+        fields = [part.strip() for part in value.rsplit(",", maxsplit=4)]
+        if len(fields) != 5:
+            continue
+        vram_raw = fields[-3]
+        value_match = re.search(r"\d+", vram_raw.replace("_", ""))
+        if value_match is None:
+            continue
+
+        value_int = int(value_match.group())
+        normalized = vram_raw.lower()
+        if "gib" in normalized or normalized.endswith("gb"):
+            used_mb = value_int * 1024
+        elif "mib" in normalized or normalized.endswith("mb"):
+            used_mb = value_int
+        elif "kib" in normalized or normalized.endswith("kb"):
+            used_mb = (value_int + 1023) // 1024
+        else:
+            # The official rocm-smi JSON format reports unitless VRAM bytes.
+            used_mb = (value_int + (1024**2 - 1)) // (1024**2)
+        pid_to_mem_mb[int(pid_match.group(1))] = used_mb
+    return pid_to_mem_mb
+
+
+def _gpu_process_query_spec(
+    platform: Any | None = None,
+) -> tuple[list[str], Callable[[str], dict[int, int]]] | None:
+    if platform is None:
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform
+    if platform.is_rocm():
+        return ["rocm-smi", "--showpids", "--json"], _parse_rocm_compute_pid_used_memory_mb
+    if platform.is_cuda():
+        return (
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            _parse_nvidia_compute_pid_used_memory_mb,
+        )
+    return None
+
+
+def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
+    """Query platform compute-process memory (pid -> used MiB).
+
+    Returns ``None`` when the platform SMI tool is unavailable, fails, times
+    out, or returns unreadable output. Callers must still enforce process-tree
+    cleanup when GPU telemetry is unavailable.
+    """
+    query_spec = _gpu_process_query_spec()
+    if query_spec is None:
+        return None
+    command, parser = query_spec
+
+    try:
+        out = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("[reliability][gpu] %s query unavailable: %s", command[0], exc)
+        return None
+    if out.returncode != 0:
+        logger.warning("[reliability][gpu] %s query failed: %s", command[0], out.stderr.strip())
+        return None
+    try:
+        return parser(out.stdout)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning("[reliability][gpu] %s output was unreadable: %s", command[0], exc)
+        return None
 
 
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
@@ -743,6 +872,7 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     snapshot = getattr(server, "reliability_fault_snapshot", None)
     if not isinstance(snapshot, dict):
         pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+    assert isinstance(snapshot, dict)
     tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
     if not tree_pids:
         pytest.skip(f"[{scenario}] no server process tree PIDs captured for this run")
@@ -751,12 +881,21 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     deadline = time.monotonic() + timeout_sec
     last_alive: list[int] = []
     last_gpu_leaks: dict[int, int] = {}
+    gpu_telemetry_available: bool | None = None
     while time.monotonic() < deadline:
         last_alive = list_alive_pids(tree_pids)
-        gpu_map = query_gpu_compute_pid_used_memory_mb()
+        gpu_map = query_gpu_compute_pid_used_memory_mb() if gpu_telemetry_available is not False else None
         if gpu_map is None:
-            pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
-        last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
+            if gpu_telemetry_available is None:
+                logger.warning(
+                    "[%s] GPU process telemetry unavailable; process-tree cleanup remains mandatory",
+                    scenario,
+                )
+            gpu_telemetry_available = False
+            last_gpu_leaks = {}
+        else:
+            gpu_telemetry_available = True
+            last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
         if not last_alive and not last_gpu_leaks:
             return
         time.sleep(poll_interval_sec)
@@ -785,7 +924,7 @@ def _capture_server_fault_snapshot(
     server: Any,
     *,
     worker_markers_extra: Sequence[str] | None = None,
-) -> dict[str, list[int]]:
+) -> dict[str, list[int] | list[str]]:
     """Capture current server process snapshot for post-fault assertions.
 
     ``tree_pids`` is ``[root, ...descendants]`` and is used by
@@ -801,7 +940,7 @@ def _capture_server_fault_snapshot(
             continue
         if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
-    snapshot = {
+    snapshot: dict[str, list[int] | list[str]] = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,
@@ -889,6 +1028,17 @@ def make_server_tree_kill_fault_injector(
     return _inject
 
 
+def _server_is_single_process_uniproc(server: Any) -> bool:
+    """True when the server tree holds only the root process (UniProc inline worker).
+
+    The UniProc executor runs the diffusion worker inside the API-server process,
+    so there is no dedicated worker process to kill; killing the root would take
+    the whole server down. Multi-process deployments (``mp``/``ray``) spawn worker
+    subprocesses as descendants of the root.
+    """
+    return len(_list_server_process_tree(server)) <= 1
+
+
 def make_process_kill_fault_injector(
     *,
     grep_patterns: str | Sequence[str],
@@ -897,6 +1047,11 @@ def make_process_kill_fault_injector(
     post_kill_wait_seconds: float = 0.0,
 ) -> FaultInjector:
     """Build a post-ready injector that kills processes matched by ordered ``grep_patterns``.
+
+    The worker-kill scenario needs a dedicated worker process: when the server
+    tree holds only the root (UniProc / single process), the injector skips
+    unconditionally — there is no worker to kill, and matching the serving
+    process would tear the whole server down.
 
     Matching is tried in two phases per pattern (first hit wins):
 
@@ -919,6 +1074,11 @@ def make_process_kill_fault_injector(
 
     def _inject(server: Any) -> None:
         _log_server_process_tree(server)
+        if _server_is_single_process_uniproc(server):
+            pytest.skip(
+                "worker-kill scenario invalid: UniProc single-process deployment has no "
+                "dedicated worker process to kill"
+            )
         server_tree = set(_list_server_process_tree(server))
         if not server_tree:
             logger.warning(
@@ -937,17 +1097,36 @@ def make_process_kill_fault_injector(
                     flush=True,
                 )
                 os.kill(pid, sig)
+                waited_from = time.monotonic()
+                dead = _wait_until_pid_dead(pid, post_kill_wait_seconds)
+                remaining = post_kill_wait_seconds - (time.monotonic() - waited_from)
+                if dead and remaining > 0:
+                    time.sleep(remaining)
+                print(
+                    f"[reliability][process-kill] killed pid={pid} stage={name} signal={signal_name} dead={int(dead)}",
+                    flush=True,
+                )
+                if signal_name == "SIGKILL" and not dead:
+                    raise RuntimeError(f"pid {pid} ({name}) still alive after SIGKILL")
+            host = getattr(server, "host", None)
+            port = getattr(server, "port", None)
+            if host is not None and port is not None:
+                try:
+                    status, _body = get_health_raw(str(host), int(port), timeout_sec=5)
+                    print(
+                        f"[reliability][process-kill] post-kill health status={status}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - log the probe, do not hide the kill
+                    print(
+                        f"[reliability][process-kill] post-kill health error={exc!r}",
+                        flush=True,
+                    )
             print(
                 f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
                 f"killed_pids={filtered} killed_count={len(filtered)}",
                 flush=True,
             )
-            if post_kill_wait_seconds > 0:
-                print(
-                    f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
-                    flush=True,
-                )
-                time.sleep(post_kill_wait_seconds)
 
         for pattern in patterns:
             print(
