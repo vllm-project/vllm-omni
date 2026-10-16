@@ -5,7 +5,7 @@
 - Vendor: Resemble AI
 - Model: `ResembleAI/chatterbox-turbo` (Turbo) and `ResembleAI/chatterbox` (English Original)
 - Task: English text-to-speech with the checkpoint's built-in voice or a voice cloned from one recording
-- Mode: online `/v1/audio/speech` with the one profile per model, each admitting 64 requests at once (Original's as 128 guided sequences), what one H100 fits. The nightly perf matrix below gives median first audio, real-time factor and throughput at 1, 8, 16 and 64 clients for both voices, beside Qwen3-TTS on the same protocol. Offline use is covered below
+- Mode: online `/v1/audio/speech` with the one profile per model, each admitting 64 requests at once (Original's as 128 guided sequences), what one H100 fits. Real time (a median real-time factor below 1 in the nightly perf matrix, the repository's measure) holds for Turbo through 64 clients with either voice and for Original up to 16; the matrix below gives median first audio, real-time factor and throughput at 1, 8, 16 and 64 clients beside Qwen3-TTS on the same protocol. Offline use is covered below
 - Hardware: 1x NVIDIA H100 SXM 80 GB
 - Maintainer: @will-rice
 
@@ -48,10 +48,11 @@ The request contract is the one in the
 | `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | measured through the nightly perf matrix at this head: 1, 8, 16 and 64 clients, built-in and cloned voices, and the 2-request/s stress case |
 | `chatterbox.yaml` (64 guided requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | as Turbo's row |
 
-Admission at 64 is a capacity contract, not a latency guarantee: the nightly
-perf matrix below gives the median first audio and real-time factor at
-each load, and the flow-precision rows give p95 and playback continuity
-at 64 clients for an earlier revision.
+Real time here is the repository's measure: a median real-time factor
+below 1 in the nightly perf matrix. The matrix below gives the median
+first audio, real-time factor and throughput at each load; the
+flow-precision rows give p95 and playback continuity at 64 clients for an
+earlier revision.
 
 ## References
 
@@ -212,8 +213,8 @@ H100 baselines in that file, which are the nightly matrix below.
 | GPU reference conditioning | `conditioning_device: cuda:0`; every admitted reference is encoded in one batch, admission equal to stage 0's request capacity; 64 references, the admission of both profiles, take 1.64–2.02 s (Turbo) or 0.51–0.68 s (Original) as one batch on H100 |
 | AR CUDA graphs | on by default; graph versus eager measured below |
 | BF16 flow decoder, FP32 HiFT | default in every profile; quality and speed measured below |
-| Median real-time factor below 1, cloned voices | Turbo up to 64 clients (0.91 at 64); Original up to 16 (0.93), 2.10 at 64 |
-| Median real-time factor below 1, built-in voice | Turbo up to 64 clients (0.74 at 64); Original up to 16 (0.84), 2.17 at 64 |
+| Real-time with cloned voices (median RTF below 1) | Turbo up to 64 clients (0.91 at 64); Original up to 16 (0.93), 2.10 at 64 |
+| Real-time with the built-in voice (median RTF below 1) | Turbo up to 64 clients (0.74 at 64); Original up to 16 (0.84), 2.17 at 64 |
 | Multilingual, VoiceDesign, instructions, prefix caching | unsupported |
 
 ## Qualification evidence
@@ -372,10 +373,9 @@ cloning, two GPUs):
 | Qwen3-TTS Base | cloned | throughput | 64 | 4777 | 1.228 | 43.3 |
 
 Turbo starts audio later than Qwen3-TTS at one and eight clients and
-earlier from 16 clients on, and its median real-time factor stays below 1
-through 64 clients with either voice where Qwen3-TTS's passes 1. Original
-keeps a median real-time factor below 1 up to 16 clients and reaches
-2.1–2.2 at 64. The earlier grids this recipe carried, from a per-model
+earlier from 16 clients on, and it is real-time (median real-time factor
+below 1) through 64 clients with either voice where Qwen3-TTS's passes 1.
+Original is real-time up to 16 clients and reaches 2.1–2.2 at 64. The earlier grids this recipe carried, from a per-model
 harness and from the shared driver at other revisions and warmups, are
 not reproduced here; the nightly matrix is the one protocol the
 repository runs for every TTS model.
