@@ -445,6 +445,7 @@ class HeliosCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            qkv_layout="BSND",
             # Text K/V is replicated on every SP rank, so Ulysses must not be
             # used here: its all-to-all would treat the per-rank replicas as
             # sequence shards and ws-fold duplicate the keys. Sharded Q over
