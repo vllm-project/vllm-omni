@@ -55,9 +55,11 @@ def test_streaming_concurrent_audio(omni_server, online_client, response_format)
             "stream": True,
             "stream_format": "audio",
             "response_format": response_format,
-            # Upstream Original measures -1.20 to -0.25 dB with this metric
-            # (seeds 0/42/123). Keep a noise floor and also check PCM content.
-            "min_hnr_db": -3.0 if omni_server.model == "ResembleAI/chatterbox" else 1.0,
+            # With this metric on this sentence, upstream Turbo measures 0.67
+            # to 2.32 dB (30 seeds, mean 1.66) and upstream Original -1.20 to
+            # -0.25 dB (seeds 0/42/123); all four streams must clear the floor,
+            # so it sits below each range. PCM content is checked separately.
+            "min_hnr_db": -3.0 if omni_server.model == "ResembleAI/chatterbox" else -1.0,
             "transcript_pcm_sample_rate": 24000,
             "timeout": 300.0,
         },
