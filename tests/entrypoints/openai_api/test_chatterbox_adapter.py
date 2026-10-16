@@ -535,6 +535,21 @@ def test_the_conditioning_device_must_be_a_supported_one_and_set(
         serving(client)
 
 
+def test_original_controls_must_be_set_in_stage_config(
+    model_dir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_speaker_cache: None
+) -> None:
+    """An Original deploy file whose additional_config names no controls fails at startup with a sentence."""
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+    deploy = modify_stage_config(
+        get_deploy_config_path(DEPLOY["original"]),
+        updates={"stages": {0: {"additional_config": {"conditioning_device": "cpu"}}}},
+    )
+    with pytest.raises(
+        ValueError, match="Original deploy files set stage 0 additional_config.cfg_weight and exaggeration"
+    ):
+        serving(engine_client(model_dir, deploy))
+
+
 @pytest.mark.parametrize("variant", ["adapter", "original"])
 def test_public_speech_token_cap_is_upstreams_generation_cap(request, variant):
     """Both checkpoints accept at most 1000 new speech tokens, the cap upstream generates with."""

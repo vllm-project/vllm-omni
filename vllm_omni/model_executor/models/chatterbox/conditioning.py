@@ -53,8 +53,6 @@ PUNCTUATION_REPLACEMENTS = (
     ("’", "'"),
 )
 SENTENCE_ENDERS = (".", "!", "?", "-", ",")
-# Resamples references on the CPU, concurrently within one encoder batch.
-RESAMPLE_POOL = ThreadPoolExecutor(thread_name_prefix="chatterbox-resample")
 # Not parameters the checkpoint carries: the S3Tokenizer subclass upstream
 # registers them itself, and the s3tokenizer package computes its own.
 TOKENIZER_BUFFERS = ("tokenizer._mel_filters", "tokenizer.window")
@@ -340,7 +338,8 @@ class VoiceConditioner:
             except ValueError as error:
                 return error
 
-        clips = list(RESAMPLE_POOL.map(resample, references))
+        with ThreadPoolExecutor(thread_name_prefix="chatterbox-resample") as pool:
+            clips = list(pool.map(resample, references))
         voices = iter(self.from_resampled_batch([clip for clip in clips if not isinstance(clip, ValueError)]))
         return [clip if isinstance(clip, ValueError) else next(voices) for clip in clips]
 

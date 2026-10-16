@@ -58,6 +58,11 @@ class ChatterboxAdapter(ARTTSAdapter):
         if "conditioning_device" not in additional_config:
             raise ValueError("Chatterbox deploy files set stage 0 additional_config.conditioning_device")
         self.conditioning_device = torch.device(additional_config["conditioning_device"])
+        if not self.controls <= additional_config.keys():
+            raise ValueError(
+                f"Chatterbox {self.variant.capitalize()} deploy files set stage 0 "
+                f"additional_config.{' and '.join(sorted(self.controls))}"
+            )
         self.default_controls = {name: additional_config[name] for name in self.controls}
         # As many references are encoded together as stage 0 admits requests:
         # the deploy profile sizes that for its card, and nothing here divides it.
@@ -97,15 +102,17 @@ class ChatterboxAdapter(ARTTSAdapter):
         self.encoder_executor.shutdown(wait=False, cancel_futures=True)
 
     def prepare_voices(self, references: list[tuple[np.ndarray, int]]) -> list[VoiceConditioning | ValueError]:
-        """Run one encoder batch on the adapter's encoder thread."""
+        """Run one encoder batch on the adapter's encoder thread.
+
+        Only that thread touches the conditioner, so loading the encoders
+        holds no lock and no prompt build waits behind it.
+        """
         model = resolve_stage_model_path(self.ctx.engine_client)
         if model is None:
             raise ValueError("Chatterbox requires a stage model path")
-        with self.initialization_lock:
-            if self.conditioner is None:
-                self.conditioner = VoiceConditioner(model, self.config, self.conditioning_device)
-            conditioner = self.conditioner
-        return conditioner.prepare_batch(references)
+        if self.conditioner is None:
+            self.conditioner = VoiceConditioner(model, self.config, self.conditioning_device)
+        return self.conditioner.prepare_batch(references)
 
     async def drain_conditioning(self) -> None:
         """Own encoder execution; every queued reference goes through the encoders together."""
