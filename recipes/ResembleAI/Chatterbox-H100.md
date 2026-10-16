@@ -31,7 +31,7 @@ upstream implementation.
 | Input | Limit |
 | --- | --- |
 | Text | English; stage 0's 2048-token context holds the prompt and the output |
-| Reference recording | mono; Turbo: longer than 5 s; Original: the shared 1 s minimum. T3 conditions on the first 15 s (Turbo) or 6 s (Original), S3Gen on the first 10 s |
+| Reference recording | mono; the shared 1 s minimum. Turbo repeats a clip of 5 s or less until it is longer (upstream refuses one). T3 conditions on the first 15 s (Turbo) or 6 s (Original), S3Gen on the first 10 s |
 | Original controls | `extra_params.exaggeration` and `extra_params.cfg_weight`, finite and nonnegative; the deploy file's defaults are 0.5; Turbo rejects them |
 | Speech tokens | `max_new_tokens` 1 to 1000, upstream's generation cap, default 1000 (40 s at 25 tokens/s) |
 

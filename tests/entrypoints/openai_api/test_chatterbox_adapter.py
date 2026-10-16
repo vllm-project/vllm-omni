@@ -395,19 +395,32 @@ async def test_reference_singleflight_survives_waiter_cancellation(adapter):
 
 
 @pytest.mark.asyncio
-async def test_bad_reference_does_not_poison_batch(adapter):
-    """A clip Turbo refuses fails alone; its batch's other clip is encoded and cached."""
-    batches = EncoderBatches(encoder(adapter))
-    bad, good = reference(2, seed=2), reference(6, seed=3)
+async def test_short_reference_is_repeated_and_encoded_with_its_batch(adapter):
+    """A two-second clip, which upstream Turbo refuses, is repeated past five seconds and encoded with the rest.
+
+    A held first batch lets the short and the long clip queue together, so
+    the second batch holds both.
+    """
+    batches = EncoderBatches(encoder(adapter), hold=True)
     try:
-        results = await asyncio.gather(adapter.resolve_voice(bad), adapter.resolve_voice(good), return_exceptions=True)
+        blocker = asyncio.create_task(adapter.resolve_voice(reference(6, seed=9)))
+        await asyncio.to_thread(batches.started.wait, 30)
+        pair = [
+            asyncio.create_task(adapter.resolve_voice(reference(2, seed=2))),
+            asyncio.create_task(adapter.resolve_voice(reference(6, seed=3))),
+        ]
+        await asyncio.sleep(0.1)
+        batches.released.set()
+        await blocker
+        short, long = await asyncio.wait_for(asyncio.gather(*pair), 60)
     finally:
         batches.remove()
 
-    assert isinstance(results[0], ValueError) and "longer than 5 s" in str(results[0])
-    assert isinstance(results[1], VoiceConditioning)
-    assert batches.batches == [1]
-    assert adapter.ctx.server._speaker_cache.stats()["entries"] == 1
+    assert isinstance(short, VoiceConditioning) and isinstance(long, VoiceConditioning)
+    # Three repeats of two seconds give six seconds: 150 decoder prompt tokens at 25 per second.
+    assert short.prompt_token.shape == (1, 150) == long.prompt_token.shape
+    assert batches.batches == [1, 2]
+    assert adapter.ctx.server._speaker_cache.stats()["entries"] == 3
     assert not adapter.conditioning_pending
 
 

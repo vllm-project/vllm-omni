@@ -43,8 +43,9 @@ vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091
 ```
 
 Use the common curl/SDK and PCM streaming clients above with `voice: default`,
-or supply `ref_audio` as a data URL. Turbo requires more than five seconds;
-Original uses the shared one-second minimum. Both expose WAV/PCM/MP3/FLAC
+or supply `ref_audio` as a data URL. Both use the shared one-second minimum;
+Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it. Both expose WAV/PCM/MP3/FLAC
 non-streaming responses and PCM/WAV streaming. Original additionally accepts
 `extra_params: {exaggeration: 0.5, cfg_weight: 0.5}`; Turbo rejects those controls.
 

@@ -345,15 +345,21 @@ class VoiceConditioner:
         return [clip if isinstance(clip, ValueError) else next(voices) for clip in clips]
 
     def resample(self, wav: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
-        """Validate, normalize and resample one reference at both model rates."""
+        """Validate, normalize and resample one reference at both model rates.
+
+        A clip no longer than the checkpoint's ``min_ref_seconds`` is repeated
+        until it is longer. Upstream Turbo refuses such a clip; repeating it
+        keeps the voice and gives the conditioning windows the length the
+        checkpoint was tuned for.
+        """
         if wav.ndim != 1:
             raise ValueError(f"Chatterbox needs a mono reference clip of shape (samples,), got shape {wav.shape}")
         wav24 = self.to_24k.resample(np.asarray(wav, dtype=np.float32), orig_sr=sample_rate).astype(np.float32)
-        seconds = len(wav24) / self.config.sample_rate
-        if seconds <= self.config.min_ref_seconds:
-            raise ValueError(
-                f"Chatterbox needs a reference clip longer than {self.config.min_ref_seconds:g} s, got {seconds:.2f} s"
-            )
+        if len(wav24) == 0:
+            raise ValueError("Chatterbox needs a reference clip with samples in it")
+        minimum = int(self.config.min_ref_seconds * self.config.sample_rate)
+        if len(wav24) <= minimum:
+            wav24 = np.tile(wav24, minimum // len(wav24) + 1)
         if self.config.loudness_target_lufs is not None:
             wav24 = normalize_loudness(wav24, self.config.sample_rate, self.config.loudness_target_lufs)
         wav16 = self.to_16k.resample(wav24, orig_sr=self.config.sample_rate).astype(np.float32)
