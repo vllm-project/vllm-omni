@@ -129,7 +129,8 @@ class OvisImageAttention(nn.Module):
 
         # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
         # forward supplied the packed table and the CUDA kernel accepts the
-        # geometry; otherwise the original eager chain.
+        # geometry; otherwise the original eager chain. The fused op reproduces
+        # the CUDA RMSNorm reduction, so both paths produce the same bits.
         qk_norm_rope_table = kwargs.get(QK_NORM_ROPE_TABLE_KEY)
         use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
             query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
@@ -161,6 +162,7 @@ class OvisImageAttention(nn.Module):
                     self.norm_k.weight,
                     qk_norm_rope_table,
                     self.norm_q.variance_epsilon,
+                    cuda_rms_norm=True,
                 )
             else:
                 encoder_query = self.norm_added_q(encoder_query)
@@ -179,6 +181,7 @@ class OvisImageAttention(nn.Module):
                 qk_norm_rope_table,
                 self.norm_q.variance_epsilon,
                 interleaved=True,
+                cuda_rms_norm=True,
             )
             query = query.view(batch_size, seq_len, num_heads, head_dim)
             key = key.view(batch_size, seq_len, num_heads, head_dim)
@@ -533,6 +536,7 @@ class OvisImageTransformer2DModel(nn.Module):
             image_rotary_emb[1],
             hidden_states.shape[0],
             dtype=hidden_states.dtype,
+            cuda_rms_norm=True,
         )
         if qk_norm_rope_table is not None:
             joint_attention_kwargs = {QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
