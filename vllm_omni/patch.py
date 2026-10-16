@@ -653,6 +653,40 @@ def _patch_cumem_free_callback_cuda() -> None:
 _patch_cumem_free_callback_cuda()
 
 
+# =============================================================================
+# Patch flashinfer.cudnn.prefill._create_cudnn_handle to accept torch.Stream
+# =============================================================================
+# WHY: FlashInfer's _create_cudnn_handle calls stream.cuda_stream, which is a
+# property on torch.cuda.Stream. In some execution contexts the stream object
+# is a torch.Stream (the base unified-stream class) which lacks that attribute,
+# causing AttributeError at the first cuDNN attention call.
+#
+# FRAGILITY: Depends on _create_cudnn_handle being a module-level function in
+# flashinfer.cudnn.prefill. If FlashInfer refactors it, this becomes a no-op
+# (the getattr guard prevents a crash on missing symbol).
+def _patch_flashinfer_cudnn_handle_stream() -> None:
+    try:
+        import flashinfer.cudnn.prefill as _fi_cudnn_prefill
+    except ImportError:
+        return
+
+    _original = getattr(_fi_cudnn_prefill, "_create_cudnn_handle", None)
+    if _original is None or getattr(_original, "_omni_stream_patched", False):
+        return
+
+    def _patched_create_cudnn_handle(stream):
+        if not isinstance(stream, torch.cuda.Stream):
+            stream = torch.cuda.Stream(stream_id=stream.stream_id)
+        return _original(stream)
+
+    _patched_create_cudnn_handle._omni_stream_patched = True
+    _fi_cudnn_prefill._create_cudnn_handle = _patched_create_cudnn_handle
+    _PATCH_LOGGER.info("[flashinfer-cudnn] _create_cudnn_handle stream patch installed.")
+
+
+_patch_flashinfer_cudnn_handle_stream()
+
+
 def _patch_batched_seeded_random_sample() -> None:
     """Draw per-request seeded sampling noise in one launch.
 

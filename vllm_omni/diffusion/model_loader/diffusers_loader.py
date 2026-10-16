@@ -279,12 +279,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
     def _prepare_weights(
         self,
-        model_name_or_path: Path | str,
+        model_name_or_path: str,
         subfolder: str | None,
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-    ) -> tuple[Path | str, list[str], bool]:
+    ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""

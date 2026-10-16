@@ -765,10 +765,12 @@ def resolve_model_class_name(
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
-    from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_flux3, _looks_like_hidream_o1
 
     if _looks_like_hidream_o1(model, cfg):
         return "HiDreamO1ImagePipeline"
+    if _looks_like_flux3(model, cfg):
+        return "Flux3Pipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
     if (
@@ -1621,6 +1623,7 @@ class OmniDiffusionConfig:
 
         from vllm_omni.diffusion.registry import resolve_native_single_file
         from vllm_omni.diffusion.utils.hf_utils import (
+            _looks_like_flux3,
             get_diffusion_model_index,
             resolve_native_diffusion_model_class,
         )
@@ -1640,6 +1643,10 @@ class OmniDiffusionConfig:
                 self.model,
                 revision=self.revision,
             )
+            # Mixed Flux3 packages also ship a Diffusers index. Native loading
+            # must resolve variant quantization from the package config below.
+            if config_dict is not None and self.diffusion_load_format != "diffusers" and _looks_like_flux3(self.model):
+                config_dict = None
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
@@ -1730,12 +1737,29 @@ class OmniDiffusionConfig:
 
                 assert self.model is not None
                 is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                is_flux3 = _looks_like_flux3(self.model, cfg)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
 
                 if is_hidream_o1:
                     self.model_class_name = "HiDreamO1ImagePipeline"
                     self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif is_flux3:
+                    from vllm_omni.diffusion.utils.flux3_package import (
+                        _inject_flux3_quantization_config,
+                        _resolve_flux3_package_selection,
+                    )
+
+                    self.model_class_name = "Flux3Pipeline"
+                    # Resolve variant metadata before the loader snapshots quantization.
+                    selection = _resolve_flux3_package_selection(self.model, self.additional_config)
+                    package_config = _inject_flux3_quantization_config(
+                        selection.package_config, selection.transformer_root, selection.quantization
+                    )
+                    self.set_tf_model_config(TransformerConfig.from_dict(package_config))
+                    if selection.quantization is not None:
+                        self.additional_config.setdefault("auto_detected_quant_method", selection.quantization)
                     self.update_multimodal_support()
                 elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"

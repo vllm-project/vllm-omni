@@ -133,6 +133,28 @@ class CuDNNAttentionImpl(AttentionImpl):
         kv_seq_len = key.shape[1]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
 
+        if (
+            attention_mask is None
+            and kv_seq_len > 1
+            and not enable_gqa
+            and query.dtype in (torch.float16, torch.bfloat16)
+        ):
+            # Same cuDNN FMHA that sdpa_kernel([CUDNN_ATTENTION]) dispatches to, called
+            # directly: torch.compile cannot trace the sdpa_kernel context manager or a
+            # symbolic enable_gqa, and a graph break here makes regionally compiled
+            # transformer blocks fall back to eager.
+            output = torch.ops.aten._scaled_dot_product_cudnn_attention(
+                query,
+                key,
+                value,
+                None,
+                False,
+                dropout_p=0.0,
+                is_causal=self.causal,
+                scale=self.softmax_scale,
+            )[0]
+            return output.permute(0, 2, 1, 3)
+
         # Pin one backend only. A priority list like [CUDNN, FLASH, MATH] hits a
         # PyTorch SDPA dispatch quirk: when FLASH rejects a non-None attn_mask,
         # cuDNN gets runtime-disabled in the same call and the dispatcher falls

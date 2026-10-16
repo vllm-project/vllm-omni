@@ -22,6 +22,7 @@ def _impl(*, causal: bool = False, backend_explicit: bool = False):
     obj.softmax_scale = 0.5
     obj.flashinfer_backend = "fa2"
     obj.backend_explicit = backend_explicit
+    obj._fp8_cudnn = False
     obj._sdpa_fallback = None
     return obj
 
@@ -81,6 +82,23 @@ def test_explicit_fa2_flashinfer_is_mask_capable(monkeypatch):
     spec = AttentionSpec(backend="FLASHINFER_ATTN", quant=AttnQuantSpec(flashinfer_backend="fa2"))
 
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
+
+
+def test_fp8_flashinfer_is_not_mask_capable():
+    spec = AttentionSpec(backend="FLASHINFER_ATTN", quant=AttnQuantSpec(dtype_qk="fp8_e4m3"))
+
+    assert FlashInferAttentionBackend.supports_attention_mask(spec) is False
+
+
+def test_fp8_flashinfer_rejects_mask_before_kernel_execution(monkeypatch):
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    impl = _impl()
+    impl._fp8_cudnn = True
+    query = torch.randn(1, 2, 2, 8)
+    metadata = AttentionMetadata(attn_mask=torch.ones(2, 2, dtype=torch.bool))
+
+    with pytest.raises(ValueError, match="FP8 cuDNN backend does not support attn_mask"):
+        impl.forward_cuda(query, query, query, metadata)
 
 
 def test_explicit_fa2_backend_kwargs_select_fa2_on_blackwell(monkeypatch):

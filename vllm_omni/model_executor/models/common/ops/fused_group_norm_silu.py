@@ -20,16 +20,11 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+_BLOCK_SIZE = 4096
+_NUM_WARPS = 16
+_NUM_STAGES = 4
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=1),
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=2),
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=4),
-        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=6),
-    ],
-    key=["spatial_size", "C"],
-)
+
 @triton.jit
 def _group_norm_silu_kernel(
     # Input/Output pointers
@@ -129,12 +124,25 @@ def _group_norm_silu_kernel(
             tl.store(out_ptr + base + offsets, out_val, mask=mask)
 
 
+_autotuned_group_norm_silu_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": _BLOCK_SIZE}, num_warps=_NUM_WARPS, num_stages=1),
+        triton.Config({"BLOCK_SIZE": _BLOCK_SIZE}, num_warps=_NUM_WARPS, num_stages=2),
+        triton.Config({"BLOCK_SIZE": _BLOCK_SIZE}, num_warps=_NUM_WARPS, num_stages=4),
+        triton.Config({"BLOCK_SIZE": _BLOCK_SIZE}, num_warps=_NUM_WARPS, num_stages=6),
+    ],
+    key=["spatial_size", "C"],
+)(_group_norm_silu_kernel)
+
+
 def fused_group_norm_silu(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     num_groups: int = 32,
     eps: float = 1e-6,
+    *,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """
     Fused GroupNorm + SiLU activation.
@@ -145,6 +153,8 @@ def fused_group_norm_silu(
     - weight, bias: per-channel parameters, shape (C,).
     - num_groups: GroupNorm group count, default 32.
     - eps: numerical stability epsilon, default 1e-6.
+    - autotune: benchmark launch configurations for new shapes. If disabled,
+      use the fixed stage-4 launch configuration.
     Uses fp32 accumulation for numeric alignment with PyTorch.
     Returns the same shape and eager F.group_norm-compatible dtype.
     Spatial dimensions are flattened during computation and restored afterward;
@@ -193,7 +203,9 @@ def fused_group_norm_silu(
     # One program per (batch, group) pair.
     grid = (B * num_groups,)
 
-    _group_norm_silu_kernel[grid](
+    kernel = _autotuned_group_norm_silu_kernel if autotune else _group_norm_silu_kernel
+    launch_config = {} if autotune else {"BLOCK_SIZE": _BLOCK_SIZE, "num_warps": _NUM_WARPS, "num_stages": _NUM_STAGES}
+    kernel[grid](
         x_flat,
         out_flat,
         weight,
@@ -202,6 +214,7 @@ def fused_group_norm_silu(
         spatial_size,
         num_groups=num_groups,
         eps=eps,
+        **launch_config,
     )
 
     return out_flat.reshape(orig_shape)

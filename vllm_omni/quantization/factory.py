@@ -305,9 +305,11 @@ def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
 
 
 def _build_modelopt_from_config(method: str, config: Mapping[str, Any]) -> QuantizationConfig:
-    config_cls = get_quantization_config(method)
     normalized_config = dict(config)
     normalized_config.setdefault("quant_method", method)
+    if method in _OVERRIDES:
+        return _build_single(method, **normalized_config)
+    config_cls = get_quantization_config(method)
     return config_cls.from_config(normalized_config)
 
 

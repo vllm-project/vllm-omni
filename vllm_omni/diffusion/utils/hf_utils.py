@@ -71,6 +71,19 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
+def _looks_like_flux3(model_name: str, config: Mapping | None = None) -> bool:
+    """Detect the Flux3 package schema."""
+    from vllm_omni.diffusion.utils.flux3_package import _is_flux3_package_config
+
+    try:
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+    except Exception:
+        return False
+    if not isinstance(cfg, Mapping):
+        return False
+    return _is_flux3_package_config(cfg)
+
+
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
 

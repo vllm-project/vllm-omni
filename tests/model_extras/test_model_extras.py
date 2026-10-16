@@ -453,6 +453,15 @@ def test_unknown_pipeline_has_empty_extra_registry() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_flux3_extra_registry_declares_contract() -> None:
+    assert get_extra_body_params("Flux3Pipeline") == frozenset({"flow_shift"})
+    assert get_extra_output_params("Flux3Pipeline") == frozenset()
+    assert should_preserve_reference_image_size("Flux3Pipeline", model="org/flux3") is True
+    assert should_init_extra_args_for_non_diffusion_stages("Flux3Pipeline") is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_bagel_text_to_image_prompt_builder() -> None:
     assert build_text_to_image_prompt(
         "BagelPipeline",

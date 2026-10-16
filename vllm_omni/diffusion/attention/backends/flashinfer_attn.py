@@ -34,6 +34,110 @@ except Exception as e:
     )
 
 
+# ---------------------------------------------------------------------------
+# FP8 (cuDNN batch prefill) support
+# ---------------------------------------------------------------------------
+
+# cuDNN FP8 workspace. Kernels serialize on the GPU, so one buffer per device
+# is shared by every layer — mirrors vLLM's mm_encoder_attention, which uses a
+# single global buffer of the same size.
+_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
+_workspace_by_device: dict[torch.device, torch.Tensor] = {}
+
+# (offsets, seq_lens) for the packed (B*S) layout; constant per (device, B, S, D_token).
+# offsets is cu_seqlens-style with B+1 entries (cuDNN requires the ragged dim
+# to be one larger than the batch dim) in *element* units — batch b's slice
+# starts at element b * S * D_token. seq_lens has B entries.
+_meta_cache: dict[tuple[torch.device, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_workspace(device: torch.device) -> torch.Tensor:
+    workspace = _workspace_by_device.get(device)
+    if workspace is None:
+        workspace = torch.empty(_WORKSPACE_SIZE_BYTES, dtype=torch.uint8, device=device)
+        _workspace_by_device[device] = workspace
+    return workspace
+
+
+def _get_meta(device: torch.device, batch: int, seqlen: int, token_elems: int) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (device, batch, seqlen, token_elems)
+    meta = _meta_cache.get(key)
+    if meta is None:
+        step = seqlen * token_elems
+        offsets = torch.arange(0, (batch + 1) * step, step, dtype=torch.int32, device=device).reshape(-1, 1, 1, 1)
+        seq_lens = torch.full((batch,), seqlen, dtype=torch.int32, device=device).reshape(-1, 1, 1, 1)
+        meta = (offsets, seq_lens)
+        _meta_cache[key] = meta
+    return meta
+
+
+@torch._dynamo.disable
+def _cudnn_fp8_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """fp8 attention via FlashInfer's cuDNN batch prefill.
+
+    q: (B, Sq, H, D); k, v: (B, Skv, H_kv, D), quantized inside this call.
+    Returns: (B, Sq, H, D) in q.dtype.
+
+    Known limitation: FlashInfer caches the cuDNN execution plan per shape
+    signature without keying on the softmax scale, so within one process the
+    first scale seen for a given shape wins. All layers of a DiT share one
+    scale in practice (head_dim**-0.5), so this is safe for current models.
+    """
+    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+    from vllm import _custom_ops as ops
+
+    B, Sq, H, D = q.shape
+    Skv = k.shape[1]
+    H_kv = k.shape[2]
+
+    def _quant(x: torch.Tensor, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # Dynamic per-tensor scale = amax / FP8_MAX, clamped away from zero:
+        # an all-zero input (e.g. AdaLN-Zero-initialized weights) would give
+        # scale 0, and the kernel's reciprocal (1/scale) overflows to inf,
+        # turning the whole output into NaN.
+        x_2d = x.reshape(-1, width)
+        amax = x_2d.abs().amax().float()
+        scale = torch.clamp(amax, min=1e-5) / float(torch.finfo(torch.float8_e4m3fn).max)
+        x_fp8, _ = ops.scaled_fp8_quant(x_2d, scale=scale)
+        # cuDNN requires per-tensor scales in (1, 1, 1, 1) layout.
+        return x_fp8, scale.reshape(1, 1, 1, 1)
+
+    q_fp8, q_s = _quant(q, H * D)
+    k_fp8, k_s = _quant(k, H_kv * D)
+    v_fp8, v_s = _quant(v, H_kv * D)
+
+    offsets_qo, seq_lens_q = _get_meta(q.device, B, Sq, H * D)
+    offsets_kv, seq_lens_kv = _get_meta(q.device, B, Skv, H_kv * D)
+    out, _ = cudnn_batch_prefill_with_kv_cache(
+        q_fp8.reshape(B * Sq, H, D),
+        k_fp8.reshape(B * Skv, H_kv, D),
+        v_fp8.reshape(B * Skv, H_kv, D),
+        softmax_scale,
+        _get_workspace(q.device),
+        max_token_per_sequence=Sq,
+        max_sequence_kv=Skv,
+        actual_seq_lens_q=seq_lens_q,
+        actual_seq_lens_kv=seq_lens_kv,
+        causal=causal,
+        return_lse=False,
+        batch_offsets_q=offsets_qo,
+        batch_offsets_k=offsets_kv,
+        batch_offsets_v=offsets_kv,
+        batch_offsets_o=offsets_qo,
+        q_scale=q_s,
+        k_scale=k_s,
+        v_scale=v_s,
+        o_data_type=q.dtype,
+    )
+    return out.reshape(B, Sq, H, D)
+
+
 class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -44,6 +148,8 @@ class FlashInferAttentionBackend(AttentionBackend):
         # FLASHINFER_ATTN config must not be advertised as mask-capable.
         requested = "auto"
         quant = getattr(attention_spec, "quant", None) if attention_spec is not None else None
+        if getattr(quant, "dtype_qk", None) == "fp8_e4m3":
+            return False
         requested_backend = getattr(quant, "flashinfer_backend", None)
         if requested_backend:
             requested = requested_backend
@@ -106,6 +212,30 @@ class FlashInferAttentionImpl(AttentionImpl):
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
         backend_kwargs = backend_kwargs or {}
         quant = backend_kwargs.get("quant") or {}
+
+        # quant dtype_qk="fp8_e4m3" selects the cuDNN scaled-FP8 batch-prefill
+        # path (SM100+ only), bypassing the wrapper entirely. The kernel always
+        # emits the compute dtype, so dtype_vo is ignored in this mode.
+        self._fp8_cudnn = quant.get("dtype_qk") == "fp8_e4m3"
+        if self._fp8_cudnn:
+            from vllm.utils.flashinfer import is_flashinfer_cudnn_fp8_prefill_attn_supported
+
+            if not is_flashinfer_cudnn_fp8_prefill_attn_supported():
+                raise ValueError(
+                    "FLASHINFER_ATTN quant dtype_qk='fp8_e4m3' requires a datacenter "
+                    "Blackwell GPU (SM100+), the FlashInfer cuDNN backend, and cuDNN >= 9.17.1."
+                )
+            self.dtype_qk = None
+            self.dtype_vo = None
+            self.flashinfer_backend = "cudnn-fp8"
+            self._workspace = None
+            self._wrapper = None
+            self._qo_indptr = None
+            self._kv_indptr = None
+            self._plan_key = None
+            logger.info_once("FLASHINFER_ATTN initialized backend=cudnn-fp8 on %s.", self.device)
+            return
+
         self.dtype_qk = self._check_dtype(quant.get("dtype_qk"), "dtype_qk", self._QK_DTYPES)
         self.dtype_vo = self._check_dtype(quant.get("dtype_vo"), "dtype_vo", self._VO_DTYPES)
         requested_backend = quant.get("flashinfer_backend", "auto")
@@ -428,6 +558,15 @@ class FlashInferAttentionImpl(AttentionImpl):
         # Explicit FLASHINFER_ATTN must not silently switch away from the
         # requested kernel. Automatic platform selection (Blackwell cute-dsl)
         # may use SDPA for masks that this FlashInfer variant cannot run.
+        # FP8 path: batched cuDNN prefill, no mask support.
+        if self._fp8_cudnn:
+            if attn_metadata is not None and attn_metadata.attn_mask is not None:
+                raise ValueError(
+                    "FLASHINFER_ATTN FP8 cuDNN backend does not support attn_mask. "
+                    "Select a mask-capable attention backend."
+                )
+            return _cudnn_fp8_attention(query, key, value, self.softmax_scale, self.causal)
+
         batch_size = query.shape[0]
         custom_mask = None
         if attn_metadata is not None and attn_metadata.attn_mask is not None:

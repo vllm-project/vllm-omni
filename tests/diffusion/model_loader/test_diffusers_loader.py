@@ -629,6 +629,113 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
+def test_safetensors_directory_source_selects_model_file_from_package_root(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Exact allow patterns keep root package components isolated."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    selected_file = tmp_path / "model.safetensors"
+    sibling_file = tmp_path / "ae.safetensors"
+    selected_file.write_bytes(b"")
+    sibling_file.write_bytes(b"")
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=[selected_file.name, "*.safetensors"],
+    )
+    weight = torch.zeros(1)
+    safetensors_iterator = MagicMock(return_value=iter([("weight", weight)]))
+    hub_download = MagicMock()
+    monkeypatch.setattr(loader_mod, "safetensors_weights_iterator", safetensors_iterator)
+    monkeypatch.setattr(loader_mod, "download_weights_from_hf", hub_download)
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", weight)]
+
+    safetensors_iterator.assert_called_once_with(
+        [str(selected_file)],
+        loader.load_config.use_tqdm_on_load,
+        loader.load_config.safetensors_load_strategy,
+    )
+    hub_download.assert_not_called()
+
+
+def test_remote_source_without_index_skips_empty_index_download(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """A remote exact-file source must not request an empty index filename."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"")
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="org/model",
+        subfolder=None,
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=[checkpoint.name],
+    )
+    weight = torch.zeros(1)
+    index_resolver = MagicMock()
+    hub_download = MagicMock(return_value=str(tmp_path))
+    safetensors_iterator = MagicMock(return_value=iter([("weight", weight)]))
+    monkeypatch.setattr(loader_mod, "maybe_download_from_modelscope", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(loader, "_resolve_weight_index", index_resolver)
+    monkeypatch.setattr(loader_mod, "download_weights_from_hf", hub_download)
+    monkeypatch.setattr(loader_mod, "safetensors_weights_iterator", safetensors_iterator)
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", weight)]
+    hub_download.assert_called_once()
+    index_resolver.assert_not_called()
+
+
+def test_safetensors_directory_source_uses_its_single_checkpoint(tmp_path, mocker):
+    """A component directory with one checkpoint loads that checkpoint."""
+    component_dir = tmp_path / "dit"
+    component_dir.mkdir()
+    checkpoint = component_dir / "component.safetensors"
+    checkpoint.write_bytes(b"")
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(component_dir),
+        subfolder="",
+        revision=None,
+        fall_back_to_pt=True,
+    )
+    safetensors_iterator = mocker.patch(
+        "vllm_omni.diffusion.model_loader.diffusers_loader.safetensors_weights_iterator",
+        return_value=iter([("weight", torch.zeros(1))]),
+    )
+
+    assert list(loader._get_weights_iterator(source)) == [("weight", torch.zeros(1))]
+
+    safetensors_iterator.assert_called_once_with(
+        [str(checkpoint)],
+        loader.load_config.use_tqdm_on_load,
+        loader.load_config.safetensors_load_strategy,
+    )
+
+
 def test_stream_online_quant_weights_offloads_layers_after_processing():
     from vllm.model_executor.model_loader.reload.layerwise import (
         get_layerwise_info,
@@ -2004,6 +2111,98 @@ def test_hsdp_broadcast_weight_load_falls_back_when_online_quantization_enabled(
     assert "load" in events
     assert "broadcast" not in events
     assert events == ["load", "process", "shard"]
+
+
+def test_cpu_offload_loads_serialized_nvfp4_directly_on_cpu():
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=False,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            sequence_parallel_size=1,
+        ),
+        quantization_config=SimpleNamespace(is_checkpoint_quantized=True),
+        lora_backend=None,
+        lora_path=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader._force_canonical_load = True
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    initialized_devices: list[torch.device] = []
+
+    def init_model(_load_format, target_device, _custom_pipeline_name, *, is_hsdp):
+        assert is_hsdp is False
+        initialized_devices.append(target_device)
+        return model
+
+    loader._init_from_load_format = init_model  # type: ignore[method-assign]
+    loader.load_weights = MagicMock()  # type: ignore[method-assign]
+    loader._process_weights_after_loading = MagicMock()  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = MagicMock()  # type: ignore[method-assign]
+
+    assert loader.load_model(load_device="cpu", device=torch.device("cuda")) is model
+    assert initialized_devices == [torch.device("cpu")]
+    loader.load_weights.assert_called_once_with(model)
+
+
+def test_hsdp_broadcast_weight_load_accepts_serialized_nvfp4(monkeypatch):
+    """Serialized NVFP4 is checkpoint storage, not online weight quantization."""
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=4,
+        ),
+        enable_broadcast_weight_load=True,
+        lora_backend=None,
+        lora_path=None,
+        quantization_config=SimpleNamespace(is_checkpoint_quantized=True),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    events: list[str] = []
+
+    loader._init_from_load_format = MagicMock(return_value=model)  # type: ignore[method-assign]
+    loader.load_weights = MagicMock(side_effect=lambda _model: events.append("load"))  # type: ignore[method-assign]
+    loader._broadcast_model_weights = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda _model, **_kwargs: events.append("broadcast")
+    )
+    loader._process_weights_after_loading = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda _model, _device: events.append("process")
+    )
+    monkeypatch.setattr(
+        loader_mod.ModuleDiscovery,
+        "discover",
+        lambda _model: PipelineModules(
+            dits=[model.transformer],
+            dit_names=["transformer"],
+            vaes=[],
+            encoders=[],
+            encoder_names=[],
+            resident_modules=[],
+            resident_names=[],
+        ),
+    )
+    monkeypatch.setattr(
+        loader_mod,
+        "apply_hsdp_to_model",
+        lambda *_args, **_kwargs: events.append("shard"),
+    )
+
+    loader._load_model_with_hsdp(torch.device("cpu"))
+
+    assert events == ["load", "broadcast", "process", "shard"]
 
 
 def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_dir: str) -> None:
