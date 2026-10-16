@@ -480,16 +480,13 @@ def test_update_states_carries_prepared_layout() -> None:
     request = _make_request()
     prepared_layout = object()
     request.prepared_layout = prepared_layout
-    scheduler_output = SimpleNamespace(
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
         finished_req_ids=set(),
-        scheduled_new_reqs=[
-            SimpleNamespace(
-                request_id=request.request_id,
-                req=request,
-                diffusion_kv_metadata=None,
-            )
-        ],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
 
     states, new_request_ids = DiffusionModelRunner._update_states(runner, scheduler_output)
