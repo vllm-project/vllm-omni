@@ -930,6 +930,51 @@ def test_later_stage_progress_that_overtakes_its_stage0_segment_end_is_held_for_
     assert not second.complete, "nothing held is left over for the next unit"
 
 
+class _NeedsUpstreamAndFinal(_DefaultHooksPlugin):
+    def unit_output_complete(self, *, unit, final_stage_id, new_output, new_context, state, runtime_config):
+        del final_stage_id, new_output, new_context, state, runtime_config
+        return unit is not None and unit.upstream_segment_finished and unit.final_segment_finished
+
+
+def test_final_segment_ends_ahead_of_upstream_ones_go_to_their_own_units() -> None:
+    """A and B speak; both final segment ends arrive before either Talker segment end.
+
+    B's final end must not be absorbed by A (which already has its own and
+    waits for its upstream end): B completes once its upstream end arrives.
+    """
+    clock, sent = _clock(_plugin(_NeedsUpstreamAndFinal))
+    first, second = _append(clock, units=2)
+    _progress(clock, stage_id=0, final_stage_id=2)  # A speaks
+    _progress(clock, stage_id=0, final_stage_id=2)  # B speaks
+    _progress(clock, stage_id=2, final_stage_id=2)  # A's final segment end
+    _progress(clock, stage_id=2, final_stage_id=2)  # B's final segment end
+    assert sent == [] and not first.complete and not second.complete
+
+    _progress(clock, stage_id=1, final_stage_id=2)  # A's Talker segment end
+    assert first.complete and not second.complete
+    _progress(clock, stage_id=1, final_stage_id=2)  # B's Talker segment end
+
+    assert second.complete
+    assert _decisions(sent) == [[("speak", None), ("speak", None)]]
+
+
+def test_held_final_segment_ends_are_replayed_to_their_own_units() -> None:
+    """Both final segment ends overtake both Stage-0 segment ends; each is replayed to its own unit."""
+    clock, sent = _clock(_plugin(_NeedsUpstreamAndFinal))
+    first, second = _append(clock, units=2)
+    _progress(clock, stage_id=2, final_stage_id=2)  # A's final segment end, held
+    _progress(clock, stage_id=2, final_stage_id=2)  # B's final segment end, held
+    _progress(clock, stage_id=0, final_stage_id=2)  # A speaks: A takes the first, B's stays held
+    _progress(clock, stage_id=1, final_stage_id=2)  # A's Talker segment end
+    assert first.complete and not second.complete
+
+    _progress(clock, stage_id=0, final_stage_id=2)  # B speaks: the held end is B's
+    _progress(clock, stage_id=1, final_stage_id=2)  # B's Talker segment end
+
+    assert second.complete
+    assert _decisions(sent) == [[("speak", None), ("speak", None)]]
+
+
 def test_later_stage_progress_with_no_undecided_stage0_submission_is_dropped() -> None:
     """A stray final segment end cannot be the next unit's: that unit was not even submitted yet."""
     clock, sent = _clock()
