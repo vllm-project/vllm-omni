@@ -19,19 +19,21 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import StageConfig
+from vllm_omni.config.stage_config import StageConfig, StageType
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
+from vllm_omni.entrypoints.openai.speech_usage import SpeechOutputTokenCounter
 from vllm_omni.errors import (
     OmniClientError,
     client_error_from_metadata,
     client_error_metadata,
     is_client_error_status,
 )
+from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -107,7 +109,13 @@ class FakeAsyncOmniEngine:
         self.stage_metadata = stage_metadata or [THREE_STAGE_META[-1]]
         self.num_stages = len(self.stage_metadata)
         self.stage_configs = [
-            StageConfig(stage_id=i, model_stage="dummy-model").to_omegaconf() for i in range(self.num_stages)
+            StageConfig(
+                stage_id=i,
+                model_stage="dummy-model",
+                stage_type=StageType(metadata.stage_type),
+                is_comprehension=getattr(metadata, "is_comprehension", False),
+            ).to_omegaconf()
+            for i, metadata in enumerate(self.stage_metadata)
         ]
         self.default_sampling_params_list = default_sampling_params_list or [
             SamplingParams(max_tokens=8) for _ in range(self.num_stages)
@@ -159,8 +167,13 @@ class FakeAsyncOmniEngine:
         except queue.Empty:
             return None
 
-    async def try_get_output_async(self) -> Any | None:
-        return self.try_get_output()
+    async def get_outputs_async(self, timeout: float = 1.0, max_messages: int = 256) -> list[Any]:
+        msgs: list[Any] = []
+        while len(msgs) < max_messages and (msg := self.try_get_output()) is not None:
+            msgs.append(msg)
+        if not msgs:
+            await asyncio.sleep(0.001)
+        return msgs
 
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         return self.stage_metadata[stage_id]
@@ -202,6 +215,58 @@ def _make_base():
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+def test_disabled_stage_metrics_preserve_speech_completion_without_full_merge(monkeypatch):
+    base = _make_base()
+    base.collect_stage_metrics = False
+    base._enable_ar_profiler = False
+    base.engine.get_stage_metadata.return_value = StageRuntimeInfo(
+        stage_type="llm", final_output=True, final_output_type="audio", model_stage="code2wav"
+    )
+    base._publish_request_gauges = MagicMock()
+    metrics = OrchestratorAggregator(2, False, 0.0, 1)
+    diagnostic_latencies = MagicMock()
+    diagnostic_latencies.__iter__.side_effect = AssertionError("diagnostic arrays merged")
+    for count, reason in [(100, None), (91, "length")]:
+        metrics.on_stage_metrics(
+            0,
+            "req-no-metrics",
+            StageRequestStats(
+                batch_id=0,
+                batch_size=1,
+                num_tokens_in=0,
+                num_tokens_out=count,
+                finish_reason=reason,
+                stage_gen_time_ms=0.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+                stage_stats=StageStats(),
+                inter_output_latencies_ms=diagnostic_latencies,
+                vllm_itls_ms=diagnostic_latencies,
+            ),
+            "text",
+        )
+    merge = MagicMock(wraps=OrchestratorAggregator._merge_stage_metric_event)
+    monkeypatch.setattr(OrchestratorAggregator, "_merge_stage_metric_event", merge)
+    result = OutputMessage(
+        request_id="req-no-metrics",
+        stage_id=1,
+        engine_outputs=OmniRequestOutput(request_id="req-no-metrics", finished=False, final_output_type="audio"),
+        finished=False,
+    )
+
+    output = base._process_single_result(result, 1, metrics, {}, 0.0, 1)
+
+    assert output is not None
+    counter = SpeechOutputTokenCounter()
+    counter.observe(output)
+    assert counter.stage0_finish_reason == "length"
+    assert counter.total() == 191
+    assert "inter_output_latencies_ms" not in output.metrics["stage_metrics"]["0"]
+    assert merge.call_count == 2
+    assert all(call.kwargs == {"collect_stage_metrics": False} for call in merge.call_args_list)
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
@@ -481,7 +546,7 @@ def test_model_config_and_vllm_config_forward_from_comprehension_stage():
     io_processor = SimpleNamespace(name="io-processor")
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
-        stage_clients=[SimpleNamespace(is_comprehension=False), SimpleNamespace(is_comprehension=True)],
+        stage_configs=[SimpleNamespace(is_comprehension=False), SimpleNamespace(is_comprehension=True)],
         stage_vllm_configs=[None, vllm_config],
     )
     omni.input_processor = input_processor
@@ -502,7 +567,7 @@ def test_openai_serving_models_can_consume_async_omni_compat_attrs():
     io_processor = SimpleNamespace(name="io-processor")
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
-        stage_clients=[SimpleNamespace(is_comprehension=True)],
+        stage_configs=[SimpleNamespace(is_comprehension=True)],
         stage_vllm_configs=[vllm_config],
     )
     omni.input_processor = input_processor
@@ -524,10 +589,11 @@ def test_get_diffusion_od_config_returns_diffusion_stage_config():
     diffusion_od_config = object()
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
         stage_clients=[
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion", od_config=diffusion_od_config),
-        ]
+        ],
     )
 
     assert omni.get_diffusion_od_config() is diffusion_od_config
@@ -537,13 +603,31 @@ def test_get_diffusion_od_config_falls_back_to_inner_engine():
     diffusion_od_config = object()
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")],
         stage_clients=[
             SimpleNamespace(stage_type="llm"),
             SimpleNamespace(stage_type="diffusion", _engine=SimpleNamespace(od_config=diffusion_od_config)),
-        ]
+        ],
     )
 
     assert omni.get_diffusion_od_config() is diffusion_od_config
+
+
+@pytest.mark.asyncio
+async def test_async_omni_rejects_diffusion_list_prompt_without_stage_clients(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    engine.stage_clients = []
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(ValueError, match="single prompt per request"):
+            async for _ in app.generate(prompt=["prompt-1", "prompt-2"], request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1133,6 +1217,7 @@ def test_async_omni_errored_property_alive():
     )
 
     assert omni.errored is False
+    assert omni.is_stopped is False
 
 
 def test_async_omni_errored_property_dead_engine():
@@ -1143,6 +1228,7 @@ def test_async_omni_errored_property_dead_engine():
     )
 
     assert omni.errored is True
+    assert omni.is_stopped is True
 
 
 def test_async_omni_errored_false_when_stage_dead():

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Phase 1 foundation types (RFC #1601).
 
 Note: Uses importlib to load modules directly, bypassing the vllm_omni
@@ -7,9 +9,13 @@ package __init__ which requires the vllm base package.
 import importlib.util
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 # ── Load modules without triggering vllm_omni.__init__ ─────────────
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -19,6 +25,7 @@ _OUTPUTS_DIR = Path(__file__).resolve().parents[2] / "vllm_omni" / "outputs"
 
 def _load_module(name: str, filepath: Path):
     spec = importlib.util.spec_from_file_location(name, filepath)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
@@ -37,45 +44,155 @@ _mm_mod = _load_module(
     "vllm_omni.outputs.mm_outputs",
     _OUTPUTS_DIR / "mm_outputs.py",
 )
+_accumulation_mod = _load_module(
+    "vllm_omni.outputs.multimodal_accumulation",
+    _OUTPUTS_DIR / "multimodal_accumulation.py",
+)
 
 OutputModality = _om_mod.OutputModality
 TensorAccumulationStrategy = _om_mod.TensorAccumulationStrategy
 get_accumulation_strategy = _om_mod.get_accumulation_strategy
 register_key_accumulation_strategy = _om_mod.register_key_accumulation_strategy
-MultimodalPayload = _mm_mod.MultimodalPayload
+if not TYPE_CHECKING:
+    MultimodalPayload = _mm_mod.MultimodalPayload
 MultimodalCompletionOutput = _mm_mod.MultimodalCompletionOutput
 
 
-def test_output_modality_parsing_and_flags():
-    """Test OutputModality enum: from_string, aliases, compounds, properties, and accumulation strategy."""
-    # Defaults
-    assert OutputModality.from_string(None) == OutputModality.TEXT
-    assert OutputModality.from_string("") == OutputModality.TEXT
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, OutputModality.TEXT),
+        ("text", OutputModality.TEXT),
+        ("image", OutputModality.IMAGE),
+        ("audio", OutputModality.AUDIO),
+        ("latent", OutputModality.LATENT),
+        ("token_ids", OutputModality.TOKEN_IDS),
+        ("text+token_ids", OutputModality.TEXT | OutputModality.TOKEN_IDS),
+        ("token_ids,latent", OutputModality.TOKEN_IDS | OutputModality.LATENT),
+        ("text+image", OutputModality.TEXT | OutputModality.IMAGE),
+        ("text,audio", OutputModality.TEXT | OutputModality.AUDIO),
+        ("latent+image,audio", OutputModality.LATENT | OutputModality.IMAGE | OutputModality.AUDIO),
+        ("image+text", OutputModality.TEXT | OutputModality.IMAGE),
+        ("audio+audio", OutputModality.AUDIO),
+    ],
+)
+def test_output_modality_parses_canonical_names(value, expected):
+    assert OutputModality.from_string(value) == expected
 
-    # Direct names and case insensitivity
-    assert OutputModality.from_string("image") == OutputModality.IMAGE
-    assert OutputModality.from_string("Audio") == OutputModality.AUDIO
 
-    # Aliases
-    assert OutputModality.from_string("speech") == OutputModality.AUDIO
-    assert OutputModality.from_string("latents") == OutputModality.LATENT
-    assert OutputModality.from_string("pixel_values") == OutputModality.IMAGE
+@pytest.mark.parametrize(
+    "value",
+    [
+        "speech",
+        "images",
+        "latents",
+        "wav",
+        "waveform",
+        "pixel_values",
+        "pixels",
+        "tokens",
+        "text+speech",
+        "token_ids+tokens",
+        "TOKEN_IDS",
+        "token_ids ",
+        "Audio",
+        "TEXT",
+        "text+Image",
+        " audio",
+        "audio ",
+        "text +audio",
+        "text, audio",
+        "text\taudio",
+        "audio\n",
+        "",
+        " ",
+        "+audio",
+        "audio,",
+        "text++audio",
+        "text,,audio",
+        "text+,audio",
+        "video",
+        "text+unknown",
+    ],
+)
+def test_output_modality_rejects_noncanonical_names(value):
+    with pytest.raises(ValueError, match="Unknown modality"):
+        OutputModality.from_string(value)
 
-    # Compound
+
+def test_output_modality_flags_and_accumulation_strategy():
     compound = OutputModality.from_string("text+image")
     assert compound.has_text and compound.has_multimodal
 
     # Flag properties
     assert OutputModality.TEXT.has_text and not OutputModality.TEXT.has_multimodal
     assert OutputModality.IMAGE.has_multimodal and not OutputModality.IMAGE.has_text
+    assert OutputModality.TOKEN_IDS.has_multimodal and not OutputModality.TOKEN_IDS.has_text
+    assert OutputModality.TOKEN_IDS != OutputModality.LATENT
 
     # Accumulation strategy
     assert get_accumulation_strategy(OutputModality.AUDIO) == TensorAccumulationStrategy.CONCAT_LAST
     assert get_accumulation_strategy(OutputModality.IMAGE) == TensorAccumulationStrategy.CONCAT_DIM0
+    assert get_accumulation_strategy(OutputModality.TOKEN_IDS) == TensorAccumulationStrategy.CONCAT_DIM0
 
-    # Unknown raises
-    with pytest.raises(ValueError, match="Unknown modality"):
-        OutputModality.from_string("video")
+
+@pytest.mark.parametrize("producer_key", [None, "model_outputs", "hidden", "token_ids"])
+def test_token_id_payload_preserves_discrete_primary_output(producer_key):
+    token_ids = torch.tensor([[12, 85], [206, 7]], dtype=torch.long)
+    raw = token_ids if producer_key is None else {producer_key: token_ids}
+
+    payload = MultimodalPayload.from_raw(raw, "token_ids")
+
+    assert payload is not None
+    assert set(payload) == {"token_ids"}
+    torch.testing.assert_close(payload["token_ids"], token_ids)
+
+
+def test_token_id_payload_keeps_explicit_latents_and_image_ids_separate():
+    token_ids = torch.tensor([12, 85, 206], dtype=torch.long)
+    latent = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+    prior_image = torch.tensor([4, 5], dtype=torch.long)
+
+    payload = MultimodalPayload.from_raw(
+        {"model_outputs": token_ids, "latent": latent, "ids.prior_image": prior_image},
+        "token_ids",
+    )
+
+    assert payload is not None
+    assert set(payload) == {"token_ids", "latent", "ids.prior_image"}
+    torch.testing.assert_close(payload["token_ids"], token_ids)
+    torch.testing.assert_close(payload["latent"], latent)
+    torch.testing.assert_close(payload["ids.prior_image"], prior_image)
+
+
+def test_token_id_payload_consolidates_dim0_and_respects_key_overrides():
+    reference_key = "__test_token_ids__.reference"
+    register_key_accumulation_strategy(reference_key, TensorAccumulationStrategy.REPLACE)
+    first_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    last_ids = torch.tensor([[5, 6]], dtype=torch.long)
+    first_ref = torch.tensor([[7, 8]], dtype=torch.long)
+    last_ref = torch.tensor([[9, 10]], dtype=torch.long)
+    payload = MultimodalPayload()
+    payload.tensors["token_ids"] = [first_ids, last_ids]
+    payload.tensors[reference_key] = [first_ref, last_ref]
+
+    payload.consolidate_tensors(OutputModality.TOKEN_IDS)
+
+    torch.testing.assert_close(payload["token_ids"], torch.cat([first_ids, last_ids], dim=0))
+    torch.testing.assert_close(payload[reference_key], last_ref)
+
+
+def test_delta_drain_retains_token_ids_and_latents():
+    token_ids = torch.tensor([12, 85], dtype=torch.long)
+    latent = torch.tensor([[0.1, 0.2]])
+    payload = MultimodalPayload.from_dict({"token_ids": token_ids, "latent": latent, "audio": torch.ones(4)})
+    assert payload is not None
+
+    _accumulation_mod.drain_delta_payload(payload)
+
+    assert set(payload) == {"token_ids", "latent"}
+    torch.testing.assert_close(payload["token_ids"], token_ids)
+    torch.testing.assert_close(payload["latent"], latent)
 
 
 def test_multimodal_payload_and_completion_output():
@@ -107,7 +224,7 @@ def test_multimodal_payload_and_completion_output():
 def test_output_modality_printed_examples(capsys):
     """Printed examples for output modality types."""
     print("\n=== OutputModality Parsing ===")
-    for s in [None, "", "image", "Audio", "speech", "latents", "pixel_values", "text+image"]:
+    for s in [None, "text", "image", "audio", "latent", "text+image", "text,audio"]:
         print(f"  from_string({s!r:20s}) -> {OutputModality.from_string(s)}")
 
     print("\n=== Flag Properties ===")

@@ -160,7 +160,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     def validate_client_extra_body(self, extra_body):
         if not isinstance(extra_body, Mapping):
             return
-        if extra_body.get("auto_response") or extra_body.get("full_duplex"):
+        if extra_body.get("auto_response"):
             raise DuplexRuntimeConfigError(
                 "Qwen requires server VAD or explicit commits; native auto_response is unsupported"
             )

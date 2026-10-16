@@ -10,8 +10,19 @@
 #     first-chunk latency (not correctness).
 #   * Stage 1 (code2wav) wraps the external Mimi codec. Each codec frame is
 #     8 active codebooks (cb 0..7) -> 1920 PCM samples @ 24 kHz / 12.5 Hz.
-#   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) is eager because the
-#     external decoder performs host-to-device copies that cannot be captured.
+#   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) runs with
+#     enforce_eager because the external decoder performs host-to-device copies
+#     that the runner cannot capture. The streaming Mimi encode (Stage 0) and
+#     decode (Stage 1) frame steps instead replay model-local CUDA graphs
+#     (hf_overrides.mimi_cuda_graphs), bitwise equal to eager. The graphs add
+#     about 80 MiB on Stage 0 and 5 MiB per decoder slot on Stage 1.
+#   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0.
+#     To serve more sessions, raise duplex_session.max_sessions and both stages'
+#     max_num_seqs together, and size Stage 0 gpu_memory_utilization for
+#     N x 1.5 GiB of KV: on a 141 GB card, utilization 0.75 holds about 60 full
+#     windows. Measured there (Stage 1 at 0.15), 64 concurrent 30 s sessions
+#     (375 frames each) stayed realtime. Longer sessions also cost more per
+#     step as their context fills.
 pipeline: personaplex
 session_mode: duplex
 duplex_session:
@@ -24,9 +35,10 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_streaming: true
-      # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk.
-      codec_chunk_frames: 5
-      # Emit only the first audio chunk early, then return to codec_chunk_frames.
+      # Mimi runs at 12.5 Hz (80 ms / frame). Send every frame as soon as it
+      # is decoded: a larger chunk holds each frame until the chunk fills,
+      # which adds (codec_chunk_frames - 1) / 2 frames of output latency.
+      codec_chunk_frames: 1
       initial_codec_chunk_frames: 1
 
 stages:
@@ -38,11 +50,18 @@ stages:
     # Prompt IDs are placeholders; voice/persona/audio semantics live in
     # request-specific embeddings, so token-ID prefix caching is invalid.
     enable_prefix_caching: false
-    async_scheduling: true
+    # Every live session appends one frame per 80 ms tick as a one-token
+    # resumable request. With async scheduling the next step is scheduled
+    # before a session's previous frame is parked, so a session can join only
+    # every other step and concurrent sessions split into alternating batches.
+    # Synchronous scheduling puts every waiting frame in one step.
+    async_scheduling: false
     max_num_batched_tokens: 512
     # Temporal transformer sliding_window is 3000 frames; keep model len within.
     max_model_len: 3000
     devices: "0"
+    hf_overrides:
+      mimi_cuda_graphs: true
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -68,6 +87,8 @@ stages:
     max_num_batched_tokens: 65536
     max_model_len: 65536
     devices: "0"
+    hf_overrides:
+      mimi_cuda_graphs: true
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:

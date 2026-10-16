@@ -38,6 +38,19 @@ def get_prompt(prompt_type="text"):
     return prompts.get(prompt_type, prompts["text"])
 
 
+# ``core_model`` runs load random weights (``load_format: dummy``), which do
+# not emit codec EOS reliably. Without an explicit budget those requests run to
+# the server's text-derived ceiling, which rejects the incomplete audio. Give
+# them a fixed caller budget; ``advanced_model`` runs keep the derived budget
+# and must end on a real EOS.
+_DUMMY_WEIGHTS_MAX_NEW_TOKENS = 64
+
+
+def codec_budget(run_level: str) -> dict[str, int]:
+    """Explicit ``max_new_tokens`` for dummy-weight runs, none for real weights."""
+    return {"max_new_tokens": _DUMMY_WEIGHTS_MAX_NEW_TOKENS} if run_level == "core_model" else {}
+
+
 def get_max_batch_size(size_type="few"):
     """Batch size for concurrent requests (same as test_qwen3_omni)."""
     batch_sizes = {"few": 5, "medium": 100, "large": 256}
@@ -66,6 +79,54 @@ default_tts_server_params = [
     )
 ]
 
+# Exercise the throughput path in the existing L4 lane with smaller capacities.
+# The production H200 profile retains its own admission and graph buckets.
+_FAST_PATH_STAGE_CONFIG = modify_stage_config(
+    get_deploy_config_path("qwen3_tts_high_concurrency_mrv2_single_gpu.yaml"),
+    updates={
+        # The temporary overlay lives outside deploy/, so anchor its parent.
+        "base_config": get_deploy_config_path("qwen3_tts_high_concurrency_mrv2.yaml"),
+        "cuda_mps": False,
+        "connectors.connector_of_shared_memory.extra.decode_batch_max_size": 2,
+        "connectors.connector_of_shared_memory.extra.decode_cudagraph_batch_sizes": [1, 2],
+        "stages": {
+            0: {
+                "max_num_seqs": 4,
+                "max_num_batched_tokens": 128,
+                "compilation_config.cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                "compilation_config.max_cudagraph_capture_size": 128,
+            },
+            1: {"max_num_seqs": 4},
+        },
+    },
+)
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    [OmniServerParams(model=MODEL, stage_config_path=_FAST_PATH_STAGE_CONFIG, server_args=["--trust-remote-code"])],
+    indirect=True,
+)
+def test_cached_predictor_streaming_audio(omni_server, online_client, run_level) -> None:
+    """Cover the optimized predictor, first audio and codec path with real weights at L3."""
+    online_client.send_audio_speech_request(
+        {
+            "model": omni_server.model,
+            "input": "The quick brown fox jumps over the lazy dog.",
+            "stream": True,
+            "stream_format": "audio",
+            "response_format": "wav",
+            "task_type": "CustomVoice",
+            "voice": "vivian",
+            **codec_budget(run_level),
+        },
+        request_num=4,
+    )
+
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
@@ -93,7 +154,7 @@ def test_default_cuda_graph_startup(omni_server) -> None:
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, online_client) -> None:
+def test_text_to_audio_001(omni_server, online_client, run_level) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -109,6 +170,7 @@ def test_text_to_audio_001(omni_server, online_client) -> None:
         "response_format": "wav",
         "task_type": "CustomVoice",
         "voice": "vivian",
+        **codec_budget(run_level),
     }
 
     online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
@@ -119,7 +181,7 @@ def test_text_to_audio_001(omni_server, online_client) -> None:
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_002(omni_server, online_client) -> None:
+def test_text_to_audio_002(omni_server, online_client, run_level) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -136,6 +198,7 @@ def test_text_to_audio_002(omni_server, online_client) -> None:
         "response_format": "wav",
         "task_type": "CustomVoice",
         "voice": "vivian",
+        **codec_budget(run_level),
     }
 
     online_client.send_audio_speech_request(request_config)

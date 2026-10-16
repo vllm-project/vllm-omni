@@ -178,7 +178,7 @@ t = s * u / (1 + (s - 1) * u)
 ```
 
 and a large `s` pushes most positions toward `t ≈ 1`. With the default `s = 12` and
-`num_inference_steps = 50` (50 sigma points, `N = 49` denoiser forwards), the published sequence
+`num_inference_steps = 49` (50 sigma points, `N = 49` denoiser forwards), the sequence
 starts `1.000, 0.998, 0.996, 0.995, 0.993, ...` and stays above `0.9` for 28 steps, giving:
 
 | `disabled_until_timestep` | Dense steps | Skip-Softmax steps |

@@ -55,7 +55,7 @@ Defined in `pyproject.toml`:
 | `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
 | `local_model`      | Tests requiring local / non-HF-hub model weights                                                        |
 
-\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility). Do **not** write `pytest.mark.H100` / `pytest.mark.L4` (or other SKU names) by hand: `check-mark` rejects that so `cards_{n}` cannot be skipped.
+\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility). Do **not** write `[hardware-platform]` marks other than `cpu` (`pytest.mark.gpu`, `pytest.mark.cuda`, `pytest.mark.rocm`, `pytest.mark.xpu`, `pytest.mark.npu`, `pytest.mark.musa`) or SKU names (`pytest.mark.H100`, `pytest.mark.L4`, …) by hand. `check-mark` rejects those so they go through `hardware_test` / `hardware_marks` and a SKU plus `cards_{n}` cannot be skipped. `pytest.mark.cpu` stays direct because CPU has no SKU.
 
 #### Example usage for markers
 
@@ -78,7 +78,7 @@ def test_video_to_audio()
 This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/helpers/mark.py` performs the following actions:
 
 1. **Applies platform and resource markers**  
-   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`, `A5`, `310P`).
+   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`, `A5`, `310P`). The helper emits these marks; test files do not write them:
    ```python
    @pytest.mark.cuda
    @pytest.mark.L4
@@ -159,7 +159,8 @@ When `mark` is present, it must be an **array** with exactly one ``hardware_mark
 }
 ```
 
-- Local bulk load: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
+- Local bulk load: `pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and H100"` (omni/TTS and `/v1/images/*` + `/v1/videos` diffusion)
+- Diffusion chat-completions remaining cases: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
 - Nightly CI perf steps: `--test-config-file tests/dfx/perf/tests/test_<model>_vllm_omni.json` (file selects cases; no `-m`)
 - Result filenames use **runtime** GPU detection (`get_runtime_resource_label`); `H100` is omitted on the default CI pool
 
@@ -182,7 +183,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
        "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
    ]
    ```
-   `check-mark` treats `[hardware-platform]` names (including `cpu`/`gpu`) as allowed `pytest.mark.<name>` values. `hardware_test(res=...)` still rejects `cpu`/`gpu` as `res` keys.
+   `check-mark` rejects every `[hardware-platform]` mark except `cpu`. Write `gpu` / `cuda` / `rocm` / `xpu` / `npu` / `musa` (and any new accelerator platform added here) through `hardware_test` / `hardware_marks` so the platform, a `[hardware-resource]` SKU, and `cards_{n}` are attached. `pytest.mark.cpu` stays direct because `cpu` has no SKU. `hardware_test(res=...)` rejects `cpu` and `gpu` as `res` keys; `gpu` is auto-added for platforms tagged `[gpu]`.
 2. **Implement a marker construction function for your platform** in `vllm-omni/tests/helpers/mark.py`:
    ```python
    # In vllm-omni/tests/helpers/mark.py
@@ -555,7 +556,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
-    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
+    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/run_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/run_stability_wan22.py` (or add `run_stability_<model>.py` alongside a matching JSON config)
     - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`).
 - ***Script Example***:
 
@@ -564,7 +565,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 ##### Stability
 
-When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/test_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
+When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/run_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
 
 ```json
 {

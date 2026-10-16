@@ -19,6 +19,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
@@ -93,7 +94,7 @@ def tiny_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
 class CapablePipeline:
     def __init__(self, spec: ARDiffusionKVCacheSpec) -> None:
         self.spec = spec
-        self.bound_state = None
+        self.bound_state: ARDiffusionKVState | None = None
         self.binds: list[str] = []
         self.resets: list[str] = []
         self.closes: list[str] = []
@@ -376,10 +377,17 @@ def test_lru_eviction_releases_blocks_and_notifies_pipeline():
 
 def test_budget_reduced_capacity_drives_runner_lru():
     pipeline = CapablePipeline(tiny_spec(capacity=2))
-    # One tiny LingBot-like session requires 128 bytes; two require 192.
+    # One tiny LingBot-like session requires 1,808 bytes; two require 2,592.
+    #
+    # These read 128 and 192 while the paging unit was the frame. tiny_spec
+    # declares one token per frame, so it used to page a single token at a
+    # time -- a block size no attention kernel accepts. Paging at 16 makes
+    # each page sixteen times larger. The block *counts* are unchanged, and
+    # so is what this test is about: a budget that fits fewer sessions than
+    # the pipeline asked for must drive the runner's LRU.
     runner = make_runner(
         pipeline,
-        available_bytes=128,
+        available_bytes=2048,
         gpu_memory_fraction=1.0,
     )
     kv = runner.kv_cache
@@ -424,6 +432,7 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
 
     def boom(self, req, kv_prefetch_job=None):
         state = pipeline.bound_state
+        assert state is not None
         ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
         ctx.ensure_video_slots(torch.device("cpu"))
         raise RuntimeError("layer exploded")
@@ -444,6 +453,34 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
 
 
+def test_decode_failure_after_kv_commit_releases_session(monkeypatch):
+    pipeline = CapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline)
+    kv = runner.kv_cache
+    assert kv is not None
+    free_total = kv.manager.block_pool.get_num_free_blocks()
+
+    def decode_failure(self, req, kv_prefetch_job=None):
+        state = commit_one_block(runner, "broken", "main")
+        assert state is pipeline.bound_state
+        assert state._committed["main"] > 0
+        raise RuntimeError("VAE decode failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", decode_failure)
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
+
+    with pytest.raises(RuntimeError, match="VAE decode failed"):
+        runner.execute_model(request)
+
+    assert pipeline.closes == ["broken"]
+    assert not runner._sessions
+    assert not kv._adapters
+    assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
 def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
     pipeline = CapablePipeline(lingbot_like_spec())
     runner = make_runner(pipeline)
@@ -453,6 +490,7 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
 
     def return_after_allocation(self, req, kv_prefetch_job=None):
         state = pipeline.bound_state
+        assert state is not None
         ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
         ctx.ensure_video_slots(torch.device("cpu"))
         return object()
@@ -564,6 +602,40 @@ def test_execute_stepwise_exception_releases_kv_and_does_not_resume_pages(monkey
     assert second is not first
 
 
+def test_execute_stepwise_decode_error_after_kv_commit_releases_session(monkeypatch):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    kv = runner.kv_cache
+    assert kv is not None
+    free_total = kv.manager.block_pool.get_num_free_blocks()
+
+    def decode_error(self, scheduler_output):
+        state = commit_one_block(runner, "req-1", "main")
+        assert state is pipeline.bound_state
+        assert state._committed["main"] > 0
+        return BatchRunnerOutput.from_list(
+            [
+                RunnerOutput(
+                    request_id="req-1",
+                    finished=True,
+                    result=DiffusionOutput(error="VAE decode failed"),
+                )
+            ]
+        )
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", decode_error)
+    output = runner.execute_stepwise(scheduler_output())
+
+    assert output.get_request_output("req-1").result.error == "VAE decode failed"
+    assert pipeline.closes == ["req-1"]
+    assert not runner._sessions
+    assert not kv._adapters
+    assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
 def test_execute_stepwise_closes_session_for_scheduler_aborted_request(monkeypatch):
     from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 
@@ -665,3 +737,106 @@ def test_pipeline_without_warmup_provider_is_safely_skipped(monkeypatch):
     monkeypatch.setattr(runner, "execute_model", fail_if_called)
     runner._warmup_ar_rollout()
     assert execute.called is False
+
+
+# ── paging unit vs eviction unit ────────────────────────────────────────────
+
+
+def test_a_frame_that_is_already_a_legal_block_keeps_its_paging():
+    """Every resolution that runs today must page exactly as it does today."""
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    for tokens_per_frame in (16, 320, 1440, 4096):
+        assert tokens_per_frame % 16 == 0
+        assert paging_block_size(tokens_per_frame) == tokens_per_frame
+
+
+def test_a_frame_the_kernel_would_reject_pages_at_the_finest_legal_unit():
+    """832x480 is the checkpoint's own default and the kernel rejects it.
+
+    (480/16) x (832/16) = 1560 tokens per frame, and 1560 % 16 == 8, so a
+    frame-sized block is not something FlashAttention's paged kernel accepts.
+    """
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    assert 1560 % 16 == 8
+    assert paging_block_size(1560) == 16
+    # And whatever it returns is always something the kernel takes.
+    for tokens_per_frame in range(1, 200):
+        assert paging_block_size(tokens_per_frame) % 16 == 0
+
+
+# ── the kernel's constraint is data, not a constant ─────────────────────────
+
+
+def _multiple_of(base):
+    from vllm.v1.attention.backend import MultipleOf
+
+    return MultipleOf(base)
+
+
+def test_the_dispatching_module_answers_in_vllms_own_vocabulary():
+    """AR-Diffusion calls flash_attn itself, so no backend can be asked.
+
+    The answer has to come from the module that picks the kernel, and it has to
+    have the shape vLLM uses, so the policy that consumes it does not care
+    where it came from.
+    """
+    from vllm.v1.attention.backend import MultipleOf
+
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import supported_kernel_block_sizes
+
+    advertised = supported_kernel_block_sizes()
+    assert advertised, "a kernel that accepts nothing cannot be paged for"
+    for entry in advertised:
+        assert isinstance(entry, int | MultipleOf)
+
+
+def test_a_kernel_that_takes_one_fixed_size_gets_that_size():
+    """hpc_attn advertises [64] -- not a multiple, a single legal value.
+
+    A frame of 1560 tokens is not 64, and 1560 % 64 == 24, so the frame cannot
+    be the block and the only thing left to page at is 64. Assuming multiples
+    of 16 here would hand the kernel a block size it rejects.
+    """
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    assert 1560 % 64 == 24
+    assert paging_block_size(1560, [64]) == 64
+    assert paging_block_size(64, [64]) == 64
+    assert paging_block_size(128, [64]) == 64  # a legal multiple is still not the advertised size
+
+
+def test_a_kernel_with_large_pages_still_keeps_a_whole_frame_when_it_fits():
+    """FlashInfer offers 128-and-up pages on Blackwell and not on Hopper.
+
+    The same checkpoint on the two cards must therefore page differently, which
+    is exactly what a constant cannot express.
+    """
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    hopper = [_multiple_of(16)]
+    blackwell = [_multiple_of(16), 128, 256]
+    assert paging_block_size(1440, hopper) == 1440  # a legal multiple of 16
+    assert paging_block_size(1440, blackwell) == 1440
+    assert paging_block_size(1560, hopper) == 16
+    assert paging_block_size(1560, blackwell) == 16  # finest legal unit, not the largest
+
+
+def test_whatever_comes_back_is_always_something_the_kernel_accepts():
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    for advertised, check in (
+        ([_multiple_of(16)], lambda n: n % 16 == 0),
+        ([64], lambda n: n == 64),
+        ([_multiple_of(32), 48], lambda n: n % 32 == 0 or n == 48),
+    ):
+        for tokens_per_frame in range(1, 300):
+            assert check(paging_block_size(tokens_per_frame, advertised))
+
+
+def test_a_kernel_that_advertises_nothing_is_an_error_not_a_guess():
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    with pytest.raises(ValueError, match="no legal block size"):
+        paging_block_size(1560, [])

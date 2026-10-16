@@ -7,10 +7,11 @@ import pytest
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.ltx2.ops import resolve_ltx2_vae_operators
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 
 def _selected_fna():

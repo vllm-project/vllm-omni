@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import base64
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,6 +28,7 @@ from vllm_omni.engine.duplex.commands import (
     UpdateSession,
 )
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -77,6 +79,7 @@ async def open_qwen():
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
     manager = DuplexSessionManager(
         plugin=plugin,
         stage_port=port,
@@ -86,10 +89,21 @@ async def open_qwen():
         model_config=None,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
-    await manager.handle(OpenDuplexSessionMessage(control_id="open", session_id=SESSION_ID, session_config=config))
+    await manager.handle(
+        OpenDuplexSessionMessage(
+            control_id="open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
+        )
+    )
     result = await results.get()
     assert result.ok, result
-    harness = Harness(manager, port, output, results, manager.runners[SESSION_ID])
+    harness = Harness(
+        manager=manager,
+        port=port,
+        output=output,
+        output_buffer=output_buffer,
+        results=results,
+        runner=manager.runners[SESSION_ID],
+    )
     await harness.settle()
     return harness
 
@@ -944,5 +958,27 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
             actual = submission.prompt["multi_modal_data"]["image"][0]
             assert saved.size == actual.size
             assert saved.tobytes() == actual.tobytes()
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_listen_audio_commit_does_not_use_video_deferred_response():
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": None}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.run(replace(append_audio(), hints={"overlap_action": "listen"}))
+        await h.run(Commit(final=True, create_response=True))
+        assert not h.runner.model_state.deferred_response_create
+        assert h.runner.model_state.committed_audio_payload is None
+        assert h.runner.model_state.audio_buffer.has_pending()
+        await h.deliver_and_settle(tts_output(request_id, text="Hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert len(h.port.submissions) == 1
     finally:
         await h.manager.shutdown()

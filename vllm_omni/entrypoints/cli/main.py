@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 CLI entry point for vLLM-Omni that intercepts vLLM commands.
 """
@@ -24,6 +27,7 @@ def main():
             os.environ["VLLM_LOGGING_COLOR"] = "1"
 
         from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+        from vllm.logger import configure_logging_from_args
 
         import vllm_omni.entrypoints.cli.benchmark.main
         import vllm_omni.entrypoints.cli.serve
@@ -66,6 +70,7 @@ def main():
                 cmds[cmd.name] = cmd
         args = parser.parse_args()
         if args.subparser in cmds:
+            configure_logging_from_args(args)
             cmds[args.subparser].validate(args)
 
         if hasattr(args, "dispatch_function"):

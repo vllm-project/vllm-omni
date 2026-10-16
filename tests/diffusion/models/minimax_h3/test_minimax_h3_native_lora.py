@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import save_file
 from vllm.lora.lora_weights import PackedLoRALayerWeights
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3.npu import lora as lora_module
 from vllm_omni.diffusion.models.minimax_h3.npu.lora import load_minimax_h3_native_lora
@@ -710,6 +711,8 @@ def test_lora_manager_activates_native_packed_qkv(tmp_path):
     assert isinstance(packed, PackedLoRALayerWeights)
     assert len(packed.lora_b) == 3
     assert all(b.shape[0] == _TINY_QKV_SLICE for b in packed.lora_b)
+    # This fixture only exposes one layer, so activate only its LoRA weights.
+    lora_model.loras = {"blocks.0.attn.qkv_proj": packed}
 
     class _DummyLoRALayer:
         def __init__(self):
@@ -833,7 +836,7 @@ def test_native_lora_load_is_platform_agnostic(tmp_path, dtype):
     assert {name: tensor.dtype for name, tensor in tensors.items() if tensor.dtype != dtype} == {}
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 def test_native_lora_delta_matches_between_cpu_and_cuda(tmp_path):
     """The packed adapter produces the same delta weight on CUDA as on CPU.

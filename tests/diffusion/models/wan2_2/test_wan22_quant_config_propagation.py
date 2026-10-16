@@ -195,6 +195,17 @@ class TestSetTfModelConfig:
 class TestPatchWanRmsNorm:
     """Test that patch_wan_rms_norm doesn't raise on concurrent module registration."""
 
+    @pytest.fixture(autouse=True)
+    def restore_wan_rms_norm(self):
+        originals = [
+            (module, module.__dict__["WanRMS_norm"])
+            for module in list(sys.modules.values())
+            if getattr(module, "__dict__", None) is not None and "WanRMS_norm" in module.__dict__
+        ]
+        yield
+        for module, original in originals:
+            module.__dict__["WanRMS_norm"] = original
+
     def test_patches_modules_with_wan_rms_norm(self):
         from vllm_omni.diffusion.models.wan2_2.norm import RMSNormVAE
         from vllm_omni.diffusion.models.wan2_2.patch_diffusers import patch_wan_rms_norm

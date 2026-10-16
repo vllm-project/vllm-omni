@@ -11,6 +11,7 @@ This script tests two main scenarios:
 
 import sys
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -21,6 +22,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
+from vllm_omni.diffusion.attention.capabilities import CompilationMode, ExecutionContext, SupportStatus
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -54,6 +56,81 @@ def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_vers
         fa._choose_vllm_flash_attn_version(9, "5", frozenset((2, 3, 4)))
     with pytest.raises(RuntimeError, match="FlashAttention 4 is unavailable"):
         fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
+
+
+def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch):
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 3, 5, 4, 8
+    query = torch.randn(batch_size, seqlen_q, num_heads, head_dim)
+    key = torch.randn(batch_size, seqlen_k, num_heads, head_dim)
+    value = torch.randn_like(key)
+    packed_out = torch.randn(batch_size * seqlen_q, num_heads, head_dim)
+    packed_lse = torch.arange(num_heads * batch_size * seqlen_q).reshape(num_heads, -1)
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(q, k, v, **kwargs):
+        captured.update(q=q, k=k, v=v, **kwargs)
+        return packed_out, packed_lse
+
+    monkeypatch.setattr(fa, "vllm_flash_attn_varlen_with_lse", fake_varlen)
+
+    out, lse = fa.vllm_flash_attn_dense_with_lse(query, key, value, causal=True, softmax_scale=0.25)
+
+    assert out.shape == query.shape
+    assert torch.equal(out.flatten(0, 1), packed_out)
+    assert lse.shape == (batch_size, num_heads, seqlen_q)
+    assert torch.equal(lse, packed_lse.unflatten(1, (batch_size, seqlen_q)).permute(1, 0, 2))
+    assert captured["q"].shape == (batch_size * seqlen_q, num_heads, head_dim)
+    assert captured["k"].shape == (batch_size * seqlen_k, num_heads, head_dim)
+    assert captured["v"].shape == (batch_size * seqlen_k, num_heads, head_dim)
+    assert torch.equal(captured["cu_seqlens_q"], torch.tensor([0, 3, 6], dtype=torch.int32))
+    assert torch.equal(captured["cu_seqlens_k"], torch.tensor([0, 5, 10], dtype=torch.int32))
+    assert captured["max_seqlen_q"] == seqlen_q
+    assert captured["max_seqlen_k"] == seqlen_k
+    assert captured["causal"] is True
+    assert captured["softmax_scale"] == 0.25
+
+
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
+def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
+    """Exercise the real versioned vLLM dispatcher and its LSE contract."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 17, 23, 4, 64
+    softmax_scale = head_dim**-0.5
+
+    torch.manual_seed(19)
+    query = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device=device, dtype=dtype)
+    value = torch.randn_like(key)
+
+    capability = torch.cuda.get_device_capability(device)
+    expected_version = 3 if capability[0] == 9 else 2
+    assert capability[0] in (8, 9), f"test expects an Ampere/Ada or Hopper GPU, got SM{capability[0]}{capability[1]}"
+    assert fa.resolve_vllm_flash_attn_version() == expected_version
+
+    output, lse = fa.vllm_flash_attn_dense_with_lse(
+        query,
+        key,
+        value,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+
+    query_bhsd = query.transpose(1, 2)
+    key_bhsd = key.transpose(1, 2)
+    value_bhsd = value.transpose(1, 2)
+    output_ref = torch.nn.functional.scaled_dot_product_attention(
+        query_bhsd,
+        key_bhsd,
+        value_bhsd,
+        scale=softmax_scale,
+    ).transpose(1, 2)
+    logits = torch.matmul(query_bhsd.float(), key_bhsd.float().transpose(-2, -1)) * softmax_scale
+    lse_ref = torch.logsumexp(logits, dim=-1)
+
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -433,6 +510,35 @@ def test_varlen_masked_routing_by_role(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_published_noop_mask_uses_dense_path(monkeypatch):
+    calls = []
+
+    def fake_dense_func(q, k, v, **_kwargs):
+        calls.append("dense")
+        return q
+
+    def fail_varlen(*_args, **_kwargs):
+        raise AssertionError("published no-op mask must not use varlen attention")
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "flash_attn_func", fake_dense_func)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fail_varlen)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones((1, 4), dtype=torch.bool),
+        extra={"attention_mask_mode": "none"},
+    )
+
+    output = impl.forward_cuda(query, query, query, metadata)
+
+    assert torch.equal(output, query)
+    assert calls == ["dense"]
+
+
+@pytest.mark.cpu
 def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     calls = []
 
@@ -548,6 +654,199 @@ def _fake_torch_npu(monkeypatch, *, npu_fusion_attention=None):
     )
     monkeypatch.setitem(sys.modules, "torch_npu", fake)
     return fake
+
+
+@pytest.fixture
+def npu_contract(monkeypatch, mocker):
+    monkeypatch.delenv("MINDIE_SD_FA_TYPE", raising=False)
+    monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: pytest.fail("NPU must not validate FA4"))
+    query = torch.zeros(1, 8, 2, 4)
+    dense = mocker.Mock(return_value=torch.zeros_like(query))
+    packed = mocker.Mock(return_value=torch.zeros_like(query.squeeze(0)))
+    _fake_mindiesd(monkeypatch, attention_forward=dense, attention_forward_varlen=packed)
+    return _npu_impl(), query, dense, packed
+
+
+def _assert_platform_path(impl, platform, query, metadata, path):
+    context = ExecutionContext(platform=platform, require_fullgraph=True)
+    result = impl.resolve_execution_path(context, query, query, query, metadata)
+    assert result.path == path
+    assert result.kernel_variant == {"npu": "mindiesd", "rocm": "aiter"}[platform]
+    assert result.support.status is SupportStatus.UNMIGRATED
+    assert result.compilation_mode is CompilationMode.EAGER_ONLY
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+
+
+def _real_pad_metadata():
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    return AttentionMetadata(
+        extra={
+            "npu_attn_varlen": True,
+            "cu_seqlens_q": cu,
+            "cu_seqlens_k": cu,
+            "max_seqlen_q": 5,
+            "max_seqlen_k": 5,
+        }
+    )
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("kv_cache_dtype", [None, "float", "auto"])
+def test_npu_contract_dense_dispatch(npu_contract, kv_cache_dtype):
+    impl, query, dense, packed = npu_contract
+    metadata = AttentionMetadata(extra={"kv_cache_dtype": kv_cache_dtype})
+    _assert_platform_path(impl, "npu", query, metadata, "npu_dense")
+    impl.forward_npu(query, query, query, metadata)
+    dense.assert_called_once()
+    packed.assert_not_called()
+    assert dense.call_args.kwargs["attn_mask"] is None
+
+
+@pytest.mark.cpu
+def test_npu_contract_mask_layout(npu_contract):
+    impl, query, dense, packed = npu_contract
+    mask = torch.arange(8)[None] < 5
+    metadata = AttentionMetadata(attn_mask=mask)
+    _assert_platform_path(impl, "npu", query, metadata, "npu_masked")
+    impl.forward_npu(query, query, query, metadata)
+    dense.assert_called_once()
+    packed.assert_not_called()
+    torch.testing.assert_close(dense.call_args.kwargs["attn_mask"], mask[:, None, None, :].expand(1, 1, 8, 8))
+
+
+@pytest.mark.cpu
+def test_npu_contract_packed_dispatch(npu_contract):
+    impl, query, dense, packed = npu_contract
+    metadata = _real_pad_metadata()
+    _assert_platform_path(impl, "npu", query, metadata, "npu_packed_varlen")
+    impl.forward_npu(query, query, query, metadata)
+    dense.assert_not_called()
+    packed.assert_called_once()
+    assert packed.call_args.args[3:] == ([0, 5, 8], [0, 5, 8])
+
+
+@pytest.mark.cpu
+def test_npu_contract_prefix_dispatch(npu_contract, monkeypatch):
+    impl, query, dense, packed = npu_contract
+    metadata = _real_pad_metadata()
+    _assert_platform_path(impl, "npu", query, metadata, "npu_packed_varlen")
+    # The same metadata resolves differently after the kernel choice changes.
+    monkeypatch.setenv("MINDIE_SD_FA_TYPE", "ascend_laser_attention")
+    _assert_platform_path(impl, "npu", query, metadata, "npu_prefix_kv_slice")
+    impl.forward_npu(query, query, query, metadata)
+    dense.assert_called_once()
+    packed.assert_not_called()
+    torch.testing.assert_close(dense.call_args.args[1], query[:, :5])
+    torch.testing.assert_close(dense.call_args.args[2], query[:, :5])
+    assert dense.call_args.kwargs["attn_mask"] is None
+
+
+@pytest.mark.cpu
+def test_npu_contract_incomplete_packing_rebuilds_mask(npu_contract):
+    impl, query, dense, packed = npu_contract
+    # CUDA-like normalization rejects this metadata, but NPU can rebuild a mask.
+    metadata = AttentionMetadata(extra={"npu_attn_varlen": True, "max_seqlen_q": 5, "valid_kv_length": 5})
+    _assert_platform_path(impl, "npu", query, metadata, "npu_masked_fallback")
+    impl.forward_npu(query, query, query, metadata)
+    dense.assert_called_once()
+    packed.assert_not_called()
+    mask = (torch.arange(8) < 5)[None, None, None, :].expand(1, 1, 8, 8)
+    torch.testing.assert_close(dense.call_args.kwargs["attn_mask"], mask)
+
+
+@pytest.mark.cpu
+def test_npu_contract_unusable_packing_does_not_run_unmasked(npu_contract):
+    impl, query, dense, packed = npu_contract
+    metadata = AttentionMetadata(extra={"npu_attn_varlen": True})
+    _assert_platform_path(impl, "npu", query, metadata, "npu_masked_fallback")
+    with pytest.raises(ValueError, match="refusing to run unmasked attention"):
+        impl.forward_npu(query, query, query, metadata)
+    dense.assert_not_called()
+    packed.assert_not_called()
+
+
+@pytest.fixture
+def rocm_contract(monkeypatch, mocker):
+    query = torch.zeros(1, 8, 2, 4)
+    dense = mocker.Mock(return_value=torch.zeros_like(query))
+    packed = mocker.Mock(side_effect=lambda *args, **kwargs: torch.zeros_like(args[0] if args else kwargs["q"]))
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "IS_AITER", True)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_func", dense)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", packed)
+    monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: pytest.fail("ROCm must not validate FA4"))
+    return _npu_impl(), query, dense, packed
+
+
+@pytest.mark.cpu
+def test_rocm_contract_dense_dispatch(rocm_contract):
+    impl, query, dense, packed = rocm_contract
+    _assert_platform_path(impl, "rocm", query, None, "rocm_dense")
+    impl.forward_hip(query, query, query)
+    dense.assert_called_once()
+    packed.assert_not_called()
+
+
+@pytest.mark.cpu
+def test_rocm_contract_masked_unpadding(rocm_contract):
+    impl, query, dense, packed = rocm_contract
+    metadata = AttentionMetadata(attn_mask=torch.arange(8)[None] < 5, extra={"attention_mask_mode": "padding"})
+    _assert_platform_path(impl, "rocm", query, metadata, "rocm_masked_varlen")
+    impl.forward_hip(query, query, query, metadata)
+    dense.assert_not_called()
+    packed.assert_called_once()
+    assert packed.call_args.args[0].shape == (5, 2, 4)
+    torch.testing.assert_close(packed.call_args.kwargs["cu_seqlens_k"], torch.tensor([0, 5], dtype=torch.int32))
+
+
+@pytest.mark.cpu
+def test_rocm_contract_multiple_packed_documents(rocm_contract):
+    impl, query, dense, packed = rocm_contract
+    cu = torch.tensor([0, 2, 4, 8], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        extra={
+            "cu_seqlens_q": cu,
+            "cu_seqlens_k": cu,
+            "max_seqlen_q": 4,
+            "max_seqlen_k": 4,
+        }
+    )
+    _assert_platform_path(impl, "rocm", query, metadata, "rocm_packed_varlen")
+    # NPU's [real, pad] path cannot consume this packing contract.
+    assert impl._resolve_packed_seq_npu(query, query, metadata.extra) is None
+    impl.forward_hip(query, query, query, metadata)
+    dense.assert_not_called()
+    packed.assert_called_once()
+    assert packed.call_args.kwargs["cu_seqlens_q"] is cu
+    assert packed.call_args.kwargs["cu_seqlens_k"] is cu
+
+
+@pytest.mark.cpu
+def test_rocm_contract_unknown_mask_stays_runtime_dependent(rocm_contract, monkeypatch):
+    impl, query, dense, packed = rocm_contract
+    metadata = AttentionMetadata(attn_mask=torch.ones(1, 8, dtype=torch.bool))
+    # Resolution may inspect shape/metadata, but must not read mask values.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "any", lambda *_args, **_kwargs: pytest.fail("resolution read mask values"))
+        _assert_platform_path(impl, "rocm", query, metadata, "rocm_runtime_mask_dependent")
+    impl.forward_hip(query, query, query, metadata)
+    dense.assert_called_once()
+    packed.assert_not_called()
+
+
+@pytest.mark.cpu
+def test_rocm_contract_requires_initialized_aiter(monkeypatch):
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "IS_AITER", False)
+    impl = _npu_impl()
+    query = torch.zeros(1, 8, 2, 4)
+    result = impl.resolve_execution_path(
+        ExecutionContext(platform="rocm", kernel_variant="aiter"), query, query, query, None
+    )
+    assert result.path == "rocm_unverified"
+    assert result.kernel_variant is None
+    assert result.support.status is SupportStatus.UNMIGRATED
 
 
 # --- Test group A: boundary resolution (_resolve_packed_seq_npu) -------------

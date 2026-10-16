@@ -1,7 +1,7 @@
 # Keep the ROCm runtime aligned with the vLLM release targeted by
 # docker/Dockerfile.ci. A stale base image can build successfully while failing
 # at runtime when vLLM-Omni imports APIs added by the newer vLLM release.
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.29.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.31.0
 
 # Keep the dependency-heavy portion independent from the source tree. The
 # registry cache is keyed on these inputs, while the final source copy can be
@@ -12,11 +12,11 @@ FROM ${BASE_IMAGE} AS deps
 # BASE_IMAGE pins the default prebuilt runtime when USE_NIGHTLY_BUILD=0.
 # VLLM_VERSION_OR_COMMIT_HASH is consumed only by the opt-in source rebuild when
 # USE_NIGHTLY_BUILD=1. Keep both aligned with docker/Dockerfile.ci's
-# VLLM_BASE_TAG. This is enforced by tests/buildkite/test_rocm_dockerfile.py. An
+# release version. This is enforced by tests/buildkite/test_rocm_dockerfile.py. An
 # intentional custom source pin must update that regression in the same change,
 # and should return to the stable release as soon as one is available.
 ARG USE_NIGHTLY_BUILD=0
-ARG VLLM_VERSION_OR_COMMIT_HASH=v0.29.0
+ARG VLLM_VERSION_OR_COMMIT_HASH=v0.31.0
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
@@ -75,7 +75,8 @@ WORKDIR ${COMMON_WORKDIR}/vllm-omni
 RUN mkdir -p vllm_omni && touch vllm_omni/__init__.py
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+# Scope the override to Omni; dependency source builds need their own versions.
+ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 
 RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
         --no-cache-dir -e ".[dev]" --no-build-isolation && \

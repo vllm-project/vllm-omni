@@ -42,12 +42,34 @@ def cpu_fp8_quant(monkeypatch, mocker):
     return quantize
 
 
-@pytest.fixture
-def dense_fa3(monkeypatch):
+@pytest.fixture(params=["dense", "vllm_varlen"])
+def fa3_kernel(monkeypatch, request):
     fake = _FakeFa3Fp8Kernel()
     monkeypatch.setattr(FlashAttentionImpl, "_fa3_fp8_device_unsupported_reason", staticmethod(lambda device: None))
     monkeypatch.setattr(fa_utils, "FLASH_ATTN_SUPPORTS_FP8", True)
-    monkeypatch.setattr(fa_utils, "flash_attn_func", fake)
+    if request.param == "dense":
+        monkeypatch.setattr(fa_utils, "flash_attn_func", fake)
+    else:
+
+        def fake_varlen(*, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, fa_version, **kwargs):
+            assert fa_version == 3  # The vLLM dispatcher otherwise defaults to FA2.
+            batch = kwargs["q_descale"].shape[0]
+            for cu_seqlens, length in ((cu_seqlens_q, max_seqlen_q), (cu_seqlens_k, max_seqlen_k)):
+                assert cu_seqlens.dtype == torch.int32
+                torch.testing.assert_close(cu_seqlens, torch.arange(batch + 1, dtype=torch.int32) * length)
+            assert q.shape[0] == batch * max_seqlen_q
+            assert k.shape[0] == v.shape[0] == batch * max_seqlen_k
+            out = fake(
+                q=q.unflatten(0, (batch, max_seqlen_q)),
+                k=k.unflatten(0, (batch, max_seqlen_k)),
+                v=v.unflatten(0, (batch, max_seqlen_k)),
+                **kwargs,
+            )
+            return out.flatten(0, 1)
+
+        monkeypatch.setattr(fa_utils, "flash_attn_func", None)
+        monkeypatch.setattr(fa_utils, "flash_attn_varlen_func", fake_varlen)
+        monkeypatch.setattr(fa_utils, "resolve_vllm_flash_attn_version", lambda requested: 3)
     return fake
 
 
@@ -159,7 +181,7 @@ class TestQuantValidation:
         assert FlashAttentionImpl._fa3_fp8_num_splits(kv_seq_len) == expected
 
     @pytest.mark.parametrize("q_heads,kv_heads", [(3, 2), (2, 4), (4, 0), (0, 2)])
-    def test_rejects_invalid_gqa_head_counts(self, dense_fa3, q_heads, kv_heads):
+    def test_rejects_invalid_gqa_head_counts(self, fa3_kernel, q_heads, kv_heads):
         with pytest.raises(ValueError, match="Q heads divisible by KV heads"):
             _make_impl().forward_fa_quant_cuda(
                 _randn_bshd(1, 8, q_heads), _randn_bshd(1, 8, kv_heads), _randn_bshd(1, 8, kv_heads)
@@ -172,7 +194,23 @@ class TestQuantValidation:
         monkeypatch.setattr(FlashAttentionImpl, "_fa3_fp8_device_unsupported_reason", staticmethod(lambda device: None))
         monkeypatch.setattr(fa_utils, "FLASH_ATTN_SUPPORTS_FP8", supports_fp8)
         monkeypatch.setattr(fa_utils, "flash_attn_func", _FakeFa3Fp8Kernel() if has_dense else None)
-        with pytest.raises(ValueError, match="selected diffusion FlashAttention implementation has no dense FA3 FP8"):
+        monkeypatch.setattr(fa_utils, "flash_attn_varlen_func", None)
+        with pytest.raises(ValueError, match="selected diffusion FlashAttention implementation has no FA3 FP8"):
+            _make_impl().forward_fa_quant_cuda(_randn_bshd(1, 8), _randn_bshd(1, 8), _randn_bshd(1, 8))
+        cpu_fp8_quant.assert_not_called()
+
+    def test_rejects_vllm_without_fa3_before_quantization(self, monkeypatch, cpu_fp8_quant):
+        monkeypatch.setattr(FlashAttentionImpl, "_fa3_fp8_device_unsupported_reason", staticmethod(lambda device: None))
+        monkeypatch.setattr(fa_utils, "FLASH_ATTN_SUPPORTS_FP8", True)
+        monkeypatch.setattr(fa_utils, "flash_attn_func", None)
+        monkeypatch.setattr(fa_utils, "flash_attn_varlen_func", lambda **kwargs: pytest.fail("must not run FA2"))
+
+        def unavailable(requested):
+            assert requested == 3
+            raise RuntimeError("FlashAttention 3 is unavailable on this device")
+
+        monkeypatch.setattr(fa_utils, "resolve_vllm_flash_attn_version", unavailable)
+        with pytest.raises(ValueError, match="FlashAttention 3 is unavailable"):
             _make_impl().forward_fa_quant_cuda(_randn_bshd(1, 8), _randn_bshd(1, 8), _randn_bshd(1, 8))
         cpu_fp8_quant.assert_not_called()
 
@@ -251,7 +289,7 @@ class TestForwardFaQuantCudaNumerics:
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("causal", [False, True])
     @pytest.mark.parametrize("deterministic", [False, True])
-    def test_matches_float_reference_within_fp8_tolerance(self, dense_fa3, causal, deterministic, dtype):
+    def test_matches_float_reference_within_fp8_tolerance(self, fa3_kernel, causal, deterministic, dtype):
         torch.manual_seed(0)
         batch, seq, heads, head_dim = 2, 64, 4, 64
         scale = head_dim**-0.5
@@ -265,12 +303,12 @@ class TestForwardFaQuantCudaNumerics:
 
         assert out.shape == (batch, seq, heads, head_dim)
         assert out.dtype == query.dtype
-        assert dense_fa3.calls[0]["qkv_shapes"] == (tuple(query.shape), tuple(key.shape), tuple(value.shape))
-        assert dense_fa3.calls[0]["deterministic"] == deterministic
-        assert dense_fa3.calls[0]["num_splits"] == 1
-        assert dense_fa3.calls[0]["q_descale_shape"] == (batch, heads)
-        assert dense_fa3.calls[0]["k_descale_shape"] == (batch, heads)
-        assert dense_fa3.calls[0]["v_descale_shape"] == (batch, heads)
+        assert fa3_kernel.calls[0]["qkv_shapes"] == (tuple(query.shape), tuple(key.shape), tuple(value.shape))
+        assert fa3_kernel.calls[0]["deterministic"] == deterministic
+        assert fa3_kernel.calls[0]["num_splits"] == 1
+        assert fa3_kernel.calls[0]["q_descale_shape"] == (batch, heads)
+        assert fa3_kernel.calls[0]["k_descale_shape"] == (batch, heads)
+        assert fa3_kernel.calls[0]["v_descale_shape"] == (batch, heads)
 
         expected = _reference_attention(query, key, value, scale, causal=causal)
         rel_err = (out.float() - expected).abs().mean() / expected.abs().mean()
@@ -278,7 +316,7 @@ class TestForwardFaQuantCudaNumerics:
 
     @pytest.mark.parametrize("q_heads,kv_heads", [(4, 2), (8, 2), (4, 1)])
     @pytest.mark.parametrize("causal", [False, True])
-    def test_gqa_tensor_scales_match_reference(self, dense_fa3, cpu_fp8_quant, q_heads, kv_heads, causal):
+    def test_gqa_tensor_scales_match_reference(self, fa3_kernel, cpu_fp8_quant, q_heads, kv_heads, causal):
         torch.manual_seed(1)
         batch, q_len, k_len, head_dim = 2, 32, 48, 64
         impl = FlashAttentionImpl(
@@ -305,14 +343,14 @@ class TestForwardFaQuantCudaNumerics:
         impl_out = impl.forward_fa_quant_cuda(query, key, value, AttentionMetadata(extra={"kv_cache_dtype": "fp8"}))
         assert impl_out.shape == query.shape
         for name in ("q_descale_shape", "k_descale_shape", "v_descale_shape"):
-            assert dense_fa3.calls[0][name] == (batch, kv_heads)
+            assert fa3_kernel.calls[0][name] == (batch, kv_heads)
         assert cpu_fp8_quant.call_count == 3
         # Flattening preserves each tensor's data without head permutations.
         for call, tensor in zip(cpu_fp8_quant.call_args_list, (query, key, value)):
             assert not call.kwargs  # vLLM computes dynamic per-tensor scales.
             assert call.args[0].is_contiguous()
             torch.testing.assert_close(call.args[0], tensor.reshape(batch * tensor.shape[1], -1))
-        for descale, tensor in zip(dense_fa3.calls[0]["descales"], (query, key, value)):
+        for descale, tensor in zip(fa3_kernel.calls[0]["descales"], (query, key, value)):
             expected_scale = tensor.float().abs().amax() / torch.finfo(torch.float8_e4m3fn).max
             torch.testing.assert_close(descale, expected_scale.expand(batch, kv_heads))
         repeat = q_heads // kv_heads

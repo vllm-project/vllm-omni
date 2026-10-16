@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
-import argparse
-import functools
 import json
 import os
 import time
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 import soundfile as sf
@@ -23,23 +21,10 @@ from vllm.multimodal.media.audio import load_audio
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.profiler import add_profiler_config_arg
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
-
-
-def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]:
-    """Parse a CLI value as a JSON object, attributing errors to ``flag_name``."""
-    try:
-        config = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError(f"{flag_name} must be valid JSON: {e}") from e
-    if not isinstance(config, dict):
-        raise argparse.ArgumentTypeError(f"{flag_name} must be a JSON object")
-    return config
-
-
-parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
 class QueryResult(NamedTuple):
@@ -137,7 +122,9 @@ def get_use_audio_in_video_query(
     question = "Describe the content of the video, then convert what the baby say into text."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|><|audio_bos|><|AUDIO|><|audio_eos|>"
+        # With use_audio_in_video=True the processor interleaves the audio into
+        # the video placeholder, so no separate <|AUDIO|> placeholder is used.
+        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -341,6 +328,7 @@ def main(args):
     else:
         query_result = query_func()
     args.quantization_config = quantization_config
+    # ``vars(args)`` forwards the parsed profiler_config to Omni.
     omni_kwargs = vars(args).copy()
     # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
@@ -491,12 +479,7 @@ def parse_args():
         default=300,
         help="Timeout for initializing stages in seconds (default: 300)",
     )
-    parser.add_argument(
-        "--profiler-config",
-        type=parse_profiler_config,
-        default=None,
-        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
-    )
+    add_profiler_config_arg(parser)
     parser.add_argument(
         "--shm-threshold-bytes",
         type=int,

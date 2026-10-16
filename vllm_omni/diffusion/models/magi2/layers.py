@@ -19,7 +19,30 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.layers.mhc import MHCMix, MHCPostResidual, sinkhorn_knopp
+from vllm_omni.diffusion.layers.swiglu7 import SwiGLU7
+from vllm_omni.platforms import current_omni_platform
+
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
+
+_mhc_post_residual = MHCPostResidual()
+_mhc_mix = MHCMix()
+
+
+def _mhc_mix_fp32(
+    streams: torch.Tensor,
+    branch_output: torch.Tensor,
+    post_coefficients: torch.Tensor,
+    residual_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """``MHCMix.forward_native`` with the stream mix as an elementwise contraction in at least FP32."""
+    branch = torch.einsum("tn,tc->tnc", post_coefficients, branch_output)
+    accumulate = torch.promote_types(streams.dtype, torch.float32)
+    mixed = (residual_matrix.to(accumulate).unsqueeze(-1) * streams.to(accumulate).unsqueeze(1)).sum(2)
+    return mixed.to(streams.dtype) + branch
+
+
+_swiglu7_op = SwiGLU7()
 
 
 def swiglu7(
@@ -30,12 +53,11 @@ def swiglu7(
 ) -> torch.Tensor:
     """Released GPT-OSS-style clamped SwiGLU activation."""
 
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    x = x.to(torch.float32)
-    gate, linear = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(max=limit)
-    linear = linear.clamp(min=-limit, max=limit)
-    return (gate * torch.sigmoid(alpha * gate) * (linear + 1.0)).to(out_dtype)
+    # Keep the native expression visible to torch.compile while dispatching
+    # the fused CustomOp for eager inference.
+    if not torch.compiler.is_compiling():
+        return _swiglu7_op(x, alpha, limit, out_dtype)
+    return _swiglu7_op.forward_native(x, alpha, limit, out_dtype)
 
 
 class ModalityDispatcher:
@@ -257,17 +279,23 @@ class MultiModalityRMSNorm(nn.Module):
         tensor: torch.Tensor,
         modality_dispatcher: ModalityDispatcher | None = None,
     ) -> torch.Tensor:
+        """Normalize the last dimension, or the last two when they split ``dim`` features."""
         original_dtype = tensor.dtype
+        split = tensor.shape[-1] != self.dim
+        if split and (tensor.ndim < 2 or tensor.shape[-2] * tensor.shape[-1] != self.dim or self.num_patterns != 1):
+            raise ValueError(f"cannot normalize a {tuple(tensor.shape)} tensor over {self.dim} features")
+        feature_shape = tuple(tensor.shape[-2:]) if split else (self.num_patterns, self.dim)
         normalized = tensor.float()
-        normalized = normalized * torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + self.eps)
+        reduce_dims = (-2, -1) if split else -1
+        normalized = normalized * torch.rsqrt(normalized.square().mean(dim=reduce_dims, keepdim=True) + self.eps)
         if self.num_modality == 1:
-            weight = self.weight.view(self.num_patterns, self.dim) + 1.0
+            weight = self.weight.view(feature_shape) + 1.0
             result = normalized * weight
         else:
             if modality_dispatcher is None:
                 raise ValueError("modality_dispatcher is required for multimodal RMSNorm")
             inputs = modality_dispatcher.dispatch(normalized)
-            weights = self.weight.view(self.num_modality, self.num_patterns, self.dim)
+            weights = self.weight.view(self.num_modality, *feature_shape)
             result = modality_dispatcher.undispatch(
                 *(part * (weights[index] + 1.0) for index, part in enumerate(inputs))
             )
@@ -329,14 +357,6 @@ class ElementWiseFourierEmbed(nn.Module):
 MHCTensorTuple = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
-def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float) -> torch.Tensor:
-    matrix = torch.exp(matrix_logits - matrix_logits.amax(dim=(-2, -1), keepdim=True))
-    for _ in range(iterations):
-        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon)
-        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon)
-    return matrix
-
-
 class MHCHandler:
     """Exact four-stream manifold-constrained hyper-connection math."""
 
@@ -355,6 +375,9 @@ class MHCHandler:
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.dtype = dtype
         self.matmul_scale = 1.0 / math.sqrt(float(num_streams * hidden_size))
+        # MUSA lowers the four-stream contractions to slow small-K batched GEMMs,
+        # so it uses FP32 forms that Inductor fuses or that split K by stream.
+        self.fp32_stream_contractions = current_omni_platform.is_musa()
 
     def flatten(self, tensor: torch.Tensor) -> torch.Tensor:
         self._check_multi(tensor)
@@ -368,13 +391,41 @@ class MHCHandler:
     ) -> MHCTensorTuple:
         if flattened.ndim != 2 or flattened.shape[-1] != self.num_streams * self.hidden_size:
             raise ValueError("invalid flattened mHC shape")
-        fused = norm(flattened).to(self.dtype) @ phi_fused
+        if self.fp32_stream_contractions:
+            fused = torch.bmm(
+                self._stream_major_normed(flattened, norm),
+                phi_fused.reshape(self.num_streams, self.hidden_size, -1),
+            ).sum(0)
+        else:
+            fused = norm(flattened).to(self.dtype) @ phi_fused
         pre, post, residual = torch.split(
             fused,
             (self.num_streams, self.num_streams, self.num_streams**2),
             dim=-1,
         )
         return pre, post, residual.view(-1, self.num_streams, self.num_streams)
+
+    def _stream_major_normed(
+        self,
+        flattened: torch.Tensor,
+        norm: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Normalize the streams into a dense [streams, tokens, hidden] bmm operand.
+
+        MUSA bmm copies a batch-strided operand before its GEMM. Compiled, the norm receives the
+        [tokens, streams, hidden] view and its kernel stores this layout directly; eager copies once.
+        """
+        tokens = flattened.shape[0]
+        if not torch.compiler.is_compiling():
+            normed = norm(flattened).to(self.dtype)
+            return normed.reshape(tokens, self.num_streams, self.hidden_size).transpose(0, 1).contiguous()
+        # Reducing over (streams, hidden) reads the streams with the same index form as the
+        # stream-major store, so Inductor keeps a producing hyper-connection mix in the norm kernel.
+        normed = norm(flattened.reshape(tokens, self.num_streams, self.hidden_size)).to(self.dtype)
+        stream_major = normed.new_empty_strided(normed.shape, (self.hidden_size, tokens * self.hidden_size, 1))
+        stream_major.copy_(normed)
+        # Inductor keeps the strides of an as_strided input, so the norm kernel stores stream-major.
+        return stream_major.as_strided(stream_major.shape, stream_major.stride()).transpose(0, 1)
 
     def apply_pre(
         self,
@@ -386,7 +437,16 @@ class MHCHandler:
         self._check_multi(streams)
         alpha, bias, logits = alpha_bias_logits
         coefficients = torch.sigmoid(alpha * self.matmul_scale * logits + bias.unsqueeze(0))
-        return torch.einsum("tn,tnc->tc", coefficients.to(out_dtype or streams.dtype), streams)
+        coefficients = coefficients.to(out_dtype or streams.dtype)
+        if (
+            self.fp32_stream_contractions
+            and coefficients.shape == streams.shape[:2]
+            and coefficients.dtype == streams.dtype
+            and streams.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and not torch.is_autocast_enabled(streams.device.type)
+        ):
+            return (coefficients.float().unsqueeze(-1) * streams.float()).sum(1).to(streams.dtype)
+        return torch.einsum("tn,tnc->tc", coefficients, streams)
 
     def compute_post_residual(
         self,
@@ -397,13 +457,19 @@ class MHCHandler:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         alpha_post, bias_post, post_logits = post
         alpha_residual, bias_residual, residual_logits = residual
-        post_coefficients = 2.0 * torch.sigmoid(alpha_post * self.matmul_scale * post_logits + bias_post.unsqueeze(0))
-        residual_matrix = sinkhorn_knopp(
-            alpha_residual * self.matmul_scale * residual_logits.float() + bias_residual.unsqueeze(0).float(),
-            self.sinkhorn_iterations,
-            self.sinkhorn_epsilon,
+        prepare = _mhc_post_residual if not torch.compiler.is_compiling() else _mhc_post_residual.forward_native
+        return prepare(
+            post_logits,
+            residual_logits,
+            alpha_post,
+            bias_post,
+            alpha_residual,
+            bias_residual,
+            scale=self.matmul_scale,
+            iterations=self.sinkhorn_iterations,
+            epsilon=self.sinkhorn_epsilon,
+            out_dtype=out_dtype,
         )
-        return post_coefficients.to(out_dtype), residual_matrix.to(out_dtype)
 
     def hyper_connect(
         self,
@@ -415,9 +481,11 @@ class MHCHandler:
         self._check_multi(residual_streams)
         if branch_output.ndim != 2 or branch_output.shape[-1] != self.hidden_size:
             raise ValueError("invalid mHC branch-output shape")
-        branch = torch.einsum("tn,tc->tnc", post_coefficients, branch_output)
-        mixed = torch.einsum("tij,tjc->tic", residual_matrix, residual_streams)
-        return mixed + branch
+        if not torch.compiler.is_compiling():
+            mix = _mhc_mix
+        else:
+            mix = _mhc_mix_fp32 if self.fp32_stream_contractions else _mhc_mix.forward_native
+        return mix(residual_streams, branch_output, post_coefficients, residual_matrix)
 
     def _check_multi(self, tensor: torch.Tensor) -> None:
         expected = (self.num_streams, self.hidden_size)

@@ -19,6 +19,7 @@ from typing_extensions import Self, override
 
 from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHandler
 from vllm_omni.diffusion.interaction.types import (
+    MAX_PENDING_INTERACTION_EVENTS,
     InteractionChunkMetadata,
     InteractionEvent,
     InteractionMode,
@@ -153,7 +154,11 @@ class SE3DeltaCameraHandler(InteractionHandler):
             duration = self.default_transition_chunks if transition_chunks is None else int(transition_chunks)
             if duration < 0:
                 raise ValueError("transition_chunks must be >= 0")
-        del state
+        session = state.interaction_sessions.get("camera")
+        if isinstance(session, CameraSession):
+            with session.lock:
+                if len(session.pending_events) >= MAX_PENDING_INTERACTION_EVENTS:
+                    raise ValueError("Too many pending camera interactions")
 
     @override
     def enqueue(
