@@ -97,7 +97,7 @@ platforms:
       - stage_id: 0
         compilation_config:
           custom_ops: ["+rotary_embedding"]
-          cudagraph_mm_encoder: false  # opt in only after checking encoder graph memory
+          cudagraph_mm_encoder: false  # CUDA default runner is v2; encoder graphs need v1
           encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
           encoder_cudagraph_max_vision_items_per_batch: 16
           encoder_cudagraph_max_frames_per_batch: 128
@@ -126,7 +126,7 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE   # Qwen3-Omni not FULL-cudagraph-safe on NPU
-          cudagraph_mm_encoder: false  # opt in only after checking encoder graph memory
+          cudagraph_mm_encoder: true
           encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
           encoder_cudagraph_max_vision_items_per_batch: 16
           encoder_cudagraph_max_frames_per_batch: 128

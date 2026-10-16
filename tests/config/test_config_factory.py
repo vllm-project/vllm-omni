@@ -3229,7 +3229,9 @@ class TestPlatformOverrides:
     def test_qwen3_omni_encoder_graphs_are_opt_in(self, deploy_name, platform):
         deploy = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(deploy_name)), platform=platform)
         config = deploy.stages[0].compilation_config
-        assert config["cudagraph_mm_encoder"] is False
+        # CUDA stays off because the default runner is v2. NPU V1 turns the
+        # capped encoder graphs on; MRv2 overlays turn them back off.
+        assert config["cudagraph_mm_encoder"] is (platform == "npu")
         if platform == "cuda":
             assert config["custom_ops"] == ["+rotary_embedding"]
         else:
