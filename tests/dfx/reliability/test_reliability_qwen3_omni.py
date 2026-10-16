@@ -25,6 +25,8 @@ from tests.dfx.conftest import (
 from tests.dfx.reliability.helpers import (
     FaultInjector,
     assert_no_server_tree_process_residual_and_gpu_release,
+    assert_post_fault_api_unreachable,
+    assert_post_fault_health_503,
     extract_openai_error_contract_from_bytes,
     inject_gpu_oom,
     make_process_kill_fault_injector,
@@ -367,24 +369,6 @@ def _create_multimodal_request_config(model: str) -> dict[str, Any]:
     }
 
 
-def _assert_post_fault_health_terminal(online_client: Any, *, scenario: str) -> None:
-    deadline = time.monotonic() + 20.0
-    last_observation = ""
-    while time.monotonic() < deadline:
-        try:
-            resp = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0]
-            status = resp.status_code
-            body = resp.error_message if resp.error_message is not None else resp.json_body
-            last_observation = f"http={status}, body={str(body)[:200]!r}"
-            if status == 503:
-                return
-        except Exception as exc:  # noqa: BLE001
-            last_observation = f"exception={exc!r}"
-            return
-        time.sleep(0.5)
-    pytest.fail(f"[{scenario} health] no terminal post-fault health observed: {last_observation}")
-
-
 def _assert_server_alive_after_fault(online_client: Any, *, scenario: str) -> None:
     """#4285: a single-stage engine death must NOT take down the API server.
 
@@ -694,7 +678,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
         },
         err_code=500,
     )
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_health_503(online_client_function, scenario=scenario)
 
 
 @pytest.mark.slow
@@ -713,7 +697,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
         _create_multimodal_request_config(omni_server_function.model), request_num=1
     )
     injector(omni_server_function)
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,
@@ -746,7 +730,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
     assert load_result["failure_observed"], (
         f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
     )
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,
@@ -774,7 +758,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
         _create_multimodal_request_config(omni_server_function.model), request_num=1
     )
     injector(omni_server_function)
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,
@@ -811,7 +795,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     assert load_result["failure_observed"], (
         f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
     )
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,

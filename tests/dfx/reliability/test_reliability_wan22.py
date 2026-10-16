@@ -26,6 +26,8 @@ from tests.dfx.reliability.helpers import (
     FaultInjector,
     GpuOomInjectionConfig,
     assert_no_server_tree_process_residual_and_gpu_release,
+    assert_post_fault_api_unreachable,
+    assert_post_fault_health_503,
     inject_gpu_oom,
     make_process_kill_fault_injector,
     make_server_root_kill_fault_injector,
@@ -201,24 +203,6 @@ def _await_video_job(online_client: Any, video_id: str, *, timeout_sec: float) -
     raise TimeoutError(f"video job {video_id} did not reach a terminal status: {last_job!r}")
 
 
-def _assert_post_fault_health_terminal(online_client: Any, *, scenario: str) -> None:
-    deadline = time.monotonic() + 20.0
-    last_observation = ""
-    while time.monotonic() < deadline:
-        try:
-            resp = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0]
-            status = resp.status_code
-            body = resp.error_message if resp.error_message is not None else resp.json_body
-            last_observation = f"http={status}, body={str(body)[:200]!r}"
-            if status == 503:
-                return
-        except Exception as exc:  # noqa: BLE001
-            last_observation = f"exception={exc!r}"
-            return
-        time.sleep(0.5)
-    pytest.fail(f"[{scenario} health] no terminal post-fault health observed: {last_observation}")
-
-
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
@@ -377,7 +361,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
         f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
     )
     _assert_post_fault_video_fast_fail(online_client_function)
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_health_503(online_client_function, scenario=scenario)
 
 
 @pytest.mark.slow
@@ -555,7 +539,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
     assert load_result["failure_observed"], (
         f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
     )
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,
@@ -577,7 +561,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
     injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
     online_client_function.send_video_diffusion_request(_video_request_config(), request_num=1)
     injector(omni_server_function)
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,
@@ -603,7 +587,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
     )
     online_client_function.send_video_diffusion_request(_video_request_config(), request_num=1)
     injector(omni_server_function)
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,
@@ -639,7 +623,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     assert load_result["failure_observed"], (
         f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
     )
-    _assert_post_fault_health_terminal(online_client_function, scenario=scenario)
+    assert_post_fault_api_unreachable(online_client_function, scenario=scenario)
     assert_no_server_tree_process_residual_and_gpu_release(
         omni_server_function,
         scenario=scenario,
