@@ -103,7 +103,7 @@ def main() -> None:
 
     lines: list[str] = []
     for stage_outputs in outputs:
-        ro = getattr(stage_outputs, "request_output", stage_outputs)
+        ro = stage_outputs
         text = ro.outputs[0].text if getattr(ro, "outputs", None) else str(ro)
         lines.append(f"request_id: {getattr(ro, 'request_id', 'unknown')}\n")
         lines.append("answer:\n")

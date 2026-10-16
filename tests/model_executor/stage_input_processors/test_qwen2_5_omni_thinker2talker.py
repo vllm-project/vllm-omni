@@ -20,6 +20,8 @@ from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
     thinker2talker_full_payload,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _make_request(
     prompt_token_ids,

@@ -32,26 +32,25 @@ mooncake_master \
 
 ## Configuration
 
-Define the connector in runtime:
+Define the connector at the top level of the deploy YAML:
 
 ```yaml
-runtime:
-  connectors:
-    connector_of_mooncake:
-      name: MooncakeStoreConnector
-      extra:
-        host: "127.0.0.1"
-        metadata_server: "http://<MASTER_IP>:8080/metadata"
-        master: "<MASTER_IP>:50051"
-        segment: 512000000
-        localbuf: 64000000
-        proto: "tcp"
+connectors:
+  connector_of_mooncake:
+    name: MooncakeStoreConnector
+    extra:
+      host: "127.0.0.1"
+      metadata_server: "http://<MASTER_IP>:8080/metadata"
+      master: "<MASTER_IP>:50051"
+      segment: 512000000
+      localbuf: 64000000
+      proto: "tcp"
 ```
 
 Wire stages to the connector:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
     output_connectors:
       to_stage_1: connector_of_mooncake

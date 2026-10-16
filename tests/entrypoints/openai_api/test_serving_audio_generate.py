@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import logging
 from inspect import Signature, signature
 from types import SimpleNamespace
@@ -18,6 +21,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import (
     OmniOpenAIServingAudioGenerate,
 )
+from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -515,7 +519,7 @@ class TestErrorHandling:
         handler.create_audio_generate = AsyncMock(side_effect=exc)
         app = _make_api_server_test_app(handler)
 
-        with patch.object(api_server_module, "terminate_if_errored") as terminate_mock:
+        with patch.object(serve_errors, "terminate_if_errored") as terminate_mock:
             with TestClient(app) as client:
                 response = client.post("/v1/audio/generate", json={"input": "Hello"})
 

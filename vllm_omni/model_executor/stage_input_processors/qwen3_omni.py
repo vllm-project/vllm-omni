@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.inputs import TextPrompt
@@ -23,6 +23,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import compute_ramp_emit, parse_chunk_ramp
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
     extract_language_from_request,
@@ -32,9 +33,8 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
-_EMBED_LAYER_KEY = "0"
-_HIDDEN_LAYER_KEY = "24"
+# Pooling output layer indices (semantic names for clarity)
+# Actual layer indices are integers; these functions provide semantic access
 # Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
 # set use REPLACE semantics (subsequent emissions discard prior chunks)
 # instead of CONCAT.  qwen3-omni currently has none — model_outputs is
@@ -48,14 +48,70 @@ _QWEN3_CODEC_EOS_TOKEN_ID = 4198
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
-    """Fetch layer tensor with tolerant key lookup (str/int)."""
+    """Fetch layer tensor with tolerant key lookup (str/int/semantic)."""
     if not isinstance(layers, dict):
         return None
-    key_int = int(key)
-    val = layers.get(key_int)
+    # Try direct string key first (supports semantic keys like "embedding")
+    val = layers.get(key)
     if val is None:
-        val = layers.get(key)
+        # Try converting to int for backward compatibility with numeric string keys
+        try:
+            key_int = int(key)
+            val = layers.get(key_int)
+        except (ValueError, TypeError):
+            pass
     return val if isinstance(val, torch.Tensor) else None
+
+
+def _get_embedding_layer_index() -> int:
+    """Return the layer index for word embeddings (always layer 0)."""
+    return 0
+
+
+def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
+    """Read accept_hidden_layer index from model config."""
+    if hasattr(transfer_manager, "_get_model_config"):
+        mc = transfer_manager._get_model_config()
+    else:
+        mc = getattr(transfer_manager, "config", None)
+    return int(mc.hf_config.talker_config.accept_hidden_layer)
+
+
+# Set once chunk 0 carried the first generated token taken from the prefill
+# sample: from then on each chunk carries the token its step sampled.
+_SAMPLED_TEXT_STREAM = "_qwen3_omni_sampled_text_stream"
+
+
+def _is_final_token(request: Any) -> bool | None:
+    """Whether the token sampled last ends the Thinker's turn (``None``: unknown)."""
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", None) or [])
+    count = getattr(request, "output_token_count", None)
+    count = len(output_token_ids) if count is None else count
+    token = getattr(request, "last_output_token_id", None)
+    if token is None and output_token_ids:
+        token = output_token_ids[-1]
+    if token is None or count == 0:
+        return None
+    params = getattr(request, "sampling_params", None)
+    stop_ids = getattr(params, "all_stop_token_ids", None) or getattr(params, "stop_token_ids", None) or ()
+    max_tokens = getattr(params, "max_tokens", None)
+    return token in stop_ids or (max_tokens is not None and count >= max_tokens)
+
+
+def _sampled_token_embed(thinker_embed: Mapping[str, Any], request: Any) -> torch.Tensor | None:
+    """Embedding of the token this step sampled, when published and not final.
+
+    The Talker is fed the embeddings of the Thinker's generated tokens except
+    the final one (a stop token, or the last one ``max_tokens`` allows), which
+    no forward ever processes. For any other token the published embedding is
+    exactly what the next step's layer-0 capture holds, one step later.
+    """
+    sampled = thinker_embed.get("sampled")
+    if not isinstance(sampled, torch.Tensor) or sampled.dim() != 2 or sampled.shape[0] != 1:
+        return None
+    if getattr(request, "resumable", False) or _is_final_token(request) is not False:
+        return None
+    return sampled.detach().cpu()
 
 
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
@@ -175,88 +231,6 @@ def _extract_qwen3_full_payload_codec_rows(
 
 
 # =========================
-# PD disaggregation helpers
-# =========================
-
-
-def _get_prefill_multimodal_output(
-    request_id: str,
-    streaming_context: Any | None,
-) -> dict[str, Any] | None:
-    bridge_states = getattr(streaming_context, "bridge_states", None)
-    if not isinstance(bridge_states, dict):
-        return None
-    by_req = bridge_states.get("pd_prefill_multimodal_output_by_req")
-    if not isinstance(by_req, dict):
-        return None
-    prefill_mm = by_req.get(request_id)
-    return prefill_mm if isinstance(prefill_mm, Mapping) else None
-
-
-def _merge_pd_embeddings(
-    decode_emb: torch.Tensor,
-    decode_hid: torch.Tensor,
-    prefill_mm: dict[str, Any],
-    device: torch.device,
-    expected_total: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Merge prefill prompt embeddings with decode generated embeddings.
-
-    In PD mode the prefill engine processes the prompt and the decode engine
-    generates tokens starting from position 1.  This function concatenates
-    them, removing the overlapping token(s):
-
-        merged = prefill[:P] + decode[overlap:]
-
-    where overlap = P + D - expected_total.
-    """
-    try:
-        p_layers = prefill_mm.get("hidden_states", {}).get("layers", {})
-        p_emb = p_layers[int(_EMBED_LAYER_KEY)].detach().to(device=device, dtype=torch.float)
-        p_hid = p_layers[int(_HIDDEN_LAYER_KEY)].detach().to(device=device, dtype=torch.float)
-    except (KeyError, AttributeError, TypeError) as exc:
-        available_keys = list(prefill_mm.keys()) if isinstance(prefill_mm, Mapping) else type(prefill_mm).__name__
-        logger.error(
-            "_merge_pd_embeddings: failed to extract prefill embeddings (%s). "
-            "Expected keys %r and %r, got: %s. "
-            "Falling back to decode-only embeddings – talker user-segment will be degraded.",
-            exc,
-            _EMBED_LAYER_KEY,
-            _HIDDEN_LAYER_KEY,
-            available_keys,
-        )
-        return decode_emb, decode_hid
-
-    if p_emb.shape[0] == 0 or decode_emb.shape[0] == 0:
-        return decode_emb, decode_hid
-
-    raw_total = p_emb.shape[0] + decode_emb.shape[0]
-    overlap = max(0, raw_total - expected_total) if expected_total is not None else 0
-
-    merged_emb = torch.cat([p_emb, decode_emb[overlap:]], dim=0)
-    merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
-    return merged_emb, merged_hid
-
-
-def _resolve_tts_token_embedding(
-    key: str,
-    *,
-    thinker_mm: dict[str, Any],
-    prefill_mm: dict[str, Any] | None,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """Return TTS BOS/EOS/PAD embedding tensors for the talker projection path.
-
-    Values are taken from the current thinker (decode) ``multimodal_output``; in
-    PD mode, missing keys may be filled from the paired prefill stage output.
-    """
-    val = thinker_mm.get("embed", {}).get(key)
-    if val is None and prefill_mm is not None:
-        val = prefill_mm.get("embed", {}).get(key)
-    return val.detach().to(device=device, dtype=torch.float) if val is not None else None
-
-
-# =========================
 # Streaming input helpers
 # =========================
 
@@ -362,6 +336,7 @@ def _get_qwen3_streaming_state(
     streaming_context: Any | None,
 ) -> _Qwen3OmniStreamingState:
     bridge_states = getattr(streaming_context, "bridge_states", None)
+    assert bridge_states is not None
     per_model_state = bridge_states.setdefault("qwen3_omni", {})
     state = per_model_state.get(request_id)
     if state is None:
@@ -451,16 +426,35 @@ def thinker2talker_async_chunk(
         return None
 
     thinker_hs = multimodal_output.get("hidden_states", {})
-    thinker_layers = thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {}
+    thinker_layers = cast(Mapping[int | str, Any], thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {})
     thinker_embed_raw = multimodal_output.get("embed", {})
     thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
-    thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
-    thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
+
+    embedding_idx = _get_embedding_layer_index()
+    accept_hidden_idx = _get_accept_hidden_layer_index(transfer_manager)
+
+    # Remap numeric layer indices to semantic keys; use explicit None checks
+    # because multi-element tensors raise on boolean evaluation.
+    emb_val = thinker_layers.get(embedding_idx)
+    if emb_val is None:
+        emb_val = thinker_layers.get(str(embedding_idx))
+    hid_val = thinker_layers.get(accept_hidden_idx)
+    if hid_val is None:
+        hid_val = thinker_layers.get(str(accept_hidden_idx))
+    semantic_layers = {
+        "embedding": emb_val,
+        "accept_hidden": hid_val,
+    }
+    thinker_emb = _layer_tensor(semantic_layers, "embedding")
+    thinker_hid = _layer_tensor(semantic_layers, "accept_hidden")
     if thinker_emb is None or thinker_hid is None:
         logger.debug(
-            "thinker2talker_async_chunk: missing thinker layers for req=%s (embed=%s hidden=%s)",
+            "thinker2talker_async_chunk: missing thinker layers for req=%s "
+            "(embedding_layer=%d:%s accept_hidden_layer=%d:%s)",
             request_id,
+            embedding_idx,
             thinker_emb is not None,
+            accept_hidden_idx,
             thinker_hid is not None,
         )
         return None
@@ -486,27 +480,48 @@ def thinker2talker_async_chunk(
             speaker=speaker,
             language=language,
         )
-        if transfer_manager.request_payload.get(request_id) is None:
-            if not is_finished:
-                transfer_manager.request_payload[request_id] = to_dict(payload)
-                return None
-        else:
-            save_payload = transfer_manager.request_payload.pop(request_id)
+        assert payload.embed is not None and payload.embed.prefill is not None
+        assert payload.hidden_states is not None and payload.hidden_states.output is not None
+        save_payload = transfer_manager.request_payload.pop(request_id, None)
+        if save_payload is not None:
             payload.embed.prefill = torch.cat(
                 (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
             )
             payload.hidden_states.output = torch.cat(
                 (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
             )
-            prefill_shape = payload.embed.prefill.shape[0]
-            if not is_finished and prefill_shape <= len(prompt_token_ids):
-                transfer_manager.request_payload[request_id] = to_dict(payload)
-                return None
+        if not is_finished and payload.embed.prefill.shape[0] == len(prompt_token_ids):
+            # The Talker prompt ends with the first generated token's embedding,
+            # which the next decode step would capture; take it from the
+            # prefill step's sample instead when the producer published it.
+            first_token_embed = _sampled_token_embed(thinker_embed, request)
+            if first_token_embed is not None:
+                payload.embed.prefill = torch.cat((payload.embed.prefill, first_token_embed), dim=0)
+                transfer_manager.request_payload[request_id] = {_SAMPLED_TEXT_STREAM: True}
+        if not is_finished and payload.embed.prefill.shape[0] <= len(prompt_token_ids):
+            transfer_manager.request_payload[request_id] = to_dict(payload)
+            return None
     else:
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
                 is_finished, request, thinker_emb, thinker_hid, transfer_manager
             )
+        stream = transfer_manager.request_payload.get(request_id)
+        if stream is not None and stream.get(_SAMPLED_TEXT_STREAM):
+            # This step's capture was already sent as the previous step's sample.
+            sampled = _sampled_token_embed(thinker_embed, request)
+            if sampled is None:
+                # A partial (including resumed) prefill has no accepted sample.
+                # Its captures replay text already sent before preemption.
+                raw_sample = thinker_embed.get("sampled")
+                if isinstance(raw_sample, torch.Tensor) and raw_sample.numel() == 0:
+                    return None
+                if _is_final_token(request) is not True and not is_finished:
+                    raise RuntimeError(f"Thinker sample embedding missing for request {request_id}")
+                # The final token is never part of the text; a finish goes out
+                # as the bare finish marker.
+                return None
+            thinker_emb = sampled
         if thinker_emb.shape[0] > 1:
             logger.warning(
                 "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
@@ -531,7 +546,7 @@ def thinker2talker_full_payload(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
-) -> dict[str, Any] | None:
+) -> OmniPayload | None:
     """Pack complete thinker output for the non-async connector path."""
     rid = getattr(request, "request_id", None)
     if not isinstance(pooling_output, Mapping):
@@ -542,21 +557,27 @@ def thinker2talker_full_payload(
         )
         return None
 
+    embedding_idx = _get_embedding_layer_index()
+    accept_hidden_idx = _get_accept_hidden_layer_index(transfer_manager)
+
+    # Use semantic keys instead of numeric indices
     layers = {
-        0: pooling_output.get("hidden_states.layer_0"),
-        24: pooling_output.get("hidden_states.layer_24"),
+        "embedding": pooling_output.get(f"hidden_states.layer_{embedding_idx}"),
+        "accept_hidden": pooling_output.get(f"hidden_states.layer_{accept_hidden_idx}"),
     }
-    thinker_emb = _layer_tensor(layers, _EMBED_LAYER_KEY)
-    thinker_hid = _layer_tensor(layers, _HIDDEN_LAYER_KEY)
+    thinker_emb = _layer_tensor(layers, "embedding")
+    thinker_hid = _layer_tensor(layers, "accept_hidden")
     if thinker_emb is None:
         hidden = pooling_output.get("hidden")
         thinker_emb = hidden if isinstance(hidden, torch.Tensor) else None
     if thinker_emb is None or thinker_hid is None:
         logger.warning(
             "thinker2talker_full_payload: missing thinker tensors for req=%s "
-            "(embed=%s hidden=%s keys=%s); consumer wait gate may hang.",
+            "(embedding_layer=%d:%s accept_hidden_layer=%d:%s keys=%s); consumer wait gate may hang.",
             rid,
+            embedding_idx,
             thinker_emb is not None,
+            accept_hidden_idx,
             thinker_hid is not None,
             list(pooling_output.keys()),
         )
@@ -651,7 +672,7 @@ def thinker2talker_token_only(
             )
         thinker_sequences = prompt_token_ids + output_ids
         thinker_input_ids = prompt_token_ids
-        info_for_len = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
+        info_for_len: OmniPayload = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
         prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
         # Keep this fallback until the connector reliably preserves voice metadata.
         additional_information = to_dict(
@@ -676,6 +697,14 @@ def thinker2talker_token_only(
 # =========================
 
 
+def _last_codec_row(codes: Any) -> torch.Tensor | None:
+    """The last ``[1, Q]`` row of token-major codec codes, or None if there is none."""
+    if not isinstance(codes, torch.Tensor) or codes.ndim != 2 or codes.shape[0] == 0:
+        return None
+    # Own the row: it outlives this step's (batch-wide) output tensor.
+    return codes[-1:].to(torch.long).clone()
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
@@ -685,19 +714,52 @@ def talker2code2wav_async_chunk(
     """
     Multimodal output version.
     """
-    if not isinstance(multimodal_output, Mapping):
-        return None
-    talker_codes = multimodal_output.get("codes", {})
-    if not isinstance(talker_codes, dict):
-        return None
-    code_predictor_codes = talker_codes.get("audio")
-    if code_predictor_codes is None:
-        return None
+    request_id = request.external_req_id
+    code_predictor_codes = None
+    frame_valid = None
+    first_audio = False
+    if isinstance(multimodal_output, Mapping):
+        talker_codes = multimodal_output.get("codes", {})
+        if isinstance(talker_codes, dict):
+            code_predictor_codes = talker_codes.get("audio")
+        meta = multimodal_output.get("meta", {})
+        if isinstance(meta, Mapping):
+            frame_valid = meta.get("codec_frame_valid")
+            flag = meta.get("first_audio", False)
+            first_audio = (
+                bool(flag.numel() and flag.reshape(-1)[-1].item()) if isinstance(flag, torch.Tensor) else bool(flag)
+            )
 
-    if code_predictor_codes.numel() == 0:
-        return None
+    if isinstance(frame_valid, torch.Tensor) and frame_valid.numel() > 0:
+        # Token-major codes with explicit per-row validity (MRv2 eager
+        # frames): a step's frame, if any, is the last row of its span, and a
+        # multi-row prefill span carries its first frame there.
+        frame = _last_codec_row(code_predictor_codes)
+        append_codes = frame is not None and bool(frame_valid.reshape(-1)[-1].item())
+        code_predictor_codes = frame
+    else:
+        # One row per step (V1 and MRv2 deferred frames): all-zero rows are
+        # prefill placeholders and a stop-token CB0 marks the post-EOS step.
+        sampling_params = getattr(request, "sampling_params", None)
+        stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
+        stop_token_id = getattr(sampling_params, "stop_token_id", None)
+        if stop_token_id is not None:
+            stop_token_ids.add(stop_token_id)
 
-    if not code_predictor_codes.any():
+        append_codes = (
+            isinstance(code_predictor_codes, torch.Tensor)
+            and code_predictor_codes.numel() > 0
+            and bool(code_predictor_codes.any())
+        )
+        if append_codes:
+            assert isinstance(code_predictor_codes, torch.Tensor)
+            first_codebook = int(code_predictor_codes[0, 0].item())
+            if first_codebook in stop_token_ids:
+                logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
+                append_codes = False
+    if append_codes:
+        transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
+    elif not is_finished:
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -706,21 +768,41 @@ def talker2code2wav_async_chunk(
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
+    # The connector config is fixed for the adapter's lifetime: parse once.
+    if not hasattr(transfer_manager, "_qwen3_omni_chunk_ramp"):
+        transfer_manager._qwen3_omni_chunk_ramp = parse_chunk_ramp(cfg, steady=chunk_size_config)
+    ramp = transfer_manager._qwen3_omni_chunk_ramp
 
-    sampling_params = getattr(request, "sampling_params", None)
-    stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
-    stop_token_id = getattr(sampling_params, "stop_token_id", None)
-    if stop_token_id is not None:
-        stop_token_ids.add(stop_token_id)
-    first_codebook = int(code_predictor_codes[0, 0].item())
-    if first_codebook in stop_token_ids:
-        logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
+    chunk_id = transfer_manager.put_req_chunk[request_id]
+    length = len(transfer_manager.code_prompt_token_ids[request_id])
+    if length <= 0:
         return None
 
-    request_id = request.external_req_id
-    chunk_id = transfer_manager.put_req_chunk[request_id]
-    transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
-    length = len(transfer_manager.code_prompt_token_ids[request_id])
+    if ramp is not None:
+        # Ramp (replaces initial_codec_chunk_frames): chunk i carries ramp[i]
+        # new frames, then codec_chunk_frames. Code2Wav decodes statelessly, so
+        # every chunk re-sends up to codec_left_context_frames earlier frames.
+        # The counter restarts with each segment, like code_prompt_token_ids.
+        chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
+        emit, context_length = compute_ramp_emit(length, chunk_index, ramp, chunk_size_config, bool(is_finished))
+        if not emit or context_length <= 0:
+            # Finished on a chunk boundary: the transport sends the finish marker.
+            return None
+        left_context_size = min(length - context_length, left_context_size_config)
+        end_index = left_context_size + context_length
+        codes = (
+            torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0)
+            .transpose(0, 1)
+            .reshape(-1)
+        )
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=codes),
+            meta=MetaStruct(
+                first_audio=torch.tensor(first_audio and chunk_id == 0),
+                left_context_size=left_context_size,
+                finished=torch.tensor(is_finished, dtype=torch.bool),
+            ),
+        )
 
     if configured_initial_chunk_size > 0:
         if chunk_id == 0:
@@ -730,6 +812,9 @@ def talker2code2wav_async_chunk(
 
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not is_finished:
+        return None
+
+    if is_finished and not append_codes and chunk_length == 0:
         return None
 
     context_length = chunk_length if chunk_length != 0 else chunk_size_config
@@ -748,6 +833,7 @@ def talker2code2wav_async_chunk(
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codes),
         meta=MetaStruct(
+            first_audio=torch.tensor(first_audio and chunk_id == 0),
             left_context_size=left_context_size,
             finished=torch.tensor(is_finished, dtype=torch.bool),
         ),

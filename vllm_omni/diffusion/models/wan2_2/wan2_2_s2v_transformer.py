@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Wan2.2 Speech-to-Video (S2V) Transformer using vllm-omni ops.
 
@@ -32,7 +32,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
-from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid, RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingS2VGrid
+from vllm_omni.diffusion.models.wan2_2.rope import RotaryEmbeddingWanS2V, WanS2VRotaryPosEmbed
 from vllm_omni.platforms import current_omni_platform
 
 from .wan2_2_transformer import DistributedRMSNorm, WanFeedForward
@@ -1359,11 +1360,9 @@ class WanS2VTransformer3DModel(nn.Module):
         return flatten_mot, mot_remb
 
     def process_motion_frame_pack(self, motion_latents, drop_motion_frames=False, add_last_motion=2):
-        flatten_mot, mot_remb = self.frame_packer(motion_latents, add_last_motion)
         if drop_motion_frames:
-            return [m[:, :0] for m in flatten_mot], [m[:, :0] for m in mot_remb]
-        else:
-            return flatten_mot, mot_remb
+            return [], []
+        return self.frame_packer(motion_latents, add_last_motion)
 
     def process_motion_transformer_motioner(self, motion_latents, drop_motion_frames=False, add_last_motion=True):
         batch_size = motion_latents.shape[0]

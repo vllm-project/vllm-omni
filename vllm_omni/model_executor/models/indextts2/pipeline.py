@@ -43,8 +43,46 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="IndexTTS2S2MelDecoder",
             sync_process_input_func=f"{_PROC}.talker2s2mel_token_only",
-            extras={"skip_tokenizer_init": True, "tokenizer": "gpt2"},
+            extras={"skip_tokenizer_init": True},
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
+        ),
+    ),
+)
+
+
+INDEXTTS25_PIPELINE = PipelineConfig(
+    model_type="indextts2_5",
+    default_deploy_config_name="indextts2_5.yaml",
+    model_arch="IndexTTS25TalkerForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="indextts2_5_talker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            engine_output_type="latent",
+            extras={"skip_tokenizer_init": True},
+            custom_process_next_stage_input_func=f"{_PROC}.talker2s2mel_full_payload",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [8193],
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="indextts2_5_s2mel_decoder",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="IndexTTS25S2MelDecoder",
+            sync_process_input_func=f"{_PROC}.talker2s2mel_token_only",
+            extras={"skip_tokenizer_init": True},
+            sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )

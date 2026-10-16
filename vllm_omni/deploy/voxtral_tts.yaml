@@ -69,3 +69,14 @@ stages:
     config_format: mistral
     load_format: mistral
     skip_mm_profiling: true
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        enforce_eager: true
+        gpu_memory_utilization: 0.7
+        distributed_executor_backend: "mp"
+      - stage_id: 1
+        gpu_memory_utilization: 0.28
+        distributed_executor_backend: "mp"

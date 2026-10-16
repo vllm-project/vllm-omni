@@ -94,26 +94,23 @@ For Ascend P2P, configure the connector with `protocol: "ascend"` and an NPU
 memory pool:
 
 ```yaml
-runtime:
-  enabled: true
-  defaults:
+connectors:
+  yuanrong_te_connector:
+    name: YuanrongTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      rpc_port: "auto"
+      protocol: "ascend"
+      device_name: "auto"
+      memory_pool_size: 1073741824
+      memory_pool_device: "npu"
+
+edges:
+  - from: 0
+    to: 1
     window_size: -1
     max_inflight: 1
-  connectors:
-    yuanrong_te_connector:
-      name: YuanrongTransferEngineConnector
-      extra:
-        host: "auto"
-        zmq_port: 50051
-        rpc_port: "auto"
-        protocol: "ascend"
-        device_name: "auto"
-        memory_pool_size: 1073741824
-        memory_pool_device: "npu"
-  edges:
-    - from: 0
-      to: 1
-      window_size: -1
 ```
 
 Important fields:
@@ -141,31 +138,27 @@ For AR 4-way TP sending KV cache to DiT 4-way TP, set the stage TP topology in
 both stage `omni_kv_config` blocks:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
-    runtime:
-      devices: "0,1,2,3"
-    engine_args:
-      tensor_parallel_size: 4
-      omni_kv_config:
-        need_send_cache: true
-        rank_mapping:
-          from_tp: 4
-          to_tp: 4
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    omni_kv_config:
+      need_send_cache: true
+      rank_mapping:
+        from_tp: 4
+        to_tp: 4
     output_connectors:
       to_stage_1: yuanrong_te_connector
 
   - stage_id: 1
-    runtime:
-      devices: "4,5,6,7"
-    engine_args:
-      parallel_config:
-        tensor_parallel_size: 4
-      omni_kv_config:
-        need_recv_cache: true
-        rank_mapping:
-          from_tp: 4
-          to_tp: 4
+    devices: "4,5,6,7"
+    parallel_config:
+      tensor_parallel_size: 4
+    omni_kv_config:
+      need_recv_cache: true
+      rank_mapping:
+        from_tp: 4
+        to_tp: 4
     input_connectors:
       from_stage_0: yuanrong_te_connector
 ```

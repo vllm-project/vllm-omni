@@ -1,19 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
 import threading
+import weakref
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
+from vllm_omni.diffusion import diffusion_engine as diffusion_engine_module
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -28,14 +33,16 @@ def _make_request(request_id: str) -> OmniDiffusionRequest:
 
 def _make_engine() -> DiffusionEngine:
     engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
     engine.scheduler.initialize(SimpleNamespace())
-    engine.executor = SimpleNamespace(shutdown=Mock())
+    engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
+    engine.executor = SimpleNamespace(shutdown=Mock(), collective_rpc=Mock())
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
-    engine._out_queue = {}
-    engine._out_queue_streaming = {}
+    engine._out_streams = {}
     engine._closed = False
+    engine._shutting_down = False
     engine._shutdown_complete = False
     engine.abort_queue = queue.Queue()
     engine._loop_started = False
@@ -44,28 +51,100 @@ def _make_engine() -> DiffusionEngine:
     return engine
 
 
-def test_close_completes_pending_async_waiters() -> None:
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [False, True])
+async def test_closing_response_stream_releases_queue(started: bool) -> None:
     engine = _make_engine()
-    event_loop = asyncio.new_event_loop()
+    request = _make_request("close-stream")
+    stream = engine.async_add_req_and_stream_response(request)
+    output_queue = engine._out_streams[request.request_id]
+    queue_ref = weakref.ref(output_queue)
+    assert engine.scheduler.get_request_state(request.request_id) is not None
+    output_queue.put_nowait(DiffusionOutput(finished=False))
+    if started:
+        await anext(stream)
+
+    await stream.aclose()
+    await stream.aclose()
+
+    assert request.request_id not in engine._out_streams
+    # Keeping the closed stream must not retain its queue through the callback.
+    del output_queue
+    assert queue_ref() is None
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_unstarted_stream_close_preserves_reused_request_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("reused")
+    stream = engine.async_add_req_and_stream_response(request)
+    replacement: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    engine._out_streams[request.request_id] = replacement
+
+    await stream.aclose()
+
+    assert engine._out_streams[request.request_id] is replacement
+
+
+@pytest.mark.asyncio
+async def test_delayed_stream_iteration_uses_original_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("reused")
+    stream = engine.async_add_req_and_stream_response(request)
+    original_output = DiffusionOutput(output="original", finished=True)
+    engine._out_streams[request.request_id].put_nowait(original_output)
+    replacement: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
+    replacement_output = DiffusionOutput(output="replacement", finished=True)
+    replacement.put_nowait(replacement_output)
+    engine._out_streams[request.request_id] = replacement
+
+    assert await anext(stream) is original_output
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert engine._out_streams[request.request_id] is replacement
+    assert replacement.get_nowait() is replacement_output
+
+
+@pytest.mark.asyncio
+async def test_throw_into_unstarted_stream_releases_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("throw-before-start")
+    stream = engine.async_add_req_and_stream_response(request)
+
+    with pytest.raises(RuntimeError, match="caller failed"):
+        await stream.athrow(RuntimeError("caller failed"))
+
+    assert request.request_id not in engine._out_streams
+
+
+@pytest.mark.asyncio
+async def test_close_rejected_during_iteration_keeps_queue() -> None:
+    engine = _make_engine()
+    request = _make_request("running")
+    stream = engine.async_add_req_and_stream_response(request)
+    next_output: asyncio.Future[DiffusionOutput] = asyncio.ensure_future(anext(stream))
+    await asyncio.sleep(0)
     try:
-        future = event_loop.create_future()
-        engine._out_queue["pending-req"] = future
-
-        engine.close()
-
-        assert future.done()
-        assert future.result().error == "DiffusionEngine is closed."
+        with pytest.raises(RuntimeError, match="already running"):
+            await stream.aclose()
+        assert request.request_id in engine._out_streams
     finally:
-        event_loop.close()
+        next_output.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await next_output
+        await stream.aclose()
+    assert request.request_id not in engine._out_streams
 
 
-def test_close_completes_pending_streaming_waiters() -> None:
+def test_close_completes_pending_output_streams() -> None:
     engine = _make_engine()
     event_loop = asyncio.new_event_loop()
     try:
         engine.main_loop = event_loop
         queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
-        engine._out_queue_streaming["pending-stream"] = queue
+        engine._out_streams["pending-stream"] = queue
 
         engine.close()
 
@@ -76,21 +155,288 @@ def test_close_completes_pending_streaming_waiters() -> None:
         event_loop.close()
 
 
-def test_handle_finished_requests_ignores_already_drained_waiter() -> None:
+def test_emit_finished_outputs_finalizes_already_drained_waiter() -> None:
     class RacingOutQueue(dict):
-        def __contains__(self, key):
-            return True
-
-        def pop(self, key, default=None):
+        def get(self, key, default=None):
             return default
 
     engine = _make_engine()
-    engine._out_queue = RacingOutQueue()
-    engine._finalize_finished_request = Mock(side_effect=AssertionError("should not finalize drained waiters"))
+    request_id = engine.scheduler.add_request(_make_request("pending-req"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+    engine._out_streams = RacingOutQueue()
 
-    engine._handle_finished_requests({"pending-req"})
+    engine._emit_finished_outputs({request_id})
 
-    engine._finalize_finished_request.assert_not_called()
+    assert engine.scheduler.get_request_state(request_id) is None
+
+
+def test_emit_step_outputs_finalizes_finished_request_without_stream() -> None:
+    engine = _make_engine()
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    request_id = engine.scheduler.add_request(_make_request("step-drained"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    engine._emit_outputs({request_id}, [request_id], SimpleNamespace(get_request_output=lambda _request_id: None))
+
+    assert engine.scheduler.get_request_state(request_id) is None
+
+
+@pytest.mark.parametrize("path", ["request", "step", "unscheduled_step"])
+def test_terminal_output_keeps_original_queue_when_request_id_is_reused(monkeypatch, path) -> None:
+    engine = _make_engine()
+    engine.main_loop = None
+    engine.execution_mode = (
+        DiffusionExecutionMode.REQUEST_BATCH if path == "request" else DiffusionExecutionMode.STEP_BATCH
+    )
+    request_id = engine._add_prepared_request(_make_request("reused"))
+    original_queue = engine._out_streams[request_id]
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+    finalize = engine._finalize_finished_request
+
+    def admit_after_finalization(*args, **kwargs):
+        output = finalize(*args, **kwargs)
+        engine._add_prepared_request(_make_request(request_id))
+        return output
+
+    monkeypatch.setattr(engine, "_finalize_finished_request", admit_after_finalization)
+    runner_output = RunnerOutput(request_id=request_id, step_index=None, finished=True, result=None)
+    engine._emit_outputs({request_id}, [] if path == "unscheduled_step" else [request_id], runner_output)
+
+    assert original_queue.qsize() == 1, "the old terminal output must not be sent to the new lifecycle"
+    assert original_queue.get_nowait().aborted
+    assert engine._out_streams[request_id].empty()
+    assert engine.scheduler.get_request_state(request_id).status == DiffusionRequestStatus.WAITING
+
+
+def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine, Mock]:
+    engine = _make_engine()
+    engine.od_config = SimpleNamespace(diffusion_kv_mode=mode)
+    cleanup = Mock()
+    engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup)
+    return engine, cleanup
+
+
+def test_paged_terminal_output_clears_worker_rows() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    for request_id in ("req-0", "req-1"):
+        engine.scheduler.add_request(_make_request(request_id))
+    engine.scheduler.finish_requests(["req-0", "req-1"], DiffusionRequestStatus.FINISHED_COMPLETED)
+
+    engine._emit_finished_outputs({"req-0", "req-1"})
+
+    cleanup.assert_called_once()
+    assert set(cleanup.call_args.args[0]) == {"req-0", "req-1"}
+
+
+def test_paged_abort_clears_worker_rows_before_scheduler_free() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    engine.scheduler = SimpleNamespace(
+        get_request_state=lambda _request_id: None,
+        finish_requests=Mock(side_effect=AssertionError("unknown request must not be logically freed")),
+    )
+
+    engine._abort_requests(["req-idle", "req-idle"])
+
+    cleanup.assert_called_once_with(["req-idle"])
+    engine.scheduler.finish_requests.assert_not_called()
+
+
+def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
+    engine, cleanup = _make_kv_cleanup_engine(DiffusionKVCacheMode.DENSE_LEGACY)
+    engine.scheduler.add_request(_make_request("req-0"))
+    engine.scheduler.finish_requests("req-0", DiffusionRequestStatus.FINISHED_COMPLETED)
+
+    engine._emit_finished_outputs({"req-0"})
+    engine._abort_requests(["req-idle"])
+
+    cleanup.assert_not_called()
+
+
+def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
+    od_config = SimpleNamespace(
+        custom_pipeline_args=None,
+        model_class_name="CustomSchedulerPipeline",
+        streaming_output=False,
+    )
+    custom_scheduler = RequestScheduler()
+    fake_executor = SimpleNamespace(
+        execute_request=Mock(),
+        execute_batch=Mock(),
+        execute_step=Mock(),
+    )
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+        lambda *args, **kwargs: Mock(return_value=fake_executor),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_request_batch",
+        lambda *args, **kwargs: False,
+    )
+
+    engine = DiffusionEngine(od_config, scheduler=custom_scheduler)
+
+    assert engine.scheduler is custom_scheduler
+
+
+def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    od_config = SimpleNamespace(
+        custom_pipeline_args=None,
+        model_class_name="SchedulerInitializationFailurePipeline",
+        streaming_output=False,
+    )
+    initialization_error = RuntimeError("Scheduler initialization failed")
+    custom_scheduler = SimpleNamespace(
+        initialize=Mock(side_effect=initialization_error),
+        close=Mock(),
+    )
+    fake_executor = SimpleNamespace(
+        shutdown=Mock(),
+    )
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+        lambda *args, **kwargs: Mock(return_value=fake_executor),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_request_batch",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        DiffusionEngine(od_config, scheduler=custom_scheduler)
+
+    assert exc_info.value is initialization_error
+    custom_scheduler.initialize.assert_called_once_with(od_config)
+    custom_scheduler.close.assert_called_once_with()
+
+
+def test_init_shuts_down_executor_when_kv_control_plane_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine, "_init_executor", lambda self, config: setattr(self, "executor", fake_executor)
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        Mock(side_effect=RuntimeError("KV initialization failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="KV initialization failed"):
+        DiffusionEngine(SimpleNamespace())
+
+    fake_executor.shutdown.assert_called_once_with()
+
+
+def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = []
+    expected_profile_requests = [object()]
+    fake_executor = SimpleNamespace(shutdown=Mock())
+    kv_cache_config = object()
+    kv_vllm_config = object()
+    od_config = SimpleNamespace(diffusion_kv_mode="paged_scheduler")
+
+    monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda self, config: None)
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_resolve_execution_mode",
+        lambda self, config: DiffusionExecutionMode.REQUEST_BATCH,
+    )
+    monkeypatch.setattr(
+        DiffusionEngine,
+        "_init_executor",
+        lambda self, config: setattr(self, "executor", fake_executor),
+    )
+
+    def prepare_profile_requests(self) -> list[object]:
+        events.append("prepare-profile")
+        return expected_profile_requests
+
+    monkeypatch.setattr(DiffusionEngine, "_prepare_diffusion_kv_profile_requests", prepare_profile_requests)
+
+    def initialize(executor, config, *, profile_requests):
+        events.append("profile-workers")
+        assert executor is fake_executor
+        assert config is od_config
+        assert profile_requests is expected_profile_requests
+        return kv_cache_config, 16, 16, kv_vllm_config
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.initialize_diffusion_kv_control_plane",
+        initialize,
+    )
+
+    def init_scheduler(self, config, scheduler, *args, **kwargs):
+        events.append("initialize-scheduler")
+        self.scheduler = SimpleNamespace(close=Mock())
+
+    monkeypatch.setattr(DiffusionEngine, "_init_scheduler", init_scheduler)
+    monkeypatch.setattr(DiffusionEngine, "_init_runtime_state", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_init_execute_fn", lambda self: None)
+    monkeypatch.setattr(DiffusionEngine, "_log_execution_mode", lambda self, config: None)
+
+    DiffusionEngine(od_config)
+
+    assert events == ["prepare-profile", "profile-workers", "initialize-scheduler"]
+
+
+@pytest.mark.asyncio
+async def test_step_compatibility_wrapper_returns_final_batch() -> None:
+    engine = _make_engine()
+    first = [OmniRequestOutput.from_diffusion(request_id="req", images=[], finished=False)]
+    final = [OmniRequestOutput.from_diffusion(request_id="req", images=[], finished=True)]
+
+    async def _step_streaming(_request):
+        yield first
+        yield final
+
+    engine.step_streaming = _step_streaming  # type: ignore[method-assign]
+    with patch.object(diffusion_engine_module.logger, "warning_once") as warning_once:
+        output = await engine.step(_make_request("req"))
+
+    assert output is final
+    warning_once.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_async_wait_compatibility_wrapper_returns_final_output() -> None:
+    engine = _make_engine()
+    first = DiffusionOutput(output="chunk", finished=False)
+    final = DiffusionOutput(output="final", finished=True)
+
+    async def _stream_response(_request):
+        yield first
+        yield final
+
+    engine.async_add_req_and_stream_response = _stream_response  # type: ignore[method-assign]
+    with patch.object(diffusion_engine_module.logger, "warning_once") as warning_once:
+        output = await engine.async_add_req_and_wait_for_response(_make_request("req"))
+
+    assert output is final
+    warning_once.assert_called_once()
 
 
 def test_abort_request_id_aborts_scheduler_request() -> None:
@@ -153,3 +499,120 @@ def test_close_defers_resource_shutdown_until_worker_thread_stops() -> None:
     engine.executor.shutdown.assert_called_once()
     assert engine._shutdown_complete is True
     assert engine._loop_started is False
+
+
+def test_fail_engine_does_not_reenter_when_executor_shutdown_fails() -> None:
+    engine = _make_engine()
+    shutdown_error = RuntimeError("worker shutdown failed")
+    engine.executor.shutdown.side_effect = shutdown_error
+    engine.scheduler.close = Mock()
+    engine._fail_pending_rpcs = Mock()
+
+    with pytest.raises(RuntimeError, match="worker shutdown failed"):
+        engine._fail_engine(RuntimeError("engine failed"))
+
+    engine._fail_engine(RuntimeError("follow-up failure"))
+
+    engine.executor.shutdown.assert_called_once_with()
+    engine.scheduler.close.assert_not_called()
+    assert engine._closed is True
+    assert engine._shutting_down is True
+    assert engine._shutdown_complete is False
+
+
+def test_finalize_aborted_request_drops_pending_async_output() -> None:
+    """An aborted request with a pending async output must be drained (#6413).
+
+    The aborted branch of _finalize_finished_request returns before the
+    async_output_id branch, so without draining, the worker's late OUTPUT_READY
+    is cached in the executor's _completed_outputs forever. The engine must tell
+    the executor to drop that output id.
+    """
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-async"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    runner_output = SimpleNamespace(result=None, async_output_id="aid-async-1")
+    output = engine._finalize_finished_request(request_id, runner_output)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_called_once_with("aid-async-1")
+
+
+def test_finalize_aborted_request_without_async_output_skips_drop() -> None:
+    """No async output pending -> nothing to drop; drop_output not called."""
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-plain"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    output = engine._finalize_finished_request(request_id)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_not_called()
+
+
+@pytest.mark.parametrize("scheduler_fails", [False, True])
+def test_fail_engine_releases_cancellation_signals_after_workers_stop(scheduler_fails):
+    from multiprocessing.shared_memory import SharedMemory
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
+
+    engine = _make_engine()
+    engine._fail_pending_rpcs = Mock()
+    registry = RequestCancellationRegistry()
+    engine._request_cancellations = registry
+    name = registry.create("running")
+
+    def shutdown():
+        # Cancellation is visible before shutdown, and late readers can attach.
+        reader = SharedMemory(name=name)
+        try:
+            assert reader.buf[0] == 1
+        finally:
+            reader.close()
+
+    engine.executor.shutdown.side_effect = shutdown
+    engine.scheduler.close = Mock(side_effect=RuntimeError("scheduler cleanup failed") if scheduler_fails else None)
+    try:
+        if scheduler_fails:
+            with pytest.raises(RuntimeError, match="scheduler cleanup failed"):
+                engine._fail_engine(RuntimeError("engine failed"))
+        else:
+            engine._fail_engine(RuntimeError("engine failed"))
+            engine.close()
+            engine.executor.shutdown.assert_called_once_with()
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+        assert not registry._signals
+    finally:
+        registry.close()
+
+
+def test_close_retains_cancellation_signal_until_stuck_worker_stops():
+    from multiprocessing.shared_memory import SharedMemory
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
+
+    engine = _make_engine()
+    registry = RequestCancellationRegistry()
+    engine._request_cancellations = registry
+    name = registry.create("running")
+    engine.worker_thread = Mock()
+    engine.worker_thread.is_alive.side_effect = [True, True, False, False]
+    try:
+        engine.close()
+        engine.executor.shutdown.assert_not_called()
+        reader = SharedMemory(name=name)
+        try:
+            assert reader.buf[0] == 1
+        finally:
+            reader.close()
+        engine.close()
+        engine.executor.shutdown.assert_called_once_with()
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+        assert not registry._signals
+    finally:
+        registry.close()

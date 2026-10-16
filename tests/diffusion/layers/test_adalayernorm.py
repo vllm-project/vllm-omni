@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for shared AdaLayerNorm layers used by FLUX and other models."""
 
 import os
@@ -46,7 +46,7 @@ def _force_default_gemm(monkeypatch):
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
 
 

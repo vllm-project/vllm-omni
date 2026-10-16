@@ -11,7 +11,7 @@ Adds per-component quantization for multi-stage models.
     config = build_quant_config({"transformer": {"method": "fp8"}, "vae": None})
 """
 
-from .component_config import ComponentQuantizationConfig
+from .component_config import ComponentQuantizationConfig, resolve_component_quant_config
 from .factory import SUPPORTED_QUANTIZATION_METHODS, build_quant_config, register_quantization_override
 from .inc_config import OmniINCConfig
 
@@ -23,6 +23,7 @@ from .inc_config import OmniINCConfig
 __all__ = [
     "build_quant_config",
     "ComponentQuantizationConfig",
+    "resolve_component_quant_config",
     "OmniINCConfig",
     "SUPPORTED_QUANTIZATION_METHODS",
     "register_quantization_override",

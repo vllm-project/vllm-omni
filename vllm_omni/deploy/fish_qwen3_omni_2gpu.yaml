@@ -11,7 +11,7 @@
 #
 # Or programmatically:
 #   Omni(model="fishaudio/s2-pro",
-#        deploy_config_path="vllm_omni/deploy/fish_qwen3_omni_2gpu.yaml")
+#        deploy_config="vllm_omni/deploy/fish_qwen3_omni_2gpu.yaml")
 
 async_chunk: true
 enable_chunked_prefill: false

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Image/tensor format helpers.
 
 The image generation part is derived from dougbtv/comfyui-vllm-omni by Doug (@dougbtv).
@@ -170,6 +173,10 @@ def bytes_to_video(video_bytes: bytes) -> VideoInput:
                 audio_stream = container.streams.audio[-1]
                 audio_frames = []
                 resampler = AudioResampler(format="fltp")
+                # Decoding the video stream above left the container at EOF.
+                # Rewind before demuxing again, or this pass yields no frames
+                # and the audio of a T2VA result is silently dropped.
+                container.seek(0)
                 for frame in container.decode(audio_stream):
                     if not isinstance(frame, AudioFrame):
                         continue

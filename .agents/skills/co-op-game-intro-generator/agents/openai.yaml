@@ -1,0 +1,4 @@
+interface:
+  display_name: "Co-op Game Intros"
+  short_description: "Design two-player menus and world-entry animation"
+  default_prompt: "Use $co-op-game-intro-generator to prepare the requested H3 prompts or video with the available tools."

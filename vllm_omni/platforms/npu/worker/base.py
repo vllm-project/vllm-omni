@@ -45,7 +45,7 @@ class OmniNPUWorkerBase(NPUWorker):
         if self.profiler is None:
             raise RuntimeError(
                 "Profiling is not enabled. For diffusion models, set --profiler-config via CLI. "
-                "For omni models, add profiler_config to your stage config file."
+                "For omni models, add profiler_config to the relevant deploy config stage."
             )
         if is_start:
             from vllm_omni.profiler import OmniTorchProfilerWrapper
@@ -59,3 +59,11 @@ class OmniNPUWorkerBase(NPUWorker):
             self.profiler.start()
         else:
             self.profiler.stop()
+
+    def shutdown(self) -> None:
+        try:
+            runner = getattr(self, "model_runner", None)
+            if runner is not None:
+                runner._close_omni_aux_output()
+        finally:
+            super().shutdown()

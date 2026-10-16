@@ -1,4 +1,7 @@
-from types import SimpleNamespace
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -24,7 +27,7 @@ class E2EOperator:
         h_size = z.shape[0]
         w_size = z.shape[1]
 
-        tasks = []
+        tasks: list[TileTask] = []
         for i in range(rows_num):
             for j in range(cols_num):
                 tasks.append(
@@ -58,10 +61,17 @@ class E2EOperator:
         return torch.cat(tiles, dim=0)
 
 
+@dataclass
+class FakeWorldGroup:
+    device_group: object
+    cpu_group: object = None
+
+
 class DummyMixin(DistributedVaeMixin):
     def __init__(self):
         self.use_tiling = True
-        self.distributed_executor = SimpleNamespace(parallel_size=2, group=None)
+        self.distributed_executor = DistributedVaeExecutor()
+        self.distributed_executor.set_parallel_size(2)
 
 
 @pytest.fixture(autouse=True)
@@ -75,11 +85,13 @@ def mock_dist(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
-def mock_dit_group(monkeypatch: pytest.MonkeyPatch):
+def mock_world_group(monkeypatch: pytest.MonkeyPatch):
+    group = object()
     monkeypatch.setattr(
-        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_dit_group",
-        lambda: None,
+        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_world_group",
+        lambda: FakeWorldGroup(device_group=group),
     )
+    return group
 
 
 @pytest.fixture(autouse=True)
@@ -91,6 +103,11 @@ def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
 # ============================
 # Unitest
 # ============================
+
+
+def test_uses_dedicated_world_device_group(mock_world_group):
+    executor = DistributedVaeExecutor()
+    assert executor.group is mock_world_group
 
 
 def test_balance_tasks():

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for SeedTTSTextDataset, SeedTTSTextSampleRequest, SeedTTSDesignDataset,
 and SeedTTSDesignSampleRequest.
 
@@ -23,15 +26,19 @@ _MODULE_NAME = "vllm_omni.benchmarks.data_modules.seed_tts_dataset"
 
 if _MODULE_NAME not in sys.modules:
     _spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
+    assert _spec is not None and _spec.loader is not None
     _mod = importlib.util.module_from_spec(_spec)
     sys.modules[_MODULE_NAME] = _mod
     _spec.loader.exec_module(_mod)
 
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (  # noqa: E402
+    SeedTTSDataset,
     SeedTTSDesignDataset,
     SeedTTSDesignSampleRequest,
+    SeedTTSSampleRequest,
     SeedTTSTextDataset,
     SeedTTSTextSampleRequest,
+    SeedTTSTurn,
 )
 
 # ---------------------------------------------------------------------------
@@ -68,6 +75,94 @@ def mock_tokenizer(mocker):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_seed_tts_dataset_groups_four_turns_with_one_reference(seed_tts_root, mock_tokenizer):
+    ds = SeedTTSDataset(
+        dataset_path=str(seed_tts_root),
+        random_seed=0,
+        locale="en",
+        disable_shuffle=True,
+    )
+
+    requests = ds.sample(
+        mock_tokenizer,
+        num_requests=1,
+        turns_per_session=4,
+        no_oversample=True,
+    )
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert [turn.utterance_id for turn in request.seed_tts_turns] == [
+        "utt000",
+        "utt001",
+        "utt002",
+        "utt003",
+    ]
+    assert [turn.target_text for turn in request.seed_tts_turns] == [
+        "target text 0",
+        "target text 1",
+        "target text 2",
+        "target text 3",
+    ]
+    assert request.seed_tts_speech_extra["ref_text"] == "ref text 0"
+    assert request.seed_tts_ref_wav_path.endswith("utt000.wav")
+
+
+def test_seed_tts_eval_expands_grouped_pcm_by_turn():
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
+        _expand_seed_tts_turn_outputs,
+    )
+
+    request = SeedTTSSampleRequest(
+        prompt="target 0",
+        prompt_len=4,
+        expected_output_len=100,
+        multi_modal_data=None,
+        request_id="session-0",
+        seed_tts_turns=tuple(
+            SeedTTSTurn(utterance_id=f"utt-{index}", target_text=f"target {index}") for index in range(4)
+        ),
+    )
+    output = types.SimpleNamespace(
+        success=True,
+        tts_turn_pcm_bytes=[bytes([index]) for index in range(4)],
+    )
+
+    requests, outputs = _expand_seed_tts_turn_outputs([request], [output])
+
+    assert [item.prompt for item in requests] == [f"target {index}" for index in range(4)]
+    assert [item.seed_tts_utterance_id for item in requests] == [f"utt-{index}" for index in range(4)]
+    assert [item.tts_output_pcm_bytes for item in outputs] == [bytes([index]) for index in range(4)]
+
+
+def test_seed_tts_eval_keeps_session_pcm_for_single_turn_chat():
+    """Chat-omni Seed-TTS sets session PCM only; expand must not wipe it."""
+    from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
+        _expand_seed_tts_turn_outputs,
+    )
+
+    request = SeedTTSSampleRequest(
+        prompt="target 0",
+        prompt_len=4,
+        expected_output_len=100,
+        multi_modal_data=None,
+        request_id="session-0",
+        seed_tts_turns=(SeedTTSTurn(utterance_id="utt-0", target_text="target 0"),),
+    )
+    pcm = b"\x01\x02\x03\x04"
+    output = types.SimpleNamespace(
+        success=True,
+        tts_output_pcm_bytes=pcm,
+        tts_turn_pcm_bytes=None,
+    )
+
+    requests, outputs = _expand_seed_tts_turn_outputs([request], [output])
+
+    assert len(requests) == 1
+    assert requests[0].prompt == "target 0"
+    assert outputs[0].tts_output_pcm_bytes == pcm
 
 
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mock_tokenizer):
@@ -143,35 +238,8 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
         assert req.seed_tts_utterance_id == "ok"
 
 
-def test_attach_sets_seed_tts_row_even_without_extra_body():
-    """seed_tts_row=True must be set for SeedTTSTextSampleRequest (no extra body)."""
-    from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSTextSampleRequest
-
-    req = SeedTTSTextSampleRequest(
-        prompt="hello world",
-        prompt_len=2,
-        expected_output_len=100,
-        multi_modal_data=None,
-        request_id="test-0",
-        seed_tts_speech_extra=None,
-        seed_tts_ref_wav_path="",
-    )
-    assert req.seed_tts_speech_extra is None
-    assert req.seed_tts_ref_wav_path == ""
-    # The fix ensures that even with speech_extra=None, the function
-    # sets seed_tts_row=True. We verify the source code has the fix.
-    import inspect
-
-    import vllm_omni.benchmarks.patch.patch as patch_mod
-
-    src = inspect.getsource(patch_mod._attach_seed_tts_to_request_func_input)
-    # seed_tts_row must be set BEFORE the 'if not ex: return' check
-    row_pos = src.index("seed_tts_row")
-    not_ex_pos = src.index("if not ex:")
-    assert row_pos < not_ex_pos, "seed_tts_row must be set before 'if not ex: return'"
-
-
-def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):
+@pytest.mark.parametrize("audio_seconds", [0.1, 61])
+def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch, audio_seconds):
     from vllm_omni.benchmarks.data_modules import seed_tts_eval
 
     calls = {}
@@ -186,8 +254,9 @@ def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):
             return self
 
     class FakeProcessor:
-        def __call__(self, wav, *, sampling_rate, return_tensors, return_attention_mask=False):
+        def __call__(self, wav, *, sampling_rate, return_tensors, return_attention_mask=False, **kwargs):
             calls["return_attention_mask"] = return_attention_mask
+            calls["processor_kwargs"] = kwargs
             assert sampling_rate == 16000
             assert return_tensors == "pt"
             assert len(wav) > 0
@@ -196,9 +265,10 @@ def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):
                 attention_mask=FakeTensor("mask") if return_attention_mask else None,
             )
 
-        def get_decoder_prompt_ids(self, *, language, task):
+        def get_decoder_prompt_ids(self, *, language, task, no_timestamps=True):
             assert language == "english"
             assert task == "transcribe"
+            calls["no_timestamps"] = no_timestamps
             return [(1, 2)]
 
         def batch_decode(self, predicted_ids, *, skip_special_tokens):
@@ -217,10 +287,18 @@ def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):
     monkeypatch.setattr(seed_tts_eval, "_en_model", FakeModel())
     monkeypatch.setattr(seed_tts_eval, "_device", "cuda:1")
 
-    text = seed_tts_eval._transcribe_en_f32_16k(np.ones(1600, dtype=np.float32))
+    text = seed_tts_eval._transcribe_en_f32_16k(np.ones(int(audio_seconds * 16000), dtype=np.float32))
 
     assert text == "hello"
     assert calls["return_attention_mask"] is True
     assert calls["input_features"].device == "cuda:1"
     assert calls["generate_kwargs"]["attention_mask"].device == "cuda:1"
     assert calls["generate_kwargs"]["forced_decoder_ids"] == [(1, 2)]
+    if audio_seconds > 30:
+        assert calls["processor_kwargs"] == {"truncation": False, "padding": "longest"}
+        assert calls["generate_kwargs"]["return_timestamps"] is True
+        assert calls["no_timestamps"] is False
+    else:
+        assert calls["processor_kwargs"] == {}
+        assert "return_timestamps" not in calls["generate_kwargs"]
+        assert calls["no_timestamps"] is True

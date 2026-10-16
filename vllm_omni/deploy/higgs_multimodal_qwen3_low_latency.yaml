@@ -43,6 +43,11 @@ stages:
     gpu_memory_utilization: 0.6
     enforce_eager: false
     attention_backend: FLASHINFER
+    # Eight codebooks share one attention row, so decode remains BF16 q_len=1
+    # per request. vLLM's SM90 XQA capability gate does not benchmark this
+    # shape; keep the faster native path (README_higgs_audio_v3.md, #5584).
+    attention_config:
+      use_trtllm_attention: false
     trust_remote_code: true
     enable_prefix_caching: true
     async_scheduling: false
