@@ -283,19 +283,26 @@ listening scores.
 
 ### Reference conditioning batch
 
-`benchmarks/tts/chatterbox_conditioning.py` on `cuda:0`: 64 references cut
-from `clone_2.wav` at 6.1, 8.3, 10.1 and 16 s with distinct amplitude
-envelopes, encoded one at a time and then as one batch, three cycles.
+`benchmarks/tts/chatterbox_conditioning.py` on `cuda:0` at this head: 64
+references cut from one 6.5 s Seed-TTS evaluation prompt
+(`common_voice_en_103675.wav`) at 6.1, 8.3, 10.1 and 16 s with distinct
+amplitude envelopes, encoded one at a time and then as one batch, three
+cycles. The same run at the commit before the batched device extraction
+(same host, same clip) is the "before" column.
 
-| Model | 64 references, serial (s) | 64 references, one batch (s) | Peak device memory (MiB) | Serial/batch parity |
-| --- | --- | --- | --- | --- |
-| Turbo | 10.22–10.74 | 3.29–4.00 | 4493 | passed: tokens and features identical, speaker embedding within 1.2e-7 |
-| Original | 8.23–8.90 | 2.18–2.29 | 3367 | passed: tokens and features identical, speaker embedding within 1.2e-7 |
+| Model | Serial before (s) | Serial (s) | One batch before (s) | One batch (s) | Peak allocated / reserved (MiB) | Serial/batch parity |
+| --- | --- | --- | --- | --- | --- | --- |
+| Turbo | 9.12–9.91 | 7.90–8.13 | 3.11–3.28 | 1.64–2.02 | 3237 / 3808 | conditioning tokens identical; one reference (the 8.3 s cut) gets one different decoder prompt token in the batch, before and after alike; prompt mel within 9.5e-7, speaker embedding within 1.4e-7, x-vector within 6.0e-6 |
+| Original | 8.61–9.51 | 6.64–8.22 | 2.00–2.19 | 0.51–0.68 | 2193 / 2804 | tokens identical; prompt mel within 9.5e-7, speaker embedding within 1.3e-7, x-vector within 5.5e-6 |
 
-Turbo's first batch took 4.00 s and the next two 3.30 s and 3.29 s. The
-voice encoder ran once over all 784 partial windows, the speech tokenizer in two
-calls of 64, and CAMPPlus in three calls grouped by equal waveform length.
-Peak device memory is whole-device usage sampled every 100 ms.
+In one batch the voice encoder ran once over all 752 partial windows, the
+speech tokenizer in two calls of 64, and CAMPPlus in three calls grouped by
+equal waveform length. The benchmark requires tokens to match exactly and
+features within 1e-4, so the Turbo run reports the one-token difference as
+a failure; the batched tokenizer's attention is not bit-identical to the
+single clip's, and which clip flips a token depends on the recording.
+Peak memory is torch's allocated and reserved device memory in the
+benchmark process.
 
 ### Nightly latency and throughput baselines, default profiles
 
