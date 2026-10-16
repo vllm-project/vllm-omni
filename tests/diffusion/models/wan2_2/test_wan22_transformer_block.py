@@ -58,13 +58,14 @@ def _run_block(block: WanTransformerBlock, residual: torch.Tensor, temb: torch.T
 @pytest.mark.parametrize("token_wise", [False, True], ids=["standard", "ti2v"])
 def test_gates_preserve_batch_and_token_conditions(token_wise: bool) -> None:
     residual = torch.tensor([10.0, 20.0]).expand(2, 3, 2).clone()
+    cross_attention = torch.tensor([5.0, 7.0])
     table = torch.zeros(1, 6, 2)
     table[0, 2] = torch.tensor([1.0, -1.0])
     table[0, 5] = torch.tensor([0.0, 2.0])
     block = _make_block(
         table,
         attention=torch.tensor([2.0, 3.0]).expand_as(residual).clone(),
-        cross_attention=torch.tensor([5.0, 7.0]).expand_as(residual).clone(),
+        cross_attention=cross_attention.expand_as(residual).clone(),
         feed_forward=torch.tensor([4.0, 6.0]).expand_as(residual).clone(),
     )
 
@@ -84,8 +85,10 @@ def test_gates_preserve_batch_and_token_conditions(token_wise: bool) -> None:
     output = _run_block(block, residual, temb)
 
     # Distinct gates catch batch/token broadcasting and attention/FFN mix-ups.
-    # A nonzero cross-attention branch also catches accidentally gating that update.
+    # A nonzero cross-attention branch also catches accidentally gating that update,
+    # and norm3's input pins that ungated residual before the FFN update.
     torch.testing.assert_close(block.norm2.input, expected_attention.float(), rtol=0, atol=0)
+    torch.testing.assert_close(block.norm3.input, (expected_attention + cross_attention).float(), rtol=0, atol=0)
     torch.testing.assert_close(output, expected_output.float(), rtol=0, atol=0)
 
 
