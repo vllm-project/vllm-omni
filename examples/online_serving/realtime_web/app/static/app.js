@@ -436,6 +436,19 @@
       return;
     }
 
+    // MiniCPM VISION units advance on fresh camera frames even with a muted mic.
+    // Never reuse a sticky frame at the faster audio flush cadence.
+    if (profile.videoOnlyMessages && muted) {
+      pendingCapture = [];
+      if (running && connectionReady && cameraPendingFrame) {
+        for (const event of profile.videoOnlyMessages(cameraPendingFrame)) {
+          socket.send(JSON.stringify(event));
+        }
+        cameraPendingFrame = null;
+      }
+      return;
+    }
+
     if (pendingCapture.length === 0) return;
     if (!microphoneUploadEnabled()) {
       pendingCapture = [];

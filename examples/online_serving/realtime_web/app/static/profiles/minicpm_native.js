@@ -37,6 +37,9 @@
       if (frame) event.video_frames = [frame];
       return event;
     },
+    videoOnlyMessages(frame) {
+      return [{ type: 'input_audio_buffer.append', video_frames: [frame] }];
+    },
     commitMessages: () => [],
     ack(responseId, playedMs) {
       return { type: 'playback.ack', response_id: responseId, item_id: `item_${responseId}`,

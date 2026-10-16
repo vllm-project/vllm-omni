@@ -41,6 +41,7 @@ from vllm_omni.engine.duplex.plugin import (
     reject_changed_runtime_value,
     reject_private_runtime_keys,
 )
+from vllm_omni.model_executor.common.duplex.payload import payload_audio
 from vllm_omni.model_executor.common.duplex.payload import payload_sample_count as _duplex_pcm_sample_count
 from vllm_omni.model_executor.common.request_outputs import coerce_int as _coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
@@ -183,6 +184,10 @@ def duplex_payload_is_exact_chunks(payload: object) -> bool:
     return sample_count is not None and sample_count != 0 and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
 
 
+def _duplex_payload_is_vision_only(payload: object) -> bool:
+    return bool(_duplex_frames(payload)) and payload_audio(payload) is None
+
+
 def duplex_first_append_unit_count(payload: object) -> int | None:
     sample_count = _duplex_pcm_sample_count(payload)
     if not sample_count or sample_count % _DUPLEX_CHUNK_SAMPLES != 0:
@@ -247,7 +252,13 @@ def build_duplex_data_plane_prompt(
     # Computed once: with a known tile this decodes the stacked pair's first frame.
     vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
     token_budget = _duplex_audio_token_budget(payload) + vision_tokens
-    if seq <= 1:
+    if _duplex_payload_is_vision_only(payload):
+        # Surplus slots are filled with </unit> pad embeddings that stay in the KV.
+        # A VISION unit is <unit> + frame blocks; later units first close the
+        # previous one with its sampled terminator + </unit>.
+        lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
+        token_budget = lead_tokens + 1 + vision_tokens
+    elif seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)

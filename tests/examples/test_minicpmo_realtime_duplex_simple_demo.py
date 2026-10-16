@@ -300,3 +300,53 @@ def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, 
     stderr = capsys.readouterr().err
     assert "audio chunk 1" in stderr
     assert "你好" in stderr
+
+
+@pytest.mark.parametrize("audio_samples", [3 * 16000 + 512, 2 * 16000])
+def test_video_soundtrack_aligns_to_video_units(monkeypatch, tmp_path, audio_samples):
+    """AAC padding must not create an extra frame-less model unit at EOF."""
+    demo = _load_demo_module()
+    audio_path = tmp_path / "input.wav"
+    pcm = b"\x01\x00" * audio_samples
+    demo.write_pcm16_wav(audio_path, pcm, sample_rate_hz=16000)
+    monkeypatch.setattr(demo, "_probe_video_frames_and_fps", lambda path: (90, 30.0))
+    monkeypatch.setattr(demo, "_extract_video_soundtrack", lambda *args: audio_path)
+
+    def extract(path, work_dir, **kwargs):
+        assert kwargs["duration_s"] == 3.0
+        return ["f0", "f1", "f2"], [None] * 3
+
+    monkeypatch.setattr(demo, "_extract_video_frames", extract)
+    wav, frames, _ = demo._extract_video_input(tmp_path / "clip.mp4", tmp_path, fps=1.0, max_side=0, stack_frames=1)
+    aligned = demo.read_pcm16_wav(wav)
+    assert aligned == pcm[:96000].ljust(96000, b"\0")
+    assert len(frames) == 3
+    assert not demo._has_residual_model_unit(aligned, chunk_period_ms=1000)
+
+
+def test_video_without_soundtrack_uses_video_duration(monkeypatch, tmp_path):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    demo = _load_demo_module()
+    monkeypatch.setitem(
+        sys.modules,
+        "av",
+        SimpleNamespace(open=lambda path: nullcontext(SimpleNamespace(streams=SimpleNamespace(audio=[])))),
+    )
+    monkeypatch.setattr(demo, "_probe_video_frames_and_fps", lambda path: (90, 30.0))
+
+    def extract(path, work_dir, **kwargs):
+        assert kwargs["duration_s"] == 3.0
+        return ["f0", "f1", "f2"], [None] * 3
+
+    monkeypatch.setattr(demo, "_extract_video_frames", extract)
+    wav, frames, _ = demo._resolve_duplex_av_inputs(
+        input_wav=None,
+        input_video="silent.mp4",
+        work_dir=tmp_path,
+        fps=1.0,
+        max_side=0,
+    )
+    assert wav is None
+    assert len(frames) == 3

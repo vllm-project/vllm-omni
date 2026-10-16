@@ -465,6 +465,30 @@ async def test_stream_pcm_chunking():
 
 
 @pytest.mark.asyncio
+async def test_stream_pcm_pacing_accounts_for_send_overhead(monkeypatch):
+    import vllm_omni.clients.duplex as duplex
+
+    client, _ = make_client(FakeSocket())
+    clock = [0.0]
+    send_starts = []
+
+    async def append(pcm, **kwargs):
+        send_starts.append(clock[0])
+        clock[0] += 0.03
+
+    async def sleep(delay):
+        assert delay >= 0
+        clock[0] += delay
+
+    monkeypatch.setattr(client, "append_audio", append)
+    monkeypatch.setattr(duplex.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(duplex.asyncio, "sleep", sleep)
+    await client.stream_pcm(bytes(9600), chunk_ms=100)
+    assert send_starts == pytest.approx([0.0, 0.1, 0.2])
+    assert clock[0] == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
 async def test_interruption_primitives_send_documented_events():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)

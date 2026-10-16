@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -116,6 +116,14 @@ class PcmAppendBuffer(ABC):
         allow_emit: bool,
     ) -> PcmAppendReservation | None: ...
 
+    def prepare_commit_prefix(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
+        """Reserve one non-terminal unit that must precede a turn commit.
+
+        Models with a single terminal payload need no prefix. The runner submits
+        each prefix in wire order before reserving and acknowledging the commit.
+        """
+        return None
+
     @abstractmethod
     def prepare_commit(
         self,
@@ -194,6 +202,9 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     # continuation deadline. A real (non-silence) input resets the chain.
     last_native_submit_monotonic: float | None = None
     silence_deadline_monotonic: float | None = None
+    # Listen-only units peeled off a commit that had to wait for the active
+    # response. Promotion submits these before the retained terminal payload.
+    commit_prefix_payloads: list[dict[str, object]] = field(default_factory=list)
 
     def retain_committed_audio(
         self,
@@ -213,6 +224,7 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
         self.committed_audio_reserved_bytes = 0
         self.deferred_response_create = False
         self.deferred_precreate_response = False
+        self.commit_prefix_payloads.clear()
         return reserved_bytes
 
     def clear_continuation(self) -> None:

@@ -1923,3 +1923,103 @@ async def test_input_clear_racing_a_queued_append_drops_it_as_the_clients_doing(
         assert h.session.state == DuplexSessionState.OPEN
     finally:
         await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_video_only_append_submits_without_commit() -> None:
+    h = await open_harness()
+    try:
+        assert h.session.capabilities.allows_video_without_audio()
+        events = await h.run(
+            commands.AppendAudio(
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                video_frames=("frame",),
+            )
+        )
+        assert "error" not in types(events)
+        assert len(h.port.submissions) == 1
+        payload = h.port.submissions[0].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        assert payload["video_frames"] == ["frame"]
+        assert not payload.get("audio")
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_speech", [False, True])
+@pytest.mark.parametrize("create_response", [False, True])
+async def test_manual_commit_drains_vision_units_before_response(with_speech: bool, create_response: bool) -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        for frame in ("frame-1", "frame-2"):
+            await h.run(commands.AppendAudio(format="pcm_f32le", sample_rate_hz=16000, video_frames=(frame,)))
+        if with_speech:
+            await h.run(
+                commands.AppendAudio(audio=pcm_f32(1600), format="pcm_f32le", sample_rate_hz=16000, is_speech=True)
+            )
+        assert not h.port.submissions
+        events = await h.run(commands.Commit(create_response=create_response))
+        assert "input_audio_buffer.committed" in types(events)
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        if not create_response:
+            await h.run(commands.CreateResponse())
+        payloads = [s.prompt["model_intermediate_buffer"]["duplex"]["payload"] for s in h.port.submissions]
+        assert [p["video_frames"] for p in payloads if p.get("video_frames")] == [["frame-1"], ["frame-2"]]
+        assert len(payloads) == (3 if with_speech else 2)
+        assert all(p.get("force_listen") is True for p in payloads[:-1])
+        assert bool(payloads[-1].get("audio")) is with_speech
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_response", [False, True])
+@pytest.mark.parametrize("with_speech", [False, True])
+async def test_deferred_commit_keeps_vision_units_ahead_of_the_speech_tail(
+    create_response: bool, with_speech: bool
+) -> None:
+    """A commit during an active response must not collapse queued VISION units.
+
+    Overlap deferral retains the turn until the response ends. Taking only the
+    first VISION unit there leaves the other frames and the speech tail in the
+    buffer, and prepare_commit clears the speech flag so that tail is stranded.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        assert h.session.active_response_id is not None
+        assert len(h.port.submissions) == 1
+
+        request_id = h.port.submissions[0].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="sure"))
+        await h.run(commands.AckPlayback(response_id=response_id, played_ms=1000))
+        for frame in ("frame-1", "frame-2"):
+            await h.run(commands.AppendAudio(format="pcm_f32le", sample_rate_hz=16000, video_frames=(frame,)))
+        if with_speech:
+            await h.run(
+                commands.AppendAudio(audio=pcm_f32(16000), format="pcm_f32le", sample_rate_hz=16000, is_speech=True)
+            )
+        events = await h.run(commands.Commit(create_response=create_response))
+        assert "input_audio_buffer.committed" in types(events)
+        assert len(h.port.submissions) == 1
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert [p["video_frames"] for p in h.runner.model_state.commit_prefix_payloads] == (
+            [["frame-1"], ["frame-2"]] if with_speech else [["frame-1"]]
+        )
+
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True))
+        if not create_response:
+            create_events = await h.run(commands.CreateResponse())
+            assert "error" not in types(create_events), create_events
+        payloads = [s.prompt["model_intermediate_buffer"]["duplex"]["payload"] for s in h.port.submissions]
+        assert [p.get("video_frames") for p in payloads[1:]] == (
+            [["frame-1"], ["frame-2"], None] if with_speech else [["frame-1"], ["frame-2"]]
+        )
+        assert all(p.get("force_listen") is True for p in payloads[1:-1])
+        assert bool(payloads[-1].get("audio")) is with_speech
+        assert not h.runner.model_state.commit_prefix_payloads
+    finally:
+        await close_harness(h)

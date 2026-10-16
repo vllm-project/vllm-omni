@@ -844,6 +844,8 @@ class DuplexClientBase(ABC):
                 yield chunk, [frames[index]] if composite is None else [frames[index], composite]
 
         frames_sent = 0
+        stream_started_at = time.monotonic()
+        sent_duration_s = 0.0
         for chunk, unit_frames in units():
             if not chunk:
                 continue
@@ -851,7 +853,11 @@ class DuplexClientBase(ABC):
             if unit_frames:
                 frames_sent += 1
             if realtime:
-                await asyncio.sleep(input_format.duration_ms(len(chunk)) / 1000.0)
+                # Relative sleeps accumulate encoding, send, and scheduling
+                # overhead, progressively slowing the input media clock.
+                sent_duration_s += input_format.duration_ms(len(chunk)) / 1000.0
+                delay_s = stream_started_at + sent_duration_s - time.monotonic()
+                await asyncio.sleep(max(0.0, delay_s))
         return frames_sent
 
     async def commit(self, *, final: bool = True, create_response: bool | None = None) -> None:

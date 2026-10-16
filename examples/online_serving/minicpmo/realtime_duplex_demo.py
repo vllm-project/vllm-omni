@@ -99,6 +99,25 @@ class _StreamingOutputWriter:
         )
 
 
+class _TimedInputClient(DuplexClient):
+    """Record the transmitted media clock without retaining audio payloads."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.input_timeline: list[dict[str, float]] = []
+
+    async def send(self, event: dict[str, object]) -> str:
+        event_id = await super().send(event)
+        if event.get("type") == "input_audio_buffer.append" and "audio_end_ms" in event:
+            self.input_timeline.append(
+                {
+                    "sent_at_s": time.monotonic(),
+                    "audio_end_s": float(event["audio_end_ms"]) / 1000.0,
+                }
+            )
+        return event_id
+
+
 class _StreamingEventCollector(EventCollector):
     def __init__(self, writer: _StreamingOutputWriter) -> None:
         super().__init__()
@@ -373,13 +392,25 @@ def _extract_video_input(
     caller already has ``--input-wav``, extract frames against that WAV
     duration instead so a silent clip cannot fail ``load_audio``.
     """
+    num_frames, frame_rate = _probe_video_frames_and_fps(video_path)
+    video_duration_s = num_frames / frame_rate
     audio_path = _extract_video_soundtrack(video_path, work_dir)
+    # Match official get_audio_segments(adjust_length=True): the video
+    # timeline determines the number of one-second audio units. Decoders
+    # can retain AAC padding (e.g. 180.032 s for a 180 s video); treating it
+    # as real input creates an extra, frame-less unit on the final commit.
+    unit_count = max(1, int(math.ceil(video_duration_s - 1e-9)))
+    target_bytes = unit_count * PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
+    pcm = read_pcm16_wav(audio_path)
+    aligned_pcm = pcm[:target_bytes].ljust(target_bytes, b"\0")
+    if aligned_pcm != pcm:
+        write_pcm16_wav(audio_path, aligned_pcm, sample_rate_hz=PCM16_SAMPLE_RATE)
     frames_b64, stacked_b64 = _extract_video_frames(
         video_path,
         work_dir,
         fps=fps,
         max_side=max_side,
-        duration_s=_pcm16_wav_duration_s(audio_path),
+        duration_s=video_duration_s,
         stack_frames=stack_frames,
     )
     return audio_path, frames_b64, stacked_b64
@@ -393,7 +424,7 @@ def _resolve_duplex_av_inputs(
     fps: float,
     max_side: int,
     stack_frames: int = 1,
-) -> tuple[str, list[str], list[str | None]]:
+) -> tuple[str | None, list[str], list[str | None]]:
     """Return ``(wav_path, frames_b64, stacked_b64)``. External WAV wins over video audio."""
     if input_video:
         video_path = Path(input_video)
@@ -407,6 +438,21 @@ def _resolve_duplex_av_inputs(
                 stack_frames=stack_frames,
             )
             return input_wav, frames, stacked
+        import av
+
+        with av.open(str(video_path)) as container:
+            has_audio = bool(container.streams.audio)
+        if not has_audio:
+            frame_count, frame_rate = _probe_video_frames_and_fps(video_path)
+            frames, stacked = _extract_video_frames(
+                video_path,
+                work_dir,
+                fps=fps,
+                max_side=max_side,
+                stack_frames=stack_frames,
+                duration_s=frame_count / frame_rate,
+            )
+            return None, frames, stacked
         extracted_wav, frames, stacked = _extract_video_input(
             video_path,
             work_dir,
@@ -433,17 +479,25 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         stack_frames=args.stack_frames,
     )
 
-    input_pcm16 = read_pcm16_wav(Path(input_wav))
-    if not input_pcm16:
+    input_pcm16 = read_pcm16_wav(Path(input_wav)) if input_wav is not None else b""
+    if input_wav is not None and not input_pcm16:
         raise ValueError("input WAV has no audio")
 
     collector = _StreamingEventCollector(stream_writer)
-    client = DuplexClient(
+    client = _TimedInputClient(
         args.url,
         model=args.model,
         config=create_duplex_session_config(
             ref_audio=_ref_audio_data_url(args.ref_audio),
             temperature=args.temperature,
+            instructions=args.instructions,
+            extra_body={
+                "sliding_window_mode": args.sliding_window_mode,
+                "basic_window_high_tokens": args.basic_window_high_tokens,
+                "basic_window_low_tokens": args.basic_window_low_tokens,
+                "context_max_units": args.context_max_units,
+                "context_previous_max_tokens": args.context_previous_max_tokens,
+            },
         ),
         reconnect=None,
         heartbeat_interval_s=None,
@@ -455,13 +509,42 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         # subscribed; seed it so counts and capability lookups still work.
         collector.add({"type": "session.created", "session": client.session_info})
         stream_event_cursor = len(collector.events)
-        frames_sent = await client.stream_pcm(
-            input_pcm16,
-            chunk_ms=args.chunk_ms,
-            realtime=not args.no_realtime_pacing,
-            video_frames=video_frames,
-            stacked_video_frames=stacked_video_frames,
-        )
+        input_stream_started_at_s = time.monotonic()
+        if input_wav is None:
+            frames_sent = 0
+            frame_period_s = 1.0 / max(args.video_fps, 1e-6)
+            for i, frame in enumerate(video_frames):
+                frames = [frame]
+                if i < len(stacked_video_frames) and stacked_video_frames[i] is not None:
+                    frames.append(stacked_video_frames[i])
+                await client.send({"type": "input_audio_buffer.append", "video_frames": frames})
+                frames_sent += 1
+                if not args.no_realtime_pacing:
+                    # Same media clock as stream_pcm: a sleep of one frame period
+                    # after each send would accumulate send overhead.
+                    delay_s = input_stream_started_at_s + frames_sent * frame_period_s - time.monotonic()
+                    await asyncio.sleep(max(0.0, delay_s))
+        else:
+            frames_sent = await client.stream_pcm(
+                input_pcm16,
+                chunk_ms=args.chunk_ms,
+                realtime=not args.no_realtime_pacing,
+                video_frames=video_frames,
+                stacked_video_frames=stacked_video_frames,
+            )
+        # Let the model answer the final utterance while holding the last frame.
+        # A commit alone does not supply more model time to native duplex.
+        tail_frames_sent = 0
+        if args.tail_silence_s > 0:
+            tail_pcm = bytes(round(args.tail_silence_s * PCM16_SAMPLE_RATE) * PCM16_BYTES_PER_SAMPLE)
+            tail_frames_sent = await client.stream_pcm(
+                tail_pcm,
+                chunk_ms=args.chunk_ms,
+                realtime=not args.no_realtime_pacing,
+                video_frames=video_frames[-1:],
+                stacked_video_frames=stacked_video_frames[-1:],
+            )
+            input_pcm16 += tail_pcm
         commit_event_cursor = len(collector.events)
         stream_decision = _latest_model_decision(collector.events, stream_event_cursor)
         input_has_residual_model_unit = _has_residual_model_unit(
@@ -555,6 +638,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in collector.events),
             encoding="utf-8",
         )
+        (output_dir / "input_timeline.json").write_text(json.dumps(client.input_timeline, indent=2), encoding="utf-8")
         (output_dir / "output.pcm").write_bytes(audio)
         if audio:
             write_pcm16_wav(
@@ -564,6 +648,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
 
         result = {
+            "validation_scope": "transport_and_lifecycle_only",
             "ok": (
                 collector.count("session.created") > 0
                 and collector.count("session.closed") > 0
@@ -572,6 +657,16 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 and (bool(audio) or not args.require_audio)
             ),
             "model_decision": model_decision,
+            "input_stream_started_at_s": input_stream_started_at_s,
+            "realtime_pacing": not args.no_realtime_pacing,
+            "sampling_temperature": args.temperature,
+            "sliding_window_mode": args.sliding_window_mode,
+            "basic_window_high_tokens": args.basic_window_high_tokens,
+            "basic_window_low_tokens": args.basic_window_low_tokens,
+            "context_max_units": args.context_max_units,
+            "context_previous_max_tokens": args.context_previous_max_tokens,
+            "tail_silence_s": args.tail_silence_s,
+            "tail_video_frames_sent": tail_frames_sent,
             "post_commit": {
                 "input_committed_event_index": committed_index,
                 "decision": post_commit_decision,
@@ -589,6 +684,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 ),
             },
             "input_video": args.input_video,
+            "input_wav": args.input_wav,
             "video_frames_extracted": len(video_frames),
             "video_frames_sent": frames_sent,
             "video_stacked_frames_extracted": sum(frame is not None for frame in stacked_video_frames),
@@ -690,14 +786,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=60.0)
     parser.add_argument(
+        "--instructions",
+        help="Session system prompt. Omit to use the model's Streaming Omni Conversation default.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=None,
         help="Stage 0 sampling temperature; omit to preserve the model default.",
     )
     parser.add_argument("--no-realtime-pacing", action="store_true")
+    parser.add_argument("--sliding-window-mode", choices=("off", "basic", "context"), default="off")
+    parser.add_argument("--basic-window-high-tokens", type=int, default=8000)
+    parser.add_argument("--basic-window-low-tokens", type=int, default=6000)
+    parser.add_argument("--context-max-units", type=int, default=24)
+    parser.add_argument("--context-previous-max-tokens", type=int, default=500)
+    parser.add_argument(
+        "--tail-silence-s",
+        type=int,
+        default=0,
+        help="Additional silent seconds holding the last frame to allow the final answer to finish.",
+    )
     parser.add_argument("--require-audio", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.tail_silence_s < 0:
+        parser.error("--tail-silence-s must be nonnegative")
+    if not 0 < args.basic_window_low_tokens < args.basic_window_high_tokens:
+        parser.error("window watermarks must satisfy 0 < low < high")
+    if args.context_max_units <= 0 or args.context_previous_max_tokens <= 0:
+        parser.error("context window limits must be positive")
+    return args
 
 
 def main() -> None:

@@ -215,6 +215,33 @@ def test_a_first_append_decodes_the_base_frame_once(monkeypatch: pytest.MonkeyPa
     assert len(prompt["prompt_token_ids"]) == 5 + 12 - 1 + 4 * TOKENS_PER_BLOCK
 
 
+@pytest.mark.parametrize("payload_audio", [None, ""], ids=["no audio key", "empty audio"])
+def test_a_vision_only_unit_reserves_exactly_its_tokens(payload_audio: str | None) -> None:
+    """Surplus slots become </unit> pad embeddings in the KV, so VISION units reserve exactly."""
+    payload: dict[str, object] = {"format": "pcm_f32le", "video_frames": [_frame((448, 448))]}
+    if payload_audio is not None:
+        payload["audio"] = payload_audio
+    runtime_config = {"duplex_first_append_context_tokens": 5, "duplex_vision_tile_pixels": TILE_448}
+
+    def budget(seq: int) -> int:
+        prompt = build_duplex_data_plane_prompt(
+            request_id="vision-only",
+            fence=DuplexFence("sid", turn_id=1),
+            session_config={},
+            runtime_config=runtime_config,
+            seq=seq,
+            turn_seq=seq,
+            payload=payload,
+            final=False,
+        )
+        return len(prompt["prompt_token_ids"])
+
+    # Context, <unit>, one frame block.
+    assert budget(1) == 5 + 1 + TOKENS_PER_BLOCK
+    # Previous terminator + </unit>, <unit>, one frame block.
+    assert budget(2) == 2 + 1 + TOKENS_PER_BLOCK
+
+
 # ---- where the tile comes from ----
 
 

@@ -128,6 +128,8 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         # wire contract allows at most 2 images per append); both must ride
         # the same unit, mirroring official ``frame_list``.
         self._frame_queue: list[list[str]] = []
+        # Independent VISION units must not wait for a partial microphone chunk.
+        self._vision_queue: list[dict[str, object]] = []
 
     def clear(self) -> None:
         for reservation in self._reservations:
@@ -136,6 +138,7 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         self._buffer.clear()
         self._spans.clear()
         self._frame_queue.clear()
+        self._vision_queue.clear()
         self._sample_rate_hz = None
         self._turn_had_speech = False
 
@@ -143,7 +146,7 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         self._spans = [_PcmSpan(span.byte_count, False, span.is_speech) for span in self._spans]
 
     def has_pending(self) -> bool:
-        return bool(self._buffer)
+        return bool(self._buffer or self._vision_queue)
 
     def has_reserved(self) -> bool:
         return bool(self._reservations)
@@ -237,7 +240,7 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
     ) -> MiniCPMO45PcmAppendReservation | None:
         fmt = payload.get("format")
         sample_rate_hz = payload.get("sample_rate_hz")
-        audio = payload.get("audio")
+        audio = payload.get("audio", "")
         if fmt != "pcm_f32le" or not isinstance(sample_rate_hz, int) or not isinstance(audio, str):
             return self._reserve_passthrough(payload, operation_id=operation_id)
         try:
@@ -262,10 +265,31 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         if isinstance(frames_in, list):
             frame_group = [frame for frame in frames_in if isinstance(frame, str) and frame]
             if frame_group:
-                self._frame_queue.append(frame_group)
+                if raw:
+                    self._frame_queue.append(frame_group)
+                else:
+                    self._vision_queue.append(dict(payload, audio="", video_frames=frame_group))
         self._turn_had_speech = self._turn_had_speech or bool(payload.get("is_speech", False))
         if not allow_emit:
             return None
+
+        # A frame group is a complete VISION unit; no synthetic audio is needed.
+        if self._vision_queue:
+            out = self._vision_queue.pop(0)
+            frames = out["video_frames"]
+            reservation = MiniCPMO45PcmAppendReservation(
+                owner=self,
+                operation_id=operation_id,
+                payload=out,
+                raw=b"",
+                sample_rate_hz=sample_rate_hz,
+                force_listen=bool(out.get("force_listen", False)),
+                is_speech=False,
+                turn_had_speech=self._turn_had_speech,
+                video_frames=frames,
+            )
+            self._reservations.append(reservation)
+            return reservation
 
         min_samples = max(1, int(sample_rate_hz * max(1, int(chunk_period_ms)) / 1000))
         buffered_samples = len(self._buffer) // 4
@@ -324,6 +348,19 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         self._reservations.append(reservation)
         return reservation
 
+    def prepare_commit_prefix(
+        self, *, operation_id: str, chunk_period_ms: int
+    ) -> MiniCPMO45PcmAppendReservation | None:
+        # Keep the final VISION unit for the terminal reservation, unless a
+        # speech tail still needs to follow it. Never merge frame groups.
+        if not self._vision_queue or (len(self._vision_queue) == 1 and not (self._turn_had_speech and self._buffer)):
+            return None
+        return self.prepare_append(
+            {"type": "audio", "audio": "", "format": "pcm_f32le", "sample_rate_hz": self._sample_rate_hz or 16000},
+            operation_id=operation_id,
+            chunk_period_ms=chunk_period_ms,
+        )
+
     def prepare_commit(
         self,
         *,
@@ -333,7 +370,7 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         """Reserve the terminal payload without invalidating prior appends."""
         had_speech = self._turn_had_speech
         reservation: MiniCPMO45PcmAppendReservation | None = None
-        if had_speech and self._buffer:
+        if (had_speech and self._buffer) or self._vision_queue:
             payload: dict[str, object] = {
                 "type": "audio",
                 "audio": "",
@@ -405,14 +442,20 @@ class MiniCPMO45PcmAppendBuffer(PcmAppendBuffer):
         if not rolled_back:
             return
         self._prepend_spans([span for item in rolled_back for span in item._spans])
-        restored_groups = [list(item._video_frames) for item in rolled_back if item._video_frames]
+        restored_vision = [
+            dict(item.payload)
+            for item in rolled_back
+            if not item._raw and item._video_frames and item.payload is not None
+        ]
+        self._vision_queue[:0] = restored_vision
+        restored_groups = [list(item._video_frames) for item in rolled_back if item._raw and item._video_frames]
         if restored_groups:
             self._frame_queue[:0] = restored_groups
         self._sample_rate_hz = self._sample_rate_hz or reservation._sample_rate_hz
         self._turn_had_speech = self._turn_had_speech or any(item._turn_had_speech for item in rolled_back)
 
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
-        if not self._buffer:
+        if not self.has_pending():
             return None
         payload: dict[str, object] = {
             "type": "audio",

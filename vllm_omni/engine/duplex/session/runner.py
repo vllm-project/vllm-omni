@@ -557,6 +557,8 @@ class DuplexSessionRunner:
             # start a turn; replaying an old one could abort the newer request.
             if self.model_state.committed_audio_payload is not payload:
                 return
+            if not await self._submit_held_commit_prefixes():
+                return
             await self._start_append(
                 payload,
                 final=True,
@@ -1643,6 +1645,72 @@ class DuplexSessionRunner:
             return "response_already_active"
         return None
 
+    def _reserve_commit_prefixes(self) -> list[PcmAppendReservation]:
+        """Reserve every non-terminal unit a commit must keep separate."""
+        reserved: list[PcmAppendReservation] = []
+        while True:
+            reservation = self.model_state.audio_buffer.prepare_commit_prefix(
+                operation_id=uuid.uuid4().hex,
+                chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000,
+            )
+            if reservation is None:
+                return reserved
+            reserved.append(reservation)
+
+    def _rollback_commit_reservations(
+        self,
+        prefixes: list[PcmAppendReservation],
+        terminal: PcmAppendReservation,
+    ) -> None:
+        """Put a deferred commit back. The first prefix rolls later reservations back too."""
+        if prefixes:
+            prefixes[0].rollback()
+            return
+        terminal.rollback()
+
+    async def _submit_held_commit_prefixes(self) -> bool:
+        """Submit prefixes retained while a response was still running."""
+        held = getattr(self.model_state, "commit_prefix_payloads", None)
+        if not held:
+            return True
+        while held:
+            prefix = held[0]
+            if not isinstance(prefix, dict):
+                held.pop(0)
+                continue
+            await self._start_append({**prefix, "force_listen": True}, final=False)
+            if not await self._wait_for_append_tail():
+                self._emit_error(
+                    "commit_aborted",
+                    "the deferred commit was not applied because an input prefix failed",
+                )
+                return False
+            held.pop(0)
+        return True
+
+    async def _submit_commit_prefix(self, event: dict[str, object]) -> bool:
+        """Submit model-framed prefix units before sealing the input turn."""
+        while True:
+            reservation = self.model_state.audio_buffer.prepare_commit_prefix(
+                operation_id=uuid.uuid4().hex,
+                chunk_period_ms=self.session.capabilities.chunk_period_ms or 1000,
+            )
+            if reservation is None:
+                return True
+            assert reservation.payload is not None
+            await self._start_append(
+                {**reservation.payload, "force_listen": True},
+                final=False,
+                pcm_reservation=reservation,
+            )
+            if not await self._wait_for_append_tail():
+                self._emit_error(
+                    "commit_aborted",
+                    "the commit was not applied because an input prefix failed",
+                    event_id=event.get("realtime_event_id"),
+                )
+                return False
+
     async def _flush_and_submit_committed_turn(
         self,
         event: dict[str, object],
@@ -1658,6 +1726,8 @@ class DuplexSessionRunner:
         """
         session = self.session
         model_state = self.model_state
+        if not await self._submit_commit_prefix(event):
+            return True
         commit_reservation = (
             model_state.audio_buffer.prepare_commit(
                 operation_id=uuid.uuid4().hex,
@@ -1745,7 +1815,9 @@ class DuplexSessionRunner:
         if (
             helpers.response_in_progress(self.session, self.tasks)
             or self.tasks.append_tasks
-            or self.run.stream_request_id is not None
+            # Listen-only commit prefixes can still own the data-plane stream.
+            # The retained terminal append follows them in the same wire order.
+            or (self.run.stream_request_id is not None and model_state.committed_audio_payload is None)
         ):
             if session.active_response_id is None and (
                 session.active_request_id is not None
@@ -1760,6 +1832,8 @@ class DuplexSessionRunner:
             return
         if model_state.committed_audio_payload is not None:
             committed_payload = model_state.committed_audio_payload
+            if not await self._submit_held_commit_prefixes():
+                return
             operation_id = model_state.committed_audio_operation_id
             if operation_id is None:
                 operation_id = uuid.uuid4().hex
@@ -1850,17 +1924,30 @@ class DuplexSessionRunner:
         """
         session = self.session
         model_state = self.model_state
+        prefix_reservations = self._reserve_commit_prefixes()
         commit_reservation = model_state.audio_buffer.prepare_commit(
             operation_id=uuid.uuid4().hex,
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
         )
         deferred_payload = commit_reservation.payload
         if deferred_payload is None:
-            commit_reservation.commit()
+            if prefix_reservations:
+                self._rollback_commit_reservations(prefix_reservations, commit_reservation)
+            else:
+                commit_reservation.commit()
             return False
         if video_only and (not deferred_payload.get("video_frames") or deferred_payload.get("audio")):
-            commit_reservation.rollback()
+            self._rollback_commit_reservations(prefix_reservations, commit_reservation)
             return False
+        held_prefixes = getattr(model_state, "commit_prefix_payloads", None)
+        if prefix_reservations and held_prefixes is None:
+            self._rollback_commit_reservations(prefix_reservations, commit_reservation)
+            return False
+        if held_prefixes is not None:
+            for reservation in prefix_reservations:
+                assert reservation.payload is not None
+                held_prefixes.append({**reservation.payload, "force_listen": True})
+                reservation.commit()
         if isinstance(realtime_item_id, str) and realtime_item_id:
             deferred_payload = {**deferred_payload, "realtime_item_id": realtime_item_id}
         retained_payload: dict[str, object]
@@ -1903,6 +1990,8 @@ class DuplexSessionRunner:
         """Commit the buffered turn and submit it, letting the model answer it."""
         session = self.session
         model_state = self.model_state
+        if not await self._submit_commit_prefix(event):
+            return
         commit_reservation = model_state.audio_buffer.prepare_commit(
             operation_id=uuid.uuid4().hex,
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
@@ -2097,10 +2186,10 @@ class DuplexSessionRunner:
             return
         # A video-only commit also owns a pending turn, even though it has no
         # overlapping speech. Keep it for the existing terminal-event promotion
-        # path while an ephemeral request is still running.
+        # path while a response is still running, including native resumable
+        # requests: their next unit must wait for the current response too.
         if (
             not next_commit_allowed
-            and not session.capabilities.supports_core_resumable_request
             and session.capabilities.allows_video_without_audio()
             and not session.capabilities.supports_concurrent_turn_requests
             and self._defer_commit_behind_active_response(

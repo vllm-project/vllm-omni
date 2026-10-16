@@ -3247,3 +3247,84 @@ def test_minicpmo_stage0_stop_tokens_exclude_turn_eos():
     stop_ids = _stage0_stop_token_ids(_NativeDuplexTokenizer())
 
     assert stop_ids == [151718, 151721, 151705]
+
+
+@pytest.mark.parametrize("is_speech", [False, True])
+def test_minicpmo_camera_frames_preserve_audio_speech_gate(is_speech):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="silent-camera")
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=["frame"],
+        is_speech=is_speech,
+        epoch=0,
+        seq=1,
+    )
+    assert result["success"]
+    assert state.pending_speech_context is is_speech
+
+
+def test_minicpmo_vision_only_units_skip_audio_encoder_and_keep_boundaries():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="vision-only")
+
+    def unexpected_audio(*args, **kwargs):
+        raise AssertionError("VISION must not encode synthetic audio")
+
+    runtime._process_streaming_audio = unexpected_audio
+    for seq in (1, 2):
+        result = runtime._stage_prefill_embeddings_only(
+            state,
+            None,
+            encoded_frames=[[torch.zeros(2, 2)]],
+            epoch=0,
+            seq=seq,
+        )
+        assert result["success"]
+        assert state.audio_chunk_idx == seq
+        assert state.audio_buffer.size == 0
+        assert state.pending_speech_context
+        ids = result["input_token_ids"]
+        assert ids.count(runtime.unit_token_id) == 1
+        assert ids.count(runtime.unit_end_token_id) == (seq - 1)
+
+
+def test_minicpmo_audio_after_vision_unit_starts_audio_encoder_at_first_chunk():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    # 4 Hz keeps the 1250 ms first window at 5 samples against a 4-sample chunk.
+    runtime.stage_model.first_chunk_ms = 1250
+    runtime.processor._streaming_mel_processor = SimpleNamespace(
+        sample_rate=4, get_config=lambda: {"effective_first_chunk_ms": 1250}
+    )
+    original_process = runtime._process_streaming_audio
+    encoded = []
+
+    def process(chunk, chunk_idx, *, processor=None):
+        encoded.append((chunk.copy(), chunk_idx))
+        return original_process(chunk, chunk_idx, processor=processor)
+
+    runtime._process_streaming_audio = process
+    state = _MiniCPMO45Stage0SessionState(session_id="vision-then-audio")
+    vision = runtime._stage_prefill_embeddings_only(state, None, encoded_frames=[[torch.zeros(2, 2)]], epoch=0, seq=1)
+    assert vision["success"]
+    assert state.audio_chunk_idx == 1
+    assert state.audio_encoder_chunk_idx == 0
+
+    audio = runtime._stage_prefill_embeddings_only(state, np.ones(4, dtype=np.float32), epoch=0, seq=2)
+
+    assert audio["success"]
+    [(chunk, chunk_idx)] = encoded
+    assert chunk_idx == 0
+    # The mel processor's first window is front-padded, as for an audio-first session.
+    assert chunk.tolist() == [0.0, 1.0, 1.0, 1.0]
+    assert state.audio_buffer.size == 0
+    assert state.audio_encoder_chunk_idx == 1
+    assert state.audio_chunk_idx == 2
+    assert audio["input_token_ids"][:2] == [runtime.unit_end_token_id, runtime.unit_token_id]
