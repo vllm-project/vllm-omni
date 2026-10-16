@@ -437,7 +437,8 @@ class HunyuanVideo15Attention(nn.Module):
         # One launch for video RMSNorm + RoPE, text RMSNorm and the
         # [video | text] cat when the forward supplied the packed table and
         # the CUDA kernel accepts the geometry; the eager chain stays for SP
-        # (text goes through joint_* metadata) and unsupported inputs.
+        # (text goes through joint_* metadata) and unsupported inputs. The
+        # fused op reproduces the CUDA RMSNorm reduction: same bits either way.
         use_fused_qk_norm_rope = (
             qk_norm_rope_table is not None
             and encoder_hidden_states is not None
@@ -483,6 +484,7 @@ class HunyuanVideo15Attention(nn.Module):
                     self.norm_added_k.weight,
                     qk_norm_rope_table,
                     self.norm_q.variance_epsilon,
+                    cuda_rms_norm=True,
                 )
             else:
                 encoder_query = self.norm_added_q(encoder_query)
@@ -897,6 +899,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 hidden_states.shape[0],
                 dtype=hidden_states.dtype,
                 identity_rows=encoder_hidden_states.shape[1],
+                cuda_rms_norm=True,
             )
 
         for block in self.transformer_blocks:
