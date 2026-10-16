@@ -47,13 +47,19 @@ class DuplexCommandError(RealtimeProtocolError):
     """
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@dataclass(frozen=True, kw_only=True)
 class DuplexCommand(RealtimeCommand):
     """A Realtime command as the duplex engine handles it.
 
     Adds the mailbox channel (``type``) and its rendering on top of the wire
     command; every concrete class below pairs this with its protocol twin.
     """
+
+    # No instance fields of its own, so the slots are empty. Spelled out rather
+    # than ``slots=True`` because on Python 3.10 ``dataclass`` repeats the
+    # inherited fields in ``__slots__`` (fixed in 3.11); the concrete classes
+    # below would then combine two slotted layouts and fail to import.
+    __slots__ = ()
 
     #: Mailbox event type this command renders to (see ``payload()``).
     type: ClassVar[str] = ""
@@ -94,6 +100,8 @@ class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     type: ClassVar[str] = "input_audio_buffer.append"
+    #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
+    audio: bytes = b""
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -108,7 +116,10 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
             merged: dict[str, object] = dict(hints)
             merged.update(data)
             data = merged
-        data["audio"] = base64.b64encode(self.audio).decode("ascii")
+        if self.audio:
+            data["audio"] = base64.b64encode(self.audio).decode("ascii")
+        else:
+            data.pop("audio", None)
         if not data.get("video_frames"):
             data.pop("video_frames", None)
         return data

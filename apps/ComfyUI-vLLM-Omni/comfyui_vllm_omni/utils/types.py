@@ -40,6 +40,10 @@ class VideoReferences(dict):
     pass
 
 
+class LatentMaskEditing(dict):
+    pass
+
+
 class FastH3Deployment(dict):
     """Descriptor for a server that fused FastH3 at startup."""
 

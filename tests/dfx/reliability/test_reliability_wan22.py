@@ -11,7 +11,7 @@ import concurrent.futures
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 import requests
@@ -47,16 +47,30 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
 ]
 
 E2E_STAGE_CONFIGS_DIR = Path(__file__).resolve().parent.parent / "e2e" / "stage_configs"
-OOM_INJECTION_CONFIG = {
+
+
+class _WanOomConfig(TypedDict):
+    target_mem_ratio: float
+    max_free_bytes: int
+    hold_seconds: int
+    startup_timeout_sec: int
+    strict: bool
+
+
+OOM_INJECTION_CONFIG: _WanOomConfig = {
     "target_mem_ratio": 0.95,
+    # Stop at a free-memory ceiling. strict=True waits for RuntimeError, and
+    # HIP retries a failed alloc without raising, so the sidecar never readies.
+    "max_free_bytes": 256 * 1024 * 1024,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
-    "strict": True,
+    "strict": False,
 }
 FAULT_ERROR_KEYWORDS = (
     "oom",
     "out of memory",
     "cuda",
+    "connection",
     "job failed",
     "unknown error",
     "internal server error",
@@ -184,7 +198,7 @@ def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_function, online_client_function) -> None:
     stage_config_path = getattr(omni_server_function, "stage_config_path", None)
@@ -195,6 +209,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_funct
         hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
     )
     try:
         image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
@@ -225,6 +240,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_funct
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -246,6 +262,7 @@ def test_reliability_fault_process_kill_request_failure(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -362,6 +379,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -392,7 +410,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skip(reason="issue#2327")
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_video_oom_recovers_after_fault_removed(
@@ -407,6 +425,7 @@ def test_reliability_video_oom_recovers_after_fault_removed(
         hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
     )
     host = omni_server_function.host
     port = omni_server_function.port
@@ -513,7 +532,7 @@ def test_reliability_video_oom_recovers_after_fault_removed(
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
@@ -548,7 +567,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
@@ -573,6 +592,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
@@ -600,6 +620,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(

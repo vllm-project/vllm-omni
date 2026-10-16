@@ -81,6 +81,24 @@ def response_in_progress(session: DuplexEngineSession, tasks: DuplexSessionTasks
     return tasks.has_response_bound_append_tasks()
 
 
+def next_commit_allowed(
+    session: DuplexEngineSession,
+    tasks: DuplexSessionTasks,
+    *,
+    concurrent_turn_requests_released: bool,
+) -> bool:
+    """Whether a new commit may flush/submit now.
+
+    Idle sessions always allow it. When ``supports_concurrent_turn_requests`` is on and
+    the plugin has released the commit gate, a commit is allowed even though
+    prior assistant TTS/playback still counts as ``response_in_progress``.
+    Barge-in remains the abort path; this gate does not cancel anything.
+    """
+    if not response_in_progress(session, tasks):
+        return True
+    return session.capabilities.supports_concurrent_turn_requests and concurrent_turn_requests_released
+
+
 def assistant_playback_active(session: DuplexEngineSession) -> bool:
     """Whether the client is still playing audio the session has sent."""
     return (
@@ -169,25 +187,6 @@ def overlap_decision_event(session: DuplexEngineSession, decision: dict[str, obj
         reason=reason if isinstance(reason, str) else None,
         details=details,
     )
-
-
-def input_committed_payload(
-    session: DuplexEngineSession,
-    committed: DuplexCommittedInput,
-    *,
-    realtime_item_id: object | None = None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "type": "input.committed",
-        "session_id": session.session_id,
-        "turn_id": committed.turn_id,
-        "epoch": committed.epoch,
-        "history_len": len(session.history),
-        "message": committed.message,
-    }
-    if isinstance(realtime_item_id, str) and realtime_item_id:
-        payload["realtime_item_id"] = realtime_item_id
-    return payload
 
 
 def audio_committed_payload(

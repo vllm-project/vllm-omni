@@ -9,6 +9,8 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
+    "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",
@@ -287,6 +289,12 @@ _OMNI_MODELS = {
         "hunyuan_image3",
         "HunyuanImage3ForConditionalGeneration",
     ),
+    ## fish_omni (Fish Audio Drama 3)
+    "FishOmniForConditionalGeneration": (
+        "fish_omni",
+        "fish_omni_model",
+        "FishOmniForConditionalGeneration",
+    ),
     ## fish_speech (Fish Speech S2 Pro)
     "FishSpeechSlowARForConditionalGeneration": (
         "fish_speech",
@@ -315,17 +323,17 @@ _OMNI_MODELS = {
         "audio8_tts_codec_decoder",
         "Audio8TTSCodecDecoder",
     ),
+    ## VibeVoice
+    "VibeVoiceForConditionalGeneration": (
+        "vibevoice",
+        "vibevoice",
+        "VibeVoiceForConditionalGeneration",
+    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
         "voxcpm2_talker",
         "VoxCPM2TalkerForConditionalGeneration",
-    ),
-    ## dots.tts
-    "DotsTTSForConditionalGeneration": (
-        "dots_tts",
-        "dots_tts_talker",
-        "DotsTTSForConditionalGeneration",
     ),
     ## Voxtral TTS
     "VoxtralTTSForConditionalGeneration": (
@@ -396,11 +404,6 @@ _OMNI_MODELS = {
         "modeling_moss_tts_codec",
         "MossTTSCodecDecoder",
     ),
-    "DyninOmniForConditionalGeneration": (
-        "dynin_omni",
-        "dynin_omni",
-        "DyninOmniForConditionalGeneration",
-    ),
     ## IndexTTS2
     "IndexTTS2TalkerForConditionalGeneration": (
         "indextts2",
@@ -433,6 +436,11 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "ming_flash_omni_thinker",
         "MingFlashOmniThinkerForConditionalGeneration",
+    ),
+    "MingImageForConditionalGeneration": (
+        "ming_image",
+        "model",
+        "MingImageForConditionalGeneration",
     ),
     "MingFlashOmniTalkerForConditionalGeneration": (
         "ming_flash_omni",
@@ -487,15 +495,11 @@ _OMNI_MODELS = {
         "acoustic",
         "MiniMaxMusic3AcousticForConditionalGeneration",
     ),
-    "BreezeForConditionalGeneration": (
-        "breeze_tts_2",
-        "modeling_breeze_tts_2_talker",
-        "BreezeTTS2TalkerForGeneration",
-    ),
-    "BreezeTTS2MimiCodec": (
-        "breeze_tts_2",
-        "modeling_breeze_tts_2_codec",
-        "BreezeTTS2MimiCodec",
+    ## YuE2-3B (text-to-music; single-stage native-AR with terminal NAR/VAE)
+    "Yue2ForCausalLM": (
+        "yue2",
+        "yue2",
+        "Yue2ForCausalLM",
     ),
 }
 

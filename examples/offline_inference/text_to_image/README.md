@@ -222,6 +222,8 @@ Anima uses the official model dimensions by default. A checkpoint may provide a 
 
 To load Anima, point `--model` to the single-file checkpoint path, pass the native pipeline class name using `--model-class-name`, and supply the converted components directory using `--custom-pipeline-args`:
 
+Download the checkpoint and components using the [Anima recipe](../../../recipes/circlestone-labs/Anima.md#command---prepare-assets), then replace the paths below with their local locations.
+
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model /path/to/models/anima-official/split_files/diffusion_models/anima-base-v1.0.safetensors \

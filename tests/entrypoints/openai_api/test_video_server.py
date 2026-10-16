@@ -11,6 +11,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import CancelledError as FutureCancelledError
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
+    StreamingPacingConfig,
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoParams,
@@ -84,6 +86,7 @@ class FakeAsyncOmni:
         self.model_class_name = "WanPipeline"
         self.captured_prompt = None
         self.captured_reference_video_bytes = None
+        self.captured_latent_edit_source_bytes = {}
         self.captured_control_reference_bytes = {}
         self.captured_sampling_params_list = None
 
@@ -104,6 +107,10 @@ class FakeAsyncOmni:
             and all(isinstance(item, str) for item in reference_videos)
         ):
             self.captured_reference_video_bytes = [Path(item).read_bytes() for item in reference_videos]
+        for field_name in ("source_video", "source_audio"):
+            source_path = prompt.get("multi_modal_data", {}).get(field_name)
+            if isinstance(source_path, str):
+                self.captured_latent_edit_source_bytes[field_name] = Path(source_path).read_bytes()
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         if sampling_params_list[0].emit_request_lifecycle:
             yield MockVideoResult(
@@ -115,6 +122,17 @@ class FakeAsyncOmni:
 
     async def abort(self, request_id, *, timeout=None):
         del request_id, timeout
+
+
+def test_regular_video_endpoint_rejects_realtime_pacing_parameter() -> None:
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    with pytest.raises(HTTPException, match="only supported by /v1/realtime/video"):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(prompt="video", streaming_buffer_seconds=0.75),
+                "regular-video",
+            )
+        )
 
 
 def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
@@ -143,6 +161,48 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     assert raw_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
     assert base64_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
     handler.shutdown()
+
+
+@pytest.mark.parametrize("typed_stage", [False, True], ids=["legacy", "typed"])
+def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses(
+    mocker: MockerFixture, typed_stage: bool
+):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    options = {
+        "model_class_name": "MiniMaxH3Pipeline",
+        "video_output_transport": {"enable_borrowed_frames": True},
+    }
+    stage = (
+        StageConfigFactory.create_typed_default_diffusion("test-model", options).stage_configs[0]
+        if typed_stage
+        else StageConfigFactory.create_default_diffusion(options)[0]
+    )
+    # Like StageDiffusionClient, this frontend engine exposes metadata but no
+    # worker od_config. The effective setting is available in stage_configs.
+    engine = FakeAsyncOmni()
+    engine.stage_configs = [stage]
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model", stage_configs=engine.stage_configs)
+    raw_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+    base64_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="encoded-video",
+    )
+    try:
+
+        async def generate_both():
+            request = VideoGenerationRequest(prompt="test prompt")
+            await handler.generate_video_bytes(request, "raw-request")
+            await handler.generate_videos(request, "base64-request")
+
+        asyncio.run(generate_both())
+        assert raw_encoder.call_args.kwargs["enable_borrowed_frames"] is True
+        assert base64_encoder.call_args.kwargs["enable_borrowed_frames"] is True
+    finally:
+        handler.shutdown()
 
 
 @pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
@@ -224,6 +284,10 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 
 
 class BlockingVideoHandler:
+    supports_mixed_reference_inputs = False
+    supports_latent_mask_editing = False
+    supported_control_upload_types = frozenset()
+
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.stage_configs = None
@@ -243,8 +307,9 @@ class BlockingVideoHandler:
         reference_video=None,
         reference_audio=None,
         on_started=None,
+        latent_edit_input=None,
     ):
-        del request, reference_id, reference_image, reference_video, reference_audio
+        del request, reference_id, reference_image, reference_video, reference_audio, latent_edit_input
         if on_started is not None:
             await on_started()
         self.started.set()
@@ -282,8 +347,9 @@ class CompletingDuringAbortHandler(BlockingVideoHandler):
         reference_video=None,
         reference_audio=None,
         on_started=None,
+        latent_edit_input=None,
     ):
-        del request, reference_image, reference_video, reference_audio
+        del request, reference_image, reference_video, reference_audio, latent_edit_input
         if on_started is not None:
             await on_started()
         self.started.set()
@@ -318,8 +384,9 @@ class SchedulerQueuedVideoHandler(BlockingVideoHandler):
         reference_video=None,
         reference_audio=None,
         on_started=None,
+        latent_edit_input=None,
     ):
-        del request, reference_id, reference_image, reference_video, reference_audio
+        del request, reference_id, reference_image, reference_video, reference_audio, latent_edit_input
         self.started.set()
         try:
             while not self.admit.is_set():
@@ -375,8 +442,13 @@ def isolated_video_backends(tmp_path, monkeypatch):
     return store, tasks, storage
 
 
+@pytest.mark.parametrize("model_class_name", [None, "SeedVR2Pipeline", "auto"])
 @pytest.mark.asyncio
-async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch):
+async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch, model_class_name):
+    # Resolve imports outside the timed server-lifecycle assertions.
+    from vllm_omni.diffusion.models.seedvr2 import long_video  # noqa: F401
+
+    app = FastAPI()
     events: list[str] = []
     serve_started = asyncio.Event()
     http_shutdown = asyncio.Event()
@@ -385,6 +457,11 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
     class FakeEngine:
         stage_configs = []
+
+        def get_diffusion_od_config(self):
+            if model_class_name == "auto":
+                return SimpleNamespace(model_class_name="SeedVR2Pipeline")
+            return None
 
         async def get_supported_tasks(self):
             return ("generate",)
@@ -422,7 +499,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
         events.append("init_app_state")
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: app)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
     monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", fake_get_vllm_config)
@@ -448,9 +525,16 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
         h11_max_header_count=None,
     )
 
+    if model_class_name != "auto" and model_class_name is not None:
+        args.model_class_name = model_class_name
+
     worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, args))
     await asyncio.wait_for(serve_started.wait(), timeout=2)
 
+    route_paths = app.openapi()["paths"]
+    assert ("/v1/seedvr2/restore-long" in route_paths) == (model_class_name is not None)
+    if model_class_name is not None:
+        assert app.state.seedvr2_long_port == args.port
     assert not engine_context_exited.is_set()
 
     http_shutdown.set()
@@ -494,6 +578,11 @@ def _make_test_video_bytes(size=(32, 24), num_frames=3) -> bytes:
         frames[idx, :, :, 1] = 128
         frames[idx, :, :, 2] = 255 - idx * 40
     return mux_video_audio_bytes(frames, fps=8, video_codec_options={"preset": "ultrafast", "threads": "0"})
+
+
+def _mask_file(value) -> tuple[str, bytes, str]:
+    payload = value if isinstance(value, str) else json.dumps(value)
+    return "mask.json", payload.encode(), "application/json"
 
 
 def test_mux_video_audio_marks_aac_priming_timestamp():
@@ -922,6 +1011,38 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
         )
 
 
+def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
+    """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
+    steps) but is not a fixed-duration model: an explicit ``num_frames``
+    must be honoured rather than rejected."""
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "Kandinsky6TI2VAPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="kandinsky6-bundle",
+    )
+
+    asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
+    sampling = engine.captured_sampling_params_list[0]
+    assert (sampling.width, sampling.height) == (864, 480)
+    assert sampling.num_frames == 125
+    assert sampling.num_inference_steps == 50
+    assert sampling.fps == 24.0
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(
+                prompt="A dog runs on a beach", width=512, height=320, num_frames=25, num_inference_steps=10
+            ),
+            "explicit",
+        )
+    )
+    sampling = engine.captured_sampling_params_list[-1]
+    assert (sampling.width, sampling.height) == (512, 320)
+    assert sampling.num_frames == 25
+    assert sampling.num_inference_steps == 10
+
+
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -1137,6 +1258,7 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
 
 def test_typed_stage_drives_video_capability_checks():
     from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
     minimax_stage = StageConfigFactory.create_typed_default_diffusion(
         "minimax-h3",
@@ -1148,6 +1270,10 @@ def test_typed_stage_drives_video_capability_checks():
         stage_configs=[minimax_stage],
     )
     assert minimax_handler.supports_mixed_reference_inputs
+    assert minimax_handler.supports_latent_mask_editing
+    assert get_diffusion_model_metadata("MiniMaxH3ModularPipeline").supports_latent_mask_editing
+    assert minimax_handler.supports_timeline_guides
+    assert get_diffusion_model_metadata("MiniMaxH3ModularPipeline").supports_timeline_guides
 
     cosmos_stage = StageConfigFactory.create_typed_default_diffusion(
         "cosmos3",
@@ -1159,6 +1285,388 @@ def test_typed_stage_drives_video_capability_checks():
         stage_configs=[cosmos_stage],
     )
     assert cosmos_handler.supported_control_upload_types == frozenset({"edge", "blur", "depth", "seg", "wsm"})
+    assert not cosmos_handler.supports_latent_mask_editing
+    assert not cosmos_handler.supports_timeline_guides
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    video_mask = [[[0.0, 1.0], [0.5, 1.0]]]
+    audio_mask = [0.0, 0.25, 1.0]
+
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Replace only the masked regions."},
+        files=[
+            ("source_video", ("source.mov", b"source-video", "video/quicktime")),
+            ("source_audio", ("source.mp3", b"source-audio", "audio/mpeg")),
+            ("video_noise_mask", _mask_file(video_mask)),
+            ("audio_noise_mask", _mask_file(audio_mask)),
+        ],
+    )
+
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+
+    multi_modal_data = engine.captured_prompt["multi_modal_data"]
+    assert engine.captured_latent_edit_source_bytes == {
+        "source_video": b"source-video",
+        "source_audio": b"source-audio",
+    }
+    assert multi_modal_data["video_noise_mask"] == video_mask
+    assert multi_modal_data["audio_noise_mask"] == audio_mask
+    _wait_until(
+        lambda: (
+            not Path(multi_modal_data["source_video"]).exists() and not Path(multi_modal_data["source_audio"]).exists()
+        )
+    )
+    assert not Path(multi_modal_data["source_video"]).exists()
+    assert not Path(multi_modal_data["source_audio"]).exists()
+
+
+def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit"},
+        files=[
+            ("source_video", ("source.mp4", b"video", "video/mp4")),
+            ("video_noise_mask", _mask_file("1")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert "not supported" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("files", "message"),
+    [
+        (
+            [("source_video", ("source.mp4", b"video", "video/mp4"))],
+            "at least one",
+        ),
+        (
+            [
+                ("source_audio", ("source.wav", b"audio", "audio/wav")),
+                ("video_noise_mask", _mask_file("0")),
+            ],
+            "source_audio requires an audio_noise_mask",
+        ),
+    ],
+)
+def test_h3_latent_edit_cross_field_validation(test_client, files, message):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "edit"}, files=files)
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "filename", "content_type", "message"),
+    [
+        ("source_video", "source.webm", "video/webm", "MP4 or MOV"),
+        ("source_audio", "source.flac", "audio/flac", "WAV or MP3"),
+    ],
+)
+def test_h3_latent_edit_rejects_unsupported_source_formats(
+    test_client,
+    field_name,
+    filename,
+    content_type,
+    message,
+):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    mask_name = "video_noise_mask" if field_name == "source_video" else "audio_noise_mask"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit"},
+        files=[
+            (field_name, (filename, b"source", content_type)),
+            (mask_name, _mask_file("0")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("mask", "message"),
+    [
+        ("[not-json", "Invalid JSON"),
+        ("[" * 2000 + "0" + "]" * 2000, "nested too deeply"),
+        ("[" * 65 + "0" + "]" * 65, "nested too deeply"),
+    ],
+)
+def test_h3_latent_edit_rejects_malformed_mask_json(test_client, mask, message):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit"},
+        files=[
+            ("source_video", ("source.mp4", b"video", "video/mp4")),
+            ("video_noise_mask", _mask_file(mask)),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_h3_latent_edit_rejects_mask_text_form_fields(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit", "video_noise_mask": "0"},
+    )
+
+    assert response.status_code == 422
+
+
+def _guide_files():
+    return [
+        ("guide_files", ("first.png", _make_test_image_bytes(), "image/png")),
+        ("guide_files", ("tail.mp4", b"guide-video", "video/mp4")),
+        ("guide_files", ("tone.flac", b"guide-audio", "audio/flac")),
+    ]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_h3_timeline_guides_reach_generation_and_are_cleaned(endpoint, test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    captured_bytes = {}
+    generate = engine.generate
+
+    async def capture_guides(prompt, request_id, sampling_params_list):
+        for index, guide in enumerate(prompt["multi_modal_data"]["timeline_guides"]):
+            for kind in ("video", "audio"):
+                if kind in guide:
+                    captured_bytes[(index, kind)] = Path(guide[kind]).read_bytes()
+        async for output in generate(prompt, request_id, sampling_params_list):
+            yield output
+
+    engine.generate = capture_guides
+    manifest = [
+        {"frame_index": 0, "image": {"upload_index": 0}},
+        {"frame_index": -22, "video": {"upload_index": 1}},
+        {"frame_index": 36, "image": {"upload_index": 0}, "audio": {"upload_index": 2}},
+    ]
+
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "Follow the guides.", "timeline_guides": json.dumps(manifest)},
+        files=_guide_files(),
+    )
+
+    assert response.status_code == 200, response.text
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    guides = engine.captured_prompt["multi_modal_data"]["timeline_guides"]
+    assert [guide["frame_index"] for guide in guides] == [0, -22, 36]
+    assert isinstance(guides[0]["image"], Image.Image) and guides[0]["image"] is guides[2]["image"]
+    assert captured_bytes == {(1, "video"): b"guide-video", (2, "audio"): b"guide-audio"}
+    assert "timeline_guides" not in engine.captured_sampling_params_list[0].extra_args
+    paths = [Path(guides[1]["video"]), Path(guides[2]["audio"])]
+    _wait_until(lambda: not any(path.exists() for path in paths))
+
+
+def test_timeline_guides_are_rejected_for_models_without_capability(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "guide", "timeline_guides": json.dumps([{"frame_index": 0, "image": {"upload_index": 0}}])},
+        files=_guide_files()[:1],
+    )
+
+    assert response.status_code == 400
+    assert "not supported" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    ("manifest", "files", "message"),
+    [
+        (None, [0], "requires a timeline_guides manifest"),
+        ("not json", [0], "Invalid timeline_guides"),
+        ("[]", [], "must not be empty"),
+        ([{"frame_index": "0", "image": {"upload_index": 0}}], [0], "Invalid timeline_guides at 0.frame_index"),
+        ([{"frame_index": 0, "image": {"upload_index": 0}, "path": "/etc/passwd"}], [0], "Invalid timeline_guides"),
+        ([{"frame_index": 0}], [], "at least one of image, video, or audio"),
+        (
+            [{"frame_index": 0, "image": {"upload_index": 0}, "video": {"upload_index": 1}}],
+            [0, 1],
+            "both image and video",
+        ),
+        ([{"frame_index": 0, "image": {"upload_index": 1}}], [0], "only 1 were uploaded"),
+        ([{"frame_index": 0, "image": {"upload_index": 0}}], [0, 1], "are not referenced"),
+        (
+            [{"frame_index": 0, "image": {"upload_index": 0}}, {"frame_index": 1, "audio": {"upload_index": 0}}],
+            [0],
+            "both image and audio",
+        ),
+        ([{"frame_index": 0, "video": {"upload_index": 0}}], [2], "must be an MP4 or MOV file"),
+        ([{"frame_index": 0, "audio": {"upload_index": 0}}], [1], "must be a WAV, MP3, or FLAC file"),
+        ([{"frame_index": index, "audio": {"upload_index": 0}} for index in range(9)], [2], "at most 8 entries"),
+    ],
+)
+def test_h3_timeline_guide_manifest_validation(test_client, manifest, files, message):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    uploads = _guide_files()
+    data = {"prompt": "guide"}
+    if manifest is not None:
+        data["timeline_guides"] = manifest if isinstance(manifest, str) else json.dumps(manifest)
+
+    response = test_client.post("/v1/videos/sync", data=data, files=[uploads[index] for index in files] or None)
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_h3_timeline_guide_persistence_failure_cleans_prior_uploads(test_client, monkeypatch):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persisted: list[str] = []
+    original = video_generation_helpers._persist_uploaded_reference
+
+    async def persist_then_fail(upload, **kwargs):
+        if persisted:
+            raise HTTPException(status_code=400, detail="second upload rejected")
+        path = await original(upload, **kwargs)
+        persisted.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_uploaded_reference", persist_then_fail)
+    manifest = [{"frame_index": 0, "video": {"upload_index": 0}, "audio": {"upload_index": 1}}]
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "guide", "timeline_guides": json.dumps(manifest)},
+        files=_guide_files()[1:],
+    )
+
+    assert response.status_code == 400
+    assert persisted and not Path(persisted[0]).exists()
+
+
+@pytest.mark.parametrize("failure", ["registration_error", "cancelled_before_start"])
+def test_create_video_cleans_timeline_guides_when_job_never_starts(test_client, monkeypatch, failure):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persisted: list[str] = []
+    original_persist = video_generation_helpers._persist_uploaded_reference
+
+    async def recording_persist(upload, **kwargs):
+        path = await original_persist(upload, **kwargs)
+        persisted.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_uploaded_reference", recording_persist)
+    original_upsert = api_server.VIDEO_TASKS.upsert
+
+    async def failing_upsert(video_id, task):
+        if failure == "registration_error":
+            raise RuntimeError("task registry unavailable")
+        # The job coroutine never starts, so its own finally block cannot clean up.
+        task.cancel()
+        await original_upsert(video_id, task)
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", failing_upsert)
+    manifest = [{"frame_index": 0, "video": {"upload_index": 0}, "audio": {"upload_index": 1}}]
+    request_kwargs = {
+        "data": {"prompt": "guide", "timeline_guides": json.dumps(manifest)},
+        "files": _guide_files()[1:],
+    }
+
+    if failure == "registration_error":
+        with pytest.raises(RuntimeError, match="task registry unavailable"):
+            test_client.post("/v1/videos", **request_kwargs)
+    else:
+        assert test_client.post("/v1/videos", **request_kwargs).status_code == 200
+
+    assert len(persisted) == 2
+    _wait_until(lambda: not any(Path(path).exists() for path in persisted))
+
+
+def test_h3_latent_edit_masks_without_sources_are_forwarded_to_stage0(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "ordinary generation"},
+        files=[
+            ("video_noise_mask", _mask_file("1")),
+            ("audio_noise_mask", _mask_file("[1, 1]")),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert engine.captured_prompt["multi_modal_data"]["video_noise_mask"] == 1
+    assert engine.captured_prompt["multi_modal_data"]["audio_noise_mask"] == [1, 1]
+
+
+def test_h3_latent_edit_rejects_oversized_mask_json(test_client, monkeypatch):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    monkeypatch.setattr(video_generation_helpers, "LATENT_EDIT_MASK_FILE_MAX_BYTES", 4)
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "edit"},
+        files=[
+            ("source_video", ("source.mp4", b"video", "video/mp4")),
+            ("video_noise_mask", _mask_file("[0.0]")),
+        ],
+    )
+
+    assert response.status_code == 400
+    assert "JSON exceeds" in response.json()["detail"]
+
+
+def test_cancelled_latent_edit_persistence_cleans_prior_source(test_client, monkeypatch):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    persist = video_generation_helpers._persist_latent_edit_source
+    persisted_paths: list[str] = []
+
+    async def persist_then_cancel(upload, *, field_name):
+        if field_name == "source_audio":
+            raise asyncio.CancelledError
+        path = await persist(upload, field_name=field_name)
+        persisted_paths.append(path)
+        return path
+
+    monkeypatch.setattr(video_generation_helpers, "_persist_latent_edit_source", persist_then_cancel)
+
+    with pytest.raises(FutureCancelledError):
+        test_client.post(
+            "/v1/videos/sync",
+            data={"prompt": "edit"},
+            files=[
+                ("source_video", ("source.mp4", b"source-video", "video/mp4")),
+                ("source_audio", ("source.wav", b"source-audio", "audio/wav")),
+                ("video_noise_mask", _mask_file("0")),
+                ("audio_noise_mask", _mask_file("0")),
+            ],
+        )
+
+    assert len(persisted_paths) == 1
+    assert not Path(persisted_paths[0]).exists()
 
 
 @pytest.mark.parametrize("model_class_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
@@ -2030,6 +2538,33 @@ def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_ba
     delete_spy.assert_called_once_with(video_id)
 
 
+def test_failed_async_latent_edit_cleans_source_upload(test_client, mocker: MockerFixture):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    captured_path: list[str] = []
+
+    async def fail_generation(*_args, latent_edit_input=None, **_kwargs):
+        assert latent_edit_input is not None
+        captured_path.append(latent_edit_input.source_video)
+        assert Path(latent_edit_input.source_video).read_bytes() == b"source-video"
+        raise RuntimeError("edit failed")
+
+    mocker.patch.object(handler, "generate_video_bytes", side_effect=fail_generation)
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "will fail"},
+        files=[
+            ("source_video", ("source.mp4", b"source-video", "video/mp4")),
+            ("video_noise_mask", _mask_file("0")),
+        ],
+    )
+    assert response.status_code == 200
+
+    _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.FAILED.value)
+    assert len(captured_path) == 1
+    _wait_until(lambda: not Path(captured_path[0]).exists())
+
+
 def test_async_guardrail_error_returns_400_on_retrieve(test_client, mocker: MockerFixture):
     mocker.patch.object(
         OmniOpenAIServingVideo,
@@ -2090,6 +2625,24 @@ def test_video_request_validation():
     assert req.generate_sound is False
     assert req.sound_duration is None
     assert VideoGenerationRequest(prompt="test", fps=12.5).resolve_video_params().fps == 12.5
+    paced = VideoGenerationRequest(
+        prompt="test",
+        streaming_pacing={
+            "max_lead_ms": 1500,
+            "max_output_bytes": 1024,
+            "idle_timeout_s": 5,
+        },
+    )
+    assert isinstance(paced.streaming_pacing, StreamingPacingConfig)
+    assert paced.streaming_buffer_seconds == 1.5
+    assert paced.streaming_pacing.max_output_bytes == 1024
+    assert paced.streaming_pacing.idle_timeout_s == 5
+    # The PR 6 scalar alias canonicalizes into the pacing object.
+    aliased = VideoGenerationRequest(prompt="test", streaming_buffer_seconds=0.75)
+    assert aliased.streaming_pacing is not None and aliased.streaming_pacing.max_lead_ms == 750.0
+    assert VideoGenerationRequest(prompt="test", streaming_pacing={"enabled": False}).streaming_buffer_seconds is None
+    with pytest.raises(ValueError, match="streaming_pacing or streaming_buffer_seconds"):
+        VideoGenerationRequest(prompt="test", streaming_pacing={}, streaming_buffer_seconds=1.0)
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", fps=float("inf"))
     with pytest.raises(ValueError):
@@ -2347,6 +2900,99 @@ def test_delete_aborts_engine_request_before_cancelling_task(test_client):
     assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 
 
+def test_create_video_rolls_back_job_when_task_registration_fails(test_client, monkeypatch):
+    handler = BlockingVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+    cleanups = []
+    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+
+    async def failing_upsert(video_id, task):
+        del video_id, task
+        raise RuntimeError("task registry unavailable")
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", failing_upsert)
+
+    with pytest.raises(RuntimeError, match="task registry unavailable"):
+        test_client.post("/v1/videos", data={"prompt": "Roll back this video"})
+
+    assert cleanups
+    assert not handler.started.is_set()
+    assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+
+
+def test_create_video_cleans_references_when_task_cancelled_before_start(test_client, monkeypatch):
+    handler = BlockingVideoHandler()
+    test_client.app.state.openai_serving_video = handler
+    cleanups = []
+    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+    original_upsert = api_server.VIDEO_TASKS.upsert
+
+    async def cancelling_upsert(video_id, task):
+        # The job coroutine never starts, so its own finally block cannot clean up.
+        task.cancel()
+        await original_upsert(video_id, task)
+
+    monkeypatch.setattr(api_server.VIDEO_TASKS, "upsert", cancelling_upsert)
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Cancel before start"})
+    assert create_resp.status_code == 200
+    _wait_until(lambda: len(cleanups) == 1)
+    assert not handler.started.is_set()
+
+
+def test_delete_failed_job_removes_unpublished_partial_artifact(test_client):
+    job = VideoResponse(model="test-model", prompt="Fail after partial save", status=VideoGenerationStatus.FAILED)
+    assert job.file_name is None
+    asyncio.run(api_server.VIDEO_STORE.upsert(job.id, job))
+    file_path = api_server.STORAGE_MANAGER.get_full_file_path(job.id)
+    Path(file_path).write_bytes(b"partial-video")
+
+    delete_resp = test_client.delete(f"/v1/videos/{job.id}")
+
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+    assert not os.path.exists(file_path)
+    assert asyncio.run(api_server.VIDEO_STORE.get(job.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_delete_does_not_interrupt_job_cancellation_cleanup():
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def job() -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleaned.set()
+            raise
+
+    ref = VideoResponse(model="test-model", prompt="Slow cleanup", status=VideoGenerationStatus.IN_PROGRESS)
+    await api_server.VIDEO_STORE.upsert(ref.id, ref)
+    task = asyncio.create_task(job())
+    await asyncio.sleep(0)
+    await api_server.VIDEO_TASKS.upsert(ref.id, task)
+    raw_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(openai_serving_video=BlockingVideoHandler()))
+    )
+
+    delete = asyncio.create_task(api_server.delete_video(ref.id, raw_request))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2.0)
+    # A client disconnect cancels DELETE; the job's own cleanup must still finish.
+    delete.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delete
+    assert not task.done()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleaned.is_set()
+
+
 def test_video_response_file_extension_is_robust():
     response = VideoResponse(model="test-model", prompt="Make something beautiful")
     assert response.file_extension == "mp4"
@@ -2382,6 +3028,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
         "pyramid_num_stages": 3,
         "pyramid_num_inference_steps_list": [1, 1, 1],
         "use_cfg_zero_star": True,
+        "color_correction_method": "wavelet",
     }
     response = test_client.post(
         "/v1/videos",
@@ -2400,6 +3047,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
     assert captured.extra_args["pyramid_num_stages"] == 3
     assert captured.extra_args["pyramid_num_inference_steps_list"] == [1, 1, 1]
     assert captured.extra_args["use_cfg_zero_star"] is True
+    assert captured.extra_args["color_correction_method"] == "wavelet"
 
 
 def test_extra_params_none_by_default(test_client, mocker: MockerFixture):

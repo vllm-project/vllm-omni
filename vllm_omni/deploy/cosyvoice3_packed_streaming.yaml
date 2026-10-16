@@ -1,0 +1,18 @@
+# Opt-in single-Hopper streaming profile: AR64 / codec16, Flow10.
+# Request stream=true to measure first audible audio; non-stream latency is not TTFP.
+# Keeps each request's HiFT mel/phase state on GPU and uses mainline GPU FP32 F0.
+# Shared serving settings come from the full-response profile; only chunk
+# boundaries, codec admission capacity, and stage environment differ.
+base_config: cosyvoice3_full_response.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      codec_chunk_frames: 25
+stages:
+  - stage_id: 1
+    env:
+      COSYVOICE3_TRT: "0"
+      COSYVOICE3_BATCH_FLOW: "1"
+      COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS: "0"
+      COSYVOICE3_PACKED_STREAMING: "1"
+    max_num_seqs: 16

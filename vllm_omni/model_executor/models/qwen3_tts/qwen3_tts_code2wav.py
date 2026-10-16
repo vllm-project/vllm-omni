@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -16,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
@@ -46,10 +48,173 @@ def _codec_ids_from_payload_or_input(
         if isinstance(codes, dict):
             audio = codes.get("audio")
             if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+                return audio.reshape(-1).to(dtype=torch.long)
             if isinstance(audio, (list, tuple)) and audio:
-                return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+                return torch.as_tensor(audio, dtype=torch.long).reshape(-1)
     return input_ids.reshape(-1).to(dtype=torch.long)
+
+
+class _SegmentRhoTracker:
+    """Per-request rho = acoustic frames (A_k) / text tokens (n_k) accounting.
+
+    Accumulates realized codec frames and decode forwards per request and
+    logs the ratio at segment/request boundaries.  Segments are delimited by
+    the scheduler's ``is_segment_finished`` flag.
+
+    n_k is derived here, not carried per payload: the payload meta ships
+    ``request_text_tokens``, the *running* assistant text-token count of the
+    request, which covers every segment released so far because a resumable
+    request keeps one request ID across segments.  A segment's own n_k is the
+    increase of that running count between its boundary and the previous one,
+    so segment 2 is logged as A_2 / n_2 and never as A_2 / n_request.
+
+    Disabled on the non-async-chunk path, where the ramp is static.
+    """
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self._stats: dict[str, dict[str, int]] = {}
+
+    @staticmethod
+    def _new_stats() -> dict[str, int]:
+        """Fresh per-request counters: open segment plus the running base."""
+        return {
+            "seg_frames": 0,
+            "seg_forwards": 0,
+            "seg_text_tokens": 0,
+            "text_tokens_base": 0,
+        }
+
+    def observe_chunk(self, req_id: str, acoustic_frames: int, request_text_tokens: int) -> None:
+        """Accumulate one decode chunk's realized frames and running count.
+
+        ``request_text_tokens`` is the request's running text-token count as
+        carried by this payload, so only its value at the segment's last
+        payload measures the segment; max() keeps it idempotent under repeat
+        delivery of the same payload.
+        """
+        if not self.enabled or acoustic_frames <= 0:
+            return
+        stats = self._stats.setdefault(req_id, self._new_stats())
+        stats["seg_frames"] += acoustic_frames
+        stats["seg_forwards"] += 1
+        if request_text_tokens > 0:
+            stats["seg_text_tokens"] = max(stats["seg_text_tokens"], request_text_tokens)
+
+    def flush_empty_payload(
+        self,
+        runtime_infos: list[dict[str, Any]] | None,
+        request_ids: Sequence[str] | None = None,
+    ) -> None:
+        """Flush finish flags carried by payloads with no frames.
+
+        The talker adapter ends a request with an empty-finished payload, so
+        forward() returns before the boundary-cleanup loop; the flags must be
+        honored here or the trailing segment is never logged.
+
+        ``request_ids`` are the canonical scheduler-side IDs that key
+        :meth:`observe_chunk` (``requires_request_ids``).  The payload meta
+        carries the *external* request ID, which may differ, so the payload ID
+        is only a fallback for direct/dummy calls without runner IDs; keying
+        this flush on it would leave the observed segment unflushed and merge
+        two segments into one ratio.
+        """
+        if not self.enabled:
+            return
+        for index, info in enumerate(runtime_infos or []):
+            if not isinstance(info, dict):
+                continue
+            meta = info.get("meta", {})
+            if not isinstance(meta, dict):
+                continue
+            req_id = self._canonical_request_id(request_ids, index)
+            if req_id is None:
+                req_id = self._payload_request_id(meta)
+            if req_id is None:
+                continue
+            finished = bool(meta.get("finished", False))
+            segment_finished = bool(meta.get("is_segment_finished", False))
+            if finished or segment_finished:
+                self.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
+
+    @staticmethod
+    def _canonical_request_id(request_ids: Sequence[str] | None, index: int) -> str | None:
+        """Scheduler-side request ID for batch ``index``, when available."""
+        if request_ids is None or index >= len(request_ids):
+            return None
+        return str(request_ids[index])
+
+    @staticmethod
+    def _payload_request_id(meta: dict[str, Any]) -> str | None:
+        """Request ID carried by the payload meta (external ID; fallback only)."""
+        req_id = meta.get("request_id")
+        if isinstance(req_id, list):
+            req_id = req_id[0] if req_id else None
+        if req_id is None:
+            return None
+        return str(req_id)
+
+    def on_boundary(self, req_id: str, *, finished: bool, segment_finished: bool) -> None:
+        """Log and clear stats at a segment or request boundary.
+
+        A segment ending exactly at request end is logged once by the
+        request branch.
+        """
+        if not self.enabled:
+            return
+        if segment_finished and not finished:
+            self._log_segment(req_id, reset=True)
+        if finished:
+            self._log_segment(req_id, reset=False)
+            self._stats.pop(req_id, None)
+
+    def on_request_finished(self, req_id: str) -> None:
+        """Flush the trailing segment when the runner reports the request finished.
+
+        The talker adapter's final empty-finished payload may never reach
+        this stage, so the trailing segment is flushed here.
+        """
+        self.on_boundary(req_id, finished=True, segment_finished=False)
+
+    def _log_segment(self, req_id: str, *, reset: bool) -> None:
+        """Log one segment's rho, zeroing the segment counters when ``reset``.
+
+        The running text-token base survives the reset: it is what makes the
+        next boundary measure the next segment instead of the request.
+        """
+        stats = self._stats.get(req_id)
+        if stats is None or stats["seg_forwards"] == 0:
+            return
+        text_tokens = stats["seg_text_tokens"]
+        segment_text_tokens = 0
+        if text_tokens > 0:
+            # The base advances to the count observed here, so the next boundary
+            # measures the next segment. A count below the base means the
+            # payload restarted the request's text accounting for this segment
+            # (segment-local ids) instead of extending it, so the increase is
+            # not this segment's n_k and rho is logged without one.
+            segment_text_tokens = text_tokens - stats["text_tokens_base"]
+            stats["text_tokens_base"] = text_tokens
+        if segment_text_tokens > 0:
+            logger.info(
+                "Qwen3-TTS segment rho: req=%s frames=%d forwards=%d text_tokens=%d rho=%.3f",
+                req_id,
+                stats["seg_frames"],
+                stats["seg_forwards"],
+                segment_text_tokens,
+                stats["seg_frames"] / segment_text_tokens,
+            )
+        else:
+            logger.info(
+                "Qwen3-TTS segment rho: req=%s frames=%d forwards=%d text_tokens=n/a",
+                req_id,
+                stats["seg_frames"],
+                stats["seg_forwards"],
+            )
+        if reset:
+            stats["seg_frames"] = 0
+            stats["seg_forwards"] = 0
+            stats["seg_text_tokens"] = 0
 
 
 class Qwen3TTSCode2Wav(nn.Module):
@@ -58,11 +223,17 @@ class Qwen3TTSCode2Wav(nn.Module):
     via the SpeechTokenizer decoder directly (bypassing HF wrapper overhead)."""
 
     input_modalities = "audio"
+    tokenizer_subfolder = "speech_tokenizer"
+    decoder_cudagraph_modes: tuple[str, ...] = ("icl", "xvec")
 
     # Ask the model runner for the scheduler-side request IDs. Stateful
     # decoder caches must use the same IDs delivered by on_requests_finished;
     # payload metadata carries an external ID which may differ.
     requires_request_ids = True
+    # A nonempty native codes.audio payload is authoritative; token IDs may
+    # serve only as per-request control slots for the generation scheduler.
+    supports_native_payload_input = True
+    batched_gpu_staging_keys = {("codes", "audio")}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -96,16 +267,21 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_actual_frames: Counter[int] = Counter()
         self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
 
+        # Per-segment rho observability (#6496): realized acoustic decode
+        # steps per text token, logged at segment boundaries.
+        self._rho_stats = _SegmentRhoTracker(enabled=self._async_chunk)
+
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
         # load_weights().
         tok_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         dec_config = tok_config.decoder_config
         self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config)
         self.decoder.eval()
+
         self._num_quantizers = int(dec_config.num_quantizers)
         self._output_sample_rate = int(tok_config.output_sample_rate)
         self._total_upsample = int(self.decoder.total_upsample)
@@ -190,6 +366,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
 
         self.decoder.enable_cudagraph(
+            capture_modes=self.decoder_cudagraph_modes,
             capture_batch_sizes=decode_cudagraph_batch_sizes,
             stateless_capture_sizes=decode_cudagraph_capture_sizes,
             device=device,
@@ -223,6 +400,7 @@ class Qwen3TTSCode2Wav(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
             self._decoder_state_cache.pop(req_id, None)
+            self._rho_stats.on_request_finished(req_id)
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
@@ -253,6 +431,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         """Decode codec codes into audio waveform.
@@ -273,11 +452,19 @@ class Qwen3TTSCode2Wav(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
 
         if input_ids is None or input_ids.numel() == 0:
+            self._rho_stats.flush_empty_payload(runtime_additional_information, kwargs.get("request_ids"))
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
+        # vLLM's runner renamed this per-request side channel to
+        # ``model_intermediate_buffer``.  Keep accepting the old explicit
+        # argument for older runners, and use the new name when it is empty.
+        # Without this fallback, the non-async-chunk/full-payload path decodes
+        # placeholder input_ids instead of the codec payload from Stage 0.
+        if not runtime_additional_information:
+            runtime_additional_information = model_intermediate_buffer
         runtime_infos = runtime_additional_information or []
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
@@ -287,11 +474,13 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
         ref_context_size = [0] * len(request_ids_list)
+        first_audio_flags = [False] * len(request_ids_list)
         segment_finished_flags = [False] * len(request_ids_list)
         request_state_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_included = [False] * len(request_ids_list)
         finished_flags = [False] * len(request_ids_list)
+        request_text_tokens = [0] * len(request_ids_list)
 
         def _meta_int(value: Any) -> int:
             if isinstance(value, list):
@@ -321,6 +510,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if not isinstance(info, dict):
                     continue
                 meta = info.get("meta", {})
+                first_audio_flags[i] = _meta_bool(meta.get("first_audio", False))
                 if "is_segment_finished" in meta:
                     segment_finished_flags[i] = _meta_bool(meta["is_segment_finished"])
                 if "left_context_size" in meta:
@@ -335,6 +525,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                     ref_context_included[i] = _meta_bool(meta["ref_context_included"])
                 if "finished" in meta:
                     finished_flags[i] = _meta_bool(meta["finished"])
+                if "request_text_tokens" in meta:
+                    request_text_tokens[i] = _meta_int(meta["request_text_tokens"])
 
         # Normal runner calls provide scheduler-side IDs, which are also used
         # by scheduler_output.finished_req_ids. Direct forward calls and CUDA
@@ -376,6 +568,14 @@ class Qwen3TTSCode2Wav(nn.Module):
             if is_new_state and ref_req_id is not None and ref_ctx_frames > 0:
                 if not ref_context_included[i] or frames < ref_ctx_frames:
                     raise ValueError("Qwen3-TTS async_chunk first ICL chunk must include its declared reference prefix")
+            if state_req_id is not None and not state_req_id.startswith(_DUMMY_REQUEST_ID):
+                # A_k: codec frames produced by this segment's text; ref-context
+                # frames are the ICL speaker prefix, so exclude them.
+                self._rho_stats.observe_chunk(
+                    state_req_id,
+                    frames - (ref_context_size[i] if ref_context_included[i] else 0),
+                    request_text_tokens=request_text_tokens[i],
+                )
             valid_codes_qf.append((state_req_id, codes_qf))
             if state_req_id is not None:
                 state = self._decoder_state_cache.get(state_req_id)
@@ -389,6 +589,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                         )
                     state = {}
                     self._decoder_state_cache[state_req_id] = state
+                state.setdefault("skip_first_audio", first_audio_flags[i])
                 state.setdefault("prefix_frames", 0)
                 if state_req_id.startswith(_DUMMY_REQUEST_ID):
                     state["_is_dummy_run"] = True
@@ -414,11 +615,13 @@ class Qwen3TTSCode2Wav(nn.Module):
             ):
                 if req_id is not None and (finished or segment_finished):
                     self._decoder_state_cache.pop(req_id, None)
+                    self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
                     "model_outputs": [empty] * num_req,
                     "sr": [sr_tensor] * num_req,
+                    "codec_frames": [empty.new_zeros((0, q), dtype=torch.long)] * num_req,
                 },
             )
 
@@ -427,12 +630,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             try:
                 _, c = valid_codes_qf[0]
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] batch=%d",
+                    "Code2Wav codec: frames=%d q=%d batch=%d",
                     c.shape[1],
                     q,
-                    int(torch.unique(c).numel()),
-                    int(c.min().item()),
-                    int(c.max().item()),
                     len(valid_codes_qf),
                 )
             except Exception:
@@ -454,9 +654,22 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         request_lengths = [int(codes_qf.shape[-1]) for _, codes_qf in valid_codes_qf]
         max_request_length = max(request_lengths)
-        request_codes = valid_codes_qf[0][1].new_zeros((len(valid_codes_qf), q, max_request_length))
-        for row, (_, codes_qf) in enumerate(valid_codes_qf):
-            request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+        request_codes_shape = (len(valid_codes_qf), q, max_request_length)
+        target_device = ids.device
+        if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
+            staged_codes = torch.zeros(
+                request_codes_shape,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            )
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+            request_codes = staged_codes.to(device=target_device, non_blocking=True)
+        else:
+            request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
 
         self._record_decode_batch_stats(
             group_size=len(valid_codes_qf),
@@ -490,8 +703,16 @@ class Qwen3TTSCode2Wav(nn.Module):
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
             self.log_decode_batch_stats()
 
+        first_audio_required = [torch.tensor(False)] * num_req
+        if request_states is not None:
+            for row, idx in enumerate(valid_indices):
+                first_audio_required[idx] = torch.tensor(bool(request_states[row].get("skip_first_audio", False)))
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
+        codes_out: list[torch.Tensor] = [empty.new_zeros((0, q), dtype=torch.long)] * num_req
+        for row, (_, codes_qf) in enumerate(valid_codes_qf):
+            start = 0 if request_states is not None else left_context_size[valid_indices[row]]
+            codes_out[valid_indices[row]] = codes_qf[:, start:].transpose(0, 1).to(torch.long)
 
         for j, idx in enumerate(valid_indices):
             wav = wav_tensors[j]
@@ -510,10 +731,16 @@ class Qwen3TTSCode2Wav(nn.Module):
         ):
             if req_id is not None and (finished or segment_finished):
                 self._decoder_state_cache.pop(req_id, None)
+                self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={
+                "model_outputs": audios,
+                "sr": srs,
+                FIRST_AUDIO_REQUIRED_KEY: first_audio_required,
+                "codec_frames": codes_out,
+            },
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
@@ -552,7 +779,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
         loaded = AutoWeightsLoader(self).load_weights(
@@ -689,6 +916,11 @@ class Qwen3TTSCode2Wav(nn.Module):
                 raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
             self._decode_batch_max_size = decode_batch_max_size
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+            decode_time_major_conv = _get_bool_config("decode_time_major_conv", False)
+            self.decoder.capture_first_audio_state_only = self._async_chunk and _get_bool_config(
+                "talker_first_audio", False
+            )
+            decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)
         else:
             codec_chunk_frames = 0
             codec_left_context_frames = 0
@@ -697,6 +929,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_capture_sizes = None
             decode_enable_tf32 = False
+            decode_cudnn_benchmark = False
+            decode_time_major_conv = False
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -713,21 +947,39 @@ class Qwen3TTSCode2Wav(nn.Module):
                 torch.get_float32_matmul_precision(),
             )
 
+        if decode_time_major_conv and device.type == "cuda":
+            self.decoder.enable_time_major_conv()
+
         self.decoder._initial_codec_chunk_frames = initial_codec_chunk_frames
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
-                self._maybe_enable_decoder_cudagraph(
-                    device=device,
-                    codec_chunk_frames=codec_chunk_frames,
-                    codec_left_context_frames=codec_left_context_frames,
-                    initial_codec_chunk_frames=initial_codec_chunk_frames,
-                    codec_chunk_ramp=codec_chunk_ramp,
-                    decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
-                    decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                # Autotune only during warmup/capture, then restore the process
+                # flags. The captured convolution algorithms remain in the
+                # graphs without changing later models' cuDNN policy.
+                autotune = (
+                    torch.backends.cudnn.flags(
+                        enabled=torch.backends.cudnn.enabled,
+                        benchmark=True,
+                        benchmark_limit=10,
+                        deterministic=torch.backends.cudnn.deterministic,
+                        allow_tf32=torch.backends.cudnn.allow_tf32,
+                    )
+                    if decode_cudnn_benchmark
+                    else nullcontext()
                 )
+                with autotune:
+                    self._maybe_enable_decoder_cudagraph(
+                        device=device,
+                        codec_chunk_frames=codec_chunk_frames,
+                        codec_left_context_frames=codec_left_context_frames,
+                        initial_codec_chunk_frames=initial_codec_chunk_frames,
+                        codec_chunk_ramp=codec_chunk_ramp,
+                        decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
+                        decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                    )
             except Exception:
                 logger.warning(
                     "Failed to enable CUDA Graph for Code2Wav decoder",

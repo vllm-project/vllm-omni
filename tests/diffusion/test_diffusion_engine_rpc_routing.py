@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the busy-loop-based RPC routing in DiffusionEngine.
 
 These tests guard the invariants established when ``collective_rpc`` was
@@ -60,6 +60,12 @@ class _ConcurrencyTrackingExecutor:
         self.is_failed = False
         self._closed = False
         self.od_config = SimpleNamespace()
+        # Pause tests: a call whose gate is registered (by request id, or by
+        # method name for ``synchronize_device``) blocks inside the executor
+        # until the gate is set; ``version`` tags each call so a test can tell
+        # which "weights" a request ran on.
+        self.gates: dict[str, threading.Event] = {}
+        self.version = "v1"
 
     def collective_rpc(
         self,
@@ -81,16 +87,25 @@ class _ConcurrencyTrackingExecutor:
                     "kwargs": kwargs,
                     "unique_reply_rank": unique_reply_rank,
                     "thread": threading.get_ident(),
+                    "version": self.version,
                 }
             )
         try:
             if self.rpc_delay:
                 time.sleep(self.rpc_delay)
+            if method == "synchronize_device":
+                gate = self.gates.get(method)
+                if gate is not None:
+                    gate.wait(timeout=5.0)
+                return [None]
             # Distinguish per-request execution from raw RPC by method name.
             if method in {"execute_model", "execute_stepwise", "generate"}:
                 # args[0] is the request-like object for execute_model.
                 req = args[0] if args else None
                 tag = req.request_id if req is not None and hasattr(req, "request_id") else "unknown"
+                gate = self.gates.get(tag)
+                if gate is not None:
+                    gate.wait(timeout=5.0)
                 return DiffusionOutput(error=f"result_for_{tag}", finished=True)
             tag = args[0] if args else method
             return DiffusionOutput(error=f"rpc_result_for_{tag}")
@@ -133,21 +148,27 @@ def _make_request(tag: str):
 
 
 def _make_engine_with_loop(
-    loop: asyncio.AbstractEventLoop,
+    loop: asyncio.AbstractEventLoop | None,
     rpc_delay: float = 0.0,
+    *,
+    scheduler: RequestScheduler | None = None,
+    start_loop: bool = True,
 ):
     """Construct a ``DiffusionEngine`` skeleton with a real busy loop.
 
     The engine is wired with a fake executor that asserts no concurrent
-    calls and a real ``RequestScheduler``.
+    calls and a real ``RequestScheduler``. ``start_loop=False`` leaves the
+    engine in its bootstrap state (no busy-loop thread).
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine._closed = False
     engine.od_config = SimpleNamespace(streaming_output=False)
     engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=rpc_delay)
 
-    sched = RequestScheduler()
-    sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
+    sched = scheduler
+    if sched is None:
+        sched = RequestScheduler()
+        sched.initialize(SimpleNamespace(max_num_seqs=1, request_batch_max_wait_ms=0.0))
     engine.scheduler = sched
     engine.step_execution = False
     engine.supports_request_batch = False
@@ -160,9 +181,14 @@ def _make_engine_with_loop(
     engine._closed = False
     engine.abort_queue = queue.Queue()
     engine._rpc_queue = queue.Queue()
+    engine._scheduling_paused = False
 
     engine.main_loop = loop
     engine.stop_event = threading.Event()
+    if not start_loop:
+        engine._loop_started = False
+        engine.worker_thread = None
+        return engine
     engine._loop_started = True
     engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
     engine.worker_thread.start()
@@ -170,6 +196,10 @@ def _make_engine_with_loop(
 
 
 def _stop_engine(engine: DiffusionEngine) -> None:
+    if engine.worker_thread is None:
+        return
+    for gate in engine.executor.gates.values():
+        gate.set()
     with engine._cv:
         engine.stop_event.set()
         engine._cv.notify_all()
@@ -196,6 +226,254 @@ async def _consume_final_output(generator):
     if final_output is None:
         raise RuntimeError("Diffusion execution finished without output.")
     return final_output
+
+
+def _start_paced_engine(execute_fn) -> DiffusionEngine:
+    """Start a stepwise streaming engine whose busy loop runs ``execute_fn``."""
+    from vllm_omni.diffusion.sched import StepScheduler
+
+    scheduler = StepScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+    engine = _make_engine_with_loop(asyncio.get_running_loop(), scheduler=scheduler, start_loop=False)
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    engine.od_config.streaming_output = True
+    engine.od_config.max_num_seqs = 1
+    engine._streaming_playback = {}
+    engine.execute_fn = execute_fn
+    engine._loop_started = True
+    engine.worker_thread = threading.Thread(target=engine._busy_loop, daemon=True)
+    engine.worker_thread.start()
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_cleans_up():
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    calls = []
+
+    def execute(output):
+        request_id = output.scheduled_request_ids[0]
+        calls.append(request_id)
+        chunk = calls.count(request_id)
+        return RunnerOutput(
+            request_id=request_id,
+            step_index=chunk,
+            finished=chunk == 3,
+            result=DiffusionOutput(chunk_index=chunk - 1, finished=chunk == 3),
+            streaming_media_duration=1.0,
+            streaming_next_media_duration=1.0,
+        )
+
+    engine = _start_paced_engine(execute)
+    try:
+        request = OmniDiffusionRequest(
+            request_id="paced",
+            prompt="video",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=3, streaming_buffer_seconds=1.75),
+        )
+        engine.add_request(request)
+        queue = engine._out_streams["paced"]
+        first = await asyncio.wait_for(queue.get(), 2)
+        assert first.chunk_index == 0
+        await engine.async_collective_rpc("release_streaming_output", args=("paced", 0))
+        # A control round-trip must finish even though generation is blocked.
+        await asyncio.wait_for(engine.async_collective_rpc("ping"), 1)
+        assert calls == ["paced"]
+        await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.1))
+        await asyncio.sleep(0.02)
+        assert calls == ["paced"]
+        await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.3))
+        await engine.async_collective_rpc("submit_interaction", args=("paced", {"event_id": "release", "event": {}}))
+        second = await asyncio.wait_for(queue.get(), 2)
+        assert second.chunk_index == 1
+        assert calls == ["paced", "paced"]
+        assert engine._playback_blocked()
+        # Delayed/reordered progress cannot move the playhead backwards.
+        await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.2))
+        assert engine._streaming_playback["paced"].played_seconds == 0.3
+        engine.abort("paced")
+        terminal = await asyncio.wait_for(queue.get(), 2)
+        assert terminal.aborted
+        assert not engine._streaming_playback
+        cleanup = [call for call in engine.executor.calls if call["method"] == "execute_stepwise"]
+        assert cleanup[-1]["args"][0].finished_req_ids == {"paced"}
+        assert cleanup[-1]["args"][0].scheduled_request_ids == []
+        assert calls == ["paced", "paced"]
+        # An aborted session must not leave the next request paused.
+        engine.add_request(
+            OmniDiffusionRequest(
+                request_id="next",
+                prompt="video",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=3),
+            )
+        )
+        next_queue = engine._out_streams["next"]
+        for _ in range(3):
+            last = await asyncio.wait_for(next_queue.get(), 2)
+        assert last.finished
+        assert calls.count("next") == 3
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_ack", [False, True])
+async def test_streaming_credit_covers_downstream_consumer_and_final_chunk(explicit_ack):
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    calls = []
+
+    def execute(output):
+        request_id = output.scheduled_request_ids[0]
+        calls.append(request_id)
+        return RunnerOutput(
+            request_id=request_id,
+            step_index=1,
+            finished=True,
+            result=DiffusionOutput(output=b"four", chunk_index=0),
+            streaming_media_duration=0.01,
+        )
+
+    engine = _start_paced_engine(execute)
+    try:
+        for request_id in ("one", "two"):
+            engine.add_request(
+                OmniDiffusionRequest(
+                    request_id=request_id,
+                    prompt="video",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        num_inference_steps=1,
+                        streaming_buffer_seconds=1.0,
+                        streaming_output_ack=explicit_ack,
+                    ),
+                )
+            )
+        stream = engine.get_output_stream("one")
+        first = await asyncio.wait_for(anext(stream), 2)
+        assert first.streaming_metrics["retained_bytes"] == 4
+        await asyncio.wait_for(engine.async_collective_rpc("ping"), 1)
+        assert calls == ["one"]
+        engine.release_streaming_output("one", 99)
+        assert engine._playback_blocked()
+        if explicit_ack:
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+            assert engine._playback_blocked()
+            engine.release_streaming_output("one", 0)
+        else:
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+        second = await asyncio.wait_for(engine._out_streams["two"].get(), 2)
+        assert second.finished
+        assert calls == ["one", "two"]
+        engine.release_streaming_output("two", 0)
+        assert not engine._streaming_playback
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("over_limit", [False, True])
+async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit):
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    calls = []
+
+    def execute(output):
+        request_id = output.scheduled_request_ids[0]
+        calls.append(request_id)
+        finished = request_id == "next"
+        return RunnerOutput(
+            request_id=request_id,
+            step_index=1,
+            finished=finished,
+            result=DiffusionOutput(output=b"four", finished=finished),
+            streaming_media_duration=0.01,
+            streaming_next_media_duration=0.01,
+        )
+
+    engine = _start_paced_engine(execute)
+    try:
+        engine.add_request(
+            OmniDiffusionRequest(
+                request_id="paced",
+                prompt="video",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    streaming_buffer_seconds=1.0,
+                    streaming_max_output_bytes=3 if over_limit else 4,
+                    streaming_idle_timeout_s=0.05,
+                ),
+            )
+        )
+        output_queue = engine._out_streams["paced"]
+        if not over_limit:
+            first = await asyncio.wait_for(output_queue.get(), 2)
+            assert not first.finished
+            # Repeated zero-progress feedback cannot keep an abandoned output alive.
+            for _ in range(3):
+                engine.update_streaming_playback("paced", 0.0)
+                await asyncio.sleep(0.01)
+        terminal = await asyncio.wait_for(output_queue.get(), 2)
+        assert terminal.finished
+        assert ("streaming_max_output_bytes" if over_limit else "idle timeout") in terminal.error
+        assert not engine._streaming_playback
+        cleanup = [call for call in engine.executor.calls if call["method"] == "execute_stepwise"]
+        assert cleanup[-1]["args"][0].finished_req_ids == {"paced"}
+        assert cleanup[-1]["args"][0].scheduled_request_ids == []
+        engine.add_request(
+            OmniDiffusionRequest(
+                request_id="next",
+                prompt="video",
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            )
+        )
+        assert (await asyncio.wait_for(engine._out_streams["next"].get(), 2)).finished
+        assert calls == ["paced", "next"]
+    finally:
+        _stop_engine(engine)
+
+
+def test_internal_pacing_deadline_does_not_start_client_idle_timeout():
+    from vllm_omni.diffusion.diffusion_engine import _StreamingPlayback
+
+    engine = _make_engine_with_loop(None, start_loop=False)
+    state = _StreamingPlayback(buffer_seconds=1.0, idle_timeout_s=0.01)
+    state.pending_boundary = True
+    state.next_ready_at = time.monotonic() + 1.0
+    engine._streaming_playback = {"paced": state}
+
+    assert engine._playback_blocked()
+    assert state.idle_since is None
+
+
+def test_next_chunk_credit_wait_starts_client_idle_timeout():
+    from vllm_omni.diffusion.diffusion_engine import _StreamingPlayback
+
+    engine = _make_engine_with_loop(None, start_loop=False)
+    state = _StreamingPlayback(buffer_seconds=1.0, idle_timeout_s=0.01)
+    state.generated_seconds = 0.6
+    state.next_media_duration = 0.6
+    state.pending_boundary = True
+    state.next_ready_at = time.monotonic() - 1.0
+    engine._streaming_playback = {"paced": state}
+
+    assert engine._playback_blocked()
+    assert state.idle_since is not None
+    state.idle_since -= state.idle_timeout_s
+    engine._expire_streaming_idle()
+    assert not engine._streaming_playback
+
+
+@pytest.mark.parametrize("position", [True, -1, float("nan"), float("inf"), "1"])
+def test_playback_feedback_rejects_invalid_positions(position):
+    engine = _make_engine_with_loop(None, start_loop=False)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        engine.collective_rpc("update_streaming_playback", args=("missing", position))
 
 
 # ─────────────────────── single-thread invariant ───────────────────────────
@@ -474,12 +752,13 @@ async def test_cancelled_future_does_not_kill_busy_loop():
 
 
 @pytest.mark.asyncio
-async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loop():
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loop(error_type):
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop)
 
     def fail_reservation(*args, **kwargs):
-        raise RuntimeError("native allocation bug")
+        raise error_type("native allocation bug")
 
     engine.scheduler._diffusion_kv_manager = SimpleNamespace(
         has_request=lambda request_id: False,
@@ -564,3 +843,319 @@ async def test_rpc_and_request_results_do_not_swap():
     assert req_res.error == "result_for_req1"
     # Belt and braces: never overlapped on the executor.
     assert engine.executor.max_concurrent == 1
+
+
+# ───────────────────────── scheduler pause (keep) ─────────────────────────
+
+
+class _GatedAdmissionScheduler(RequestScheduler):
+    """Batching wait that only ends when the test opens admission."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.admission_open = threading.Event()
+
+    def get_admission_wait_decision(self, *, now: float, dp_concurrent: bool = False):
+        decision = super().get_admission_wait_decision(now=now, dp_concurrent=dp_concurrent)
+        return decision.__class__(should_wait=True, deadline=None, max_batch=self.max_num_running_reqs)
+
+    def should_end_admission_wait(self, decision, *, now: float, stable_since: float) -> bool:
+        return self.admission_open.is_set()
+
+
+def _pause(engine: DiffusionEngine, timeout: float | None = None):
+    return engine.async_collective_rpc("pause_scheduler", timeout=timeout, kwargs={"mode": "keep"})
+
+
+def _resume(engine: DiffusionEngine):
+    return engine.async_collective_rpc("resume_scheduler")
+
+
+def _methods(engine: DiffusionEngine) -> list[str]:
+    return [call["method"] for call in engine.executor.calls]
+
+
+def _executed(engine: DiffusionEngine) -> list[tuple[str, str]]:
+    return [
+        (call["args"][0].request_id, call["version"])
+        for call in engine.executor.calls
+        if call["method"] == "execute_model"
+    ]
+
+
+def _submit(engine: DiffusionEngine, tag: str) -> asyncio.Task:
+    return asyncio.create_task(_consume_final_output(engine.async_add_req_and_stream_response(_make_request(tag))))
+
+
+async def _wait_until(predicate, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not reached in time")
+        await asyncio.sleep(0.005)
+
+
+@pytest.mark.asyncio
+async def test_keep_pause_retains_waiting_request_and_serves_control_rpcs():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    try:
+        assert await _pause(engine) is None
+        queued = _submit(engine, "queued")
+        result = await engine.async_collective_rpc("list_loras", unique_reply_rank=0)
+        assert result.error == "rpc_result_for_list_loras"
+        await asyncio.sleep(0.05)
+        assert engine.scheduler.num_waiting_requests() == 1
+        assert _executed(engine) == []
+        assert not queued.done()
+
+        await _resume(engine)
+        assert (await asyncio.wait_for(queued, 3.0)).error == "result_for_queued"
+        assert _methods(engine) == ["synchronize_device", "list_loras", "execute_model"]
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_keep_pause_acks_after_running_batch_and_freezes_queue():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    gate = engine.executor.gates["A"] = threading.Event()
+    try:
+        a = _submit(engine, "A")
+        await _wait_until(lambda: _executed(engine) == [("A", "v1")])
+        b = _submit(engine, "B")
+        await _wait_until(lambda: engine.scheduler.num_waiting_requests() == 1)
+
+        pause = asyncio.create_task(_pause(engine))
+        await asyncio.sleep(0.1)
+        assert not pause.done()
+
+        gate.set()
+        await asyncio.wait_for(pause, 3.0)
+        assert _methods(engine) == ["execute_model", "synchronize_device"]
+        assert (await asyncio.wait_for(a, 3.0)).error == "result_for_A"
+        assert engine.scheduler.num_waiting_requests() == 1
+        assert not b.done()
+
+        engine.executor.version = "v2"
+        await _resume(engine)
+        assert (await asyncio.wait_for(b, 3.0)).error == "result_for_B"
+        assert _executed(engine) == [("A", "v1"), ("B", "v2")]
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_keep_pause_ack_does_not_release_later_rpcs_before_the_batch_is_emitted():
+    """A pause ACK must not open the queue to RPCs that touch device memory
+    (sleep) before the batch that just ran has been delivered.
+    """
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    barrier_gate = engine.executor.gates["synchronize_device"] = threading.Event()
+    methods_at_emit: list[list[str]] = []
+    emit_outputs = engine._emit_outputs
+
+    def _recording_emit(*args, **kwargs):
+        methods_at_emit.append(_methods(engine))
+        return emit_outputs(*args, **kwargs)
+
+    engine._emit_outputs = _recording_emit
+    try:
+        gate = engine.executor.gates["A"] = threading.Event()
+        a = _submit(engine, "A")
+        await _wait_until(lambda: _executed(engine) == [("A", "v1")])
+        pause = asyncio.create_task(_pause(engine))
+        await _wait_until(lambda: engine._scheduling_paused)
+        gate.set()
+        # The barrier holds the busy loop inside the post-execute RPC drain,
+        # so the sleep is queued before the pause ACK is published.
+        await _wait_until(lambda: "synchronize_device" in _methods(engine))
+        sleep_rpc = asyncio.create_task(engine.async_collective_rpc("handle_sleep_task", args=("t",)))
+        await _wait_until(lambda: not engine._rpc_queue.empty())
+        barrier_gate.set()
+
+        await asyncio.wait_for(pause, 3.0)
+        assert (await asyncio.wait_for(a, 3.0)).error == "result_for_A"
+        assert (await asyncio.wait_for(sleep_rpc, 3.0)).error == "rpc_result_for_t"
+    finally:
+        _stop_engine(engine)
+
+    assert _methods(engine) == ["execute_model", "synchronize_device", "handle_sleep_task"]
+    assert methods_at_emit and "handle_sleep_task" not in methods_at_emit[0]
+
+
+@pytest.mark.asyncio
+async def test_timed_out_pause_still_ends_the_drain_before_the_batch_is_emitted():
+    """A pause whose caller already gave up is still a drain barrier: its
+    cancelled task must not let a later RPC run before the batch is emitted.
+    """
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    methods_at_emit: list[list[str]] = []
+    emit_outputs = engine._emit_outputs
+
+    def _recording_emit(*args, **kwargs):
+        methods_at_emit.append(_methods(engine))
+        return emit_outputs(*args, **kwargs)
+
+    engine._emit_outputs = _recording_emit
+    try:
+        gate = engine.executor.gates["A"] = threading.Event()
+        a = _submit(engine, "A")
+        await _wait_until(lambda: _executed(engine) == [("A", "v1")])
+
+        # The caller times out while A is still executing: the pause future is
+        # cancelled, but its task stays queued ahead of the sleep.
+        with pytest.raises(TimeoutError):
+            await _pause(engine, timeout=0.1)
+        sleep_rpc = asyncio.create_task(engine.async_collective_rpc("handle_sleep_task", args=("t",)))
+        await _wait_until(lambda: engine._rpc_queue.qsize() == 2)
+        gate.set()
+
+        assert (await asyncio.wait_for(a, 3.0)).error == "result_for_A"
+        assert (await asyncio.wait_for(sleep_rpc, 3.0)).error == "rpc_result_for_t"
+    finally:
+        _stop_engine(engine)
+
+    assert _methods(engine) == ["execute_model", "handle_sleep_task"]
+    assert methods_at_emit and "handle_sleep_task" not in methods_at_emit[0]
+
+
+@pytest.mark.asyncio
+async def test_pause_rejects_unsupported_modes_without_closing_the_gate():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    try:
+        for kwargs in ({"mode": "abort"}, {"mode": "wait"}, {}):
+            with pytest.raises(ValueError):
+                await engine.async_collective_rpc("pause_scheduler", kwargs=kwargs)
+        engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+        with pytest.raises(NotImplementedError):
+            await _pause(engine)
+        engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
+
+        assert (await asyncio.wait_for(_submit(engine, "still-runs"), 3.0)).error == "result_for_still-runs"
+        assert _methods(engine) == ["execute_model"]
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_keep_pause_during_batching_wait_holds_the_batch():
+    loop = asyncio.get_running_loop()
+    sched = _GatedAdmissionScheduler()
+    sched.initialize(SimpleNamespace(max_num_seqs=4, request_batch_max_wait_ms=1000.0))
+    engine = _make_engine_with_loop(loop, scheduler=sched)
+    try:
+        waiting = _submit(engine, "W")
+        await _wait_until(lambda: engine.scheduler.num_waiting_requests() == 1)
+        await asyncio.sleep(0.05)
+
+        await asyncio.wait_for(_pause(engine), 3.0)
+        assert _methods(engine) == ["synchronize_device"]
+        assert engine.scheduler.num_waiting_requests() == 1
+
+        await _resume(engine)
+        await asyncio.sleep(0.05)
+        assert _executed(engine) == []
+        sched.admission_open.set()
+        assert (await asyncio.wait_for(waiting, 3.0)).error == "result_for_W"
+    finally:
+        sched.admission_open.set()
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_pause_timeout_leaves_gate_closed_until_explicit_resume():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    gate = engine.executor.gates["A"] = threading.Event()
+    try:
+        a = _submit(engine, "A")
+        await _wait_until(lambda: _executed(engine) == [("A", "v1")])
+        b = _submit(engine, "B")
+        await _wait_until(lambda: engine.scheduler.num_waiting_requests() == 1)
+
+        with pytest.raises(TimeoutError):
+            await _pause(engine, timeout=0.1)
+        gate.set()
+        assert (await asyncio.wait_for(a, 3.0)).error == "result_for_A"
+        await asyncio.sleep(0.1)
+        assert _executed(engine) == [("A", "v1")]
+        assert not b.done()
+
+        await _resume(engine)
+        assert (await asyncio.wait_for(b, 3.0)).error == "result_for_B"
+        assert "synchronize_device" not in _methods(engine)
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_repeated_pause_and_resume_are_idempotent():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    try:
+        await _resume(engine)
+        await _pause(engine)
+        await _pause(engine)
+        queued = _submit(engine, "Q")
+        await asyncio.sleep(0.05)
+        assert _executed(engine) == []
+        await _resume(engine)
+        await _resume(engine)
+        assert (await asyncio.wait_for(queued, 3.0)).error == "result_for_Q"
+        assert _methods(engine) == ["synchronize_device", "synchronize_device", "execute_model"]
+    finally:
+        _stop_engine(engine)
+
+
+@pytest.mark.asyncio
+async def test_abort_of_waiting_request_while_paused_delivers_terminal():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    try:
+        await _pause(engine)
+        b = _submit(engine, "B")
+        await _wait_until(lambda: engine.scheduler.num_waiting_requests() == 1)
+        engine.abort("B")
+
+        result = await asyncio.wait_for(b, 3.0)
+        assert result.aborted is True
+        assert engine.scheduler.get_request_state("B") is None
+        assert _executed(engine) == []
+
+        await _resume(engine)
+        assert (await asyncio.wait_for(_submit(engine, "C"), 3.0)).error == "result_for_C"
+        assert _executed(engine) == [("C", "v1")]
+        assert engine.worker_thread.is_alive()
+    finally:
+        _stop_engine(engine)
+
+
+def test_pause_and_resume_before_loop_starts_use_engine_local_path():
+    engine = _make_engine_with_loop(None, start_loop=False)
+
+    assert engine.collective_rpc("pause_scheduler", kwargs={"mode": "keep"}) is None
+    assert _methods(engine) == ["synchronize_device"]
+
+    assert engine.collective_rpc("resume_scheduler") is None
+    assert engine.add_req_and_wait_for_response(_make_request("X")).error == "result_for_X"
+    assert _executed(engine) == [("X", "v1")]
+
+
+@pytest.mark.asyncio
+async def test_requests_without_pause_never_trigger_the_barrier():
+    loop = asyncio.get_running_loop()
+    engine = _make_engine_with_loop(loop)
+    try:
+        first = await asyncio.wait_for(_submit(engine, "r1"), 3.0)
+        await engine.async_collective_rpc("ping", args=("p",), unique_reply_rank=0)
+        second = await asyncio.wait_for(_submit(engine, "r2"), 3.0)
+    finally:
+        _stop_engine(engine)
+
+    assert (first.error, second.error) == ("result_for_r1", "result_for_r2")
+    assert _methods(engine) == ["execute_model", "ping", "execute_model"]

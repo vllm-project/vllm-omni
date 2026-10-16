@@ -16,7 +16,9 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 | --- | --- | --- | --- | --- | --- |
+| AuK / AuK-Flash | assembled local bundle | ✓ (`ref_audio`) | HTTP audio after full generation | — | — |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
+| Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
 | higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
@@ -99,6 +101,41 @@ For full request-shape documentation (all parameters, response formats, error co
 
 ---
 
+## AuK / AuK-Flash
+
+AuK serves speech generation and reference-voice synthesis at 24 kHz. Assemble a local bundle before serving:
+
+```bash
+python tools/prepare_auk_checkpoint.py \
+    --auk-dir ckpts/AuK --qwen-dir ckpts/Qwen2.5-Omni-3B --out ckpts/auk-omni
+MODEL=ckpts/auk-omni bash examples/online_serving/text_to_speech/auk/run_server.sh
+```
+
+AuK accepts the complete instruction after you fill in the [local recipe template](../../../../recipes/Tencent/AuK-H100.md#supported-model-contract) or the [official AuK cookbook](https://github.com/Tencent-Hunyuan/AuK/blob/main/docs/COOKBOOK.md). Pass it in `instructions` and leave `input` empty. For instruct TTS, fill in `Generate speech based on the following description: "{voice description}". The content to speak is: "{text}".`; for zero-shot TTS, editing, enhancement and separation, use the corresponding complete instruction from the cookbook. Set `duration_seconds` for text-only generation; with `ref_audio`, omitting it keeps the source length.
+
+For compatibility with clients that can only send `input`, AuK treats an input-only request as the complete instruction and logs a recommendation to move it to `instructions` with `input=""`.
+
+`extra_params` accepts `num_inference_steps`, `guidance_scale`, `sway`, `t_grid`, and `vae_sample`; `seed` is a top-level field.
+
+```bash
+python examples/online_serving/text_to_speech/auk/speech_client.py \
+    --model ckpts/auk-omni \
+    --instructions 'Generate speech based on the following description: "A calm young woman speaking warmly and slowly.". The content to speak is: "Welcome back, how was your day?".' \
+    --duration-seconds 3 --seed 7
+```
+
+Complete-instruction editing also does not need a separate text argument:
+
+```bash
+python examples/online_serving/text_to_speech/auk/speech_client.py \
+    --model ckpts/auk-omni --instructions "Keep pure speech voice, remove noise and reverberation." \
+    --ref-audio noisy.wav --seed 7 --output clean.wav
+```
+
+The client accepts local reference files, URLs, and data URLs. `--stream` writes signed 16-bit 24 kHz PCM after the complete waveform is ready. See `speech_client.py --help` for editing and sampling options.
+
+---
+
 ## CosyVoice3
 
 2-stage TTS (`talker` + flow-matching `code2wav`) at 24 kHz. Voice cloning only — every request needs `ref_audio` + `ref_text`; there are no built-in voice presets.
@@ -119,16 +156,22 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 ./cosyvoice3/run_server.sh
 ```
 
-Streaming is on by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path.
+Streaming is on by default. On CUDA Hopper GPUs with at least 140 GiB of device memory (H200), serving automatically selects `cosyvoice3_packed_streaming_optimized_standard.yaml` when `nvidia-cuda-mps-control` is available on `PATH`: AR32 / codec32, standard sampling, packed Flow, cached ISTFT, HiFT decode graphs, and local CUDA MPS. No `--hf-overrides` is needed. Other devices and environments without the MPS control tool use `cosyvoice3.yaml` with RAS sampling and AR8 / codec8.
 
-Cross-request Stage-1 flow batching is opt-in. Enable it in the server environment when concurrent requests should share a flow-estimator call:
+The optimized profile is not a universal hardware configuration. Its packed kernels are Hopper-only; the talker's Model Runner V2 is unsupported on NPU/XPU, and CUDA MPS requires a local NVIDIA GPU and its control tool. Larger batches, 25-frame chunks, and graph allocations also require per-device validation on smaller or slower GPUs. Automatic selection retains the generic profile outside the validated device class; an explicit deploy configuration takes precedence.
+
+The H200 default targets streaming throughput at C32/C64. It changes sampling from RAS to standard (temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.21); output lengths and quality can differ. HiFT captures a recurring exact shape on its third use, which adds latency to that request, and its graph pool needs memory headroom beyond the engine reservations. This profile is not a claim of optimal first-audio latency at low concurrency. Pass `--deploy-config cosyvoice3.yaml` to retain the previous configuration, or `--deploy-config <path>` to select another profile.
+
+Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path; use `--deploy-config cosyvoice3.yaml` alongside it when selecting that path on H200.
+
+Cross-request Stage-1 flow batching is enabled in the H200 profile. For the generic configuration, enable it in the server environment when concurrent requests should share a flow-estimator call:
 
 ```bash
 export COSYVOICE3_BATCH_FLOW=1
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
 ```
 
-Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
 ### CLI client
 
@@ -158,8 +201,56 @@ The client supports `--api-base`, `--model`, `--text`, `--ref-audio`, `--ref-tex
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
-- Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+- Deploy config auto-loads the device-specific CosyVoice3 default described above. Pass `--deploy-config <path>` to override.
 - For offline inference and the end-to-end script, see the [offline CosyVoice3 section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#cosyvoice3).
+
+---
+
+## Fish Audio Drama 3
+
+35B-total / 3B-active MoE TTS at 44.1 kHz: a Qwen3.5 MoE backbone samples one
+semantic token per frame and a codebook tower predicts the other 9 codebooks.
+It shares the DAC codec stage with Fish Speech S2 Pro. Speaker tags
+(`<|speaker:0|>` to `<|speaker:15|>`) and inline event tags such as `[sighs]`
+go in `input`. See the [Drama 3 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/fishaudio/Drama-3.md) for measured
+performance and known limitations.
+
+### Launch
+
+```bash
+vllm serve fishaudio/drama-3 --omni --port 8091
+```
+
+The deploy config auto-loads from `vllm_omni/deploy/fish_omni.yaml` (the HF `model_type` on the checkpoint is `fish_omni`).
+
+### Voice cloning
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "fishaudio/drama-3",
+        "input": "[sighs] Fine. If we miss it, it is on you.",
+        "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+        "ref_text": "We asked over twenty different people, and they all said it was his.",
+        "response_format": "wav"
+    }' --output cloned.wav
+```
+
+### CLI client
+
+The Fish Speech client works unchanged with `--model fishaudio/drama-3`:
+
+```bash
+cd examples/online_serving/text_to_speech/fish_speech
+python speech_client.py --model fishaudio/drama-3 --text "<|speaker:0|> Hi. <|speaker:1|> Hello."
+python speech_client.py --model fishaudio/drama-3 --text "Hello world" --stream --output output.pcm
+```
+
+### Notes
+
+- Output: 44.1 kHz mono. Streaming PCM players must use `-r 44100`.
+- `ref_audio` needs `ref_text` (the transcript of the reference audio).
 
 ---
 
@@ -424,10 +515,9 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 This mode supports local EngineCore stages with one local process group per
 replica, including stages configured with multiple `num_replicas`. Headless,
 remote, intra-replica data-parallel, and Ray stage deployments are not
-supported. Runtime voice upload and deletion are disabled with multiple
-API frontends because their registries are process-local. Built-in voices,
-inline `ref_audio`, and voices restored from `custom_voice_dir` at startup are
-supported.
+supported. Built-in voices, inline `ref_audio`, voices restored from
+`custom_voice_dir` at startup, and runtime voice upload and deletion are
+supported: all API frontends share the uploaded-voice directory.
 
 ### Executor backend
 
@@ -494,9 +584,9 @@ checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
 
-The runtime upload and delete routes require a single API frontend; with
-`--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
-from `custom_voice_dir` at startup.
+Uploaded voices live in `SPEAKER_SAMPLES_DIR`; with `--api-server-count > 1`
+every API process shares that directory, so a voice uploaded or deleted through
+one process is used or rejected consistently by all of them.
 
 ### Precomputed custom voices
 

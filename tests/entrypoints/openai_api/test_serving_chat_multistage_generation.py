@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for multistage generation input construction."""
 
 from __future__ import annotations
@@ -94,6 +95,34 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[2].lora_request is None
 
 
+@pytest.mark.parametrize("extra_body", [{}, {"bot_task": "think"}])
+def test_build_multistage_generation_inputs_leaves_mm_uuids_to_content_hash(serving_chat, extra_body):
+    """Fixed image UUIDs collide across requests with the same processor kwargs.
+
+    Leave UUID generation to vLLM so cache keys depend on image content.
+    """
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+        ],
+        default_sampling_params_list=[SamplingParams(temperature=0.0), OmniDiffusionSamplingParams()],
+    )
+    for images in ([Image.new("RGB", (32, 32), color="red")], [Image.new("RGB", (32, 32), c) for c in ("red", "blue")]):
+        engine_prompt, _ = OmniOpenAIServingChat._build_multistage_generation_inputs(
+            serving_chat,
+            engine=engine,
+            prompt="edit me",
+            extra_body=dict(extra_body),
+            reference_images=images,
+            gen_params=OmniDiffusionSamplingParams(seed=0),
+        )
+        assert engine_prompt["multi_modal_data"]
+        assert "multi_modal_uuids" not in engine_prompt
+
+
 def test_prepare_multistage_multimodal_inputs_defers_downstream_modalities(serving_chat):
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
@@ -165,6 +194,28 @@ def test_needs_multistage_multimodal_split_detects_aura_handoff(serving_chat):
     )
 
     assert serving_chat._needs_multistage_multimodal_split() is True
+
+
+def test_joyai_asr_profile_bypasses_asr_without_audio(serving_chat):
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_ASR_PIPELINE
+
+    engine_client = object.__new__(AsyncOmni)
+    engine_client.engine = SimpleNamespace(stage_configs=list(JOYAI_VL_INTERACTION_ASR_PIPELINE.stages))
+    serving_chat.engine_client = engine_client
+    image = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}
+    audio = {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}}
+
+    def entry_stage_id(content):
+        modalities = serving_chat._input_modalities([{"role": "user", "content": content}])
+        return engine_client.resolve_entry_stage_id(modalities)
+
+    # Audio enters at Qwen3-ASR, which defers the image/video parts to JoyAI.
+    assert entry_stage_id([audio, image]) == 0
+    assert serving_chat._deferred_multimodal_modalities() == {"image", "video"}
+    # Without audio the request enters at JoyAI directly.
+    assert entry_stage_id([image]) == 1
+    assert entry_stage_id("What happened?") == 1
 
 
 def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):

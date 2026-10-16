@@ -1,0 +1,32 @@
+name: CodeQL Advanced
+
+on:
+  pull_request:
+    branches: [main]
+  # Full scan of the default branch. Cron is UTC; 18:00 UTC is 02:00 Asia/Shanghai.
+  schedule:
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: actions,javascript-typescript,python
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
