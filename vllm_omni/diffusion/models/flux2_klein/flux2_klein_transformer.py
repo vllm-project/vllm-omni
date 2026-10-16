@@ -327,6 +327,7 @@ class Flux2Attention(nn.Module):
                         self.norm_k.weight,
                         qk_norm_rope_table,
                         self.norm_q.variance_epsilon,
+                        cuda_rms_norm=True,
                     )
                 else:
                     query = torch.cat([encoder_query, query], dim=1)
@@ -543,6 +544,7 @@ class Flux2ParallelSelfAttention(nn.Module):
                     qk_norm_rope_table,
                     self.norm_q.variance_epsilon,
                     interleaved=True,
+                    cuda_rms_norm=True,
                 )
                 query = query.view(batch_size, seq_len, num_heads, head_dim)
                 key = key.view(batch_size, seq_len, num_heads, head_dim)
@@ -1082,6 +1084,7 @@ class Flux2Transformer2DModel(nn.Module):
             hidden_states.shape[0],
             dtype=hidden_states.dtype,
             sequence_parallel_size=sp_size,
+            cuda_rms_norm=True,
         )
         # Never mutate the caller-owned dict: rebind to a copy with (or
         # without) this forward's table.

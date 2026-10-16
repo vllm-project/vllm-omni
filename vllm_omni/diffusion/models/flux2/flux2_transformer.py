@@ -231,7 +231,8 @@ class Flux2Attention(nn.Module):
             # Fused text/image RMSNorm + cat + RoPE (one launch) when the
             # forward supplied the packed table and the CUDA kernel accepts
             # the geometry; otherwise the eager chain, which the SP path (its
-            # RoPE is applied per stream) always uses.
+            # RoPE is applied per stream) always uses. The fused op reproduces
+            # the CUDA RMSNorm reduction, so both paths produce the same bits.
             qk_norm_rope_table = None if use_sp_joint_attention else kwargs.get(QK_NORM_ROPE_TABLE_KEY)
             use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
                 query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
@@ -293,6 +294,7 @@ class Flux2Attention(nn.Module):
                         self.norm_k.weight,
                         qk_norm_rope_table,
                         self.norm_q.variance_epsilon,
+                        cuda_rms_norm=True,
                     )
                 else:
                     query = torch.cat([encoder_query, query], dim=1)
@@ -484,6 +486,7 @@ class Flux2ParallelSelfAttention(nn.Module):
                     qk_norm_rope_table,
                     self.norm_q.variance_epsilon,
                     interleaved=True,
+                    cuda_rms_norm=True,
                 )
                 query = query.view(batch_size, seq_len, num_heads, head_dim)
                 key = key.view(batch_size, seq_len, num_heads, head_dim)
@@ -1003,6 +1006,7 @@ class Flux2Transformer2DModel(nn.Module):
             hidden_states.shape[0],
             dtype=hidden_states.dtype,
             sequence_parallel_size=sp_size,
+            cuda_rms_norm=True,
         )
         # Never mutate the caller-owned dict: rebind to a copy with (or
         # without) this forward's table.
