@@ -938,16 +938,6 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
-            "--diffusion-offload-config",
-            type=json.loads,
-            default=None,
-            help="Diffusion CPU-offload config as JSON. "
-            "Set mode to module or layer, list dit and/or text_encoder in "
-            "components, and put layer-only tuning under layer_options. "
-            "Layer settings are weight_transfer (rank-local or allgather) and "
-            "resident_layers (DiT only).",
-        )
-        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
             help="Compatibility alias for model-level CPU offload. New integrations should use "
@@ -1022,6 +1012,50 @@ class OmniServeCommand(CLISubcommand):
                 "Optional per-worker GiB ceiling for registering an HWR mmap for direct H2D. "
                 "Zero applies no additional ceiling. Eligible no-AllGather HWR hits attempt registration "
                 "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
+            ),
+        )
+        # New canonical offload shortcut and JSON config (RFC #7204)
+        omni_config_group.add_argument(
+            "--diffusion-offload",
+            dest="diffusion_offload_shortcut",
+            choices=("none", "module", "layer"),
+            default=None,
+            help=(
+                "Canonical offload granularity shortcut. "
+                "none = disable offload explicitly; "
+                "module = whole-DiT swapping with pinned memory; "
+                "layer = rank-local DiT block streaming with pinned memory. "
+                "Mutually exclusive with --diffusion-offload-config. "
+                "Does not replace all legacy flags — use --diffusion-offload-config for "
+                "fine-grained control over components and weight transfer."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-offload-config",
+            dest="diffusion_offload_config",
+            type=str,
+            default=None,
+            help=(
+                "Canonical offload policy as a JSON object (RFC #7204). "
+                "Keys: mode (none/module/layer, required), components "
+                "(object keyed by dit/text_encoder with per-component options "
+                "like weight_transfer and resident_layers), pin_memory (bool). "
+                'Omitted components default to {"dit":{}} for new-style configs. '
+                "Mutually exclusive with --diffusion-offload."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-config",
+            dest="host_weight_runtime_config",
+            type=str,
+            default=None,
+            help=(
+                "Canonical Host Weight Runtime policy as a JSON object (RFC #7204). "
+                "Keys: mode (disabled/preferred/required, default disabled), "
+                "root (writable node-local store path, required for preferred/required), "
+                "registration_limit_gib (per-worker mmap registration ceiling, default 0). "
+                "Supplied with preferred/required mode also requires active "
+                "mode=layer offload with components.dit and rank-local transfer."
             ),
         )
         # Video model parameters (e.g., Wan2.2) - engine-level

@@ -174,6 +174,14 @@ class OffloadConfig:
         dlo_transfers = dict(resolved.transfers)
         dlo_resident_layers = resolved.resident_layers
         dit_uses_allgather = resolved.uses_allgather(DIT_COMPONENT)
+
+        # If distributed layerwise offload is active but the DiT uses
+        # rank-local transfer (no AllGather), each rank streams complete
+        # blocks independently — force dp_size=1 so the backend picks the
+        # standard-loader or mmap host path instead of DLO sharding.
+        if enable_distributed_layerwise_offload and not dit_uses_allgather:
+            dp_size = 1
+
         dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=getattr(od_config, "dlo_host_registration_limit_gib", 0.0),
             enable_dlo=enable_distributed_layerwise_offload,

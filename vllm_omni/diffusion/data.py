@@ -210,7 +210,7 @@ def parse_kv_cache_skip_selector(
     values: set[int]
     if isinstance(selector, set):
         values = selector
-    elif isinstance(selector, (list, tuple)):
+    elif isinstance(selector, list | tuple):
         values = set(selector)
     elif isinstance(selector, str):
         text = selector.strip()
@@ -381,9 +381,10 @@ class DiffusionParallelConfig:
         assert self.sequence_parallel_size == expected_sp_size, (
             f"Sequence parallel size must be {expected_sp_size}, but got {self.sequence_parallel_size}"
         )
-        assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
-            f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
-        )
+        assert self.ulysses_mode in {
+            "strict",
+            "advanced_uaa",
+        }, f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
 
         # Validate HSDP configuration
         if self.use_hsdp:
@@ -974,6 +975,16 @@ class OmniDiffusionConfig:
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
+    # New canonical offload policy (RFC #7204) — mutually exclusive with the
+    # legacy boolean flags above.  One of:
+    #   diffusion_offload_shortcut: str | None  ("none" | "module" | "layer")
+    #   diffusion_offload_config:   dict | None  full canonical JSON schema
+    diffusion_offload_shortcut: str | None = None
+    diffusion_offload_config: dict | None = None
+    # New canonical HWR config (RFC #7204) — mutually exclusive with legacy
+    # flat HWR flags above.
+    host_weight_runtime_config: dict | None = None
+
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
@@ -1176,12 +1187,12 @@ class OmniDiffusionConfig:
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
-        if not isinstance(num_experts, (list, tuple, int)):
+        if not isinstance(num_experts, list | tuple | int):
             return False
         if isinstance(num_experts, int):
             return num_experts > 0
 
-        if isinstance(num_experts, (list, tuple)):
+        if isinstance(num_experts, list | tuple):
             return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False
@@ -1458,6 +1469,38 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        # --- Canonical offload config (RFC #7204): JSON string → dict ---
+        if isinstance(self.diffusion_offload_config, str):
+            import json as _json
+
+            try:
+                self.diffusion_offload_config = _json.loads(self.diffusion_offload_config)
+            except _json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in diffusion_offload_config: {exc}") from exc
+        elif self.diffusion_offload_config is not None and not isinstance(self.diffusion_offload_config, Mapping):
+            raise TypeError(
+                f"diffusion_offload_config must be a JSON object, dict, or None; "
+                f"got {type(self.diffusion_offload_config).__name__}"
+            )
+        if isinstance(self.host_weight_runtime_config, str):
+            import json as _json
+
+            try:
+                self.host_weight_runtime_config = _json.loads(self.host_weight_runtime_config)
+            except _json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in host_weight_runtime_config: {exc}") from exc
+        elif self.host_weight_runtime_config is not None and not isinstance(self.host_weight_runtime_config, Mapping):
+            raise TypeError(
+                f"host_weight_runtime_config must be a JSON object, dict, or None; "
+                f"got {type(self.host_weight_runtime_config).__name__}"
+            )
+
+        # Mutual exclusion between shortcut and full config
+        if self.diffusion_offload_shortcut is not None and self.diffusion_offload_config is not None:
+            raise ValueError(
+                "diffusion_offload_shortcut and diffusion_offload_config are mutually exclusive; use one or the other"
+            )
 
         validate_host_weight_runtime_options(
             mode=self.host_weight_runtime_mode,

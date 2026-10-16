@@ -860,6 +860,10 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     host_weight_runtime_root: str | None = None
     dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
+    # New canonical offload policy (RFC #7204)
+    diffusion_offload_shortcut: str | None = None
+    diffusion_offload_config: dict | None = None
+    host_weight_runtime_config: dict | None = None
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
     # Mirrors OmniDiffusionConfig.enable_cuda_graph_decode; enforced by the
@@ -1016,7 +1020,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
 
         if self.diffusion_attention_config is None or isinstance(
             self.diffusion_attention_config,
-            (AttentionConfig, Mapping),
+            AttentionConfig | Mapping,
         ):
             self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
         else:
@@ -1043,6 +1047,26 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        # --- Canonical offload config (RFC #7204): JSON string → dict ---
+        if isinstance(self.diffusion_offload_config, str):
+            import json as _json
+
+            try:
+                self.diffusion_offload_config = _json.loads(self.diffusion_offload_config)
+            except _json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in diffusion_offload_config: {exc}") from exc
+        if isinstance(self.host_weight_runtime_config, str):
+            import json as _json
+
+            try:
+                self.host_weight_runtime_config = _json.loads(self.host_weight_runtime_config)
+            except _json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in host_weight_runtime_config: {exc}") from exc
+        if self.diffusion_offload_shortcut is not None and self.diffusion_offload_config is not None:
+            raise ValueError(
+                "diffusion_offload_shortcut and diffusion_offload_config are mutually exclusive; use one or the other"
+            )
 
         validate_host_weight_runtime_options(
             mode=self.host_weight_runtime_mode,
