@@ -6,6 +6,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.ops import gated_residual
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -64,7 +65,7 @@ def test_gated_residual_rejects_invalid_shapes():
         gated_residual(residual, residual, torch.randn(3, 16))
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_CUDA_ONLY
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gate_shape", [(4096,), (2, 1, 4096), (2, 257, 4096)])
@@ -83,7 +84,7 @@ def test_gated_residual_cuda_matches_eager(dtype, gate_shape, mocker):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_CUDA_ONLY
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_gated_residual_supports_torch_compile(dtype):
@@ -97,7 +98,7 @@ def test_gated_residual_supports_torch_compile(dtype):
     torch.testing.assert_close(actual, residual + branch * gate, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_CUDA_ONLY
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tokens", [1, 17])
@@ -121,7 +122,7 @@ def test_gated_residual_supports_strided_modulation_gate(dtype, tokens, view, mo
     torch.testing.assert_close(actual, residual + branch * gate, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_CUDA_ONLY
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compiled", [False, True])
@@ -150,7 +151,10 @@ def test_gated_residual_preserves_product_rounding(dtype: torch.dtype, compiled:
 
 @pytest.mark.parametrize(
     "device",
-    [pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=[pytest.mark.cuda, _CUDA_ONLY])],
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=[*hardware_marks(res={"cuda": "L4"}, num_cards=1), _CUDA_ONLY]),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gate_shape", [(16,), (2, 1, 16), (2, 3, 16)])
@@ -180,7 +184,7 @@ def test_gated_residual_backward_matches_eager(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_CUDA_ONLY
 @pytest.mark.parametrize("grad_context", [torch.no_grad, torch.inference_mode])
 def test_gated_residual_no_grad_keeps_fused_path(grad_context, mocker):
@@ -198,7 +202,7 @@ def test_gated_residual_no_grad_keeps_fused_path(grad_context, mocker):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_CUDA_ONLY
 @pytest.mark.parametrize(
     "case", ["float32", "mixed_dtype", "activation_stride", "gate_stride", "broadcast", "scalar_gate", "hidden_size"]
@@ -231,7 +235,7 @@ def test_gated_residual_cuda_fallback(case: str, mocker):
     torch.testing.assert_close(actual, residual + branch * gate, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @_CUDA_ONLY
 def test_gated_residual_custom_op_schema_and_fake():
     residual = torch.randn(2, 7, 128, device="cuda", dtype=torch.bfloat16)
