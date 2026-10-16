@@ -16,11 +16,15 @@ from vllm_omni.diffusion.attention.capabilities import CompilationMode
 pytestmark = [
     pytest.mark.diffusion,
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1),
 ]
 
 
-@pytest.fixture(params=["FLASH_ATTN", "FLASHINFER_ATTN"])
+@pytest.fixture(
+    params=[
+        pytest.param("FLASH_ATTN", marks=hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1)),
+        pytest.param("FLASHINFER_ATTN", marks=hardware_marks(res={"cuda": "H100"}, num_cards=1)),
+    ]
+)
 def sparse_adapter(request):
     # Add a provider here and its dependency/device setup below to run the same contract.
     if not torch.cuda.is_available():

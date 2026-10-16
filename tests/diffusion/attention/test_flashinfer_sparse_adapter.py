@@ -10,6 +10,7 @@ from tests.helpers.block_sparse import (
     make_attention_inputs,
     selected_attention_reference,
 )
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferSparseAdapter
 from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
 
@@ -90,7 +91,7 @@ def test_runtime_failure_propagates_and_opaque_id_is_forwarded(monkeypatch):
     assert seen == ["future-provider-id"]
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("implementation", ["fa2", "fa3"])
 @torch.inference_mode()
 def test_padding_tails_and_preparation_through_shared_dispatch(implementation):
@@ -142,7 +143,7 @@ def test_padding_tails_and_preparation_through_shared_dispatch(implementation):
     torch.compiler.reset()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("implementation", ["auto", "fa2", "fa3"])
 @torch.inference_mode()
 def test_dynamic_fullgraph_patterns_and_owners(implementation):
