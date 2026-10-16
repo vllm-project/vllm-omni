@@ -5,7 +5,7 @@
 - Vendor: Resemble AI
 - Model: `ResembleAI/chatterbox-turbo` (Turbo) and `ResembleAI/chatterbox` (English Original)
 - Task: English text-to-speech with the checkpoint's built-in voice or a voice cloned from one recording
-- Mode: online `/v1/audio/speech` with the one profile per model, each admitting 64 requests at once (Original's as 128 guided sequences), what one H100 fits. At 64 clients neither model plays in real time (the rows below); real-time playback held up to 16 cloned-voice or 32 built-in clients for Turbo, and up to 8 built-in clients for Original, in the earlier run at `39d191c53` on an overlay with the shipped profiles' keys. Offline use is covered below
+- Mode: online `/v1/audio/speech` with the one profile per model, each admitting 64 requests at once (Original's as 128 guided sequences), what one H100 fits. The nightly perf matrix below gives median first audio, real-time factor and throughput at 1, 8, 16 and 64 clients for both voices, beside Qwen3-TTS on the same protocol. Offline use is covered below
 - Hardware: 1x NVIDIA H100 SXM 80 GB
 - Maintainer: @will-rice
 
@@ -13,8 +13,8 @@
 
 One card serving concurrent streams: each model has one profile, which
 conditions references on the GPU, runs stage 0 with CUDA graphs and the flow
-decoder in BF16 with HiFT in FP32, and admits the measured real-time
-envelope. Cloned voices cost
+decoder in BF16 with HiFT in FP32, and admits 64 requests at once, what
+one H100 fits. Cloned voices cost
 more than the built-in voice at every load, because each new reference is
 encoded before its request starts; size for distinct references if the
 traffic is cloning. This recipe also holds the comparison with the canonical
@@ -45,13 +45,13 @@ The request contract is the one in the
 
 | Profile on this hardware | Status |
 | --- | --- |
-| `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | measured at 64 clients at this head, built-in and cloned voices, with quality; 8–32-client rows from `39d191c53` on an overlay with the same keys |
+| `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | measured through the nightly perf matrix at this head: 1, 8, 16 and 64 clients, built-in and cloned voices, and the 2-request/s stress case |
 | `chatterbox.yaml` (64 guided requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | as Turbo's row |
 
-Real-time here means p95 real-time factor below 1 and every stream
-continuous (no playback underrun beyond 100 ms). Admission at 64 is a
-capacity contract, not a real-time guarantee; the evidence below gives each
-row.
+Admission at 64 is a capacity contract, not a latency guarantee: the nightly
+perf matrix below gives the median first audio and real-time factor at
+each load, and the flow-precision rows give p95 and playback continuity
+at 64 clients for an earlier revision.
 
 ## References
 
@@ -66,10 +66,13 @@ row.
 - Accelerator model and per-device memory: NVIDIA H100 SXM, 80 GB
 - Number of devices: 1; the API process and both stages share it (`conditioning_device: cuda:0`)
 - Device interconnect: none used
-- Host: Intel Xeon Platinum 8470 with a 22-CPU container quota and a 251 GB
-  memory limit; the load driver ran on the same host. The 64-client rows
-  come from a second pod of the same type (GPU `GPU-0e708041`, same driver,
-  CPU model, quota and memory limit); every other measurement from the first
+- Host: three pods of this type, all with driver 580.126.09 and a 251 GB
+  memory limit, the load driver on the same host each time. The nightly
+  matrix ran on an Intel Xeon Platinum 8480+ host with a 23.8-CPU container
+  quota (GPU `GPU-afa1e129`); the reference conditioning batch on a Xeon
+  Platinum 8470 host with a 22.1-CPU quota (`GPU-0e708041`); the upstream
+  comparison and the flow-precision rows on another 8470 host with a 22-CPU
+  quota
 - Qualification scope: CUDA only; the measurements below name their profile and revision
 
 ## Software environment
@@ -81,11 +84,11 @@ row.
 | Driver / runtime | 580.126.09 (CUDA 13.0); PyTorch 2.13.0+cu130, torchaudio 2.11.0+cu130 |
 | vLLM | 0.31.0 |
 | Transformers / Diffusers | 5.14.1 / 0.40.0 |
-| vLLM-Omni | `feacefc03` for the 64-client rows and the conditioning batch; `39d191c53` plus the BF16-flow default in the deploy files for the upstream comparison, the nightly rows, the flow-precision rows and the 8–32-client rows |
+| vLLM-Omni | the code of `feacefc03` for the nightly matrix and the conditioning batch; `39d191c53` plus the BF16-flow default in the deploy files for the upstream comparison and the flow-precision rows |
 | Checkpoints | Turbo `749d1c1a46eb10492095d68fbcf55691ccf137cd`; Original `5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18` |
 
-Every measurement below comes from the first host on 2026-10-15, except
-the 64-client rows, from the second host on 2026-10-16. Upstream ran in
+The upstream comparison and the flow-precision rows are from 2026-10-15,
+the conditioning batch and the nightly matrix from 2026-10-16. Upstream ran in
 its own environment: Python 3.11.15, `chatterbox-tts` 0.1.7, PyTorch and
 torchaudio 2.6.0+cu124, NumPy 1.26.4, Transformers 5.2.0, Diffusers 0.29.0,
 `resemble-perth` 1.0.1. Both sides of the upstream comparison used four CPU
@@ -165,10 +168,8 @@ pytest tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf
 ```
 
 Expected: every case completes with zero failed requests, and the median
-first-audio latency and real-time factor stay near the H100 baselines in
-that file (the nightly rows below). With the 64-request Turbo overlay
-measured below, the shared driver's report showed a 100.00 % streaming continuity
-rate at 16 cloned-voice clients and at 32 built-in clients.
+first-audio latency, real-time factor and audio throughput stay near the
+H100 baselines in that file, which are the nightly matrix below.
 
 ## Notes
 
@@ -181,10 +182,9 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
   7.3 GiB in all, under the 35 % (8.3 GiB). Original: 1.32 GiB, 0.16 GiB,
   0.08 GiB and 120 KiB per token; 16 sequences need 3.75 GiB, about 5.3 GiB
   in all, under the 30 % (7.1 GiB). Stage 1 allocates no KV cache; its 15 %
-  bounds the flow's and HiFT's activations. The 64-client rows below ran
-  with these fractions (159,248 KV-cache tokens for Turbo, 297,184 for
-  Original at startup); the 8–32-client rows ran on the overlays' 0.35 and
-  0.40.
+  bounds the flow's and HiFT's activations. The nightly matrix below ran
+  with these fractions: 159,248 KV-cache tokens for Turbo and 297,184 for
+  Original at startup.
 - Key flags: `conditioning_device` under stage 0 `additional_config`
   places the reference encoders: on the stages' GPU (`cuda:0`) in every CUDA
   profile, and on the CPU on NPU, XPU and MUSA through each profile's
@@ -192,11 +192,11 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
   decoder runs under BF16 autocast with FP32 weights and FP32 HiFT, which
   is `ChatterboxConfig`'s default `flow_dtype`, and
   `hf_overrides: {flow_dtype: float32}` on stage 1 restores the FP32 flow.
-- Known limitations: cloned voices add the reference encoding to first
-  audio (5.0 s at the p50 for Turbo and 4.9 s for Original at 64 clients at
-  this head; 0.9 s at 8 Turbo clients at `39d191c53`); neither model is
-  real-time at 64 clients, and Original is not real-time for cloned voices
-  at 8. English only
+- Known limitations: cloned voices add the reference encoding to median
+  first audio (Turbo 0.20 s at one client and 0.42 s at 64, Original 0.19 s
+  and 1.18 s, on the nightly's Seed-TTS subset, whose references repeat
+  and are cached after first use); Original's median real-time factor
+  passes 1 between 16 and 64 clients with either voice. English only
   (the multilingual checkpoint is not served); no VoiceDesign or free-form
   instructions; no prefix caching (prompts are placeholder ids whose
   embeddings differ per request). Text that needs more than 1000 speech
@@ -208,12 +208,12 @@ rate at 16 cloned-voice clients and at 32 built-in clients.
 
 | Feature | Status |
 | --- | --- |
-| Built-in voice, voice cloning, async streaming | both variants, measured at 64 HTTP clients with distinct references at this head and at 8–32 at `39d191c53` |
+| Built-in voice, voice cloning, async streaming | both variants, the nightly perf matrix at 1, 8, 16 and 64 clients |
 | GPU reference conditioning | `conditioning_device: cuda:0`; every admitted reference is encoded in one batch, admission equal to stage 0's request capacity; 64 references, the admission of both profiles, take 1.64–2.02 s (Turbo) or 0.51–0.68 s (Original) as one batch on H100 |
 | AR CUDA graphs | on by default; graph versus eager measured below |
 | BF16 flow decoder, FP32 HiFT | default in every profile; quality and speed measured below |
-| Real-time with cloned voices | not at 64 clients; Turbo up to 16 clients at `39d191c53`; Original at no measured load |
-| Real-time with the built-in voice | not at 64 clients; Turbo up to 32 clients and Original up to 8 at `39d191c53` |
+| Median real-time factor below 1, cloned voices | Turbo up to 64 clients (0.91 at 64); Original up to 16 (0.93), 2.10 at 64 |
+| Median real-time factor below 1, built-in voice | Turbo up to 64 clients (0.74 at 64); Original up to 16 (0.84), 2.17 at 64 |
 | Multilingual, VoiceDesign, instructions, prefix caching | unsupported |
 
 ## Qualification evidence
@@ -313,37 +313,72 @@ single clip's, and which clip flips a token depends on the recording.
 Peak memory is torch's allocated and reserved device memory in the
 benchmark process.
 
-### Nightly latency and throughput baselines, the 8-slot profiles at `39d191c53`
+### Nightly perf matrix
 
-Measured with the Verification command: one pytest session, the eight
-Chatterbox cases of `tests/dfx/perf/tests/test_tts.json`, all passed with
-zero failed requests, on the profiles of `39d191c53` (stage 0 admitting 8,
-conditioning on the CPU), not yet rerun on the shipped 64-request profiles.
-Those profiles ran stage 0 in BF16 with async chunk streaming and stage 1 with the BF16 flow and FP32 HiFT; requests go
-through `/v1/audio/speech` with the built-in voice, the bundled
-`seed_tts_smoke` English texts and seed 42. Latency: 20 requests at
-concurrency one after two warmups; throughput: 80 requests at concurrency
-eight after eight warmups; stress: 100 requests at two per second after two
-warmups. Only stage 0's `enforce_eager` differs between a graph and an
-eager row.
+Measured with the Verification command on 2026-10-16: one pytest session
+over the Chatterbox cases of `tests/dfx/perf/tests/test_tts.json`, which
+mirror the Qwen3-TTS cases. `latency` is 20 requests at one client after
+two warmups; `throughput` is 80, 128 and 128 requests at 8, 16 and 64
+clients, each after as many warmup requests as clients; `stress` is 100
+requests at two per second; the `quality` cases are off in CI, as for every
+model. Built-in rows (`default_voice`) use the bundled `seed_tts_smoke`
+texts (about 4 s of audio each) with seed 42. Cloned rows (`voice_clone`)
+use the English rows of `linyueqian/seed-tts-eval-subset`, as Qwen3-TTS's
+do: one reference recording and its target text per row, 100 rows, so a
+128-request run repeats references, which the speaker cache serves after
+their first use, and Turbo repeats the subset's clips shorter than 5 s; the
+requests carry the 1000-token cap the model enforces. Every case completed
+every request. The graph rows are the shipped profiles; the eager rows set
+only `enforce_eager: true` on stage 0. The values are the medians the
+nightly stores, with audio throughput in seconds of audio per second.
 
-| Variant / AR mode | Workload | Mean RTF | Mean first audio (ms) | Mean audio duration (s) |
-| --- | --- | --- | --- | --- |
-| Turbo / graph | Latency | 0.121 | 240 | 3.984 |
-| Turbo / eager | Latency | 0.288 | 429 | 3.984 |
-| Original / graph | Latency | 0.370 | 587 | 3.436 |
-| Original / eager | Latency | 0.437 | 761 | 3.482 |
-| Turbo / graph | Throughput, 8 clients | 0.229 | 539 | 4.018 |
-| Original / graph | Throughput, 8 clients | 0.735 | 1330 | 3.498 |
-| Turbo / graph | Stress, 2 requests/s | 0.146 | 314 | 4.060 |
-| Original / graph | Stress, 2 requests/s | 0.646 | 1064 | 3.518 |
+| Model | Voice | Phase | Clients | Median first audio (ms) | Median RTF | Audio throughput |
+| --- | --- | --- | --- | --- | --- | --- |
+| Turbo | built-in | latency | 1 | 208 | 0.124 | — |
+| Turbo | built-in | throughput | 8 | 504 | 0.233 | 33.8 |
+| Turbo | built-in | throughput | 16 | 622 | 0.335 | 47.4 |
+| Turbo | built-in | throughput | 64 | 1282 | 0.737 | 83.5 |
+| Turbo | built-in | stress, 2/s | — | 322 | 0.160 | 8.0 |
+| Turbo | cloned | latency | 1 | 412 | 0.166 | — |
+| Turbo | cloned | throughput | 8 | 815 | 0.344 | 21.6 |
+| Turbo | cloned | throughput | 16 | 729 | 0.376 | 38.6 |
+| Turbo | cloned | throughput | 64 | 1707 | 0.907 | 65.5 |
+| Turbo, eager stage 0 | built-in | latency | 1 | 396 | 0.323 | — |
+| Original | built-in | latency | 1 | 520 | 0.382 | — |
+| Original | built-in | throughput | 8 | 1361 | 0.765 | 10.7 |
+| Original | built-in | throughput | 16 | 1481 | 0.838 | 19.5 |
+| Original | built-in | throughput | 64 | 3020 | 2.170 | 30.5 |
+| Original | built-in | stress, 2/s | — | 1339 | 0.796 | 6.7 |
+| Original | cloned | latency | 1 | 715 | 0.395 | — |
+| Original | cloned | throughput | 8 | 1675 | 0.864 | 9.0 |
+| Original | cloned | throughput | 16 | 1733 | 0.926 | 16.5 |
+| Original | cloned | throughput | 64 | 4201 | 2.098 | 29.5 |
+| Original, eager stage 0 | built-in | latency | 1 | 768 | 0.462 | — |
 
-The nightly JSON stores the median first-audio latency and median RTF of
-every row, and the audio throughput of the throughput rows, under the H100
-bucket from this run; B200 runs the same cases with no baseline. These rows
-come from one bounded run per case and are qualification evidence, not a
-benchmark: they cover English text of a few seconds and the built-in voice
-only.
+Qwen3-TTS on the same protocol, its H100 baselines from the same file
+(`Qwen3-TTS-12Hz-1.7B-CustomVoice` for the built-in voice, `-Base` for
+cloning, two GPUs):
+
+| Model | Voice | Phase | Clients | Median first audio (ms) | Median RTF | Audio throughput |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-TTS CustomVoice | built-in | latency | 1 | 47 | 0.137 | — |
+| Qwen3-TTS CustomVoice | built-in | throughput | 8 | 75 | 0.186 | 38.4 |
+| Qwen3-TTS CustomVoice | built-in | throughput | 16 | 714 | 0.315 | 55.4 |
+| Qwen3-TTS CustomVoice | built-in | throughput | 64 | 5942 | 1.166 | 68.7 |
+| Qwen3-TTS CustomVoice | built-in | stress, 2/s | — | 57 | 0.157 | 11.1 |
+| Qwen3-TTS Base | cloned | latency | 1 | 141 | 0.159 | — |
+| Qwen3-TTS Base | cloned | throughput | 8 | 227 | 0.331 | 24.2 |
+| Qwen3-TTS Base | cloned | throughput | 16 | 647 | 0.364 | 40.4 |
+| Qwen3-TTS Base | cloned | throughput | 64 | 4777 | 1.228 | 43.3 |
+
+Turbo starts audio later than Qwen3-TTS at one and eight clients and
+earlier from 16 clients on, and its median real-time factor stays below 1
+through 64 clients with either voice where Qwen3-TTS's passes 1. Original
+keeps a median real-time factor below 1 up to 16 clients and reaches
+2.1–2.2 at 64. The earlier grids this recipe carried, from a per-model
+harness and from the shared driver at other revisions and warmups, are
+not reproduced here; the nightly matrix is the one protocol the
+repository runs for every TTS model.
 
 ### Flow precision
 
@@ -366,9 +401,11 @@ row pair:
 | Original | FP32 | 8 | 1430.3 | 0.8400 | 1.1578 | 9.384 | 63.75 % |
 | Original | BF16 | 8 | 1229.6 | 0.7140 | 0.9300 | 11.064 | 100.00 % |
 
-The 64-request overlays at 64 clients, 192 requests after a 64-request
-warmup, the protocol of the concurrency section below; the FP32 rows each
-ran on a fresh server, the BF16 rows are that section's:
+The 64-request overlays at `39d191c53` at 64 clients with the shared
+`bench_tts.py` driver: 192 requests after a 64-request warmup, built-in
+voice on the smoke texts and cloned voices with a distinct Seed-TTS
+recording per request, 1000-token allowance, streamed PCM; the FP32 rows
+each ran on a fresh server, the BF16 rows on the overlay's own servers:
 
 | Model | Voice | Flow | p95 first audio (s) | p95 RTF | p95 underrun (s) | Continuity | Mean WER | Mean SIM |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -387,102 +424,6 @@ median RTF for Original; from eight clients on it raises throughput (Turbo
 underrun by 45–84 %. At 64 clients mean WER moves by at most 0.0035 in
 either direction and mean SIM not at all; the single-request quality guards
 above hold with the BF16 flow.
-
-### Concurrent HTTP clients
-
-The shipped profiles at 64 clients, their admission, measured at this head
-(`feacefc03`) on the second host. The 8–32-client rows are the earlier run
-at `39d191c53` on an overlay whose keys equal the shipped profiles (stage 0
-at 64 requests, Original's 128 sequences; stage 1 at 64 slots) except the
-stage 0 memory fractions (0.35 and 0.40 there, 0.20 and 0.45 shipped),
-which only change KV-cache headroom; that run's 64-client rows are kept
-beneath for comparison.
-
-The shared `bench_tts.py` driver: 192 requests at 64 clients (96 at 8 and
-16, 128 at 32), each run after a warmup of one request per client at full
-concurrency; a 1000-token allowance, streamed PCM, production sampling, one
-server per model with its built-in rows before its cloned rows. Built-in
-rows use the bundled `seed_tts_smoke` texts (about 4 s of audio each).
-Cloned rows use the English Seed-TTS evaluation set, filtered to its 215
-distinct prompt recordings longer than 5 s (upstream Turbo's bound, so no
-reference is repeated), with each recording's own target text; every cloned
-request carries a different recording, and the only repeated reference in
-a run is the first one, which the warmup also uses. Times in seconds; RTF
-is end-to-end latency over audio duration, so it includes the wait for
-first audio; underrun is the extra buffering a stream needs when playback
-starts at its first byte; continuity is the share of requests whose
-underrun stays within 100 ms. No request failed in any run.
-
-At this head, 64 clients:
-
-| Model | Voice | p50 first audio | p95 first audio | p95 completion | p95 RTF | p50 underrun | p95 underrun | Continuity | Mean audio |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Turbo | cloned | 6.418 | 6.927 | 9.201 | 3.207 | 0.000 | 0.137 | 91.67 % | 3.90 s |
-| Turbo | built-in | 1.403 | 1.486 | 3.846 | 1.128 | 0.278 | 0.588 | 4.69 % | 4.01 s |
-| Original | cloned | 7.868 | 9.371 | 15.096 | 5.290 | 2.930 | 3.619 | 4.17 % | 3.92 s |
-| Original | built-in | 2.939 | 3.600 | 8.291 | 2.664 | 2.614 | 3.144 | 0.00 % | 3.62 s |
-
-At `39d191c53` on the overlay, 8 to 64 clients (mean audio 3.86–3.92 s
-cloned, 3.98–4.04 s Turbo built-in, 3.59–3.65 s Original built-in):
-
-| Model | Voice | Clients | p50 first audio | p95 first audio | p95 completion | p95 RTF | p95 underrun | Continuity |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Turbo | cloned | 8 | 1.380 | 1.623 | 2.074 | 0.713 | 0.000 | 100.00 % |
-| Turbo | cloned | 16 | 2.111 | 2.346 | 3.020 | 0.985 | 0.000 | 100.00 % |
-| Turbo | cloned | 32 | 4.219 | 4.481 | 6.333 | 2.154 | 0.000 | 96.09 % |
-| Turbo | cloned | 64 | 7.102 | 7.672 | 10.036 | 3.587 | 0.848 | 42.71 % |
-| Turbo | built-in | 8 | 0.527 | 0.609 | 1.197 | 0.354 | 0.000 | 100.00 % |
-| Turbo | built-in | 16 | 0.656 | 0.694 | 1.358 | 0.415 | 0.000 | 100.00 % |
-| Turbo | built-in | 32 | 0.898 | 0.974 | 2.078 | 0.584 | 0.000 | 100.00 % |
-| Turbo | built-in | 64 | 1.449 | 1.544 | 3.227 | 0.956 | 0.231 | 77.60 % |
-| Original | cloned | 8 | 1.365 | 2.184 | 3.904 | 1.223 | 0.265 | 77.08 % |
-| Original | cloned | 16 | 2.498 | 3.070 | 4.977 | 1.620 | 0.285 | 71.88 % |
-| Original | cloned | 32 | 3.949 | 5.964 | 9.863 | 3.447 | 1.890 | 10.94 % |
-| Original | cloned | 64 | 9.081 | 9.383 | 15.834 | 5.395 | 4.073 | 5.73 % |
-| Original | built-in | 8 | 1.348 | 1.400 | 2.622 | 0.916 | 0.000 | 100.00 % |
-| Original | built-in | 16 | 1.566 | 1.616 | 3.005 | 1.045 | 0.000 | 100.00 % |
-| Original | built-in | 32 | 2.071 | 2.107 | 4.349 | 1.492 | 0.314 | 0.00 % |
-| Original | built-in | 64 | 3.126 | 3.294 | 7.109 | 2.519 | 2.039 | 0.52 % |
-
-Not shipped: cuDNN flow attention with CUDA MPS over the same overlay at
-`39d191c53` was mixed rather than faster (Turbo real-time to 8 cloned
-clients instead of 16, p95 RTF 0.551 at 8; Original built-in to 16 clients
-instead of 8, p95 RTF 0.829 at 16; at 64, Turbo built-in 89.58 % continuous
-instead of 77.60 %).
-
-Reading the tables:
-
-- Conditioning cost: at the same client count, cloned first audio exceeds
-  built-in first audio by the reference encoding. At 64 clients at this
-  head the p50 gap is 5.0 s for Turbo and 4.9 s for Original; at
-  `39d191c53` Turbo's was 0.85 s at 8 clients, 1.46 s at 16, 3.32 s at 32
-  and 5.65 s at 64, and Original's 0.02, 0.93, 1.88 and 5.96 s.
-- At 64 clients neither model is real-time (p95 RTF below 1 with every
-  stream continuous) with either voice: Turbo's built-in p95 RTF is 1.13
-  with 4.7 % of streams continuous and its cloned p95 RTF 3.21 with 91.7 %
-  continuous; Original's are 2.66 with none and 5.29 with 4.2 %.
-- Against the `39d191c53` run at 64, Turbo's cloned p50 first audio fell
-  from 7.10 s to 6.42 s and continuity rose from 42.7 % to 91.7 %, which
-  is the batched device conditioning; Turbo's built-in continuity fell from
-  77.6 % to 4.7 % with p95 RTF 0.956 to 1.128, on a different host of the
-  same type, and the two runs are not separated into code and host.
-- At `39d191c53` Turbo was real-time up to 16 cloned clients and up to 32
-  built-in clients, and Original up to 8 built-in clients; with cloned
-  voices Original was real-time at no measured load (p95 RTF 1.22 at 8
-  because of the encoding wait).
-
-Quality at 64 clients at this head, the shared Seed-TTS evaluator over all
-192 outputs of each run (no ASR or SIM failure; median WER 0 in every run):
-
-| Model | Voice | Mean WER | Mean SIM (median) |
-| --- | --- | --- | --- |
-| Turbo | cloned | 0.0376 | 0.887 (0.893) |
-| Turbo | built-in | 0.0643 | — |
-| Original | cloned | 0.0261 | 0.883 (0.887) |
-| Original | built-in | 0.0674 | — |
-
-The built-in rows score the bundled `seed_tts_smoke` texts and the cloned
-rows the Seed-TTS targets, so WER is not comparable between voices.
 
 The shared sentence-segmented WebSocket frontend is exercised by
 `tests/e2e/online_serving/test_chatterbox.py`; its load is not measured on
