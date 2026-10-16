@@ -36,7 +36,8 @@ The platform implementations use different quantization runtimes:
 Persistent KV storage quantization is a separate cache lifecycle and is not
 part of this option.
 
-CUDA FA3 FP8 returns BF16 output, including for FP16 Q/K/V inputs. The current
+CUDA FP8 attention returns the input dtype (BF16 or FP16), casting FA3's BF16
+output back to FP16 when needed by the model's output projection. The current
 CUDA path requires dense inputs without caller masks, packed-sequence
 metadata, or piecewise spans. Dynamic quantization adds reductions,
 conversions, and kernel launches, so enabling it can increase latency,
