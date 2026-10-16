@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.cosmos3.transfer import (
     load_or_compute_control_frames,
     media_hw,
     normalized_video_to_uint8_cthw,
+    pad_temporal_frames,
     parse_transfer_hint,
     uint8_cthw_to_normalized_5d,
 )
@@ -625,6 +626,11 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         del sp, prompt_data
         return conditioning_request.num_pixel_frames
 
+    def _resolve_processing_pixel_frames(self, requested_pixel_frames: int) -> int:
+        # Pad to a supported VAE frame count, then trim output to the requested length.
+        factor = self.manifest.temporal_compression_factor
+        return ((requested_pixel_frames - 1 + factor - 1) // factor) * factor + 1
+
     def _prompt_token_limit(self, sp: Any, prompt_data: Any) -> int:
         # The paged request spec reserves the same limit for text and scratch.
         limit = _strict_integer(
@@ -780,12 +786,15 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         num_pixel_frames = _strict_integer(self._request_param(sp, prompt_data, "num_frames", 1))
         frame_stride = self.manifest.temporal_compression_factor * self.manifest.chunk_size
         minimum_frames = 1 if self.manifest.chunk_size == 1 else 1 + frame_stride
-        if num_pixel_frames < minimum_frames or (num_pixel_frames - 1) % frame_stride != 0:
+        if num_pixel_frames < minimum_frames or (
+            self.manifest.chunk_size != 1 and (num_pixel_frames - 1) % frame_stride != 0
+        ):
             raise ARDiffusionRequestRejectedError(
                 f"Cosmos3-Nano-Sim-Transfer requires F >= {minimum_frames} and (F - 1) % {frame_stride} == 0 "
                 f"pixel frames; got F={num_pixel_frames}."
             )
-        latent_frames = (num_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
+        processing_frames = self._resolve_processing_pixel_frames(num_pixel_frames)
+        latent_frames = (processing_frames - 1) // self.manifest.temporal_compression_factor + 1
         required_history_frames = 2 * latent_frames + 1
         if full_history:
             if sink != 0:
@@ -899,6 +908,9 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
                 "Cosmos3-Nano-Sim-Transfer control video must cover the complete requested clip: "
                 f"expected {request.num_pixel_frames} frames, got {control_frames.shape[1]}."
             )
+        control_frames = pad_temporal_frames(
+            control_frames, self._resolve_processing_pixel_frames(request.num_pixel_frames)
+        )
         control_video = uint8_cthw_to_normalized_5d(control_frames, dtype=torch.float32)
         control_latents = self._encode_video_tensor(control_video)
         expected = (

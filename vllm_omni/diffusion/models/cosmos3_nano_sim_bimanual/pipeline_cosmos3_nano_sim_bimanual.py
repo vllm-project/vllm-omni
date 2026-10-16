@@ -610,6 +610,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         del prompt_data, conditioning_request
         return _admission_int(_first_not_none(sp.num_frames, 1), "num_frames")
 
+    def _resolve_processing_pixel_frames(self, requested_pixel_frames: int) -> int:
+        return requested_pixel_frames
+
     def _validate_conditioning_request(
         self,
         sp,
@@ -1671,12 +1674,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(
                     f"Cosmos3-Nano-Sim-Bimanual num_frames must be positive, got {requested_pixel_frames}."
                 )
-            if (requested_pixel_frames - 1) % self.manifest.temporal_compression_factor:
+            processing_pixel_frames = self._resolve_processing_pixel_frames(requested_pixel_frames)
+            if (processing_pixel_frames - 1) % self.manifest.temporal_compression_factor:
                 raise ARDiffusionRequestRejectedError(
                     "num_frames must satisfy (num_frames - 1) % temporal_compression_factor == 0; "
                     f"got {requested_pixel_frames} with factor {self.manifest.temporal_compression_factor}."
                 )
-            target_frame = (requested_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
+            target_frame = (processing_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
             if target_frame < start_frame:
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos3-Nano-Sim-Bimanual full rollout target precedes existing "
@@ -1850,10 +1854,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             raise RuntimeError("Cosmos3-Nano-Sim-Bimanual full rollout produced no accumulated latent frames.")
         if stream_video:
             output_value = torch.cat(decoded_chunks, dim=2)
-            if output_value.shape[2] != requested_pixel_frames:
+            if output_value.shape[2] != processing_pixel_frames:
                 raise RuntimeError(
-                    f"Causal decoder returned {output_value.shape[2]} frames; expected {requested_pixel_frames}."
+                    f"Causal decoder returned {output_value.shape[2]} frames; expected {processing_pixel_frames}."
                 )
+            output_value = output_value[:, :, :requested_pixel_frames]
         elif sp.output_type == "latent":
             output_value = request_latents if tick else accumulated
         else:

@@ -126,7 +126,7 @@ def params(frames: int = 121, **extra) -> SimpleNamespace:
     return SimpleNamespace(extra_args={"depth": {"control_path": "control.mp4"}, "num_frames": frames, **extra})
 
 
-@pytest.mark.parametrize("frames", [1, 5, 121, 593])
+@pytest.mark.parametrize("frames", [1, 2, 4, 5, 121, 593, 600])
 @pytest.mark.parametrize("enforce_eager", [True, False])
 def test_chunk1_admission(frames: int, enforce_eager: bool) -> None:
     p = pipeline()
@@ -151,7 +151,7 @@ def test_omitted_history_uses_checkpoint_defaults() -> None:
     assert (request.window_frames, request.sink_frames) == (51, 1)
 
 
-@pytest.mark.parametrize("frames", [1, 121, 257, 901])
+@pytest.mark.parametrize("frames", [1, 121, 257, 600, 901])
 @pytest.mark.parametrize("source", ["extra_args", "attribute", "prompt", "additional_information"])
 def test_explicit_null_selects_complete_rollout(frames: int, source: str) -> None:
     sp = params(frames)
@@ -167,7 +167,56 @@ def test_explicit_null_selects_complete_rollout(frames: int, source: str) -> Non
     else:
         prompt = {"additional_information": {"kv_cache_inference_size": None}}
     request = pipeline()._validate_conditioning_request(sp, None, prompt_data=prompt)
-    assert (request.window_frames, request.sink_frames) == ((frames - 1) // 4 + 1, 0)
+    assert (request.window_frames, request.sink_frames) == ((frames - 1 + 3) // 4 + 1, 0)
+
+
+@pytest.mark.parametrize("frames", [1, 2, 4, 5, 600, 601])
+def test_control_padding_preserves_source_and_uses_shared_helper(monkeypatch, frames) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transfer import pad_temporal_frames
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import pipeline_cosmos3_nano_sim_transfer as module
+
+    p = pipeline()
+    p.transformer = SimpleNamespace(latent_channel_size=48)
+    source = torch.arange(frames, dtype=torch.float32).view(1, frames, 1, 1).expand(3, -1, 32, 32).clone()
+    original = source.clone()
+    monkeypatch.setattr(module, "load_or_compute_control_frames", lambda *args, **kwargs: source)
+    processed = p._resolve_processing_pixel_frames(frames)
+    latent_frames = (processed - 1) // 4 + 1
+
+    def encode(video):
+        expected = pad_temporal_frames(original, processed).div(127.5).sub(1).unsqueeze(0)
+        torch.testing.assert_close(video, expected)
+        return torch.zeros(1, 48, latent_frames, 2, 2)
+
+    p._encode_video_tensor = encode
+    request = p._validate_conditioning_request(params(frames, kv_cache_inference_size=None), None)
+    p._prepare_conditioning(
+        params(frames),
+        typed_inputs=None,
+        request=request,
+        geometry=Cosmos3NanoSimBimanualGeometry(height=32, width=32),
+        start_frame=0,
+        target_frame=latent_frames,
+    )
+    assert request.num_pixel_frames == frames
+    torch.testing.assert_close(source, original)
+
+
+def test_short_control_still_rejected(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import pipeline_cosmos3_nano_sim_transfer as module
+
+    p = pipeline()
+    monkeypatch.setattr(module, "load_or_compute_control_frames", lambda *args, **kwargs: torch.zeros(3, 599, 32, 32))
+    request = p._validate_conditioning_request(params(600), None)
+    with pytest.raises(ValueError, match="expected 600 frames, got 599"):
+        p._prepare_conditioning(
+            params(600),
+            typed_inputs=None,
+            request=request,
+            geometry=Cosmos3NanoSimBimanualGeometry(height=32, width=32),
+            start_frame=0,
+            target_frame=151,
+        )
 
 
 def test_integer_history_override_takes_precedence_over_prompt_null() -> None:

@@ -101,6 +101,7 @@ def pipeline_methods() -> type:
         "_resolve_request_fps",
         "_resolve_request_geometry",
         "_resolve_requested_pixel_frames",
+        "_resolve_processing_pixel_frames",
         "_validate_conditioning_request",
         "_prepare_conditioning",
         "_conditioning_fingerprint",
@@ -226,6 +227,14 @@ def test_full_video_decodes_incrementally_without_retaining_latents(frames: int,
     )
     pipe._decode_latents.assert_not_called()
     assert state.terminal
+
+
+def test_padded_processing_trims_streamed_rgb_to_requested_length() -> None:
+    pipe, state = fake_pipeline(prefix=False)
+    pipe._resolve_processing_pixel_frames = lambda frames: ((frames - 1 + 3) // 4) * 4 + 1
+    output = pipe.forward(request(600)).media.video.tensor
+    assert output.shape == (1, 3, 600, 32, 32)
+    assert state.next_frame_idx == 151  # 601 processed pixels, 600 returned.
 
 
 def test_latent_output_keeps_existing_path() -> None:
