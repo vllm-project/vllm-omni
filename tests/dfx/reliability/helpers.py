@@ -1191,20 +1191,6 @@ def make_process_kill_fault_injector(
                 )
                 if signal_name == "SIGKILL" and not dead:
                     raise RuntimeError(f"pid {pid} ({name}) still alive after SIGKILL")
-            host = getattr(server, "host", None)
-            port = getattr(server, "port", None)
-            if host is not None and port is not None:
-                try:
-                    status, _body = get_health_raw(str(host), int(port), timeout_sec=5)
-                    print(
-                        f"[reliability][process-kill] post-kill health status={status}",
-                        flush=True,
-                    )
-                except Exception as exc:  # noqa: BLE001 - log the probe, do not hide the kill
-                    print(
-                        f"[reliability][process-kill] post-kill health error={exc!r}",
-                        flush=True,
-                    )
             print(
                 f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
                 f"killed_pids={filtered} killed_count={len(filtered)}",
