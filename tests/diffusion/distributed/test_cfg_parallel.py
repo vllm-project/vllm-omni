@@ -427,6 +427,31 @@ def test_cfg_world_size_does_not_swallow_initialized_group_errors(monkeypatch: p
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("do_true_cfg", "cfg_world_size", "expected"),
+    [
+        pytest.param(True, 1, True, id="sequential-cfg"),
+        pytest.param(False, 1, False, id="no-cfg"),
+        pytest.param(True, 2, False, id="cfg-parallel"),
+        pytest.param(False, 2, False, id="cfg-parallel-no-cfg"),
+    ],
+)
+def test_runs_separate_cfg_forwards_only_for_sequential_cfg(
+    monkeypatch: pytest.MonkeyPatch,
+    do_true_cfg: bool,
+    cfg_world_size: int,
+    expected: bool,
+):
+    from vllm_omni.diffusion.distributed import cfg_parallel as cfg_parallel_mod
+
+    monkeypatch.setattr(cfg_parallel_mod, "_get_cfg_world_size_or_one", lambda: cfg_world_size)
+
+    assert TestCFGPipeline().runs_separate_cfg_forwards(do_true_cfg) is expected
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
 def test_cfg_defaults_to_sequential_without_initialized_group():
     pipeline = _build_pipeline_on_device(
         TestCFGPipeline,
