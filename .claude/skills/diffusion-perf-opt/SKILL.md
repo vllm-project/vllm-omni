@@ -7,6 +7,16 @@ description: Diagnose and optimize vLLM Omni diffusion workloads, especially Wan
 
 Use this skill to run a disciplined optimization loop for vLLM Omni diffusion workloads. Keep two ideas separate: real performance baselines are collected with low overhead, while torch profiler traces are diagnostic artifacts and may distort latency.
 
+## Ascend NPU tasks
+
+For Ascend NPU diffusion model or operator optimization, read the
+[MindIE-SD router](../performance/operators/dit-npu-fusion-analysis/SKILL.md)
+first and load the selected external skill. MindIE-SD owns NPU optimization
+methods and acceptance guidance; supply Omni code/workload context and keep
+Omni tests and changes in this repository. The CUDA-oriented workflow below
+continues to apply to CUDA tasks. Do not infer NVLink/NCCL or GPU profiler
+requirements for an NPU task.
+
 ## First Questions
 
 Before proposing changes, ask for the optimization scene if it is not already known:

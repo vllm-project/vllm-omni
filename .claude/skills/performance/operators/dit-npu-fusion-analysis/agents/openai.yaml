@@ -1,0 +1,4 @@
+interface:
+  display_name: "NPU 模型优化路由"
+  short_description: "将 Ascend 扩散模型和算子优化路由到 MindIE-SD 技能并衔接 Omni 验证"
+  default_prompt: "使用 $dit-npu-fusion-analysis 定位并读取 MindIE-SD 对应技能，传入当前 Omni 模型与工作负载上下文，按任务范围分析或优化并返回验证证据。"
