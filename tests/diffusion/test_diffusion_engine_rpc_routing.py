@@ -23,6 +23,7 @@ import asyncio
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields as _dc_fields
 from types import SimpleNamespace
 from typing import Any
@@ -504,6 +505,57 @@ async def test_executor_only_called_from_busy_loop_thread():
         f"(expected {{{busy_tid}}}, got {engine.executor.thread_ids})"
     )
 
+
+
+def _inline_client_profile(engine: DiffusionEngine, executor: ThreadPoolExecutor):
+    from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
+
+    client = object.__new__(InlineStageDiffusionClient)
+    client._engine = engine
+    client._executor = executor
+    client.stage_id = 0
+    client.replica_id = 0
+    return lambda is_start: client.collective_rpc_async("profile", args=(is_start, "trace"))
+
+
+def _stage_proc_profile(engine: DiffusionEngine, executor: ThreadPoolExecutor):
+    from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+
+    proc = object.__new__(StageDiffusionProc)
+    proc._engine = engine
+    proc._executor = executor
+    return lambda is_start: proc._handle_collective_rpc("profile", None, (is_start, "trace"), {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_profile", [_inline_client_profile, _stage_proc_profile])
+async def test_profile_before_first_request_runs_on_busy_loop_thread(make_profile):
+    """/start_profile before the first request must start the busy loop and
+    run there, not on the stage's executor thread. The torch profiler
+    session is thread-local: a start on the executor thread leaves stop
+    (on the busy loop) without a session, and kineto's save() segfaults."""
+    engine = _make_engine_with_loop(None, start_loop=False)
+    engine._init_lock = asyncio.Lock()
+    executor = ThreadPoolExecutor(max_workers=1)
+    profile = make_profile(engine, executor)
+    try:
+        await asyncio.wait_for(profile(True), 5)
+        # The first request starts the busy loop (as step_streaming does).
+        await engine._check_and_start_background_loop()
+        await asyncio.wait_for(
+            _consume_final_output(engine.async_add_req_and_stream_response(_make_request("req1"))), 5
+        )
+        await asyncio.wait_for(profile(False), 5)
+    finally:
+        _stop_engine(engine)
+        executor.shutdown(wait=True)
+
+    assert [call["method"] for call in engine.executor.calls] == ["profile", "execute_model", "profile"]
+    call_threads = {call["thread"] for call in engine.executor.calls}
+    assert call_threads == {engine.worker_thread.ident}, (
+        f"profiler start, inference and stop must share the busy-loop thread "
+        f"(expected {{{engine.worker_thread.ident}}}, got {call_threads})"
+    )
 
 @pytest.mark.asyncio
 async def test_executor_calls_never_overlap_under_load():
