@@ -12,6 +12,7 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.1 T2V (1.3B) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
 | Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| PAN 2 | `IFM/PAN2` |
 | LTX-2 | `Lightricks/LTX-2` |
 
 ## Wan2.2 T2V
@@ -304,6 +305,26 @@ vllm serve Lightricks/LTX-2 --omni --port 8098
 
 See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
 pipeline selection, requests, defaults, and advanced options.
+
+## PAN 2
+
+```bash
+# One GPU with ~100 GiB free; see the recipe for multi-GPU and smaller GPUs.
+vllm serve IFM/PAN2 --omni --port 8091
+```
+
+```bash
+create_response=$(curl -s http://localhost:8091/v1/videos \
+  -H "Accept: application/json" \
+  -F "prompt=A paper boat drifts down a rain-soaked street gutter, reflections of neon signs rippling around it." \
+  -F "seed=42")
+video_id=$(echo "$create_response" | jq -r '.id')
+```
+
+Poll and download the result as shown in [Poll Until
+Complete](#poll-until-complete). PAN 2 needs a structured prompt; the plain
+prompt above only shows the command. See the [PAN 2
+recipe](../../../../recipes/IFM/PAN2.md) for details.
 
 ## Example materials
 
