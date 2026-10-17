@@ -27,6 +27,11 @@ from vllm_omni.model_executor.models.aura_omni.duplex.data_plane import (
     AuraDataPlaneSession,
 )
 from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
+from vllm_omni.model_executor.models.aura_omni.duplex.stages import (
+    AURA_JUDGED_STAGE_LAYOUT,
+    AURA_STAGE_LAYOUT,
+    AuraStageLayout,
+)
 from vllm_omni.model_executor.stage_input_processors.aura_omni import (
     DEFAULT_AURA_SYSTEM_PROMPT,
     SILENT_TEXT,
@@ -139,10 +144,12 @@ class AuraDuplexPlugin(DuplexModelPlugin):
 
     plugin_id = "aura"
     private_runtime_config_keys = _PRIVATE_KEYS
+    # Stage ids by role; a pipeline variant with extra stages overrides this.
+    stages: AuraStageLayout = AURA_STAGE_LAYOUT
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
-        self.data_plane = AuraDataPlaneSession(encode_audio)
+        self.data_plane = AuraDataPlaneSession(encode_audio, stages=self.stages)
 
     def configure_sampling_params(
         self,
@@ -152,8 +159,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
     ) -> tuple[object, ...]:
         del runtime_config
         configured = list(defaults)
-        if len(configured) > 1 and isinstance(configured[1], SamplingParams):
-            stage1 = configured[1].clone()
+        aura, talker = self.stages.aura, self.stages.talker
+        if len(configured) > aura and isinstance(configured[aura], SamplingParams):
+            stage1 = configured[aura].clone()
             stop_ids = list(stage1.stop_token_ids or [])
             for stop_id in (AURA_SILENT_TOKEN_ID, AURA_IM_END_TOKEN_ID):
                 if stop_id not in stop_ids:
@@ -163,25 +171,25 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             # aura2tts can see <|silent|> instead of an empty detokenized string.
             stage1.include_stop_str_in_output = True
             stage1.skip_special_tokens = False
-            configured[1] = stage1
+            configured[aura] = stage1
         # Codec EOS (2150) and the 240-token cap are defaults for an unset
         # Talker config. A value already set by yaml or the caller is kept,
         # even when max_tokens is longer than 240.
-        if len(configured) > 2 and isinstance(configured[2], SamplingParams):
-            stage2 = configured[2].clone()
+        if len(configured) > talker and isinstance(configured[talker], SamplingParams):
+            stage2 = configured[talker].clone()
             if not stage2.stop_token_ids:
                 stage2.stop_token_ids = [2150]
             if stage2.max_tokens is None:
                 stage2.max_tokens = 240
-            configured[2] = stage2
+            configured[talker] = stage2
         return tuple(configured)
 
     def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
-        # Talker is stage 2; Code2Wav is the last stage. Stage 0/1 are the
+        # Talker through Code2Wav drain. The stages before Talker are the
         # input gate and are idle once a turn is released.
-        if stage_count <= 2:
+        if stage_count <= self.stages.talker:
             return frozenset()
-        return frozenset(range(2, stage_count))
+        return frozenset(range(self.stages.talker, stage_count))
 
     def plan_append(
         self,
@@ -291,9 +299,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         output: object,
         context: object,
     ) -> bool:
-        """Project Stage1 thinker text to the client without short-circuiting TTS."""
+        """Project AURA thinker text to the client without short-circuiting TTS."""
         del output, context
-        return stage_id == 1
+        return stage_id == self.stages.aura
 
     def user_transcript(
         self,
@@ -308,7 +316,7 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         Vision-follow sets ``is_speech`` false; that audio is a silent pad and
         must not open a user bubble. The pipeline still forwards Stage0.
         """
-        if stage_id != 0 or not finished:
+        if stage_id != self.stages.asr or not finished:
             return None
         info = prompt.get("additional_information") if isinstance(prompt, dict) else None
         if isinstance(info, dict) and info.get("is_speech") is False:
@@ -336,7 +344,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             plan_partial_stage_output,
         )
 
-        return plan_partial_stage_output(orchestrator, stage_id, replica_id, output, req_state)
+        return plan_partial_stage_output(
+            orchestrator, stage_id, replica_id, output, req_state, aura_stage_id=self.stages.aura
+        )
 
     def partial_stage_followup(self, plan: Any, req_state: Any) -> Any:
         """Close the Talker stream after a resumable final sentence.
@@ -379,9 +389,9 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         output: object,
         context: object,
     ) -> bool:
-        """After Stage1 text/silent final, next commit may start while TTS drains."""
+        """After AURA text/silent final, next commit may start while TTS drains."""
         del context
-        if stage_id != 1:
+        if stage_id != self.stages.aura:
             return False
         if segment_finished:
             return True
@@ -398,8 +408,8 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         output: object,
     ) -> DuplexOutputDecision | None:
         del final_stage_id, segment_output_metadata
-        # Stage1 silent → short-circuit TTS/Code2Wav.
-        if stage_id != 1 or not segment_finished:
+        # AURA silent → short-circuit TTS/Code2Wav.
+        if stage_id != self.stages.aura or not segment_finished:
             return None
         completion = _first_completion(output)
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
@@ -517,4 +527,14 @@ class AuraDuplexPlugin(DuplexModelPlugin):
         )
 
 
-__all__ = ["AURA_SILENT_TOKEN_ID", "AuraDuplexPlugin"]
+class AuraJudgedDuplexPlugin(AuraDuplexPlugin):
+    """AURA with a response-judge stage after ASR (``aura_omni_judged``).
+
+    Only the stage layout differs; the judge decision itself is handled by
+    the engine for any pipeline with a ``response_judge`` stage.
+    """
+
+    stages = AURA_JUDGED_STAGE_LAYOUT
+
+
+__all__ = ["AURA_SILENT_TOKEN_ID", "AuraDuplexPlugin", "AuraJudgedDuplexPlugin"]

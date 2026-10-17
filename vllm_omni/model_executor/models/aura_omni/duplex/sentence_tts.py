@@ -69,11 +69,18 @@ def decode_growing_token_ids(decode: Any, token_ids: list[int], cache: dict[str,
     return candidate
 
 
-def stage1_tts_text(orchestrator: Any, output: Any, *, cache: dict[str, object] | None = None) -> str:
-    """Stage1 text for sentence TTS.
+def stage1_tts_text(
+    orchestrator: Any,
+    output: Any,
+    *,
+    cache: dict[str, object] | None = None,
+    aura_stage_id: int = 1,
+) -> str:
+    """AURA text for sentence TTS.
 
     ``cumulative_text`` is attached only when the request finishes.
-    Mid-generation chunks still carry ``cumulative_token_ids``.
+    Mid-generation chunks still carry ``cumulative_token_ids``, decoded with
+    the AURA stage's own tokenizer.
     """
     from vllm_omni.model_executor.stage_input_processors.aura_omni import (
         _extract_output,
@@ -86,7 +93,7 @@ def stage1_tts_text(orchestrator: Any, output: Any, *, cache: dict[str, object] 
         return cumulative
     token_ids = getattr(completion, "cumulative_token_ids", None)
     if isinstance(token_ids, list) and token_ids:
-        processor = orchestrator.stage_pools[1].output_processor
+        processor = orchestrator.stage_pools[aura_stage_id].output_processor
         tokenizer = getattr(processor, "tokenizer", None)
         decode = getattr(tokenizer, "decode", None)
         if callable(decode):
@@ -105,8 +112,10 @@ def plan_partial_stage_output(
     replica_id: int,
     output: Any,
     req_state: Any,
+    *,
+    aura_stage_id: int = 1,
 ) -> PartialStageForward | None:
-    """Hand a finished sentence to Talker before Stage1 finishes.
+    """Hand a finished sentence to Talker before the AURA stage finishes.
 
     Same request id as the turn (Code2Wav was prewarmed on it). Text goes
     through ``aura2tts`` in the orchestrator, not the ``from_stage_1`` SHM
@@ -114,7 +123,7 @@ def plan_partial_stage_output(
     until Stage1 finishes. The orchestrator submits the returned plan.
     """
     del replica_id
-    if not req_state.session_owned or stage_id != 1:
+    if not req_state.session_owned or stage_id != aura_stage_id:
         return
     if stage_id + 1 > req_state.final_stage_id:
         return
@@ -141,7 +150,7 @@ def plan_partial_stage_output(
         return
 
     finished = bool(getattr(output, "finished", False))
-    raw_text = stage1_tts_text(orchestrator, output, cache=bridge)
+    raw_text = stage1_tts_text(orchestrator, output, cache=bridge, aura_stage_id=aura_stage_id)
     # Captured before the chunk helper increments ``emits``.
     prior_emits = int(bridge.get("emits", 0))
     chunk = next_duplex_sentence_chunk(bridge, raw_text, finished=finished)

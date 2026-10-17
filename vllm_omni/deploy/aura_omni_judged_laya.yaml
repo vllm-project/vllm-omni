@@ -1,0 +1,51 @@
+# aura_omni_judged.yaml with the LAYA decision model as the response judge.
+# Only stage 1 changes: LAYA is an encoder with a decision head, served with
+# the pooling runner; it scores the listed options at their [MASK] markers
+# and the turn is let through when P(reply_option) >= threshold.
+#
+# LAYA checkpoints keep config.json and the tokenizer in subfolders; `model`
+# is a directory laid out for vLLM (config.json with
+# architectures: [LayaDecisionModel], the weights, tokenizer files).
+base_config: aura_omni_judged.yaml
+pipeline: aura_omni_judged
+
+stages:
+  - stage_id: 1
+    model: /path/to/laya-multilingual-vllm
+    model_arch: LayaDecisionModel
+    runner: pooling
+    # Pooling is one forward pass: sync scheduler, no prefix cache (encoder-only).
+    async_scheduling: false
+    enable_prefix_caching: false
+    max_model_len: 1024
+    max_num_batched_tokens: 8192
+    # Without a prefix cache every judge call is one prefill of the whole
+    # prompt (up to about 170 tokens with this prompt on the test transcripts). vLLM's
+    # default capture sizes stop at 2 * max_num_seqs (16 here), so a prompt
+    # like that would run without CUDA graphs. Batches larger than the largest
+    # size still run, without graphs.
+    compilation_config:
+      cudagraph_capture_sizes: [16, 32, 48, 64, 96, 128, 192, 256]
+    default_pooling_params:
+      task: classify
+    hf_overrides:
+      laya_question_type: choice
+      # Prompt and threshold chosen on the tune split of the author's Chinese
+      # multi-turn dialogues; other languages or domains may need their own.
+      response_judge:
+        format: laya
+        question_type: choice
+        instructions: Who is this utterance for, and does the voice assistant need to reply?
+        options:
+          assistant_request: >-
+            a question or request for the voice assistant (information, explanation,
+            alarm, reminder, music, volume, translation, a story or joke)
+          backchannel: "an acknowledgement or filler: uh-huh, okay, I see, got it, oh really, hmm, laughter"
+          someone_else: >-
+            talking to a family member or someone nearby: calling them by name or
+            title (mom, dear, honey), asking them to do something, telling them what
+            the speaker is about to do, or on a phone call
+          noise: a cough, throat clearing, or meaningless noise
+        reply_option: assistant_request
+        threshold: 0.0173
+        state_template: "The microphone of a home voice assistant picked up the user saying: \"{transcript}\""
