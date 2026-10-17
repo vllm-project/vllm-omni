@@ -1,32 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import importlib
+from typing import Any
 
 from .connectors.base import OmniConnectorBase
-from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
-
-try:
-    from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector import (
-        YuanrongTransferEngineConnector,
-    )
-except ImportError:
-    YuanrongTransferEngineConnector = None
-
-try:
-    from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
-except ImportError:
-    MooncakeTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mooncake) not installed
-
-try:
-    from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
-except ImportError:
-    MoriTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mori) not installed
-
-try:
-    from .connectors.nixl_connector import NixlConnector
-except ImportError:
-    NixlConnector = None  # NIXL deps not installed
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
@@ -38,9 +18,71 @@ from .utils.initialization import (
     load_omni_transfer_config,
 )
 
-# Backward-compatible alias: MooncakeConnector was renamed to MooncakeStoreConnector.
-# Keep this alias for at least one release cycle.
-MooncakeConnector = MooncakeStoreConnector
+# Connectors backed by optional native transports are resolved on first attribute
+# access rather than at package import time.
+#
+# Their dependencies are heavy, and merely loading one can be harmful when the
+# connector is never used: ``mooncake.store`` and ``mooncake.engine`` pull in
+# CANN's LLM-DataDist runtime (``libruntime_v100.so``), whose exit-time destructor
+# frees a corrupted heap block and makes the interpreter abort on shutdown
+# (``corrupted size vs. prev_size`` followed by SIGABRT).  That kills any process
+# which so much as imports ``vllm_omni`` -- including short-lived subprocesses --
+# even though the deployment may only ever build a ``SharedMemoryConnector``.
+#
+# ``OmniConnectorFactory`` already resolves connectors by name at construction
+# time (see ``factory.py``), so nothing needs these classes at import time.
+#
+# name -> (module, attribute, missing_dependency_yields_none)
+_LAZY_CONNECTORS: dict[str, tuple[str, str, bool]] = {
+    "MooncakeConnector": (
+        f"{__name__}.connectors.mooncake_store_connector",
+        "MooncakeStoreConnector",
+        False,
+    ),
+    "MooncakeStoreConnector": (
+        f"{__name__}.connectors.mooncake_store_connector",
+        "MooncakeStoreConnector",
+        False,
+    ),
+    "MooncakeTransferEngineConnector": (
+        f"{__name__}.connectors.mooncake_transfer_engine_connector",
+        "MooncakeTransferEngineConnector",
+        True,  # RDMA deps (msgspec/zmq/mooncake) not installed
+    ),
+    "MoriTransferEngineConnector": (
+        f"{__name__}.connectors.mori_transfer_engine_connector",
+        "MoriTransferEngineConnector",
+        True,  # RDMA deps (msgspec/zmq/mori) not installed
+    ),
+    "NixlConnector": (
+        f"{__name__}.connectors.nixl_connector",
+        "NixlConnector",
+        True,  # NIXL deps not installed
+    ),
+    "YuanrongTransferEngineConnector": (
+        "vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector",
+        "YuanrongTransferEngineConnector",
+        True,
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve the optional connector implementations lazily (PEP 562)."""
+    entry = _LAZY_CONNECTORS.get(name)
+    if entry is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module_name, attr, optional = entry
+    try:
+        value = getattr(importlib.import_module(module_name), attr)
+    except ImportError:
+        if not optional:
+            raise
+        value = None
+    globals()[name] = value  # cache so later lookups skip this function
+    return value
+
 
 __all__ = [
     # Config
