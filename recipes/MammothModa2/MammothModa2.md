@@ -24,8 +24,9 @@ requests (`max_num_seqs: 8`) and one image per request
 (`num_outputs_per_prompt: 1`). TeaCache and Cache-DiT are optional alternative
 cache backends in request mode. Enable TeaCache with `--cache-backend tea_cache`
 as shown below, or enable Cache-DiT using the commented settings in that YAML.
-Compilation, DiT quantization, parallelism, and offload are not enabled by
-these presets.
+Two-device CFG parallelism is available in request and step modes, but cannot
+be combined with Cache-DiT. Compilation, DiT quantization, other parallel
+strategies, and offload are not enabled by these presets.
 
 To use step execution and continuous batching, select
 [`mammoth_moda2_step.yaml`](../../vllm_omni/deploy/mammoth_moda2_step.yaml)
@@ -65,6 +66,11 @@ The default deploy config places both the AR and DiT stages on one GPU
 stage 0 and 0.3 for stage 1. The A800 validation section below also shows a
 two-GPU placement with one stage per GPU for attributable timing and memory;
 the measured results are summarized below.
+
+To run the positive and negative guidance branches in parallel, assign two
+devices to the DiT stage (for example, `devices: "0,1"`) and pass
+`--cfg-parallel-size 2` to the shared text-to-image example. Do not configure
+`cache_backend: cache_dit` in this mode.
 
 ## GPU
 
