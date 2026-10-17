@@ -34,6 +34,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
 from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
+from .npu.audio_tconv import install_audio_vae_tconv_conv1d
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
@@ -1110,6 +1111,11 @@ class MiniMaxH3AudioVAE(nn.Module):
                 pin_memory=True,
             )
         self.model = self.remote.model
+        # Optional NPU opt-in: rewrite the decoder's transposed convolutions
+        # (7 stage upsamplers + the anti-aliased activations' depthwise
+        # resamplers) into phase-decomposed conv1d. No-op unless
+        # VLLM_OMNI_MINIMAX_H3_AUDIO_TCONV_CONV1D is set.
+        install_audio_vae_tconv_conv1d(self.model)
         self.sample_rate = int(self.config_dict["sample_rate"])
 
     def load_to_device(self) -> None:
