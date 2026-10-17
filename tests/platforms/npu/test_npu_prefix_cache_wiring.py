@@ -20,6 +20,7 @@ Two layers of protection, both pure CPU:
 """
 
 import ast
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,7 +28,7 @@ import pytest
 import torch
 
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -80,6 +81,52 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
+def test_npu_output_builder_views_then_acks_delivery_after_connector():
+    tree = ast.parse(_NPU_RUNNER.read_text())
+    sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
+    calls = {
+        node.func.attr: node.lineno
+        for node in ast.walk(sample)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"delivery_view", "ack_delivery", "get_omni_connector_output"}
+    }
+    assert calls["delivery_view"] < calls["get_omni_connector_output"] < calls["ack_delivery"]
+
+
+def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():
+    tree = ast.parse(_NPU_RUNNER.read_text())
+    sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
+    per_req_hidden = next(
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(stmt, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "req_hidden_states" for target in stmt.targets)
+            for stmt in node.body
+        )
+    )
+    branch = ast.fix_missing_locations(ast.Module(body=copy.deepcopy(per_req_hidden.body), type_ignores=[]))
+    scope = {
+        "req_hidden_states_cpu": {"r1": torch.tensor([[40.0], [50.0]])},
+        "delivery": StageCacheOutputs(
+            hidden_states=None,
+            mm_outputs={},
+            token_ranges={"r1": (5, 6)},
+            scheduled_token_ranges={"r1": (4, 6)},
+        ),
+        "rid": "r1",
+        "max": max,
+    }
+    exec(compile(branch, str(_NPU_RUNNER), "exec"), scope)
+    assert scope["req_hidden_states"].flatten().tolist() == [50.0]
+
+    scope["delivery"] = None
+    exec(compile(branch, str(_NPU_RUNNER), "exec"), scope)
+    assert scope["req_hidden_states"].flatten().tolist() == [40.0, 50.0]
+
+
 class _FakeView:
     """Minimal group-view double (mirrors tests/core/test_prefix_cache)."""
 
@@ -99,6 +146,10 @@ class _FakeView:
 
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
+
+    def token_range(self, req_id, count):
+        start = self.computed.get(req_id, 0)
+        return start, start + count
 
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []

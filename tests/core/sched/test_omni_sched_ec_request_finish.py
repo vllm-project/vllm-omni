@@ -61,6 +61,7 @@ def _make_free_request_sched(*, ec_connector) -> tuple[OmniARScheduler, MagicMoc
 class _FakeFinishedRequest:
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
+        self.status = RequestStatus.FINISHED_STOPPED
 
     def is_finished(self) -> bool:
         return True

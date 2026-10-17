@@ -58,6 +58,8 @@ class PrefixCacheWrite:
     req_id: str
     row_start: int
     row_end: int
+    token_start: int
+    token_end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,10 +79,8 @@ class PrefixCacheSchedulerAdapter:
     decode, chunked prefill and a live ID re-entering scheduled_new_reqs.
 
     ABORTED requires an explicit optional cancellation field:
-    ``discarded_req_ids`` (the producer proposed in PR #7681) or
-    ``aborted_req_ids``. Neither is produced by the current scheduler
-    contract; until a producer lands, production terminals remain FINISHED.
-    These fields are accepted for forward compatibility, not inferred.
+    ``discarded_req_ids`` from the Omni scheduler or ``aborted_req_ids``.
+    Cancellation is never inferred from ordinary completion.
     """
 
     def __init__(self) -> None:
@@ -202,7 +202,8 @@ class PrefixCacheSchedulerAdapter:
             count = int(num_scheduled_tokens.get(req_id, 0))
             if count < 0:
                 raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
-            writes.append(PrefixCacheWrite(req_id, cursor, cursor + count))
+            token_start, token_end = group_view.token_range(req_id, count)
+            writes.append(PrefixCacheWrite(req_id, cursor, cursor + count, token_start, token_end))
             cursor += count
         slots = group_view.step_slots_cpu(list(req_order), dict(num_scheduled_tokens))
         return PrefixCacheWriteLayout(tuple(writes), cursor, slots)
