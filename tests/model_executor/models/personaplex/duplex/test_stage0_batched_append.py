@@ -97,6 +97,8 @@ def _talker(max_sessions: int) -> PersonaPlexTalkerForConditionalGeneration:
     torch.nn.Module.__init__(talker)
     talker._personaplex_duplex_stage0_runtime = runtime
     talker._dtype = torch.float32
+    talker._depformer_graphs_enabled = False
+    talker._depformer_graph = None
     talker.mtp_hidden_size = _WIDTH
     talker.num_active_codebooks = 8
     talker.depformer = _depformer

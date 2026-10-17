@@ -107,6 +107,8 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
         num_active_codebooks=8,
         depformer=depformer,
         _depformer_teacher_forcing=PersonaPlexTalkerForConditionalGeneration._depformer_teacher_forcing,
+        _depformer_graphs_enabled=False,
+        _depformer_graph=None,
         _duplex_stage0_runtime=lambda: SimpleNamespace(
             prepared_depformer_state=lambda _request_id: None,
             record_sample=lambda *, request_id, text_token, effective_codes: recorded.append(
@@ -114,6 +116,10 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
             ),
         ),
     )
+    model._maybe_init_depformer_graphs = PersonaPlexTalkerForConditionalGeneration._maybe_init_depformer_graphs.__get__(
+        model
+    )
+    model._run_depformer = PersonaPlexTalkerForConditionalGeneration._run_depformer.__get__(model)
     method = getattr(PersonaPlexTalkerForConditionalGeneration, "post_sample_talker_mtp", None)
     assert callable(method)
 

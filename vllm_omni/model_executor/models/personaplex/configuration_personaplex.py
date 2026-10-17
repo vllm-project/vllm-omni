@@ -207,6 +207,9 @@ class PersonaPlexConfig(PretrainedConfig):
             Replay the streaming Mimi per-frame encode (Stage 0) and decode
             (Stage 1) from model-local CUDA graphs. Can be enabled through
             ``hf_overrides``.
+        depformer_cuda_graphs (`bool`, *optional*, defaults to `False`):
+            Capture ``PersonaPlexDepformer.forward`` into model-local CUDA
+            graphs. The HF default is False, could be overridden in ``hf_overrides``.
     """
 
     model_type = "personaplex"
@@ -227,6 +230,7 @@ class PersonaPlexConfig(PretrainedConfig):
         num_audio_codebooks: int = 16,
         mimi_name: str | None = None,
         mimi_cuda_graphs: bool = False,
+        depformer_cuda_graphs: bool = False,
         **kwargs: Any,
     ) -> None:
         if temporal_config is None:
@@ -263,6 +267,8 @@ class PersonaPlexConfig(PretrainedConfig):
             self.mimi_config.mimi_name = mimi_name
         self.mimi_name = self.mimi_config.mimi_name
         self.mimi_cuda_graphs = mimi_cuda_graphs
+
+        self.depformer_cuda_graphs = depformer_cuda_graphs
 
     @staticmethod
     def _coerce(value: Any, config_cls: type[PretrainedConfig]) -> PretrainedConfig:
