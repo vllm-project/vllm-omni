@@ -143,6 +143,17 @@ def validate_request_attention_schedule(request: Any, od_config: Any) -> Attenti
     return resolve_attention_schedule(request_schedule, default, profiles=profiles)
 
 
+def resolve_batch_attention_schedule(states: Any, od_config: Any) -> AttentionSchedule:
+    """One resolved schedule for a batch. Different ranges must not share a denoise forward."""
+    resolved = [validate_request_attention_schedule(SimpleRequest(state), od_config) for state in states]
+    if not resolved:
+        return ()
+    first = resolved[0]
+    if any(item != first for item in resolved[1:]):
+        raise ValueError("attention_schedule values in one batch must be identical")
+    return first
+
+
 def require_request_attention_schedule_fits(request: Any, od_config: Any, total_steps: int) -> AttentionSchedule:
     """Step-mode form of require_attention_schedule_fits for one request or runner state.
 
@@ -162,6 +173,37 @@ class SimpleRequest:
         self.sampling_params = getattr(state, "sampling_params", None)
         if self.sampling_params is None:
             self.sampling_params = getattr(state, "sampling", None)
+
+
+def require_no_cache_backend(od_config: Any, schedule: AttentionSchedule) -> None:
+    """A non-empty schedule cannot run with a cache backend that reuses or skips transformer evaluations.
+
+    TeaCache-style backends skip DiT evaluations on some steps and add a residual cached at an
+    earlier step, which may have run a different profile. The selected attention would then not be
+    what ran, so the combination is rejected instead of invalidating caches at profile switches.
+    """
+    if not schedule:
+        return
+    cache_backend = getattr(od_config, "cache_backend", None) if od_config is not None else None
+    if cache_backend in (None, "none"):
+        return
+    raise ValueError(
+        f"attention_schedule cannot be combined with cache_backend={cache_backend!r}: the cache backend "
+        "reuses or skips transformer evaluations across denoise steps, so the scheduled attention would "
+        "not run as selected. Disable the cache backend or send attention_schedule=[]."
+    )
+
+
+def require_denoise_progress_publisher(pipeline: Any, schedule: AttentionSchedule) -> None:
+    """A non-empty schedule cannot enter denoise on a pipeline that never publishes a step."""
+    if not schedule:
+        return
+    if callable(getattr(pipeline, "record_denoise_step", None)):
+        return
+    raise ValueError(
+        "attention_schedule requires a pipeline that publishes denoise progress via record_denoise_step; "
+        "rejecting before denoise"
+    )
 
 
 def select_attention_profile(schedule: AttentionSchedule, step_index: int, *, total_steps: int) -> str | None:
