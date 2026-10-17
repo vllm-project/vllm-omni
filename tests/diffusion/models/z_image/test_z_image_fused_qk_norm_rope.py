@@ -78,18 +78,23 @@ def test_packed_table_is_built_under_sequence_parallelism():
     assert table is not None and table.shape == (3 * shard, _HEAD_DIM)
     expected = torch.cat((cos[0], sin[0]), dim=-1).to(torch.bfloat16)
     assert torch.equal(table, expected.repeat(3, 1))
+    # Compiled execution packs the same table: the fused op also serves torch.compile.
     od_config.enforce_eager = False
     with set_forward_context(omni_diffusion_config=od_config):
-        assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
+        assert torch.equal(_packed_qk_norm_rope_table(cos, sin, torch.bfloat16), expected.repeat(3, 1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("compiled", [False, True])
 def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
+    """Eager: the fused path is bit-identical to norm_q/norm_k + RoPE. Compiled
+    (``fullgraph=True``): the fused custom op is traced into the graph and its
+    output stays within BF16 rounding of the compiled chain, whose RMSNorm is
+    Inductor's and reduces in a different order."""
     from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image
+    from vllm_omni.platforms import current_omni_platform
 
-    fused_op = mocker.spy(z_image, "fused_qk_norm_rope")
     torch.manual_seed(3)
     with torch.device("cuda"):
         attn = z_image.ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
@@ -110,6 +115,17 @@ def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
         attn = torch.compile(attn, fullgraph=True)
     with torch.no_grad():
         eager = attn(hidden, mask, cos, sin)
-        fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
-    assert torch.equal(fused, eager)
-    assert fused_op.call_count == (0 if compiled else 1)
+        if compiled:
+            # A spy wrapper is not traceable under fullgraph: check the kernel launch instead.
+            from torch.profiler import ProfilerActivity, profile
+
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
+                current_omni_platform.synchronize()
+            assert any("qk_norm_rope" in row.key for row in prof.key_averages()), "fused op not in the compiled graph"
+            torch.testing.assert_close(fused, eager, atol=6.25e-2, rtol=1.6e-2)
+        else:
+            fused_op = mocker.spy(z_image, "fused_qk_norm_rope")
+            fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
+            assert torch.equal(fused, eager)
+            assert fused_op.call_count == 1

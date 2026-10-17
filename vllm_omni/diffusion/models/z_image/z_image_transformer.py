@@ -345,14 +345,13 @@ class ZImageAttention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        # The forward packs a table only for eager BF16 D=128 inputs; the fused
-        # op then reproduces the CUDA RMSNorm reduction of norm_q/norm_k, so it
-        # is bit-identical to the chain below. Compiled RMSNorm reduces in a
-        # different order, so compiled graphs keep the original chain.
-        if (
-            qk_norm_rope_table is not None
-            and not torch.compiler.is_compiling()
-            and _fused_cuda_supported(query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
+        # The forward packs a table only for BF16 D=128 inputs; the fused op
+        # then reproduces the CUDA RMSNorm reduction of norm_q/norm_k, so in
+        # eager mode it is bit-identical to the chain below. Compiled graphs
+        # use the same custom op; their reference is Inductor's RMSNorm, which
+        # reduces in a different order.
+        if qk_norm_rope_table is not None and _fused_cuda_supported(
+            query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
         ):
             batch_size, seq_len, num_heads, head_dim = query.shape
             num_kv_heads = key.shape[2]
@@ -631,13 +630,9 @@ class RopeEmbedder:
 def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
     """Repeat cos[0]/sin[0] for all batches, matching RotaryEmbedding.
 
-    Sequence-parallel inputs already contain this rank's shard. ``None`` for
-    compiled forwards and outside the CUDA-matching contract (BF16, D=128).
+    Sequence-parallel inputs already contain this rank's shard. ``None``
+    outside the CUDA-matching contract (BF16, D=128).
     """
-    if is_forward_context_available():
-        config = get_forward_context().omni_diffusion_config
-        if config is not None and not config.enforce_eager:
-            return None
     return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype, cuda_rms_norm=True)
 
 
