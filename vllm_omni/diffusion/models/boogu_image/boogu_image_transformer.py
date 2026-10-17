@@ -1191,6 +1191,12 @@ class BooguImageTransformer2DModel(nn.Module):
         "BooguImageSingleStreamTransformerBlock",
     ]
     _layerwise_offload_blocks_attrs = ["single_stream_layers", "double_stream_layers"]
+    packed_modules_mapping = {
+        "instruct_to_qkv": ["instruct_to_q", "instruct_to_k", "instruct_to_v"],
+        "img_to_qkv": ["img_to_q", "img_to_k", "img_to_v"],
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "gate_up_proj": ["linear_1", "linear_3"],
+    }
     # Boundary outputs are hidden states, masks, and RoPE; each triplet is in
     # image/reference/context order so tensors sharing a sequence reuse metadata.
     # Twelve entries: 3 hidden states (dim=3), 3 masks (dim=2), then the
