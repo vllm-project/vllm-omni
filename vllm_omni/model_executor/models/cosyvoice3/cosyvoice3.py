@@ -46,7 +46,9 @@ from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_enabled,
+    cosyvoice3_flow_left_context,
     cosyvoice3_packed_inference_enabled,
+    cosyvoice3_packed_streaming_enabled,
     cosyvoice3_standard_sampling,
 )
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
@@ -814,7 +816,11 @@ class CosyVoice3Model(
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
-            self.code2wav = CosyVoice3Code2Wav(self.config)
+            connector_extra = self._connector_extra(vllm_config)
+            self._check_flow_window_vs_packed(connector_extra)
+            self.code2wav = CosyVoice3Code2Wav(
+                self.config, flow_left_context_tokens=cosyvoice3_flow_left_context(connector_extra)
+            )
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.
@@ -830,6 +836,40 @@ class CosyVoice3Model(
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
         return self.model
+
+    @staticmethod
+    def _connector_extra(vllm_config: VllmConfig) -> dict:
+        """Return the stage connector's ``extra`` block, or {} without one."""
+        model_config = getattr(vllm_config, "model_config", None)
+        connector = getattr(model_config, "stage_connector_config", None)
+        if isinstance(connector, Mapping):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        return dict(extra) if isinstance(extra, Mapping) else {}
+
+    @staticmethod
+    def _check_flow_window_vs_packed(connector_extra: Mapping[str, object]) -> None:
+        """Refuse the flow left-context window under packed streaming.
+
+        Packed streaming keeps prefix frames bit-stable across chunks: its
+        attention is chunk-causal on a grid that ``prompt_token_pad`` aligns
+        with each emitted chunk, and its noise is fixed per row position.
+        Dropping the window's tokens shifts every later frame, so new frames
+        straddle attention chunks and their context no longer matches the
+        audio already emitted. The window is applied in stage 0, which cannot
+        see the stage-1 environment that selects this profile, so the
+        conflict can only be caught here.
+        """
+        if not cosyvoice3_packed_streaming_enabled():
+            return
+        window = cosyvoice3_flow_left_context(connector_extra)
+        if window > 0:
+            raise ValueError(
+                "COSYVOICE3_PACKED_STREAMING is incompatible with a bounded flow left context "
+                f"(codec_left_context_frames={window}); set codec_left_context_frames: 0 in the "
+                "connector extra, as cosyvoice3_packed_streaming.yaml does"
+            )
 
     def _create_llm_vllm_config(self, parent_config: VllmConfig) -> VllmConfig:
         """Create VllmConfig for the inner Qwen2 LLM.

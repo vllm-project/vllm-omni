@@ -8,6 +8,9 @@ connectors:
   connector_of_shared_memory:
     extra:
       codec_chunk_frames: 25
+      # Packed streaming recomputes its chunk-causal prefix exactly, so the
+      # flow left-context window has to stay off; stage 1 enforces this.
+      codec_left_context_frames: 0
 stages:
   - stage_id: 1
     env:

@@ -3,6 +3,7 @@
 """Runtime toggles shared by the CosyVoice3 stages."""
 
 import os
+from collections.abc import Mapping
 from contextlib import nullcontext
 
 import torch
@@ -47,6 +48,15 @@ def cosyvoice3_packed_streaming_enabled() -> bool:
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability()[0] == 9
     )
+
+
+def cosyvoice3_flow_left_context(connector_extra: Mapping[str, object]) -> int:
+    """Emitted tokens resent to flow as left context; <= 0 means unbounded.
+
+    Stage 0 applies the window and stage 1 validates it against packed
+    streaming, so both have to read the same key with the same default.
+    """
+    return int(connector_extra.get("codec_left_context_frames", 25))
 
 
 def cosyvoice3_packed_inference_enabled() -> bool:

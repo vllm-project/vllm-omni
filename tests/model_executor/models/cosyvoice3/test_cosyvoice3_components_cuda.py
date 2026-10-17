@@ -19,7 +19,8 @@ pytestmark = [
 
 @pytest.mark.nvidia_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
+@pytest.mark.parametrize("flow_window", [0, 2])
+def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch, flow_window):
     """A padded flow batch must match individual flow calls on valid mels."""
     from omegaconf import DictConfig
 
@@ -79,9 +80,10 @@ def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
     model = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
     model.flow_model = flow_model
+    model.flow_left_context_tokens = flow_window
 
     def return_mel(self, feat, *, cache_state=None, finalize=False):
-        return feat, None
+        return feat, None if finalize else {}
 
     model._stream_hift_from_feat = types.MethodType(return_mel, model)
 
@@ -109,6 +111,12 @@ def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
         {**common, "token": torch.tensor([[1, 2, 3]], dtype=torch.int32)},
         {**common, "token": torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int32)},
     ]
+    if flow_window:
+        _, history = model.forward_streaming(
+            **common, token=torch.tensor([[1, 2, 63]], dtype=torch.int32), n_timesteps=2
+        )
+        for item, tokens in zip(items, [[1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6, 7]]):
+            item.update(token=torch.tensor([tokens], dtype=torch.int32), cache_state=history, token_offset_tokens=2)
 
     batched = model.forward_streaming_batch(items, n_timesteps=2)
     individual = [
@@ -117,6 +125,8 @@ def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
             prompt_token=item["prompt_token"],
             prompt_feat=item["prompt_feat"],
             embedding=item["embedding"],
+            cache_state=item.get("cache_state"),
+            token_offset_tokens=item.get("token_offset_tokens", 0),
             n_timesteps=2,
         )
         for item in items
