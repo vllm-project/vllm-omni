@@ -52,7 +52,29 @@
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H200": {
+            "request_throughput": [
+              0.0127
+            ],
+            "mean_ttft_ms": [
+              356.5399
+            ],
+            "mean_tpot_ms": [
+              5.4928
+            ],
+            "mean_e2el_ms": [
+              155494.6209
+            ],
+            "mean_audio_ttfp_ms": [
+              356.5399
+            ],
+            "mean_audio_rtf": [
+              0.6644
+            ]
+          }
+        }
       },
       {
         "dataset_name": "omniinteract",
@@ -74,7 +96,29 @@
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H200": {
+            "request_throughput": [
+              0.0066
+            ],
+            "mean_ttft_ms": [
+              401.2267
+            ],
+            "mean_tpot_ms": [
+              6.5562
+            ],
+            "mean_e2el_ms": [
+              303244.6906
+            ],
+            "mean_audio_ttfp_ms": [
+              401.2267
+            ],
+            "mean_audio_rtf": [
+              0.7724
+            ]
+          }
+        }
       },
       {
         "dataset_name": "omniinteract",
@@ -96,8 +140,31 @@
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H200": {
+            "request_throughput": [
+              0.0056
+            ],
+            "mean_ttft_ms": [
+              479.0183
+            ],
+            "mean_tpot_ms": [
+              8.3959
+            ],
+            "mean_e2el_ms": [
+              332483.5274
+            ],
+            "mean_audio_ttfp_ms": [
+              475.1807
+            ],
+            "mean_audio_rtf": [
+              0.6391
+            ]
+          }
+        }
       }
-    ]
+    ],
+    "description": "H200 performance references use equal-weight daily means from local runs on 2026-10-09 through 2026-10-14 (hardware alias L20X), separately for 1q1a, 1q1a_math and 1qna at C2/N4. All performance requests completed; the pooled IA_QTF1 quality gate failed on five of six days and remains unchanged. Four-decimal rounding; no added margin."
   }
 ]

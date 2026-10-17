@@ -54,6 +54,13 @@
           "guidance_scale": 6.0,
           "flow_shift": 5.0,
           "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.1218,
+            "mean_e2el_ms": 8237.5848,
+            "mean_peak_memory_mb": 78726.0
+          }
         }
       }
     ]
@@ -117,6 +124,13 @@
           "guidance_scale": 6.0,
           "flow_shift": 5.0,
           "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        },
+        "baseline": {
+          "H100": {
+            "request_throughput": 0.1656,
+            "mean_e2el_ms": 6035.9394,
+            "mean_peak_memory_mb": 43518.0
+          }
         }
       }
     ]
