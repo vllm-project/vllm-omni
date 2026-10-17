@@ -8,9 +8,10 @@ import threading
 
 import torch
 from vllm.logger import init_logger
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.platforms import current_omni_platform
 
 _FAILED_MHC_KERNELS: set[tuple[str, int, str]] = set()
 _WARNED_MHC_KERNELS: set[tuple[str, int, str]] = set()
@@ -49,6 +50,42 @@ def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float)
     return matrix
 
 
+if current_omni_platform.is_musa():
+
+    @triton.jit
+    def _asm_add_rn_f32(a, b):
+        """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
+
+        The MUSA assembler cannot allocate the PTX ``=f`` register class
+        for inline asm, so the barrier is expressed as a correctly-rounded
+        fused op instead: ``fma_rn(a, 1.0, b)`` is exactly the
+        correctly-rounded ``a + b`` (``a * 1`` is exact) and is already a
+        single fused multiply-add, so the optimizer cannot contract
+        anything further.
+        """
+        return tldevice.fma_rn(a, 1.0, b)
+
+else:
+
+    @triton.jit
+    def _asm_add_rn_f32(a, b):
+        """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
+
+        The native expression runs the scaled-logits multiply and the bias
+        add as separate kernels, so they can never fuse; an inline-asm add
+        is invisible to the optimizer's contraction and keeps the kernel
+        bit-equal to that boundary.
+        """
+        return tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            [a, b],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
+
 @triton.jit
 def _mhc_post_residual_kernel(
     post_ptr,
@@ -63,29 +100,371 @@ def _mhc_post_residual_kernel(
     residual_stride,
     scale,
     epsilon,
+    num_tokens,
     iterations: tl.constexpr,
+    tokens_per_program: tl.constexpr,
+    out_dtype_code: tl.constexpr,
 ):
-    token = tl.program_id(0).to(tl.int64)
-    index = tl.arange(0, 4)
-    post = tl.load(post_ptr + token * post_stride + index)
+    pid = tl.program_id(0)
+    offs_t = pid * tokens_per_program + tl.arange(0, tokens_per_program)
+    t_mask = offs_t < num_tokens
+    offs_row = offs_t.to(tl.int64)
+    post_row = offs_row * post_stride
+    residual_row = offs_row * residual_stride
+    offs_post_out = offs_row * 4
+    offs_residual_out = offs_row * 16
+
+    # Post coefficients: 2 * sigmoid((alpha_post * scale) * x + bias).
+    # sigmoid is div_rn(1, 1 + exp(-z)); the add sits behind the asm
+    # barrier so it cannot contract into an FMA. Fixed variables: no
+    # tuple rebinding inside static_range (Triton 3.2 / MUSA).
     ap = tl.load(alpha_post_ptr)
-    bp = tl.load(bias_post_ptr + index)
-    post = 2.0 * tl.sigmoid(ap * scale * post + bp)
-    offsets = index[:, None] * 4 + index[None, :]
-    matrix = tl.load(residual_ptr + token * residual_stride + offsets)
+    post_scale = ap * scale
+    p0 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 0, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 0)
+            )
+        ),
+    )
+    p1 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 1, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 1)
+            )
+        ),
+    )
+    p2 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 2, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 2)
+            )
+        ),
+    )
+    p3 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 3, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 3)
+            )
+        ),
+    )
+
+    # Bit-exact Sinkhorn (per #7545), statically unrolled.
     ar = tl.load(alpha_residual_ptr)
-    br = tl.load(bias_residual_ptr + offsets)
-    matrix = ar * scale * matrix + br
-    # Native amax propagates any NaN to the whole token's normalization.
-    has_nan = tl.sum(tl.sum((matrix != matrix).to(tl.int32), axis=0), axis=0) != 0
-    maximum = tl.max(tl.max(matrix, axis=0), axis=0)
-    maximum = tl.where(has_nan, float("nan"), maximum)
-    matrix = tl.exp(matrix - maximum)
+    residual_scale = ar * scale
+    m00 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 0, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 0),
+    )
+    m01 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 1, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 1),
+    )
+    m02 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 2, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 2),
+    )
+    m03 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 3, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 3),
+    )
+    m10 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 4, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 4),
+    )
+    m11 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 5, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 5),
+    )
+    m12 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 6, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 6),
+    )
+    m13 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 7, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 7),
+    )
+    m20 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 8, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 8),
+    )
+    m21 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 9, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 9),
+    )
+    m22 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 10, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 10),
+    )
+    m23 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 11, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 11),
+    )
+    m30 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 12, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 12),
+    )
+    m31 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 13, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 13),
+    )
+    m32 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 14, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 14),
+    )
+    m33 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 15, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 15),
+    )
+
+    # NaN-propagating amax over all 16 elements, matching torch.amax
+    # (floating-point max is order-independent; the NaN union is separate).
+    any_nan = (
+        (m00 != m00)
+        | (m01 != m01)
+        | (m02 != m02)
+        | (m03 != m03)
+        | (m10 != m10)
+        | (m11 != m11)
+        | (m12 != m12)
+        | (m13 != m13)
+        | (m20 != m20)
+        | (m21 != m21)
+        | (m22 != m22)
+        | (m23 != m23)
+        | (m30 != m30)
+        | (m31 != m31)
+        | (m32 != m32)
+        | (m33 != m33)
+    )
+    amax = tl.maximum(
+        tl.maximum(
+            tl.maximum(
+                tl.maximum(
+                    tl.maximum(
+                        tl.maximum(
+                            tl.maximum(
+                                tl.maximum(
+                                    tl.maximum(
+                                        tl.maximum(
+                                            tl.maximum(
+                                                tl.maximum(tl.maximum(tl.maximum(tl.maximum(m00, m01), m02), m03), m10),
+                                                m11,
+                                            ),
+                                            m12,
+                                        ),
+                                        m13,
+                                    ),
+                                    m20,
+                                ),
+                                m21,
+                            ),
+                            m22,
+                        ),
+                        m23,
+                    ),
+                    m30,
+                ),
+                m31,
+            ),
+            m32,
+        ),
+        m33,
+    )
+    amax = tl.where(any_nan, float("nan"), amax)
+
+    m00 = tldevice.exp(m00 - amax)
+    m01 = tldevice.exp(m01 - amax)
+    m02 = tldevice.exp(m02 - amax)
+    m03 = tldevice.exp(m03 - amax)
+    m10 = tldevice.exp(m10 - amax)
+    m11 = tldevice.exp(m11 - amax)
+    m12 = tldevice.exp(m12 - amax)
+    m13 = tldevice.exp(m13 - amax)
+    m20 = tldevice.exp(m20 - amax)
+    m21 = tldevice.exp(m21 - amax)
+    m22 = tldevice.exp(m22 - amax)
+    m23 = tldevice.exp(m23 - amax)
+    m30 = tldevice.exp(m30 - amax)
+    m31 = tldevice.exp(m31 - amax)
+    m32 = tldevice.exp(m32 - amax)
+    m33 = tldevice.exp(m33 - amax)
+
     for _ in tl.static_range(iterations):
-        matrix = matrix / (tl.sum(matrix, axis=0)[None, :] + epsilon)
-        matrix = matrix / (tl.sum(matrix, axis=1)[:, None] + epsilon)
-    tl.store(post_out_ptr + token * 4 + index, post)
-    tl.store(residual_out_ptr + token * 16 + offsets, matrix)
+        # matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon):
+        # ascending sequential chain over i per column j.
+        c0 = m00 + m10 + m20 + m30
+        c1 = m01 + m11 + m21 + m31
+        c2 = m02 + m12 + m22 + m32
+        c3 = m03 + m13 + m23 + m33
+        m00 = tldevice.div_rn(m00, c0 + epsilon)
+        m01 = tldevice.div_rn(m01, c1 + epsilon)
+        m02 = tldevice.div_rn(m02, c2 + epsilon)
+        m03 = tldevice.div_rn(m03, c3 + epsilon)
+        m10 = tldevice.div_rn(m10, c0 + epsilon)
+        m11 = tldevice.div_rn(m11, c1 + epsilon)
+        m12 = tldevice.div_rn(m12, c2 + epsilon)
+        m13 = tldevice.div_rn(m13, c3 + epsilon)
+        m20 = tldevice.div_rn(m20, c0 + epsilon)
+        m21 = tldevice.div_rn(m21, c1 + epsilon)
+        m22 = tldevice.div_rn(m22, c2 + epsilon)
+        m23 = tldevice.div_rn(m23, c3 + epsilon)
+        m30 = tldevice.div_rn(m30, c0 + epsilon)
+        m31 = tldevice.div_rn(m31, c1 + epsilon)
+        m32 = tldevice.div_rn(m32, c2 + epsilon)
+        m33 = tldevice.div_rn(m33, c3 + epsilon)
+        # matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon):
+        # interleaved lane pairing (x0 + x2) + (x1 + x3).
+        r0 = (m00 + m02) + (m01 + m03)
+        r1 = (m10 + m12) + (m11 + m13)
+        r2 = (m20 + m22) + (m21 + m23)
+        r3 = (m30 + m32) + (m31 + m33)
+        m00 = tldevice.div_rn(m00, r0 + epsilon)
+        m01 = tldevice.div_rn(m01, r0 + epsilon)
+        m02 = tldevice.div_rn(m02, r0 + epsilon)
+        m03 = tldevice.div_rn(m03, r0 + epsilon)
+        m10 = tldevice.div_rn(m10, r1 + epsilon)
+        m11 = tldevice.div_rn(m11, r1 + epsilon)
+        m12 = tldevice.div_rn(m12, r1 + epsilon)
+        m13 = tldevice.div_rn(m13, r1 + epsilon)
+        m20 = tldevice.div_rn(m20, r2 + epsilon)
+        m21 = tldevice.div_rn(m21, r2 + epsilon)
+        m22 = tldevice.div_rn(m22, r2 + epsilon)
+        m23 = tldevice.div_rn(m23, r2 + epsilon)
+        m30 = tldevice.div_rn(m30, r3 + epsilon)
+        m31 = tldevice.div_rn(m31, r3 + epsilon)
+        m32 = tldevice.div_rn(m32, r3 + epsilon)
+        m33 = tldevice.div_rn(m33, r3 + epsilon)
+
+    # Materialize outputs at the eager out_dtype boundary.
+    v = p0
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 0, v, mask=t_mask)
+    v = p1
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 1, v, mask=t_mask)
+    v = p2
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 2, v, mask=t_mask)
+    v = p3
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 3, v, mask=t_mask)
+    v = m00
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 0, v, mask=t_mask)
+    v = m01
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 1, v, mask=t_mask)
+    v = m02
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 2, v, mask=t_mask)
+    v = m03
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 3, v, mask=t_mask)
+    v = m10
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 4, v, mask=t_mask)
+    v = m11
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 5, v, mask=t_mask)
+    v = m12
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 6, v, mask=t_mask)
+    v = m13
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 7, v, mask=t_mask)
+    v = m20
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 8, v, mask=t_mask)
+    v = m21
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 9, v, mask=t_mask)
+    v = m22
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 10, v, mask=t_mask)
+    v = m23
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 11, v, mask=t_mask)
+    v = m30
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 12, v, mask=t_mask)
+    v = m31
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 13, v, mask=t_mask)
+    v = m32
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 14, v, mask=t_mask)
+    v = m33
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 15, v, mask=t_mask)
 
 
 @triton.jit
@@ -195,7 +574,7 @@ class MHCPostResidual(CustomOp):
         residual_out = torch.empty((tokens, 4, 4), device=post_logits.device, dtype=out_dtype)
         if tokens:
             try:
-                _mhc_post_residual_kernel[(tokens,)](
+                _mhc_post_residual_kernel[(triton.cdiv(tokens, 32),)](
                     *tensors,
                     post_out,
                     residual_out,
@@ -203,7 +582,10 @@ class MHCPostResidual(CustomOp):
                     residual_logits.stride(0),
                     scale,
                     epsilon,
+                    tokens,
                     iterations=iterations,
+                    tokens_per_program=32,
+                    out_dtype_code={torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}[out_dtype],
                     num_warps=1,
                     enable_fp_fusion=False,
                 )
