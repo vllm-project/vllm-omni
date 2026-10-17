@@ -23,6 +23,8 @@ stages:
 
   - stage_id: 1
     enforce_eager: false
+    engine_backend: vllm_omni.diffusion.models.ming_image.engine.MingImageDiffusionEngine
+    worker_extension_cls: vllm_omni.diffusion.models.ming_image.engine.MingImageCompileWorkerExtension
     diffusion_compile_granularity: regional
     diffusion_compile_dynamic: true
     tensor_parallel_size: 1
