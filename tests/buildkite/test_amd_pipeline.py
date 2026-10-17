@@ -415,7 +415,7 @@ def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
         lane_definitions.append(step)
 
         assert step["grade"] == "Blocking"
-        assert step["timeout_in_minutes"] == 20
+        assert step["timeout_in_minutes"] == 25
         assert "export VLLM_OMNI_AR_FA_REQUIRED=1" in step["commands"]
 
         pytest_commands = [command for command in step["commands"] if "pytest" in command]
@@ -428,7 +428,7 @@ def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
         assert argv[argv.index("--run-level") + 1] == "core_model"
 
         transfer_argv = split(pytest_commands[1])
-        assert transfer_argv[:2] == ["timeout", "5m"]
+        assert transfer_argv[:4] == ["timeout", "--signal=TERM", "--kill-after=1m", "5m"]
         assert "tests/diffusion/utils/test_chunked_transfer.py" in transfer_argv
         assert transfer_argv[transfer_argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
         assert transfer_argv[transfer_argv.index("--run-level") + 1] == "core_model"
@@ -546,10 +546,40 @@ def test_amd_ulysses_lanes_cover_uaa_and_attention_sp(label: str, pipeline: Path
     pytest_commands = [command for command in step["commands"] if "pytest" in command]
 
     assert step["grade"] == "Blocking"
-    assert len(pytest_commands) == 2
+    assert len(pytest_commands) == 1
     assert "tests/diffusion/attention/test_ulysses_uaa.py" in pytest_commands[0]
-    assert "tests/diffusion/attention/test_attention_sp.py" in pytest_commands[1]
+    assert "tests/diffusion/attention/test_attention_sp.py" in pytest_commands[0]
     assert all(f"core_model and rocm and MI325 and {cards}" in command for command in pytest_commands)
+
+    argv = split(pytest_commands[0])
+    assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "20m"]
+    assert step["timeout_in_minutes"] == 25
+    assert "--durations=20" in argv
+
+
+@pytest.mark.parametrize(
+    ("label", "cards"),
+    [
+        ("Diffusion · Distributed Test · 2-GPU", "cards_2"),
+        ("Diffusion · Distributed & Attention Test · 4-GPU", "cards_4"),
+    ],
+)
+def test_cuda_distributed_lanes_cover_both_attention_files_within_the_job_budget(label: str, cards: str) -> None:
+    step = _find_step(label, CUDA_READY_PIPELINE)
+    argv = [split(command) for command in step["commands"] if "pytest" in split(command)]
+
+    paths = {arg for command in argv for arg in command if arg.startswith("tests/")}
+    assert paths == {
+        "tests/diffusion/distributed",
+        "tests/diffusion/attention/test_ulysses_uaa.py",
+        "tests/diffusion/attention/test_attention_sp.py",
+    }
+    assert step["mirror_hardwares"] == f"l4_{cards.removeprefix('cards_')}"
+    for command in argv:
+        assert command[command.index("-m") + 1] == f"core_model and cuda and L4 and {cards}"
+        assert command[command.index("--run-level") + 1] == "core_model"
+    command_budget = sum(int(command[1].removesuffix("m")) for command in argv)
+    assert step["timeout_in_minutes"] >= command_budget + 5
 
 
 def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:

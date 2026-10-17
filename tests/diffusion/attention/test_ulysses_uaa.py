@@ -1256,6 +1256,7 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline(
                 pass
 
 
+@pytest.mark.cpu
 def test_default_ulysses_import_does_not_require_optional_symmem_backend():
     # Use a fresh interpreter: successful CUDA E2E cannot cover missing optional
     # dependencies, and this test module already imported Ulysses above.

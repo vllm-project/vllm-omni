@@ -994,9 +994,20 @@ def test_composed_strategy_detects_uneven_allgather_regions(monkeypatch):
 @pytest.mark.parametrize(
     ("ulysses_degree", "ring_degree", "allgather_degree", "num_kv_heads"),
     [
-        pytest.param(2, 2, 1, None, id="ulysses-ring", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)),
-        pytest.param(1, 1, 2, None, id="allgather-kv", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)),
-        pytest.param(2, 1, 2, None, id="ulysses-allgather-kv", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)),
+        pytest.param(
+            2, 2, 1, None, id="ulysses-ring", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),
+        pytest.param(
+            1, 1, 2, None, id="allgather-kv", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),
+        pytest.param(
+            2,
+            1,
+            2,
+            None,
+            id="ulysses-allgather-kv",
+            marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4),
+        ),
         pytest.param(1, 2, 1, 2, id="ring-gqa", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)),
         pytest.param(1, 2, 1, 1, id="ring-mqa", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)),
     ],
