@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import time
 from typing import Any
 
+from ..utils.env import expand_env_value
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 
@@ -29,17 +30,26 @@ class MooncakeStoreConnector(OmniConnectorBase):
                 "Please ensure the 'mooncake' package is installed in your environment."
             )
 
+        # Set before config parsing: close() reads these, and __del__ runs
+        # even when __init__ aborts on a bad config.
+        self.store: MooncakeDistributedStore | None = None
+        self.pin: ReplicateConfig | None = None
+
         self.config = config
-        self.host = config.get("host", "127.0.0.1")
+        # The transfer-engine listen address registered with the mooncake
+        # master at setup() must be reachable from other stage pods, so a
+        # cross-pod deployment can pin it to the local pod IP via an env var
+        # (e.g. MC_STORE_HOST=$(POD_IP)). strict mode fails loudly on an
+        # unset var instead of leaking "$VAR" into the transfer engine.
+        self.host = expand_env_value(config.get("host", "127.0.0.1"), strict=True, field_name="host")
         self.metadata = config.get("metadata_server", "http://127.0.0.1:8080/metadata")
         self.master = config.get("master", "127.0.0.1:50051")
         self.segment = config.get("segment", 512 * 1024 * 1024)  # 512MB
         self.localbuf = config.get("localbuf", 64 * 1024 * 1024)  # 64MB
         self.proto = config.get("proto", "tcp")
         self.rdma = config.get("rdma", "")
-
-        self.store: MooncakeDistributedStore | None = None
-        self.pin: ReplicateConfig | None = None
+        # ChunkTransferAdapter reads connector.stage_id when async_chunk is on.
+        self.stage_id = config.get("stage_id", -1)
 
         self._metrics = {
             "puts": 0,
