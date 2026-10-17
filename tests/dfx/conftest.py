@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.hardware import _safe_filename_token, hardware_json_value
+from tests.helpers.hardware import get_runtime_resource_label as get_runtime_resource_label
 from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
@@ -407,16 +409,6 @@ def create_benchmark_indices(
 OMNI_RESULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "perf" / "scripts" / "result_omni_template.json"
 
 
-def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
-    """Make a single path segment safe for result filenames on common filesystems."""
-    if value is None:
-        return default
-    s = str(value).strip()
-    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
-        s = s.replace(bad, "_")
-    return s if s else default
-
-
 def _benchmark_param_id_suffix(param: dict[str, Any], *, idx: int) -> str:
     """Derive a readable pytest id suffix from one ``benchmark_params`` entry."""
     name = param.get("name")
@@ -452,87 +444,10 @@ def _unique_benchmark_param_id_suffixes(params_list: list[dict[str, Any]]) -> li
     return unique
 
 
-# Device marketing-name tokens for ``get_runtime_resource_label`` only.
-# Longer / more specific tokens must appear before shorter substrings
-# (e.g. ``H200`` before ``H20``, ``910B4`` before ``910``).
-_RUNTIME_DEVICE_ALIASES: tuple[str, ...] = (
-    "H100",
-    "H800",
-    "H200",
-    "H20",
-    "B200",
-    "GB200",
-    "L40S",
-    "L40",
-    "L4",
-    "A100",
-    "A800",
-    "A10G",
-    "A10",
-    "A30",
-    "MI325",
-    "MI300",
-    "MI250",
-    "B60",
-    "S5000",
-    "910B4",
-    "910B",
-    "910",
-    "310P",
-    "A2",
-    "A3",
-)
-_RUNTIME_RESOURCE_LABEL: str | None = None
-
-
-def _normalize_runtime_device_label(raw: str) -> str:
-    """Map a platform device name to a short filename-safe resource token."""
-    if not raw or not str(raw).strip():
-        return "na"
-    upper = str(raw).upper()
-    for token in _RUNTIME_DEVICE_ALIASES:
-        if token.upper() in upper:
-            return _safe_filename_token(token)
-    compact = re.sub(r"[^a-zA-Z0-9]+", "", str(raw))
-    for prefix in ("NVIDIA", "AMD", "ASCEND", "HUAWEI"):
-        if compact.upper().startswith(prefix):
-            compact = compact[len(prefix) :]
-            break
-    return _safe_filename_token(compact[:48]) if compact else "na"
-
-
-def _read_runtime_device_name(*, device_id: int = 0) -> str | None:
-    """Device name from the active Omni platform."""
-    if current_omni_platform.device_count() <= device_id:
-        return None
-    get_name = getattr(current_omni_platform, "get_device_name", None)
-    if not callable(get_name):
-        return None
-    raw = get_name(device_id)
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return None
-
-
-def get_runtime_resource_label(*, device_id: int = 0, refresh: bool = False) -> str:
-    """Return a filename-safe hardware label detected on the running machine."""
-    global _RUNTIME_RESOURCE_LABEL
-    if not refresh and _RUNTIME_RESOURCE_LABEL is not None:
-        return _RUNTIME_RESOURCE_LABEL
-    raw = _read_runtime_device_name(device_id=device_id)
-    label = _normalize_runtime_device_label(raw) if raw else "na"
-    if not refresh:
-        _RUNTIME_RESOURCE_LABEL = label
-    return label
-
+# ``get_runtime_resource_label`` and ``hardware_json_value`` live in
+# ``tests.helpers.hardware`` and are re-exported above.
 
 _FILENAME_OMIT_RESOURCE_LABELS = frozenset({"H100"})
-
-
-def hardware_json_value(resource_label: str | None) -> str:
-    """Hardware token stored in perf result JSON (empty when unknown)."""
-    token = _safe_filename_token(resource_label)
-    return "" if token == "na" else token
 
 
 def resource_label_for_filename(resource_label: str | None) -> str:
@@ -553,7 +468,7 @@ def is_hardware_nested_baseline(baseline: dict[str, Any]) -> bool:
       (``[hardware-resource]`` markers from ``pyproject.toml``).
 
     Metric names under each hardware bucket are unconstrained.
-    Runtime device aliases (:data:`_RUNTIME_DEVICE_ALIASES`) are unrelated.
+    Runtime device aliases (:data:`tests.helpers.hardware._RUNTIME_DEVICE_ALIASES`) are unrelated.
     """
     if not baseline:
         return False

@@ -82,14 +82,18 @@ class DuplexOmniEngine(AsyncOmniEngine):
             )
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
+        self.plugin.configure_pipeline(pipeline_config)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
         from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
-        stage0_vllm_config = self.stage_pools[0].stage_vllm_config if self.stage_pools else None
-        model_config = getattr(stage0_vllm_config, "model_config", None)
+        # Match the frontend's comprehension-stage selection. An optional ASR
+        # stage does not own the served model's tokenizer or prompt policy.
+        model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
+        stage_vllm_config = self.stage_pools[model_stage_id].stage_vllm_config if self.stage_pools else None
+        model_config = getattr(stage_vllm_config, "model_config", None)
         return DuplexOrchestrator(
             plugin=self.plugin,
             duplex_session_config=self.duplex_session_config,

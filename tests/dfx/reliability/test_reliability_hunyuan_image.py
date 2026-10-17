@@ -61,6 +61,7 @@ FAULT_ERROR_KEYWORDS = (
     "oom",
     "out of memory",
     "cuda",
+    "connection",
     "job failed",
     "unknown error",
     "internal server error",

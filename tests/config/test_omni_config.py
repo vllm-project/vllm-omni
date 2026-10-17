@@ -490,6 +490,10 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
     expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    if deploy_name == "minicpmo_4_5":
+        # Single-card deploy: batch sizes round up to a capture bucket so the
+        # 32-entry pool covers the shape space.
+        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected
@@ -947,10 +951,15 @@ def test_platform_v1_fallback_overrides_stage_v2():
     assert deploy.stages[1].model_runner is None
 
 
-def test_downstream_mrv2_stage_requires_turn_sessions():
-    stages = [StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")]
-    with pytest.raises(ValueError, match="session_mode 'turn' only"):
-        merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+def test_qwen3_omni_downstream_mrv2_accepts_duplex_sessions():
+    stages = [
+        StageDeployConfig(stage_id=0),
+        StageDeployConfig(stage_id=1, model_runner="v2"),
+        StageDeployConfig(stage_id=2, model_runner="v2"),
+    ]
+    merged = merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in merged] == [False, True, True]
+    assert [stage.yaml_engine_args["session_mode"] for stage in merged] == ["duplex", "duplex", "duplex"]
 
 
 def test_v1_downstream_stage_keeps_duplex_sessions():
@@ -1014,6 +1023,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "compilation_config",
         "profiler_config",
         "quantization_config",
+        # Stage-level speculative_config is passed straight through to the
+        # engine: the Talker K-step block is read by the engine, not unpacked
+        # structurally like the other stage configs.
+        "speculative_config",
     }
     assert "diffusion_config" not in public_fields
     assert {f.name for f in fields(VllmOmniDiffusionStageConfig)} == public_fields | {"diffusion_config"}
@@ -1088,6 +1101,7 @@ def test_sub_config_fields_match_structured_scopes():
         "attention_backend",
         "attention_config",
         "moe_backend",
+        "linear_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
         "interleave_mm_strings",

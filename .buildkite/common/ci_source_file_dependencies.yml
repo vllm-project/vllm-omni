@@ -5,8 +5,8 @@
 # YAML anchors above the registry hold model business-code paths. Job keys
 # ({model}_function / _perf / _accuracy / _reliability / _doc / _cov) alias
 # those anchors and add the scripts the job actually runs. Feature keys below
-# are unchanged. ``source_filter_fallback`` is not a job key: when no job-key
-# prefix matches, a matching diff keeps every job for that upload.
+# are unchanged. ``source_filter_fallback`` is not a job key: a fallback-only
+# diff, or a fallback hit with no job-key match, keeps every job for that upload.
 #
 # YAML anchors are nested lists; the loader flattens them.
 
@@ -82,27 +82,31 @@ x-minicpmo-4-5-functional-runtime: &minicpmo_4_5_functional_runtime
   - vllm_omni/platforms/npu/worker/
   - vllm_omni/model_executor/models/common/
 
-x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
-  - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
+# Shared duplex paths used by both MiniCPM-o and Qwen3-Omni jobs.
+x-duplex: &duplex
   - vllm_omni/engine/duplex/
   - vllm_omni/engine/duplex_omni_engine.py
   - vllm_omni/engine/duplex_orchestrator.py
-  - vllm_omni/engine/omni_engine_base.py
   - vllm_omni/entrypoints/duplex/
   - vllm_omni/entrypoints/duplex_omni.py
-  - vllm_omni/entrypoints/async_omni_base.py
   - vllm_omni/protocol/
   - vllm_omni/clients/
+  - vllm_omni/experimental/fullduplex/
+  - vllm_omni/entrypoints/openai/api_server.py
+  - vllm_omni/entrypoints/openai/duplex_capability.py
+
+x-minicpmo-4-5-duplex: &minicpmo_4_5_duplex
+  - *duplex
+  - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
+  - vllm_omni/engine/omni_engine_base.py
+  - vllm_omni/entrypoints/async_omni_base.py
   - vllm_omni/outputs/duplex.py
   - vllm_omni/model_executor/duplex_sampling.py
-  - vllm_omni/experimental/fullduplex/
   - vllm_omni/core/sched/
   - vllm_omni/outputs/multimodal_accumulation.py
   - vllm_omni/engine/stage_init_utils.py
   - vllm_omni/engine/orchestrator.py
   - vllm_omni/entrypoints/cli/serve.py
-  - vllm_omni/entrypoints/openai/api_server.py
-  - vllm_omni/entrypoints/openai/duplex_capability.py
   - vllm_omni/config/stage_config.py
 
 x-qwen2-5-omni: &qwen2_5_omni
@@ -145,6 +149,12 @@ x-qwen-image: &qwen_image
   - vllm_omni/diffusion/models/dmd2/
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
 
+x-qwen-image-21: &qwen_image_21
+  - vllm_omni/diffusion/models/qwen_image_21/
+  - vllm_omni/diffusion/models/qwen_image/
+  - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py
+  - vllm_omni/model_extras/qwen_image_21.py
+
 x-hunyuan-image3: &hunyuan_image3
   - vllm_omni/diffusion/models/hunyuan_image3/
   - vllm_omni/model_executor/models/hunyuan_image3/
@@ -182,7 +192,8 @@ x-lingbot-world: &lingbot_world
 
 source_file_dependencies:
   # Hardware presets and shared test helpers. Not a job key — do not attach this
-  # to a step. Used only when no job-key prefix matches: then a hit keeps every job.
+  # to a step. Fallback-only diffs keep every job, even when a job lists a shared
+  # path. Mixed diffs use normal job dependencies when any job-key prefix matches.
   source_filter_fallback:
     - .buildkite/common/ci_mirror_hardwares.yml
     - tests/helpers/
@@ -288,6 +299,17 @@ source_file_dependencies:
     - vllm_omni/benchmarks/data_modules/seed_tts_dataset.py
     - vllm_omni/clients/duplex.py
     - vllm_omni/deploy/qwen3_omni_duplex.yaml
+
+  omni_qwen3_omni_duplex_perf:
+    - *qwen3_omni
+    - *duplex
+    - vllm_omni/deploy/qwen3_omni_duplex.yaml
+    - vllm_omni/entrypoints/cli/benchmark/
+    - vllm_omni/benchmarks/
+    - tests/dfx/conftest.py
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json
+    - tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json
 
   omni_qwen3_omni_reliability:
     - *qwen3_omni
@@ -405,6 +427,20 @@ source_file_dependencies:
     - tests/e2e/offline_inference/test_qwen3_tts_base.py
     - tests/e2e/online_serving/test_qwen3_tts_base.py
 
+  tts_vibevoice_function:
+    - tests/e2e/offline_inference/test_vibevoice_tts.py
+    - tests/assets/qwen3_tts/clone_2.wav
+    - vllm_omni/model_executor/models/vibevoice/
+    - vllm_omni/model_executor/models/registry.py
+    - vllm_omni/model_executor/models/model_local_kv.py
+    - vllm_omni/transformers_utils/configs/
+    - vllm_omni/worker/gpu_ar_model_runner.py
+    - vllm_omni/worker/gpu_model_runner.py
+    - vllm_omni/worker/sparse_audio.py
+    - vllm_omni/outputs/output_processor.py
+    - vllm_omni/deploy/vibevoice.yaml
+    - vllm_omni/config/pipeline_registry.py
+
   # --- diffusion jobs ---
   diffusion_wan22_function:
     - *wan22
@@ -461,10 +497,24 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
+  diffusion_qwen_image_21_accuracy:
+    - *qwen_image_21
+    - tests/e2e/accuracy/qwen_image_21/
+    - tests/e2e/accuracy/helpers.py
+    - tests/e2e/accuracy/conftest.py
+    - tests/assets/qwen_image_edit/
+    - tests/helpers/
+    - tests/conftest.py
+
   diffusion_qwen_image_perf:
     - *qwen_image
     - tests/dfx/perf/scripts/run_diffusion_benchmark.py
     - tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+
+  diffusion_qwen_image_21_perf:
+    - *qwen_image_21
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
 
   diffusion_text_to_image_doc:
     - *qwen_image

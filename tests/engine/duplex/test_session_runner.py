@@ -47,6 +47,7 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
@@ -223,8 +224,10 @@ async def open_harness(
     stage_count: int = 2,
     clock: Any = None,
     log_stats: bool = False,
+    plugin: DuplexModelPlugin | None = None,
 ) -> Harness:
-    plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    if plugin is None:
+        plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
@@ -385,6 +388,88 @@ def b64(data: bytes) -> str:
 # --------------------------------------------------------------------------- #
 # Session lifecycle                                                           #
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("camera_update", [False, True])
+async def test_aura_asr_transcript_does_not_project_as_assistant_output(camera_update: bool) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    plugin = AuraDuplexPlugin(_fake_encode_audio)
+    h = await open_harness(plugin=plugin, stage_count=4, auto_response=not camera_update)
+    try:
+        image = BytesIO()
+        Image.new("RGB", (8, 8), "red").save(image, format="PNG")
+        await h.run(
+            commands.AppendAudio(
+                audio=pcm_f32(1600),
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                is_speech=True,
+                video_frames=(b64(image.getvalue()),),
+            )
+        )
+        if camera_update:
+            events = await h.run(commands.Commit(final=True, create_response=False))
+            speech_item_id = find(events, "input_audio_buffer.committed").to_realtime()["item_id"]
+            assert not h.port.submissions
+            image = BytesIO()
+            Image.new("RGB", (8, 8), "blue").save(image, format="PNG")
+            await h.run(commands.AppendAudio(video_frames=(b64(image.getvalue()),)))
+        await h.run(commands.Commit(final=True, create_response=True))
+        submission = h.port.submissions[-1]
+        if camera_update:
+            info = submission.prompt["additional_information"]
+            assert info["realtime_item_id"] == speech_item_id
+            audio, rate = submission.prompt["multi_modal_data"]["audio"]
+            assert rate == 16000 and audio.tobytes() == pcm_f32(1600)
+            video = info["deferred_multi_modal_data"]["video"][0][0]
+            assert [tuple(frame[0, 0]) for frame in video] == [(255, 0, 0), (0, 0, 255)]
+        request_id = submission.context.request_id
+        output = SimpleNamespace(
+            request_id=request_id,
+            finished=True,
+            outputs=[SimpleNamespace(text="Watch the red light.", token_ids=[], multimodal_output={})],
+            multimodal_output={},
+        )
+        transcript = plugin.user_transcript(stage_id=0, output=output, prompt=submission.prompt, finished=True)
+        context = DuplexOutputContext(
+            identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
+            final_stage_id=3,
+            segment_finished=True,
+        )
+        assert not h.runner.on_stage_output(
+            0,
+            output,
+            stage_stats(stage_id=0, request_id=request_id, num_tokens_out=5),
+            request_id=request_id,
+            context=context,
+            input_transcript=transcript,
+            input_item_id=submission.prompt["additional_information"]["realtime_item_id"],
+        )
+        events = await h.settle()
+        transcription = find(events, "conversation.item.input_audio_transcription.completed")
+        assert transcription.transcript == transcript
+        if camera_update:
+            assert transcription.to_realtime()["item_id"] == speech_item_id
+            assert h.session.pending_input_bytes == 0
+        assert not any(event.type.startswith("response.output_") for event in events)
+        assert (h.session.active_response_id is not None) == camera_update
+
+        output.outputs[0].text = "I will watch it."
+        assert not h.deliver(output, stage_id=1, segment_finished=True)
+        events = await h.settle()
+        delta = find(events, "response.output_audio_transcript.delta")
+        assert delta.delta == "I will watch it."
+        # AURA starts the response on thinker output; earlier ASR metrics are
+        # stashed until then and must appear on the public transcript event.
+        assert _stage_metrics_of(delta)["0"]["num_tokens_out"] == 5
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -602,6 +687,45 @@ async def test_commit_projects_the_user_item_and_does_not_resubmit_consumed_audi
         assert len(h.port.submissions) == 1
         assert h.session.input_commit_seq == 1
         assert h.session.history[-1]["role"] == "user"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_response_commit_releases_residual_audio_before_the_next_turn() -> None:
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        for turn in range(2):
+            # Match streaming input with a partial final model unit. Give the
+            # turns different PCM so replaying the first tail cannot go unnoticed.
+            value = 0.05 + turn * 0.05
+            for _ in range(7):
+                await h.run(append_audio(3200, value=value))
+            await h.run(commands.Commit())
+
+            assert h.runner.model_state.committed_audio_payload is None
+            assert h.session.pending_input_bytes == 0
+            assert len(h.port.submissions) == (turn + 1) * 2
+            streaming_append = h.port.submissions[-2].prompt["model_intermediate_buffer"]["duplex"]
+            assert streaming_append["final"] is False
+            assert base64.b64decode(streaming_append["payload"]["audio"]) == pcm_f32(16000, value=value)
+            final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+            assert final_append["final"] is True
+            assert base64.b64decode(final_append["payload"]["audio"]) == (
+                pcm_f32(6400, value=value) + pcm_f32(9600, value=0.0)
+            )
+
+            samples = (turn + 1) * 24000
+            await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=samples, turn_id=turn))
+            events = await h.deliver_and_settle(
+                tts_output(h.stage0_request_id(), samples=samples, turn_end=True, turn_id=turn)
+            )
+            done = find(events, "response.done")
+            assert done.status == "completed"
+            ack = await h.run(commands.AckPlayback(played_ms=1000, response_id=done.response_id))
+            assert types(ack) == ["playback.acknowledged"]
+            assert ack[0].details["history_committed"] is True
+            assert ack[0].details["playback"]["committed_ms"] == 1000
     finally:
         await close_harness(h)
 
@@ -1558,7 +1682,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
         await orchestrator.session_manager.shutdown()
 
 
-def _response_request_metrics_of(event: object) -> dict[str, object]:
+def _response_request_metrics_of(event: DuplexEvent) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")

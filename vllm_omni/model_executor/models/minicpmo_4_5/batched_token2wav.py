@@ -1227,8 +1227,10 @@ class BatchedToken2Wav(nn.Module):
                 if len(set(row_offsets)) == 1 and not self._row_offset_merge:
                     row_offsets = None
         mel_frames = int(mu.shape[2])
-        # Padding only pays off while replay is active: Whole-Euler, the CFM wrapper (still enabled,
-        # no TRT stepper), or on NPU the platform runner keyed by `_cfm_graph_enabled`.
+        # Padding only pays off while replay is active: whole-Euler replay, or
+        # the CFM wrapper (`_disable` keeps the object alive, so check its
+        # flag) with no TRT stepper in the way -- or, on NPU where there is no
+        # wrapper, the platform runner keyed by `_cfm_graph_enabled`.
         graphs_active = valid_lengths is None and (
             self._whole_euler_active()
             or (
