@@ -152,6 +152,12 @@ class OutputQueueSink:
                 msgs.append(self._sync_q.get_nowait())
             except queue.Empty:
                 break
+            except Exception as exc:
+                if msgs and is_janus_sync_queue_shutdown(exc):
+                    # Deliver what drained; the shutdown surfaces on the next,
+                    # empty drain (see ``shutdown``).
+                    break
+                raise
         return msgs
 
     def arm_wakeup(self) -> asyncio.Event:
@@ -167,6 +173,27 @@ class OutputQueueSink:
         self._ready.clear()
         self._wake_scheduled = False
         return self._ready
+
+    def shutdown(self) -> None:
+        """Mark the end of orchestrator output and wake a waiting serving loop.
+
+        Called by the orchestrator thread as it exits. Messages already queued
+        (such as the fatal ``ErrorMessage`` written on a crash) still drain;
+        once they are gone ``drain`` raises the janus shutdown error, which
+        the engine maps to its orchestrator-dead ``RuntimeError``. The wakeup
+        is unconditional so a loop parked after ``arm_wakeup`` learns of the
+        exit now instead of at its next liveness timeout.
+        """
+        # janus>=2.0 (requirements/common.txt): shutdown() is idempotent and
+        # still valid after close(), so nothing here needs guarding.
+        self._sync_q.shutdown()
+        self._wake_scheduled = True
+        loop, ready = self._loop, self._ready
+        if loop is not None and ready is not None:
+            try:
+                loop.call_soon_threadsafe(ready.set)
+            except RuntimeError:
+                pass  # serving loop already closed
 
 
 def is_janus_sync_queue_shutdown(exc: Exception) -> bool:
