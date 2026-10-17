@@ -567,14 +567,14 @@ class CosyVoice3Code2Wav(nn.Module):
 
         Build each prompt/continuation contiguously before right padding. Padding
         the prompt and continuation separately would insert a gap in conditioning.
-        The default keeps exact-length CPU-F0 HiFT. The opt-in Hopper profile
-        uses packed Flow, batched HiFT, and FP64 GPU F0.
+        The default keeps exact-length CPU-F0 HiFT. The opt-in profile (GPUs with
+        FA2/FA3) uses packed Flow, batched HiFT, and FP64 GPU F0.
         """
         if not items:
             return []
         if stream_items:
             if not cosyvoice3_packed_streaming_enabled():
-                raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on Hopper")
+                raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on a GPU with FA2/FA3")
             if any(bool(item.get("finalize", False)) != bool(items[0].get("finalize", False)) for item in items):
                 raise ValueError("Use forward_streaming_batch to group mixed finalization states")
         if len(items) > 8:

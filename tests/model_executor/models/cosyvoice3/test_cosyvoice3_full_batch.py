@@ -37,6 +37,15 @@ def _items(shapes, **extra):
     ]
 
 
+def require_packed_fa(monkeypatch, fa_version):
+    """Pin the packed Flow attention backend, skipping GPUs without it."""
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_packed_fa_version
+
+    monkeypatch.setenv("COSYVOICE3_PACKED_FA_VERSION", str(fa_version))
+    if cosyvoice3_packed_fa_version() != fa_version:
+        pytest.skip(f"FA{fa_version} is unavailable on this GPU")
+
+
 def tiny_flow(monkeypatch):
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
@@ -70,10 +79,10 @@ def test_full_batch_ragged_prompt_matches_independent_flow(monkeypatch, offset, 
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("fa_version", [2, 3])
 @torch.inference_mode()
-def test_packed_full_response_preserves_request_isolation(monkeypatch):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("the opt-in packed backend requires Hopper FA3")
+def test_packed_full_response_preserves_request_isolation(monkeypatch, fa_version):
+    require_packed_fa(monkeypatch, fa_version)
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
     model = tiny_flow(monkeypatch).bfloat16()
     model.hift.upsample_rates = [1]
@@ -109,32 +118,27 @@ def test_packed_stream_noise_growth_preserves_prefix_and_global_rng():
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("fa_version", [2, 3])
 @torch.inference_mode()
-def test_packed_stream_attention_matches_chunk_causal_reference():
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("the opt-in packed backend requires Hopper FA3")
+def test_packed_stream_attention_matches_chunk_causal_reference(monkeypatch, fa_version):
+    require_packed_fa(monkeypatch, fa_version)
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
         RaggedRowAttention,
         pack_rows,
-        packed_fa3,
+        ragged_attention_tensor_geometry,
     )
 
+    # Row starts that are not multiples of 16 exercise FA2's page alignment.
     lengths = [67, 103]
     rows = pack_rows(lengths, torch.device("cuda"))
-    attention = RaggedRowAttention(rows, heads=2, head_dim=64, chunk_size=50)
+    attention = RaggedRowAttention(rows, heads=2, head_dim=64, fa_version=fa_version, chunk_size=50)
     generator = torch.Generator(device="cuda").manual_seed(7)
     q, k, v = [
         torch.randn(sum(lengths), 2, 64, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
     ]
-    actual = packed_fa3(
-        q,
-        k[:, None],
-        v[:, None],
-        attention.cache_seqlens,
-        attention.page_table,
-        attention.cu_seqlens_q,
-        attention.max_seqlen_q,
-    )
+    actual = ragged_attention_tensor_geometry(
+        q.reshape(1, -1, 128), k.reshape(1, -1, 128), v.reshape(1, -1, 128), attention, attention.max_seqlen_q
+    ).reshape(-1, 2, 64)
     start = 0
     for length in lengths:
         position = torch.arange(length, device="cuda")
@@ -150,10 +154,10 @@ def test_packed_stream_attention_matches_chunk_causal_reference():
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("fa_version", [2, 3])
 @torch.inference_mode()
-def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monkeypatch):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("the opt-in packed backend requires Hopper FA3")
+def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monkeypatch, fa_version):
+    require_packed_fa(monkeypatch, fa_version)
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0")
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
     model = tiny_flow(monkeypatch).bfloat16()

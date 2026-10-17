@@ -5,18 +5,18 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from tests.model_executor.models.cosyvoice3.test_cosyvoice3_full_batch import MelOutput, _items
+from tests.model_executor.models.cosyvoice3.test_cosyvoice3_full_batch import MelOutput, _items, require_packed_fa
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("fa_version", [2, 3])
 @pytest.mark.parametrize("streaming", [False, True])
 @torch.inference_mode()
-def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("the opt-in packed backend requires Hopper FA3")
+def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, fa_version):
+    require_packed_fa(monkeypatch, fa_version)
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
