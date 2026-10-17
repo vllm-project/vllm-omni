@@ -4,7 +4,7 @@
 
 import math
 from collections.abc import Iterable
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelOutput
+from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.helios.cross_attn_cache import SourceTensorLRUCache
 
 if TYPE_CHECKING:
@@ -35,6 +36,15 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+@cache
+def _is_validated_ascend_a3_device(device: torch.device) -> bool:
+    if device.type != "npu":
+        return False
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+    return get_ascend_device_type() == AscendDeviceType.A3
 
 
 def pad_for_3d_conv(x, kernel_size):
@@ -72,6 +82,54 @@ def apply_rotary_emb_helios(
         dim=-1,
     )
     return rotated.flatten(-2, -1).type_as(hidden_states)
+
+
+class HeliosRotaryEmbedding(nn.Module):
+    """Adapt Helios RoPE, fusing its validated NPU B=1, D=128 layout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.impl = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+
+    @staticmethod
+    def _can_use_npu_impl(hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> bool:
+        return (
+            hidden_states.device.type == "npu"
+            and _is_validated_ascend_a3_device(hidden_states.device)
+            and hidden_states.dim() == 4
+            and freqs_cis.dim() == 3
+            and hidden_states.dtype == torch.bfloat16
+            and freqs_cis.dtype == torch.float32
+            and freqs_cis.device == hidden_states.device
+            and hidden_states.shape[0] == freqs_cis.shape[0] == 1
+            and hidden_states.shape[1] == freqs_cis.shape[1]
+            and hidden_states.shape[-1] == 128
+        )
+
+    def forward(self, hidden_states: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        """Apply adjacent-pair RoPE to ``[B, S, H, D]`` hidden states.
+
+        ``freqs_cis`` is ``[B, S, 2D]`` with concatenated cosine and sine
+        halves. Helios repeats every frequency for an adjacent feature pair.
+        """
+        head_dim = hidden_states.shape[-1]
+        if head_dim % 2 or freqs_cis.shape[-1] != 2 * head_dim:
+            raise ValueError(
+                "Helios RoPE expects an even head dimension and a frequency table "
+                f"twice that width; got {head_dim=} and {freqs_cis.shape[-1]=}."
+            )
+
+        # RotaryEmbeddingWan's fused backends consume a sequence-only table.
+        # Helios can carry per-sample frame indices, so preserve batch-specific
+        # frequencies and the exact pre-existing implementation when B > 1.
+        # Other accelerators also keep that implementation until independently
+        # validated against their compile paths.
+        if not self._can_use_npu_impl(hidden_states, freqs_cis):
+            return apply_rotary_emb_helios(hidden_states, freqs_cis)
+
+        cos = freqs_cis[..., :head_dim:2].unsqueeze(-2)
+        sin = freqs_cis[..., head_dim + 1 :: 2].unsqueeze(-2)
+        return self.impl(hidden_states, cos, sin)
 
 
 class DistributedRMSNorm(nn.Module):
@@ -302,6 +360,7 @@ class HeliosSelfAttention(nn.Module):
 
         self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+        self.rotary_embedding = HeliosRotaryEmbedding()
 
         self.to_out = RowParallelLinear(
             self.inner_dim,
@@ -354,8 +413,8 @@ class HeliosSelfAttention(nn.Module):
         value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
 
         if rotary_emb is not None:
-            query = apply_rotary_emb_helios(query, rotary_emb)
-            key = apply_rotary_emb_helios(key, rotary_emb)
+            query = self.rotary_embedding(query, rotary_emb)
+            key = self.rotary_embedding(key, rotary_emb)
 
         if self.is_amplify_history and original_context_length is not None:
             history_seq_len = hidden_states.shape[1] - original_context_length
