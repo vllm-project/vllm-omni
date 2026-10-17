@@ -31,6 +31,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.torch_compile import log_torch_compile_stats
 
 logger = init_logger(__name__)
 
@@ -926,8 +927,9 @@ class CodePredictorWrapper(nn.Module):
                 dynamic=self._short_kv_enabled,
                 options={"epilogue_fusion": False},
             )
-        with torch._dynamo.config.patch(cache_size_limit=self._compile_cache_size_limit()):
-            self._warmup_buckets()
+        with log_torch_compile_stats(logger, "code_predictor"):
+            with torch._dynamo.config.patch(cache_size_limit=self._compile_cache_size_limit()):
+                self._warmup_buckets()
 
         if self._kv_cache_enabled:
             # Fifteen short steps per call: they rely on the runner capturing
