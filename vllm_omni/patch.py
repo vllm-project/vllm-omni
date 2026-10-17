@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from functools import cached_property
+from typing import Any
 
 import torch
 from aenum import extend_enum
@@ -587,7 +588,7 @@ _patch_inductor_factorable_divisibility()
 
 
 # =============================================================================
-# Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
+# Patch CuMem/XpuMem allocator _python_free_callback to fix double-free on shutdown
 # =============================================================================
 # WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free
 # skip with ``if data.is_asleep and current_platform.is_rocm():`` — only ROCm
@@ -605,19 +606,16 @@ _patch_inductor_factorable_divisibility()
 # The fix removes the ``current_platform.is_rocm()`` condition so the guard
 # applies to CUDA (and any future platform that implements cumem).
 #
+# The same guard is applied to XpuMemAllocator, whose upstream
+# ``_python_free_callback`` has no asleep check at all.
+#
 # FRAGILITY: Relies on ``_python_free_callback`` being a regular method
-# (not a slot or C extension).  If CuMemAllocator is rewritten in C/Cython,
-# this monkey-patch will silently become a no-op.
-def _patch_cumem_free_callback_cuda() -> None:
-    try:
-        from vllm.device_allocator.cumem import CuMemAllocator
-    except ImportError:
-        _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
-        return
+# (not a slot or C extension).  If CuMemAllocator/XpuMemAllocator is rewritten
+# in C/Cython, this monkey-patch will silently become a no-op.
+def _patch_mem_allocator_free_callback(allocator_cls: Any, log_tag: str) -> None:
+    _original_free_callback = allocator_cls._python_free_callback
 
-    _original_free_callback = CuMemAllocator._python_free_callback
-
-    if getattr(_original_free_callback, "_omni_cumem_cuda_patched", False):
+    if getattr(_original_free_callback, "_omni_free_callback_patched", False):
         return
 
     # The upstream bug: `_python_free_callback` only skips the double-free
@@ -629,28 +627,49 @@ def _patch_cumem_free_callback_cuda() -> None:
             data.cpu_backup_tensor = None
         if data.is_asleep:
             # sleep() already called unmap_and_release() on this allocation.
-            # Return an empty chunk list so the C extension skips
-            # cuMemRelease, avoiding a double-free.  Same logic as the
-            # existing ROCm guard, but applied to all platforms.
+            # Return an empty chunk list so the C extension skips the
+            # release, avoiding a double-free.  Same logic as the existing
+            # ROCm guard, but applied to all platforms.
             device, size, d_mem, _ = data.handle
             result = (device, size, d_mem, [])
             _PATCH_LOGGER.debug(
-                "[cumem-cuda] Free callback: asleep entry %s -> empty handle",
+                "[%s] Free callback: asleep entry %s -> empty handle",
+                log_tag,
                 ptr,
             )
             return result
-        # Drain pending kernels before the C extension's cuMemUnmap.
+        # Drain pending kernels before the C extension unmaps.
         torch.accelerator.synchronize(data.handle[0])
         return data.handle
 
-    _patched_free_callback._omni_cumem_cuda_patched = True
-    CuMemAllocator._python_free_callback = _patched_free_callback
+    _patched_free_callback._omni_free_callback_patched = True
+    allocator_cls._python_free_callback = _patched_free_callback
     _PATCH_LOGGER.info(
-        "[cumem-cuda] CuMemAllocator._python_free_callback patched: asleep guard extended to all platforms."
+        "[%s] %s._python_free_callback patched: asleep guard extended to all platforms.",
+        log_tag,
+        allocator_cls.__name__,
     )
 
 
-_patch_cumem_free_callback_cuda()
+def _patch_sleep_allocator_free_callbacks() -> None:
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+    except ImportError:
+        _PATCH_LOGGER.debug("[cumem] CuMemAllocator not available; skipping patch")
+    else:
+        if cumem_available:
+            _patch_mem_allocator_free_callback(CuMemAllocator, "cumem")
+
+    try:
+        from vllm.device_allocator.xpumem import XpuMemAllocator, xpumem_available
+    except ImportError:
+        _PATCH_LOGGER.debug("[xpumem] XpuMemAllocator not available; skipping patch")
+    else:
+        if xpumem_available:
+            _patch_mem_allocator_free_callback(XpuMemAllocator, "xpumem")
+
+
+_patch_sleep_allocator_free_callbacks()
 
 
 def _patch_batched_seeded_random_sample() -> None:

@@ -594,3 +594,20 @@ def test_cuda_profiler_is_wired_for_omni_worker(monkeypatch):
 
     assert isinstance(worker.profiler, FakeCudaProfiler)
     assert worker.profiler.profiler_config.profiler == "cuda"
+
+
+@pytest.mark.parametrize(
+    "module_name, class_name",
+    [
+        ("vllm_omni.platforms.xpu.worker.xpu_ar_worker", "XPUARWorker"),
+        ("vllm_omni.platforms.xpu.worker.xpu_generation_worker", "XPUGenerationWorker"),
+    ],
+)
+def test_xpu_workers_reuse_omni_gpu_worker_base(module_name, class_name):
+    module = pytest.importorskip(module_name)
+    worker_cls = getattr(module, class_name)
+
+    mro = worker_cls.__mro__
+    assert mro.index(OmniGPUWorkerBase) < mro.index(module.XPUWorker)
+    for method in ("_maybe_get_memory_pool_context", "sleep", "wake_up", "handle_sleep_task", "handle_wake_task"):
+        assert getattr(worker_cls, method) is getattr(OmniGPUWorkerBase, method)

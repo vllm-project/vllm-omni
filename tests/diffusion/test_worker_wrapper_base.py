@@ -348,8 +348,8 @@ class TestWorkerWrapperBaseDelegation:
 
         allocator = FakeAllocator()
         mocker.patch(
-            "vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class",
-            return_value=SimpleNamespace(get_instance=lambda: allocator),
+            "vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance",
+            return_value=allocator,
         )
         mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector",
@@ -433,8 +433,8 @@ class TestWorkerWrapperBaseDelegation:
     def test_worker_shutdown_releases_only_owned_sleep_pool(self, mocker: MockerFixture, owns_pool, cleanup_fails):
         destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
         shutdown_connector = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
-        allocator_class = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class")
-        release = allocator_class.return_value.get_instance.return_value.release_pools
+        allocator = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance").return_value
+        release = allocator.release_pools
         if cleanup_fails:
             release.side_effect = RuntimeError("pool release failed")
         worker = DiffusionWorker.__new__(DiffusionWorker)
