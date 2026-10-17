@@ -271,7 +271,7 @@ class _StartupMemoryProfiler:
         return False
 
 
-def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_class_name="WanPipeline"):
+def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_class_name="MiniMaxH3Pipeline"):
     """Run the real load_model with the loader, memory profiler, offload and cache factory replaced."""
 
     class _Loader:
