@@ -8,10 +8,14 @@ transferred from the shipped ``campplus.onnx`` into the in-tree torch
 architecture :class:`CAMPPlus` (``indextts2/utils/campplus/dtdnn.py``) — same
 module the onnx was exported from, so a single architecture source of truth.
 
-Equivalence (verified on NPU, 50-run warm): maxdiff vs onnx 7.7e-03 at
-[T=97/200/501] on the 192-d normalized embedding; per-call latency 30-32ms
-vs 120-155ms for the CPU onnxruntime session.
+Equivalence (CPU onnxruntime vs NPU torch, L2-normalized 192-d embedding,
+onnx asset sha256 a6ac6a639977): cosine >= 0.999998, maxdiff <= 4.2e-04 at
+[T=97/200/501]; per-call latency 30-32ms vs 120-155ms for the CPU
+onnxruntime session. Covered by
+``tests/model_executor/models/cosyvoice3/test_campplus_torch_parity.py``.
 """
+
+import os
 
 import onnx
 import regex as re
@@ -52,6 +56,7 @@ def _fused_conv2d(old: nn.Module, mod: str, by_mod: dict) -> nn.Module:
         old.dilation,
         old.groups,
         bias=True,
+        dtype=torch.float32,
     )
     nc.weight.data.copy_(torch.from_numpy(by_mod[mod]["weight"]))
     nc.bias.data.copy_(torch.from_numpy(by_mod[mod]["bias"]))
@@ -69,20 +74,8 @@ def _with_bias_conv1d(old: nn.Conv1d) -> nn.Conv1d:
         dilation=old.dilation,
         groups=old.groups,
         bias=True,
+        dtype=torch.float32,
     )
-
-
-def _load_campplus_from_onnx(onnx_path: str) -> CAMPPlus:
-    # vLLM constructs models under a bf16 default dtype; every nn.Module
-    # created here (including the convs that receive the fp32 onnx weights
-    # via copy_) would otherwise be built in bf16 and later collide with the
-    # fp32 fbank input ("Input type (float) and bias type (c10::BFloat16)").
-    previous_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.float32)
-    try:
-        return _build_campplus_fp32(onnx_path)
-    finally:
-        torch.set_default_dtype(previous_dtype)
 
 
 def _build_campplus_fp32(onnx_path: str) -> CAMPPlus:
@@ -121,7 +114,13 @@ def _build_campplus_fp32(onnx_path: str) -> CAMPPlus:
                     d[slot] = raw[ref]
         by_mod[mod] = d
 
-    model = CAMPPlus(feat_dim=80, embedding_size=192)
+    # Explicit fp32 without touching the process-global default dtype (which
+    # is racy under threads): vLLM may construct models under a bf16 default,
+    # so the convs rebuilt by the surgery below pass ``dtype=torch.float32``
+    # explicitly and this ``.float()`` moves the remaining CAMPPlus submodules
+    # to fp32 *before* any onnx fp32 weight is copied in — every value written
+    # afterwards lands in an fp32 parameter, so no precision is lost.
+    model = CAMPPlus(feat_dim=80, embedding_size=192).float()
 
     # --- head surgery: onnx folded Conv+BN; rebuild head convs with fused weight+bias ---
     fcm = model.head
@@ -189,9 +188,28 @@ def _build_campplus_fp32(onnx_path: str) -> CAMPPlus:
     return model
 
 
+# Process-level cache keyed exactly like the TensorRT wrapper's
+# ``(onnx_path, device)`` so multiple Token2Wav replicas constructed in one
+# worker process share a single parsed onnx -> torch model.
+_CAMPPLUS_TORCH_CACHE: dict[tuple[str, str], CampplusTorch] = {}
+
+
 def get_campplus_torch(onnx_path: str, device: str | torch.device) -> CampplusTorch:
-    """Build a torch CAM++ from ``campplus.onnx`` weights and move it to ``device``."""
-    model = _load_campplus_from_onnx(onnx_path)
+    """Build (once per process per ``device``) a torch CAM++ from ``campplus.onnx``."""
+    # Normalize to an explicit device index before keying the cache: an
+    # unindexed "npu"/"cuda" only resolves to the *current* device at ``.to()``
+    # time, so two stages on different cards both passing "npu" would collide
+    # on one key and silently share weights pinned to the first card (review).
+    d = device if isinstance(device, torch.device) else torch.device(device)
+    if d.index is None:
+        d = torch.device(d.type, getattr(torch, d.type).current_device())
+    key = (os.path.abspath(onnx_path), str(d))
+    cached = _CAMPPLUS_TORCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    model = _build_campplus_fp32(onnx_path)
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info("campplus onnx->torch transfer done: %.1fM params, device=%s", n_params / 1e6, device)
-    return CampplusTorch(model, device)
+    logger.info("campplus onnx->torch transfer done: %.1fM params, device=%s", n_params / 1e6, d)
+    wrapper = CampplusTorch(model, d)
+    _CAMPPLUS_TORCH_CACHE[key] = wrapper
+    return wrapper
