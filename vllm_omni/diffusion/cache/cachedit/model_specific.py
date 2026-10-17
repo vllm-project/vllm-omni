@@ -50,20 +50,24 @@ def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[in
     Returns:
         A tuple of (num_high_noise_steps, num_low_noise_steps).
     """
-    if pipeline.boundary_ratio is not None:
-        boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
-    else:
-        boundary_timestep = None
+    # Mirror the fallback forward() applies when the server pins no boundary_ratio;
+    # without it every step would land on transformer and transformer_2's context
+    # would be sized for zero steps.
+    boundary_ratio = pipeline.boundary_ratio if pipeline.boundary_ratio is not None else 0.875
+    boundary_timestep = boundary_ratio * pipeline.scheduler.config.num_train_timesteps
 
-    # Set timesteps to calculate the split
+    # Set timesteps to calculate the split. forward() re-arms the scheduler for
+    # every request, so probing it here is safe, but it must use the same flow
+    # shift: the UniPC scheduler is built unshifted and forward() applies the
+    # shift in set_timesteps, so an unshifted probe misplaces the boundary.
     device = next(pipeline.transformer.parameters()).device
-    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+    if getattr(pipeline, "_sample_solver", None) == "unipc":
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device, shift=pipeline._flow_shift)
+    else:
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
 
     timesteps = pipeline.scheduler.timesteps
-    num_high_noise_steps = 0  # high-noise steps for transformer
-    for t in timesteps:
-        if boundary_timestep is None or t >= boundary_timestep:
-            num_high_noise_steps += 1
+    num_high_noise_steps = int((timesteps >= boundary_timestep).sum())  # high-noise steps for transformer
     # low-noise steps for transformer_2
     num_low_noise_steps = num_inference_steps - num_high_noise_steps
     return num_high_noise_steps, num_low_noise_steps
