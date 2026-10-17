@@ -123,7 +123,8 @@ def test_distributed_tile_hooks_match_tiled_decode():
         tiled = vae.tiled_decode(z, return_dict=False)[0]
 
         tasks, grid_spec = DistributedAutoencoderKLQwenImage21.tile_split(distributed, z)
-        # 16x16 latent, 8x8 latent tiles, stride 6 -> range(0, 16, 6) = 3 stops/axis.
+        # 16x16 latent, 8x8 latent tiles, stride 6 -> _tile_starts gives [0, 6, 8]
+        # (the trailing tile is snapped back to 16 - 8 = 8), 3 stops per axis.
         assert len(tasks) == 9
         assert grid_spec.grid_shape == (3, 3)
         assert grid_spec.split_dims == (3, 4)
@@ -135,6 +136,37 @@ def test_distributed_tile_hooks_match_tiled_decode():
 
     assert merged.shape == tiled.shape
     torch.testing.assert_close(merged, tiled)
+
+
+def test_trailing_tile_keeps_the_full_decode_window():
+    """Regression: a clipped trailing tile leaves a visible seam (vllm-omni#8850).
+
+    Tiles are placed at a fixed stride, so a size that is not a multiple of the
+    stride used to clip the trailing tile at the image border (4 latent cells
+    instead of 8 here). A clipped tile decodes with less context than its
+    neighbours, which leaves a seam that the blend does not hide. The layout must
+    snap the trailing tile back so every tile keeps the full decode window.
+    """
+    torch.manual_seed(0)
+    vae = _make_vae(DistributedAutoencoderKLQwenImage21)
+    vae.enable_tiling(
+        tile_sample_min_height=32,
+        tile_sample_min_width=32,
+        tile_sample_stride_height=24,
+        tile_sample_stride_width=24,
+    )
+    tile_latent = 32 // vae.spatial_compression_ratio  # 8 latent cells
+
+    # 16 and 22 are not multiples of the latent stride (6), so the trailing tile
+    # is clipped under the old layout.
+    for height, width in ((16, 22), (22, 16), (16, 16)):
+        z = torch.randn(1, 4, 1, height, width)
+        tasks, _ = DistributedAutoencoderKLQwenImage21.tile_split(vae, z)
+        windows = {(task.tensor[0].shape[-2], task.tensor[0].shape[-1]) for task in tasks}
+        assert windows == {(tile_latent, tile_latent)}, (
+            f"latent {height}x{width}: decoded tiles with a clipped window {windows}; "
+            f"every tile must keep the full {tile_latent}x{tile_latent} window"
+        )
 
 
 def test_tiled_encode_output_shape_and_closeness():
