@@ -23,6 +23,9 @@ SPEC.loader.exec_module(SELECTOR)
     ("branch", "labels", "expected"),
     [
         ("main", (), ("merge",)),
+        ("0.30.0", (), ("merge",)),
+        ("0.30.0", ("ready",), ("merge",)),
+        ("v0.30.0", (), ("ready",)),
         ("feature", ("ready",), ("ready",)),
         ("feature", ("merge-test",), ("merge",)),
         ("feature", ("merge-test", "ready"), ("ready", "merge")),
@@ -87,6 +90,22 @@ def test_scheduled_main_rejects_nightly_and_weekly_together():
             nightly=True,
             weekly=True,
         )
+
+
+def test_scheduled_version_branch_selects_only_nightly():
+    assert SELECTOR.select_amd_test_suites(
+        branch="0.30.0",
+        labels=("ready",),
+        nightly=True,
+    ) == ("nightly",)
+
+
+def test_scheduled_version_branch_selects_only_weekly():
+    assert SELECTOR.select_amd_test_suites(
+        branch="0.30.0",
+        labels=("ready",),
+        weekly=True,
+    ) == ("weekly",)
 
 
 def test_empty_debug_override_uses_normal_selection():

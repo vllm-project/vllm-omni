@@ -682,6 +682,7 @@ def run_benchmark(
     if random_output_len is not None:
         result["random_output_len"] = random_output_len
     result["Hardware"] = hardware_json_value(resource_label)
+    result["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
     result["test_name"] = test_name
     if benchmark_params_name:
         result["name"] = benchmark_params_name
