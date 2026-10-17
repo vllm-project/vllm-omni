@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from vllm_omni.diffusion.lora.layers import (
     DiffusionReplicatedLinearWithLoRA,
     DiffusionRowParallelLinearWithLoRA,
 )
+from vllm_omni.diffusion.lora.layers.mot_qkv_parallel_linear import DiffusionMoTQKVParallelLinearWithLoRA
 
 
 def _match_target_modules(module_name: str, target_modules: list[str]) -> bool:
@@ -66,6 +67,7 @@ def from_layer_diffusion(
     Diffusion-specific layer replacement. similar to vLLM's `from_layer`
     """
     diffusion_lora_classes = [
+        DiffusionMoTQKVParallelLinearWithLoRA,
         DiffusionMergedQKVParallelLinearWithLoRA,
         DiffusionQKVParallelLinearWithLoRA,
         DiffusionMergedColumnParallelLinearWithLoRA,
