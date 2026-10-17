@@ -11,7 +11,9 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -25,11 +27,13 @@ def test_observation_conditioned_startup_skips_generic_warmup(model_class_name: 
     engine.od_config.model_class_name = model_class_name
     engine.od_config.diffusion_load_format = "default"
     engine.add_req_and_wait_for_response = Mock(side_effect=AssertionError("generic text warmup submitted"))
+    engine.collective_rpc = Mock()
     engine.close = Mock()
 
     engine.run_startup_warmup()
 
     engine.add_req_and_wait_for_response.assert_not_called()
+    engine.collective_rpc.assert_not_called()
     engine.close.assert_not_called()
 
 
@@ -69,6 +73,112 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     assert captured_requests[0].sampling_params.num_inference_steps == 2
 
 
+def test_startup_runs_vae_warmup_after_generic_dummy():
+    events = []
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": [{"height": 384, "width": 640}]}
+    engine._dummy_run = lambda: events.append("dummy_run")
+    engine.collective_rpc = Mock(side_effect=lambda method: events.append("vae_warmup"))
+    engine.close = Mock()
+
+    engine.run_startup_warmup()
+
+    assert events == ["dummy_run", "vae_warmup"]
+    engine.collective_rpc.assert_called_once_with(method="run_helios_vae_warmup")
+    engine.close.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "additional_config",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"helios_vae_warmup_profiles": None}, id="none"),
+        pytest.param({"helios_vae_warmup_profiles": []}, id="empty-list"),
+        pytest.param({"helios_vae_warmup_profiles": ()}, id="empty-tuple"),
+    ],
+)
+def test_startup_skips_vae_warmup_when_profiles_are_disabled(additional_config: dict[str, object], mocker) -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = additional_config
+    engine._dummy_run = mocker.Mock()
+    engine.collective_rpc = mocker.Mock()
+    engine.close = mocker.Mock()
+
+    engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_not_called()
+    engine.close.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        pytest.param({}, id="empty-mapping"),
+        pytest.param("", id="empty-string"),
+        pytest.param(b"", id="empty-bytes"),
+        pytest.param(False, id="false"),
+        pytest.param(0, id="zero"),
+        pytest.param("384x640", id="string"),
+    ],
+)
+def test_startup_malformed_profiles_reach_pipeline_validation(profiles: object, mocker) -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": profiles}
+    engine._dummy_run = mocker.Mock()
+    engine.close = mocker.Mock()
+    runner = object.__new__(DiffusionModelRunner)
+    runner.od_config = engine.od_config
+    runner.pipeline = object.__new__(HeliosPipeline)
+
+    def run_warmup(method: str) -> None:
+        assert method == "run_helios_vae_warmup"
+        runner.run_helios_vae_warmup()
+
+    engine.collective_rpc = mocker.Mock(side_effect=run_warmup)
+
+    with pytest.raises(TypeError, match="helios_vae_warmup_profiles must be a sequence of profile mappings"):
+        engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_called_once_with(method="run_helios_vae_warmup")
+    engine.close.assert_called_once_with()
+
+
+def test_startup_skips_vae_warmup_when_generic_dummy_fails():
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": [{"height": 384, "width": 640}]}
+    engine._dummy_run = Mock(side_effect=RuntimeError("dummy failed"))
+    engine.collective_rpc = Mock()
+    engine.close = Mock()
+
+    with pytest.raises(RuntimeError, match="dummy failed"):
+        engine.run_startup_warmup()
+
+    engine.collective_rpc.assert_not_called()
+    engine.close.assert_called_once_with()
+
+
+def test_startup_closes_engine_when_vae_warmup_fails():
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.additional_config = {"helios_vae_warmup_profiles": [{"height": 384, "width": 640}]}
+    engine._dummy_run = Mock()
+    engine.collective_rpc = Mock(side_effect=RuntimeError("vae warmup failed"))
+    engine.close = Mock()
+
+    with pytest.raises(RuntimeError, match="vae warmup failed"):
+        engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_called_once_with(method="run_helios_vae_warmup")
+    engine.close.assert_called_once_with()
+
+
 def test_allgather_startup_runs_broadcast_dummy_request() -> None:
     engine = object.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(
@@ -80,10 +190,12 @@ def test_allgather_startup_runs_broadcast_dummy_request() -> None:
         parallel_config=SimpleNamespace(data_parallel_size=2, sequence_parallel_size=1),
     )
     engine._dummy_run = Mock()
+    engine.collective_rpc = Mock()
 
     engine.run_startup_warmup()
 
     engine._dummy_run.assert_called_once_with()
+    engine.collective_rpc.assert_not_called()
 
 
 def test_dummy_run_num_frames_uses_explicit_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:
