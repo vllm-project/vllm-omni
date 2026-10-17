@@ -21,6 +21,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -2202,3 +2203,22 @@ def test_shutdown_drops_cached_sampled_token_override(mocker):
 
     assert runner._sampled_token_ids_cpu_override is None
     upstream.assert_called_once()
+
+
+def test_shutdown_releases_encoder_cudagraph_manager(mocker):
+    """Encoder graphs, their pool and the model they reference go before upstream teardown."""
+    runner = object.__new__(GPUARModelRunner)
+    runner.omni_prefix_cache = None
+    runner._sampled_token_ids_cpu_override = None
+    manager = mocker.Mock()
+    runner.encoder_cudagraph_manager = manager
+    mocker.patch.object(runner, "_clear_duplex_sampling")
+    events = []
+    manager.clear.side_effect = lambda: events.append("clear")
+    # Only upstream teardown is stubbed: the release can sit in any omni layer.
+    mocker.patch.object(GPUModelRunner, "shutdown", side_effect=lambda self: events.append("upstream"), autospec=True)
+
+    runner.shutdown()
+
+    assert runner.encoder_cudagraph_manager is None
+    assert events == ["clear", "upstream"]
