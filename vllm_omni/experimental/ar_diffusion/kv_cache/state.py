@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.ar_diffusion.kv_cache.conditioning import ConditioningKVScope
+from vllm_omni.experimental.ar_diffusion.kv_cache.first_block import FirstBlockKVSnapshot
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedForwardContext,
     ARDiffusionPagedLayerContext,
@@ -54,6 +57,7 @@ class ARDiffusionKVState:
         self._committed: dict[str, int] = dict.fromkeys(expected, 0)
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
         self._closed = False
+        self.conditioning_kv = ConditioningKVScope(kv_cache, session_id, num_layers)
 
     @property
     def kv_branch_names(self) -> tuple[str, ...]:
@@ -144,6 +148,58 @@ class ARDiffusionKVState:
         ctx.mark_committed()
         self._paged_pending[kv_branch] = None
 
+    def snapshot_first_block(self, kv_branch: str, token_count: int) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Copy a successfully committed opening block into immutable CPU storage."""
+        adapter = self.adapter(kv_branch)
+        if token_count <= 0 or token_count % self.kv_cache.spec.chunk_size:
+            raise ValueError("first-block snapshot length must be a positive whole number of frames")
+        if adapter.num_computed_tokens != token_count or self._paged_pending[kv_branch] is not None:
+            raise RuntimeError("first-block K/V can be published only after its complete commit")
+        slots = compute_slot_mapping(
+            self.kv_cache.block_table(adapter), torch.arange(token_count), self.kv_cache.block_size
+        )
+        if any(int(block) == self.kv_cache.null_block_id for block in self.kv_cache.block_table(adapter)):
+            raise RuntimeError("first-block K/V was evicted before snapshot publication")
+        slots = slots.to(self.kv_cache.device)
+        layers = []
+        for layer in range(self.num_layers):
+            key = self.kv_cache._k_pools[layer].index_select(0, slots).cpu().contiguous()
+            value = self.kv_cache._v_pools[layer].index_select(0, slots).cpu().contiguous()
+            layers.append((key, value))
+        return tuple(layers)
+
+    def restore_first_block(self, kv_branch: str, snapshot: FirstBlockKVSnapshot) -> None:
+        """Copy a read-only snapshot into this request's newly owned video pages."""
+        adapter = self.adapter(kv_branch)
+        kv_cache = self.kv_cache
+        key = snapshot.key
+        if adapter.completed_chunks or self._committed[kv_branch]:
+            raise RuntimeError("first-block K/V can only be restored into an empty request")
+        if key.branch != kv_branch or key.num_layers != self.num_layers:
+            raise ValueError("first-block snapshot has an incompatible branch or layer count")
+        if (key.local_heads, key.head_size, key.dtype, key.device) != (
+            kv_cache.num_kv_heads,
+            kv_cache.head_size,
+            kv_cache.dtype,
+            kv_cache.device,
+        ):
+            raise ValueError("first-block snapshot has an incompatible storage representation")
+        chunk_size = kv_cache.spec.chunk_size
+        if key.token_count <= 0 or key.token_count % chunk_size:
+            raise ValueError("first-block snapshot has an invalid token count")
+        for start in range(0, key.token_count, chunk_size):
+            kv_cache.allocate_token_slots(adapter, chunk_size)
+            for layer, (k, v) in enumerate(snapshot.layers):
+                kv_cache.write_chunk_kv(
+                    layer,
+                    k[start : start + chunk_size].to(kv_cache.device).unsqueeze(0),
+                    v[start : start + chunk_size].to(kv_cache.device).unsqueeze(0),
+                    adapter,
+                )
+            kv_cache.commit_chunk(adapter)
+        self._committed[kv_branch] = key.token_count
+        self._paged_pending[kv_branch] = None
+
     def is_cross_attention_populated(self, kv_branch: str, cache_name: str) -> bool:
         self.adapter(kv_branch)
         return self.kv_cache.is_cross_attention_populated(self.session_id, cache_name, kv_branch)
@@ -183,17 +239,25 @@ class ARDiffusionKVState:
         """
         if self._closed:
             raise RuntimeError(f"AR-Diffusion session {self.session_id!r} is closed")
+        self.conditioning_kv.invalidate()
         self.kv_cache.release_cross_attention(self.session_id)
 
     def close(self) -> None:
         """Release all self- and cross-attention storage owned by this session."""
         if self._closed:
             return
+        errors: list[Exception] = []
         for adapter in self.adapters.values():
-            self.kv_cache.end_request(adapter)
+            try:
+                self.kv_cache.end_request(adapter)
+            except Exception as exc:  # noqa: BLE001 - release all owned storage even on failure
+                errors.append(exc)
         self.kv_cache.release_cross_attention(self.session_id)
+        self.conditioning_kv.close()
         self._paged_pending = dict.fromkeys(self.adapters)
         self._closed = True
+        if errors:
+            raise errors[0]
 
     def reset(self, *, keep_cross_attention: Collection[str] = ()) -> None:
         """Release resident blocks and reopen this session with fresh adapters.
@@ -210,6 +274,7 @@ class ARDiffusionKVState:
             for adapter in self.adapters.values():
                 self.kv_cache.end_request(adapter)
             self.kv_cache.retain_cross_attention(self.session_id, keep_cross_attention)
+            self.conditioning_kv.retain(keep_cross_attention)
         else:
             self.close()
         self.adapters = {
@@ -218,6 +283,8 @@ class ARDiffusionKVState:
         self._committed = dict.fromkeys(self.adapters, 0)
         self._paged_pending = dict.fromkeys(self.adapters)
         self._closed = False
+        if not keep_cross_attention:
+            self.conditioning_kv = ConditioningKVScope(self.kv_cache, self.session_id, self.num_layers)
         _log.info(
             "AR-Diffusion RESET session=%s KV branches=%s kept_cross=%s",
             self.session_id,

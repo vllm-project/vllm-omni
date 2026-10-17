@@ -12,7 +12,7 @@ import concurrent.futures
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pytest
 
@@ -24,7 +24,6 @@ from tests.dfx.conftest import (
 )
 from tests.dfx.reliability.helpers import (
     FaultInjector,
-    GpuOomInjectionConfig,
     assert_no_server_tree_process_residual_and_gpu_release,
     assert_post_fault_api_unreachable,
     assert_post_fault_health_503,
@@ -50,11 +49,24 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
 ]
 
 E2E_STAGE_CONFIGS_DIR = Path(__file__).resolve().parent.parent / "e2e" / "stage_configs"
-OOM_INJECTION_CONFIG: GpuOomInjectionConfig = {
+
+
+class _WanOomConfig(TypedDict):
+    target_mem_ratio: float
+    max_free_bytes: int
+    hold_seconds: int
+    startup_timeout_sec: int
+    strict: bool
+
+
+OOM_INJECTION_CONFIG: _WanOomConfig = {
     "target_mem_ratio": 0.95,
+    # Stop at a free-memory ceiling. strict=True waits for RuntimeError, and
+    # HIP retries a failed alloc without raising, so the sidecar never readies.
+    "max_free_bytes": 256 * 1024 * 1024,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
-    "strict": True,
+    "strict": False,
 }
 FAULT_ERROR_KEYWORDS = (
     "oom",
@@ -215,6 +227,7 @@ def test_reliability_fault_gpu_oom_large_request_failure(omni_server_function, o
         hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
     )
     try:
         request_config = _video_request_config()
@@ -385,6 +398,7 @@ def test_reliability_fault_gpu_oom_recovers_after_fault_removed(
         hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
     )
     failure_observed = False
     failure_detail = ""

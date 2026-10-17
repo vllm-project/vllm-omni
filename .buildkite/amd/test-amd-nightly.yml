@@ -83,6 +83,27 @@ steps:
         commands:
           - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"
 
+  - group: ":full_moon: CosyVoice3 Offline MI300 Nightly"
+    steps:
+      - label: "CosyVoice3 Offline Zero-shot Smoke"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        retry:
+          automatic:
+            - exit_status: 134
+              limit: 1
+        artifact_paths:
+          - artifacts/rocm-cosyvoice3-offline-nightly/**/*
+        commands:
+          - pytest --collect-only -q tests/e2e/offline_inference/test_cosyvoice3_expansion.py -m "slow and tts and rocm and MI325 and cards_1" --run-level full_model
+          - pytest -s -v tests/e2e/offline_inference/test_cosyvoice3_expansion.py -m "slow and tts and rocm and MI325 and cards_1" --run-level full_model --junitxml=/tmp/cosyvoice3-offline-pytest.xml
+          - |
+            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-cosyvoice3-offline-nightly"
+            mkdir -p "$$artifact_dir"
+            cp -v /tmp/cosyvoice3-offline-pytest.xml "$$artifact_dir/"
+
   - group: ":full_moon: JoyImage MI300 Nightly"
     steps:
       # Dense AITER compilation alone took 23m on cold workers; masked varlen
@@ -192,6 +213,25 @@ steps:
             mkdir -p "$$artifact_dir"
             cp -v /tmp/lingbot-pytest.xml "$$artifact_dir/"
 
+  - group: ":full_moon: HunyuanVideo-1.5 MI300 Nightly"
+    steps:
+      - label: "HunyuanVideo-1.5 Default T2V Smoke"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanvideo15-nightly/**/*
+        commands:
+          - pytest --collect-only -q 'tests/e2e/online_serving/test_hunyuan_video_15_expansion.py::test_hunyuan_video_15_t2v_default[default]' -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model
+          - pytest -s -v 'tests/e2e/online_serving/test_hunyuan_video_15_expansion.py::test_hunyuan_video_15_t2v_default[default]' -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model --junitxml=/tmp/hunyuanvideo15-pytest.xml
+          - |
+            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuanvideo15-nightly"
+            mkdir -p "$$artifact_dir"
+            cp -v /tmp/hunyuanvideo15-pytest.xml "$$artifact_dir/"
+
   - group: ":full_moon: MiniMax-H3 MI300 Nightly"
     steps:
       - label: "MiniMax-H3 Official T2VA Smoke"
@@ -279,6 +319,46 @@ steps:
               "$$MINIMAX_H3_ARTIFACT_DIR/processes-after.txt" \
               2>&1 | tee "$$MINIMAX_H3_ARTIFACT_DIR/process-cleanup.txt"
 
+  - group: ":full_moon: Qwen-Image MI300 Nightly"
+    steps:
+      - label: "Qwen-Image Official-Weight Smoke"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        env:
+          VLLM_ROCM_USE_AITER: "1"
+          DIFFUSION_ATTENTION_BACKEND: FLASH_ATTN
+        artifact_paths:
+          - artifacts/rocm-qwen-image-nightly/**/*
+        commands:
+          - export QWEN_IMAGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-nightly"
+          - export AITER_JIT_DIR="/tmp/vllm-omni-qwen-image-aiter-$$BUILDKITE_JOB_ID"
+          - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-qwen-image-torch-$$BUILDKITE_JOB_ID"
+          - mkdir -p "$$QWEN_IMAGE_ARTIFACT_DIR" "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
+          - |
+            node='tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]'
+            pytest --collect-only -q \
+              'tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]' \
+              -m 'full_model and diffusion and rocm and MI325 and cards_1' \
+              --run-level full_model > "$$QWEN_IMAGE_ARTIFACT_DIR/collection.txt"
+            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+              "$$QWEN_IMAGE_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one Qwen-Image ROCm node, found $$count." >&2
+              cat "$$QWEN_IMAGE_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 75m
+            pytest -s -v -ra
+            'tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]'
+            -m 'full_model and diffusion and rocm and MI325 and cards_1'
+            --run-level full_model
+            --durations=0
+            --junitxml="$$QWEN_IMAGE_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN_IMAGE_ARTIFACT_DIR/pytest.log"
+
   - group: ":full_moon: Cosmos3 MI300 Nightly"
     steps:
       - label: "Cosmos3 T2I Function"
@@ -333,3 +413,47 @@ steps:
             mkdir -p "$$artifact_dir"
             cp -v tests/e2e/accuracy/artifacts/HunyuanImage-3_0-Instruct/*.png "$$artifact_dir/"
             cp -v /tmp/hunyuanimage3-pytest.xml "$$artifact_dir/"
+
+  # Full-model Stable Audio CPU offload. READY keeps the core_model Qwen-Image
+  # cases, and MERGE runs this file under TORCH_SDPA. This lane is the default
+  # ROCm backend and stays non-blocking while the ROCm memory threshold is unset.
+  - group: ":full_moon: Stable Audio CPU Offload MI300 Nightly"
+    steps:
+      - label: "Stable Audio CPU Offload"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        artifact_paths:
+          - artifacts/rocm-stable-audio-cpu-offload/**/*
+        commands:
+          - export STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-stable-audio-cpu-offload"
+          - mkdir -p "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR"
+          # Restore the provenance-checked unmasked BF16 AITER MHA module used
+          # by the default ROCm diffusion backend before either inference path.
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - |
+            node='tests/diffusion/offloader/test_diffusion_cpu_offload.py::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
+            pytest --collect-only -q \
+              tests/diffusion/offloader/test_diffusion_cpu_offload.py \
+              -m 'full_model and rocm and MI325 and cards_1' \
+              --run-level full_model > "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt"
+            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+              "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one Stable Audio CPU-offload node, found $$count." >&2
+              cat "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 45m
+            pytest -s -v -ra
+            tests/diffusion/offloader/test_diffusion_cpu_offload.py
+            -m 'full_model and rocm and MI325 and cards_1'
+            --run-level full_model
+            --durations=0
+            --junitxml="$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 100 "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.log" >
+            "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"

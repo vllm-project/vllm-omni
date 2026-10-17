@@ -147,6 +147,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             supports_audio_truncate=True,
             supports_chat_completions=True,
             supports_image_input=True,
+            # Frames arrive as input_image conversation items, never on an
+            # audio append (QwenPcmBuffer.prepare_append refuses video_frames).
+            optional_input_modalities=frozenset(),
             supports_text_only_turn=True,
             adapter_patterns=["turn_commit"],
             signal_sources=["client_event", "server_policy"],

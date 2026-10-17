@@ -199,13 +199,26 @@ class QwenImage21CausalConv3d(nn.Conv2d):
         self.padding = (0, 0)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
         assert cache_x is None
-        x = x.squeeze(2)  # Remove the temporal dimension
-        x = F.pad(x, padding)
-        x = super().forward(x)
-        x = x.unsqueeze(2)  # Add the temporal dimension back
-        return x
+        x = x.squeeze(2)  # Single-frame tensors have a unit time axis.
+        left, right, top, bottom = self._padding
+        if x.device.type == "npu" and left == right and top == bottom:
+            # Symmetric pad matches Conv2d padding, so skip the extra pad kernel.
+            # Other devices keep the explicit pad: built-in padding selects
+            # different cuDNN BF16 kernels and drifts from the Diffusers reference.
+            x = F.conv2d(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                padding=(top, left),
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        else:
+            x = F.pad(x, (left, right, top, bottom))
+            x = super().forward(x)
+        return x.unsqueeze(2)
 
 
 class QwenImage21RMS_norm(nn.Module):
@@ -240,9 +253,33 @@ class QwenImage21RMS_norm(nn.Module):
         needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
             t in str(x.dtype) for t in ("float4_", "float8_")
         )
-        normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=(1 if self.channel_first else -1)).to(
-            x.dtype
+        reuse_normalization = (
+            x.device.type == "npu"
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
         )
+        dim = 1 if self.channel_first else -1
+        if reuse_normalization:
+            # The dtype conversion owns this buffer; never overwrite the input.
+            normalized = x.float()
+            denominator = normalized.norm(p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
+            normalized = normalized.div_(denominator).to(x.dtype)
+        else:
+            normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=dim).to(x.dtype)
+        if (
+            x.device.type == "npu"
+            and normalized.dtype == self.gamma.dtype
+            and (not isinstance(self.bias, torch.Tensor) or self.bias.dtype == normalized.dtype)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            # Reuse the fresh normalization output, preserving each rounding step.
+            normalized.mul_(self.scale).mul_(self.gamma)
+            # bias=False stores a Python zero, not a trainable tensor.
+            if not isinstance(self.bias, torch.Tensor) and self.bias == 0.0:
+                return normalized
+            return normalized.add_(self.bias)
         return normalized * self.scale * self.gamma + self.bias
 
 

@@ -33,6 +33,7 @@ from tests.dfx.reliability.helpers import (
     make_server_root_kill_fault_injector,
     make_server_tree_kill_fault_injector,
     post_json_raw,
+    reliability_scenarios_for_eager_oom,
     run_fault_injection_with_rate_load,
     stop_gpu_oom_hogs,
     worker_residual_timeout_after_kill_signal,
@@ -87,9 +88,11 @@ class _OomInjectionConfig(_OomInjectionBaseConfig):
 OOM_INJECTION_CONFIG: _OomInjectionConfig = {
     "device": _default_oom_device_spec(),
     "target_mem_ratio": 0.95,
-    # MI325 can retain several GiB after allocating 95% of initially free memory.
-    # Keep a small absolute ceiling so the hard-failure probes deterministically OOM.
-    "max_free_bytes": 256 * 1024 * 1024,
+    # MI300 keeps a large caching-allocator pool, so a 256MB device-free ceiling
+    # still lets the text and multimodal probes return 200. HIP also retries an
+    # OOM instead of failing the request. Leave only a few MB so those probes
+    # have to allocate. CUDA keeps the wider 256MB ceiling.
+    "max_free_bytes": 32 * 1024 * 1024 if getattr(torch.version, "hip", None) else 256 * 1024 * 1024,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,
@@ -216,7 +219,7 @@ def _get_mix_prompt() -> str:
 def _mix_chat_completions_probe_payload(omni_server: _HasServeArgs) -> dict[str, Any]:
     """Heavy multimodal ``/v1/chat/completions`` body for OOM recover tests.
 
-    Uses the same synthetic sizes as ``test_reliability_fault_gpu_oom_large_request_failure``
+    Uses the same synthetic sizes as ``test_reliability_fault_gpu_oom_chat_large_payload_failure``
     (large vision tensors + long text), not the light expansion mix (224² / 5s audio): under
     ``strict=False`` sidecars, a small mix often still completes on a GPU that retains multi-GB
     free after the hog stops at ``target_mem_ratio``.
@@ -393,11 +396,19 @@ def _assert_server_alive_after_fault(online_client: Any, *, scenario: str) -> No
 
 
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
+QWEN_OOM_PARAMS = create_reliability_omni_server_params(
+    reliability_scenarios_for_eager_oom(
+        RELIABILITY_SCENARIOS,
+        is_hip=bool(getattr(torch.version, "hip", None)),
+        stage_ids=(0, 1),
+    ),
+    DEPLOY_CONFIGS_DIR,
+)
 
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server_function", QWEN_OOM_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     omni_server_function,
     online_client_function,
@@ -432,8 +443,12 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     # Under OOM pressure both chat and speech should return HTTP 500
     # instead of request-validation-class (4xx) errors.
     try:
+        # Preserve the text-only output contract while using the heavy
+        # multimodal input needed to reach the allocation path on MI300.
+        text_request = _oom_contract_request(["text"])
+        text_request["max_tokens"] = 256
         online_client_function.send_chat_completions_http_request(
-            {"json": _oom_contract_request(["text"]), "timeout": oom_contract_timeout_sec},
+            {"json": text_request, "timeout": oom_contract_timeout_sec},
             err_code=500,
         )
         online_client_function.send_chat_completions_http_request(
@@ -449,8 +464,8 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_large_request_failure(omni_server_function, online_client_function) -> None:
+@pytest.mark.parametrize("omni_server_function", QWEN_OOM_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
         _deploy_config_path_from_omni_server(omni_server_function),
@@ -492,7 +507,7 @@ def test_reliability_fault_gpu_oom_large_request_failure(omni_server_function, o
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server_function", QWEN_OOM_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
@@ -808,7 +823,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_recovers_after_fault_removed(
+def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     omni_server_function,
     online_client_function,
 ) -> None:

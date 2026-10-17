@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from typing import Literal
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -60,6 +62,20 @@ class SDPABackend(AttentionBackend):
         del attention_spec
         return True
 
+    @classmethod
+    def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        return True
+
+    @classmethod
+    def supports_cross_head_geometry(cls, q_heads: int, kv_heads: int) -> bool:
+        return kv_heads > 0 and q_heads % kv_heads == 0
+
+    @classmethod
+    def supports_cross_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        return True
+
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [x for x in range(1024)]  # todo
@@ -105,11 +121,18 @@ class SDPAImpl(AttentionImpl):
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
         enable_gqa = query.shape[2] != key.shape[2]
+        # Some fused kernels advertise support but reject FP32 additive bias
+        # with low-precision Q. Preserve bias precision in the math kernel.
+        preserve_float_bias = (
+            attention_mask is not None and attention_mask.is_floating_point() and attention_mask.dtype != query.dtype
+        )
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         # Only the PyTorch SDPA backend needs this dispatch check. If SDPA
         # cannot select a fused GQA kernel for the runtime shape/mask, expand
         # K/V locally so it can use the better-supported equal-head path.
-        if enable_gqa and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal):
+        if enable_gqa and (
+            preserve_float_bias or not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal)
+        ):
             if query.shape[1] % key.shape[1] != 0:
                 raise ValueError(
                     "GQA requires query heads to be a multiple of KV heads, "
@@ -119,19 +142,19 @@ class SDPAImpl(AttentionImpl):
             key = key.repeat_interleave(repeat_num, dim=1)
             value = value.repeat_interleave(repeat_num, dim=1)
             enable_gqa = False
-            logger.debug(
-                "CUDA SDPA cannot use a fused native-GQA kernel for this shape; expanding K/V heads before SDPA."
+            if not torch.compiler.is_compiling():
+                logger.debug("SDPA is expanding K/V heads for the selected GQA execution path.")
+        with sdpa_kernel(SDPBackend.MATH) if preserve_float_bias else nullcontext():
+            output = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=self.causal,
+                scale=self.softmax_scale,
+                enable_gqa=enable_gqa,
             )
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=self.causal,
-            scale=self.softmax_scale,
-            enable_gqa=enable_gqa,
-        )
         out = output.permute(0, 2, 1, 3)
         return out
 

@@ -3150,7 +3150,7 @@ class TestPlatformOverrides:
             assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
-            assert args["hf_overrides"]["local_compile_audio_sampler"] is True
+            assert "local_compile_audio_sampler" not in args["hf_overrides"]
             extra = deploy.connectors["shm"]["extra"]
             assert extra["generation_min_batch_size"] == 16
             assert extra["generation_max_wait_ms"] == 6
@@ -3173,15 +3173,12 @@ class TestPlatformOverrides:
             "mrv2_gpu_slot_state": True,
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
-            "local_compile_audio_sampler": True,
             "mrv2_eager_mtp": True,
         }
-        inductor_tuning = {
-            "triton.enable_pdl": True,
-            "coordinate_descent_tuning": True,
-            "max_autotune_pointwise": True,
-        }
-        assert args["compilation_config"]["inductor_compile_config"] == inductor_tuning
+        # Both CUDA stages run without torch.compile; explicit kernels replace the fusions.
+        assert args["compilation_config"]["mode"] == 0
+        assert args["compilation_config"]["cudagraph_mode"] == "FULL"
+        assert "inductor_compile_config" not in args["compilation_config"]
         extra = deploy.connectors["shm"]["extra"]
         assert extra["initial_codec_chunk_frames"] == 1
         assert extra["codec_chunk_frames"] == 15
@@ -3194,14 +3191,10 @@ class TestPlatformOverrides:
         assert codec_args["max_num_seqs"] == 128
         assert codec_args["hf_overrides"]["codec_attention_backend"] == "triton_slot"
         compilation = codec_args["compilation_config"]
-        assert compilation["mode"] == 3 and compilation["backend"] == "inductor"
+        assert compilation["mode"] == 0 and "backend" not in compilation
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
-        assert compilation["inductor_compile_config"] == {
-            **inductor_tuning,
-            "combo_kernels": False,
-            "benchmark_combo_kernel": False,
-        }
+        assert "inductor_compile_config" not in compilation
         for variant in ("moss_tts_delay", "moss_tts_realtime"):
             assert not any(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config(variant).stages)
 
