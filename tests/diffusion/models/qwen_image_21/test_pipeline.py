@@ -402,3 +402,33 @@ def test_postprocess_envelope_normalizes_non_dict_metadata(postprocess):
     result = postprocess({"payload": {"image": torch.rand(1, 4, 16, 16)}, "metadata": "bogus"})
 
     assert result["metadata"] == {}
+
+
+# ---------------------------------------------------------------------------
+# load_weights
+# ---------------------------------------------------------------------------
+
+
+def test_load_weights_skips_text_encoder_lm_head():
+    """The quantized text encoder streams through load_weights with its LM head
+    replaced by Identity; the checkpoint's lm_head must be dropped, not raise."""
+    pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.text_encoder = nn.Module()
+    pipeline.text_encoder.model = nn.Linear(2, 2, bias=False)
+    pipeline.text_encoder.lm_head = nn.Identity()
+    pipeline.transformer = nn.Linear(2, 2, bias=False)
+    encoder_weight = torch.full((2, 2), 1.0)
+    transformer_weight = torch.full((2, 2), 3.0)
+
+    loaded = pipeline.load_weights(
+        [
+            ("text_encoder.model.weight", encoder_weight),
+            ("text_encoder.lm_head.weight", torch.full((2, 2), 9.0)),
+            ("transformer.weight", transformer_weight),
+        ]
+    )
+
+    assert loaded == {"text_encoder.model.weight", "transformer.weight"}
+    torch.testing.assert_close(pipeline.text_encoder.model.weight, encoder_weight)
+    torch.testing.assert_close(pipeline.transformer.weight, transformer_weight)
