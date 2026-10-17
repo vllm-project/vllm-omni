@@ -249,10 +249,7 @@ def test_environment_scanner_covers_indirection_aliases_membership_and_casing():
             "VLLM_VIDEO_AUDIO_DELTA_MODE",
         },
         "model_executor/models/mimo_audio/mimo_audio.py": {"model_stage"},
-        "model_executor/models/moss_tts/modeling_moss_tts_local_depth.py": {
-            "VLLM_OMNI_MOSS_LOCAL_SHORT_ATTN",
-            "VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER",
-        },
+        "model_executor/models/moss_tts/modeling_moss_tts_local_depth.py": {"VLLM_OMNI_MOSS_LOCAL_SHORT_ATTN"},
         "distributed/ray_utils/utils.py": {"RAY_RAYLET_PID"},
     }
     for relative_path, expected in expected_by_path.items():

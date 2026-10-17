@@ -73,6 +73,55 @@ profile. This selects `AsyncOmni` and the ordinary API initialization instead
 of the duplex handler. See [Full Duplex](full_duplex_api.md#enable-full-duplex)
 for the command and configuration requirements.
 
+### Multiple Frontends
+
+For a local multi-replica deployment, `--api-server-count K` distributes duplex
+processing across separate Python processes on one public port. This requires
+`duplex_session.replica_policy: least_sessions`, a per-replica session cap, and
+a model plugin that does **not** support session resume, such as PersonaPlex.
+The default stays at one frontend; resume-capable plugins and `legacy` routing
+are rejected when `K > 1`.
+
+Create a PersonaPlex deploy configuration with eight replica groups as described
+in [Multiple duplex frontends](../configuration/stage_configs.md#multiple-duplex-frontends),
+then start four frontends:
+
+```bash
+vllm serve nvidia/personaplex-7b-v1 --omni \
+    --deploy-config /path/to/personaplex-eight-replicas.yaml \
+    --api-server-count 4 --host 0.0.0.0 --port 8099
+```
+
+With eight groups, `max_sessions: 64` and `max_sessions_per_replica: 8`, each
+frontend owns two groups and admits at most 16 sessions. Ownership is
+`group_index % K`; global capacity is split evenly, including any remainder.
+`K` must not exceed the number of groups. A group cannot share a stage replica
+with a group owned by a different frontend. Prefer `max_sessions >= K` so every
+frontend receives a nonzero admission budget.
+
+The operating system assigns new connections without consulting session
+capacity. An admission error with `error.retryable: true` means the client may
+close its current WebSocket, back off and reconnect to try another frontend;
+repeated rejection is possible even
+while another frontend has capacity. Reconnect opens a **new** session, not a
+resume, and does not preserve model state. Clients should bound retries and
+record rejection and retry counts when measuring service capacity.
+
+PersonaPlex startup warmup is opt-in: set `duplex_session.warmup_frames` to a
+positive frame count to enable it. Frontends with nonzero admission budgets
+then warm their owned groups locally and gate their own duplex connections
+until warmup completes; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
+before being admitted, as in single-frontend mode.
+`/health` retains the engine-health check; it is not an
+all-frontend warmup barrier, and a 200 response does not mean that the accepting
+frontend has free admission slots.
+Prometheus multiprocess collection aggregates the owner-only
+`vllm_omni:duplex_reserved_sessions` gauge and admission
+rejection counters. The supervisor still shuts down the service on an engine
+failure or abnormal frontend exit; this mode does not isolate failures or
+migrate sessions. See the [architecture](../design/fullduplex.md#multiple-frontends)
+for the shared-engine attachment model and its limits.
+
 ### Run the Example Client
 
 `examples/online_serving/barge_in_client.py` asks a question, interrupts the

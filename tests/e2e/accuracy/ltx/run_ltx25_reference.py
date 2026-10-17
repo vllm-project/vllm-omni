@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Generate raw LTX video and audio outputs with the official or Omni runtime."""
+"""Generate raw LTX video/audio or audio-only outputs with the official or Omni runtime."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--connector-model", type=Path)
     parser.add_argument(
         "--official-pipeline",
-        choices=("distilled_two_stage", "full_one_stage", "full_two_stage"),
+        choices=("distilled_two_stage", "full_one_stage", "full_two_stage", "t2a_one_stage"),
         default="distilled_two_stage",
     )
     parser.add_argument("--enable-layerwise-offload", action="store_true")
@@ -86,6 +86,25 @@ def _save_outputs(
             "audio_sample_rate": int(audio_sample_rate),
             "frame_indices": frame_indices,
             "mp4": "output.mp4",
+        }
+    )
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+
+def _save_audio_outputs(
+    output_dir: Path,
+    *,
+    audio: torch.Tensor,
+    audio_sample_rate: int,
+    metadata: dict[str, Any],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audio = audio.detach().float().cpu()
+    np.save(output_dir / "audio.npy", audio.numpy())
+    metadata.update(
+        {
+            "audio_shape": list(audio.shape),
+            "audio_sample_rate": int(audio_sample_rate),
         }
     )
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -166,14 +185,34 @@ def _configure_official_sdpa(pipeline: Any) -> None:
         )
 
 
+def _connector_weight_files(model: Path) -> list[Path]:
+    connector_root = model / "connectors"
+    index_path = connector_root / "diffusion_pytorch_model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text())
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Connector weight index has no weight_map: {index_path}")
+        if not all(isinstance(filename, str) and filename for filename in weight_map.values()):
+            raise ValueError(f"Connector weight index has invalid filenames: {index_path}")
+        filenames = sorted(set(weight_map.values()))
+        weight_files = [connector_root / filename for filename in filenames]
+        missing = [path for path in weight_files if not path.is_file()]
+        if missing:
+            raise ValueError(f"Connector weight index references missing files: {missing}")
+        return weight_files
+
+    weight_files = sorted(connector_root.glob("*.safetensors"))
+    if not weight_files:
+        raise ValueError(f"No connector safetensors found under {connector_root}")
+    return weight_files
+
+
 def _use_diffusers_connector_weights(prompt_encoder: Any, model: Path) -> None:
     """Run official connector code with the checkpoint under test."""
     from safetensors import safe_open
 
-    connector_root = model / "connectors"
-    shards = sorted(connector_root.glob("*.safetensors"))
-    if not shards:
-        raise ValueError(f"No connector safetensors found under {connector_root}")
+    weight_files = _connector_weight_files(model)
 
     original_build_embeddings_processor = prompt_encoder._build_embeddings_processor
 
@@ -183,7 +222,7 @@ def _use_diffusers_connector_weights(prompt_encoder: Any, model: Path) -> None:
         expected = {name for name in parameters if name.startswith(("video_connector.", "audio_connector."))}
         loaded: set[str] = set()
         with torch.no_grad():
-            for shard in shards:
+            for shard in weight_files:
                 with safe_open(str(shard), framework="pt", device="cpu") as weights:
                     for source_name in weights.keys():
                         if not source_name.startswith(("video_connector.", "audio_connector.")):
@@ -205,8 +244,7 @@ def _use_diffusers_connector_weights(prompt_encoder: Any, model: Path) -> None:
     prompt_encoder._build_embeddings_processor = build_embeddings_processor
 
 
-@torch.inference_mode()
-def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
+def _prepare_official_runtime(args: argparse.Namespace) -> None:
     if args.official_root is None:
         raise ValueError("Official backend requires --official-root")
     _insert_official_paths(args.official_root)
@@ -215,6 +253,80 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     # still pinned independently to the explicit cuDNN backend below.
     torch.backends.cuda.enable_cudnn_sdp(False)
     _reset_accelerator_peak_memory_stats()
+
+
+@torch.inference_mode()
+def _run_official_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
+    _prepare_official_runtime(args)
+
+    from ltx_core.components.guiders import MultiModalGuiderParams
+    from ltx_pipelines.t2a_one_stage import T2AOneStagePipeline
+    from ltx_pipelines.utils.model_paths import ModelPaths
+    from ltx_pipelines.utils.types import OffloadMode
+
+    required = {
+        "--transformer-path": args.transformer_path,
+        "--text-encoder-path": args.text_encoder_path,
+        "--audio-vae-path": args.audio_vae_path,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(f"Official LTX-2.5 T2A backend is missing: {', '.join(missing)}")
+
+    pipeline = T2AOneStagePipeline(
+        model_paths=ModelPaths.from_split(
+            transformer_path=str(args.transformer_path),
+            text_encoder_path=str(args.text_encoder_path),
+            audio_vae_path=str(args.audio_vae_path),
+        ),
+        loras=[],
+        offload_mode=OffloadMode.CPU if args.enable_layerwise_offload else OffloadMode.NONE,
+    )
+    if args.connector_model is not None:
+        _use_diffusers_connector_weights(pipeline.prompt_encoder, args.connector_model)
+    _configure_official_sdpa(pipeline)
+    audio = pipeline(
+        prompt=request["prompt"],
+        negative_prompt=request["negative_prompt"],
+        seed=request["seed"],
+        frame_rate=request["fps"],
+        num_inference_steps=request["num_inference_steps"],
+        audio_guider_params=MultiModalGuiderParams(
+            cfg_scale=request["audio_cfg_scale"],
+            stg_scale=request["audio_stg_scale"],
+            rescale_scale=request["audio_rescale_scale"],
+            # Audio-only generation has no video branch; 1.0 disables v2a guidance.
+            modality_scale=1.0,
+            skip_step=0,
+            stg_blocks=request["audio_stg_blocks"],
+        ),
+        num_frames=request["num_frames"],
+        # Omni evaluates CFG and STG passes as one fused batch.
+        max_batch_size=4,
+        sigmas=torch.tensor(request["sigmas"], dtype=torch.float32),
+    )
+    _save_audio_outputs(
+        args.output_dir,
+        audio=audio.waveform,
+        audio_sample_rate=audio.sampling_rate,
+        metadata={
+            "backend": "official",
+            "attention_backend": "torch_sdpa_cudnn_bf16",
+            "official_revision": os.environ.get("VLLM_TEST_LTX_OFFICIAL_REVISION"),
+            "seed": request["seed"],
+            "num_frames": request["num_frames"],
+            "sigmas": request["sigmas"],
+            "transformer_path": str(args.transformer_path),
+            "connector_model": None if args.connector_model is None else str(args.connector_model),
+            "pipeline": "T2AOneStagePipeline",
+            **_accelerator_peak_memory_stats(),
+        },
+    )
+
+
+@torch.inference_mode()
+def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
+    _prepare_official_runtime(args)
 
     from ltx_pipelines.utils.args import ImageConditioningInput
     from ltx_pipelines.utils.model_paths import ModelPaths
@@ -485,6 +597,23 @@ def _unwrap_omni_output(output: Any) -> tuple[Any, Any, int]:
     return frames, audio, int(audio_sample_rate)
 
 
+def _unwrap_omni_audio_output(output: Any) -> tuple[Any, int]:
+    from vllm_omni.outputs import OmniRequestOutput
+
+    result = output[0] if isinstance(output, list) and output else output
+    if not isinstance(result, OmniRequestOutput):
+        raise ValueError(f"Expected OmniRequestOutput, got {type(result).__name__}")
+    nested_output = getattr(result, "request_output", None)
+    if result.is_pipeline_output and isinstance(nested_output, OmniRequestOutput):
+        result = nested_output
+    multimodal_output = result.multimodal_output or {}
+    audio = multimodal_output.get("audio")
+    audio_sample_rate = multimodal_output.get("audio_sample_rate")
+    if audio is None or audio_sample_rate is None:
+        raise ValueError("Omni output did not contain audio and audio_sample_rate")
+    return audio, int(audio_sample_rate)
+
+
 def _canonical_video(video: Any) -> torch.Tensor:
     if isinstance(video, list):
         if len(video) == 1:
@@ -602,11 +731,77 @@ def _run_omni(args: argparse.Namespace, request: dict[str, Any]) -> None:
         omni.shutdown()
 
 
+@torch.inference_mode()
+def _run_omni_t2a(args: argparse.Namespace, request: dict[str, Any]) -> None:
+    if args.model is None:
+        raise ValueError("Omni T2A backend requires --model")
+
+    # vLLM imports can otherwise change the process-wide Gemma dispatch.
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    _reset_accelerator_peak_memory_stats()
+
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+    from vllm_omni.entrypoints.omni import Omni
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_extras import get_extra_body_params
+    from vllm_omni.platforms import current_omni_platform
+
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request["seed"])
+    omni = Omni(
+        model=args.model,
+        model_class_name=args.model_class_name,
+        enforce_eager=True,
+        enable_layerwise_offload=args.enable_layerwise_offload,
+        diffusion_attention_config={"default": {"backend": "CUDNN_ATTN"}},
+        parallel_config=DiffusionParallelConfig(),
+    )
+    try:
+        sampling_params = OmniDiffusionSamplingParams(
+            generator=generator,
+            guidance_scale=None,
+            num_inference_steps=request["num_inference_steps"],
+            frame_rate=float(request["fps"]),
+        )
+        extra_args = {key: value for key, value in request.items() if key.startswith("audio_")}
+        extra_args["num_frames"] = request["num_frames"]
+        extra_args["sigmas"] = request["sigmas"]
+        apply_declared_extra_args(sampling_params, get_extra_body_params(args.model_class_name), extra_args)
+        output = omni.generate(
+            {"prompt": request["prompt"], "negative_prompt": request["negative_prompt"]},
+            sampling_params,
+        )
+        audio, audio_sample_rate = _unwrap_omni_audio_output(output)
+        _save_audio_outputs(
+            args.output_dir,
+            audio=torch.as_tensor(np.asarray(audio) if not isinstance(audio, torch.Tensor) else audio),
+            audio_sample_rate=audio_sample_rate,
+            metadata={
+                "backend": "omni",
+                "attention_backend": "torch_sdpa_cudnn_bf16",
+                "seed": request["seed"],
+                "num_frames": request["num_frames"],
+                "sigmas": request["sigmas"],
+                "model": args.model,
+                "model_class_name": args.model_class_name,
+                "worker_peak_memory_mb": _omni_worker_peak_memory_mb(output),
+                **_accelerator_peak_memory_stats(),
+            },
+        )
+    finally:
+        omni.shutdown()
+
+
 def main() -> None:
     args = _parse_args()
     request = json.loads(args.request.read_text())
     if args.backend == "official":
-        _run_official(args, request)
+        if args.official_pipeline == "t2a_one_stage":
+            _run_official_t2a(args, request)
+        else:
+            _run_official(args, request)
+    elif args.model_class_name == "LTX2TextToAudioPipeline":
+        _run_omni_t2a(args, request)
     else:
         _run_omni(args, request)
 
