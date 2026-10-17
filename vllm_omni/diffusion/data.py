@@ -790,6 +790,8 @@ def resolve_model_class_name(
         return "NextStep11Pipeline"
     if model_type == "s2v":
         return "WanS2VPipeline"
+    if cfg.get("type") == "lingbot_vla_v2":
+        return "LingBotVLAV2Pipeline"
     if model_type == "vla":
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
@@ -1802,6 +1804,11 @@ class OmniDiffusionConfig:
                 elif cfg.get("type") == "pi05":
                     if self.model_class_name is None:
                         self.model_class_name = "Pi05Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif cfg.get("type") == "lingbot_vla_v2":
+                    if self.model_class_name is None:
+                        self.model_class_name = "LingBotVLAV2Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":

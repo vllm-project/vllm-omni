@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.lingbot_vla_v2_pipeline_config import LINGBOT_VLA_V2_PIPELINE
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
@@ -180,6 +181,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
     "lance": LANCE_PIPELINE,
+    "lingbot_vla_v2": LINGBOT_VLA_V2_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,

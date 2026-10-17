@@ -41,6 +41,14 @@ LingBot-Video MoE transformer.
 - **Dense pipeline**: decoded-video MAE, MSE, PSNR, latency, and optional steady-state timings
 - **MoE transformer**: bitwise router, sparse-block, shared-expert, and full-transformer parity
 
+### [LingBot-VLA 2.0](lingbot_vla_v2/README.md) — Direct-Policy Latency
+
+Manual paired comparison of the LeRobot LingBot-VLA 2.0 policy and vLLM-Omni on
+the same device, after an action-parity check.
+
+- **Scopes**: model only, and processor plus model
+- **Key metrics**: median latency per implementation and the per-block paired ratio over interleaved ABBA blocks
+
 ### [LingBot-World](lingbot_world/README.md) — Realtime Streaming Cadence
 
 Client-side benchmark for a `WS /v1/realtime/video` world-model session, where one
