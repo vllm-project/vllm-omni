@@ -1119,6 +1119,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.image_token_id = int(config.image_token_id)
         self.video_token_id = int(config.video_token_id)
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
+        weight_only_nvfp4 = quant_config is not None and quant_config.get_name() == "svdquant"
+        if weight_only_nvfp4 and (quant_config.activation_bits != 16 or self._tp_size != 1):
+            raise ValueError("MiniMax-H3 serialized NVFP4 encoder requires W4A16 and text_encoder_tp_size=1")
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         self.vision.to(dtype=dtype)
@@ -1129,7 +1132,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
             quant_config=quant_config,
         )
-        self.text_model.to(dtype=dtype)
+        if not weight_only_nvfp4:
+            self.text_model.to(dtype=dtype)
         logger.info(
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
@@ -1187,12 +1191,14 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
+        quant_config = getattr(self, "quant_config", None)
+        serialized_fused = quant_config is not None and quant_config.get_name() == "svdquant"
         # Seeded from modules that own a multi-shard loader, so a fused weight
         # receiving no source shard is caught as well as a partially filled one.
         expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {
             f"{module_name}.weight": sources
             for module_name, module in self.named_modules()
-            if (sources := _fused_source_shards(module)) is not None
+            if (sources := _fused_source_shards(module)) is not None and f"{module_name}.weight" in params
         }
         loaded_fused_shards: dict[str, set[str | int]] = {name: set() for name in expected_fused_shards}
         for name, tensor in weights:
@@ -1204,7 +1210,11 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             if param is None:
                 logger.warning("MiniMax H3 text encoder weight %s has no target parameter", name)
                 continue
-            weight_loader = getattr(param, "weight_loader", _default_weight_loader)
+            weight_loader = (
+                _default_weight_loader
+                if serialized_fused and shard_id is None
+                else getattr(param, "weight_loader", _default_weight_loader)
+            )
             weight_loader(param, tensor, shard_id)
             loaded.add(param_name)
             if shard_id is not None and param_name in loaded_fused_shards:

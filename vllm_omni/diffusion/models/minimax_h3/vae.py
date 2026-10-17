@@ -358,6 +358,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
         decoder = getattr(self.remote.model, "decoder", None)
         if decoder is not None:
+            decode_dtype = self.config_dict.get("decode_dtype", "float32")
+            if decode_dtype not in ("float32", "float16"):
+                raise ValueError("MiniMax-H3 video VAE decode_dtype must be float32 or float16")
+            if decode_dtype == "float16":
+                decoder.to(dtype=torch.float16)
             install_h3_vae_optimizations(
                 decoder,
                 device=device,

@@ -354,6 +354,7 @@ def test_local_embedding_spans_reassemble_multimodal_rows():
 
     model = object.__new__(h3.MiniMaxH3DiTModel)
     nn.Module.__init__(model)
+    model.arch = h3.MiniMaxH3DiTArchConfig(hidden_size=2)
     model.hidden_size = 2
     model.video_patch_proj = _IdentityProjection()
     model.audio_patch_proj = _IdentityProjection()
