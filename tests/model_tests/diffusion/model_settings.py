@@ -181,4 +181,10 @@ DIFFUSION_TEST_SETTINGS = {
         supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
         model_type_marker=ModelTypeMarker.DIFFUSION,
     ),
+    "StableDiffusionXLPipeline": DiffusionModelTestOpts(
+        model="stabilityai/stable-diffusion-xl-base-1.0",
+        builder=diff_model_builders.tiny_sdxl_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+        extra_test_groups=[[DiffusionAccs.CPU_OFFLOAD]],
+    ),
 }
