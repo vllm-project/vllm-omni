@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex thinker → code2wav stage input processors.
 
 The thinker is a plain token-autoregressive LM whose sampled stream contains
@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 logger = init_logger(__name__)
@@ -41,14 +42,6 @@ _DEFAULT_AUDIOCODEC_VOCAB_SIZE = 8192
 _TTA_NUM_CODEBOOKS = 4
 
 _STATE_KEY = "_audex_async_state"
-
-
-def _ensure_list(value: Any) -> list[int]:
-    if value is None:
-        return []
-    if isinstance(value, torch.Tensor):
-        return value.reshape(-1).tolist()
-    return list(value)
 
 
 def _connector_extra(transfer_manager: Any) -> dict[str, Any]:
@@ -85,7 +78,7 @@ def _finished_request_codes(
     cfg = _connector_extra(transfer_manager)
     codec_offset = int(cfg.get(offset_key, default_offset))
     codec_size = int(cfg.get(size_key, default_size))
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
+    output_token_ids = _common.ensure_list_flatten(getattr(request, "output_token_ids", []))
     codes = _codec_frames(output_token_ids, codec_offset, codec_size)
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     return codes, request_id
@@ -159,7 +152,7 @@ def _extract_new_codes(
     codec_size: int,
 ) -> list[int]:
     """Return codec frame ids from tokens sampled since the last call."""
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
+    output_token_ids = _common.ensure_list_flatten(getattr(request, "output_token_ids", []))
     new_tokens = output_token_ids[int(state.get("seen_len", 0)) :]
     state["seen_len"] = len(output_token_ids)
     return _codec_frames(new_tokens, codec_offset, codec_size)
@@ -348,8 +341,8 @@ def thinker2code2wav_token_only(
         if not source_output.finished:
             continue
         output = source_output.outputs[0]
-        prompt_ids = _ensure_list(source_output.prompt_token_ids)
-        raw_output_ids = _ensure_list(output.cumulative_token_ids)
+        prompt_ids = _common.ensure_list_flatten(source_output.prompt_token_ids)
+        raw_output_ids = _common.ensure_list_flatten(output.cumulative_token_ids)
         if raw_output_ids[: len(prompt_ids)] == prompt_ids:
             raw_output_ids = raw_output_ids[len(prompt_ids) :]
         engine_inputs.append(OmniTokensPrompt(prompt_token_ids=raw_output_ids))

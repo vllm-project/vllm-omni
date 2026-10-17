@@ -29,6 +29,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors import _common
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -46,30 +47,6 @@ _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES = 25
 _NUM_CODEBOOKS = 8
 _AUDIO_STREAM_BOS_ID = 1024
 _NUM_REAL_CODES = _AUDIO_STREAM_BOS_ID  # codes in [0, 1023] are real
-
-
-def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
-    """Reverse the delay-pattern shift, mirroring upstream's
-    ``boson_multimodal.model.higgs_audio.utils.revert_delay_pattern``.
-
-    Input shape: ``[num_codebooks, seq_len + num_codebooks - 1]``.
-    Output shape: ``[num_codebooks, seq_len]``.
-
-    For each codebook ``i``, slice rows ``[i:i+1]`` from columns
-    ``[i : seq_len + i]`` to remove ``i`` leading BOS pads and ``Q-1-i``
-    trailing PAD entries.
-    """
-    if audio_codes_qt.ndim != 2:
-        raise ValueError(f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}")
-    q, t = audio_codes_qt.shape
-    if t < q:
-        # Not enough frames to revert delay pattern; return as-is.
-        return audio_codes_qt
-    seq_len = t - q + 1
-    out_l = []
-    for i in range(q):
-        out_l.append(audio_codes_qt[i : i + 1, i : seq_len + i])
-    return torch.cat(out_l, dim=0)
 
 
 def talker2code2wav(
@@ -121,7 +98,7 @@ def talker2code2wav(
         # the upstream ``HiggsAudioServeEngine.generate`` decode line:
         #     vq_code = revert_delay_pattern(out).clip(0, real-1)[:, 1:-1]
         codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
-        codes_qt = _revert_delay_pattern(codes_qt)
+        codes_qt = _common.revert_delay_pattern(codes_qt, allow_short=True)
         codes_qt = codes_qt.clamp_(min=0, max=_NUM_REAL_CODES - 1)
         if codes_qt.shape[-1] >= 3:
             codes_qt = codes_qt[:, 1:-1]

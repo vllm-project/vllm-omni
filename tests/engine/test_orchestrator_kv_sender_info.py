@@ -97,6 +97,8 @@ def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
         prompt_transform_func=None,
         prompt_expand_func=None,
         custom_process_input_func=None,
+        sync_process_input_func=None,
+        prewarm_placeholder_builder=None,
     )
 
     def fake_base_init(self, config, *_args, **_kwargs):
