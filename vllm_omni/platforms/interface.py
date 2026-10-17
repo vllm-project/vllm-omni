@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from enum import Enum
 from typing import Any
@@ -10,7 +11,7 @@ import torch.nn as nn
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
-from vllm.platforms import Platform
+from vllm.platforms import Platform, current_platform
 from vllm.platforms.interface import PlatformEnum
 
 logger = init_logger(__name__)
@@ -365,6 +366,36 @@ class OmniPlatform(Platform):
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
         return CUDAGraphWrapper
+
+    @classmethod
+    def capture_cuda_graph(
+        cls,
+        fn: Callable[[], None],
+        *,
+        generators: list[torch.Generator] | None = None,
+    ) -> torch.cuda.CUDAGraph | None:
+        """Record ``fn`` on CUDA-alike devices. Returns None when capture is unavailable."""
+        if not current_platform.is_cuda_alike():
+            return None
+        graph = torch.cuda.CUDAGraph()
+        if generators:
+            for generator in generators:
+                graph.register_generator_state(generator)
+        with torch.cuda.graph(
+            graph,
+            pool=current_platform.get_global_graph_pool(),
+            capture_error_mode="thread_local",
+        ):
+            fn()
+        return graph
+
+    @classmethod
+    def replay_cuda_graph(cls, graph: torch.cuda.CUDAGraph | None, eager: Callable[[], None]) -> None:
+        """Replay a captured graph, or run ``eager`` when there is no graph."""
+        if graph is None:
+            eager()
+            return
+        graph.replay()
 
     @classmethod
     def set_forward_context(

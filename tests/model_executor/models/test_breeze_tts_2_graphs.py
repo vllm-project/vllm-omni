@@ -201,6 +201,7 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations(full
     retained = []
     with monkeypatch.context() as platform_guard:
         platform_guard.setattr(current_platform, "is_cuda", lambda: False)
+        platform_guard.setattr(current_platform, "is_cuda_alike", lambda: False)
         for scale in (4.0, 0.5, 4.0):
             expected = depth._generate_frame(
                 hidden,
@@ -225,6 +226,7 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations(full
                     guidance_scale=scale,
                 )
             entry = depth._graphs[fallback_key]
+            assert entry.graph is None
             assert entry.noise_generators is None
             assert len(observed_generators) == depth.num_codebooks - 1
             assert all(generator is generators[0] for generator in observed_generators)
