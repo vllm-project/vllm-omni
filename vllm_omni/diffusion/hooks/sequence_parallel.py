@@ -175,10 +175,14 @@ class SequenceParallelSplitHook(ModelHook):
         self,
         metadata: SequenceParallelInputType,
         config: SequenceParallelConfig,
+        padding_mask_optional: bool = False,
     ) -> None:
         super().__init__()
         self.metadata = metadata
         self.config = config
+        # True when the model only masks SP padding if parallel_config.mask_sp_padding is set
+        # (see ``_sp_padding_mask_optional`` on the model), so no mask-capable backend is needed otherwise.
+        self._padding_mask_optional = padding_mask_optional
         self.module_forward_metadata: ModuleForwardMetadata | None = None
         # Cache for text lengths resolved from kwargs
         self._text_len_cache: dict[str, int] = {}
@@ -470,26 +474,31 @@ class SequenceParallelSplitHook(ModelHook):
             # Keyed groups record their length even when no padding is needed.
             return sp_shard(x, dim, validate=False)
 
-        # Check backend compatibility
+        # Check backend compatibility. A model that masks padding only on request
+        # (_sp_padding_mask_optional) needs a mask-capable backend only if mask_sp_padding is set.
         attention_config = None
+        mask_sp_padding = True
         if is_forward_context_available():
             od_config = get_forward_context().omni_diffusion_config
             if od_config is not None:
                 attention_config = od_config.diffusion_attention_config
+                if od_config.parallel_config is not None:
+                    mask_sp_padding = od_config.parallel_config.mask_sp_padding
 
-        attn_backend = get_attn_backend_for_capability(
-            role="self",
-            attention_config=attention_config,
-        )
-        attention_spec = None
-        if attention_config is not None:
-            attention_spec, _ = attention_config.resolve_with_source(role="self")
-        if not attn_backend.supports_attention_mask(attention_spec):
-            raise ValueError(
-                f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
-                f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
-                f"Please switch to SDPA or Ascend attention backend."
+        if mask_sp_padding or not self._padding_mask_optional:
+            attn_backend = get_attn_backend_for_capability(
+                role="self",
+                attention_config=attention_config,
             )
+            attention_spec = None
+            if attention_config is not None:
+                attention_spec, _ = attention_config.resolve_with_source(role="self")
+            if not attn_backend.supports_attention_mask(attention_spec):
+                raise ValueError(
+                    f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
+                    f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
+                    f"Please switch to SDPA or Ascend attention backend."
+                )
 
         # Ring attention does not support attention_mask
         if get_ring_parallel_world_size() > 1:
@@ -705,6 +714,8 @@ def apply_sequence_parallel(
         f"ring={config.ring_degree}, plan keys: {list(plan.keys())}"
     )
 
+    padding_mask_optional = bool(getattr(module, "_sp_padding_mask_optional", False))
+
     for module_id, sp_model_plan in plan.items():
         submodule = _get_submodule_by_name(module, module_id)
         if not isinstance(submodule, list):
@@ -716,7 +727,7 @@ def apply_sequence_parallel(
             hook: SequenceParallelSplitHook | SequenceParallelGatherHook
             if isinstance(sp_model_plan, dict):
                 # Input specification
-                hook = SequenceParallelSplitHook(sp_model_plan, config)
+                hook = SequenceParallelSplitHook(sp_model_plan, config, padding_mask_optional=padding_mask_optional)
                 hook_name = _SP_INPUT_HOOK_TEMPLATE.format(module_id)
             elif isinstance(sp_model_plan, (SequenceParallelOutput, list, tuple)):
                 # Output specification
