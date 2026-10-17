@@ -91,7 +91,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
    Accepts `num_cards` as either a single integer for all platforms or as a dictionary with per-platform values. If not specified, defaults to 1 card per platform.
 
 4. **Integrates resource validation**  
-   On CUDA and XPU, when `num_cards > 1`, attaches pytest's built-in `skipif` if the machine has fewer devices than requested. This is not a named `skipif_*` marker and is not used for `-m` filtering.
+   On the active CUDA, ROCm, XPU, NPU or MUSA platform, when `num_cards > 1`, attaches pytest's built-in `skipif` if the machine has fewer visible devices than requested. Single-card marks and marks for other platforms do not query device counts. This is not a named `skipif_*` marker and is not used for `-m` filtering.
 
 5. **Works with pytest filtering**  
    Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "H100 and cards_2"`, `-m "L4 and not cards_1"`).
