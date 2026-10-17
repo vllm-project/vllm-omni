@@ -32,7 +32,7 @@ from vllm_omni.engine.duplex.contracts import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
-    from vllm_omni.config.stage_config import PipelineConfig
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
 
 
 class DuplexRuntimeConfigError(ValueError):
@@ -587,6 +587,25 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
             )
 
 
+def validate_duplex_replica_policy(
+    plugin: DuplexModelPlugin,
+    runtime_config: DuplexSessionRuntimeConfig,
+    *,
+    distributed: bool,
+) -> None:
+    """Validate replica policy before workers start and against the actual stage pools."""
+    if runtime_config.replica_policy == "legacy":
+        return
+    if distributed:
+        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
+    cap = runtime_config.max_sessions_per_replica
+    assert cap is not None
+    # This capability depends on the requested capacity for some plugins; the
+    # global admission limit does not describe sharing within a single replica.
+    if cap > 1 and not plugin.capabilities(max_sessions=cap).supports_multi_session_same_replica:
+        raise ValueError("This duplex plugin does not support sharing a replica; set max_sessions_per_replica to 1")
+
+
 @lru_cache(maxsize=8)
 def _silence_pcm_f32le_base64(samples: int) -> str:
     return base64.b64encode(bytes(max(0, samples) * 4)).decode("ascii")
@@ -626,4 +645,5 @@ __all__ = [
     "payload_turn_id",
     "reject_changed_runtime_value",
     "validate_duplex_plugin_sampling",
+    "validate_duplex_replica_policy",
 ]

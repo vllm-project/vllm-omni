@@ -480,6 +480,26 @@ class StagePool:
 
     # ---- Legacy (non-distributed) route binding ----
 
+    def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
+        """Bind a real request to a required local replica, without selecting a fallback.
+
+        Call before input preprocessing or sender metadata construction, then
+        pass the same pin to submission to recheck availability. Session
+        reservations belong to the duplex placement owner, not this ledger.
+        """
+        if self._hub is not None or self._lb is not None:
+            raise StageUnavailableError("pinned replica routing is only supported for local stage pools")
+        if not self.is_replica_available(replica_id):
+            raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
+        bound = self.get_bound_replica_id(request_id)
+        if bound is not None and bound != replica_id:
+            raise StageUnavailableError(
+                f"stage {self.stage_id} request {request_id} is bound to replica {bound}, "
+                f"conflicting with pinned replica {replica_id}"
+            )
+        self._request_bindings[request_id] = replica_id
+        return replica_id
+
     def get_bound_replica_id(self, request_id: str) -> int | None:
         """Return the currently bound replica id for *request_id* if present.
 
@@ -1022,6 +1042,7 @@ class StagePool:
         *,
         prompt_text: Any = None,
         affinity_request_id: str | None = None,
+        pinned_replica_id: int | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
         expected_replica_id: int | None = None,
@@ -1041,18 +1062,24 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
-            replica_id = await self._pick_or_select(
-                request_id,
-                affinity_request_id=affinity_request_id,
-            )
+            if pinned_replica_id is not None:
+                replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+            else:
+                replica_id = await self._pick_or_select(
+                    request_id,
+                    affinity_request_id=affinity_request_id,
+                )
             client = self._diffusion_client(replica_id)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
-        replica_id = await self._pick_or_select(
-            request_id,
-            affinity_request_id=affinity_request_id,
-        )
+        if pinned_replica_id is not None:
+            replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+        else:
+            replica_id = await self._pick_or_select(
+                request_id,
+                affinity_request_id=affinity_request_id,
+            )
         # A request whose multimodal cache keys name a replica must not move: that
         # replica's sender-cache entries may omit media the new one never received.
         if expected_replica_id is not None and replica_id != expected_replica_id:
@@ -1114,6 +1141,7 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        pinned_replica_id: int | None = None,
         submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
@@ -1121,9 +1149,14 @@ class StagePool:
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+        if pinned_replica_id is not None:
+            replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+        else:
+            bound_replica_id = self.get_bound_replica_id(request_id)
+            if bound_replica_id is None or self.clients[bound_replica_id] is None:
+                replica_id = await self._pick_or_select(request_id)
+            else:
+                replica_id = bound_replica_id
 
         client = self.clients[replica_id]
         if client is None:
