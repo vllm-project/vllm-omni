@@ -34,7 +34,7 @@ https://github.com/zhaochenyang20/seed-tts-eval):
   ``RuntimeError: input type and weight type should be same`` on common exports. Disable
   with ``SEED_TTS_UTMOS_EVAL=0``.
 
-Enable with ``SEED_TTS_WER_EVAL=1`` or ``--seed-tts-wer-eval``. Install optional deps::
+Enable with ``WER_EVAL=1`` or ``--wer-eval``. Install optional deps::
 
     pip install 'vllm-omni[dev]'
 
