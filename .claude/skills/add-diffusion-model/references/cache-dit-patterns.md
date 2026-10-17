@@ -60,7 +60,7 @@ omni = Omni(
         "Fn_compute_blocks": 1,
         "Bn_compute_blocks": 0,
         "max_warmup_steps": 4,
-    }
+    },
 )
 ```
 
@@ -81,9 +81,8 @@ def enable_cache_for_dit(pipeline, cache_config):
     cache_dit.enable_cache(pipeline.transformer, cache_config=db_cache_config)
 
     def refresh_cache_context(pipeline, num_inference_steps, verbose=True):
-        cache_dit.refresh_context(
-            pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose
-        )
+        cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+
     return refresh_cache_context
 ```
 
@@ -102,6 +101,7 @@ Single transformer with two block lists:
 ```python
 import cache_dit
 from cache_dit import BlockAdapter, ForwardPattern, ParamsModifier, DBCacheConfig
+
 
 def enable_cache_for_your_model(pipeline, cache_config):
     db_cache_config = DBCacheConfig(
@@ -128,9 +128,8 @@ def enable_cache_for_your_model(pipeline, cache_config):
     )
 
     def refresh_cache_context(pipeline, num_inference_steps, verbose=True):
-        cache_dit.refresh_context(
-            pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose
-        )
+        cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+
     return refresh_cache_context
 ```
 
@@ -159,12 +158,9 @@ def enable_cache_for_dual_transformer(pipeline, cache_config):
 
     def refresh_cache_context(pipeline, num_inference_steps, verbose=True):
         high_steps, low_steps = _split_inference_steps(num_inference_steps)
-        cache_dit.refresh_context(
-            pipeline.transformer, num_inference_steps=high_steps, verbose=verbose
-        )
-        cache_dit.refresh_context(
-            pipeline.transformer_2, num_inference_steps=low_steps, verbose=verbose
-        )
+        cache_dit.refresh_context(pipeline.transformer, num_inference_steps=high_steps, verbose=verbose)
+        cache_dit.refresh_context(pipeline.transformer_2, num_inference_steps=low_steps, verbose=verbose)
+
     return refresh_cache_context
 ```
 
@@ -227,7 +223,7 @@ omni = Omni(
         "Bn_compute_blocks": 0,
         "max_warmup_steps": 4,
         "residual_diff_threshold": 0.24,
-    }
+    },
 )
 images = omni.generate(
     "a beautiful landscape",

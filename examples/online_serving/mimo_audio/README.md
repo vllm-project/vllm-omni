@@ -4,7 +4,7 @@
 
 Please refer to [README.md](../../../README.md)
 
-> ⚠️ **Important (audio generation)**  
+> ⚠️ **Important (audio generation)**
 > For **audio generation** (TTS, responses that include synthesized audio, etc.), install **`flash-attn`** for your **CUDA** and **PyTorch** stack. Without it on GPU, **output audio may be noise-only or unusable**. See the [FlashAttention](https://github.com/Dao-AILab/flash-attention) repository for compatible builds.
 
 ## Run examples (MiMo-Audio)
@@ -18,8 +18,8 @@ vllm serve XiaomiMiMo/MiMo-Audio-7B-Instruct --omni \
     --port 18091 \
     --chat-template ./examples/online_serving/mimo_audio/chat_template.jinja
 ```
-> ⚠️ **Important**  
-> **MiMo-Audio is not compatible with the default chat template.**  
+> ⚠️ **Important**
+> **MiMo-Audio is not compatible with the default chat template.**
 > The provided `chat_template.jinja` implements MiMo-specific role, audio token, and instruction formatting and **must be used for all inference**.
 
 

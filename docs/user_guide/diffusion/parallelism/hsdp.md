@@ -59,7 +59,7 @@ omni = Omni(
     model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
     parallel_config=DiffusionParallelConfig(
         ulysses_degree=4,  # Sequence parallel
-        use_hsdp=True,     # HSDP overlays on SP
+        use_hsdp=True,  # HSDP overlays on SP
     ),
 )
 ```

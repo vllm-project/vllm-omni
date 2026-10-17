@@ -375,7 +375,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["text"]
+    modalities=["text"],
 )
 print(response.choices[0].message.content)
 ```
@@ -391,7 +391,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["text", "audio"]
+    modalities=["text", "audio"],
 )
 # Response contains two choices: one with text, one with audio
 print(response.choices[0].message.content)  # Text response
@@ -446,7 +446,7 @@ response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
     messages=[{"role": "user", "content": "Say hello in one sentence."}],
     modalities=["audio"],
-    extra_body={"speaker": "chelsie"}
+    extra_body={"speaker": "chelsie"},
 )
 # Audio-only responses contain a single audio choice
 print(response.choices[0].message.audio)

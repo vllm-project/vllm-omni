@@ -41,15 +41,19 @@ Replace standard `nn.Linear` with vLLM's parallel linear layers. This is the mos
 
 ```python
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear, RowParallelLinear,
+    ColumnParallelLinear,
+    RowParallelLinear,
 )
+
 
 class TPFeedForward(nn.Module):
     def __init__(self, dim, ffn_dim):
         super().__init__()
         self.fc1 = ColumnParallelLinear(dim, ffn_dim, bias=False, return_bias=False)
         self.fc2 = RowParallelLinear(
-            ffn_dim, dim, bias=False,
+            ffn_dim,
+            dim,
+            bias=False,
             input_is_parallel=True,  # Input already sharded from fc1
             return_bias=False,
         )
@@ -67,6 +71,7 @@ class TPFeedForward(nn.Module):
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm_omni.diffusion.attention.layer import Attention
 
+
 class TPSelfAttention(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads=None):
         super().__init__()
@@ -82,14 +87,16 @@ class TPSelfAttention(nn.Module):
             return_bias=False,
         )
         self.to_out = RowParallelLinear(
-            dim, dim, bias=False,
+            dim,
+            dim,
+            bias=False,
             input_is_parallel=True,
             return_bias=False,
         )
         self.attn = Attention(
-            num_heads=self.to_qkv.num_heads,      # Local heads per GPU
+            num_heads=self.to_qkv.num_heads,  # Local heads per GPU
             head_size=self.head_dim,
-            softmax_scale=1.0 / (self.head_dim ** 0.5),
+            softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=self.to_qkv.num_kv_heads,  # Local KV heads per GPU
             role="self",
@@ -98,9 +105,11 @@ class TPSelfAttention(nn.Module):
     def forward(self, x):
         qkv, _ = self.to_qkv(x)
         q, k, v = qkv.split(
-            [self.to_qkv.num_heads * self.head_dim,
-             self.to_qkv.num_kv_heads * self.head_dim,
-             self.to_qkv.num_kv_heads * self.head_dim],
+            [
+                self.to_qkv.num_heads * self.head_dim,
+                self.to_qkv.num_kv_heads * self.head_dim,
+                self.to_qkv.num_kv_heads * self.head_dim,
+            ],
             dim=-1,
         )
         B, S, _ = x.shape
@@ -123,6 +132,7 @@ stacked_params_mapping = [
     ("to_qkv", "to_k", "k"),
     ("to_qkv", "to_v", "v"),
 ]
+
 
 def load_weights(self, weights):
     params = dict(self.named_parameters())
@@ -190,11 +200,11 @@ Find where tensors need sharding/gathering:
 ```python
 class MyTransformer(nn.Module):
     def __init__(self):
-        self.patch_embed = PatchEmbed()    # Before blocks
-        self.pos_embed = RoPE()            # RoPE may need splitting
-        self.blocks = nn.ModuleList([...]) # Blocks process sharded x
+        self.patch_embed = PatchEmbed()  # Before blocks
+        self.pos_embed = RoPE()  # RoPE may need splitting
+        self.blocks = nn.ModuleList([...])  # Blocks process sharded x
         self.norm_out = LayerNorm()
-        self.proj_out = Linear()           # Gather after this
+        self.proj_out = Linear()  # Gather after this
 
     def forward(self, x):
         x = self.patch_embed(x)
@@ -213,10 +223,12 @@ class MyTransformer(nn.Module):
 # BAD: Inline — hooks can't intercept
 unified = torch.cat([x, cap_feats], dim=1)
 
+
 # GOOD: Extract into submodule
 class UnifiedPrepare(nn.Module):
     def forward(self, x, cap_feats):
         return torch.cat([x, cap_feats], dim=1)
+
 
 self.unified_prepare = UnifiedPrepare()
 unified = self.unified_prepare(x, cap_feats)
@@ -230,8 +242,10 @@ Common cases: `torch.cat()`, `pad_sequence()`, `tensor.reshape()`, complex prepr
 
 ```python
 from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput, SequenceParallelOutput,
+    SequenceParallelInput,
+    SequenceParallelOutput,
 )
+
 
 class StandardTransformer(nn.Module):
     _sp_plan = {
@@ -369,20 +383,24 @@ Inherit `CFGParallelMixin` and implement `diffuse()`:
 ```python
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 
+
 class YourPipeline(nn.Module, CFGParallelMixin):
-    def diffuse(self, latents, timesteps, prompt_embeds, negative_embeds,
-                do_true_cfg, true_cfg_scale, **kwargs):
+    def diffuse(self, latents, timesteps, prompt_embeds, negative_embeds, do_true_cfg, true_cfg_scale, **kwargs):
         for i, t in enumerate(timesteps):
             positive_kwargs = {
                 "hidden_states": latents,
                 "encoder_hidden_states": prompt_embeds,
                 "timestep": t,
             }
-            negative_kwargs = {
-                "hidden_states": latents,
-                "encoder_hidden_states": negative_embeds,
-                "timestep": t,
-            } if do_true_cfg else None
+            negative_kwargs = (
+                {
+                    "hidden_states": latents,
+                    "encoder_hidden_states": negative_embeds,
+                    "timestep": t,
+                }
+                if do_true_cfg
+                else None
+            )
 
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=do_true_cfg,
@@ -390,9 +408,7 @@ class YourPipeline(nn.Module, CFGParallelMixin):
                 positive_kwargs=positive_kwargs,
                 negative_kwargs=negative_kwargs,
             )
-            latents = self.scheduler_step_maybe_with_cfg(
-                noise_pred, t, latents, do_true_cfg
-            )
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
         return latents
 ```
 
@@ -434,12 +450,12 @@ class VideoAudioScheduler:
         self.audio_scheduler = audio_scheduler
 
     def step(self, noise_pred, t, latents, return_dict=False, generator=None):
-        video_out = self.video_scheduler.step(
-            noise_pred[0], t[0], latents[0], return_dict=False, generator=generator
-        )[0]
-        audio_out = self.audio_scheduler.step(
-            noise_pred[1], t[1], latents[1], return_dict=False, generator=generator
-        )[0]
+        video_out = self.video_scheduler.step(noise_pred[0], t[0], latents[0], return_dict=False, generator=generator)[
+            0
+        ]
+        audio_out = self.audio_scheduler.step(noise_pred[1], t[1], latents[1], return_dict=False, generator=generator)[
+            0
+        ]
         return ((video_out, audio_out),)
 ```
 

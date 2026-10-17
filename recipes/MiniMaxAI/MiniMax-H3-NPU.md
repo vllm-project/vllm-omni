@@ -344,7 +344,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import FastH3WeightFusion
 
-BASE = os.environ["BASE_DIR"] + "/FL2VA"          # base H3 FL2VA partition (native layout)
+BASE = os.environ["BASE_DIR"] + "/FL2VA"  # base H3 FL2VA partition (native layout)
 ADAPTER = os.environ["FASTH3_DIR"] + "/dense-datafree/adapter_model.safetensors"
 OUT = os.environ.get("FUSED_DIR", "/path/to/FastH3-Dense-Fused/FL2VA")
 
@@ -355,32 +355,31 @@ BASE_SCHEDULE = [0.999, 0.749, 0.5, 0.25, 0.0]
 COMPONENTS = ["audio_vae", "video_vae", "text_encoder", "tokenizer", "processor"]
 
 fusion = FastH3WeightFusion.from_path(
-    ADAPTER, head_dim=HEAD_DIM, num_blocks=NUM_BLOCKS,
-    num_refiner_blocks=NUM_REFINER_BLOCKS)
+    ADAPTER, head_dim=HEAD_DIM, num_blocks=NUM_BLOCKS, num_refiner_blocks=NUM_REFINER_BLOCKS
+)
 assert fusion is not None, "adapter not recognized as FastH3"
 
 os.makedirs(OUT + "/transformer", exist_ok=True)
 src_t = BASE + "/transformer"
-for shard in sorted(f for f in os.listdir(src_t)
-                    if f.endswith(".safetensors") and "index" not in f):
+for shard in sorted(f for f in os.listdir(src_t) if f.endswith(".safetensors") and "index" not in f):
     data = load_file(os.path.join(src_t, shard), device="cpu")
     fused = {}
     for k, v in data.items():
         fv = fusion.fuse(k, v)
         fused[k] = fv.to("cpu").to(torch.bfloat16) if fv is not v else v
     save_file(fused, os.path.join(OUT, "transformer", shard))
-fusion.validate_fully_applied()   # every delta must have met its parameter
+fusion.validate_fully_applied()  # every delta must have met its parameter
 
-for j in os.listdir(src_t):       # copy transformer index/config
+for j in os.listdir(src_t):  # copy transformer index/config
     if j.endswith(".json"):
         shutil.copy2(os.path.join(src_t, j), os.path.join(OUT, "transformer", j))
 
-for c in COMPONENTS:              # symlink unchanged components
+for c in COMPONENTS:  # symlink unchanged components
     s = os.path.join(BASE, c)
     if os.path.exists(s):
         os.symlink(os.path.realpath(s), os.path.join(OUT, c))
 
-idx = json.loads(open(BASE + "/model_index.json").read())   # inject sigma ladder
+idx = json.loads(open(BASE + "/model_index.json").read())  # inject sigma ladder
 idx.setdefault("_minimax_h3", {})["base_schedule"] = BASE_SCHEDULE
 open(OUT + "/model_index.json", "w").write(json.dumps(idx, indent=4) + "\n")
 print("fused ->", OUT)

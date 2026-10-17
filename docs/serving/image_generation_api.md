@@ -60,7 +60,7 @@ response = requests.post(
         "size": "1024x1024",
         "num_inference_steps": 50,
         "seed": 42,
-    }
+    },
 )
 
 # Decode and save
@@ -86,8 +86,8 @@ response = requests.post(
         "size": "1024x1024",
         "num_inference_steps": 50,
         "seed": 42,
-        "response_format":"file"
-    }
+        "response_format": "file",
+    },
 )
 
 # save to file
@@ -112,7 +112,7 @@ response = client.images.generate(
     prompt="a horse jumping over a fence nearby a babbling brook",
     n=1,
     size="1024x1024",
-    response_format="b64_json"
+    response_format="b64_json",
 )
 
 # Note: Extension parameters (seed, steps, cfg) require direct HTTP requests
@@ -192,7 +192,7 @@ response = requests.post(
         "negative_prompt": "blurry, low quality, distorted, ugly",
         "num_inference_steps": 100,
         "size": "1024x1024",
-    }
+    },
 )
 ```
 

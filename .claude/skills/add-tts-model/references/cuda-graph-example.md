@@ -7,6 +7,7 @@ model.
 ```python
 import torch
 
+
 class CodePredictorGraph:
     """Captures the 16-step code predictor AR loop as a single CUDA graph."""
 

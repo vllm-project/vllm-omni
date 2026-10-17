@@ -350,13 +350,15 @@ params = OmniDiffusionSamplingParams(
     seed=42,
     extra_args={"video_cfg_scale": 3.0, "audio_cfg_scale": 7.0},
 )
-req = DiffusionRequestBatch([
-    OmniDiffusionRequest(
-        prompt={"prompt": "Cherry blossoms moving in a light breeze"},
-        sampling_params=params,
-        request_id="ltx-example",
-    )
-])
+req = DiffusionRequestBatch(
+    [
+        OmniDiffusionRequest(
+            prompt={"prompt": "Cherry blossoms moving in a light breeze"},
+            sampling_params=params,
+            request_id="ltx-example",
+        )
+    ]
+)
 
 t2v_output = pipe(req)
 i2v_output = pipe(req, image=image)

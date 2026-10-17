@@ -18,8 +18,8 @@ vllm serve XiaomiMiMo/MiMo-Audio-7B-Instruct --omni \
     --port 18091 \
     --chat-template ./examples/online_serving/mimo_audio/chat_template.jinja
 ```
-> ⚠️ **Important**  
-> **MiMo-Audio is not compatible with the default chat template.**  
+> ⚠️ **Important**
+> **MiMo-Audio is not compatible with the default chat template.**
 > The provided `chat_template.jinja` implements MiMo-specific role, audio token, and instruction formatting and **must be used for all inference**.
 
 
@@ -68,5 +68,5 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     ``````
 ??? abstract "openai_chat_completion_client_for_multimodal_generation.py"
     ``````py
-    --8<-- "examples/online_serving/mimo_audio/openai_chat_completion_client_for_multimodal_generation.py"
+    --8 < --"examples/online_serving/mimo_audio/openai_chat_completion_client_for_multimodal_generation.py"
     ``````

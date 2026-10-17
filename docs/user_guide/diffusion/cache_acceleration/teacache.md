@@ -68,10 +68,7 @@ Then initialize without explicitly setting `cache_backend`:
 ```python
 from vllm_omni import Omni
 
-omni = Omni(
-    model="Qwen/Qwen-Image",
-    cache_config={"rel_l1_thresh": 0.2}
-)
+omni = Omni(model="Qwen/Qwen-Image", cache_config={"rel_l1_thresh": 0.2})
 ```
 
 ---
@@ -170,7 +167,7 @@ _MODEL_COEFFICIENTS = {
 
 ```python
 # Lower the threshold for more conservative caching
-cache_config={"rel_l1_thresh": 0.1}
+cache_config = {"rel_l1_thresh": 0.1}
 ```
 
 ### Common Issue 2: Limited Speedup
@@ -180,7 +177,7 @@ cache_config={"rel_l1_thresh": 0.1}
 **Solutions**:
 1. Increase the threshold to enable more aggressive caching (non-distilled models only; on few-step distilled models such as Z-Image-Turbo a higher threshold mostly costs quality, see the Summary):
    ```python
-   cache_config={"rel_l1_thresh": 0.3}
+   cache_config = {"rel_l1_thresh": 0.3}
    ```
 2. Ensure you're using sufficient inference steps (35+ recommended for non-distilled models; few-step distilled models cannot add steps)
 3. Check that your model architecture is supported (see Supported Models section)

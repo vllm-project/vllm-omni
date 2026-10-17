@@ -220,7 +220,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["text"]
+    modalities=["text"],
 )
 print(response.choices[0].message.content)
 ```
@@ -235,11 +235,11 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["text", "audio"]
+    modalities=["text", "audio"],
 )
 # Response contains two choices: one with text, one with audio
 print(response.choices[0].message.content)  # Text response
-print(response.choices[1].message.audio)    # Audio response
+print(response.choices[1].message.audio)  # Audio response
 ```
 
 ## Streaming Output
@@ -330,11 +330,11 @@ The gradio script supports the following arguments:
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/qwen3_omni/gradio_demo.py"
+    --8 < --"examples/online_serving/qwen3_omni/gradio_demo.py"
     ``````
 ??? abstract "openai_chat_completion_client_for_multimodal_generation.py"
     ``````py
-    --8<-- "examples/online_serving/qwen3_omni/openai_chat_completion_client_for_multimodal_generation.py"
+    --8 < --"examples/online_serving/qwen3_omni/openai_chat_completion_client_for_multimodal_generation.py"
     ``````
 ??? abstract "qwen3_omni_moe_thinking.yaml"
     ``````yaml

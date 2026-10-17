@@ -59,6 +59,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 
+
 class SelfAttention(torch.nn.Module):
     def __init__(
         self,

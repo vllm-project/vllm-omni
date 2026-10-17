@@ -125,11 +125,10 @@ In `DiffusionParallelConfig`:
 **Solution**:
 ```python
 # Step 1: Enable TP with smallest degree
-parallel_config=DiffusionParallelConfig(tensor_parallel_size=2)
+parallel_config = DiffusionParallelConfig(tensor_parallel_size=2)
 
 # Step 2: If still OOM, increase TP degree
-parallel_config=DiffusionParallelConfig(tensor_parallel_size=4)
-
+parallel_config = DiffusionParallelConfig(tensor_parallel_size=4)
 ```
 
 ### Common Issue 2: Divisibility Error

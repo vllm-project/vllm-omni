@@ -40,9 +40,7 @@ def load_model(self, *args, **kwargs) -> None:
         )
         max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
         self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
-        self.talker_mtp_inputs_embeds = self._make_buffer(
-            max_batch_size, hidden_size, dtype=self.dtype, numpy=False
-        )
+        self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
 ```
@@ -175,11 +173,7 @@ Location: In post process section, after hidden_states assignment
 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
 if multimodal_outputs is not None:
-    keys_or_type = (
-        list(multimodal_outputs.keys())
-        if isinstance(multimodal_outputs, dict)
-        else type(multimodal_outputs)
-    )
+    keys_or_type = list(multimodal_outputs.keys()) if isinstance(multimodal_outputs, dict) else type(multimodal_outputs)
     logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
 else:
     logger.debug("[AR] execute_model: multimodal_outputs is None")
@@ -194,9 +188,7 @@ Location: In both broadcast_pp_output True and False branches
 #  -------------------------------------- Omni-new -------------------------------------------------
 # Try with sampling_metadata first; fall back to without for models that don't support it
 try:
-    logits = self.model.compute_logits(
-        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-    )
+    logits = self.model.compute_logits(sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata)
 except TypeError:
     logits = self.model.compute_logits(sample_hidden_states)
 #  -------------------------------------- Omni-new -------------------------------------------------

@@ -115,9 +115,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="Qwen/Qwen2.5-Omni-7B",
-    messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["text"]
+    model="Qwen/Qwen2.5-Omni-7B", messages=[{"role": "user", "content": "Describe vLLM in brief."}], modalities=["text"]
 )
 print(response.choices[0].message.content)
 ```
@@ -132,11 +130,11 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen2.5-Omni-7B",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["audio"]
+    modalities=["audio"],
 )
 # Response contains two choices: one with text, one with audio
 print(response.choices[0].message.content)  # Text response
-print(response.choices[1].message.audio)    # Audio response
+print(response.choices[1].message.audio)  # Audio response
 ```
 
 ## Streaming Output
@@ -222,7 +220,7 @@ The gradio script supports the following arguments:
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/qwen2_5_omni/gradio_demo.py"
+    --8 < --"examples/online_serving/qwen2_5_omni/gradio_demo.py"
     ``````
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh

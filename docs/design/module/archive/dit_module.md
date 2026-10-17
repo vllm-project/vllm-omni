@@ -162,6 +162,7 @@ class DiffusionRequestStatus(enum.IntEnum):
     FINISHED_ABORTED = ...
     FINISHED_ERROR = ...
 
+
 @dataclass
 class SchedulerRequestState:
     request_id: str
@@ -313,9 +314,7 @@ class DiffusionWorker:
         # Select the device and initialize distributed execution
         self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
-        self.vllm_config = _create_diffusion_worker_vllm_config(
-            self.device, self.od_config
-        )
+        self.vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
         init_distributed_environment(world_size, rank)
         parallel_config = self.od_config.parallel_config
         initialize_model_parallel(
@@ -395,10 +394,7 @@ def execute_model(self, reqs: list[OmniDiffusionRequest], od_config):
         self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
 
     # Set forward context for parallelism
-    with set_forward_context(
-        vllm_config=self.vllm_config,
-        omni_diffusion_config=self.od_config
-    ):
+    with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
         output = self.pipeline.forward(req)
     return output
 ```
@@ -407,9 +403,7 @@ The model execution leverages multiple parallelism strategies that are transpare
 
 ```python
 # Inside transformer layers, parallel groups are accessed via:
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_sp_group, get_dp_group, get_cfg_group, get_pp_group
-)
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group, get_dp_group, get_cfg_group, get_pp_group
 ```
 
 **Optimizations**:
@@ -522,7 +516,8 @@ def get_attn_backend_for_role(role, head_size, attention_config=None, role_categ
     # 4. Platform default                           — hardware-specific
     if attention_config is not None:
         spec, source = attention_config.resolve_with_source(
-            role=role, role_category=role_category,
+            role=role,
+            role_category=role_category,
         )
         if spec is not None:
             return load_backend(spec.backend), spec
@@ -799,10 +794,7 @@ class CacheDiTBackend(CacheBackend):
 **Location**: `vllm_omni/diffusion/cache/selector.py`
 
 ```python
-def get_cache_backend(
-    cache_backend: str | None,
-    cache_config: dict | DiffusionCacheConfig
-) -> CacheBackend | None:
+def get_cache_backend(cache_backend: str | None, cache_config: dict | DiffusionCacheConfig) -> CacheBackend | None:
     """Get cache backend instance based on cache_backend string.
 
     Args:

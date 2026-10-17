@@ -189,11 +189,11 @@ pip install matplotlib
     ``````
 ??? abstract "end2end.py"
     ``````py
-    --8<-- "examples/offline_inference/internvla_a1/end2end.py"
+    --8 < --"examples/offline_inference/internvla_a1/end2end.py"
     ``````
 ??? abstract "internvla_a1_common.py"
     ``````py
-    --8<-- "examples/offline_inference/internvla_a1/internvla_a1_common.py"
+    --8 < --"examples/offline_inference/internvla_a1/internvla_a1_common.py"
     ``````
 ??? abstract "run.sh"
     ``````sh

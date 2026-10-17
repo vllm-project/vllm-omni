@@ -39,7 +39,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 omni = Omni(
     model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2)  # Enable Ulysses-SP
+    parallel_config=DiffusionParallelConfig(ulysses_degree=2),  # Enable Ulysses-SP
 )
 
 outputs = omni.generate(
@@ -72,7 +72,7 @@ omni = Omni(
 ```python
 omni = Omni(
     model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ring_degree=2)  # Enable Ring-Attention
+    parallel_config=DiffusionParallelConfig(ring_degree=2),  # Enable Ring-Attention
 )
 ```
 
@@ -81,17 +81,14 @@ omni = Omni(
 ```python
 omni = Omni(
     model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)  # 4 GPUs total
+    parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2),  # 4 GPUs total
 )
 ```
 
 **Ulysses × AllGather-KV** (4 GPUs total, no Ring in the attention computation):
 
 ```python
-omni = Omni(
-    model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2, allgather_degree=2)
-)
+omni = Omni(model="Qwen/Qwen-Image", parallel_config=DiffusionParallelConfig(ulysses_degree=2, allgather_degree=2))
 ```
 
 ### Ulysses × AllGather-KV
@@ -275,7 +272,7 @@ nvidia-smi topo -m
 
 ```python
 # If 4 GPUs is slower than 2
-parallel_config=DiffusionParallelConfig(ulysses_degree=2)
+parallel_config = DiffusionParallelConfig(ulysses_degree=2)
 ```
 
 1. Try to switch between Ring-Attention and Ulysses-SP
@@ -292,7 +289,7 @@ parallel_config=DiffusionParallelConfig(ulysses_degree=2)
 1. Increase parallelism degree to split sequence more:
 
 ```python
-parallel_config=DiffusionParallelConfig(ulysses_degree=4)  # From 2
+parallel_config = DiffusionParallelConfig(ulysses_degree=4)  # From 2
 ```
 
 1. Combine with other parallelism method, e.g., tensor parallel, and memory optimization methods, e.g., cpu offloading.

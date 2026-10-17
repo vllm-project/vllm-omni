@@ -64,5 +64,5 @@ Key arguments:
 
 ??? abstract "text_to_audio.py"
     ``````py
-    --8<-- "examples/offline_inference/text_to_audio/text_to_audio.py"
+    --8 < --"examples/offline_inference/text_to_audio/text_to_audio.py"
     ``````

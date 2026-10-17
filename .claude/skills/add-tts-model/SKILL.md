@@ -85,7 +85,7 @@ Declaring a model "done" without all three has shipped regressions more than onc
 If the model caches *anything* across `forward()` calls (streaming generators, codec buffers, sliding-window pads, CUDA graph state), key it by request ID:
 
 ```python
-self._state: dict[str, YourState] = {}    # request_key → state
+self._state: dict[str, YourState] = {}  # request_key → state
 # fetch: request_key = str(info.get("_omni_req_id", "0"))
 # free on finish: del self._state[request_key]
 ```
@@ -232,8 +232,8 @@ See `plan/voxcpm2_native_ar_design.md`.
    ```python
    @register_tts_adapter
    class YourModelAdapter(ARTTSAdapter):
-       name = "your_model"                              # registry key + log label
-       stage_keys = frozenset({"your_stage_key"})       # the deploy yaml's model_stage
+       name = "your_model"  # registry key + log label
+       stage_keys = frozenset({"your_stage_key"})  # the deploy yaml's model_stage
 
        def validate(self, request) -> str | None:
            if not request.input or not request.input.strip():
@@ -302,6 +302,7 @@ See `plan/voxcpm2_native_ar_design.md`.
 ```python
 import base64
 from pathlib import Path
+
 
 def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
     """Build prompt with reference audio for voice cloning, called from the adapter."""

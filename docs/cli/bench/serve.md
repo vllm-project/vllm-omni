@@ -966,29 +966,29 @@ If successful, following output is like:
 
 ```text
 ============ Serving Benchmark Result ============
-Successful requests:                     3  
-Failed requests:                         0  
-Maximum request concurrency:             1  
-Benchmark duration (s):                  8.42  
-Request throughput (req/s):              0.36  
-Peak concurrent requests:                2.00  
+Successful requests:                     3
+Failed requests:                         0
+Maximum request concurrency:             1
+Benchmark duration (s):                  8.42
+Request throughput (req/s):              0.36
+Peak concurrent requests:                2.00
 -------------------Peak Memory--------------------
-Mean PEAK_MEMORY_MB (MB):                58832.00  
-Median PEAK_MEMORY_MB (MB):              58832.00  
-P99 PEAK_MEMORY_MB (MB):                 58832.00  
+Mean PEAK_MEMORY_MB (MB):                58832.00
+Median PEAK_MEMORY_MB (MB):              58832.00
+P99 PEAK_MEMORY_MB (MB):                 58832.00
 ----------------End-to-end Latency----------------
-Mean E2EL (ms):                          2798.16  
-Median E2EL (ms):                        2799.83  
-P99 E2EL (ms):                           2800.03  
+Mean E2EL (ms):                          2798.16
+Median E2EL (ms):                        2799.83
+P99 E2EL (ms):                           2800.03
 ================== Image Result ==================
-Total images generated:                  3  
-Image throughput (img/s):                0.36  
+Total images generated:                  3
+Image throughput (img/s):                0.36
 Average pixels per image:                1048576.00
-Mean denoise step latency (ms):          136.59  
+Mean denoise step latency (ms):          136.59
 ---------------- Image Generation ----------------
-Mean IMAGE_GENERATION (ms):              2731.84  
-Median IMAGE_GENERATION (ms):            2732.02  
-P99 IMAGE_GENERATION (ms):               2734.65  
+Mean IMAGE_GENERATION (ms):              2731.84
+Median IMAGE_GENERATION (ms):            2732.02
+P99 IMAGE_GENERATION (ms):               2734.65
 ==================================================
 ```
 

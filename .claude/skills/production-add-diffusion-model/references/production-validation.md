@@ -53,6 +53,7 @@ from vllm_omni.diffusion.worker.request_batch import (
     split_diffusion_output_by_request,
 )
 
+
 class MyPipeline(torch.nn.Module):
     supports_request_batch = True
 
@@ -61,10 +62,7 @@ class MyPipeline(torch.nn.Module):
         common = req.sampling_params_list[0]
 
         text_prompts: list[str] | None = [
-            prompt
-            if isinstance(prompt, str)
-            else (prompt.get("prompt") or "")
-            for prompt in req.prompts
+            prompt if isinstance(prompt, str) else (prompt.get("prompt") or "") for prompt in req.prompts
         ]
 
         prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
@@ -139,6 +137,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.interface import SupportsStepExecution
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+
 
 class MyPipeline(torch.nn.Module, SupportsStepExecution):
     supports_step_execution: ClassVar[bool] = True

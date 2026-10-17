@@ -325,7 +325,7 @@ omni = Omni(
     model="<your-model>",
     quantization_config={
         "method": "mxfp4_dualscale",
-        "ignored_layers": ["blocks.10.attn1.to_qkv"],   # explicit per-layer override
+        "ignored_layers": ["blocks.10.attn1.to_qkv"],  # explicit per-layer override
     },
 )
 ```
@@ -599,7 +599,7 @@ omni = Omni(
     quantization_config={
         "method": "mxfp4_dualscale",
         "ignored_layers": [
-            "blocks.0.attn1.to_qkv",   # runtime name, not diffusers name
+            "blocks.0.attn1.to_qkv",  # runtime name, not diffusers name
             "blocks.0.attn1.to_out",
             "blocks.0.ffn.net_0.proj",
         ],
@@ -666,9 +666,9 @@ things it must do:
 3. **Inject `quantization_config`** into `config.json`:
    ```python
    config["quantization_config"] = {
-       "quant_method":              "mxfp4_dualscale",
-       "is_checkpoint_serialized":  True,
-       "ignored_layers":            ignored_layers,   # runtime names
+       "quant_method": "mxfp4_dualscale",
+       "is_checkpoint_serialized": True,
+       "ignored_layers": ignored_layers,  # runtime names
    }
    ```
 

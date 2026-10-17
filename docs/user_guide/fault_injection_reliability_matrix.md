@@ -34,9 +34,9 @@ In real customer environments, the system will inevitably encounter accidental o
 
 This document currently covers two core failure modes, and the system is expected to show predictable and observable behavior under each mode:
 
-- **Failure Mode 1: Process receives abnormal signals (`SIGINT` / `SIGTERM` / `SIGKILL`)**  
+- **Failure Mode 1: Process receives abnormal signals (`SIGINT` / `SIGTERM` / `SIGKILL`)**
   Focus on three aspects: whether processes exit as expected and complete cleanup, whether requests fail fast or connections are interrupted, and whether GPU resources are eventually fully released with no residue.
-- **Failure Mode 2: OOM (occupy all free GPU memory via an extra process)**  
+- **Failure Mode 2: OOM (occupy all free GPU memory via an extra process)**
   Focus on two aspects: whether service health degrades to the expected state (for example, `503`), and whether requests fail within an acceptable time without hanging.
 
 More failure modes (for example, network jitter and network interruption) will be added in future iterations to improve end-to-end reliability validation coverage.

@@ -180,7 +180,7 @@ Note: This task uses hardcoded message lists in the script.
 
 ### Tokenizer path
 
-- **`MIMO_AUDIO_TOKENIZER_PATH` not set or model fails to find tokenizer**  
+- **`MIMO_AUDIO_TOKENIZER_PATH` not set or model fails to find tokenizer**
   Export the tokenizer path before running:
   ```bash
   export MIMO_AUDIO_TOKENIZER_PATH="XiaomiMiMo/MiMo-Audio-Tokenizer"

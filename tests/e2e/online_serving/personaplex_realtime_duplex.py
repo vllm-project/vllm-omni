@@ -472,7 +472,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             label="primary frame coverage",
         ),
         wait_for(
-            lambda: (len(_audio_bytes(secondary)) // (2 * FRAME_SAMPLES) >= secondary_frames - args.max_frame_deficit),
+            lambda: len(_audio_bytes(secondary)) // (2 * FRAME_SAMPLES) >= secondary_frames - args.max_frame_deficit,
             timeout_s=args.timeout_s,
             label="secondary frame coverage",
         ),

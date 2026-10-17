@@ -32,7 +32,7 @@ The major APIs for Sequence Parallel:
 
 ```python
 from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,   # For sharding (splitting) tensors
+    SequenceParallelInput,  # For sharding (splitting) tensors
     SequenceParallelOutput,  # For gathering tensors
 )
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
@@ -128,19 +128,19 @@ Identify where tensors need to be sharded or gathered in your model's forward pa
 ```python
 class MyTransformer(nn.Module):
     def __init__(self):
-        self.patch_embed = PatchEmbed()      # ← Boundary 1
-        self.pos_embed = RoPE()              # ← Boundary 2
-        self.blocks = nn.ModuleList([...])   # ← Boundary 3
+        self.patch_embed = PatchEmbed()  # ← Boundary 1
+        self.pos_embed = RoPE()  # ← Boundary 2
+        self.blocks = nn.ModuleList([...])  # ← Boundary 3
         self.norm_out = LayerNorm()
-        self.proj_out = Linear()             # ← Boundary 4
+        self.proj_out = Linear()  # ← Boundary 4
 
     def forward(self, x):
-        x = self.patch_embed(x)              # ← Shard before this?
-        pos = self.pos_embed(x)              # ← Shard RoPE outputs?
+        x = self.patch_embed(x)  # ← Shard before this?
+        pos = self.pos_embed(x)  # ← Shard RoPE outputs?
         for block in self.blocks:
-            x = block(x, pos)                # ← Blocks process sharded x
+            x = block(x, pos)  # ← Blocks process sharded x
         x = self.norm_out(x)
-        output = self.proj_out(x)            # ← Gather after this?
+        output = self.proj_out(x)  # ← Gather after this?
         return output
 ```
 
@@ -162,11 +162,14 @@ class ZImageTransformer(nn.Module):
 
         return unified
 
+
 # ✅ GOOD: Extract into submodule
 class UnifiedPrepare(nn.Module):
     """Submodule to concatenate image and text features."""
+
     def forward(self, x, cap_feats):
         return torch.cat([x, cap_feats], dim=1)
+
 
 class ZImageTransformer(nn.Module):
     def __init__(self):
@@ -202,9 +205,11 @@ Most common pattern for standard transformers:
 
 ```python
 from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,   # For sharding (splitting) tensors
+    SequenceParallelInput,  # For sharding (splitting) tensors
     SequenceParallelOutput,  # For gathering tensors
 )
+
+
 class StandardTransformer(nn.Module):
     _sp_plan = {
         # Shard hidden_states at first transformer block input
@@ -222,9 +227,11 @@ When RoPE is computed in a separate module:
 
 ```python
 from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,   # For sharding (splitting) tensors
+    SequenceParallelInput,  # For sharding (splitting) tensors
     SequenceParallelOutput,  # For gathering tensors
 )
+
+
 class TransformerWithRoPE(nn.Module):
     _sp_plan = {
         # Shard RoPE module OUTPUTS (returns tuple of cos, sin)
@@ -250,6 +257,7 @@ class DualStreamTransformer(nn.Module):
     Dual-stream model where we need to replicate the text components, but shard
     the image components to correctly handle sequence parallelism.
     """
+
     _sp_plan = {
         # In this case, the rope_preparer returns a tuple of len 4, where the
         # first 2 items correspond to the text, and the second 2 correspond to
@@ -450,7 +458,7 @@ if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
     batch_size = hidden_states.shape[0]
     padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
     hidden_states_mask = torch.ones(batch_size, padded_seq_len, dtype=torch.bool, device=hidden_states.device)
-    hidden_states_mask[:, ctx.sp_original_seq_len:] = False
+    hidden_states_mask[:, ctx.sp_original_seq_len :] = False
 
 # Pass mask to attention layers
 attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask) if hidden_states_mask is not None else None

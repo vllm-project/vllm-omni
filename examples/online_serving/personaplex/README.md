@@ -40,8 +40,10 @@ from vllm_omni.clients.duplex import DuplexClient
 from vllm_omni.clients.personaplex import create_duplex_session_config
 
 cfg = create_duplex_session_config(voice="NATF2.pt", persona="You are a concise assistant.")
-async with DuplexClient("ws://127.0.0.1:8000/v1/realtime?duplex=1", model="/path/to/personaplex-7b-v1", config=cfg) as c:
-    await c.stream_pcm(pcm_f32le_24k)          # keep streaming; the model speaks while it listens
+async with DuplexClient(
+    "ws://127.0.0.1:8000/v1/realtime?duplex=1", model="/path/to/personaplex-7b-v1", config=cfg
+) as c:
+    await c.stream_pcm(pcm_f32le_24k)  # keep streaming; the model speaks while it listens
 ```
 
 Voice and persona are fixed for the session (`session.update` cannot change them).

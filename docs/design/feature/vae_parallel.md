@@ -121,16 +121,16 @@ Reuse `AutoencoderKLQwenImage.tiled_decode` logic and divide it into three stage
 class GridSpec:
     split_dims: tuple[int, ...]  # Tensor dimensions being split (e.g., (2, 3) for (B, C, H, W))
     grid_shape: tuple[int, ...]  # Tile grid layout (num_rows, num_cols)
-    tile_spec: dict = field(default_factory=dict) # Metadata required for merging
-    output_dtype: torch.dtype | None = None # Final output dtype
+    tile_spec: dict = field(default_factory=dict)  # Metadata required for merging
+    output_dtype: torch.dtype | None = None  # Final output dtype
 ```
 
 ```python
 class TileTask:
-    tile_id: int # task id
+    tile_id: int  # task id
     grid_coord: tuple[int, ...]  # Tile position in grid
     tensor: torch.Tensor | list[torch.Tensor]  # The tile tensor
-    workload: int | float = 1 # Used for load balancing (e.g., tile area)
+    workload: int | float = 1  # Used for load balancing (e.g., tile area)
 ```
 
 And tiled base split/exec/merge as follow:
@@ -182,6 +182,7 @@ def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
     )
     return tiletask_list, grid_spec
 
+
 def tile_exec(self, task: TileTask) -> torch.Tensor:
     """Decode a single latent tile into RGB space."""
     self.clear_cache()
@@ -193,6 +194,7 @@ def tile_exec(self, task: TileTask) -> torch.Tensor:
         time.append(decoded)
     result = torch.cat(time, dim=2)
     return result
+
 
 def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
     """Merge decoded tiles into a full image."""
@@ -319,23 +321,30 @@ def encode_tile_split(self, x: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
                     tile = x[:, :, :1, i : i + tile_sample_min_height, j : j + tile_sample_min_width]
                 else:
                     tile = x[
-                        :, :,
+                        :,
+                        :,
                         1 + temporal_compression * (k - 1) : 1 + temporal_compression * k,
                         i : i + tile_sample_min_height,
                         j : j + tile_sample_min_width,
                     ]
                 time_list.append(tile)
             tiletask_list.append(
-                TileTask(len(tiletask_list), (i // tile_sample_stride_height, j // tile_sample_stride_width),
-                         time_list, workload=time_list[0].shape[3] * time_list[0].shape[4])
+                TileTask(
+                    len(tiletask_list),
+                    (i // tile_sample_stride_height, j // tile_sample_stride_width),
+                    time_list,
+                    workload=time_list[0].shape[3] * time_list[0].shape[4],
+                )
             )
 
     grid_spec = GridSpec(
         split_dims=(3, 4),
         grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
         tile_spec={
-            "latent_height": latent_height, "latent_width": latent_width,
-            "blend_height": blend_height, "blend_width": blend_width,
+            "latent_height": latent_height,
+            "latent_width": latent_width,
+            "blend_height": blend_height,
+            "blend_width": blend_width,
             "tile_latent_stride_height": tile_latent_stride_height,
             "tile_latent_stride_width": tile_latent_stride_width,
         },
@@ -364,9 +373,7 @@ def encode_tile_exec(self, task: TileTask) -> torch.Tensor:
 ### Step 3: Implement encode_tile_merge
 
 ```python
-def encode_tile_merge(
-    self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
-) -> torch.Tensor:
+def encode_tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
     """Merge encoded tiles into a full latent tensor."""
     grid_h, grid_w = grid_spec.grid_shape
     result_rows = []
@@ -378,9 +385,15 @@ def encode_tile_merge(
                 tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_height"])
             if j > 0:
                 tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_width"])
-            result_row.append(tile[:, :, :,
-                : grid_spec.tile_spec["tile_latent_stride_height"],
-                : grid_spec.tile_spec["tile_latent_stride_width"]])
+            result_row.append(
+                tile[
+                    :,
+                    :,
+                    :,
+                    : grid_spec.tile_spec["tile_latent_stride_height"],
+                    : grid_spec.tile_spec["tile_latent_stride_width"],
+                ]
+            )
         result_rows.append(torch.cat(result_row, dim=-1))
 
     enc = torch.cat(result_rows, dim=3)[
@@ -445,13 +458,13 @@ Testing requirements:
 
 ```python
 m = Omni(
-        model=model_name,
-        vae_use_tiling=True,
-        parallel_config=DiffusionParallelConfig(
-            tensor_parallel_size=2,
-            vae_patch_parallel_size=1, # or 2
-        ),
-    )
+    model=model_name,
+    vae_use_tiling=True,
+    parallel_config=DiffusionParallelConfig(
+        tensor_parallel_size=2,
+        vae_patch_parallel_size=1,  # or 2
+    ),
+)
 ```
 
 When vae_patch_parallel_size is larger than the DiT world size, it will automatically fall back to using the DiT world size instead.

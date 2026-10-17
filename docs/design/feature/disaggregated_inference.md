@@ -45,7 +45,9 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def get(self, from_stage: str, to_stage: str, get_key: str, metadata: Optional[dict] = None) -> Optional[tuple[Any, int]]:
+    def get(
+        self, from_stage: str, to_stage: str, get_key: str, metadata: Optional[dict] = None
+    ) -> Optional[tuple[Any, int]]:
         """
         Retrieve data.
         Args: metadata - transport-specific handles returned by put() (e.g., SHM name).

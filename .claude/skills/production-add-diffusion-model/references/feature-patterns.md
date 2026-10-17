@@ -35,15 +35,17 @@ The public builder accepts one method or a longest-prefix component map:
 ```python
 from vllm_omni.quantization import build_quant_config
 
-config = build_quant_config({
-    "transformer": {
-        "method": "fp8",
-        "ignored_layers": ["transformer.final_layer"],
-    },
-    "text_encoder": None,
-    "vae": None,
-    "default": None,
-})
+config = build_quant_config(
+    {
+        "transformer": {
+            "method": "fp8",
+            "ignored_layers": ["transformer.final_layer"],
+        },
+        "text_encoder": None,
+        "vae": None,
+        "default": None,
+    }
+)
 
 assert config.resolve("transformer.blocks.0.attn.qkv_proj") is not None
 assert config.resolve("text_encoder.layers.0.mlp") is None
@@ -168,11 +170,7 @@ seen = {name: set() for name in expected}
 # After mapping/loading each source:
 seen[target_name].add(shard_id)
 
-incomplete = {
-    name: sorted(shards - seen[name], key=str)
-    for name, shards in expected.items()
-    if shards - seen[name]
-}
+incomplete = {name: sorted(shards - seen[name], key=str) for name, shards in expected.items() if shards - seen[name]}
 if incomplete:
     raise RuntimeError(f"incomplete fused checkpoint parameters: {incomplete}")
 ```
@@ -207,11 +205,13 @@ from operator import attrgetter
 
 import torch
 
+
 def assert_offload_path(root, path):
     value = attrgetter(path)(root)
     if not isinstance(value, torch.nn.Module):
         raise TypeError(f"offload path {path!r} is not an nn.Module")
     return value
+
 
 for path in (
     *pipeline._dit_modules,
@@ -353,6 +353,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTRequestSpec,
     RequestScopedCacheDiTRuntime,
 )
+
 
 class MyPipeline(nn.Module):
     def __init__(self, *args, **kwargs):

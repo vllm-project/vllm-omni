@@ -81,6 +81,7 @@ To pre-warm specific shapes (e.g. at image build time):
 
 ```python
 from vllm_omni.quantization.quack_fp8 import warmup_quack_fp8
+
 # (M, K, N) per linear; M = number of tokens for your resolution/frame count
 warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 ```

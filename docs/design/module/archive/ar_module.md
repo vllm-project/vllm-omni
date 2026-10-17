@@ -268,8 +268,8 @@ def _collect_additional_information_for_prefill(self, num_scheduled_tokens_np):
         pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
         # Overlay prompt_embeds for prefill portion
         if pe_cpu is not None:
-            src = pe_cpu[num_computed_tokens:num_computed_tokens + overlay_len]
-            self.inputs_embeds[start_offset:start_offset + overlay_len].copy_(src)
+            src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len]
+            self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
 ```
 
 #### Additional Information Processing

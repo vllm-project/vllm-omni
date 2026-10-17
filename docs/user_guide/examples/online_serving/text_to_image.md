@@ -298,11 +298,11 @@ cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_image/gradio_demo.py"
+    --8 < --"examples/online_serving/text_to_image/gradio_demo.py"
     ``````
 ??? abstract "openai_chat_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_image/openai_chat_client.py"
+    --8 < --"examples/online_serving/text_to_image/openai_chat_client.py"
     ``````
 ??? abstract "run_curl_text_to_image.sh"
     ``````sh

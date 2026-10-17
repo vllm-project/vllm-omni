@@ -312,16 +312,12 @@ from vllm_omni.entrypoints.omni import Omni
 
 if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
-    outputs = omni.generate([
-        {
-            "prompt": "a cup of coffee on a table",
-            "negative_prompt": "low resolution"
-        },
-        {
-            "prompt": "a toy dinosaur on a sandy beach",
-            "negative_prompt": "cinematic, realistic"
-        }
-    ])
+    outputs = omni.generate(
+        [
+            {"prompt": "a cup of coffee on a table", "negative_prompt": "low resolution"},
+            {"prompt": "a toy dinosaur on a sandy beach", "negative_prompt": "cinematic, realistic"},
+        ]
+    )
     for i, output in enumerate(outputs):
         output.images[0].save(f"{i}.jpg")
 ```

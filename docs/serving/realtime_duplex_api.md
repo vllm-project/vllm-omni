@@ -196,8 +196,8 @@ re-attaching from a new client or process requires the wire-level
 from vllm_omni.clients.duplex import read_pcm16_wav
 
 question = read_pcm16_wav(Path("question_16k.wav"))
-await client.stream_pcm(question, chunk_ms=100)      # paced 100 ms appends
-await client.commit(create_response=False)           # the model decides listen/speak
+await client.stream_pcm(question, chunk_ms=100)  # paced 100 ms appends
+await client.commit(create_response=False)  # the model decides listen/speak
 ```
 
 `stream_pcm` slices PCM into `chunk_ms` appends and paces them in real time
@@ -227,8 +227,8 @@ handle with `decision == "listen"`.
 ```python
 async for response in client.responses():
     if response.decision == "listen":
-        continue                                   # the model kept listening
-    async for chunk in response.audio():           # decoded PCM16 at 24 kHz
+        continue  # the model kept listening
+    async for chunk in response.audio():  # decoded PCM16 at 24 kHz
         play(chunk)
         await client.ack_playback(response.played_ms, response_id=response.response_id)
     await response.wait()
@@ -251,8 +251,8 @@ what the example and the benchmarks do at the end of a turn.
 ### Interrupt
 
 ```python
-await client.cancel_response()        # cancel the active response (epoch advances)
-await client.clear_input()            # drop un-committed input audio
+await client.cancel_response()  # cancel the active response (epoch advances)
+await client.clear_input()  # drop un-committed input audio
 ```
 
 In the model-native lane you usually do not need either: keep streaming
@@ -375,12 +375,14 @@ from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 
 omni = DuplexOmni(model="openbmb/MiniCPM-o-4_5", trust_remote_code=True)
 async with await omni.open_session({"modalities": ["audio", "text"], "ref_audio": ref_audio_data_url}) as session:
+
     async def consume():
-        async for event in session.events():          # typed DuplexEvent objects
+        async for event in session.events():  # typed DuplexEvent objects
             if isinstance(event, AudioDelta):
                 play(event.audio)
             elif isinstance(event, ResponseDone):
-                break                                  # one turn is enough here
+                break  # one turn is enough here
+
     task = asyncio.create_task(consume())
     await session.submit(AppendAudio(audio=pcm16_bytes, format="pcm16", sample_rate_hz=16000))
     await session.submit(Commit())

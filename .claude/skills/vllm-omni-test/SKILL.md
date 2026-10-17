@@ -159,11 +159,14 @@ def test_<env_or_attr>(monkeypatch):
 # BAD — do not use in L1 unit tests
 from unittest.mock import patch, MagicMock
 
+
 @patch("vllm_omni.some.module.fn")
 def test_bad(mock_fn): ...
 
+
 def test_also_bad():
-    with patch("...") as m: ...
+    with patch("...") as m:
+        ...
 ```
 
 See **L1 unit test constraints (mocking)** below for the full do/don't list.
@@ -199,12 +202,14 @@ def test_text_to_image_001(offline_client) -> None:
 @hardware_test(...)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_runner, offline_client) -> None:
-    offline_client.send_audio_speech_request({
-        "input": "...",
-        "task_type": "Base",
-        "ref_audio": REF_AUDIO_URL,
-        "ref_text": REF_TEXT,
-    })
+    offline_client.send_audio_speech_request(
+        {
+            "input": "...",
+            "task_type": "Base",
+            "ref_audio": REF_AUDIO_URL,
+            "ref_text": REF_TEXT,
+        }
+    )
 ```
 
 *Offline TTS e2e — **single-stage** (Coqui XTTS, MOSS-TTS-Nano; representative):*
@@ -215,13 +220,15 @@ def test_text_to_audio_001(omni_runner, offline_client) -> None:
 @hardware_test(...)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
 def test_voice_clone_001(offline_client) -> None:
-    offline_client.send_single_stage_tts_request({
-        "input": "...",
-        "language": "en",
-        "prompt_audio_path": REF_AUDIO_PATH,
-        "response_format": "wav",
-        "run_level": "advanced_model",
-    })
+    offline_client.send_single_stage_tts_request(
+        {
+            "input": "...",
+            "language": "en",
+            "prompt_audio_path": REF_AUDIO_PATH,
+            "response_format": "wav",
+            "run_level": "advanced_model",
+        }
+    )
 ```
 
 *Online serving e2e — **Omni** (representative):*
@@ -339,6 +346,7 @@ vLLM-Omni e2e tests start a real **OmniServer** (online) or **OmniRunner** (offl
 @pytest.mark.parametrize("omni_server", [pytest.param(OmniServerParams(model=MODEL), marks=H100)], indirect=True)
 def test_foo_images_generations_default_1024(omni_server, online_client) -> None:
     online_client.send_images_generations_request({...})
+
 
 # Function-scoped — reliability / per-test clean state only
 @pytest.mark.parametrize(
@@ -821,14 +829,14 @@ Production behavior is driven by [`.buildkite/cuda/pipeline.yml`](../../../.buil
 
 When you add or debug **L3** or **L4** tests and need those child pipelines to run **off `main`** or **without** `NIGHTLY=1`, apply **temporary** edits (revert before merge):
 
-1. **Point the upload at the right file (optional shortcut)**  
+1. **Point the upload at the right file (optional shortcut)**
    In the **Upload Ready Pipeline** step, the command is `buildkite-agent pipeline upload .buildkite/cuda/test-ready.yml`. For a one-off run you may change that path to `.buildkite/cuda/test-merge.yml` (L3) or `.buildkite/cuda/test-nightly.yml` (L4), and adjust the step’s `if:` so it does not conflict with the other upload steps (avoid double-uploading unless intentional).
 
-2. **L3 — merge pipeline**  
+2. **L3 — merge pipeline**
    The gate `if: build.branch == "main"` lives on the **Upload Merge Pipeline** step in `cuda/pipeline.yml` (not inside `test-merge.yml`). **Comment out that `if` line** so `test-merge.yml` is uploaded on your feature branch. Alternatively rely on step (1) instead of the dedicated merge upload step.
 
-3. **L4 — nightly pipeline**  
-   **Comment out** `if: build.env("NIGHTLY") == "1"` on the **Upload Nightly Pipeline** step in `cuda/pipeline.yml` so the nightly definition is uploaded without setting the env var.  
+3. **L4 — nightly pipeline**
+   **Comment out** `if: build.env("NIGHTLY") == "1"` on the **Upload Nightly Pipeline** step in `cuda/pipeline.yml` so the nightly definition is uploaded without setting the env var.
    Child steps in [`test-nightly.yml`](../../../.buildkite/cuda/test-nightly.yml) often repeat `if: build.env("NIGHTLY") == "1"`; **comment out those lines on the steps you need to run**, otherwise they will still be skipped after upload.
 
 ### Step 6: Run Tests

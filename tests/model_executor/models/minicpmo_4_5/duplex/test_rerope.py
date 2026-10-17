@@ -48,7 +48,7 @@ except (ImportError, ModuleNotFoundError):
     vllm.__version_tuple__ = (0, 7, 0)  # type: ignore[attr-defined]
     v1 = _make_pkg("vllm.v1")
     spec_reg = _make_pkg("vllm.v1.kv_cache_spec_registry")
-    spec_reg.register_kv_cache_spec = lambda *a, **k: (lambda cls: cls)  # type: ignore[attr-defined]
+    spec_reg.register_kv_cache_spec = lambda *a, **k: lambda cls: cls  # type: ignore[attr-defined]
     kv_if = _make_pkg("vllm.v1.kv_cache_interface")
 
     class MockSpec:

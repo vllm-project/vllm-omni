@@ -61,6 +61,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import QwenI
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 import torch
 
+
 class CustomPipeline(QwenImageEditPipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
@@ -92,15 +93,11 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 omni = Omni(
     model="Qwen/Qwen-Image-Edit",
     diffusion_load_format="dummy",  # Skip initial loading
-    custom_pipeline_args={
-        "pipeline_class": "custom_pipeline.CustomPipeline"
-    },
+    custom_pipeline_args={"pipeline_class": "custom_pipeline.CustomPipeline"},
 )
 
 # Generate with the custom pipeline
-outputs = omni.generate(
-    ...
-)
+outputs = omni.generate(...)
 
 # Access custom trajectory data
 output = outputs[0]
@@ -134,6 +131,7 @@ You can create custom worker extensions to add new methods beyond pipeline re-in
 from typing import Any
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 
+
 class MyCustomExtension(CustomPipelineWorkerExtension):
     def custom_method(self):
         """Your custom worker method."""
@@ -144,12 +142,11 @@ class MyCustomExtension(CustomPipelineWorkerExtension):
         # Access worker internals via self
         return self.model_runner.some_operation(data)
 
+
 omni = Omni(
     model="Qwen/Qwen-Image-Edit",
     diffusion_load_format="dummy",
-    custom_pipeline_args={
-        "pipeline_class": "custom_pipeline.CustomPipeline"
-    },
+    custom_pipeline_args={"pipeline_class": "custom_pipeline.CustomPipeline"},
     worker_extension_cls=MyCustomExtension,
     # Note: worker_extension_cls is an internal parameter
     # CustomPipelineWorkerExtension will automatically init pipeline when

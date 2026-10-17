@@ -385,7 +385,7 @@ python openai_chat_client.py \
 
 ??? abstract "openai_chat_client.py"
     ``````py
-    --8<-- "examples/online_serving/bagel/openai_chat_client.py"
+    --8 < --"examples/online_serving/bagel/openai_chat_client.py"
     ``````
 ??? abstract "run_server.sh"
     ``````sh

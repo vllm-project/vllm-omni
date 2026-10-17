@@ -145,5 +145,5 @@ assets, see the [LoRA guide](../../diffusion/lora.md#wan22-lightx2v-offline-asse
 
 ??? abstract "image_to_video.py"
     ``````py
-    --8<-- "examples/offline_inference/image_to_video/image_to_video.py"
+    --8 < --"examples/offline_inference/image_to_video/image_to_video.py"
     ``````

@@ -92,10 +92,7 @@ The actual data plane is a shared-memory segment created by:
 The connector stores a small metadata object such as:
 
 ```python
-{
-    "shm": {"name": ..., "size": ...},
-    "size": ...
-}
+{"shm": {"name": ..., "size": ...}, "size": ...}
 ```
 
 This metadata is passed over the control plane and allows the downstream stage to locate the shared-memory segment.

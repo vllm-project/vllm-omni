@@ -179,7 +179,7 @@ Note: This task uses hardcoded message lists in the script.
 
 ### Tokenizer path
 
-- **`MIMO_AUDIO_TOKENIZER_PATH` not set or model fails to find tokenizer**  
+- **`MIMO_AUDIO_TOKENIZER_PATH` not set or model fails to find tokenizer**
   Export the tokenizer path before running:
   ```bash
   export MIMO_AUDIO_TOKENIZER_PATH="XiaomiMiMo/MiMo-Audio-Tokenizer"
@@ -203,7 +203,7 @@ Note: This task uses hardcoded message lists in the script.
 
 ??? abstract "end2end.py"
     ``````py
-    --8<-- "examples/offline_inference/mimo_audio/end2end.py"
+    --8 < --"examples/offline_inference/mimo_audio/end2end.py"
     ``````
 ??? abstract "message_base64_wav.json"
     ``````json
@@ -211,9 +211,9 @@ Note: This task uses hardcoded message lists in the script.
     ``````
 ??? abstract "message_convert.py"
     ``````py
-    --8<-- "examples/offline_inference/mimo_audio/message_convert.py"
+    --8 < --"examples/offline_inference/mimo_audio/message_convert.py"
     ``````
 ??? abstract "process_speechdata.py"
     ``````py
-    --8<-- "examples/offline_inference/mimo_audio/process_speechdata.py"
+    --8 < --"examples/offline_inference/mimo_audio/process_speechdata.py"
     ``````

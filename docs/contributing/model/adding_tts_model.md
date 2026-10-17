@@ -238,15 +238,15 @@ Do not wrap the HuggingFace model directly - that bypasses PagedAttention and fu
 
 from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer
 
-class YourTTSARStage(nn.Module):
 
+class YourTTSARStage(nn.Module):
     def __init__(self, config, vllm_config, prefix):
-        self.layers = nn.ModuleList([
-            Qwen3DecoderLayer(
-                config, vllm_config=vllm_config, prefix=f"{prefix}.layers.{i}"
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Qwen3DecoderLayer(config, vllm_config=vllm_config, prefix=f"{prefix}.layers.{i}")
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.lm_head = ParallelLMHead(config.codec_size, config.hidden_size)
 ```
 
@@ -257,8 +257,7 @@ See `qwen3_tts_code_predictor_vllm.py` for the full implementation.
 Implement `forward()` to return an `OmniOutput` with intermediate data for Stage 1:
 
 ```python
-def forward(self, input_ids, positions, intermediate_tensors=None,
-            inputs_embeds=None, **kwargs) -> OmniOutput:
+def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs) -> OmniOutput:
     hidden_states = self.run_layers(input_ids, positions, intermediate_tensors, inputs_embeds)
     logits = self.lm_head(hidden_states)
 
@@ -301,8 +300,8 @@ needed). Implement `chunked_decode_streaming()` to support async_chunk streaming
 ```python
 # your_model_decoder.py
 
-class YourTTSDecoder(nn.Module):
 
+class YourTTSDecoder(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         # Initialize your audio decoder (SpeechTokenizer, HiFiGAN, etc.)
@@ -310,14 +309,13 @@ class YourTTSDecoder(nn.Module):
     def forward(self, codes: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.decoder(codes)
 
-    def chunked_decode_streaming(self, codes, chunk_size=25,
-                                  left_context_size=25) -> torch.Tensor:
+    def chunked_decode_streaming(self, codes, chunk_size=25, left_context_size=25) -> torch.Tensor:
         """Decode with a sliding context window for smooth chunk boundaries."""
         end_index = codes.shape[-1]
         context_size = 0 if end_index <= chunk_size else left_context_size
         wav_chunk = self(codes)
         # Trim left context to avoid duplicate audio
-        return wav_chunk[..., context_size * self.total_upsample:]
+        return wav_chunk[..., context_size * self.total_upsample :]
 ```
 
 ### Step 3: Implement the Unified Model Class
@@ -327,8 +325,8 @@ The unified class dispatches to the correct stage based on `model_stage` in the 
 ```python
 # your_model.py
 
-class YourTTSModelForConditionalGeneration(nn.Module, SupportsPP):
 
+class YourTTSModelForConditionalGeneration(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_stage = vllm_config.model_config.model_stage
@@ -411,15 +409,18 @@ Register all stage classes in `vllm_omni/model_executor/models/registry.py`:
 _OMNI_MODELS = {
     # (package_name, module_name, class_name)
     "YourTTSModelForConditionalGeneration": (
-        "your_model_name", "your_model",
+        "your_model_name",
+        "your_model",
         "YourTTSModelForConditionalGeneration",
     ),
     "YourTTSARStageForConditionalGeneration": (
-        "your_model_name", "your_model_ar_stage",
+        "your_model_name",
+        "your_model_ar_stage",
         "YourTTSARStageForConditionalGeneration",
     ),
     "YourTTSDecoder": (
-        "your_model_name", "your_model_decoder",
+        "your_model_name",
+        "your_model_decoder",
         "YourTTSDecoder",
     ),
 }
@@ -549,9 +550,7 @@ def ar2decoder(
     for output in stage_list[source_id].engine_outputs:
         result = output.outputs[0]
         codes = result.multimodal_output["audio_codes"].cpu()
-        decoder_inputs.append(
-            OmniTokensPrompt(prompt_token_ids=codes.reshape(-1).tolist())
-        )
+        decoder_inputs.append(OmniTokensPrompt(prompt_token_ids=codes.reshape(-1).tolist()))
 
     return decoder_inputs
 ```
@@ -576,9 +575,7 @@ def ar2decoder_async_chunk(
     if isinstance(pooling_output, dict):
         frame = extract_frame(pooling_output)
         if frame is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(
-                frame.cpu().tolist()
-            )
+            transfer_manager.code_prompt_token_ids[request_id].append(frame.cpu().tolist())
     elif not finished:
         return None
 
@@ -861,11 +858,10 @@ any CUDA allocations. Stream via a per-request generator stored in an instance d
 
 ```python
 class YourModelForCausalLM(nn.Module):
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self._lm: nn.Module | None = None          # populated in load_weights()
-        self._stream_gens: dict[str, Any] = {}     # request_key → generator
+        self._lm: nn.Module | None = None  # populated in load_weights()
+        self._stream_gens: dict[str, Any] = {}  # request_key → generator
 
     def load_weights(self, weights):
         # Load self._lm here, after vLLM distributed init

@@ -162,7 +162,7 @@ For multi-modal or unusual sites, use a dot-namespaced role and pair it with `ro
 self.audio_to_video_attn = Attention(
     num_heads=self.num_heads,
     head_size=self.head_dim,
-    softmax_scale=1.0 / (self.head_dim ** 0.5),
+    softmax_scale=1.0 / (self.head_dim**0.5),
     causal=False,
     role="mymodel.audio_to_video",
     role_category="cross",
@@ -220,6 +220,7 @@ Add support for vLLM-Omni's `OmniDiffusionConfig`:
 
 ```python
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+
 
 class YourModelTransformer2DModel(nn.Module):
     def __init__(
@@ -314,19 +315,19 @@ class YourModelPipeline(nn.Module):
 
         # Load components from checkpoint
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only)
+            model, subfolder="scheduler", local_files_only=local_files_only
+        )
         self.text_encoder = CLIPTextModel.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only).to(self.device)
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.vae = AutoencoderKL.from_pretrained(
-            model, subfolder="vae", local_files_only=local_files_only).to(self.device)
+            model, subfolder="text_encoder", local_files_only=local_files_only
+        ).to(self.device)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
+            self.device
+        )
 
         # Initialize transformer with vLLM-Omni config
-        transformer_kwargs = get_transformer_config_kwargs(
-            od_config.tf_model_config, YourModelTransformer2DModel)
-        self.transformer = YourModelTransformer2DModel(
-            od_config=od_config, **transformer_kwargs)
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, YourModelTransformer2DModel)
+        self.transformer = YourModelTransformer2DModel(od_config=od_config, **transformer_kwargs)
 
         # Store VAE scale factor for latent space conversions
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
@@ -372,15 +373,13 @@ See some parameters in `OmniDiffusionSamplingParams` as follows:
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
+
 def forward(
     self,
     req: DiffusionRequestBatch,
 ) -> list[DiffusionOutput]:
     # Extract prompts from the request batch
-    prompts = [
-        p if isinstance(p, str) else (p.get("prompt") or "")
-        for p in req.prompts
-    ]
+    prompts = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
 
     # Extract common sampling parameters
     sampling_params = req.sampling_params
@@ -400,10 +399,7 @@ def forward(
 
 For an image editing model, the request `prompt` can be a dict like:
 ```python
-{
-    "prompt": "turn this cat to a dog",
-    "multi_modal_data": {"image": input_image}
-},
+({"prompt": "turn this cat to a dog", "multi_modal_data": {"image": input_image}},)
 ```
 
 **Wrap output:**
@@ -437,6 +433,7 @@ def get_your_model_post_process_func(
     model_path = od_config.model
     if not os.path.exists(model_path):
         from vllm_omni.diffusion.model_loader.utils import download_weights_from_hf_specific
+
         model_path = download_weights_from_hf_specific(model_path, None, ["*"])
 
     vae_config_path = os.path.join(model_path, "vae/config.json")
@@ -474,7 +471,7 @@ def get_your_model_pre_process_func(
 
     def pre_process_func(
         request: OmniDiffusionRequest,
-        ):
+    ):
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
@@ -493,6 +490,7 @@ Add methods for automatic weight downloading and loading:
 ```python
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader
+
 
 class YourModelPipeline(nn.Module):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
@@ -535,16 +533,14 @@ Register your model in `vllm_omni/diffusion/registry.py` so vLLM-Omni can discov
 
 _DIFFUSION_MODELS = {
     # Format: "PipelineClassName": (module_folder, module_file, class_name)
-
     # Existing models
     "QwenImagePipeline": ("qwen_image", "pipeline_qwen_image", "QwenImagePipeline"),
     "FluxPipeline": ("flux", "pipeline_flux", "FluxPipeline"),
-
     # Add your model
     "YourModelPipeline": (
-        "your_model_name",           # Module folder name
-        "pipeline_your_model",       # Python file name (without .py)
-        "YourModelPipeline",         # Pipeline class name
+        "your_model_name",  # Module folder name
+        "pipeline_your_model",  # Python file name (without .py)
+        "YourModelPipeline",  # Pipeline class name
     ),
 }
 ```
@@ -559,17 +555,14 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
-
     # Add your model
-    "YourModelPipeline": "get_your_model_pre_process_func", # Optional
+    "YourModelPipeline": "get_your_model_pre_process_func",  # Optional
 }
 _DIFFUSION_POST_PROCESS_FUNCS = {
     # Format: "PipelineClassName": "function_name"
-
     # Existing models
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
-
     # Add your model
     "YourModelPipeline": "get_your_model_post_process_func",
 }
@@ -818,11 +811,7 @@ See detailed guide: [How to add TeaCache support](../../design/feature/teacache.
 
 **Usage:** Set `cache_backend` and `cache_config` when initializing:
 ```python
-omni = Omni(model="your-model",
-    cache_backend="tea_cache",
-    cache_config={"rel_l1_thresh": 0.2}
-)
-
+omni = Omni(model="your-model", cache_backend="tea_cache", cache_config={"rel_l1_thresh": 0.2})
 ```
 
 
@@ -837,13 +826,14 @@ See detailed guide: [How to add Cache-DiT support](../../design/feature/cache_di
 
 **Usage:** Set `cache_backend` and `cache_config` when initializing:
 ```python
-omni = Omni(model="your-model",  
+omni = Omni(
+    model="your-model",
     cache_backend="cache_dit",
     cache_config={
         "Fn_compute_blocks": 1,
         "Bn_compute_blocks": 0,
         "max_warmup_steps": 4,
-    }
+    },
 )
 ```
 
@@ -911,6 +901,7 @@ If not specified, the default targets are used:
 To enable timing support in your pipeline, inherit from DiffusionPipelineProfilerMixin.
 ```python
 from vllm_omni.diffusion.profiler import DiffusionPipelineProfilerMixin
+
 
 class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Optional: Specify custom timing targets
@@ -1049,7 +1040,11 @@ hidden_states = hidden_states.reshape(batch_size, seq_len, -1)
 
 4. **Apply vae tiling and slicing**
    ```python
-   omni = Omni(model="...", vae_use_slicing=True, vae_use_tiling=True,)
+   omni = Omni(
+       model="...",
+       vae_use_slicing=True,
+       vae_use_tiling=True,
+   )
    ```
 
 ---

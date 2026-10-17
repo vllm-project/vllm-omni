@@ -76,7 +76,7 @@ omni = Omni(
         "Fn_compute_blocks": 1,
         "Bn_compute_blocks": 0,
         "max_warmup_steps": 4,
-    }
+    },
 )
 ```
 
@@ -168,8 +168,8 @@ cache_dit.enable_cache(
     BlockAdapter(
         transformer=pipeline.transformer,  # Single transformer
         blocks=[
-            pipeline.transformer.transformer_blocks,        # Block list 1
-            pipeline.transformer.single_transformer_blocks, # Block list 2
+            pipeline.transformer.transformer_blocks,  # Block list 1
+            pipeline.transformer.single_transformer_blocks,  # Block list 2
         ],
         forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_1],
         params_modifiers=[modifier],
@@ -247,7 +247,7 @@ omni = Omni(
         "Bn_compute_blocks": 0,
         "max_warmup_steps": 4,
         "residual_diff_threshold": 0.24,
-    }
+    },
 )
 
 images = omni.generate(
@@ -288,10 +288,10 @@ images = omni.generate(
 
 **Solution:**
 ```python
-cache_config={
+cache_config = {
     "residual_diff_threshold": 0.12,  # Lower from 0.24 (try 0.12-0.18)
-    "max_warmup_steps": 6,            # Increase from 4 (try 6-8)
-    "max_continuous_cached_steps": 2, # Reduce if higher
+    "max_warmup_steps": 6,  # Increase from 4 (try 6-8)
+    "max_continuous_cached_steps": 2,  # Reduce if higher
 }
 ```
 

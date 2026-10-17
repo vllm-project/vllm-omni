@@ -790,7 +790,7 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 
 ??? abstract "fish_speech/gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/fish_speech/gradio_demo.py"
+    --8 < --"examples/online_serving/text_to_speech/fish_speech/gradio_demo.py"
     ``````
 ??? abstract "fish_speech/run_gradio_demo.sh"
     ``````sh
@@ -802,11 +802,11 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
     ``````
 ??? abstract "fish_speech/speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/fish_speech/speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/fish_speech/speech_client.py"
     ``````
 ??? abstract "higgs_audio_v2/batch_speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py"
     ``````
 ??? abstract "higgs_audio_v2/run_server.sh"
     ``````sh
@@ -817,7 +817,7 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
     ``````
 ??? abstract "glm_tts/openai_speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/glm_tts/openai_speech_client.py"
     ``````
 ??? abstract "glm_tts/run_gradio_demo.sh"
     ``````sh
@@ -833,19 +833,19 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
     ``````
 ??? abstract "omnivoice/speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/omnivoice/speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/omnivoice/speech_client.py"
     ``````
 ??? abstract "qwen3_tts/batch_speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/qwen3_tts/batch_speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/qwen3_tts/batch_speech_client.py"
     ``````
 ??? abstract "qwen3_tts/gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/qwen3_tts/gradio_demo.py"
+    --8 < --"examples/online_serving/text_to_speech/qwen3_tts/gradio_demo.py"
     ``````
 ??? abstract "qwen3_tts/openai_speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/qwen3_tts/openai_speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/qwen3_tts/openai_speech_client.py"
     ``````
 ??? abstract "qwen3_tts/run_gradio_demo.sh"
     ``````sh
@@ -857,29 +857,29 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
     ``````
 ??? abstract "qwen3_tts/speaker_embedding_interpolation.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/qwen3_tts/speaker_embedding_interpolation.py"
+    --8 < --"examples/online_serving/text_to_speech/qwen3_tts/speaker_embedding_interpolation.py"
     ``````
 ??? abstract "qwen3_tts/streaming_speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/qwen3_tts/streaming_speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/qwen3_tts/streaming_speech_client.py"
     ``````
 ??? abstract "qwen3_tts/tts_common.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/qwen3_tts/tts_common.py"
+    --8 < --"examples/online_serving/text_to_speech/qwen3_tts/tts_common.py"
     ``````
 ??? abstract "voxcpm2/gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/voxcpm2/gradio_demo.py"
+    --8 < --"examples/online_serving/text_to_speech/voxcpm2/gradio_demo.py"
     ``````
 ??? abstract "voxcpm2/openai_speech_client.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/voxcpm2/openai_speech_client.py"
+    --8 < --"examples/online_serving/text_to_speech/voxcpm2/openai_speech_client.py"
     ``````
 ??? abstract "voxtral_tts/gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/voxtral_tts/gradio_demo.py"
+    --8 < --"examples/online_serving/text_to_speech/voxtral_tts/gradio_demo.py"
     ``````
 ??? abstract "voxtral_tts/text_preprocess.py"
     ``````py
-    --8<-- "examples/online_serving/text_to_speech/voxtral_tts/text_preprocess.py"
+    --8 < --"examples/online_serving/text_to_speech/voxtral_tts/text_preprocess.py"
     ``````

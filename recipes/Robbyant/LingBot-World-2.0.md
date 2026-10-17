@@ -233,11 +233,7 @@ retaining the camera/C2WS path in BF16:
 ```python
 quantization_config = {
     "method": "fp8",
-    "ignored_layers": [
-        f"transformer.blocks.{i}.cam_injector_layer{j}"
-        for i in range(40)
-        for j in (1, 2)
-    ]
+    "ignored_layers": [f"transformer.blocks.{i}.cam_injector_layer{j}" for i in range(40) for j in (1, 2)]
     + [
         "transformer.c2ws_hidden_states_layer1",
         "transformer.c2ws_hidden_states_layer2",

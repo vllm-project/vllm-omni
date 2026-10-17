@@ -93,6 +93,8 @@ class FeedForward(nn.Module):
 
 ```python
 from vllm_omni.diffusion.attention.layer import Attention
+
+
 class YourModelAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int):
         super().__init__()
@@ -119,7 +121,7 @@ class YourModelAttention(nn.Module):
         )
 
         self.attn = Attention(
-            num_heads=self.to_qkv.num_heads, # Each GPU gets num_heads/N heads
+            num_heads=self.to_qkv.num_heads,  # Each GPU gets num_heads/N heads
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
@@ -231,7 +233,11 @@ self.proj = RowParallelLinear(dim, dim, input_is_parallel=True)
 **Solution:** Set `input_is_parallel=True` when input comes from ColumnParallelLinear:
 ```python
 # ✅ GOOD: Correct pairing
-self.w1 = ColumnParallelLinear(dim, hidden_dim, return_bias=False,)
+self.w1 = ColumnParallelLinear(
+    dim,
+    hidden_dim,
+    return_bias=False,
+)
 self.w2 = RowParallelLinear(
     hidden_dim,
     dim,

@@ -55,8 +55,8 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 omni = Omni(
     model="Tongyi-MAI/Z-Image-Turbo",
     parallel_config=DiffusionParallelConfig(
-        tensor_parallel_size=2,          # Enable tensor parallelism for DiT
-        vae_patch_parallel_size=2,       # Enable VAE patch parallelism
+        tensor_parallel_size=2,  # Enable tensor parallelism for DiT
+        vae_patch_parallel_size=2,  # Enable VAE patch parallelism
     ),
     vae_use_tiling=True,  # Required for VAE patch parallelism
 )
@@ -200,8 +200,8 @@ omni = Omni(
     model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
     parallel_config=DiffusionParallelConfig(
         tensor_parallel_size=2,
-        vae_patch_parallel_size=2,               # must match the DiT group size
-        vae_parallel_mode="spatial_shard_width", # or "spatial_shard_height"
+        vae_patch_parallel_size=2,  # must match the DiT group size
+        vae_parallel_mode="spatial_shard_width",  # or "spatial_shard_height"
     ),
 )
 ```

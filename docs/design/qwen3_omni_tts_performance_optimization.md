@@ -303,8 +303,8 @@ The 5-layer transformer forward pass launches ~60 small CUDA kernels per step. `
 ```python
 self._compiled_model_fwd = torch.compile(
     self.model.forward,
-    mode="default",    # no Inductor CUDA graphs, avoids conflict with vLLM's CUDAGraphWrapper
-    dynamic=True,      # sequence length grows each step (2, 3, ..., num_groups+1)
+    mode="default",  # no Inductor CUDA graphs, avoids conflict with vLLM's CUDAGraphWrapper
+    dynamic=True,  # sequence length grows each step (2, 3, ..., num_groups+1)
 )
 ```
 

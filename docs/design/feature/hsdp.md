@@ -60,7 +60,6 @@ Add `_hsdp_shard_conditions` to your model class. This is a list of functions th
 
 ```python
 class MyTransformerModel(nn.Module):
-
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
         """Match transformer blocks for HSDP sharding.
@@ -81,7 +80,6 @@ class MyTransformerModel(nn.Module):
 
 ```python
 class MyModel(nn.Module):
-
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
         return "blocks" in name and name.split(".")[-1].isdigit()

@@ -71,8 +71,8 @@ init → create all models (empty) → set weights_sources(subfolder=None) → [
 self.weights_sources = [
     DiffusersPipelineLoader.ComponentSource(
         model_or_path=od_config.model,
-        subfolder=None,      # root directory
-        prefix="",           # no prefix stripping
+        subfolder=None,  # root directory
+        prefix="",  # no prefix stripping
         fall_back_to_pt=False,
     )
 ]
@@ -134,11 +134,9 @@ def download_dependency():
     with open(LOCK_FILE, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         if not DEPENDENCY_DIR.exists():
-            subprocess.run([
-                "git", "clone", "--depth", "1",
-                REPO_URL, "--branch", BRANCH,
-                str(DEPENDENCY_DIR)
-            ], check=True)
+            subprocess.run(
+                ["git", "clone", "--depth", "1", REPO_URL, "--branch", BRANCH, str(DEPENDENCY_DIR)], check=True
+            )
         fcntl.flock(f, fcntl.LOCK_UN)
 
     # Add to Python path via .pth file
@@ -161,10 +159,11 @@ Custom models that handle images, audio, or video I/O should implement protocol 
 
 ```python
 from vllm_omni.diffusion.models.interface import (
-    SupportImageInput,    # Model accepts image input
-    SupportAudioInput,    # Model accepts audio input
-    SupportAudioOutput,   # Model produces audio output
+    SupportImageInput,  # Model accepts image input
+    SupportAudioInput,  # Model accepts audio input
+    SupportAudioOutput,  # Model produces audio output
 )
+
 
 class MyPipeline(nn.Module, SupportImageInput, SupportAudioInput, SupportAudioOutput):
     pass  # Protocol markers enable proper engine routing
@@ -261,13 +260,15 @@ If pre/post functions are not registered in `_DIFFUSION_PRE_PROCESS_FUNCS` / `_D
 from huggingface_hub import snapshot_download
 import json, os
 
+
 def main(output_dir):
     # Download model weights from HF
     snapshot_download(repo_id="org/model-weights", local_dir=os.path.join(output_dir, "weights"))
 
     # Download additional components if from separate repos
-    snapshot_download(repo_id="org/vae-weights", local_dir=os.path.join(output_dir, "vae"),
-        allow_patterns=["*.safetensors"])
+    snapshot_download(
+        repo_id="org/vae-weights", local_dir=os.path.join(output_dir, "vae"), allow_patterns=["*.safetensors"]
+    )
 
     # Generate model_index.json
     config = {"_class_name": "YourPipeline", "custom_key": "weights/model.safetensors"}
@@ -277,8 +278,10 @@ def main(output_dir):
     # Install external code dependency (if needed)
     download_dependency()
 
+
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="./your_model")
     args = parser.parse_args()

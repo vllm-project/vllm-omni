@@ -455,9 +455,7 @@ diffusers reference:
 import torch
 from diffusers import QwenImage21Pipeline  # diffusers PR #14804
 
-pipe = QwenImage21Pipeline.from_pretrained(
-    "Qwen/Qwen-Image-2.1", torch_dtype=torch.bfloat16
-).to("cuda")
+pipe = QwenImage21Pipeline.from_pretrained("Qwen/Qwen-Image-2.1", torch_dtype=torch.bfloat16).to("cuda")
 image = pipe(
     prompt="A ceramic teapot on a wooden table",
     num_inference_steps=50,

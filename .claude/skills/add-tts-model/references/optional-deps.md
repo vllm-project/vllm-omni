@@ -12,6 +12,7 @@ def _patch_torchaudio_load() -> None:
     """Fallback torchaudio.load/save to soundfile if torchcodec is unavailable."""
     try:
         import torchcodec  # noqa: F401
+
         return  # torchcodec present, torchaudio works as-is
     except ImportError:
         pass

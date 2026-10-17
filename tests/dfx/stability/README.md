@@ -82,8 +82,8 @@ echo "Report directory: $GPU_MONITOR_BUNDLE_DIR"
 ## Directories and Outputs (monitoring only)
 
 - **Scripts**: `tests/dfx/stability/scripts/resource_monitor.sh` (entry point) and `scripts/generate_report.py` (called by `finalize` to generate HTML).
-- **Data directory**: `tests/dfx/stability/gpu_monitor_data/` by default (can be overridden with `RESOURCE_MONITOR_DATA_ROOT`).  
-    - Each run generates `run_<run_id>/gpu_metrics.csv`.  
+- **Data directory**: `tests/dfx/stability/gpu_monitor_data/` by default (can be overridden with `RESOURCE_MONITOR_DATA_ROOT`).
+    - Each run generates `run_<run_id>/gpu_metrics.csv`.
     - After `finalize`, you get `gpu_monitor_bundle_<run_id>/` containing `gpu_metrics.csv`, `report.html`, and `README.txt`.
 - **View the report**: open `report.html` in the bundle directory with a browser to inspect memory usage curves and statistics.
 

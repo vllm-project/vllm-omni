@@ -82,7 +82,7 @@ Key arguments:
 
 ??? abstract "image_edit.py"
     ``````py
-    --8<-- "examples/offline_inference/image_to_image/image_edit.py"
+    --8 < --"examples/offline_inference/image_to_image/image_edit.py"
     ``````
 ??? abstract "run_qwen_image_edit_2511.sh"
     ``````sh

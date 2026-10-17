@@ -58,8 +58,10 @@ L1 modules run in **Simple Test** (`test-ready.yml` / `test-merge.yml`: `-m 'cor
 def test_handler(mocker):
     mocker.patch("vllm_omni.pkg.fn", return_value=0)
 
+
 # Bad (L1)
 from unittest.mock import patch
+
 
 @patch("vllm_omni.pkg.fn")
 def test_handler(mock_fn): ...

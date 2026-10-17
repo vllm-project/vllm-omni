@@ -260,7 +260,7 @@ class MyVideoAudioPipeline(nn.Module, CFGParallelMixin):
 
     def diffuse(self, video_latents, audio_latents, timesteps_video, timesteps_audio, ...):
         for t_v, t_a in zip(timesteps_video, timesteps_audio):
-            positive_kwargs = {...}  
+            positive_kwargs = {...}
             negative_kwargs = {...} if do_true_cfg else None
 
             video_pred, audio_pred = self.predict_noise_maybe_with_cfg(
@@ -321,7 +321,7 @@ python text_to_image.py \
 images = pipeline(
     prompt="a cat",
     negative_prompt="",  # Must provide (even if empty)
-    guidance_scale=3.5,   # Must be > 1.0
+    guidance_scale=3.5,  # Must be > 1.0
 )
 ```
 

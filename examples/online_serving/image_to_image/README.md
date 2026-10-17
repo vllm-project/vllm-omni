@@ -103,15 +103,15 @@ with open("input.png", "rb") as f:
 
 response = client.chat.completions.create(
     model="Qwen/Qwen-Image-Edit",
-    messages=[{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "Convert to watercolor style"},
-            {"type": "image_url", "image_url": {
-                "url": f"data:image/png;base64,{img_b64}"
-            }},
-        ],
-    }],
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Convert to watercolor style"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+            ],
+        }
+    ],
     extra_body={
         "num_inference_steps": 50,
         "guidance_scale": 1,
@@ -264,15 +264,15 @@ with open("input.png", "rb") as f:
     img_b64 = base64.b64encode(f.read()).decode()
 
 payload = {
-    "messages": [{
-        "role": "user",
-        "content": [
-            {"type": "image_url", "image_url": {
-                "url": f"data:image/png;base64,{img_b64}"
-            }},
-            {"type": "text", "text": "a rabbit"},
-        ],
-    }],
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                {"type": "text", "text": "a rabbit"},
+            ],
+        }
+    ],
     "extra_body": {
         "num_inference_steps": 50,
         "cfg_scale": 4.0,

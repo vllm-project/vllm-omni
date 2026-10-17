@@ -111,10 +111,8 @@ from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
 from vllm_omni.entrypoints.openai.app_state import (
     ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL,
-    OmniAudioGenerate,
     OmniBatchChat,
     Omnichat,
-    Omnispeech,
     _get_engine_and_model,
 )
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
@@ -124,12 +122,8 @@ from vllm_omni.entrypoints.openai.diffusion import (
     _generate_with_async_omni,
     apply_stage_default_sampling_params,
 )
-from vllm_omni.entrypoints.openai.errors import (
-    InvalidPresetVoiceReferenceError,
-    InvalidVoiceReferenceError,
-    _create_speech_error_json_response,
-    _error_response_to_json_response,
-)
+
+# Speech-specific errors moved to vllm_omni.entrypoints.openai.speech.router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
     encode_image_base64_with_compression,
@@ -148,11 +142,8 @@ from vllm_omni.entrypoints.openai.images.helpers import (
 )
 from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
-from vllm_omni.entrypoints.openai.protocol.audio import (
-    BatchSpeechRequest,
-    OpenAICreateAudioGenerateRequest,
-    OpenAICreateSpeechRequest,
-)
+
+# Speech protocol models moved to vllm_omni.entrypoints.openai.speech.router
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -189,6 +180,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
 )
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+from vllm_omni.entrypoints.openai.speech.router import speech_router
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
@@ -403,6 +395,7 @@ async def omni_run_server_worker(
         remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         remove_route_from_app(app, "/health", {"GET"})
         app.include_router(router)
+        app.include_router(speech_router)
         get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
         od_config = get_od_config() if callable(get_od_config) else None
         model_class_name = getattr(od_config, "model_class_name", None) or getattr(args, "model_class_name", None)
@@ -1391,175 +1384,6 @@ async def create_batch_chat_completion(request: BatchChatCompletionRequest, raw_
     return JSONResponse(content=result.model_dump(mode="json"))
 
 
-_remove_route_from_router(router, "/v1/audio/speech", {"POST"})
-
-
-def _unsupported_api_response(raw_request: Request, api_name: str) -> JSONResponse:
-    """404 for a route whose serving handler is not configured on this server."""
-    message = f"The model does not support {api_name}"
-    base_server = getattr(raw_request.app.state, "serving_tokenization", None)
-    if base_server is None:
-        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail=message)
-    err = base_server.create_error_response(
-        message=message,
-        err_type="NotFoundError",
-        status_code=HTTPStatus.NOT_FOUND,
-    )
-    return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
-
-
-@router.post(
-    "/v1/audio/speech",
-    dependencies=[Depends(validate_json_request)],
-    responses={
-        HTTPStatus.OK.value: {"content": {"audio/*": {}, "text/event-stream": {}}},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
-@load_aware_call
-async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request):
-    """Generate speech audio from text using the loaded TTS model.
-
-    Args:
-        request: Speech synthesis request in OpenAI-compatible format.
-        raw_request: Raw FastAPI request for accessing app state.
-
-    Returns:
-        The generated audio response, or an OpenAI-style error payload when
-        the request cannot be fulfilled.
-
-    Raises:
-        HTTPException: If the server does not support speech generation or the
-        synthesis request fails unexpectedly.
-    """
-    handler = Omnispeech(raw_request)
-    if handler is None:
-        return _unsupported_api_response(raw_request, "Speech API")
-    try:
-        result = await handler.create_speech(request, raw_request)
-        if isinstance(result, ErrorResponse):
-            return _error_response_to_json_response(result)
-        return result
-    except (EngineGenerateError, EngineDeadError) as exc:
-        return _create_engine_error_json_response(raw_request, exc)
-    except Exception as e:
-        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
-
-
-@router.post(
-    "/v1/audio/speech/batch",
-    dependencies=[Depends(validate_json_request)],
-    responses={
-        HTTPStatus.OK.value: {"model": dict},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
-@load_aware_call
-async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
-    handler = Omnispeech(raw_request)
-    if handler is None:
-        return _unsupported_api_response(raw_request, "Speech API")
-    try:
-        result = await handler.create_speech_batch(request)
-        if isinstance(result, ErrorResponse):
-            return _error_response_to_json_response(result)
-        # exclude_none so optional per-item fields are omitted rather than
-        # serialized as null: errored items drop `usage`/`audio_data`/`media_type`,
-        # successful items drop `error`. Matches the documented batch response shape.
-        return JSONResponse(content=result.model_dump(exclude_none=True))
-    except (EngineGenerateError, EngineDeadError) as exc:
-        return _create_engine_error_json_response(raw_request, exc)
-    except ValueError as e:
-        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
-    except Exception as e:
-        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
-
-
-@router.post(
-    "/v1/audio/generate",
-    dependencies=[Depends(validate_json_request)],
-    responses={
-        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-@with_cancellation
-@load_aware_call
-async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
-    handler = OmniAudioGenerate(raw_request)
-    if handler is None:
-        return _unsupported_api_response(raw_request, "Audio Generate API")
-    try:
-        result = await handler.create_audio_generate(request, raw_request)
-        if isinstance(result, ErrorResponse):
-            return _error_response_to_json_response(result)
-        return result
-    except (EngineGenerateError, EngineDeadError) as exc:
-        return _create_engine_error_json_response(raw_request, exc)
-    except Exception as e:
-        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
-
-
-@router.get(
-    "/v1/audio/voices",
-    responses={
-        HTTPStatus.OK.value: {"model": dict},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-async def list_voices(raw_request: Request):
-    """List available TTS voices exposed by the loaded speech model.
-
-    Args:
-        raw_request: Raw FastAPI request for accessing app state.
-
-    Returns:
-        A JSON payload containing the sorted set of supported speaker names, or
-        an OpenAI-style error response when the current server configuration
-        does not support the Speech API.
-    """
-    handler = Omnispeech(raw_request)
-    if handler is None:
-        return _create_speech_error_json_response(
-            "The model does not support Speech API",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-
-    speakers = sorted(handler._get_available_voices())
-
-    # Get uploaded speakers details
-    uploaded_speakers = []
-    if hasattr(handler, "uploaded_speakers"):
-        for voice_name, info in handler.uploaded_speakers.items():
-            voice_entry = {
-                "name": info.get("name", voice_name),
-                "consent": info.get("consent", ""),
-                "created_at": info.get("created_at", 0),
-                "file_size": info.get("file_size", 0),
-                "mime_type": info.get("mime_type", ""),
-                "embedding_source": info.get("embedding_source", "audio"),
-                "embedding_dim": info.get("embedding_dim"),
-            }
-            if info.get("ref_text"):
-                voice_entry["ref_text"] = info["ref_text"]
-            if info.get("speaker_description"):
-                voice_entry["speaker_description"] = info["speaker_description"]
-            uploaded_speakers.append(voice_entry)
-
-    return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
-
-
 def _resolve_api_server_count(args: Namespace, client_config: OmniClientConfig | None) -> int:
     """Resolve frontend topology once, from the launcher's client configuration."""
     requested = getattr(args, "api_server_count", None)
@@ -1594,167 +1418,6 @@ async def _require_single_api_video_store(raw_request: Request) -> None:
     # cancellation. Keep this independent of the temporary diffusion launch
     # restriction: enabling multi-API diffusion alone cannot make jobs shared.
     _reject_process_local_state_with_multiple_api_workers(raw_request, "Asynchronous video jobs")
-
-
-@router.post(
-    "/v1/audio/voices",
-    responses={
-        HTTPStatus.OK.value: {"model": dict},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-async def upload_voice(
-    raw_request: Request,
-    audio_sample: UploadFile | None = File(None),
-    speaker_embedding: str | None = Form(None),
-    consent: str = Form(...),
-    name: str = Form(...),
-    ref_text: str | None = Form(None),
-    speaker_description: str | None = Form(None),
-):
-    """Upload a new voice for voice cloning.
-
-    Accepts either an audio file or a pre-computed speaker embedding vector.
-    These are mutually exclusive: provide one or the other.
-
-    When using ``audio_sample``, the server stores the audio and extracts the
-    speaker embedding on first use (Base task models only).
-
-    When using ``speaker_embedding``, pass a JSON-encoded list of floats
-    (1024-dim for 0.6B, 2048-dim for 1.7B). The voice is stored as a
-    safetensors file and is immediately ready for use.
-
-    Args:
-        audio_sample: Audio file (max 10MB). Mutually exclusive with speaker_embedding.
-        speaker_embedding: JSON-encoded float list. Mutually exclusive with audio_sample.
-        consent: Consent recording ID
-        name: Name for the new voice
-        ref_text: Optional transcript of the audio for ICL (in-context
-            learning) mode. When provided, voice clone requests using this
-            voice will produce higher quality results.
-        speaker_description: Optional free-form description of the voice
-            (e.g. "warm speaker", "energetic narrator").
-        raw_request: Raw FastAPI request
-
-    Returns:
-        JSON response with voice information
-    """
-    handler = Omnispeech(raw_request)
-    if handler is None:
-        return _create_speech_error_json_response(
-            "The model does not support Speech API",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-
-    try:
-        if speaker_embedding is not None and audio_sample is not None:
-            return _create_speech_error_json_response("'audio_sample' and 'speaker_embedding' are mutually exclusive")
-        if speaker_embedding is not None:
-            result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
-        elif audio_sample is not None:
-            result = await handler.upload_voice(
-                audio_sample,
-                consent,
-                name,
-                ref_text=ref_text,
-                speaker_description=speaker_description,
-            )
-        else:
-            return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
-
-        return JSONResponse(content={"success": True, "voice": result})
-
-    except ValueError as e:
-        return _create_speech_error_json_response(str(e))
-    except Exception as e:
-        logger.exception(f"Failed to upload voice: {e}")
-        return _create_speech_error_json_response(
-            f"Failed to upload voice: {str(e)}",
-            err_type="InternalServerError",
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-        )
-
-
-@router.delete(
-    "/v1/audio/voices/{name}",
-    responses={
-        HTTPStatus.OK.value: {"model": dict},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
-    },
-)
-async def delete_voice(name: str, raw_request: Request):
-    """Delete an uploaded voice.
-
-    Deletes the voice sample and associated metadata. Also removes any
-    cached voice clone prompts for this voice.
-
-    Args:
-        name: Name of the voice to delete
-        raw_request: Raw FastAPI request
-
-    Returns:
-        JSON response indicating success or failure
-    """
-    handler = Omnispeech(raw_request)
-    if handler is None:
-        return _create_speech_error_json_response(
-            "The model does not support Speech API",
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-
-    try:
-        # Delete the voice
-        await handler.delete_voice(name)
-        return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
-    except InvalidPresetVoiceReferenceError as e:
-        return _create_speech_error_json_response(
-            str(e),
-            err_type="ForbiddenError",
-            status_code=HTTPStatus.FORBIDDEN,
-        )
-    except InvalidVoiceReferenceError as e:
-        return _create_speech_error_json_response(
-            str(e),
-            err_type="NotFoundError",
-            status_code=HTTPStatus.NOT_FOUND,
-        )
-    except ValueError as e:
-        return _create_speech_error_json_response(str(e))
-    except Exception as e:
-        logger.exception(f"Failed to delete voice '{name}': {e}")
-        return _create_speech_error_json_response(
-            f"Failed to delete voice: {str(e)}",
-            err_type="InternalServerError",
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-        )
-
-
-@router.websocket("/v1/audio/speech/stream")
-async def streaming_speech(websocket: WebSocket):
-    """WebSocket endpoint for streaming text input TTS.
-
-    Accepts text incrementally and returns audio for the buffered text on
-    input.done, which flushes without closing the connection. See
-    serving_speech_stream.py for protocol.
-    """
-    handler = getattr(websocket.app.state, "openai_streaming_speech", None)
-    if handler is None:
-        await websocket.accept()
-        await websocket.send_json(
-            {
-                "type": "error",
-                "message": "Streaming speech is not available",
-            }
-        )
-        await websocket.close()
-        return
-    await handler.handle_session(websocket)
 
 
 @router.websocket("/v1/video/chat/stream")

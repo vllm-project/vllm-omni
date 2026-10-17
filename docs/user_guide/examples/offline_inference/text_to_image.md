@@ -196,16 +196,12 @@ from vllm_omni.entrypoints.omni import Omni
 
 if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
-    outputs = omni.generate([
-        {
-            "prompt": "a cup of coffee on a table",
-            "negative_prompt": "low resolution"
-        },
-        {
-            "prompt": "a toy dinosaur on a sandy beach",
-            "negative_prompt": "cinematic, realistic"
-        }
-    ])
+    outputs = omni.generate(
+        [
+            {"prompt": "a cup of coffee on a table", "negative_prompt": "low resolution"},
+            {"prompt": "a toy dinosaur on a sandy beach", "negative_prompt": "cinematic, realistic"},
+        ]
+    )
     for i, output in enumerate(outputs):
         output.images[0].save(f"{i}.jpg")
 ```
@@ -271,9 +267,9 @@ Then open `http://localhost:7862/` in your local browser to interact with the we
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "examples/offline_inference/text_to_image/gradio_demo.py"
+    --8 < --"examples/offline_inference/text_to_image/gradio_demo.py"
     ``````
 ??? abstract "text_to_image.py"
     ``````py
-    --8<-- "examples/offline_inference/text_to_image/text_to_image.py"
+    --8 < --"examples/offline_inference/text_to_image/text_to_image.py"
     ``````

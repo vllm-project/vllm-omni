@@ -139,7 +139,7 @@ omni = Omni(
         # SCM (Step Computation Masking) parameters [cache-dit only]
         "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
         "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
-    }
+    },
 )
 ```
 
@@ -224,12 +224,12 @@ DBCache intelligently caches intermediate transformer block outputs when the res
 **Example Configuration**:
 
 ```python
-cache_config={
-    "Fn_compute_blocks": 8,           # Use first 8 blocks for difference computation
-    "Bn_compute_blocks": 0,           # No additional fusion blocks
-    "max_warmup_steps": 8,            # Cache after 8 warmup steps
+cache_config = {
+    "Fn_compute_blocks": 8,  # Use first 8 blocks for difference computation
+    "Bn_compute_blocks": 0,  # No additional fusion blocks
+    "max_warmup_steps": 8,  # Cache after 8 warmup steps
     "residual_diff_threshold": 0.12,  # Lower threshold for faster inference
-    "max_cached_steps": -1,           # No limit on cached steps
+    "max_cached_steps": -1,  # No limit on cached steps
 }
 ```
 
@@ -246,7 +246,7 @@ TaylorSeer uses Taylor expansion to forecast future hidden states, allowing the 
 **Example Configuration**:
 
 ```python
-cache_config={
+cache_config = {
     "enable_taylorseer": True,
     "taylorseer_order": 1,  # First-order Taylor expansion
 }
@@ -276,9 +276,9 @@ SCM allows you to specify which steps must be computed and which can use cached 
 **Example Configuration**:
 
 ```python
-cache_config={
+cache_config = {
     "scm_steps_mask_policy": "medium",  # Balanced speed/quality
-    "scm_steps_policy": "dynamic",      # Use dynamic cache
+    "scm_steps_policy": "dynamic",  # Use dynamic cache
 }
 ```
 
@@ -338,11 +338,11 @@ In `cache_config` passed to `Omni` constructor, it accepts the arguments of `DBC
 **Solution**:
 ```python
 # Reduce aggressiveness - use more conservative settings
-cache_config={
+cache_config = {
     "residual_diff_threshold": 0.20,  # Lower threshold (closer to default 0.24)
-    "Fn_compute_blocks": 8,            # Use more blocks for better decisions
-    "max_warmup_steps": 6,             # Longer warmup
-    "scm_steps_mask_policy": "slow",   # More compute steps
+    "Fn_compute_blocks": 8,  # Use more blocks for better decisions
+    "max_warmup_steps": 6,  # Longer warmup
+    "scm_steps_mask_policy": "slow",  # More compute steps
 }
 ```
 

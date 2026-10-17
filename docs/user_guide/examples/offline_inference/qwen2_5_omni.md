@@ -68,11 +68,11 @@ If media file paths are not provided, the script will use default assets. Suppor
 
 ??? abstract "end2end.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen2_5_omni/end2end.py"
+    --8 < --"examples/offline_inference/qwen2_5_omni/end2end.py"
     ``````
 ??? abstract "extract_prompts.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen2_5_omni/extract_prompts.py"
+    --8 < --"examples/offline_inference/qwen2_5_omni/extract_prompts.py"
     ``````
 ??? abstract "run_multiple_prompts.sh"
     ``````sh

@@ -112,8 +112,7 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMi
 import torch.nn as nn
 
 
-class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin):
-    ...
+class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin): ...
 ```
 
 The order matters: `PipelineParallelMixin` must be listed before `CFGParallelMixin` so calls to
@@ -314,8 +313,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
 
 
-class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin):
-    ...
+class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin): ...
 ```
 
 ### Issue: Non-last PP ranks crash when calling `predict_noise`

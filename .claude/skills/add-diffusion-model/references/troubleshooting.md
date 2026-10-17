@@ -149,10 +149,10 @@ self.w2 = RowParallelLinear(hidden_dim, dim, input_is_parallel=True, return_bias
 
 **Fix**: Reduce aggressiveness:
 ```python
-cache_config={
-    "residual_diff_threshold": 0.12,      # Lower from 0.24
-    "max_warmup_steps": 6,                # Increase from 4
-    "max_continuous_cached_steps": 2,      # Reduce if higher
+cache_config = {
+    "residual_diff_threshold": 0.12,  # Lower from 0.24
+    "max_warmup_steps": 6,  # Increase from 4
+    "max_continuous_cached_steps": 2,  # Reduce if higher
 }
 ```
 

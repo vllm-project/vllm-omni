@@ -111,7 +111,7 @@ self.norm_k = RMSNorm(head_dim, eps=eps)
 self.rope = RotaryEmbedding(is_neox_style=False)
 
 query = self.norm_q(query)  # [B, S, Hq, D] or packed [T, Hq, D]
-key = self.norm_k(key)      # [B, S, Hkv, D] or packed [T, Hkv, D]
+key = self.norm_k(key)  # [B, S, Hkv, D] or packed [T, Hkv, D]
 query, key = apply_rope_to_qk(
     self.rope,
     query,
@@ -132,11 +132,11 @@ matches the model:
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 
 query, key = fused_qk_norm_rope(
-    query,                    # [T, Hq, D]
-    key,                      # [T, Hkv, D]
-    self.norm_q.weight,       # [D]
-    self.norm_k.weight,       # [D]
-    rope_table,               # [T, rotary_dim] = [cos | sin]
+    query,  # [T, Hq, D]
+    key,  # [T, Hkv, D]
+    self.norm_q.weight,  # [D]
+    self.norm_k.weight,  # [D]
+    rope_table,  # [T, rotary_dim] = [cos | sin]
     self.norm_q.variance_epsilon,
 )
 ```
@@ -153,6 +153,7 @@ through:
 self.q_norm = RMSNorm(head_dim, eps=eps, dtype=torch.bfloat16)
 self.k_norm = RMSNorm(head_dim, eps=eps, dtype=torch.bfloat16)
 self.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
+
 
 def apply_partial_rope(self, x, freqs, rot_dim):
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
@@ -213,6 +214,7 @@ and config into every quantizable vLLM linear:
 def resolve_component_quant_config(quant_config, component):
     return quant_config.resolve(component) if hasattr(quant_config, "resolve") else quant_config
 
+
 transformer_quant_config = resolve_component_quant_config(
     od_config.quantization_config,
     "transformer",
@@ -238,12 +240,14 @@ Use `build_quant_config()` for direct construction/testing:
 ```python
 from vllm_omni.quantization import build_quant_config
 
-quant_config = build_quant_config({
-    "transformer": {"method": "fp8"},
-    "text_encoder": None,
-    "vae": None,
-    "default": None,
-})
+quant_config = build_quant_config(
+    {
+        "transformer": {"method": "fp8"},
+        "text_encoder": None,
+        "vae": None,
+        "default": None,
+    }
+)
 ```
 
 Preserve each parameter's vLLM `weight_loader`; perform checkpoint layout
@@ -271,6 +275,7 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader import OffloadPlan
+
 
 class MyPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["transformer"]

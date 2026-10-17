@@ -146,7 +146,7 @@ sampling_params = OmniDiffusionSamplingParams(num_inference_steps=50)
 # Good: CFG-Parallel will work
 sampling_params = OmniDiffusionSamplingParams(
     num_inference_steps=50,
-    true_cfg_scale=4.0  # Must be > 1.0
+    true_cfg_scale=4.0,  # Must be > 1.0
 )
 ```
 
@@ -156,9 +156,9 @@ outputs = omni.generate(
     {
         "prompt": "beautiful landscape",
         "negative_prompt": "low quality, blurry",  # Required for best results
-        "multi_modal_data": {"image": input_image}
+        "multi_modal_data": {"image": input_image},
     },
-    sampling_params
+    sampling_params,
 )
 ```
 

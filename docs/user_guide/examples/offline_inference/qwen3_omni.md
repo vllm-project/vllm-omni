@@ -117,11 +117,11 @@ python end2end_async_chunk.py \
 
 ??? abstract "end2end.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen3_omni/end2end.py"
+    --8 < --"examples/offline_inference/qwen3_omni/end2end.py"
     ``````
 ??? abstract "end2end_async_chunk.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen3_omni/end2end_async_chunk.py"
+    --8 < --"examples/offline_inference/qwen3_omni/end2end_async_chunk.py"
     ``````
 ??? abstract "run_multiple_prompts.sh"
     ``````sh

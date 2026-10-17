@@ -55,8 +55,8 @@ Recommended order for a weight update on a diffusion stage:
 
 ```python
 await engine.pause_generation(mode="keep", clear_cache=False)
-await engine.sleep(level=1)          # optional: free memory for the trainer
-await engine.wake_up()               # admission stays closed until resume
+await engine.sleep(level=1)  # optional: free memory for the trainer
+await engine.wake_up()  # admission stays closed until resume
 # install new weights here
 await engine.resume_generation()
 ```
@@ -95,16 +95,13 @@ Behavior notes:
 You can programmatically control the lifecycle of stages using the `AsyncOmni` engine.
 
 ```python
-
 import asyncio
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
+
 async def run_sleep_demo():
     # 1. initialization
-    engine = AsyncOmni(
-        model="ByteDance-Seed/BAGEL-7B-MoT",
-        enable_sleep_mode=True
-    )
+    engine = AsyncOmni(model="ByteDance-Seed/BAGEL-7B-MoT", enable_sleep_mode=True)
 
     # 2. sleep mode level2
     acks = await engine.sleep(stage_ids=[0], level=2)
@@ -113,9 +110,9 @@ async def run_sleep_demo():
     # 3. wake up
     await engine.wake_up(stage_ids=[0])
 
+
 if __name__ == "__main__":
     asyncio.run(run_sleep_demo())
-
 ```
 
 ### server command Example

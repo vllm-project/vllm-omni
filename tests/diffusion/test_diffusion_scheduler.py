@@ -672,8 +672,9 @@ class TestRequestScheduler:
         mocker.patch.object(
             self.scheduler,
             "_can_schedule_waiting",
-            side_effect=lambda state: can_schedule(state)
-            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+            side_effect=lambda state: (
+                can_schedule(state) and not (state.request_id == "deferred" and manager.has_request("deferred"))
+            ),
         )
         for request_id in ("admitted", "deferred"):
             request = _make_request(request_id)

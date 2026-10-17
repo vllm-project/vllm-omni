@@ -17,8 +17,7 @@ BASE="$(git merge-base HEAD origin/main)"
 ```python
 def forward(self, **kwargs):
     # BLOCKER-prone: raw dict + string keys duplicated across files
-    if "runtime_additional_information" in kwargs and \
-       "model_intermediate_buffer" not in kwargs:
+    if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
         ...
 ```
 Real instances of this exact guard are copy-pasted across `cosyvoice3.py`, `indextts2_talker.py` (×2), `indextts2_s2mel_decoder.py`, `qwen3_tts_talker.py`, `qwen3_omni.py`. A typo in any string key silently no-ops; there is no type check, no IDE completion, and unknown keys are silently dropped.
@@ -86,8 +85,7 @@ Catch the **specific** types you actually expect (`ValueError`, `KeyError`, `Att
 ### Anti-pattern
 ```python
 # ⚠ Any param + Any return — no contract, no narrowing
-def _extract_mm_output(engine_outputs: Any) -> dict[str, Any]:
-    ...
+def _extract_mm_output(engine_outputs: Any) -> dict[str, Any]: ...
 ```
 
 ### Why dangerous (root cause)
@@ -117,7 +115,7 @@ Replace `Any` with the concrete type, a `Protocol`, or a `Union`. If a type is g
 ```python
 # Per-step in a diffusion/AR loop: clones the full latent every iteration
 for t in timesteps:
-    trajectory_latents.append(x_t.clone())   # O(N) GPU alloc + memcpy each step
+    trajectory_latents.append(x_t.clone())  # O(N) GPU alloc + memcpy each step
 ```
 Real clusters: `vllm_omni/diffusion/models/bagel/bagel_transformer.py` calls `x_t.clone()` ~9× across a trajectory loop (lines 1820–2186); the cache hooks `vllm_omni/diffusion/cache/teacache/hook.py:155` and `magcache/hook.py:182` clone `hidden_states` per step. Separately, `copy.deepcopy(self.scheduler)` / `copy.deepcopy(req.sampling_params)` is copy-pasted across diffusion pipelines — `pipeline_qwen_image.py:786`, `pipeline_hunyuan_image3.py:1904`, `pipeline_ltx2*.py` (×3), `pipeline_dreamzero.py:1085`, `diffusion_model_runner.py:398` — a full object-graph deepcopy on the request path. (Contrast `dreamzero/causal_wan_model.py:203`, which carries a `# No .clone() needed.` comment — the aware pattern.)
 
@@ -147,8 +145,8 @@ Tensors: prefer a view (`x[..., :k]`, `torch.narrow`, `as_strided`) or write int
 # all inside an async (event-loop) function
 async def handle(self, req):
     with self._lock:
-        resp = await self._client.call(req)   # lock held across await -> serializes all requests
-    time.sleep(0.1)                           # stalls the single loop for every concurrent request
+        resp = await self._client.call(req)  # lock held across await -> serializes all requests
+    time.sleep(0.1)  # stalls the single loop for every concurrent request
 ```
 
 ### Why dangerous

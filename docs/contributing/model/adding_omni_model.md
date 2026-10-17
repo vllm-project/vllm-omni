@@ -74,11 +74,8 @@ The thinker stage handles multimodal understanding. Key features:
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
 
-class Qwen3OmniMoeThinkerForConditionalGeneration(
-    Qwen3MoeForCausalLM,
-    SupportsMultiModal,
-    SupportsPP
-):
+
+class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3MoeForCausalLM, SupportsMultiModal, SupportsPP):
     """Thinker stage: multimodal understanding → text generation."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -93,10 +90,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 The talker stage converts text embeddings to codec codes:
 
 ```python
-class Qwen3OmniMoeTalkerForConditionalGeneration(
-    Qwen3MoeForCausalLM,
-    SupportsPP
-):
+class Qwen3OmniMoeTalkerForConditionalGeneration(Qwen3MoeForCausalLM, SupportsPP):
     """Talker stage: text embeddings → RVQ codec codes."""
 
     def __init__(self, vllm_config, talker_config, prefix):
@@ -156,8 +150,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         if self.model_stage == "thinker":
             # Initialize thinker model
             thinker_vllm_config = vllm_config.with_hf_config(
-                config.thinker_config,
-                architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"]
+                config.thinker_config, architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"]
             )
             self.thinker = init_vllm_registered_model(
                 vllm_config=thinker_vllm_config,
@@ -170,8 +163,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         elif self.model_stage == "talker":
             # Initialize talker model
             talker_vllm_config = vllm_config.with_hf_config(
-                config.talker_config,
-                architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"]
+                config.talker_config, architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"]
             )
             self.talker = init_vllm_registered_model(
                 vllm_config=talker_vllm_config,
@@ -184,8 +176,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         elif self.model_stage == "code2wav":
             # Initialize code2wav model
             code2wav_vllm_config = vllm_config.with_hf_config(
-                config.code2wav_config,
-                architectures=["Qwen3OmniMoeCode2Wav"]
+                config.code2wav_config, architectures=["Qwen3OmniMoeCode2Wav"]
             )
             self.code2wav = init_vllm_registered_model(
                 vllm_config=code2wav_vllm_config,
@@ -196,8 +187,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.code2wav
         else:
             raise ValueError(
-                f"Invalid model_stage: {self.model_stage}. "
-                f"Must be one of: 'thinker', 'talker', 'code2wav'"
+                f"Invalid model_stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'"
             )
 ```
 
@@ -308,11 +298,10 @@ Register your model in `vllm_omni/model_executor/models/registry.py`:
 ```python
 _OMNI_MODELS = {
     # ... existing models ...
-
     # Your new model
     "YourModelForConditionalGeneration": (
-        "your_model_name",        # Module folder name
-        "your_model",             # Module file name (without .py)
+        "your_model_name",  # Module folder name
+        "your_model",  # Module file name (without .py)
         "YourModelForConditionalGeneration",  # Class name
     ),
     "YourModelThinkerForConditionalGeneration": (
@@ -410,10 +399,7 @@ The stage transition process follows these steps:
        else:
            # Custom transition function (YOUR CODE HERE)
            return self.custom_process_input_func(
-               stage_list,
-               self.engine_input_source,
-               prompt,
-               self.requires_multimodal_data
+               stage_list, self.engine_input_source, prompt, self.requires_multimodal_data
            )
    ```
    - If `custom_process_input_func` is configured, it calls that function
@@ -514,6 +500,7 @@ Create stage transition processors in `vllm_omni/model_executor/stage_input_proc
 
 ```python
 # qwen3_omni.py (Thinker → Talker, non-async path)
+
 
 def thinker2talker_token_only(
     source_outputs: list[Any],

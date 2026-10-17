@@ -62,16 +62,12 @@ omni = Omni(
     lora_backend="peft",  # default, can be omitted
 )
 
-lora_request = LoRARequest(
-    lora_name="preloaded",
-    lora_int_id=1,
-    lora_path=lora_path
-)
+lora_request = LoRARequest(lora_name="preloaded", lora_int_id=1, lora_path=lora_path)
 
 outputs = omni.generate(
     prompt="A piece of cheesecake",
     lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
+    lora_scale=2.0,  # optional arg, default 1.0
 )
 ```
 
@@ -113,8 +109,8 @@ from vllm_omni import Omni
 omni = Omni(
     model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
     lora_path=[
-        "/path/to/wan2.2_high_noise_lora.safetensors",   # -> transformer
-        "/path/to/wan2.2_low_noise_lora.safetensors",    # -> transformer_2
+        "/path/to/wan2.2_high_noise_lora.safetensors",  # -> transformer
+        "/path/to/wan2.2_low_noise_lora.safetensors",  # -> transformer_2
     ],
     lora_backend="distill",
 )

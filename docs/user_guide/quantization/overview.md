@@ -101,10 +101,12 @@ through `build_quant_config()`:
 ```python
 from vllm_omni.quantization import build_quant_config
 
-config = build_quant_config({
-    "transformer": {"method": "fp8"},
-    "vae": None,
-})
+config = build_quant_config(
+    {
+        "transformer": {"method": "fp8"},
+        "vae": None,
+    }
+)
 ```
 
 | Component | Default quantized? | Notes |

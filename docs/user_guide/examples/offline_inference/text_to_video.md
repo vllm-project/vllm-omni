@@ -200,5 +200,5 @@ accepts `motion_score`, `clean_caption`, and `use_resolution_binning` through
 
 ??? abstract "text_to_video.py"
     ``````py
-    --8<-- "examples/offline_inference/text_to_video/text_to_video.py"
+    --8 < --"examples/offline_inference/text_to_video/text_to_video.py"
     ``````

@@ -167,15 +167,16 @@ Create a callable that applies final transformations to produce the model output
 **Example (Qwen-Image):**
 
 ```python
-    return_dict = kwargs.get("return_dict", True)
+return_dict = kwargs.get("return_dict", True)
 
-    def postprocess(h):
-        """Apply Qwen-specific output postprocessing."""
-        h = module.norm_out(h, temb)
-        output = module.proj_out(h)
-        if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
+
+def postprocess(h):
+    """Apply Qwen-specific output postprocessing."""
+    h = module.norm_out(h, temb)
+    output = module.proj_out(h)
+    if not return_dict:
+        return (output,)
+    return Transformer2DModelOutput(sample=output)
 ```
 
 ### Step 5: Return CacheContext
@@ -386,7 +387,7 @@ omni = Omni(
     cache_config={
         "rel_l1_thresh": 0.2,
         "coefficients": [1.33e6, -1.69e5, 7.95e3, -1.64e2, 1.26],  # Your coefficients
-    }
+    },
 )
 
 images = omni.generate(
@@ -441,9 +442,7 @@ EXTRACTOR_REGISTRY["YourTransformer2DModel"] = extract_your_context
 **Solution:** Add coefficients to `_MODEL_COEFFICIENTS` in `config.py`, or pass custom coefficients:
 ```python
 omni = Omni(
-    model="your-model",
-    cache_backend="tea_cache",
-    cache_config={"coefficients": [1.0, -0.5, 0.1, -0.01, 0.001]}
+    model="your-model", cache_backend="tea_cache", cache_config={"coefficients": [1.0, -0.5, 0.1, -0.01, 0.001]}
 )
 ```
 
@@ -459,7 +458,7 @@ omni = Omni(
 
 **Solution:** Lower the threshold:
 ```python
-cache_config={"rel_l1_thresh": 0.1}  # Try 0.1-0.2
+cache_config = {"rel_l1_thresh": 0.1}  # Try 0.1-0.2
 ```
 
 - **Coefficients not tuned:**

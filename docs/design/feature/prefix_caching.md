@@ -361,17 +361,16 @@ dim. That leftover copy is the async-builder read replica for this step; it
 does not write the pool or carry abort/preempt occupancy.
 
 ```python
-cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
+cache.register_policy(ModelCachePolicy.from_model(model))  # load_model
 adapter = PrefixCacheSchedulerAdapter()
 step = adapter.translate_step(scheduler_output)
-cache.new_step_starts(step)   # before _update_states
+cache.new_step_starts(step)  # before _update_states
 layout = adapter.build_write_layout(
     prefix_cache_group_view,
     num_scheduled_tokens=dict(step.scheduled_tokens),
 )
-sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
-                         num_tokens_padded=n_pad, write_layout=layout)
-outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
+sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n, num_tokens_padded=n_pad, write_layout=layout)
+outs = cache.materialize(sid, req_ids)  # or discard_step(sid)
 ```
 
 `new_step_starts` accepts only `PrefixCacheStep`; there is no bare-event or

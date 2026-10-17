@@ -77,12 +77,12 @@ is a flat dict per inference:
 
 ```python
 {
-    "observation.images.base_0_rgb":        np.uint8[H, W, 3],
-    "observation.images.left_wrist_0_rgb":  np.uint8[H, W, 3],
+    "observation.images.base_0_rgb": np.uint8[H, W, 3],
+    "observation.images.left_wrist_0_rgb": np.uint8[H, W, 3],
     "observation.images.right_wrist_0_rgb": np.uint8[H, W, 3],
-    "state":   np.float32[state_dim],   # zero-padded to max_state_dim=32 server-side
-    "prompt":  "pick up the red block",
-    "session_id": "<uuid>",             # accepted but ignored (π0 is stateless)
+    "state": np.float32[state_dim],  # zero-padded to max_state_dim=32 server-side
+    "prompt": "pick up the red block",
+    "session_id": "<uuid>",  # accepted but ignored (π0 is stateless)
 }
 ```
 

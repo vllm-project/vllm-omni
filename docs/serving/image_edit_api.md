@@ -36,10 +36,8 @@ curl -s -D >(grep -i x-request-id >&2) \
 import base64
 from openai import OpenAI
 from pathlib import Path
-client = OpenAI(
-    api_key="None",
-    base_url="http://localhost:8000/v1"
-)
+
+client = OpenAI(api_key="None", base_url="http://localhost:8000/v1")
 
 input_image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
 
@@ -47,16 +45,16 @@ result = client.images.edit(
     image=[],
     model="Qwen-Image-Edit-2511",
     prompt="Change the bears in the two input images into walking together.",
-    size='512x512',
+    size="512x512",
     stream=False,
-    output_format='jpeg',
+    output_format="jpeg",
     # url格式
     extra_body={
-        "url": [input_image_url,input_image_url],
+        "url": [input_image_url, input_image_url],
         "num_inference_steps": 50,
         "guidance_scale": 1,
         "seed": 777,
-    }
+    },
 )
 
 image_base64 = result.data[0].b64_json

@@ -72,8 +72,9 @@ class YourPipeline(nn.Module):
         # Instantiate transformer (weights loaded later via weights_sources)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model, subfolder="transformer",
-                prefix="transformer.", fall_back_to_pt=True)]
+                model_or_path=od_config.model, subfolder="transformer", prefix="transformer.", fall_back_to_pt=True
+            )
+        ]
 
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         # Encode prompt → prepare latents → denoise loop → VAE decode
@@ -91,6 +92,7 @@ For pipelines with a standard denoising loop, prefer the existing progress bar p
 
 ```python
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+
 
 class YourPipeline(nn.Module, ProgressBarMixin):
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
@@ -163,10 +165,7 @@ use the pinned reference only to generate parity evidence.
 try:
     from external_model.utils import init_vae, load_checkpoint
 except ImportError:
-    raise ImportError(
-        "Failed to import from dependency 'external_model'. "
-        "Please run the download script first."
-    )
+    raise ImportError("Failed to import from dependency 'external_model'. Please run the download script first.")
 ```
 
 Use an external runtime dependency only when the user explicitly requested an
@@ -206,6 +205,7 @@ When weights are in safetensors format but need name remapping:
 
 ```python
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 
 class CustomPipeline(nn.Module):
     def __init__(self, *, od_config, prefix=""):
@@ -274,6 +274,7 @@ If the model accepts images, audio, or other multi-modal inputs, implement the p
 
 ```python
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportAudioInput
+
 
 class MyPipeline(nn.Module, SupportImageInput, SupportAudioInput):
     # Protocol markers — the engine uses these to enable proper input routing
@@ -453,6 +454,7 @@ declares which submodules the offloader should manage:
 ```python
 from typing import ClassVar
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+
 
 class YourPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["transformer"]

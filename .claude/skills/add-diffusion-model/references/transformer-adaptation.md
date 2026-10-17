@@ -44,6 +44,7 @@ The vLLM-Omni `Attention` layer wraps backend selection (FlashAttention, SDPA, S
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
+
 class SelfAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads):
         super().__init__()
@@ -58,7 +59,7 @@ class SelfAttentionBlock(nn.Module):
         self.attn = Attention(
             num_heads=num_heads,
             head_size=self.head_dim,
-            softmax_scale=1.0 / (self.head_dim ** 0.5),
+            softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=num_heads,
             role="self",
@@ -87,8 +88,10 @@ For multi-modal sites that don't fit `self` / `cross`, use a dot-namespaced role
 
 ```python
 self.audio_to_video_attn = Attention(
-    num_heads=num_heads, head_size=self.head_dim,
-    softmax_scale=1.0 / (self.head_dim ** 0.5), causal=False,
+    num_heads=num_heads,
+    head_size=self.head_dim,
+    softmax_scale=1.0 / (self.head_dim**0.5),
+    causal=False,
     role="mymodel.audio_to_video",
     role_category="cross",
 )
@@ -99,9 +102,8 @@ self.audio_to_video_attn = Attention(
 For tensor parallelism, use vLLM's parallel linear layers:
 
 ```python
-from vllm.model_executor.layers.linear import (
-    QKVParallelLinear, RowParallelLinear
-)
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+
 
 class TPSelfAttention(nn.Module):
     def __init__(self, dim, num_heads):
@@ -120,7 +122,7 @@ class TPSelfAttention(nn.Module):
         self.attn = Attention(
             num_heads=num_heads,
             head_size=self.head_dim,
-            softmax_scale=1.0 / (self.head_dim ** 0.5),
+            softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=num_heads,
             role="self",
@@ -132,10 +134,12 @@ class TPSelfAttention(nn.Module):
 ```python
 # Replace:
 from diffusers.utils import logging
+
 logger = logging.get_logger(__name__)
 
 # With:
 from vllm.logger import init_logger
+
 logger = init_logger(__name__)
 ```
 
@@ -154,6 +158,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 ```python
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
+
 class MyTransformer(nn.Module):
     def __init__(self, *, od_config=None, num_layers=28, hidden_size=3072, **kwargs):
         super().__init__()
@@ -170,6 +175,7 @@ The `load_weights` method receives an iterable of `(name, tensor)` from safetens
 
 ```python
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 
 class MyTransformer(nn.Module):
     def load_weights(self, weights):
@@ -199,6 +205,7 @@ stacked_params_mapping = [
     ("to_qkv", "to_k", "k"),
     ("to_qkv", "to_v", "v"),
 ]
+
 
 def load_weights(self, weights):
     params = dict(self.named_parameters())

@@ -88,19 +88,11 @@ with graph_capture(self.device):
 ```python
 # GPU
 if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
-    self.talker_mtp = CUDAGraphWrapper(
-        talker_mtp,
-        self.vllm_config,
-        runtime_mode=CUDAGraphMode.FULL
-    )
+    self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
 
 # NPU
 if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
-    self.talker_mtp = ACLGraphWrapper(
-        talker_mtp,
-        self.vllm_config,
-        runtime_mode=CUDAGraphMode.FULL
-    )
+    self.talker_mtp = ACLGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
 ```
 
 ### Checking Graph Wrapper Type
@@ -179,6 +171,7 @@ if self.speculative_config and self.speculative_config.method == "mtp":
 
 # NPU - explicit update required before forward
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
+
 update_cos_sin(positions)
 ```
 
@@ -204,6 +197,7 @@ self.sampler = Sampler()
 
 # NPU - uses AscendSampler
 from vllm_ascend.sample.sampler import AscendSampler
+
 self.sampler = AscendSampler()
 ```
 

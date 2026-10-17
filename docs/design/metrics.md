@@ -130,9 +130,7 @@ The `Orchestrator` constructs `stage_replica_map` from the static `stage_pools` 
 stage_replica_map = {
     flat_idx: (str(stage_id), str(replica_id))
     for flat_idx, (stage_id, replica_id) in enumerate(
-        (s, r)
-        for s, pool in enumerate(stage_pools)
-        for r in range(pool.num_replicas)
+        (s, r) for s, pool in enumerate(stage_pools) for r in range(pool.num_replicas)
     )
 }
 ```
