@@ -22,7 +22,8 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
-def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path):
+@pytest.mark.parametrize("save_detailed", [False, True])
+def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path, save_detailed):
     """Exercise real dataset/benchmark code; replace only the HTTP backend."""
     from vllm_omni.benchmarks import serve
     from vllm_omni.benchmarks.patch import patch
@@ -58,6 +59,10 @@ def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path):
             "--extra-body",
             '{"seed":42,"guidance_scale":2.5,"bot_task":"think_recaption"}',
             "--save-result",
+            *(["--save-detailed"] if save_detailed else []),
+            "--omni-request-timeout-s",
+            "42",
+            "--videomme-save-eval-items",
             "--result-dir",
             str(tmp_path),
             "--result-filename",
@@ -65,6 +70,10 @@ def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path):
         ]
     )
     requests = []
+    snapshot = {"0": {"num_tokens_out": 1, "finish_reason": "stop", "vllm_itls_ms": [5.0]}}
+    monkeypatch.setattr(patch, "_SAVE_DETAILED", not save_detailed)
+    monkeypatch.setattr(patch, "_REQUEST_TIMEOUT_OVERRIDE_S", None)
+    monkeypatch.delenv("VIDEOMME_SAVE_EVAL_ITEMS", raising=False)
 
     async def request_func(request_func_input, session, pbar=None):
         requests.append(request_func_input)
@@ -77,10 +86,14 @@ def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path):
             image_count=1,
             start_time=time.perf_counter(),
             latency=99.0 if len(requests) <= 2 else 0.1,
+            stage_metrics=snapshot,
         )
 
     monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "/v1/images/edits", request_func)
     result = serve.main(args)
+    assert patch._SAVE_DETAILED is save_detailed
+    assert patch._omni_request_timeout_s() == 42
+    assert os.environ["VIDEOMME_SAVE_EVAL_ITEMS"] == "1"
     assert len(requests) == 10
     for request in requests:
         assert request.prompt == sample["prompt"]
@@ -90,6 +103,11 @@ def test_it2i_dataset_uses_upstream_warmups(monkeypatch, tmp_path):
     saved = json.loads((tmp_path / "result.json").read_text())
     assert saved["completed"] == 8
     assert saved["mean_e2el_ms"] == pytest.approx(100.0)  # Excludes both 99-second warmups.
+    assert saved["request_stage_metrics"] == [{"0": {"num_tokens_out": 1, "finish_reason": "stop"}}] * 8
+    if save_detailed:
+        assert saved["stage_metrics"] == [snapshot] * 8
+    else:
+        assert "stage_metrics" not in saved
 
 
 @pytest.mark.parametrize(
