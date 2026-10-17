@@ -2043,7 +2043,8 @@ async def async_request_openai_chat_omni_completions(
                                     content = delta.get("content")
                                     if not content and isinstance(delta.get("audio"), dict):
                                         content = delta["audio"].get("data")
-                                    if modality == "text":
+                                    # OpenAI-compatible streams may omit the modality extension.
+                                    if modality == "text" or (modality is None and delta.get("content")):
                                         token_delta, completion_tokens_seen = _resolve_token_delta_from_usage(
                                             completion_tokens,
                                             completion_tokens_seen,
@@ -2069,11 +2070,15 @@ async def async_request_openai_chat_omni_completions(
                                             )
                                         if has_text_content:
                                             generated_text += content
-                                    elif modality == "audio":
-                                        if output.audio_ttfp == 0.0:
-                                            output.audio_ttfp = timestamp - st
-                                        audio_generate_time = timestamp - st
+                                    if modality == "audio" or (
+                                        modality is None and isinstance(delta.get("audio"), dict)
+                                    ):
+                                        if isinstance(delta.get("audio"), dict):
+                                            content = delta["audio"].get("data")
                                         if content:
+                                            if output.audio_ttfp == 0.0:
+                                                output.audio_ttfp = timestamp - st
+                                            audio_generate_time = timestamp - st
                                             audio_bytes = base64.b64decode(content)
                                             if response_format == "wav":
                                                 try:
@@ -2213,6 +2218,9 @@ async def async_request_openai_chat_omni_completions(
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
                     output.success = not streaming_error_received
+                    if output.success and "audio" in (payload.get("modalities") or []) and audio_frames == 0:
+                        output.success = False
+                        output.error = "Audio was requested but no decodable audio frames were received"
                 else:
                     output.error = response.reason or ""
                     output.success = False

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+config_cls: Qwen3OmniSpeechPipelineConfig
+model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+# Match the two-GPU vLLM-Omni stage placement; keep TP at its default of 1.
+stages:
+  image_encoder:
+    gpu: 0
+    gpu_memory_fraction: 0.02
+  audio_encoder:
+    gpu: 0
+    gpu_memory_fraction: 0.02
+  thinker:
+    gpu: 0
+    # The pinned backend reserves 0.05 of this budget for the encoders.
+    gpu_memory_fraction: 0.90
+  talker_ar:
+    gpu: 1
+    gpu_memory_fraction: 0.60
+  code2wav:
+    gpu: 1
+    gpu_memory_fraction: 0.10

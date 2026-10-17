@@ -3,7 +3,17 @@
 steps:
   - label: ":github: Resolve skip-ci & upload pipeline"
     key: upload-ci-pipeline
+    if: build.branch == "main" || !(build.pull_request.labels includes "backend-comparison-test")
     commands:
       - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml"
     agents:
       queue: "medium_cpu_queue_premerge"
+
+  # ready admits the webhook; comparison PRs run only this independent pipeline.
+  - label: ":left_right_arrow: Upload Backend Comparison"
+    key: upload-backend-comparison
+    if: build.branch != "main" && build.pull_request.labels includes "backend-comparison-test"
+    commands:
+      - buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml
+    agents:
+      queue: medium_cpu_queue_premerge

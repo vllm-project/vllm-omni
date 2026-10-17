@@ -1,0 +1,48 @@
+[
+  {
+    "test_name": "test_sglang_qwen3_omni",
+    "server_type": "sglang-omni",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {"cuda": "H100"},
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "env": {
+        "SGLANG_OMNI_STARTUP_TIMEOUT": "1800",
+        "SGLANG_OMNI_WARMUP_TIMEOUT": "1800"
+      },
+      "serve_args": {
+        "config": "tests/dfx/perf/deploy/sgl_qwen3_omni.yaml"
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "text_audio_latency",
+        "dataset_name": "seed-tts-text",
+        "dataset_path": "linyueqian/seed-tts-eval-subset",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [20],
+        "max_concurrency": [1],
+        "num_warmups": 2,
+        "seed": 0,
+        "seed_tts_locale": "en",
+        "seed_tts_system_prompt": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech. Read the user text aloud exactly as written. Output only the supplied text and its spoken audio.",
+        "output_len": 256,
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "audio": {"voice": "Chelsie", "format": "wav"},
+          "seed": 0
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration"
+      }
+    ]
+  }
+]
