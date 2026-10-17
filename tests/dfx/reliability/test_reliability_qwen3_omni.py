@@ -219,7 +219,7 @@ def _get_mix_prompt() -> str:
 def _mix_chat_completions_probe_payload(omni_server: _HasServeArgs) -> dict[str, Any]:
     """Heavy multimodal ``/v1/chat/completions`` body for OOM recover tests.
 
-    Uses the same synthetic sizes as ``test_reliability_fault_gpu_oom_chat_large_payload_failure``
+    Uses the same synthetic sizes as ``test_reliability_fault_gpu_oom_large_request_failure``
     (large vision tensors + long text), not the light expansion mix (224² / 5s audio): under
     ``strict=False`` sidecars, a small mix often still completes on a GPU that retains multi-GB
     free after the hog stops at ``target_mem_ratio``.
@@ -465,7 +465,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_OOM_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, online_client_function) -> None:
+def test_reliability_fault_gpu_oom_large_request_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
         _deploy_config_path_from_omni_server(omni_server_function),
@@ -823,7 +823,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
+def test_reliability_fault_gpu_oom_recovers_after_fault_removed(
     omni_server_function,
     online_client_function,
 ) -> None:
