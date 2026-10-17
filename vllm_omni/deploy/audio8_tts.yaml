@@ -41,7 +41,7 @@ stages:
     enforce_eager: false
     trust_remote_code: false
     enable_prefix_caching: false
-    async_scheduling: false
+    async_scheduling: true
     # The checkpoint's max_seq_len is 2048 packed text+audio positions; with
     # chunked prefill off, max_num_batched_tokens must be >= max_model_len.
     max_model_len: 2048
@@ -62,6 +62,13 @@ stages:
     max_num_seqs: 1
     # The codec is ~1.4 GB of weights plus per-chunk activations.
     gpu_memory_utilization: 0.1
+    # Disable upstream CUDAGraph in favor of the model-local graph.
+    # 2-D codec inputs are represented by a single [0] placeholder, so upstream always
+    # sees num_tokens=1 and selects the same FULL graph despite varying codec tensor shapes.
+    #
+    # enforce_eager: false
+    # compilation_config:
+    #   cudagraph_mode: NONE
     enforce_eager: true
     trust_remote_code: false
     enable_prefix_caching: false
