@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState, DuplexTurnEventType
-from vllm_omni.engine.duplex.plugin import PcmAppendReservation
+from vllm_omni.engine.duplex.plugin import PcmAppendReservation, settle_response_runtime
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -244,7 +244,11 @@ class AppendAttempt:
 
     def _fail_precreated_response(self, reason: str) -> None:
         session = self.ctx.session
+        failed_response_id = session.active_response_id
         session.end_response(commit_text=False)
+        settle_response_runtime(
+            self.ctx.plugin, session, committed=False, response_id=failed_response_id, release_owner=True
+        )
         self.out.emit(
             {
                 "type": "response.done",

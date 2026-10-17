@@ -146,6 +146,11 @@ def test_load_duplex_plugin_instantiates_the_class_at_the_dotted_path() -> None:
     assert plugin.private_runtime_config_keys == frozenset()
     assert plugin.silence_continuation_samples == 16000
     assert plugin.runtime_config_for_function_output(DuplexSessionConfig(), {}, {"name": "tool"}) is None
+    assert plugin.note_published_function_call({}, call_id="call_1", history_len=1) is None
+    assert plugin.has_pending_tool_followup({}) is False
+    assert plugin.extra_prompt_config({}) == {}
+    assert plugin.runtime_patch_for_submitted_prompt({}) is None
+    assert plugin.runtime_config_after_response({}, committed=False) is None
 
 
 def test_load_duplex_plugin_rejects_a_non_plugin_class() -> None:

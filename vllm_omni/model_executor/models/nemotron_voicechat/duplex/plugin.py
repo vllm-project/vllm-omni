@@ -441,14 +441,34 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
             )
         return runtime
 
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        """Read one call the data plane projected from function-channel tokens.
+
+        ``data_plane`` already decoded ``sotc`` … ``eotc`` into ``call_id``,
+        ``name``, and ``arguments`` and set ``function_call``. This hook is the
+        session's view of that event. A non-call output returns ``None``.
+        """
+        if model_result.get("function_call") is not True:
+            return None
+        call_id = model_result.get("call_id")
+        name = model_result.get("name")
+        arguments = model_result.get("arguments", "")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            return None
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+        return {"call_id": call_id, "name": name, "arguments": arguments}
+
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object]:
         """Queue a client tool result for frame-locked function-channel injection."""
-        del config
+        del config, history_len
         call_id = item.get("call_id")
         output = item.get("output")
         if not isinstance(call_id, str) or not call_id:
