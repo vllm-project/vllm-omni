@@ -22,7 +22,6 @@ from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     _DEFAULT_WIDTH,
     ABOT_DMD_TIMESTEPS,
     _build_shifted_flow_schedule,
-    _convert_wan_umt5_encoder_state_dict,
     _fix_wan22_residual_vae_keys,
     _paged_kv_tokens_per_frame,
     _positive_finite_flow_shift,
@@ -31,6 +30,7 @@ from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     _validate_local_model_files,
     _validate_parallel_config,
 )
+from vllm_omni.diffusion.models.wan2_2.text_encoder import convert_wan_umt5_encoder_state_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -196,7 +196,7 @@ def test_umt5_conversion_maps_gated_gelu_branches() -> None:
     for value, suffix in enumerate(suffixes):
         source[f"blocks.0.{suffix}"] = torch.full((1,), value)
 
-    converted = _convert_wan_umt5_encoder_state_dict(source, num_layers=1)
+    converted = convert_wan_umt5_encoder_state_dict(source, num_layers=1)
 
     assert converted["encoder.block.0.layer.1.DenseReluDense.wi_0.weight"].item() == suffixes.index("ffn.gate.0.weight")
     assert converted["encoder.block.0.layer.1.DenseReluDense.wi_1.weight"].item() == suffixes.index("ffn.fc1.weight")

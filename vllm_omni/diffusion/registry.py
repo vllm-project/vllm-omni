@@ -34,6 +34,7 @@ def resolve_native_single_file(model_class_name: str | None) -> str | None:
 
 
 _DIFFUSION_MODELS = {
+    "MatrixGame4Pipeline": ("matrix_game4", "pipeline_matrix_game4", "MatrixGame4Pipeline"),
     # arch:(mod_folder, mod_relname, cls_name)
     "SeedVR2Pipeline": ("seedvr2", "pipeline_seedvr2", "SeedVR2Pipeline"),
     "QwenImagePipeline": (
@@ -770,6 +771,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "MatrixGame4Pipeline": "get_matrix_game4_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
