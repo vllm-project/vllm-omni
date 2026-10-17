@@ -3,8 +3,8 @@
 """CPU checks of the packed Flow attention metadata for FA3 and FA2 pages.
 
 The kernels only run on CUDA; here a reference reads the paged KV exactly as
-the FlashAttention calls are configured, so the page table, KV slots and query
-segments can be checked against chunk-causal attention on unpadded rows.
+the FlashAttention calls are configured, so the page table, KV gather index and
+query segments can be checked against chunk-causal attention on unpadded rows.
 """
 
 import pytest
@@ -29,9 +29,7 @@ def _attention(lengths, fa_version, chunk_size=None, width=None):
 
 def _paged_kv(x, attention):
     """Lay packed K or V out as ``packed_fa2`` does (identity for FA3 pages)."""
-    page_size = attention.page_size
-    pages = x.shape[0] // page_size + attention.page_table.shape[0]
-    return x.new_zeros(pages * page_size, *x.shape[1:]).index_copy_(0, attention.kv_slots, x)
+    return x.index_select(0, attention.slot_frames)
 
 
 def _segment_slots(attention, segment):
@@ -92,19 +90,17 @@ def test_paged_attention_matches_isolated_row_attention(fa_version, chunk_size):
 @pytest.mark.parametrize("fa_version", [2, 3])
 @pytest.mark.parametrize("chunk_size", [None, CHUNK])
 @pytest.mark.parametrize("lengths", [[1], [15, 17, 33], [67, 0, 103, 16, 1], [500, 7, 129, 64, 0]])
-def test_kv_slots_are_page_aligned_disjoint_and_fit_the_fa2_allocation(fa_version, chunk_size, lengths):
+def test_every_segment_reads_exactly_its_rows_frames(fa_version, chunk_size, lengths):
     rows, attention = _attention(lengths, fa_version, chunk_size)
     page_size = attention.page_size
-    slots = attention.kv_slots
+    slot_frames = attention.slot_frames
 
-    assert slots.unique().numel() == rows.total
+    # Rows start on a page and waste less than one page each.
+    assert slot_frames.shape[0] == sum(-(-n // page_size) for n in lengths) * page_size
+    assert int(attention.page_table.max()) < slot_frames.shape[0] // page_size
+    # Slots past a row's end alias frame 0, so a segment must never read past
+    # its own row: each one reads exactly its row's frames, in order.
     row_starts = rows.starts_host[:-1].long()
-    nonempty = torch.tensor(lengths) > 0
-    assert torch.all(slots[row_starts[nonempty]] % page_size == 0)
-    # packed_fa2 sizes its page buffer from shapes alone; every slot must fit.
-    pages = rows.total // page_size + attention.page_table.shape[0]
-    assert int(slots.max()) < pages * page_size
-    # Every segment reads its row's packed frames, in order, up to its end.
     segment_rows = []
     for row, length in enumerate(lengths):
         chunks = 1 if length == 0 else len(range(0, length, chunk_size or length))
@@ -112,8 +108,62 @@ def test_kv_slots_are_page_aligned_disjoint_and_fit_the_fa2_allocation(fa_versio
     assert len(segment_rows) == attention.cache_seqlens.shape[0]
     for segment, row in enumerate(segment_rows):
         end = int(attention.cache_seqlens[segment])
-        expected = slots[row_starts[row] : row_starts[row] + end]
-        assert torch.equal(_segment_slots(attention, segment), expected)
+        frames = slot_frames[_segment_slots(attention, segment)]
+        assert torch.equal(frames, row_starts[row] + torch.arange(end))
+
+
+@pytest.mark.parametrize("chunk_size", [None, CHUNK])
+def test_fa2_slots_aliasing_frame_zero_never_reach_other_rows(chunk_size):
+    lengths = [7, 67, 1, 103, 16]
+    _, attention = _attention(lengths, fa_version=2, chunk_size=chunk_size)
+    generator = torch.Generator().manual_seed(1)
+    q, k, v = [torch.randn(sum(lengths), 2, 8, generator=generator) for _ in range(3)]
+    clean = _paged_attention(q, k, v, attention)
+    k[0], v[0] = float("nan"), float("nan")
+
+    poisoned = _paged_attention(q, k, v, attention)
+
+    assert torch.equal(poisoned[lengths[0] :], clean[lengths[0] :])
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_flow_graph_slot_buffer_covers_every_padded_layout(monkeypatch, seed):
+    import random
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
+        FlowGraphRunner,
+        pack_rows,
+        page_metadata,
+    )
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: None)
+    attn = SimpleNamespace(heads=2, inner_dim=16)
+    dit = SimpleNamespace(transformer_blocks=[SimpleNamespace(attn=attn)], static_chunk_size=CHUNK)
+    rng = random.Random(seed)
+    noise, spks, time_span = torch.zeros(1, 1, 80), torch.zeros(1, 80), torch.zeros(4)
+    for fa_version in (2, 3):
+        runner = FlowGraphRunner(SimpleNamespace(dit=dit, fa_version=fa_version))
+        page_size = 16 if fa_version == 2 else 1
+        for _ in range(50):
+            lengths = tuple(rng.choice([1, 15, 17, rng.randint(1, 900)]) for _ in range(rng.randint(1, 8)))
+            streaming = rng.random() < 0.5
+            key, twin, seg_rows, seg_ends, _ = runner._layout(lengths, streaming)
+            state = runner._allocate(key, noise, spks, time_span)
+            twin_rows = pack_rows(twin, torch.device("cpu"), width=state.frames.shape[0])
+            page_table, slot_frames = page_metadata(
+                torch.tensor(twin),
+                torch.tensor(seg_rows),
+                torch.tensor(seg_ends),
+                twin_rows.row_ids,
+                twin_rows.positions,
+                page_size=page_size,
+                columns=state.page_table.shape[1],
+                slots=state.slot_frames.shape[0],
+            )
+            assert sum(-(-n // page_size) for n in twin) * page_size <= state.slot_frames.shape[0]
+            assert page_table.shape == state.page_table.shape
+            assert int(page_table.max()) < state.slot_frames.shape[0] // page_size
 
 
 def test_fa3_pages_are_the_packed_sequence_itself():
@@ -121,7 +171,7 @@ def test_fa3_pages_are_the_packed_sequence_itself():
     rows, attention = _attention(lengths, fa_version=3, chunk_size=CHUNK)
 
     assert attention.page_size == 1
-    assert torch.equal(attention.kv_slots, torch.arange(rows.total))
+    assert torch.equal(attention.slot_frames, torch.arange(rows.total))
     starts = rows.starts_host.long()
     for segment, (row, end) in enumerate([(0, 50), (0, 67), (1, 0), (2, 50), (2, 100), (2, 103)]):
         assert int(attention.cache_seqlens[segment]) == end

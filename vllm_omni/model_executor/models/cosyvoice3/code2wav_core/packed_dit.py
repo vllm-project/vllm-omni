@@ -22,7 +22,7 @@ from ..runtime import cosyvoice3_packed_fa_version
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 
 # FA3 pages the packed KV in place. vLLM's FA2 requires pages of a multiple of
-# 16 frames, so every row is copied onto a page-aligned start.
+# 16 frames, so every row is gathered onto a page-aligned start.
 PAGE_SIZE = {3: 1, 2: 16}
 
 
@@ -35,20 +35,24 @@ def page_metadata(
     *,
     page_size: int,
     columns: int,
+    slots: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Page table and KV slots for packed rows that each start on a page.
+    """Page table and KV gather index for packed rows that each start on a page.
 
     Segment ``s`` reads the first ``segment_ends[s]`` frames of its row, which
     is a whole row (full context) or the prefix up to one query chunk
-    (chunk-causal). Packed frame ``i`` is stored at KV slot ``kv_slots[i]``.
+    (chunk-causal). KV slot ``j`` holds packed frame ``slot_frames[j]``. Slots
+    past a row's last frame hold frame 0; no segment reads past its own row,
+    so they are never attended.
     """
     pages = (lengths.long() + page_size - 1) // page_size
     page_starts = F.pad(pages.cumsum(0), (1, 0))[:-1]
     page = torch.arange(columns, dtype=torch.int64, device=lengths.device)
     used = page[None] * page_size < segment_ends[:, None]
     page_table = torch.where(used, page_starts[segment_rows.long()][:, None] + page[None], 0).to(torch.int32)
-    kv_slots = page_starts[row_ids] * page_size + positions
-    return page_table, kv_slots
+    slot_frames = torch.zeros(slots, dtype=torch.int64, device=lengths.device)
+    slot_frames[page_starts[row_ids] * page_size + positions] = torch.arange(row_ids.shape[0], device=lengths.device)
+    return page_table, slot_frames
 
 
 class RaggedRowAttention:
@@ -85,7 +89,7 @@ class RaggedRowAttention:
         self.cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
         self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
         self.max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
-        self.page_table, self.kv_slots = page_metadata(
+        self.page_table, self.slot_frames = page_metadata(
             torch.tensor(rows.lengths, device=device),
             torch.tensor(segment_rows, device=device),
             self.cache_seqlens,
@@ -93,6 +97,7 @@ class RaggedRowAttention:
             rows.positions,
             page_size=self.page_size,
             columns=-(-rows.width // self.page_size),
+            slots=sum(-(-length // self.page_size) for length in rows.lengths) * self.page_size,
         )
 
 
@@ -270,27 +275,21 @@ def packed_fa2(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    kv_slots: torch.Tensor,
+    slot_frames: torch.Tensor,
     cache_seqlens: torch.Tensor,
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
 ) -> torch.Tensor:
-    """FA2 boundary: copy packed K/V onto page-aligned slots, then attend."""
+    """FA2 boundary: gather packed K/V onto page-aligned slots, then attend."""
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 
     page_size = PAGE_SIZE[2]
-    # Rows use ceil(length / page_size) pages, at most one partial page per
-    # row, and every non-empty row has at least one segment.
-    pages = k.shape[0] // page_size + page_table.shape[0]
-    page_shape = (pages, page_size, *k.shape[1:])
-    # Unused slots are never attended; zeros keep their loads well defined.
-    k_pages = k.new_zeros(pages * page_size, *k.shape[1:]).index_copy_(0, kv_slots, k)
-    v_pages = v.new_zeros(pages * page_size, *v.shape[1:]).index_copy_(0, kv_slots, v)
+    page_shape = (slot_frames.shape[0] // page_size, page_size, *k.shape[1:])
     return flash_attn_varlen_func(
         q,
-        k_pages.view(page_shape),
-        v_pages.view(page_shape),
+        k.index_select(0, slot_frames).view(page_shape),
+        v.index_select(0, slot_frames).view(page_shape),
         max_seqlen_q=max_seqlen_q,
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_k=page_table.shape[1] * page_size,
@@ -306,7 +305,7 @@ def fake_packed_fa2(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    kv_slots: torch.Tensor,
+    slot_frames: torch.Tensor,
     cache_seqlens: torch.Tensor,
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -435,7 +434,7 @@ def mark_packed_compile_metadata(rows: PackedRows, attention: RaggedRowAttention
     dynamo.mark_dynamic(attention.page_table, (0, 1))
     dynamo.mark_dynamic(attention.cu_seqlens_q, 0)
     dynamo.mark_dynamic(attention.cache_seqlens, 0)
-    dynamo.mark_dynamic(attention.kv_slots, 0)
+    dynamo.mark_dynamic(attention.slot_frames, 0)
     dynamo.mark_dynamic(rows.frames, 0)
     dynamo.mark_dynamic(rows.starts_host, 0)
     dynamo.mark_dynamic(rows.row_ids, 0)
@@ -530,7 +529,7 @@ def ragged_attention_tensor_geometry(
             query,
             key,
             value,
-            attention.kv_slots,
+            attention.slot_frames,
             attention.cache_seqlens,
             attention.page_table,
             attention.cu_seqlens_q,
@@ -780,7 +779,7 @@ class _FlowGraph:
     cache_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
     page_table: torch.Tensor
-    kv_slots: torch.Tensor
+    slot_frames: torch.Tensor
     frames: torch.Tensor
     output: torch.Tensor | None = None
 
@@ -854,7 +853,10 @@ class FlowGraphRunner:
             cache_seqlens=torch.zeros(segments, device=device, dtype=torch.int32),
             cu_seqlens_q=torch.zeros(segments + 1, device=device, dtype=torch.int32),
             page_table=torch.zeros((segments, -(-padded_total // page_size)), device=device, dtype=torch.int32),
-            kv_slots=torch.zeros(2 * padded_total, device=device, dtype=torch.int64),
+            # Each row wastes less than one page: a static bound on the slots.
+            slot_frames=torch.zeros(
+                (2 * padded_total // page_size + rows) * page_size, device=device, dtype=torch.int64
+            ),
             frames=torch.arange(padded_total, device=device),
         )
 
@@ -873,7 +875,7 @@ class FlowGraphRunner:
         ends = state.table[rows + segments : rows + 2 * segments]
         state.cache_seqlens.copy_(ends)
         state.cu_seqlens_q.copy_(state.table[rows + 2 * segments :])
-        page_table, kv_slots = page_metadata(
+        page_table, slot_frames = page_metadata(
             lengths,
             seg_rows_t,
             ends,
@@ -881,9 +883,10 @@ class FlowGraphRunner:
             state.positions,
             page_size=PAGE_SIZE[self.estimator.fa_version],
             columns=state.page_table.shape[1],
+            slots=state.slot_frames.shape[0],
         )
         state.page_table.copy_(page_table)
-        state.kv_slots.copy_(kv_slots)
+        state.slot_frames.copy_(slot_frames)
         state.noise[:, :total].copy_(noise)
         state.mu[:, :total].copy_(mu)
         state.cond[:, :total].copy_(cond)
@@ -901,7 +904,7 @@ class FlowGraphRunner:
         attention.fa_version = estimator.fa_version
         attention.page_size = PAGE_SIZE[estimator.fa_version]
         attention.cache_seqlens, attention.cu_seqlens_q = state.cache_seqlens, state.cu_seqlens_q
-        attention.page_table, attention.kv_slots = state.page_table, state.kv_slots
+        attention.page_table, attention.slot_frames = state.page_table, state.slot_frames
         # Streaming queries cover one training chunk, even when their KV
         # prefix and the packed graph allocation contain thousands of frames.
         attention.max_seqlen_q = estimator.dit.static_chunk_size if key[0] else rows.width
