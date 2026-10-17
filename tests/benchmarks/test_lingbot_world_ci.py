@@ -425,7 +425,7 @@ def test_server_initialization_and_stage_deadlines_use_the_explicit_profile_budg
     }
 
 
-@pytest.mark.parametrize("platform,count", [("cuda", 3), ("npu", 6)])
+@pytest.mark.parametrize("platform,count", [("cuda", 3), ("cuda", 6), ("npu", 6)])
 def test_weekly_shards_cover_every_original_case_once_without_changing_measurements(platform, count):
     from tests.dfx.lingbot_world.prepare import profile_for_case_shard
 
@@ -878,6 +878,13 @@ def test_quality_retains_scores_after_generation_failure_without_passing(
 
     def score(videos, output, *, suite, dimensions, **kwargs):
         calls.append(suite)
+        # A job-level kill can prevent the coordinator's finally block from running.
+        checkpoint = json.loads((output.parent / "quality.json").read_text())
+        assert checkpoint["evaluator_packages"] == packages
+        assert checkpoint["evaluator_hardware"] == {"unit_test": True}
+        assert checkpoint["generation_manifest_sha256"] == sha256(generation / "generation.json")
+        assert checkpoint["generation_passed"] is generation_passed
+        assert not checkpoint["passed"] and not checkpoint["quality_passed"]
         frames = (settings["num_chunks"] * 3 - 1) * 4 + 1
         scores = {label: {name: 1.0 for name in dimensions} for label in videos}
         if population_mode and suite == "wbench":
@@ -1130,7 +1137,7 @@ def test_generation_and_gpu_evaluation_are_blocking_and_connected(platform, leve
             assert evaluate["commands"][0].endswith("lingbot-artifacts/npu-nightly")
     if level == "weekly":
         assert prefix + "-long" in keyed
-        count = 3 if platform == "cuda" else 6
+        count = 6
         shard_matrix = {"setup": {"shard": [str(i) for i in range(count)]}}
         assert evaluate["matrix"] == shard_matrix
         assert (
@@ -1140,6 +1147,8 @@ def test_generation_and_gpu_evaluation_are_blocking_and_connected(platform, leve
         )
         if platform == "cuda":
             assert generate["matrix"] == shard_matrix
+            # Keep 18 quality videos per job below the observed 300-minute limit.
+            assert evaluate["timeout_in_minutes"] == 240
             assert keyed[prefix + "-long"]["mirror_hardwares"] == "h100_4_exclusive"
         else:
             assert generate["matrix"] == {"setup": {"shard": [str(i) for i in range(count)], "repeat": ["0", "1", "2"]}}

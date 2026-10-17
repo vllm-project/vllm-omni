@@ -183,11 +183,21 @@ are recorded separately. P99 is always reported but gates only when each
 independent start has at least 1000 steady observations; long profiles use
 two measured 600-chunk sessions per start.
 
-CI partitions weekly's 18 cases into three CUDA groups of six cases and six NPU
-groups of three cases. Each case still receives all three reference and three
+CI partitions weekly's 18 cases into six CUDA and six NPU groups of three cases. Each case still receives all three reference and three
 candidate starts. Generated effective profiles retain the source profile SHA256;
 generation and evaluation use the same `LINGBOT_CASE_SHARD=INDEX/COUNT` selection.
 No scene, seed, rollout length or measurement is removed.
+CUDA weekly scoring now evaluates 18 videos per shard, with a 240-minute job
+limit. The earlier six-case/36-video orbit shard
+[timed out after approximately 300 minutes](https://buildkite.com/vllm/vllm-omni/builds/17464#01a1485e-e82e-4b98-8f8a-b4893af2d460)
+despite requesting 1,440 minutes. Its failed JUnit and partial native scores
+remain failure evidence. The smaller shards retain the same generation and
+quality profiles, warmups, starts and regression budgets; fresh target runs
+must confirm that the complete evaluation finishes within the job limit.
+The quality coordinator checkpoints evaluator versions, hardware, input manifest
+and policy hashes before launching native workers. A forced job termination can
+bypass Python cleanup, so this checkpoint stays failed until the complete gate
+finishes; it also retains provenance when only one native suite completed.
 
 NPU nightly and long collection each run as three independent reference/candidate
 pairs, followed by a blocking CPU aggregation job. Nightly retains its three

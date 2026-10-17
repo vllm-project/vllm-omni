@@ -678,9 +678,9 @@ steps:
         key: lingbot-cuda-weekly-generation
         matrix:
           setup:
-            shard: ["0", "1", "2"]
+            shard: ["0", "1", "2", "3", "4", "5"]
         env:
-          LINGBOT_CASE_SHARD: "{{matrix.shard}}/3"
+          LINGBOT_CASE_SHARD: "{{matrix.shard}}/6"
         source_file_dependencies: lingbot_world_regression
         timeout_in_minutes: 1440
         mirror_hardwares: h100_4_exclusive
@@ -697,14 +697,15 @@ steps:
         key: lingbot-cuda-weekly-quality
         matrix:
           setup:
-            shard: ["0", "1", "2"]
+            shard: ["0", "1", "2", "3", "4", "5"]
         env:
-          LINGBOT_CASE_SHARD: "{{matrix.shard}}/3"
+          LINGBOT_CASE_SHARD: "{{matrix.shard}}/6"
         source_file_dependencies: lingbot_world_regression
         depends_on:
           - step: lingbot-cuda-weekly-generation
             allow_failure: true
-        timeout_in_minutes: 1440
+        # Six-case scoring exceeded the observed 300-minute job limit.
+        timeout_in_minutes: 240
         mirror_hardwares: h100_1
         artifact_paths:
           - "lingbot-artifacts/cuda-weekly-quality/**/*"

@@ -145,6 +145,8 @@ def test_wbench_vbench_and_video_precision(lingbot_settings):
     }
     if population_path is not None:
         report["reference_population_sha256"] = sha256(population_path)
+    # A forced job timeout can bypass finally; retain provenance before workers start.
+    write_json(output / "quality.json", report)
     try:
         evaluations = {}
         for suite in ("vbench", "wbench"):
