@@ -21,10 +21,10 @@ FAULT_CARD_COUNTS = {
 }
 QWEN_HARD_OOM_TESTS = {
     "test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech",
-    "test_reliability_fault_gpu_oom_chat_large_payload_failure",
+    "test_reliability_fault_gpu_oom_large_request_failure",
     "test_reliability_fault_gpu_oom_concurrent_pressure_failure",
 }
-QWEN_RECOVERY_OOM_TEST = "test_reliability_fault_gpu_oom_state_converges_after_fault_removed"
+QWEN_RECOVERY_OOM_TEST = "test_reliability_fault_gpu_oom_recovers_after_fault_removed"
 
 
 def _decorator_name(decorator: ast.expr) -> str | None:

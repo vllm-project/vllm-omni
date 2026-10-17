@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import errno
 import http.client
 import inspect
 import json
@@ -32,12 +33,30 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import psutil
 import pytest
 
 logger = logging.getLogger(__name__)
+
+
+class GpuOomInjectionConfig(TypedDict, total=False):
+    """Fields read by :func:`inject_gpu_oom` and ``resolve_oom_device_spec``."""
+
+    device: str
+    target_mem_ratio: float
+    hold_seconds: int
+    startup_timeout_sec: int
+    strict: bool
+
+
+class ServerFaultSnapshot(TypedDict):
+    root_pids: list[int]
+    tree_pids: list[int]
+    worker_pids: list[int]
+    worker_markers: list[str]
+
 
 # Substrings matched against ``psutil.Process.name`` + argv text for classifying GPU
 # workers under the test server tree. Extend per-suite via
@@ -77,17 +96,6 @@ def post_chat_completions_raw(
         resp = conn.getresponse()
         data = resp.read()
         return resp.status, data
-    finally:
-        conn.close()
-
-
-def get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int, bytes]:
-    """GET /health with stdlib HTTP client; returns (status, body)."""
-    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
-    try:
-        conn.request("GET", "/health")
-        resp = conn.getresponse()
-        return resp.status, resp.read()
     finally:
         conn.close()
 
@@ -922,6 +930,80 @@ def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
         return None
 
 
+_TERMINAL_HEALTH_ERRNOS = frozenset(
+    {
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EPIPE,
+        errno.ETIMEDOUT,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+    }
+)
+
+
+def post_fault_health_exception_is_terminal(exc: BaseException) -> bool:
+    """Return whether a ``/health`` poll failed because the API is gone or the read timed out.
+
+    An ``AssertionError`` from an unexpected HTTP status means something is still
+    listening. Callers decide whether that is a failure or a reason to keep polling.
+    """
+    if isinstance(exc, AssertionError):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    errno_val = getattr(exc, "errno", None)
+    if errno_val in _TERMINAL_HEALTH_ERRNOS:
+        return True
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "timed out",
+            "timeout",
+            "connection refused",
+            "actively refused",
+            "connection aborted",
+            "connection reset",
+        )
+    )
+
+
+def assert_post_fault_health_503(online_client: Any, *, scenario: str) -> None:
+    """Wait 20s, then require one ``/health`` response of HTTP 503.
+
+    The API process must still be listening. A connection error propagates.
+    """
+    time.sleep(20.0)
+    status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+    assert status == 503, f"[{scenario} health] expected /health 503 after 20s, got status={status}"
+
+
+def assert_post_fault_api_unreachable(online_client: Any, *, scenario: str) -> None:
+    """Poll ``/health`` until it fails to connect, or until 20s elapse.
+
+    HTTP 200 and HTTP 503 both mean a process is still listening, so polling
+    continues. A connection failure means the API process is gone.
+    """
+    deadline = time.monotonic() + 20.0
+    last_observation = "no response"
+    while time.monotonic() < deadline:
+        try:
+            status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+            last_observation = f"http={status}"
+        except Exception as exc:  # noqa: BLE001
+            if post_fault_health_exception_is_terminal(exc):
+                return
+            last_observation = f"exception={exc!r}"
+        time.sleep(0.5)
+    pytest.fail(
+        f"[{scenario} health] /health stayed reachable for 20s after the API process was killed; "
+        f"last_observation={last_observation}"
+    )
+
+
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
     """Wall-clock budget for fault-snapshot PIDs / GPU to clear after ``signal_name``."""
     if signal_name == "SIGKILL":
@@ -1008,7 +1090,7 @@ def _capture_server_fault_snapshot(
     server: Any,
     *,
     worker_markers_extra: Sequence[str] | None = None,
-) -> dict[str, list[int] | list[str]]:
+) -> ServerFaultSnapshot:
     """Capture current server process snapshot for post-fault assertions.
 
     ``tree_pids`` is ``[root, ...descendants]`` and is used by
@@ -1024,7 +1106,7 @@ def _capture_server_fault_snapshot(
             continue
         if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
-    snapshot: dict[str, list[int] | list[str]] = {
+    snapshot: ServerFaultSnapshot = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,
@@ -1192,20 +1274,6 @@ def make_process_kill_fault_injector(
                 )
                 if signal_name == "SIGKILL" and not dead:
                     raise RuntimeError(f"pid {pid} ({name}) still alive after SIGKILL")
-            host = getattr(server, "host", None)
-            port = getattr(server, "port", None)
-            if host is not None and port is not None:
-                try:
-                    status, _body = get_health_raw(str(host), int(port), timeout_sec=5)
-                    print(
-                        f"[reliability][process-kill] post-kill health status={status}",
-                        flush=True,
-                    )
-                except Exception as exc:  # noqa: BLE001 - log the probe, do not hide the kill
-                    print(
-                        f"[reliability][process-kill] post-kill health error={exc!r}",
-                        flush=True,
-                    )
             print(
                 f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
                 f"killed_pids={filtered} killed_count={len(filtered)}",
