@@ -11,18 +11,20 @@ calling the model for one branch only.
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed import cfg_parallel as cfg_mod
 from vllm_omni.diffusion.models.hidream_o1_image.pipeline_hidream_o1_image import (
     T_EPS,
     HiDreamO1ImagePipeline,
     build_hidream_o1_scheduler,
 )
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -88,9 +90,11 @@ class _TwoRankGroup:
         return gathered
 
 
-def test_static_config_accepts_cfg_parallel() -> None:
+def test_static_config_accepts_cfg_parallel(tmp_path: Path) -> None:
     pipe, _ = _pipeline(5.0)
-    pipe.od_config = SimpleNamespace(parallel_config=SimpleNamespace(cfg_parallel_size=2))
+    pipe.od_config = OmniDiffusionConfig(
+        model=str(tmp_path), parallel_config=DiffusionParallelConfig(cfg_parallel_size=2)
+    )
     pipe._validate_static_config()
 
 
@@ -101,7 +105,7 @@ def test_static_config_accepts_cfg_parallel() -> None:
 def test_single_rank_matches_the_loop_before_the_mixin(guidance_scale: float, calls_per_step: list[str]) -> None:
     pipe, calls = _pipeline(guidance_scale)
 
-    output = pipe.forward(SimpleNamespace())
+    output = pipe.forward(DiffusionRequestBatch(requests=[]))
 
     z, height, width = output.output
     assert (height, width) == (HEIGHT, WIDTH)
@@ -120,7 +124,7 @@ def test_two_cfg_ranks_run_one_branch_each_and_agree(monkeypatch: pytest.MonkeyP
     def run_rank(rank: int) -> tuple[torch.Tensor, list[str]]:
         rank_of_thread.rank = rank
         pipe, calls = _pipeline(guidance_scale)
-        return pipe.forward(SimpleNamespace()).output[0], calls
+        return pipe.forward(DiffusionRequestBatch(requests=[])).output[0], calls
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         (z0, calls0), (z1, calls1) = (future.result() for future in [pool.submit(run_rank, r) for r in (0, 1)])
