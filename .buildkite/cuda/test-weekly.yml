@@ -285,20 +285,21 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_1
 
-      # Own step: the image has no NanoCodec, so this file import-skips out of
-      # the mark-selected TTS steps above. The overrides keep nemo_toolkit[tts]
-      # from downgrading transformers; see
+      # Own step: the image has no NanoCodec, so these files import-skip out of
+      # the mark-selected TTS steps above. pip, not uv: uv rejects the
+      # pyopenjtalk build that nemo_toolkit[tts] pulls (metadata version
+      # 0.0.0). The second install puts back the pins NeMo downgrades; see
       # examples/offline_inference/text_to_speech/README.md.
       - label: "TTS · Gepard-1.0 · L4"
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0" > /tmp/gepard-overrides.txt
-          - uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" "nemo_toolkit[tts]==2.7.3" --overrides /tmp/gepard-overrides.txt
+          - pip install "nemo_toolkit[tts]==2.7.3"
+          - pip install "transformers>=5.13.0,<5.15" "huggingface-hub>=1.31.0" "protobuf>=5.29.6,<6"
           - >-
             pytest -s -v tests/e2e/offline_inference/test_gepard_tts.py
             tests/e2e/online_serving/test_gepard_tts.py
-            -m "tts and cuda"
+            -m "slow and tts and cuda"
             --run-level "full_model"
         mirror_hardwares: l4_1
 
