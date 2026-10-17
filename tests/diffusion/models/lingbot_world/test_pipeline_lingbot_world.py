@@ -1264,15 +1264,20 @@ def test_online_action_path_rejects_escape_from_trusted_root(escape_kind: str, t
         )
 
 
-def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path: Path) -> None:
+def test_online_action_path_environment_root_fallback_warns_deprecation(monkeypatch, tmp_path: Path) -> None:
     module = _load_pipeline_module()
     root = tmp_path / "trusted"
-    action_dir = root / "forward"
-    action_dir.mkdir(parents=True)
+    (root / "forward").mkdir(parents=True)
     monkeypatch.setenv("VLLM_OMNI_LINGBOT_ACTION_ROOT", str(root))
+    warnings = []
+    monkeypatch.setattr(module.logger, "warning_once", lambda msg, *args: warnings.append(msg))
     resolved_actions = []
-    module.load_camera_trajectory = lambda action: (
-        resolved_actions.append(action) or _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
+    monkeypatch.setattr(
+        module,
+        "load_camera_trajectory",
+        lambda action: (
+            resolved_actions.append(action) or _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
+        ),
     )
 
     request = _preprocess_request(
@@ -1283,7 +1288,37 @@ def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path
 
     assert request.sampling_params.extra_args["_lingbot_camera_trajectory"] is not None
     assert resolved_actions[0].root == root.resolve()
-    assert resolved_actions[0].relative == Path("forward")
+    assert len(warnings) == 1
+    assert "VLLM_OMNI_LINGBOT_ACTION_ROOT is deprecated" in warnings[0]
+    assert "model_config.lingbot_action_root" in warnings[0]
+
+
+def test_online_action_path_typed_root_wins_over_environment_without_warning(monkeypatch, tmp_path: Path) -> None:
+    module = _load_pipeline_module()
+    typed_root = tmp_path / "typed"
+    (typed_root / "forward").mkdir(parents=True)
+    env_root = tmp_path / "env"
+    (env_root / "forward").mkdir(parents=True)
+    monkeypatch.setenv("VLLM_OMNI_LINGBOT_ACTION_ROOT", str(env_root))
+    warnings = []
+    monkeypatch.setattr(module.logger, "warning_once", lambda msg, *args: warnings.append(msg))
+    resolved_actions = []
+    monkeypatch.setattr(
+        module,
+        "load_camera_trajectory",
+        lambda action: (
+            resolved_actions.append(action) or _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
+        ),
+    )
+
+    _preprocess_request(
+        module,
+        sampling=_SamplingParams(extra_args={"action_path": "forward"}),
+        od_config=_od_config(model_config={"lingbot_action_root": str(typed_root)}),
+    )
+
+    assert resolved_actions[0].root == typed_root.resolve()
+    assert warnings == []
 
 
 def test_online_action_path_error_suppresses_path_bearing_filesystem_cause(tmp_path: Path) -> None:
@@ -1325,7 +1360,7 @@ def test_online_action_path_unknown_user_is_sanitized(source: str, tmp_path: Pat
 def test_action_path_requires_a_trusted_root_for_every_request() -> None:
     module = _load_pipeline_module()
 
-    with pytest.raises(ValueError, match="lingbot_action_root|VLLM_OMNI_LINGBOT_ACTION_ROOT"):
+    with pytest.raises(ValueError, match="lingbot_action_root"):
         _preprocess_request(module, od_config=_od_config(model_config={}))
 
 
