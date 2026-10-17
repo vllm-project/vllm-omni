@@ -2680,7 +2680,7 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
+        str | list[str] | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
@@ -2755,7 +2755,7 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
+        str | list[str] | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
