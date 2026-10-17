@@ -12,6 +12,7 @@ from torch.distributed import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
+    register_fsdp_forward_method,
 )
 from vllm.logger import init_logger
 
@@ -296,6 +297,9 @@ def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
     if context.ignored_params:
         root_kwargs["ignored_params"] = context.ignored_params
     fully_shard(model, **root_kwargs)
+    # Auxiliary entrypoints need root unshard hooks in both loading paths.
+    for method_name in getattr(model, "_hsdp_forward_methods", ()):
+        register_fsdp_forward_method(model, method_name)
     for param in model.parameters():
         param.requires_grad = False
 

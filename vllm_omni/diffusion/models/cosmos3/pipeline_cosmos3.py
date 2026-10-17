@@ -984,6 +984,7 @@ class Cosmos3OmniDiffusersPipeline(
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
     _resident_modules: ClassVar[list[str]] = []
+    _transformer_cls_override: ClassVar[type[Cosmos3VFMTransformer] | None] = None
     sampling_dtype: ClassVar[torch.dtype] = torch.float32
 
     @classmethod
@@ -1088,7 +1089,7 @@ class Cosmos3OmniDiffusersPipeline(
             sound_latent_fps = self._sound_tokenizer.latent_fps
 
         # --- Transformer (weights loaded later via weights_sources) ---
-        transformer_cls = resolve_cosmos3_transformer_cls(od_config.tf_model_config)
+        transformer_cls = self._transformer_cls_override or resolve_cosmos3_transformer_cls(od_config.tf_model_config)
         self.transformer = transformer_cls(
             od_config=od_config,
             temporal_compression_factor=self.vae_scale_factor_temporal,
