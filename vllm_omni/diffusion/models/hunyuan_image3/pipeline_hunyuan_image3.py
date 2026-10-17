@@ -4,7 +4,8 @@
 import copy
 import logging
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, ClassVar
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import torch
@@ -20,12 +21,15 @@ from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
+from vllm_omni.diffusion.attention.schedule import require_request_attention_schedule_fits
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
     get_forward_context,
     is_forward_context_available,
+    request_denoise_progress,
     set_forward_context_denoise_step_idx,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -342,6 +346,7 @@ class HunyuanImage3Pipeline(
     SupportImageInput,
     SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
+    DenoiseProgressMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
     supports_request_batch = False
@@ -2077,6 +2082,9 @@ class HunyuanImage3Pipeline(
             None,
             None,
         )
+        # Check the request's schedule against the sequence built here, before prepare_latents and the
+        # AR-reuse prefill below. The runner has not opened the forward context yet.
+        require_request_attention_schedule_fits(state, self.od_config, len(timesteps))
         pipe._num_timesteps = len(timesteps)
         req_scheduler = copy.deepcopy(self.scheduler)
         if hasattr(req_scheduler, "set_begin_index"):
@@ -2328,6 +2336,7 @@ class HunyuanImage3Pipeline(
         pred = pred.to(dtype=torch.float32)
 
         if first_step:
+            # Later steps reuse this prompt K/V, computed at step 0 under whatever profile step 0 selected.
             self._capture_prompt_kv_cache(states, row_state_indexes, row_branches)
         if cfg_factor > 1:
             pred_cond, pred_uncond = pred.chunk(2)
@@ -2364,13 +2373,34 @@ class HunyuanImage3Pipeline(
                 "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
                 "disable step execution or use dense_legacy."
             )
-        self._ensure_grouped_attention_backend_supported(len(states))
+        # A bound schedule selects attention from each request's own step and total, so requests
+        # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
+        scheduled = is_forward_context_available() and bool(get_forward_context().attention_schedule)
+        if scheduled:
+            groups = [[state] for state in states]
+        else:
+            self._ensure_grouped_attention_backend_supported(len(states))
+            groups = self._split_step_groups(states)
         outputs: dict[str, torch.Tensor] = {}
-        for group in self._split_step_groups(states):
-            pred = self._denoise_step_group(group)
+        for group in groups:
+            with self._scheduled_request_progress(group[0]) if scheduled else nullcontext():
+                pred = self._denoise_step_group(group)
             for state, state_pred in zip(group, pred):
                 outputs[state.request_id] = state_pred.unsqueeze(0)
         return torch.cat([outputs[state.request_id] for state in states], dim=0)
+
+    @staticmethod
+    def _scheduled_request_progress(state: "StepRequestState"):
+        """Publish one scheduled request's step, actual total and normalized timestep around its group.
+
+        _denoise_step_group republishes the same step and clears it after its forward; the returned
+        context manager restores the step, timestep, total and active flag on any exit.
+        """
+        timestep = (
+            float(cast(torch.Tensor, state.current_timestep))
+            / cast(FlowMatchEulerDiscreteScheduler, state.scheduler).config.num_train_timesteps
+        )
+        return request_denoise_progress(state.step_index, state.total_steps, timestep)
 
     def step_scheduler(
         self,
