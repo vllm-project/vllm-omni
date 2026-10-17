@@ -14,6 +14,7 @@ The existing SandAI-derived reference kernel is retained below unchanged.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -157,7 +158,117 @@ def _fused_moe_bf16_kernel(
         tl.store(c_ptrs, accumulator.to(compute_type), mask=token_mask[:, None] & (offs_cn[None, :] < N))
 
 
-def invoke_fused_moe_bf16(
+@triton.jit
+def _fused_moe_bf16_gate_up_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    even_Ks: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
+):
+    # Same program order, routing and SwiGLU7 math as _fused_moe_bf16_kernel
+    # with FUSE_SWIGLU. Gate (even) and up (odd) rows of each interleaved
+    # BLOCK_SIZE_N tile accumulate separately, so the epilogue needs no
+    # accumulator reshape.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+    off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
+    off_experts = off_experts_i32.to(tl.int64)
+    if off_experts == -1:
+        # The filtered down GEMM never reads these half-width rows.
+        return
+
+    # Output column i reads B rows 2i (gate) and 2i + 1 (up); wrap like the
+    # interleaved kernel so N-tail tiles stay in bounds.
+    offs_pair = (pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2).to(tl.int64)) % (N // 2)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+    b_gate_ptrs = b_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_pair[None, :] * (2 * stride_bn))
+    b_up_ptrs = b_gate_ptrs + stride_bn
+    gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=tl.float32)
+    up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        if even_Ks:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b_gate = tl.load(b_gate_ptrs)
+            b_up = tl.load(b_up_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k_start),
+                other=0.0,
+            )
+            b_gate = tl.load(b_gate_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
+            b_up = tl.load(b_up_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
+        gate += tl.dot(a, b_gate)
+        up += tl.dot(a, b_up)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_gate_ptrs += BLOCK_SIZE_K * stride_bk
+        b_up_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Keep GEMM accumulators in FP32 through SwiGLU7.
+    gate_c = tl.minimum(gate, SWIGLU_LIMIT)
+    up_c = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+    out_act = (gate_c * tl.sigmoid(SWIGLU_ALPHA * gate_c) * (up_c + 1.0)).to(compute_type)
+    offs_half = pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_half[None, :]
+    tl.store(c_ptrs, out_act, mask=token_mask[:, None] & (offs_half[None, :] < N // 2))
+
+
+_BF16_MOE_CONFIGS = {
+    "BLOCK_SIZE_M": (64, 128),
+    "BLOCK_SIZE_N": (64, 128, 256, 512),
+    "BLOCK_SIZE_K": (16, 32, 64, 128),
+    "GROUP_SIZE_M": (16,),
+    "num_warps": (4, 8, 16, 32),
+    "num_stages": (1, 2, 3, 4),
+}
+_BF16_GATE_UP_CONFIGS = {
+    "BLOCK_SIZE_M": (64, 128),
+    "BLOCK_SIZE_N": (128, 256, 512),
+    "BLOCK_SIZE_K": (32, 64, 128),
+    "GROUP_SIZE_M": (16,),
+    "num_warps": (4, 8, 16),
+    "num_stages": (1, 2, 3),
+}
+
+
+def _check_bf16_moe_launch(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -169,15 +280,8 @@ def invoke_fused_moe_bf16(
     top_k: int,
     config: dict[str, int],
     fuse_swiglu: bool,
+    supported_config: dict[str, tuple[int, ...]],
 ) -> None:
-    """Launch one BF16 MAGI-2 GEMM in the original route order.
-
-    Gate/up calls use interleaved ``B=[experts, 2*intermediate, hidden]`` and
-    retain FP32 accumulators through SwiGLU7 before writing BF16
-    ``C=[routes, intermediate]``. Down calls use ``B=[experts, hidden,
-    intermediate]`` and write ``C=[tokens, router_top_k, hidden]``. The latter
-    multiplies routing weights in FP32 before the BF16 output cast.
-    """
     if any(t.dtype != torch.bfloat16 for t in (A, B, C)):
         raise ValueError("MAGI-2 fused MoE requires BF16 activations, weights, and output")
     if A.ndim != 2 or B.ndim != 3 or topk_weights.ndim != 2:
@@ -211,30 +315,99 @@ def invoke_fused_moe_bf16(
     if any(t.device != A.device for t in tensors):
         raise ValueError("MAGI-2 fused MoE tensors must share a device")
 
-    supported_config = {
-        "BLOCK_SIZE_M": (128,),
-        "BLOCK_SIZE_N": (64, 128, 256, 512),
-        "BLOCK_SIZE_K": (16, 32, 64, 128),
-        "GROUP_SIZE_M": (16,),
-        "num_warps": (4, 8, 16, 32),
-        "num_stages": (1, 2, 3, 4),
-    }
     if config.keys() != supported_config.keys() or any(
         type(config[key]) is not int or config[key] not in values for key, values in supported_config.items()
     ):
         raise ValueError("invalid MAGI-2 BF16 MoE launch config")
-    if expert_ids.numel() < triton.cdiv(sorted_token_ids.numel(), config["BLOCK_SIZE_M"]):
+    # Exact block count: route metadata aligned to another BLOCK_SIZE_M would
+    # assign token blocks to the wrong experts.
+    if expert_ids.numel() != triton.cdiv(sorted_token_ids.numel(), config["BLOCK_SIZE_M"]):
         raise ValueError("expert_ids must contain one expert per padded token block")
     if sorted_token_ids.numel() % config["BLOCK_SIZE_M"]:
         raise ValueError("sorted_token_ids capacity must be block aligned")
 
+
+def _bf16_moe_grid(sorted_token_ids: torch.Tensor, B: torch.Tensor):
     def grid(meta: dict[str, int]) -> tuple[int]:
         return (
             triton.cdiv(sorted_token_ids.shape[0], meta["BLOCK_SIZE_M"])
             * triton.cdiv(B.shape[1], meta["BLOCK_SIZE_N"]),
         )
 
-    _fused_moe_bf16_kernel[grid](
+    return grid
+
+
+def invoke_fused_moe_bf16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    *,
+    top_k: int,
+    config: dict[str, int],
+    fuse_swiglu: bool,
+    split_gate_up: bool = False,
+) -> Any:
+    """Launch one BF16 MAGI-2 GEMM in the original route order.
+
+    Gate/up calls use interleaved ``B=[experts, 2*intermediate, hidden]`` and
+    retain FP32 accumulators through SwiGLU7 before writing BF16
+    ``C=[routes, intermediate]``. Down calls use ``B=[experts, hidden,
+    intermediate]`` and write ``C=[tokens, router_top_k, hidden]``. The latter
+    multiplies routing weights in FP32 before the BF16 output cast. Returns
+    the Triton launch result.
+
+    ``split_gate_up=True`` (gate/up calls only) computes the same output with
+    gate and up rows accumulated in separate tiles, so SwiGLU7 needs no
+    accumulator reshape. ``BLOCK_SIZE_N`` still counts interleaved ``B`` rows;
+    one tile writes ``BLOCK_SIZE_N // 2`` output columns.
+    """
+    if split_gate_up and not fuse_swiglu:
+        raise ValueError("split_gate_up requires fuse_swiglu=True")
+    _check_bf16_moe_launch(
+        A,
+        B,
+        C,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k=top_k,
+        config=config,
+        fuse_swiglu=fuse_swiglu,
+        supported_config=_BF16_GATE_UP_CONFIGS if split_gate_up else _BF16_MOE_CONFIGS,
+    )
+    grid = _bf16_moe_grid(sorted_token_ids, B)
+    if split_gate_up:
+        return _fused_moe_bf16_gate_up_kernel[grid](
+            A,
+            B,
+            C,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.shape[1],
+            B.shape[2],
+            sorted_token_ids.shape[0],
+            topk_weights.numel(),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(-2),
+            C.stride(-1),
+            top_k=top_k,
+            compute_type=tl.bfloat16,
+            even_Ks=B.shape[2] % config["BLOCK_SIZE_K"] == 0,
+            SWIGLU_ALPHA=1.702,
+            SWIGLU_LIMIT=7.0,
+            **config,
+        )
+    return _fused_moe_bf16_kernel[grid](
         A,
         B,
         C,

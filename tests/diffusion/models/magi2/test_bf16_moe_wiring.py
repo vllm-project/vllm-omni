@@ -83,8 +83,15 @@ def test_reference_keeps_fp32_gate_up_until_activation():
     assert not torch.equal(actual, early_rounded.expand_as(actual))
 
 
-def _torch_invoke(a, b, c, weights, sorted_ids, expert_ids, num_padded, *, top_k, config, fuse_swiglu):
-    """Execute the launcher's route contract with Torch instead of Triton."""
+def _torch_invoke(
+    a, b, c, weights, sorted_ids, expert_ids, num_padded, *, top_k, config, fuse_swiglu, split_gate_up=False
+):
+    """Execute the launcher's route contract with Torch instead of Triton.
+
+    ``split_gate_up`` only changes the kernel's accumulator layout, so it runs
+    the same math as ``fuse_swiglu``.
+    """
+    assert fuse_swiglu or not split_gate_up
     route_count = weights.numel()
     output = c.view(route_count, c.shape[-1])
     block_size = config["BLOCK_SIZE_M"]
@@ -194,6 +201,27 @@ def test_bf16_forward_selects_the_k_tile_per_platform(monkeypatch, is_musa):
     moe._bf16_fused_moe_forward(x, probabilities, indices, moe._pack_bf16_w13(gate, up), down)
     k_tile = 64 if is_musa else 32
     assert tiles == [(True, k_tile), (False, k_tile)]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("is_musa", [False, True])
+def test_bf16_forward_splits_gate_up_only_for_w13_on_musa(monkeypatch, is_musa):
+    calls = []
+
+    def invoke(*args, **kwargs):
+        calls.append(kwargs)
+        return _torch_invoke(*args, **kwargs)
+
+    monkeypatch.setattr(moe, "invoke_fused_moe_bf16", invoke)
+    monkeypatch.setattr(moe.current_omni_platform, "is_musa", Mock(return_value=is_musa))
+    inputs = _moe_inputs(5, 2)
+    x, probabilities, indices, gate, up, down = inputs
+    actual = moe._bf16_fused_moe_forward(x, probabilities, indices, moe._pack_bf16_w13(gate, up), down)
+    w13, w2 = calls
+    assert w13["fuse_swiglu"] is True and w13.get("split_gate_up", False) is is_musa
+    # The W2 down GEMM never splits.
+    assert w2["fuse_swiglu"] is False and "split_gate_up" not in w2
+    torch.testing.assert_close(actual, _reference_forward(*inputs), rtol=0, atol=0)
 
 
 @pytest.mark.cpu
