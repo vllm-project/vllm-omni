@@ -292,7 +292,13 @@ def test_frame_sample_content_passes_frames(tmp_path, monkeypatch):
     response.with_name("response.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
     video = tmp_path / "video.mp4"
     video.write_bytes(b"video")
-    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
+    max_sides = []
+
+    def fake_extract_jpeg(*args, max_side=None, **kwargs):
+        max_sides.append(max_side)
+        return b"\xff\xd8jpeg"
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", fake_extract_jpeg)
 
     class Judge:
         def temporal(self, *args, **kwargs):
@@ -319,6 +325,9 @@ def test_frame_sample_content_passes_frames(tmp_path, monkeypatch):
         judge_video_mode="frame-sample",
     )
     assert score["content"]["frame_count"] == 2
+    # Temporal and content frames are both bounded by the default max side.
+    assert max_sides and set(max_sides) == {eval_module.DEFAULT_JUDGE_FRAME_MAX_SIDE}
+    assert score["judge_frame_max_side"] == eval_module.DEFAULT_JUDGE_FRAME_MAX_SIDE
 
 
 def test_local_directory_collapsed_train_with_row_identity_and_split_filter(tmp_path):
