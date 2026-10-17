@@ -252,11 +252,15 @@ class StubCosmos3Transformer(nn.Module):
         self.cached_freqs_gen: Any | None = None
         self.calls: list[dict[str, Any]] = []
         self.reset_calls = 0
+        self.pp_reset_calls = 0
 
     def reset_cache(self) -> None:
         self.reset_calls += 1
         self.cached_kv = None
         self.cached_freqs_gen = None
+
+    def reset_pp_step(self) -> None:
+        self.pp_reset_calls += 1
 
     def forward(
         self,
@@ -3269,3 +3273,153 @@ class TestForwardRouting:
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))
+
+
+def _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, *, first: bool, last: bool):
+    """Build a stub pipeline that pretends pipeline parallelism is active."""
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.transformer = pipeline.transformer.__class__(
+        latent_channel_size=2, action_gen=True, action_dim=4, sound_gen=True, sound_dim=3
+    )
+    monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
+    monkeypatch.setattr(pipeline_module, "is_pipeline_first_stage", lambda: first)
+    monkeypatch.setattr(pipeline_module, "is_pipeline_last_stage", lambda: last)
+    monkeypatch.setattr(
+        pipeline,
+        "predict_noise_maybe_with_cfg",
+        lambda *args, **kwargs: None,  # PP driver returns None off the last rank
+    )
+    return pipeline
+
+
+def test_diffuse_pp_none_branch_unpacks_joint_on_first_rank(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=True, last=False)
+
+    # What the last PP rank sends back to rank 0 after its scheduler step:
+    # the packed [video | action | sound] joint tensor, flattened per batch row.
+    video = torch.full((1, 2, 1, 1, 1), 11.0)
+    action = torch.full((1, 3, 4), 22.0)
+    sound = torch.full((1, 3, 2), 33.0)
+    packed = torch.cat([video.reshape(1, -1), action.reshape(1, -1), sound.reshape(1, -1)], dim=1)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        assert noise_pred is None
+        return packed.clone()
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    video_out, action_out, sound_out = pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        action_latents=torch.zeros(1, 3, 4),
+        sound_latents=torch.zeros(1, 3, 2),
+        timesteps=torch.tensor([9, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    torch.testing.assert_close(video_out, video)
+    torch.testing.assert_close(action_out, action)
+    torch.testing.assert_close(sound_out, sound)
+    assert pipeline.transformer.pp_reset_calls == 1
+
+
+def test_diffuse_pp_none_branch_keeps_local_latents_on_middle_rank(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=False, last=False)
+
+    latents = torch.full((1, 2, 1, 1, 1), 5.0)
+    action = torch.full((1, 3, 4), 6.0)
+    sound = torch.full((1, 3, 2), 7.0)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        # Middle ranks do not receive the packed result; the handshake leaves
+        # the local latents untouched.
+        return latents
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    video_out, action_out, sound_out = pipeline.diffuse(
+        latents=latents,
+        action_latents=action,
+        sound_latents=sound,
+        timesteps=torch.tensor([9, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    torch.testing.assert_close(video_out, latents)
+    torch.testing.assert_close(action_out, action)
+    torch.testing.assert_close(sound_out, sound)
+
+
+def test_diffuse_pp_none_branch_video_only_returns_tensor(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=True, last=False)
+
+    received = torch.full((1, 2, 1, 1, 1), 9.0)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        assert noise_pred is None
+        return received.clone()
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    result = pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([9, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    assert isinstance(result, torch.Tensor)
+    torch.testing.assert_close(result, received)
+
+
+def test_diffuse_pp_sequential_cfg_skips_local_combine_off_last_rank(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=True, last=False)
+    combines: list[Any] = []
+    real_combine = pipeline.combine_cfg_noise
+
+    def recording_combine(*args, **kwargs):
+        combines.append(args)
+        return real_combine(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "combine_cfg_noise", recording_combine)
+    # Off the last rank the driver returns None, so _step must take the
+    # None-branch instead of combining locally.
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", lambda *args, **kwargs: None)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        return torch.zeros_like(latents)
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    result = pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([9]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    assert combines == []
+    assert isinstance(result, torch.Tensor)

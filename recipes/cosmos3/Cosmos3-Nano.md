@@ -106,6 +106,16 @@ vllm serve nvidia/Cosmos3-Nano \
   --init-timeout 1800
 ```
 
+For a two-GPU pipeline-parallel deployment, add --pipeline-parallel-size 2:
+
+    vllm serve nvidia/Cosmos3-Nano \
+      --omni \
+      --host 0.0.0.0 --port 8000 \
+      --init-timeout 1800 \
+      --pipeline-parallel-size 2
+
+Cosmos3 Pipeline-Parallel is validated for T2V/I2V. Cache-DiT cannot be used with Pipeline-Parallel; disable the cache backend for this deployment.
+
 For Cosmos3, SeaCache is the recommended default choice when opting into
 diffusion caching. Caching remains opt-in; add `--cache-backend sea_cache` to
 the command above. Its default threshold and maximum cached-step streak are
