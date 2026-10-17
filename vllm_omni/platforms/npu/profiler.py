@@ -69,6 +69,7 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
 
         return torch_npu.profiler.profile(
             activities=npu_activities,
+            record_shapes=profiler_config.torch_profiler_record_shapes,
             with_stack=False,
             profile_memory=profiler_config.torch_profiler_with_memory,
             # Forward the shape-recording flag; without it the NPU profiler
