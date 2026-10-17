@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import inspect
 import json
 import logging
@@ -34,6 +34,10 @@ from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.mistral_encoder import MistralEncoderModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -438,6 +442,12 @@ class Flux2Pipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+        if hasattr(self.text_encoder.config, "text_encoder_out_layers"):
+            self.text_encoder_out_layers = tuple(self.text_encoder.config.text_encoder_out_layers)
+        else:
+            self.text_encoder_out_layers = (10, 20, 30)
+
         self._current_timestep = None
         self._interrupt = False
 
@@ -677,7 +687,6 @@ class Flux2Pipeline(
         num_images_per_prompt: int = 1,
         prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 512,
-        text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
     ):
         device = device or self._execution_device
 
@@ -694,7 +703,7 @@ class Flux2Pipeline(
                 device=device,
                 max_sequence_length=max_sequence_length,
                 system_message=self.system_message,
-                hidden_states_layers=text_encoder_out_layers,
+                hidden_states_layers=self.text_encoder_out_layers,
             )
 
         batch_size, seq_len, _ = prompt_embeds.shape
@@ -886,7 +895,6 @@ class Flux2Pipeline(
         callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
-        text_encoder_out_layers: tuple[int, ...] = (10, 20, 30),
         caption_upsample_temperature: float = None,
     ) -> DiffusionOutput:
         if len(req.prompts) > 1:
@@ -922,7 +930,6 @@ class Flux2Pipeline(
             else num_images_per_prompt
         )
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
-        text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
         caption_upsample_temperature = req.sampling_params.extra_args.get(
             "caption_upsample_temperature", caption_upsample_temperature
         )
@@ -977,7 +984,6 @@ class Flux2Pipeline(
             device=device,
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
-            text_encoder_out_layers=text_encoder_out_layers,
         )
 
         has_neg_prompt = negative_prompt_embeds is not None or any(req_negative_prompt)
@@ -993,7 +999,6 @@ class Flux2Pipeline(
                 device=device,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
-                text_encoder_out_layers=text_encoder_out_layers,
             )
 
         # 4. process images
@@ -1159,7 +1164,7 @@ class Flux2Pipeline(
         text_encoder_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "text_encoder")
         transformer_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "transformer")
         if (
-            self.od_config.enable_cpu_offload
+            resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
             and text_encoder_quant_config is not None
             and transformer_quant_config is None
         ):

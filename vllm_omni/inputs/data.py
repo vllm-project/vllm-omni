@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import copy
+import math
 import pprint
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
@@ -43,11 +47,14 @@ class OmniInteractionEvent(OmniTextPrompt, total=False):
     pass
 
 
-class OmniInteractionPrompt(TypedDict, total=False):
-    """Mid-stream interaction payload."""
+class OmniInteractionPrompt(TypedDict):
+    """Normalized mid-stream interaction payload passed to ``submit_interaction``.
 
-    event_id: NotRequired[str]
-    event: NotRequired[OmniInteractionEvent]
+    WebSocket clients payload may omit ``event_id``; the API layer assigns a fallback ID in this case.
+    """
+
+    event_id: str
+    event: OmniInteractionEvent
     transition_chunks: NotRequired[int]
 
 
@@ -251,7 +258,7 @@ class OmniDiffusionSamplingParams:
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
+    fps: float | None = None  # Request/output-encoding FPS; fractional rates are supported.
     frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
@@ -343,7 +350,42 @@ class OmniDiffusionSamplingParams:
     # results
     output: torch.Tensor | None = None
 
+    # Internal control-plane event used by asynchronous APIs. When enabled,
+    # the diffusion engine emits a non-terminal output when the scheduler
+    # first admits this request for execution.
+    emit_request_lifecycle: bool = False
+
+    # Opt-in playback feedback for a single interactive video stream. The
+    # engine starts another chunk only while generated media is below this
+    # many seconds ahead of the client's reported playback position.
+    streaming_buffer_seconds: float | None = None
+    streaming_max_output_bytes: int = 64 * 1024 * 1024
+    streaming_idle_timeout_s: float = 30.0
+    # AsyncOmni releases each output only after its consumer resumes iteration.
+    streaming_output_ack: bool = False
+
     def __post_init__(self) -> None:
+        buffer = self.streaming_buffer_seconds
+        if buffer is not None and (
+            isinstance(buffer, bool)
+            or not isinstance(buffer, (int, float))
+            or not math.isfinite(buffer)
+            or not 0 < buffer <= 10
+        ):
+            raise ValueError("streaming_buffer_seconds must be finite and in (0, 10]")
+        if (
+            isinstance(self.streaming_max_output_bytes, bool)
+            or not isinstance(self.streaming_max_output_bytes, int)
+            or not 0 < self.streaming_max_output_bytes <= 2**63 - 1
+        ):
+            raise ValueError("streaming_max_output_bytes must be a positive integer")
+        if (
+            isinstance(self.streaming_idle_timeout_s, bool)
+            or not isinstance(self.streaming_idle_timeout_s, (int, float))
+            or not math.isfinite(self.streaming_idle_timeout_s)
+            or self.streaming_idle_timeout_s <= 0
+        ):
+            raise ValueError("streaming_idle_timeout_s must be finite and positive")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
 

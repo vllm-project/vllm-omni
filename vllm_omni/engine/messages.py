@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Protocol
 
 import msgspec
 from vllm.inputs import PromptType
+from vllm.lora.request import LoRARequest
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
@@ -13,6 +17,14 @@ from vllm_omni.outputs import OmniRequestOutput
 
 class EngineQueueMessage(msgspec.Struct, forbid_unknown_fields=True):
     pass
+
+
+class OutputQueueWriter(Protocol):
+    """Where the orchestrator thread puts messages for the serving frontend."""
+
+    async def put(self, item: EngineQueueMessage) -> None: ...
+
+    def put_nowait(self, item: EngineQueueMessage) -> None: ...
 
 
 class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
@@ -27,6 +39,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_timestamp: float
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
+    request_artifact_dirs: list[str] | None = None
+    entry_stage_id: int = 0
+    lora_request: LoRARequest | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -42,6 +57,9 @@ class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
 class AbortRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["abort"] = "abort"
     request_ids: list[str]
+    # When set, Orchestrator emits AbortResultMessage on rpc_async_queue so
+    # callers can await acknowledgment. Omit for fire-and-forget abort().
+    rpc_id: str | None = None
 
 
 class InteractionMessage(EngineQueueMessage, kw_only=True):
@@ -96,6 +114,20 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     metrics: StageRequestMetrics | None = None
     finished: bool
     stage_submit_ts: float | None = None
+
+
+class AbortResultMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["abort_result"] = "abort_result"
+    rpc_id: str
+    success: bool
+    error: str | None = None
+    # Final-stage AR abort outputs (partial tokens) for frontend delivery.
+    # Empty for diffusion / requests with no output-processor state.
+    abort_outputs: list[OutputMessage] | None = None
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("abort", self.rpc_id)
 
 
 class StageMetricsMessage(EngineQueueMessage, kw_only=True):

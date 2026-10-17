@@ -35,7 +35,6 @@ MIN_AUDIO_SAMPLES = 1000
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4704"),
 ]
 
 

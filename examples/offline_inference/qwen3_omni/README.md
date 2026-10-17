@@ -1,7 +1,8 @@
 # Qwen3-Omni: Offline inference
 
 ## Setup
-Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+Use `--deploy-config` for deployment overrides such as stage memory allocation.
+See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/).
 
 ## Run examples
 
@@ -70,8 +71,8 @@ For true stage-level concurrency -- where downstream stages (Talker, Code2Wav)
 start **before** the upstream stage (Thinker) finishes -- use the async_chunk
 example. This requires:
 
-1. A deploy config YAML with ``async_chunk: true`` (e.g.
-   ``qwen3_omni_moe.yaml``).
+1. A deploy YAML with ``async_chunk: true`` (for example, an overlay based on
+   ``vllm_omni/deploy/qwen3_omni_moe.yaml``).
 2. Hardware that matches the config (e.g. 2x H100 for the default 3-stage
    config).
 
@@ -97,11 +98,11 @@ bash run_multiple_prompts_async_chunk.sh --max-in-flight 4
 python end2end_async_chunk.py --query-type text --modalities text
 ```
 
-#### Custom stage config
+#### Custom deploy config
 ```bash
 python end2end_async_chunk.py \
     --query-type use_audio \
-    --deploy-config /path/to/your_deploy_config.yaml
+    --deploy-config /path/to/your_async_chunk.yaml
 ```
 
 > **Note**: The synchronous ``end2end.py`` (using ``Omni``) is still the

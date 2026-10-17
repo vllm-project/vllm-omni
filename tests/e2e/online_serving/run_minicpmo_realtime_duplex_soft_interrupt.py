@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Validate MiniCPM-o Realtime duplex soft-interrupt delta streaming.
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
@@ -15,15 +18,14 @@ import hashlib
 import io
 import json
 import sys
-import uuid
 import wave
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
-AUDIO_DELTA_EVENTS = {"response.audio.delta", "response.output_audio.delta"}
+AUDIO_DELTA_EVENTS = {"response.output_audio.delta"}
 TRANSCRIPT_DELTA_EVENTS = {
-    "response.audio_transcript.delta",
+    "response.output_audio_transcript.delta",
     "response.output_text.delta",
 }
 
@@ -252,6 +254,19 @@ def summarize_artifacts(
         (summary["done_indices"][0] for summary in reversed(response_summaries) if summary.get("done_indices")),
         None,
     )
+    # A soft interrupt's follow-up response can drain past the commit (residual
+    # model unit), so its response.done lands after input_audio_buffer.committed.
+    # Anchor the "listen after last done, before commit" sandwich on the last
+    # turn that closed its floor strictly before the commit, not the
+    # globally-last done (which may sit after the commit and leave the interval empty).
+    last_done_before_commit_index = next(
+        (
+            summary["done_indices"][0]
+            for summary in reversed(response_summaries)
+            if summary.get("done_indices") and commit_index is not None and summary["done_indices"][0] < commit_index
+        ),
+        None,
+    )
     listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
     effective_min_responses = min_responses if validation_mode == "response-required" else 1
     enough_responses = len(response_summaries) >= effective_min_responses
@@ -279,9 +294,9 @@ def summarize_artifacts(
     )
     listen_after_last_done = last_done_index is not None and any(index > last_done_index for index in listen_indices)
     listen_after_response_before_commit = (
-        last_done_index is not None
+        last_done_before_commit_index is not None
         and commit_index is not None
-        and any(last_done_index < index < commit_index for index in listen_indices)
+        and any(last_done_before_commit_index < index < commit_index for index in listen_indices)
     )
     final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)
@@ -396,10 +411,9 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         str(args.chunk_ms),
         "--timeout-s",
         str(args.timeout_s),
-        "--session-id",
-        f"duplex-soft-interrupt-{uuid.uuid4().hex}",
     ]
-    command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
+    if args.ref_audio is not None:
+        command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
     temperature = getattr(args, "temperature", None)
     if temperature is None and args.validation_mode == "response-required":
         temperature = 0.0
@@ -460,7 +474,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", default="ws://127.0.0.1:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
     parser.add_argument("--input-wav", required=True)
-    parser.add_argument("--ref-audio", required=True)
+    parser.add_argument(
+        "--ref-audio",
+        help="Optional reference WAV; the MiniCPM-o server uses the bundled prompt when omitted.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--summary-output")
     parser.add_argument("--chunk-ms", type=int, default=200)

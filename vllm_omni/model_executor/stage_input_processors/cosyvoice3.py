@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
@@ -16,6 +15,7 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayloadStruct,
 )
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
 
@@ -93,32 +93,6 @@ def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
     return None
 
 
-def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
-    if raw_info is None:
-        return {}
-    if isinstance(raw_info, dict):
-        return raw_info
-
-    entries = getattr(raw_info, "entries", None)
-    if not isinstance(entries, dict):
-        return {}
-
-    decoded: dict[str, Any] = {}
-    for key, entry in entries.items():
-        tensor_data = getattr(entry, "tensor_data", None)
-        if tensor_data is not None:
-            dtype_name = getattr(entry, "tensor_dtype", "float32")
-            tensor_shape = getattr(entry, "tensor_shape", None)
-            if tensor_shape is None:
-                continue
-            dt = np.dtype(dtype_name)
-            arr = np.frombuffer(tensor_data, dtype=dt).reshape(tensor_shape)
-            decoded[key] = torch.from_numpy(arr.copy())
-        else:
-            decoded[key] = getattr(entry, "list_data", None)
-    return decoded
-
-
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: dict[str, Any] | None,
@@ -149,7 +123,7 @@ def talker2code2wav_async_chunk(
         request_state = transfer_manager.request_payload.get(request_id)
         if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
             with nullcontext():
-                info = _decode_additional_information(getattr(request, "additional_information", None))
+                info = deserialize_additional_information(getattr(request, "additional_information", None))
                 info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
                 prompt_payload = {}
                 cond_keys = ("speech_token", "speech_feat", "embedding", "speech_token_len")
@@ -318,7 +292,13 @@ def talker2code2wav_async_chunk(
 # CONCAT across the (already trivial) per-request accumulator history so a
 # regression where decode unexpectedly re-emits them does not silently
 # duplicate the prefill tensor.  See mixin._FULL_PAYLOAD_REPLACE_KEYS.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset(
+    {"embed.speech_token", "embed.speech_feat", "embed.embedding", "embed.speech_token_len"}
+)
+
+
+# This processor consumes sampled codec IDs even when no tensor payload is emitted.
+talker2code2wav_async_chunk.requires_token_updates = True  # type: ignore[attr-defined]
 
 
 def text2flow_token_only(
@@ -373,20 +353,20 @@ def text2flow_full_payload(
     """
     del transfer_manager
     rid = getattr(request, "external_req_id", None) or getattr(request, "request_id", "?")
-    if not isinstance(pooling_output, dict):
+    if not isinstance(pooling_output, Mapping):
         logger.warning(
-            "cosyvoice3.text2flow_full_payload: pooling_output not a dict "
+            "cosyvoice3.text2flow_full_payload: pooling_output not a mapping "
             "(type=%s) for req=%s; consumer wait gate may hang.",
             type(pooling_output).__name__,
             rid,
         )
         return None
     embed_out: dict[str, Any] = {}
-    for key in ("speech_token", "speech_feat", "embedding"):
+    for key in ("speech_token", "speech_feat", "embedding", "speech_token_len"):
         v = pooling_output.get(f"embed.{key}")
         if v is None:
             nested = pooling_output.get("embed")
-            if isinstance(nested, dict):
+            if isinstance(nested, Mapping):
                 v = nested.get(key)
         if isinstance(v, torch.Tensor) and v.numel() > 0:
             embed_out[key] = v

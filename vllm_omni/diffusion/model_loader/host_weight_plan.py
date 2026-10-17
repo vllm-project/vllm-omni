@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Loader-owned host-weight plans shared with diffusion offload backends."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Loader-owned host-weight plans shared by direct-checkpoint consumers."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from safetensors import safe_open
@@ -20,6 +21,9 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.host_weight_runtime import HostWeightLeaseCarrier
 
 TensorTransform = Callable[[torch.Tensor], torch.Tensor]
 
@@ -40,6 +44,7 @@ class HostWeightPlan:
     backing_kind: str
     bindings: dict[str, TensorBinding]
     planned_source_prefixes: frozenset[str] = frozenset()
+    lease_carrier: HostWeightLeaseCarrier | None = None
 
 
 @dataclass(frozen=True)
@@ -200,7 +205,7 @@ def _build_source_map(
     if not model_to_ckpt:
         raise _PlanIncompatibleError("no compatible safetensors entries were found in the loader's model sources")
     logger.info(
-        "Indexed %d runtime tensor names from %d checkpoint keys for DLO preflight",
+        "Indexed %d runtime tensor names from %d checkpoint keys for checkpoint preflight",
         len(model_to_ckpt),
         indexed_keys,
     )
@@ -265,35 +270,71 @@ def _validate_source_metadata(
                 source = handle.get_slice(binding.checkpoint_key)
                 source_shape = tuple(source.get_shape())
                 source_dtype = _SAFETENSORS_DTYPES.get(source.get_dtype())
-                if source_shape != tuple(target.shape):
-                    raise _PlanIncompatibleError(
-                        f"shape mismatch for {runtime_name!r}: checkpoint={source_shape}, runtime={tuple(target.shape)}"
-                    )
-                if source_dtype is None or source_dtype != target.dtype:
+                if source_dtype is None:
                     raise _PlanIncompatibleError(
                         f"dtype mismatch for {runtime_name!r}: checkpoint={source.get_dtype()}, runtime={target.dtype}"
                     )
 
+                runtime_shape = source_shape
+                runtime_dtype = source_dtype
+                if binding.transform is not None:
+                    # Adapter transforms can map full checkpoint tensors to a
+                    # rank-local runtime shape. Validate that contract without
+                    # materializing the source tensor during preflight.
+                    try:
+                        transformed = binding.transform(
+                            torch.empty(
+                                source_shape,
+                                dtype=source_dtype,
+                                device="meta",
+                            )
+                        )
+                    except (NotImplementedError, RuntimeError, TypeError, ValueError) as exc:
+                        raise _PlanIncompatibleError(
+                            f"checkpoint transform for {runtime_name!r} cannot be validated on tensor metadata: {exc}"
+                        ) from exc
+                    if not isinstance(transformed, torch.Tensor):
+                        raise _PlanIncompatibleError(
+                            f"checkpoint transform for {runtime_name!r} returned {type(transformed).__name__}, "
+                            "expected torch.Tensor"
+                        )
+                    runtime_shape = tuple(transformed.shape)
+                    runtime_dtype = transformed.dtype
 
-def build_checkpoint_mmap_plan(
+                if runtime_shape != tuple(target.shape):
+                    raise _PlanIncompatibleError(
+                        f"shape mismatch for {runtime_name!r}: checkpoint={source_shape}, "
+                        f"transformed={runtime_shape}, runtime={tuple(target.shape)}"
+                    )
+                if runtime_dtype != target.dtype:
+                    raise _PlanIncompatibleError(
+                        f"dtype mismatch for {runtime_name!r}: checkpoint={source.get_dtype()}, "
+                        f"transformed={runtime_dtype}, runtime={target.dtype}"
+                    )
+
+
+def build_checkpoint_binding_plan(
     pipeline: nn.Module,
     *,
     dit_modules: Sequence[tuple[str, nn.Module]],
     sources: Sequence[object],
     model_path: str | None,
     tensor_parallel_size: int,
-    use_hsdp: bool,
     online_quantization: bool,
+    use_pipeline_key_remap: bool = True,
+    has_distilled_lora: bool = False,
 ) -> HostWeightPlanResult:
-    """Build a complete direct-checkpoint plan or return a fallback reason."""
+    """Build a complete binding plan for the pre-sharded HSDP consumer."""
     if tensor_parallel_size != 1:
         return HostWeightPlanResult(None, f"TP={tensor_parallel_size} requires the ordinary loader")
-    if use_hsdp:
-        return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
     if online_quantization:
         return HostWeightPlanResult(None, "online quantization requires the ordinary loader")
+    if has_distilled_lora:
+        return HostWeightPlanResult(None, "distilled LoRA requires the ordinary loader")
 
     remap_fn = getattr(type(pipeline), "_remap_ckpt_key", None)
+    if not callable(remap_fn) and use_pipeline_key_remap:
+        remap_fn = getattr(pipeline, "remap_checkpoint_key", None)
     if not callable(remap_fn):
         remap_fn = None
     adapter = get_direct_mmap_adapter(pipeline)
@@ -346,10 +387,37 @@ def build_checkpoint_mmap_plan(
     )
 
 
+def build_checkpoint_mmap_plan(
+    pipeline: nn.Module,
+    *,
+    dit_modules: Sequence[tuple[str, nn.Module]],
+    sources: Sequence[object],
+    model_path: str | None,
+    tensor_parallel_size: int,
+    use_hsdp: bool,
+    online_quantization: bool,
+    has_distilled_lora: bool = False,
+) -> HostWeightPlanResult:
+    """Build the DLO mmap plan without changing its HSDP eligibility."""
+    if use_hsdp:
+        return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
+    return build_checkpoint_binding_plan(
+        pipeline,
+        dit_modules=dit_modules,
+        sources=sources,
+        model_path=model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        online_quantization=online_quantization,
+        use_pipeline_key_remap=False,
+        has_distilled_lora=has_distilled_lora,
+    )
+
+
 __all__ = [
     "HostWeightPlan",
     "HostWeightPlanResult",
     "TensorBinding",
+    "build_checkpoint_binding_plan",
     "build_checkpoint_mmap_plan",
     "has_online_quantization",
 ]

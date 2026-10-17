@@ -1,12 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
+
+
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
+def test_qwen3_vl_npu_rope_patch_is_independent_and_idempotent(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
+    from vllm_omni.platforms.npu.models import minimax_h3 as npu_minimax_h3
+
+    def rope_sentinel(q, k, cos, sin):
+        del cos, sin
+        return q, k
+
+    def sdpa_sentinel(query, key, value):
+        del key, value
+        return query
+
+    monkeypatch.setattr(npu_minimax_h3, "_ROPE_PATCHED", False)
+    monkeypatch.setattr(npu_minimax_h3, "_SDPA_PATCHED", False)
+    monkeypatch.setattr(encoder_module, "_apply_rotary_pos_emb", rope_sentinel)
+    monkeypatch.setattr(encoder_module, "_scaled_dot_product_attention", sdpa_sentinel)
+
+    npu_minimax_h3.apply_minimax_h3_qwen3vl_patch()
+
+    assert encoder_module._apply_rotary_pos_emb is npu_minimax_h3._apply_rotary_pos_emb_npu
+    assert encoder_module._scaled_dot_product_attention is sdpa_sentinel
+    assert npu_minimax_h3._ROPE_PATCHED
+    assert not npu_minimax_h3._SDPA_PATCHED
+
+    monkeypatch.setattr(encoder_module, "_apply_rotary_pos_emb", rope_sentinel)
+    npu_minimax_h3.apply_minimax_h3_qwen3vl_patch()
+
+    assert encoder_module._apply_rotary_pos_emb is rope_sentinel
 
 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")

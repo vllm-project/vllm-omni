@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for component routing for quantization."""
 
 from unittest.mock import MagicMock
@@ -8,6 +8,9 @@ import pytest
 import torch
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
 )
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -231,6 +234,36 @@ class TestOmniINCConfigUpgrade:
         assert upgraded.weight_bits == 4
         assert upgraded.group_size == 128
 
+    def test_upgraded_config_resolves_remapped_blocks(self):
+        """Layer resolution sees blocks remapped after the upgrade (#5652).
+
+        The upgraded instance must not keep a config_parser bound to the
+        vanilla INCConfig, otherwise the stage-prefix remap done by
+        apply_vllm_mapper is not seen when thinker layers are resolved.
+        """
+        from vllm.model_executor.layers.quantization.inc import INCConfig
+
+        vanilla = INCConfig(
+            weight_bits=4,
+            group_size=128,
+            sym=True,
+            block_name_to_quantize="thinker.model.layers",
+        )
+        upgraded = OmniINCConfig.maybe_upgrade(vanilla)
+        upgraded.apply_vllm_mapper(THINKER_MAPPER)
+
+        layer = torch.nn.Linear(8, 8)
+        # Remapped thinker block -> quantized with the checkpoint settings.
+        assert upgraded.get_layer_config(layer, "thinker.language_model.model.layers.0.mlp.down_proj") == (
+            4,
+            128,
+            True,
+        )
+        # Outside the quantized blocks -> left unquantized.
+        assert upgraded.get_layer_config(layer, "thinker.visual.blocks.0.attn.proj") == (16, -1, True)
+        # The original config is not remapped by the upgrade.
+        assert vanilla.block_name_to_quantize == ["thinker.model.layers"]
+
 
 # ===================================================================
 # 2. Three-branch thinker routing (simulated)
@@ -344,7 +377,42 @@ class TestTalkerVisualRouting:
 
 
 # ===================================================================
-# 4. ComponentQuantizationConfig.resolve
+# 4. ComponentQuantizationConfig.apply_vllm_mapper
+# ===================================================================
+
+
+class TestComponentApplyVllmMapper:
+    def test_maps_compressed_tensors_component_and_default(self):
+        thinker = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=["thinker.model.layers.0.mlp.gate"],
+            quant_format="pack-quantized",
+        )
+        default = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=["talker.model.layers.0.mlp.gate"],
+            quant_format="pack-quantized",
+        )
+        config = ComponentQuantizationConfig(
+            component_configs={"thinker": thinker, "code2wav": None},
+            default_config=default,
+        )
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "thinker.model": "thinker.language_model.model",
+                "talker.model": "talker.language_model.model",
+            }
+            # vLLM 0.29 renamed get_unstacked_mapper to get_rename_mapper.
+        ).get_rename_mapper()
+
+        config.apply_vllm_mapper(mapper)
+
+        assert thinker.ignore == ["thinker.language_model.model.layers.0.mlp.gate"]
+        assert default.ignore == ["talker.language_model.model.layers.0.mlp.gate"]
+
+
+# ===================================================================
+# 5. ComponentQuantizationConfig.resolve
 # ===================================================================
 
 

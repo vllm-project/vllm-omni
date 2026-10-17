@@ -1,12 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E402, I001
 import argparse
+import json
+import logging
 import math
 import os
 import sys
-import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+import requests
 from PIL import Image
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -45,9 +51,133 @@ from benchmarks.accuracy.text_to_image.gbench import (
 from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     build_serve_common_argv,
     seed_tts_bench_argv,
+    videomme_bench_argv,
 )
-from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import sync_dataset_env_from_ns
+from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import (
+    _acc_result_filename,
+    _write_accuracy_result_metadata,
+    sync_dataset_env_from_ns,
+)
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
+
+
+def test_videomme_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
+    monkeypatch.setenv("VLLM_VIDEOMME_DATASET_PATH", "lmms-eval/Video-MME")
+    monkeypatch.delenv("VLLM_VIDEOMME_REPO", raising=False)
+    monkeypatch.delenv("VIDEOMME_ROOT", raising=False)
+
+    argv = videomme_bench_argv()
+
+    dataset_idx = argv.index("--dataset-path")
+    assert argv[argv.index("--dataset-name") + 1] == "videomme"
+    assert argv[dataset_idx + 1] == "lmms-eval/Video-MME"
+
+
+def test_videomme_bench_argv_uses_local_directory(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("VLLM_VIDEOMME_DATASET_PATH", str(tmp_path))
+    monkeypatch.delenv("VIDEOMME_ROOT", raising=False)
+
+    argv = videomme_bench_argv()
+
+    assert argv[argv.index("--dataset-path") + 1] == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        (
+            "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261014_164800.json",
+        ),
+        (
+            "openbmb/MiniCPM-o-4_5",
+            "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json",
+        ),
+        (
+            "/models/MiniCPM-o-4_5/",
+            "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json",
+        ),
+    ],
+)
+def test_acc_result_filename(model: str, expected: str) -> None:
+    when = datetime(2026, 10, 14, 16, 48, 0)
+    assert _acc_result_filename(model, "daily_omni", when=when) == expected
+
+
+def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import tests.helpers.hardware as hardware
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    path = tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json"
+    path.write_text(
+        json.dumps({"model_id": "openbmb/MiniCPM-o-4_5", "daily_omni_accuracy": 0.8}),
+        encoding="utf-8",
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    _write_accuracy_result_metadata(
+        path,
+        data,
+        {"min_daily_omni_accuracy": 0.77, "min_seed_tts_mean_sim": None},
+        dataset="daily_omni",
+    )
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["daily_omni_accuracy"] == 0.8
+    assert saved["dataset"] == "daily_omni"
+    assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
+    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
+    assert saved["Hardware"] == "H100"
+
+
+def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    import tests.helpers.hardware as hardware
+
+    def _boom() -> str:
+        raise RuntimeError("device_count unavailable")
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", _boom)
+    path = tmp_path / "result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261015_110000.json"
+    path.write_text(
+        json.dumps({"model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct", "daily_omni_accuracy": 0.8}),
+        encoding="utf-8",
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    with caplog.at_level(logging.WARNING):
+        _write_accuracy_result_metadata(
+            path,
+            data,
+            {"min_daily_omni_accuracy": 0.69},
+            dataset="daily_omni",
+        )
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["daily_omni_accuracy"] == 0.8
+    assert saved["dataset"] == "daily_omni"
+    assert saved["model_id"] == "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.69}
+    assert saved["Hardware"] == ""
+    assert "Hardware" in caplog.text
+
+
+def test_sync_dataset_env_preserves_videomme_hf_repo_id(monkeypatch):
+    ns = argparse.Namespace(
+        daily_omni_repo=None,
+        daily_omni_qa_json=None,
+        daily_omni_video_dir=None,
+        videomme_repo=None,
+        videomme_dataset_path="lmms-eval/Video-MME",
+        seed_tts_dataset_path=None,
+        seed_tts_root=None,
+    )
+
+    monkeypatch.delenv("VLLM_VIDEOMME_DATASET_PATH", raising=False)
+    sync_dataset_env_from_ns(ns)
+
+    assert os.environ["VLLM_VIDEOMME_DATASET_PATH"] == "lmms-eval/Video-MME"
 
 
 def test_seed_tts_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
@@ -106,11 +236,9 @@ def test_resolve_seed_tts_root_downloads_only_requested_locale(monkeypatch, tmp_
         captured["allow_patterns"] = allow_patterns
         return str(downloaded_root)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "huggingface_hub",
-        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
-    )
+    from vllm_omni.transformers_utils import repo_utils
+
+    monkeypatch.setattr(repo_utils.hf_api(), "snapshot_download", fake_snapshot_download)
 
     resolved = resolve_seed_tts_root(
         "zhaochenyang20/seed-tts-eval",
@@ -272,7 +400,8 @@ def test_trajectory_judge_payload_collapses_six_frames_into_single_storyboard():
     assert judge_images[0].size == (24, 12)
 
 
-def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch):
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch, num_images):
     captured = {}
 
     class FakeResponse:
@@ -305,16 +434,46 @@ def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch):
     output = client.generate_image_edit(
         model="Qwen/Qwen-Image-Edit",
         prompt="edit this image",
-        images=image,
+        images=image if num_images == 1 else [image] * num_images,
         width=512,
         height=512,
+        guidance_scale=2.5,
+        seed=42,
+        bot_task="think_recaption",
+        sys_type="en_unified",
     )
 
     assert output.size == (1, 1)
     assert captured["url"] == "http://127.0.0.1:8093/v1/images/edits"
     assert captured["data"]["prompt"] == "edit this image"
     assert captured["data"]["size"] == "512x512"
-    assert captured["files"][0][0] == "image"
+    assert len(captured["files"]) == num_images
+    assert all(field == ("image" if num_images == 1 else "image[]") for field, _ in captured["files"])
+    assert captured["data"]["guidance_scale"] == "2.5"
+    assert captured["data"]["seed"] == "42"
+    assert captured["data"]["bot_task"] == "think_recaption"
+    assert captured["data"]["sys_type"] == "en_unified"
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_image_edit_client_preserves_server_error_detail(mocker, status_code):
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = b'{"error": "image input limit exceeded"}'
+    post = mocker.patch("benchmarks.accuracy.common.requests.post", return_value=response)
+    client = VllmOmniImageClient(base_url="http://127.0.0.1:8093")
+
+    with pytest.raises(requests.HTTPError, match="image input limit exceeded") as exc:
+        client.generate_image_edit(
+            model="test-model",
+            prompt="edit this image",
+            images=Image.new("RGB", (2, 2)),
+            width=512,
+            height=512,
+        )
+
+    assert exc.value.response is response
+    post.assert_called_once()
 
 
 def test_text_to_image_client_forwards_output_compression(monkeypatch):

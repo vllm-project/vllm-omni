@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E tests for Covo-Audio-Chat model with audio input and audio/text output.
 """
@@ -25,7 +28,7 @@ def get_question():
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_audio_to_audio(omni_runner, omni_runner_handler) -> None:
+def test_audio_to_audio(omni_runner, offline_client) -> None:
     """
     Test audio input → text + audio output.
     Deploy Setting: default yaml
@@ -44,4 +47,4 @@ def test_audio_to_audio(omni_runner, omni_runner_handler) -> None:
         "audios": (audio, 16000),
         "modalities": ["audio"],
     }
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)

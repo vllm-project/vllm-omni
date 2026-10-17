@@ -1,24 +1,7 @@
-# Target vllm version: v0.27.0 (releases/v0.27.0 branch).
-# Keep VLLM_BASE_TAG aligned with the target vLLM release on every rebase.
-#
-# Release-boundary form: there is no precompiled-wheel pin here, because the
-# base image already ships exactly the target vLLM. Everything the runtime
-# needs — torch, flashinfer, nvJitLink, numpy — comes from that image as one
-# self-consistent set.
-#
-# This block reappears only when the rebase targets a vLLM commit that is NOT a
-# released tag. During the 0.27 rebase, targeting v0.27.0rc1 on top of the
-# v0.26.0 base image required reinstalling vLLM from wheels.vllm.ai and then
-# hand-repairing the fallout: pinning torch ahead of flashinfer (installing it
-# after bound flashinfer's TVM FFI runtime to the old torch and aborted engine
-# core init), registering libnvJitLink.so.13 with ldconfig, and re-pinning numpy
-# under numba's ceiling. All of it was compensation for a base image and a vLLM
-# that disagreed. At a real release boundary they agree, so none of it is
-# needed. If you pin an untagged commit again, restore the reinstall block —
-# agent/tasks/20_update_wheel_url.sh fails the run rather than letting the
-# Dockerfile silently ship the wrong vLLM.
+# Use the official release image with its matching CUDA/PyTorch stack.
+ARG VLLM_VERSION=0.31.0
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.27.0
+ARG VLLM_BASE_TAG=v${VLLM_VERSION}
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents
@@ -26,6 +9,7 @@ ARG VLLM_BASE_TAG=v0.27.0
 # everything except the actual project dir, since that should not
 # change much across branches.
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG} AS deps
+ARG VLLM_VERSION
 # Keep APP_DIR outside /workspace so k8s Buildkite workspace mounts cannot
 # shadow the editable install target (#5364). Docker WORKDIR creates /opt if
 # needed.
@@ -50,12 +34,17 @@ RUN apt-get update && \
 # for CI
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+# Scope the override to Omni; dependency source builds need their own versions.
+ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 # Editable install: deps + project metadata are cached in this layer, while
 # the package itself is linked to APP_DIR (populated later by COPY --link).
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
 RUN uv pip install --system -e ".[dev]"
+# Fail the image build if dependency resolution replaced the selected vLLM.
+# The CPU builder has no NVIDIA driver; CUDA imports are checked at the start
+# of each GPU test job by .buildkite/cuda/scripts/check_vllm_runtime.py.
+RUN python3 -c "import vllm; assert vllm.__version__ == '${VLLM_VERSION}', vllm.__version__"
 
 # The final stage just copies the working dir on top of the
 # dependencies image. This uses --link so that we can skip

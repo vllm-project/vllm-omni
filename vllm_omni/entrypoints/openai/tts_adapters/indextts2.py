@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 serving adapter."""
 
 from __future__ import annotations
@@ -23,8 +24,6 @@ from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
-_TTS_MAX_NEW_TOKENS_MIN = 1
-_TTS_MAX_NEW_TOKENS_MAX = 4096
 _INDEXTTS2_EMOTION_KEYS = ("emo_audio", "emo_vector", "emo_alpha", "emo_text", "use_emo_text", "use_random")
 
 
@@ -108,6 +107,8 @@ def indextts2_conditioning_cache_salt(
         "use_random",
         "lang",
         "text_normalization",
+        "ref_audio_cache_key",
+        "emo_audio_cache_key",
     ):
         h.update(b"\x00")
         h.update(key.encode("utf-8"))
@@ -152,11 +153,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
             fmt_err = server._validate_ref_audio_format(request.ref_audio)
             if fmt_err:
                 return fmt_err
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
-                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
-            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
-                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        err = self._validate_max_new_tokens(request)
+        if err:
+            return err
         if request.extra_params is not None:
             if not isinstance(request.extra_params, dict):
                 return "extra_params must be a JSON object/dict."
@@ -260,8 +259,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
             ref_audio_source = server._get_uploaded_audio_data(voice_lower)
             using_uploaded_voice = ref_audio_source is not None
         if ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
+            wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio_source)
             params["voice"] = [[wav_list, sr]]
+            params["ref_audio_cache_key"] = [cache_key]
         if using_uploaded_voice and voice_lower:
             params["voice_name"] = [voice_lower]
             params["voice_created_at"] = [server._voice_created_at(voice_lower)]
@@ -271,8 +271,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
             if key not in extras:
                 continue
             if key == "emo_audio":
-                wav_list, sr = await server._resolve_ref_audio(extras[key])
+                wav_list, sr, emo_key = await server._resolve_ref_audio(extras[key])
                 params[key] = [[wav_list, sr]]
+                params["emo_audio_cache_key"] = [emo_key]
             else:
                 params[key] = [extras[key]]
         return params

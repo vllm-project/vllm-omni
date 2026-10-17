@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """VAE patch-parallel decode parity tests for diffusion models.
 
@@ -145,7 +145,7 @@ def _run_generate(
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 4})
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards={"cuda": 4})
 @pytest.mark.parametrize("model_case", MODEL_CASES)
 def test_vae_patch_parallel_tp2(model_case: dict[str, Any], tmp_path: Path):
     if current_omni_platform.is_npu():

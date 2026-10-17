@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Helios (https://github.com/BestWishYsh/Helios)
 
 import math
-from collections import OrderedDict
+import weakref
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -27,9 +27,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,
-    SequenceParallelOutput,
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelOutput
+from vllm_omni.diffusion.models.helios.conditioning_cache import (
+    HeliosConditioningCache,
+    active_conditioning_cache,
+    tensor_version,
 )
 
 if TYPE_CHECKING:
@@ -448,6 +450,15 @@ class HeliosCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            computation="cross",
+            cross_parallel_layout="local_q_replicated_kv",
+            qkv_layout="BSND",
+            # Text K/V is replicated on every SP rank, so Ulysses must not be
+            # used here: its all-to-all would treat the per-rank replicas as
+            # sequence shards and ws-fold duplicate the keys. Sharded Q over
+            # full replicated K/V is correct locally and needs no
+            # communication (same as Wan2.2 cross-attn).
+            skip_sequence_parallel=True,
         )
 
     def project_kv(self, encoder_hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -624,15 +635,49 @@ class HeliosTransformer3DModel(nn.Module):
     _hsdp_shard_conditions = [_is_transformer_block]
 
     _sp_plan = {
-        "rope": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
-        },
-        "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
-        },
+        # "rope" and "blocks.0" are intentionally omitted.
+        # The rope hook splits along dim=1 of the 5D output [B, D, T, H, W],
+        # which is the frequency dimension, NOT the sequence dimension.
+        # The blocks.0 hook splits the concatenated hidden_states as a whole,
+        # which can put all history tokens in one rank (original_context_length=0).
+        # Instead, hidden_states and rotary_emb are split per-component in
+        # forward() after flatten+transpose, ensuring each rank gets half
+        # of each component (history and current).
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
+
+    def _sp_split_seq(self, x: torch.Tensor) -> torch.Tensor:
+        """Split tensor along sequence dim (dim=1) for Ulysses SP.
+
+        If seq_len is not divisible by world_size, replicate the last
+        token(s) to pad to a divisible length.  This avoids crashing
+        on non-divisible history components (which use different patch
+        sizes and thus produce different token counts).
+
+        Residual caveat: the replicated padding tokens attend unmasked
+        in attn1 on the last rank (at most ws-1 replicas per component).
+        The impact is bounded, but this is the first place to look if
+        odd resolutions ever show quality drift.
+        """
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+        )
+
+        ws = get_sequence_parallel_world_size()
+        if ws > 1 and x.dim() >= 2 and x.shape[1] > 0:
+            seq_len = x.shape[1]
+            remainder = seq_len % ws
+            if remainder != 0:
+                pad = ws - remainder
+                # Replicate the last token to fill the padding
+                last = x[:, -1:, ...].expand(-1, pad, *([-1] * (x.dim() - 2)))
+                x = torch.cat([x, last], dim=1)
+                seq_len = x.shape[1]
+            r = get_sequence_parallel_rank()
+            n = seq_len // ws
+            x = x[:, r * n : (r + 1) * n, ...].contiguous()
+        return x
 
     def __init__(
         self,
@@ -753,79 +798,62 @@ class HeliosTransformer3DModel(nn.Module):
         # 5. Output norm & projection
         self.norm_out = HeliosOutputNorm(inner_dim, eps)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
-        self._projected_encoder_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
-        self._cross_attn_kv_cache: OrderedDict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = OrderedDict()
-        self._cross_attn_cache_size = 2
+        self._conditioning_owner = object()
+        self._conditioning_revision = 0
+        self._conditioning_dependencies = ()
+        self._conditioning_versions = ()
 
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    @staticmethod
-    def _tensor_cache_key(tensor: torch.Tensor) -> tuple:
-        try:
-            version = tensor._version
-        except RuntimeError:
-            version = None
-
-        return (
-            tensor.data_ptr(),
-            tuple(tensor.shape),
-            tuple(tensor.stride()),
-            tensor.dtype,
-            tensor.device.type,
-            tensor.device.index,
-            version,
-        )
-
-    @staticmethod
-    def _get_from_lru(cache: OrderedDict, key: tuple):
-        value = cache.get(key)
-        if value is not None:
-            cache.move_to_end(key)
-        return value
-
-    def _put_lru(self, cache: OrderedDict, key: tuple, value) -> None:
-        cache[key] = value
-        cache.move_to_end(key)
-        while len(cache) > self._cross_attn_cache_size:
-            cache.popitem(last=False)
-
     def clear_cross_attention_cache(self) -> None:
-        self._projected_encoder_cache.clear()
-        self._cross_attn_kv_cache.clear()
+        """Invalidate active request projections before the next lookup.
+
+        Call after non-tensor adapter/configuration changes as well as weight
+        loading. Request owners release storage on completion or cancellation.
+        """
+        self._conditioning_revision += 1
 
     def _cache_enabled(self) -> bool:
         return not self.training and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
 
-    def _project_encoder_hidden_states(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self._cache_enabled():
-            return self.condition_embedder.text_embedder(encoder_hidden_states)
-
-        cache_key = self._tensor_cache_key(encoder_hidden_states)
-        cached = self._get_from_lru(self._projected_encoder_cache, cache_key)
-        if cached is not None:
-            return cached
-
-        projected = self.condition_embedder.text_embedder(encoder_hidden_states)
-        self._put_lru(self._projected_encoder_cache, cache_key, projected)
-        return projected
-
-    def _get_cross_attn_key_values(
-        self,
-        encoder_hidden_states: torch.Tensor,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
-        if not self._cache_enabled():
+    def _conditioning_projection_revision(self):
+        # Track all projection parameters, including norm/quantization/adapter
+        # parameters registered in these modules. Inference-mode parameters lack
+        # a reliable counter, so disable reuse for that case.
+        modules = [self.condition_embedder.text_embedder, *(block.attn2 for block in self.blocks)]
+        dependencies = tuple(t for module in modules for t in (*module.parameters(), *module.buffers()))
+        versions = tuple((tensor_version(t), t.dtype, t.device) for t in dependencies)
+        if any(version is None for version, _, _ in versions):
             return None
+        same_objects = len(dependencies) == len(self._conditioning_dependencies) and all(
+            current is previous() for current, previous in zip(dependencies, self._conditioning_dependencies)
+        )
+        if not same_objects or versions != self._conditioning_versions:
+            self._conditioning_revision += 1
+            self._conditioning_dependencies = tuple(weakref.ref(t) for t in dependencies)
+            self._conditioning_versions = versions
+        device_type = next(self.parameters()).device.type
+        autocast = (torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type))
+        return self._conditioning_owner, self._conditioning_revision, autocast
 
-        cache_key = self._tensor_cache_key(encoder_hidden_states)
-        cached = self._get_from_lru(self._cross_attn_kv_cache, cache_key)
-        if cached is not None:
-            return cached
+    def _prepare_conditioning(self, source, cache, branch):
+        if cache is None or not self._cache_enabled():
+            projected = self.condition_embedder.text_embedder(source)
+            return projected, None
+        revision = self._conditioning_projection_revision()
+        if revision is None:
+            # Drop any prior value before using unversioned weights.
+            cache.invalidate()
+            projected = self.condition_embedder.text_embedder(source)
+            return projected, None
 
-        key_values = [block.attn2.project_kv(encoder_hidden_states) for block in self.blocks]
-        self._put_lru(self._cross_attn_kv_cache, cache_key, key_values)
-        return key_values
+        def build(value):
+            projected = self.condition_embedder.text_embedder(value)
+            return projected, [block.attn2.project_kv(projected) for block in self.blocks]
+
+        return cache.prepare(source, branch=branch, projection_revision=revision, build=build)
 
     def forward(
         self,
@@ -841,6 +869,8 @@ class HeliosTransformer3DModel(nn.Module):
         latents_history_long: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        conditioning_cache: HeliosConditioningCache | None = None,
+        conditioning_branch: str = "positive",
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size = hidden_states.shape[0]
         p_t, p_h, p_w = self.config.patch_size
@@ -860,6 +890,9 @@ class HeliosTransformer3DModel(nn.Module):
             device=hidden_states.device,
         )
         rotary_emb = rotary_emb.flatten(2).transpose(1, 2)
+        # USP: per-component split (each rank gets half of current frames)
+        hidden_states = self._sp_split_seq(hidden_states)
+        rotary_emb = self._sp_split_seq(rotary_emb)
         original_context_length = hidden_states.shape[1]
 
         # 2. Process short history latents
@@ -876,6 +909,9 @@ class HeliosTransformer3DModel(nn.Module):
                 device=latents_history_short.device,
             )
             rotary_emb_history_short = rotary_emb_history_short.flatten(2).transpose(1, 2)
+            # USP: per-component split
+            latents_history_short = self._sp_split_seq(latents_history_short)
+            rotary_emb_history_short = self._sp_split_seq(rotary_emb_history_short)
 
             hidden_states = torch.cat([latents_history_short, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_short, rotary_emb], dim=1)
@@ -896,6 +932,9 @@ class HeliosTransformer3DModel(nn.Module):
             rotary_emb_history_mid = pad_for_3d_conv(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = center_down_sample_3d(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = rotary_emb_history_mid.flatten(2).transpose(1, 2)
+            # USP: per-component split
+            latents_history_mid = self._sp_split_seq(latents_history_mid)
+            rotary_emb_history_mid = self._sp_split_seq(rotary_emb_history_mid)
 
             hidden_states = torch.cat([latents_history_mid, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_mid, rotary_emb], dim=1)
@@ -916,6 +955,9 @@ class HeliosTransformer3DModel(nn.Module):
             rotary_emb_history_long = pad_for_3d_conv(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = center_down_sample_3d(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = rotary_emb_history_long.flatten(2).transpose(1, 2)
+            # USP: per-component split
+            latents_history_long = self._sp_split_seq(latents_history_long)
+            rotary_emb_history_long = self._sp_split_seq(rotary_emb_history_long)
 
             hidden_states = torch.cat([latents_history_long, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_long, rotary_emb], dim=1)
@@ -940,7 +982,11 @@ class HeliosTransformer3DModel(nn.Module):
             encoder_hidden_states,
             is_return_encoder_hidden_states=False,
         )
-        encoder_hidden_states = self._project_encoder_hidden_states(encoder_hidden_states)
+        if conditioning_cache is None and self._cache_enabled():
+            conditioning_cache = active_conditioning_cache()
+        encoder_hidden_states, cross_attn_key_values = self._prepare_conditioning(
+            encoder_hidden_states, conditioning_cache, conditioning_branch
+        )
         timestep_proj = timestep_proj.unflatten(-1, (6, -1))
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
@@ -958,10 +1004,21 @@ class HeliosTransformer3DModel(nn.Module):
             timestep_proj = timestep_proj.permute(0, 2, 1, 3)
 
         # 6. Transformer blocks
+        # Manually increment _sp_shard_depth so that attention layers
+        # know SP is active and perform Ulysses All-to-All communication.
+        # Normally this is done by split_output=True hooks (e.g. rope),
+        # but those are removed because they split the wrong dimension.
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if is_forward_context_available():
+            get_forward_context()._sp_shard_depth += 1
+
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
         rotary_emb = rotary_emb.contiguous()
-        cross_attn_key_values = self._get_cross_attn_key_values(encoder_hidden_states)
 
         for block_idx, block in enumerate(self.blocks):
             cross_attn_key_value = None if cross_attn_key_values is None else cross_attn_key_values[block_idx]
@@ -979,6 +1036,11 @@ class HeliosTransformer3DModel(nn.Module):
         hidden_states = self.proj_out(hidden_states)
 
         # 8. Unpatchify
+        # proj_out gather may include padded tokens from non-divisible
+        # sequences. Slice to the expected size before reshape.
+        expected_seq = post_patch_num_frames * post_patch_height * post_patch_width
+        if hidden_states.shape[1] > expected_seq:
+            hidden_states = hidden_states[:, :expected_seq, :]
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
         )
@@ -992,6 +1054,7 @@ class HeliosTransformer3DModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with QKV fusion, FFN remapping, and TP norm sharding."""
+        self.clear_cross_attention_cache()
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 

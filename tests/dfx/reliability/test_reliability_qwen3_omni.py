@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Qwen3-Omni reliability integration tests.
 """
@@ -10,7 +13,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypedDict
 
 import pytest
 import torch
@@ -31,6 +34,7 @@ from tests.dfx.reliability.helpers import (
     make_server_tree_kill_fault_injector,
     post_chat_completions_raw,
     post_json_raw,
+    reliability_scenarios_for_eager_oom,
     run_fault_injection_with_rate_load,
     stop_gpu_oom_hogs,
     worker_residual_timeout_after_kill_signal,
@@ -63,15 +67,32 @@ DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "vll
 
 def _default_oom_device_spec() -> str:
     """Use currently visible CUDA ordinals to avoid invalid device index in sidecar."""
-    count = torch.accelerator.device_count()
+    count = torch.accelerator.device_count() or 0
     if count <= 0:
         return "0"
     return ",".join(str(i) for i in range(count))
 
 
-OOM_INJECTION_CONFIG = {
+class _OomInjectionBaseConfig(TypedDict):
+    device: str
+    target_mem_ratio: float
+    hold_seconds: int
+    startup_timeout_sec: int
+    strict: bool
+
+
+class _OomInjectionConfig(_OomInjectionBaseConfig):
+    max_free_bytes: int
+
+
+OOM_INJECTION_CONFIG: _OomInjectionConfig = {
     "device": _default_oom_device_spec(),
-    "target_mem_ratio": 0.92,
+    "target_mem_ratio": 0.95,
+    # MI300 keeps a large caching-allocator pool, so a 256MB device-free ceiling
+    # still lets the text and multimodal probes return 200. HIP also retries an
+    # OOM instead of failing the request. Leave only a few MB so those probes
+    # have to allocate. CUDA keeps the wider 256MB ceiling.
+    "max_free_bytes": 32 * 1024 * 1024 if getattr(torch.version, "hip", None) else 256 * 1024 * 1024,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,
@@ -80,7 +101,7 @@ OOM_INJECTION_CONFIG = {
 # ``strict=True`` sidecars keep allocating until CUDA refuses, which often
 # evicts/kills the server; here we only take a fraction of *initial* free
 # memory and stop, then rely on a heavy multimodal forward to hit OOM.
-OOM_RECOVER_INJECTION_CONFIG = {
+OOM_RECOVER_INJECTION_CONFIG: _OomInjectionBaseConfig = {
     "device": _default_oom_device_spec(),
     # ``strict=False`` stops at this fraction of *initial* free memory per GPU (see helpers sidecar).
     # On multi-GPU hosts a mild ratio plus a small e2e-style mix can still leave several GB free
@@ -114,9 +135,9 @@ PROCESS_KILL_ERROR_KEYWORDS = (
     "500",
     "503",
 )
-# Prefix match for vLLM-titled children (``VLLM::Worker``, ``VLLM::StageEngineCoreProc_*``, …).
-# Must be a literal substring of ``name``/``cmdline`` — no trailing whitespace (would break match).
-RUNTIME_WORKER_PATTERN = "VLLM::"
+# Text chat is the thinker, stage 0. ``VLLM::`` with limit=1 can kill stage 1
+# first and leave the request path alive. Match the stage name literally.
+RUNTIME_WORKER_PATTERN = "StageEngineCoreProc_stage0"
 # RFC#2366 signal x target matrix:
 # - worker: SIGTERM, SIGKILL
 # - serve-root no-load: SIGINT; SIGTERM/SIGKILL skipped (vllm issue#43060)
@@ -338,11 +359,19 @@ def _assert_server_alive_after_fault(host: str, port: int, *, scenario: str) -> 
 
 
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
+QWEN_OOM_PARAMS = create_reliability_omni_server_params(
+    reliability_scenarios_for_eager_oom(
+        RELIABILITY_SCENARIOS,
+        is_hip=bool(getattr(torch.version, "hip", None)),
+        stage_ids=(0, 1),
+    ),
+    DEPLOY_CONFIGS_DIR,
+)
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server_function", QWEN_OOM_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     omni_server_function,
 ) -> None:
@@ -360,12 +389,15 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
         hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
     )
     host = omni_server_function.host
     port = omni_server_function.port
     mix_base = _mix_chat_completions_probe_payload(omni_server_function)
     oom_contract_timeout_sec = 120
     try:
+        # Preserve the text-only output contract while using the heavy
+        # multimodal input needed to reach the allocation path on MI300.
         chat_status, chat_body = post_json_raw(
             host,
             port,
@@ -375,6 +407,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
                 "messages": mix_base["messages"],
                 "stream": False,
                 "modalities": ["text"],
+                "max_tokens": 256,
             },
             timeout_sec=oom_contract_timeout_sec,
         )
@@ -412,9 +445,9 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server_function", QWEN_OOM_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
         _deploy_config_path_from_omni_server(omni_server_function),
@@ -425,6 +458,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
         hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
     )
     try:
         video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
@@ -444,7 +478,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
             "key_words": {"audio": ["test"]},
         }
         try:
-            openai_client_function.send_omni_request(request_config, request_num=1)
+            online_client_function.send_omni_request(request_config, request_num=1)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -454,9 +488,9 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server_function", QWEN_OOM_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
         _deploy_config_path_from_omni_server(omni_server_function),
@@ -467,6 +501,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
         hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
         startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
         strict=OOM_INJECTION_CONFIG["strict"],
+        max_free_bytes=OOM_INJECTION_CONFIG["max_free_bytes"],
     )
     try:
         video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
@@ -487,7 +522,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
             "key_words": {"audio": ["test"]},
         }
         try:
-            openai_client_function.send_omni_request(request_config, request_num=4)
+            online_client_function.send_omni_request(request_config, request_num=4)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -498,6 +533,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -505,7 +541,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_request_failure(
-    omni_server_after_fault_function, openai_client_function
+    omni_server_after_fault_function, online_client_function
 ) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=_get_system_prompt(),
@@ -519,7 +555,7 @@ def test_reliability_fault_process_kill_request_failure(
         "key_words": {"text": ["beijing"]},
     }
     try:
-        openai_client_function.send_omni_request(request_config, request_num=1)
+        online_client_function.send_omni_request(request_config, request_num=1)
     except Exception as exc:
         assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
     else:
@@ -528,6 +564,7 @@ def test_reliability_fault_process_kill_request_failure(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -567,7 +604,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
         assert elapsed <= _PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC + 1.0, (
             f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
         )
-        assert ff_status >= 500, (
+        assert ff_status is not None and ff_status >= 500, (
             f"[process_kill fast_fail] expected server-side failure after fault, "
             f"got status={ff_status}, body={ff_body[:200]!r}"
         )
@@ -644,6 +681,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 @pytest.mark.slow
 @pytest.mark.skip(reason="issue#3683")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "fault_injector",
     WORKER_SIGNAL_FAULT_PARAMS,
@@ -652,13 +690,13 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_worker_with_load_request_failure(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     fault_injector: FaultInjector,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
     scenario = "kill_worker_with_load"
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: fault_injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -674,7 +712,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
@@ -698,20 +736,20 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 
 @pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
     scenario = f"kill_serve_root_with_load_{signal_name.lower()}"
     injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -733,6 +771,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
@@ -760,11 +799,12 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
@@ -775,7 +815,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
         inter_kill_wait_seconds=0.1,
     )
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -801,7 +841,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     "EngineCore still dies and is evicted (not respawned), so the engine does not "
     "recover after the hog stops. Out of scope for the #4285 fault-isolation fix."
 )
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     omni_server_function,

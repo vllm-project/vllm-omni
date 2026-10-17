@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by the FluxKontext model.
@@ -7,7 +10,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
@@ -20,7 +23,8 @@ BASE_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"})
 def _get_diffusion_feature_cases(model: str):
     return [
         pytest.param(
-            OmniServerParams(model=model),
+            # The unsharded transformer alone exceeds the L4's 22 GiB.
+            OmniServerParams(model=model, server_args=["--enable-layerwise-offload"]),
             id="base",
             marks=BASE_FEATURE_MARKS,
         ),
@@ -32,7 +36,7 @@ def _get_diffusion_feature_cases(model: str):
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_flux_kontext_text_to_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_flux_kontext_text_to_image(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test text-to-image generation with FluxKontext in regular end-user scenarios."""
     messages = dummy_messages_from_mix_data(content_text="A photo of a cat sitting on a laptop keyboard")
 
@@ -47,7 +51,7 @@ def test_flux_kontext_text_to_image(omni_server: OmniServer, openai_client: Open
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.parametrize(
@@ -55,7 +59,7 @@ def test_flux_kontext_text_to_image(omni_server: OmniServer, openai_client: Open
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_flux_kontext_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_flux_kontext_image_edit(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test image editing with FluxKontext in regular end-user scenarios."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
@@ -74,7 +78,7 @@ def test_flux_kontext_image_edit(omni_server: OmniServer, openai_client: OpenAIC
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.parametrize(
@@ -82,7 +86,7 @@ def test_flux_kontext_image_edit(omni_server: OmniServer, openai_client: OpenAIC
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_flux_kontext_image_edit_no_negative(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_flux_kontext_image_edit_no_negative(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test image editing with FluxKontext without negative prompt."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
@@ -99,7 +103,7 @@ def test_flux_kontext_image_edit_no_negative(omni_server: OmniServer, openai_cli
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.parametrize(
@@ -107,7 +111,7 @@ def test_flux_kontext_image_edit_no_negative(omni_server: OmniServer, openai_cli
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_flux_kontext_high_resolution(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_flux_kontext_high_resolution(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test high-resolution generation with FluxKontext."""
     messages = dummy_messages_from_mix_data(content_text="A beautiful landscape with mountains and a lake")
 
@@ -122,7 +126,7 @@ def test_flux_kontext_high_resolution(omni_server: OmniServer, openai_client: Op
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.parametrize(
@@ -130,7 +134,7 @@ def test_flux_kontext_high_resolution(omni_server: OmniServer, openai_client: Op
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_flux_kontext_multiple_outputs(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_flux_kontext_multiple_outputs(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test generating multiple outputs with FluxKontext."""
     messages = dummy_messages_from_mix_data(content_text="A photo of a cat sitting on a laptop keyboard")
 
@@ -146,4 +150,4 @@ def test_flux_kontext_multiple_outputs(omni_server: OmniServer, openai_client: O
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E expansion tests for Step-Audio2 online serving (weekly CI).
 
@@ -94,22 +94,22 @@ def _build_audio_to_text_request_config(omni_server, audio_base64: str) -> dict:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_single_audio_to_text_request(omni_server, openai_client) -> None:
+def test_single_audio_to_text_request(omni_server, online_client) -> None:
     """Test a single audio-to-text request via the chat completions API."""
     request_config = _build_audio_to_text_request_config(
         omni_server,
         _synthetic_audio_base64(duration_sec=2),
     )
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("request_num", [2, 4])
-def test_concurrent_audio_to_text_requests(omni_server, openai_client, request_num: int) -> None:
+def test_concurrent_audio_to_text_requests(omni_server, online_client, request_num: int) -> None:
     """Test concurrent audio-to-text requests."""
     request_config = _build_audio_to_text_request_config(
         omni_server,
         _synthetic_audio_base64(duration_sec=2),
     )
-    responses = openai_client.send_omni_request(request_config, request_num=request_num)
+    responses = online_client.send_omni_request(request_config, request_num=request_num)
     assert len(responses) == request_num

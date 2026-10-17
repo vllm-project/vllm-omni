@@ -1,17 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.metrics.utils import (
     count_audio_chunk_frames,
     count_audio_frames,
     count_image_pixels,
     count_tokens_from_outputs,
+    count_video_frames,
+    extract_diffusion_vae_decode_ms,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_frames"),
+    [
+        ((1, 64, 64, 3), 1),
+        ((3, 64, 64, 3), 3),
+        ((4, 64, 64, 3), 4),
+        ((8, 64, 64, 3), 8),
+        ((3, 8, 64, 64), 8),
+        ((1, 1, 64, 64, 3), 1),
+        ((1, 3, 64, 64, 3), 3),
+        ((1, 4, 64, 64, 3), 4),
+        ((1, 3, 8, 64, 64), 8),
+    ],
+)
+def test_count_video_frames_handles_short_channel_last_outputs(shape, expected_frames):
+    assert count_video_frames(SimpleNamespace(shape=shape)) == expected_frames
 
 
 @pytest.mark.parametrize(
@@ -99,3 +123,50 @@ def test_count_tokens_from_outputs() -> None:
     ]
 
     assert count_tokens_from_outputs(engine_outputs) == 6
+
+
+@pytest.mark.parametrize(
+    ("durations", "expected_ms"),
+    [
+        # Default target.
+        ({"QwenImagePipeline.vae.decode": 0.25, "QwenImagePipeline.diffuse": 2.0}, 250.0),
+        # MammothModa2: prefixed VAE module.
+        (
+            {"MammothModa2DiTPipeline.gen_vae.decode": 0.5, "MammothModa2DiTPipeline.gen_transformer.forward": 3.0},
+            500.0,
+        ),
+        # MiniMax-H3: latent decoders for video and audio are summed.
+        (
+            {
+                "MiniMaxH3Pipeline.video_vae.decode_latent": 1.5,
+                "MiniMaxH3Pipeline.audio_vae.decode_latent": 0.25,
+                "MiniMaxH3Pipeline.decode": 2.0,
+                "MiniMaxH3Pipeline.post_decode": 0.1,
+            },
+            1750.0,
+        ),
+    ],
+)
+def test_extract_vae_decode_ms_matches_vae_decode_targets(durations: dict[str, float], expected_ms: float) -> None:
+    output = DiffusionOutput(stage_durations=durations)
+
+    assert extract_diffusion_vae_decode_ms(output) == pytest.approx(expected_ms)
+
+
+@pytest.mark.parametrize(
+    "durations",
+    [
+        {"MiniMaxH3Pipeline.decode": 2.0, "MiniMaxH3Pipeline.post_decode": 0.1},
+        {"Magi2Pipeline._decode_video": 1.0, "Magi2Pipeline._decode_audio": 0.5},
+        {"QwenImagePipeline.vae.encode": 0.3, "QwenImagePipeline.diffuse": 2.0},
+        {"SomePipeline.vae": 0.3, "SomePipeline.myvae.decode": 0.4},
+        {},
+    ],
+)
+def test_extract_vae_decode_ms_ignores_other_targets(durations: dict[str, float]) -> None:
+    assert extract_diffusion_vae_decode_ms(DiffusionOutput(stage_durations=durations)) is None
+
+
+def test_extract_vae_decode_ms_without_stage_durations() -> None:
+    # Pipelines pass stage_durations=None when the profiler is off.
+    assert extract_diffusion_vae_decode_ms(DiffusionOutput(stage_durations=None)) is None

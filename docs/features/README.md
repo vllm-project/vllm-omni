@@ -20,13 +20,19 @@ an implementation contract has a user-facing workflow.
 | Choose serial, batched, step-wise, or streaming diffusion execution | [Execution Modes and Streaming](../user_guide/diffusion/execution_modes.md) | [Diffusion Continuous Batching](../design/feature/diffusion_continuous_batching.md), [Async Diffusion Output](../design/feature/async_diffusion_output.md) |
 | Reclaim stage memory without restarting the server | [Sleep Mode](sleep_mode.md) | Runtime lifecycle behavior is documented in the user guide |
 
+The [Prefill-Decode Disaggregation design reference](pd_disaggregation.md)
+describes the experimental Qwen3-Omni runtime topology and its current
+integration boundaries. It is not yet a supported launch recipe.
+
 Some runtime designs are deliberately not promoted as standalone User Guide
 features yet:
 
-- [Disaggregated Inference](../design/feature/disaggregated_inference.md) and
+- Generic, OmniConnector-based
+  [Disaggregated Inference](../design/feature/disaggregated_inference.md) is not
+  yet a standalone User Guide feature. Its
   [OmniConnector implementations](../design/index.md#communication) describe
-  topology and transport contracts. Practical deployment configuration remains
-  under [Pipeline and deploy configurations](../configuration/stage_configs.md).
+  transport contracts, while practical connector configuration remains under
+  [Pipeline and deploy configurations](../configuration/stage_configs.md).
 - [Async Chunk](../design/feature/async_chunk.md) and
   [Async Omni Output Materialization](../design/feature/omni_async_output_materialization.md)
   are model- and pipeline-dependent. Use the selected model's deploy
@@ -53,6 +59,7 @@ defines the shared configuration and backend extension points.
 | Distribute diffusion work across devices | [Parallelism](../user_guide/diffusion/parallelism/overview.md) | [Parallelism designs](../design/index.md#parallelism) |
 | Select dense, sparse, or quantized attention paths | [Attention Backends](../user_guide/diffusion/attention_backends.md) | [Attention Backend Selection](../design/feature/attention_backend_selection.md) |
 | Compile repeated diffusion regions | [Regional Compilation](../user_guide/diffusion/regional_compilation.md) | User-facing optimization guide |
+| Speed up Wan VAE video decode | [Wan VAE Decoder Fast Path](../user_guide/diffusion/vae_fast_path.md) | User-facing optimization guide |
 | Add generated video frames | [Frame Interpolation](../user_guide/diffusion/frame_interpolation.md) | User-facing extension guide |
 | Reduce diffusion model startup time | [Startup and Loading](../user_guide/diffusion/startup_and_loading.md) | User-facing loading guide |
 | Apply diffusion adapters | [LoRA](../user_guide/diffusion/lora.md) | User-facing extension guide |

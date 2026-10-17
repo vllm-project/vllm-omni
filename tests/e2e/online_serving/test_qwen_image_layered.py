@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Online serving tests for ``Qwen/Qwen-Image-Layered`` (layer decomposition).
 
@@ -18,7 +18,7 @@ from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
     dummy_messages_from_mix_data,
 )
 
@@ -47,7 +47,7 @@ def _get_diffusion_feature_cases(model: str):
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
-def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_single_image_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Default Qwen-Image-Layered smoke (single ``default`` server config)."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
@@ -64,4 +64,4 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

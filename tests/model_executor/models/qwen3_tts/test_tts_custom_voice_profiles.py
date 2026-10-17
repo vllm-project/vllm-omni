@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 from types import SimpleNamespace
 
@@ -186,6 +189,7 @@ def test_voxcpm2_custom_voice_profiles_warm_full_prompt_cache(tmp_path):
 
     model = VoxCPM2TalkerForConditionalGeneration.__new__(VoxCPM2TalkerForConditionalGeneration)
     model.config = SimpleNamespace(custom_voice_dir=str(tmp_path))
+    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=False))
     model._speaker_cache = SpeakerEmbeddingCache()
 
     model._load_custom_voice_profiles()
@@ -218,6 +222,7 @@ def test_voxcpm2_custom_voice_profiles_skip_unloadable_manifest_entry(tmp_path):
 
     model = VoxCPM2TalkerForConditionalGeneration.__new__(VoxCPM2TalkerForConditionalGeneration)
     model.config = SimpleNamespace(custom_voice_dir=str(tmp_path))
+    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=False))
     model._speaker_cache = SpeakerEmbeddingCache()
 
     model._load_custom_voice_profiles()

@@ -39,13 +39,13 @@ isolated detached worktree. Run every source read, `rg` search, import, and test
 from that snapshot, not the caller's checkout. A detached worktree provides
 snapshot isolation, not a security boundary.
 
-Treat a fork head as untrusted unless the user and environment policy explicitly
-establish trust. Never run its imports, tests, builds, hooks, package setup, or
-repo-configurable linters/plugins on the reviewer host. Execute them only in a
-disposable sandbox or VM with no credentials or inherited secrets, no host agent
-or service sockets, minimal read-only host mounts, disabled or explicitly
-allowlisted network, resource/time limits, and destruction after the run. If
-that boundary is unavailable, limit the review to the remote diff, SHA-addressed
+Treat a fork head as untrusted until the user and environment policy
+explicitly establish trust. Without recorded trust, never run its imports,
+tests, builds, hooks, package setup, or repo-configurable linters/plugins on
+the reviewer host. Once the user explicitly trusts this pinned commit for
+this host, record the trusted SHA with the review state and execute with
+credentials, agent sockets, and other secrets out of scope. Without recorded
+trust, limit the review to the remote diff, SHA-addressed
 reads such as `git show <head_sha>:<path>`, and existing CI evidence; report all
 executable validation as a gap.
 
@@ -111,6 +111,17 @@ Mark early findings as preliminary and continue. This is not a GitHub comment.
   but do not publish review events without separate authorization.
 - Record DCO, pre-commit, required CI, and mergeability. Pending or unknown gates
   do not block source review.
+- GitHub Actions `SKIP` omits SPDX, shellcheck, markdownlint, mypy-3.10, and
+  test-mark coverage. A green GHA pre-commit job does not prove those local
+  gates passed. New files still need the full Linting list: Omni SPDX
+  (`vLLM-Omni project`), no stdlib `re`/`base64` in `vllm_omni/`, no new
+  pickle / Hugging Face Hub API / `torch.cuda` call sites, test marks, TTS
+  adapter ratchet, Buildkite schema, and native shellcheck on macOS/Windows.
+  See [Linting](https://vllm-omni.readthedocs.io/en/latest/contributing/#linting).
+- Expanding `CHECK_IMPORTS[*].allowed_files`, `ALLOWED_FILES`,
+  `MAX_MODEL_TYPE_BRANCHES`, or Buildkite `SKIP_FILES` is a policy change.
+  Do not rubber-stamp allowlist/budget growth; require justification and
+  prefer fixing the call site.
 - Treat a failed gate as its own evidence. Do not restate its formatting/lint
   output as a new code-review finding.
 - Open CI logs only when the first failing step overlaps the frozen diff or

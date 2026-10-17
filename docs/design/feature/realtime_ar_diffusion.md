@@ -143,8 +143,20 @@ fraction to select additional resident sessions up to the model-declared cap.
 All model-owned reservations are deducted before the paged self-attention pool
 is allocated.
 
-LingBot reports its persistent full-horizon image-condition tensor. DreamZero
-reports the measured 603 MiB per-session Wan VAE causal-convolution state.
+LingBot advances a session-owned causal Wan VAE encoder for each condition
+block: the opening pixel frame is followed by four zero pixel frames per later
+latent frame. It retains one current condition block, with separate committed
+and in-flight encoder histories so a failed block cannot overwrite committed
+context. The state reservation includes both encoder histories, derived from
+the encoder's convolution input grids, and the streaming decoder cache. These
+caches are released through the same close/reset hooks. Condition encoding
+currently requires the unpatched, non-tiled Wan encoder path; the existing
+decoder's tiling fallback remains independent. Real-weight GPU parity with a
+full-horizon encode still requires validation because the pointwise posterior
+projection now runs per block.
+
+DreamZero reports the measured 603 MiB per-session Wan VAE causal-convolution
+state.
 
 ## Concurrency and routing limits
 
@@ -177,6 +189,24 @@ For LingBot World v2:
 - `lingbot_world/transformer.py` implements checkpoint-compatible causal attention; and
 - `lingbot_world/pipeline.py` constructs conditioning, owns small non-KV session state, and
   produces one block plus the standard metadata envelope.
+
+## Ulysses sequence parallelism
+
+LingBot supports pure Ulysses sequence parallelism for both direct and
+AR-Diffusion execution. With Ulysses degree greater than one, hidden tokens,
+camera features, token-expanded timestep modulation, and RoPE tables are sharded
+together. Without SP, timestep modulation retains the frame-broadcast path.
+Self-attention performs the sequence-to-head all-to-all before reading or writing
+paged KV, while static text K/V uses the same local head shard. Text K/V shards
+own compact storage; cross-attention exchanges query/output layouts to use these
+shards. This retains the shared cache geometry and reduces text K/V storage at
+the cost of two all-to-all calls per layer.
+
+The output head projects local tokens before gathering the flow values. For
+the 14B model this reduces the gathered width from 5120 to 64; frame modulation
+uses each shard's global token offset, including shards that split a frame. Only
+`ulysses_mode="strict"` is supported; `advanced_uaa`, Ring, and AllGather-KV modes
+remain unsupported for this model.
 
 ## Non-goals
 

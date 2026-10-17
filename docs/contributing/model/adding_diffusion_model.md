@@ -779,6 +779,31 @@ turning them on. For Qwen-Image-style serving examples, document
 `--step-execution` as the feature gate and `--max-num-seqs N` as the
 companion batching knob.
 
+### Streaming Output and Mid-Stream Interactions
+
+To add streaming generation with optional mid-stream prompt updates to a new diffusion pipeline (often a video generation pipeline):
+
+0. **Model should internally support** chunked video emission and bounded VAE decode of a chunk.
+1. **Implement stepwise execution** so interaction RPCs can be consumed at chunk
+   boundaries (see [Step Execution](#step-execution) above).
+2. **Mix in** ``InteractionMixin`` on the pipeline class.
+3. **Implement** ``peek_chunk_media(StepRequestState) -> ChunkMediaSpec`` to offer information
+   about the next chunk to generate.
+   This is called whenever one supported interaction modality needs frame-level calculation,
+   e.g., per-frame camera trajectory. If only chunk-level calculation is involved, peeking is skipped.
+4. **Optionally implement** ``prepare_next_chunk(StepRequestState)`` if the
+   pipeline must rebuild something (e.g., per-chunk state) after an interaction is applied.
+   This function is called at chunk boundary.
+5. **Register** supported modalities and handlers in ``vllm_omni/diffusion/interaction/registry.py``
+   (keyed by ``od_config.model_class_name`` → modality key as in ``req["multi_modal_data"]``).
+
+Serve with ``--diffusion-streaming-output`` (auto-enables step execution). See
+[Diffusion Execution Modes](../../user_guide/diffusion/execution_modes.md#streaming-output)
+and the example script at `examples/online_serving/streaming_video_generation/`.
+
+**Interaction payload contract:** Although ``OmniInteractionPrompt`` type annocation requires ``event_id``,
+the WebSocket API payload may omit ``event_id`` and let the API layer assigns one.
+
 ### Cache Acceleration
 
 #### TeaCache

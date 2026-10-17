@@ -12,7 +12,7 @@ import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
 
-from vllm_omni.engine.stage_init_utils import _resolve_model_to_local_path
+from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
 
 from .audio_prep import (
@@ -78,7 +78,7 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
         loaded_encoder_params = set()
         with torch.no_grad():
             for shard_path in _iter_model_safetensors(
-                _resolve_model_to_local_path(str(wrapper.vllm_config.model_config.model))
+                resolve_model_to_local_path(str(wrapper.vllm_config.model_config.model))
             ):
                 with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
                     for key in handle.keys():

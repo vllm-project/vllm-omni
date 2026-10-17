@@ -10,4 +10,8 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     HunyuanImage3Pipeline,
 )
 
-__all__ = ["HunyuanImage3Pipeline", "HunyuanImage3Model", "HunyuanImage3Text2ImagePipeline"]
+__all__ = [
+    "HunyuanImage3Pipeline",
+    "HunyuanImage3Model",
+    "HunyuanImage3Text2ImagePipeline",
+]

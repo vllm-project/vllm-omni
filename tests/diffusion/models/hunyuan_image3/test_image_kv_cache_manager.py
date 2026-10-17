@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for ImageKVCacheManager.
 
 Covers: cache → reuse flow, AR KV injection, CFG (sequential & parallel), SP, cross-request isolation.
@@ -8,7 +8,8 @@ Covers: cache → reuse flow, AR KV injection, CFG (sequential & parallel), SP, 
 from __future__ import annotations
 
 import math
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,8 +20,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _TRANSFORMER_MODULE = "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer"
 
-NUM_HEADS = 4
-NUM_KV_HEADS = 2
+NUM_HEADS = 32
+NUM_KV_HEADS = 8
 HEAD_DIM = 16
 IMAGE_TOKEN_LEN = 8
 SUFFIX_TOKEN_LEN = 3
@@ -35,15 +36,30 @@ SCALING = 1.0 / math.sqrt(HEAD_DIM)
 class MockAttention(nn.Module):
     def __init__(self, num_heads, head_size, causal=False, softmax_scale=None, num_kv_heads=None, **kwargs):
         super().__init__()
+        self.paged_kv_active = False
+        self.calls = []
+        self.paged_calls = []
+        self.paged_metadata = []
+
+    def is_paged_kv_active(self):
+        return self.paged_kv_active
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
+        self.calls.append((query, key, value))
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+        if is_forward_context_available() and get_forward_context().paged_kv_adapter is not None:
+            self.paged_calls.append((query, key, value))
+            self.paged_metadata.append(attn_metadata)
+        if attn_metadata is not None and attn_metadata.joint_query is not None:
+            return torch.cat((attn_metadata.joint_query, query), dim=1)
         return query
 
 
 @contextmanager
 def patched_mgr_env(sp_size=1):
     target = _TRANSFORMER_MODULE
-    patches = [
+    patches: list[AbstractContextManager] = [
         patch(f"{target}.get_sequence_parallel_world_size", return_value=sp_size),
         patch(f"{target}.get_allgather_parallel_world_size", return_value=sp_size),
         patch(f"{target}.get_ulysses_parallel_world_size", return_value=1, create=True),
@@ -99,6 +115,7 @@ def _call_mgr(
     shard_image_size=None,
     gen_timestep_scatter_index=None,
     position_ids=None,
+    full_attn_spans=None,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
@@ -115,7 +132,256 @@ def _call_mgr(
         shard_image_size=shard_image_size,
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
+        full_attn_spans=full_attn_spans,
     )
+
+
+def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
+    mgr = _make_cache_mgr()
+
+    assert isinstance(mgr, nn.Module)
+    assert dict(mgr.named_modules())["attn"] is mgr.attn
+    assert mgr.state_dict() == {}
+
+
+def test_cache_manager_initializes_with_quantization_skip_layers(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as layer
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageKVCacheManager
+
+    config = SimpleNamespace(
+        diffusion_attention_config=None,
+        parallel_config=SimpleNamespace(ring_degree=1),
+        diffusion_kv_cache_dtype="auto",
+        diffusion_kv_cache_skip_layer_indices={3},
+    )
+    monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **_: (layer.SDPABackend, None))
+    monkeypatch.setattr(layer, "build_parallel_attention_strategy", lambda **_: object())
+    with patched_mgr_env(), set_current_diffusion_config(config):
+        # Keep the real Attention constructor and its skip-layer validation.
+        with patch(f"{_TRANSFORMER_MODULE}.Attention", layer.Attention):
+            mgr = ImageKVCacheManager(
+                num_heads=NUM_HEADS,
+                num_kv_heads=NUM_KV_HEADS,
+                head_dim=HEAD_DIM,
+                scaling=SCALING,
+                prefix="model.layers.3.self_attn",
+            )
+    assert mgr.attn.layer_idx == 3
+    assert not mgr.attn._should_apply_kv_cache_quant()
+
+
+@pytest.mark.parametrize("first_step", [True, False])
+def test_native_connector_keeps_imported_prefix_in_paged_attention(first_step) -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    query_len, prefix_len = IMAGE_TOKEN_LEN, 19
+    key, value = _make_known_kv(2 * query_len)
+    spans = [[(prefix_len, prefix_len + query_len)]] * 2
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(object()),
+        patch.object(mgr, "_forward_dense_legacy", side_effect=AssertionError("dense KV path")),
+        patch(f"{_TRANSFORMER_MODULE}.repeat_kv", side_effect=AssertionError("KV head expansion")),
+        patch(f"{_TRANSFORMER_MODULE}.get_paged_kv_computed_tokens", return_value=(prefix_len, prefix_len)),
+    ):
+        _call_mgr(
+            mgr,
+            2,
+            query_len,
+            prefix_len + query_len,
+            key,
+            value,
+            first_step=first_step,
+            full_attn_spans=spans,
+        )
+    assert len(mgr.attn.paged_calls) == 1
+    assert mgr.attn.paged_calls[0][1].shape == (2, query_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_metadata[0].attn_mask is None
+    assert mgr.attn.paged_metadata[0].full_attn_spans == spans
+    assert mgr.image_kv_cache_map is None
+    assert not hasattr(mgr, "_materialize_paged_prefix")
+
+
+def test_legacy_tensor_prefix_still_uses_dense_cache_and_reuse() -> None:
+    mgr = _make_cache_mgr()
+    prefix_len, prompt_len = 3, 2
+    imported = _make_known_kv(prefix_len, base=10.0)
+    mgr._injected_ar_kv = [imported]
+    first_len = prompt_len + IMAGE_TOKEN_LEN
+    key, value = _make_known_kv(first_len, base=20.0)
+    with (
+        patch.object(mgr, "_forward_paged", side_effect=AssertionError("legacy entered paged path")),
+    ):
+        _call_mgr(
+            mgr,
+            1,
+            first_len,
+            prefix_len + first_len,
+            key,
+            value,
+            first_step=True,
+            gen_timestep_scatter_index=_gen_timestep_index(1, prompt_len),
+        )
+        assert mgr.image_kv_cache_map is not None
+        assert mgr.image_kv_cache_map[0].shape[1] == prefix_len + prompt_len
+        next_key, next_value = _make_known_kv(IMAGE_TOKEN_LEN, base=30.0)
+        _call_mgr(
+            mgr,
+            1,
+            IMAGE_TOKEN_LEN,
+            prefix_len + first_len,
+            next_key,
+            next_value,
+            position_ids=torch.arange(prefix_len + prompt_len, prefix_len + first_len).unsqueeze(0),
+        )
+    assert len(mgr.attn.calls) == 2
+    assert not mgr.attn.paged_calls
+    assert mgr.attn.calls[-1][1].shape == (1, prefix_len + first_len, NUM_HEADS, HEAD_DIM)
+
+
+@pytest.mark.parametrize("prefix_len", [0, 19])
+@pytest.mark.parametrize("prompt_query_len", [0, 3])
+def test_paged_sp_splits_uncached_queries(prefix_len, prompt_query_len) -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr(sp_size=2)
+    mgr.attn.paged_kv_active = True
+    shard_image_size = IMAGE_TOKEN_LEN // 2
+    query_len = prompt_query_len + shard_image_size
+    query = torch.randn(2 * query_len, NUM_HEADS, HEAD_DIM)
+    key, value = _make_known_kv(2 * query_len)
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        output = mgr(
+            query,
+            key,
+            value,
+            first_step=True,
+            query_lens=[query_len] * 2,
+            seq_lens=[prefix_len + query_len] * 2,
+            shard_image_size=shard_image_size,
+            full_attn_spans=[[(prefix_len + prompt_query_len, prefix_len + query_len)]] * 2,
+        )
+
+    torch.testing.assert_close(output, query)
+    metadata = mgr.attn.paged_metadata[0]
+    torch.testing.assert_close(
+        metadata.joint_key, key.reshape(2, query_len, NUM_KV_HEADS, HEAD_DIM)[:, :prompt_query_len]
+    )
+    assert metadata.joint_query.shape[1] == prompt_query_len
+    assert mgr.attn.paged_calls[0][0].shape[1] == shard_image_size
+    assert mgr.image_kv_cache_map is None
+
+
+def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    bs = 2
+    prefix_lens = torch.tensor([[2], [4]], dtype=torch.long)
+    first_q_len = 12
+    first_k, first_v = _make_known_kv(bs * first_q_len, base=1.0)
+    full_attn_spans = [[(2, 12)], [(2, 12)]]
+
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=first_q_len,
+            seq_len=first_q_len,
+            key_flat=first_k,
+            value_flat=first_v,
+            first_step=True,
+            gen_timestep_scatter_index=prefix_lens,
+            full_attn_spans=full_attn_spans,
+        )
+
+        assert mgr.image_kv_cache_map is None
+        assert mgr.image_kv_cache_lens is None
+        assert len(mgr.attn.paged_calls) == 1
+        assert mgr.attn.paged_calls[0][0].shape == (bs, first_q_len, NUM_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][1].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][2].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_metadata[0].full_attn_spans == full_attn_spans
+
+        current_q_len = IMAGE_TOKEN_LEN
+        current_k, current_v = _make_known_kv(bs * current_q_len, base=50.0)
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=current_q_len,
+            seq_len=prefix_lens[-1].item() + current_q_len,
+            key_flat=current_k,
+            value_flat=current_v,
+            position_ids=torch.arange(4, 4 + current_q_len).repeat(bs, 1),
+            full_attn_spans=full_attn_spans,
+        )
+
+    assert len(mgr.attn.paged_calls) == 2
+    assert mgr.attn.paged_calls[1][0].shape == (bs, current_q_len, NUM_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_calls[1][1].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_calls[1][2].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_metadata[1].full_attn_spans == full_attn_spans
+
+
+def test_cache_manager_rejects_dense_imported_prefix_for_paged_attention() -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    prefix_len = 4
+    prefix_key, prefix_value = _make_known_kv(prefix_len, base=100.0)
+    mgr._injected_ar_kv = [(prefix_key, prefix_value)]
+    current_key, current_value = _make_known_kv(3, base=1.0)
+
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        with pytest.raises(NotImplementedError, match="does not support imported AR KV"):
+            _call_mgr(
+                mgr,
+                bs=1,
+                q_len=3,
+                seq_len=7,
+                key_flat=current_key,
+                value_flat=current_value,
+                first_step=True,
+                gen_timestep_scatter_index=torch.tensor([[0]]),
+                full_attn_spans=[[(4, 7)]],
+            )
+
+
+@pytest.mark.parametrize(
+    ("paged_kv_active", "expected_kv_heads"),
+    [(False, NUM_HEADS), (True, NUM_KV_HEADS)],
+)
+def test_gqa_kv_stays_compressed_for_paged_attention(
+    paged_kv_active: bool,
+    expected_kv_heads: int,
+) -> None:
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = paged_kv_active
+    q_len = 3
+    key, value = _make_known_kv(q_len)
+
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=q_len,
+        seq_len=q_len,
+        key_flat=key,
+        value_flat=value,
+        first_step=True,
+        num_image_tokens=0,
+        gen_timestep_scatter_index=_gen_timestep_index(1, 0),
+        full_attn_spans=[[(0, q_len)]] if paged_kv_active else None,
+    )
+
+    _, key_input, value_input = mgr.attn.calls[-1]
+    expected_shape = (1, q_len, expected_kv_heads, HEAD_DIM)
+    assert key_input.shape == expected_shape
+    assert value_input.shape == expected_shape
 
 
 # ============================================================
@@ -158,6 +424,7 @@ def test_no_ar_kv(bs):
         gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
     )
 
+    assert mgr.image_kv_cache_map is not None
     cached_key, cached_value = mgr.image_kv_cache_map
     # 3 prompt tokens cached per batch
     assert cached_key.shape == (bs, prompt_len, NUM_KV_HEADS, HEAD_DIM)
@@ -245,12 +512,14 @@ def test_ar_kv_no_cfg(sp_size):
         gen_timestep_scatter_index=_gen_timestep_index(bs, current_start),
     )
 
+    assert mgr.image_kv_cache_map is not None
     cached_key, cached_value = mgr.image_kv_cache_map
     if sp_size == 1:
         # cached = ar(5) + prompt(3) = 8
         expected_cached_len = 8
     else:
         # cached = seq_len - shard_image_size = 17 - 4 = 13
+        assert shard_image_size is not None
         expected_cached_len = seq_len - shard_image_size
 
     assert cached_key.shape == (bs, expected_cached_len, NUM_KV_HEADS, HEAD_DIM)

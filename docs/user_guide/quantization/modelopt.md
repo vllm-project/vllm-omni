@@ -204,6 +204,91 @@ omni = Omni(
 | `--linear-backend cutlass` | str | auto | Select the validated CUTLASS linear backend for supported ModelOpt NVFP4 or mixed FP8/NVFP4 diffusion stages |
 | `--moe-backend cutlass` | str | auto | Select the validated CUTLASS MoE backend for supported ModelOpt mixed MoE checkpoints |
 
+## Cosmos3 Mixed-Precision Schedule
+
+The experimental Cosmos3 schedule can use the checkpoint-native quantized GEMM for middle denoising
+steps and dense 16-bit activation execution for selected first and last steps.
+The schedule supports serialized ModelOpt FP8 and NVFP4 checkpoints:
+
+| Detected weight format | Native middle steps | A16 boundary steps |
+|------------------------|---------------------|--------------------|
+| FP8 | W8A8 | W8A16 |
+| NVFP4 | W4A4 | W4A16 |
+
+The native and A16 paths share one quantized weight representation. The A16
+path dequantizes the live backend weight and calls `F.linear`; it does not keep
+a second checkpoint-weight snapshot. Scheduled FP8 currently requires
+serialized tensorwise scales and a backend that retains canonical FP8 weights.
+Scheduled NVFP4 requires a supported CUTLASS-compatible native or FlashInfer
+layout. SmoothQuant, Marlin-repacked FP8, and per-channel/per-token FP8
+schedules fail closed.
+
+The reasoner uses dense A16 execution by default when its weights are FP8 or
+NVFP4. Set the nested `reasoner` field to `native` to retain the checkpoint-native
+W8A8/W4A4 path. A BF16 reasoner remains BF16 in either mode. The schedule
+currently requires tensor parallel size 1 and one active request per worker,
+does not support HSDP, and does not support block-scaled FP8. Its live-weight
+design is compatible with model-level and standard layer-wise offload, but
+those paths still require GPU end-to-end validation. Distributed layer-wise
+offload is rejected because its direct loader bypasses ModelOpt post-load
+transformations.
+
+A checkpoint can opt in by adding a versioned policy to its authoritative
+`transformer/config.json`. The same policy schema is used for FP8 and NVFP4:
+
+```json
+{
+  "quantization_config": {
+    "quant_method": "modelopt",
+    "quant_algo": "FP8",
+    "runtime": {
+      "diffusion_step_policy": {
+        "schema_version": 1,
+        "type": "first_last_n",
+        "index_space": "denoising_loop_iteration",
+        "scope": ["transformer"],
+        "default_mode": "native",
+        "first_steps": {"count": 3, "mode": "a16"},
+        "last_steps": {"count": 3, "mode": "a16"},
+        "overlap": "a16",
+        "reasoner": "a16"
+      }
+    }
+  }
+}
+```
+
+The example preserves the checkpoint's existing `quant_method` and
+`quant_algo`; only `runtime` is added.
+
+When present and valid, the checkpoint policy is the default. An explicit
+runtime object overrides it. To retain ordinary checkpoint-native execution
+for every step, disable only the schedule:
+
+```bash
+vllm serve /path/to/Cosmos3-Nano-modelopt \
+  --omni \
+  --additional-config '{"cosmos3_mixed_precision":{"enabled":false}}'
+```
+
+This does not disable checkpoint quantization; it prevents installation of the
+mixed-step runtime.
+
+```bash
+vllm serve /path/to/Cosmos3-Nano-modelopt \
+  --omni \
+  --additional-config \
+  '{"cosmos3_mixed_precision":{"first_steps":3,"last_steps":3,"reasoner":"a16"}}'
+```
+
+The presence of `cosmos3_mixed_precision` supplies an explicit runtime
+override; an empty object uses the defaults shown above.
+The schedule uses vLLM's selected native backend and fails during loading if
+its live weight layout cannot support A16 dequantization.
+The runtime selects FP8 or NVFP4 from the checkpoint's ModelOpt configuration.
+BF16 linears are untouched. Mixed FP8/NVFP4 checkpoints are not supported by
+this schedule.
+
 ## Validation and Notes
 
 1. Compare the ModelOpt checkpoint against the BF16 baseline with the same

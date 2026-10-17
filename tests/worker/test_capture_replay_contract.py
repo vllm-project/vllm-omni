@@ -14,9 +14,9 @@ cannot be masked by an adjacent ``else``/``elif`` that happens to read it. It
 matches by attribute chain (``self.input_ids.gpu``), so local variable renames
 do not break it.
 
-Scope: the BASE runner (``OmniGPUModelRunner``) only. The generation runner is
-KNOWN to lack the ``has_preprocess`` branch; extend this
-check to the generation file when it adds the branch.
+Scope: the BASE runner (``OmniGPUModelRunner``) and the generation runner's
+``_dummy_run`` override (which gained the branch in RFC #5450 C6; its
+``_preprocess`` is inherited from the base).
 """
 
 import ast
@@ -25,6 +25,7 @@ import textwrap
 
 import pytest
 
+from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -69,11 +70,24 @@ def _has_preprocess_branch_reads_both_buffers(method) -> bool:
     return any(_REQUIRED_BUFFERS <= _attr_chains_in(node.body) for node in guarded)
 
 
-@pytest.mark.parametrize("method_name", ["_dummy_run", "_preprocess"])
-def test_has_preprocess_branch_reads_shared_buffers(method_name):
-    method = getattr(OmniGPUModelRunner, method_name)
+@pytest.mark.parametrize(
+    ("runner_cls", "method_name"),
+    [
+        (OmniGPUModelRunner, "_dummy_run"),
+        (OmniGPUModelRunner, "_preprocess"),
+        (GPUGenerationModelRunner, "_dummy_run"),
+    ],
+)
+def test_has_preprocess_branch_reads_shared_buffers(runner_cls, method_name):
+    method = getattr(runner_cls, method_name)
     assert _has_preprocess_branch_reads_both_buffers(method), (
-        f"{OmniGPUModelRunner.__name__}.{method_name}: the has_preprocess branch no "
+        f"{runner_cls.__name__}.{method_name}: the has_preprocess branch no "
         "longer reads BOTH self.input_ids.gpu and self.inputs_embeds.gpu — capture "
         "and replay would diverge."
     )
+
+
+def test_generation_dummy_run_overrides_with_branch():
+    # Guard against the override being deleted (which would silently fall back
+    # to the base implementation and vacuously pass the parametrized check).
+    assert "_dummy_run" in GPUGenerationModelRunner.__dict__

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
@@ -21,6 +21,7 @@ from vllm.multimodal.media.audio import load_audio
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.profiler import add_profiler_config_arg
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
@@ -121,7 +122,9 @@ def get_use_audio_in_video_query(
     question = "Describe the content of the video, then convert what the baby say into text."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|><|audio_bos|><|AUDIO|><|audio_eos|>"
+        # With use_audio_in_video=True the processor interleaves the audio into
+        # the video placeholder, so no separate <|AUDIO|> placeholder is used.
+        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -325,6 +328,7 @@ def main(args):
     else:
         query_result = query_func()
     args.quantization_config = quantization_config
+    # ``vars(args)`` forwards the parsed profiler_config to Omni.
     omni_kwargs = vars(args).copy()
     # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
@@ -378,11 +382,10 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
-    if profiler_enabled and hasattr(omni, "start_profile"):
+    profiler_enabled = args.profiler_config is not None
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
         omni.start_profile(stages=[0])
-    elif profiler_enabled:
-        print("[Warn] VLLM_TORCH_PROFILER_DIR is set, but current engine does not support profiler controls.")
     omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
@@ -418,7 +421,7 @@ def main(args):
             print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
         processed_count += 1
-        if profiler_enabled and hasattr(omni, "stop_profile") and processed_count >= total_requests:
+        if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
             omni.stop_profile()
@@ -476,6 +479,7 @@ def parse_args():
         default=300,
         help="Timeout for initializing stages in seconds (default: 300)",
     )
+    add_profiler_config_arg(parser)
     parser.add_argument(
         "--shm-threshold-bytes",
         type=int,

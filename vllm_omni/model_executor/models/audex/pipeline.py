@@ -66,6 +66,7 @@ AUDEX_TTS_PIPELINE = PipelineConfig(
             tokenizer_subdir="checkpoint_folder_audiogen",
             sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )
@@ -127,6 +128,7 @@ AUDEX_S2S_PIPELINE = PipelineConfig(
             tokenizer_subdir="checkpoint_folder_audiogen",
             sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )
@@ -190,6 +192,7 @@ AUDEX_TTA_PIPELINE = PipelineConfig(
             # payload ships via thinker2xcodec_full_payload.
             sync_process_input_func=f"{_PROC}.thinker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )

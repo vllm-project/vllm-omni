@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end test for ErnieImage text-to-image generation.
@@ -11,7 +11,7 @@ Equivalent to running:
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniRunnerHandler
+from tests.helpers.runtime import OfflineOmniClient
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -37,9 +37,9 @@ pytestmark = [
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=2)
-def test_ernie_image_text_to_image(omni_runner_handler: OmniRunnerHandler) -> None:
+def test_ernie_image_text_to_image(offline_client: OfflineOmniClient) -> None:
     request_config = {
-        "model": omni_runner_handler.runner.model_name,
+        "model": offline_client.runner.model_name,
         "prompt": "A photo of a cat sitting on a laptop",
         "sampling_params": OmniDiffusionSamplingParams(
             height=512,
@@ -49,4 +49,4 @@ def test_ernie_image_text_to_image(omni_runner_handler: OmniRunnerHandler) -> No
             seed=42,
         ),
     }
-    omni_runner_handler.send_diffusion_request(request_config)
+    offline_client.send_diffusion_request(request_config)

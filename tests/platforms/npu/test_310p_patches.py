@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for 310P patch wiring.
 
 The tests load patch modules from source with fake Qwen3-TTS dependencies, so
@@ -414,6 +414,121 @@ def test_qwen3_tts_code_predictor_forward_uses_projected_embedding_and_sampling(
     assert sample_calls == [{0: generator}]
 
 
+def test_310p_attention_forward_runs_fused_qkv_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the mocked 310P fused-QKV path at runtime on CPU.
+
+    The reviewer explicitly asked for more than source inspection: this test now
+    instantiates the patched attention, runs ``prepare_qkv_weights()``, verifies
+    the packed weight/bias cache, and drives the mocked 310P flash-attention op.
+    """
+    module, _ = _load_qwen3_tts_patch(monkeypatch)
+
+    trans_calls = []
+    rotary_calls = []
+    flash_calls = []
+
+    def maybe_trans_nz(weight: torch.Tensor) -> torch.Tensor:
+        trans_calls.append(weight.detach().clone())
+        return weight + 1.0
+
+    def npu_apply_rotary_pos_emb(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        layout: str = "BSND",
+        rotary_mode: str = "half",
+    ):
+        rotary_calls.append((query.detach().clone(), key.detach().clone(), cos.detach().clone(), sin.detach().clone()))
+        return query + cos - sin, key + cos - sin
+
+    def npu_flash_attention(**kwargs) -> None:
+        flash_calls.append(
+            {key: value.detach().clone() if torch.is_tensor(value) else value for key, value in kwargs.items()}
+        )
+        kwargs["out"].copy_((kwargs["query"] + kwargs["key"] + kwargs["value"]).to(kwargs["out"].dtype))
+
+    monkeypatch.setattr(module, "maybe_trans_nz", maybe_trans_nz)
+    monkeypatch.setattr(module, "aligned_16", lambda tensor: tensor)
+    monkeypatch.setattr(module.torch_npu, "npu_apply_rotary_pos_emb", npu_apply_rotary_pos_emb, raising=False)
+    monkeypatch.setattr(module.torch_npu, "_npu_flash_attention", npu_flash_attention, raising=False)
+
+    config = SimpleNamespace(
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=2,
+        hidden_size=4,
+        num_code_groups=2,
+        attention_bias=True,
+        rms_norm_eps=1e-6,
+    )
+    attention = module._Qwen3CodePredictorAttention310P(config)
+    attention.num_heads = 2
+    attention.num_kv_heads = 2
+    attention.head_dim = 2
+    attention.scaling = 0.5
+    attention._q_size = attention.num_heads * attention.head_dim
+    attention._kv_size = attention.num_kv_heads * attention.head_dim
+    attention.q_norm = torch.nn.Identity()
+    attention.k_norm = torch.nn.Identity()
+    attention.o_proj = torch.nn.Identity()
+    attention.qkv_proj = torch.nn.Linear(4, attention._q_size + 2 * attention._kv_size, bias=True)
+    with torch.no_grad():
+        attention.qkv_proj.weight.copy_(torch.arange(48, dtype=torch.float32).reshape(12, 4) / 10)
+        attention.qkv_proj.bias.copy_(torch.arange(12, dtype=torch.float32) / 10)
+    attention._split_qkv = lambda qkv: qkv.split([attention._q_size, attention._kv_size, attention._kv_size], dim=-1)
+
+    attention.prepare_qkv_weights()
+
+    assert len(trans_calls) == 1
+    assert trans_calls[0].is_contiguous()
+    expected_fused_weight = attention.qkv_proj.weight.detach().clone().contiguous() + 1.0
+    torch.testing.assert_close(attention._fused_qkv_weight, expected_fused_weight)
+    assert attention._fused_qkv_bias is attention.qkv_proj.bias
+
+    hidden_states = (torch.arange(12, dtype=torch.float32).reshape(1, 3, 4) - 3) / 10
+    cos = torch.full((1, 3, 2), 0.25, dtype=torch.float32)
+    sin = torch.full((1, 3, 2), -0.5, dtype=torch.float32)
+    attention_mask = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    output = attention(hidden_states, (cos, sin), attention_mask=attention_mask)
+
+    expected_qkv = torch.nn.functional.linear(hidden_states, expected_fused_weight, attention.qkv_proj.bias)
+    expected_q_raw, expected_k_raw, expected_v_raw = expected_qkv.split(
+        [attention._q_size, attention._kv_size, attention._kv_size],
+        dim=-1,
+    )
+    expected_q = expected_q_raw.view(1, 3, attention.num_heads, attention.head_dim).transpose(1, 2)
+    expected_k = expected_k_raw.view(1, 3, attention.num_kv_heads, attention.head_dim).transpose(1, 2)
+    expected_v = expected_v_raw.view(1, 3, attention.num_kv_heads, attention.head_dim).transpose(1, 2)
+    expected_cos = cos.unsqueeze(1)
+    expected_sin = sin.unsqueeze(1)
+    expected_q = expected_q + expected_cos - expected_sin
+    expected_k = expected_k + expected_cos - expected_sin
+    expected_q_f = expected_q.transpose(1, 2).reshape(3, attention.num_heads, attention.head_dim)
+    expected_k_f = expected_k.transpose(1, 2).reshape(3, attention.num_kv_heads, attention.head_dim)
+    expected_v_f = expected_v.transpose(1, 2).reshape(3, attention.num_kv_heads, attention.head_dim)
+    expected_flash = (expected_q_f + expected_k_f + expected_v_f).to(torch.float16).to(torch.float32)
+
+    # One fused aclnn rope call covers q and k in the 4D BSND layout.
+    assert len(rotary_calls) == 1
+    assert rotary_calls[0][0].shape == (1, 3, attention.num_heads, attention.head_dim)
+    assert rotary_calls[0][1].shape == (1, 3, attention.num_kv_heads, attention.head_dim)
+    assert rotary_calls[0][2].shape == (1, 3, 1, attention.head_dim)
+    assert rotary_calls[0][3].shape == (1, 3, 1, attention.head_dim)
+    assert len(flash_calls) == 1
+    torch.testing.assert_close(flash_calls[0]["query"], expected_q_f)
+    torch.testing.assert_close(flash_calls[0]["key"], expected_k_f)
+    torch.testing.assert_close(flash_calls[0]["value"], expected_v_f)
+    torch.testing.assert_close(flash_calls[0]["mask"], attention_mask)
+    torch.testing.assert_close(flash_calls[0]["seq_len"], torch.tensor([3], dtype=torch.int32))
+    assert flash_calls[0]["scale_value"] == pytest.approx(0.5)
+    assert flash_calls[0]["num_heads"] == 2
+    assert flash_calls[0]["num_kv_heads"] == 2
+    torch.testing.assert_close(output, expected_flash.reshape(1, 3, 4))
+
+
 def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
     module, _ = _load_qwen3_tts_patch(monkeypatch)
     talker = module._Qwen3TTSTalker310P(vllm_config=object())
@@ -433,39 +548,16 @@ def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.Monk
     assert codes[0].shape == (4, 2)
 
 
-def test_qwen3_tts_prompt_patch_runs_stft_frontend_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen3_tts_prompt_patch_sets_cpu_mel_front_end_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     module, _ = _load_qwen3_tts_patch(monkeypatch)
-    captured = {}
 
-    def fake_mel_spectrogram(wav_tensor, **kwargs):
-        captured["wav_device"] = wav_tensor.device
-        captured["wav_dtype"] = wav_tensor.dtype
-        captured["kwargs"] = kwargs
-        return torch.ones(1, 128, 3, dtype=torch.float32)
-
-    class FakeSpeakerEncoder(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.param = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
-
-        def forward(self, mels):
-            captured["speaker_input_dtype"] = mels.dtype
-            return (torch.ones(4, dtype=mels.dtype),)
-
-    monkeypatch.setattr(module.prompt_embeds_builder, "mel_spectrogram", fake_mel_spectrogram)
-    builder = object.__new__(module._Qwen3TTSPromptEmbedsBuilder310P)
-    builder._device = lambda: torch.device("cpu")
-    builder._embedding_dtype = torch.float16
-    builder._speaker_encoder = FakeSpeakerEncoder()
-    builder._config = SimpleNamespace(speaker_encoder_config=SimpleNamespace(sample_rate=24000))
-
-    speaker = builder.extract_speaker_embedding(np.zeros(16, dtype=np.float32), 24000)
-
-    assert captured["wav_device"] == torch.device("cpu")
-    assert captured["wav_dtype"] is torch.float32
-    assert captured["kwargs"]["sampling_rate"] == 24000
-    assert captured["speaker_input_dtype"] is torch.float16
-    assert speaker.dtype is torch.float16
+    # The 310P builder keeps the base implementation and only opts into the
+    # CPU mel front-end, because the NPU has no torch.stft.
+    assert issubclass(
+        module._Qwen3TTSPromptEmbedsBuilder310P,
+        module.prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder,
+    )
+    assert module._Qwen3TTSPromptEmbedsBuilder310P._mel_spectrogram_on_cpu is True
 
 
 def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -552,7 +644,11 @@ def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.
     torch.testing.assert_close(norm_out, torch.tensor([[2.0, 3.0]]))
 
 
-def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+def _load_qwen3_tts_code2wav_npu_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    platform_dtype_override: bool = True,
+):
     linear_weights = []
     conv_weights = []
 
@@ -582,15 +678,22 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
             self.prefix = prefix
             self.decoder = FakeDecoder()
 
-        def _npu_decoder_runtime_dtype(self, _device):
-            return torch.float16
-
         def load_weights(self, weights):
             assert list(weights) == []
+            self.decoder.to(dtype=self.vllm_config.model_config.dtype)
+            self.decoder.precompute_snake_caches()
             return {"loaded"}
 
-    logger = SimpleNamespace(info=lambda *_: None, debug=lambda *_: None)
+    if platform_dtype_override:
+
+        def _npu_decoder_runtime_dtype(self, _device: torch.device) -> torch.dtype:
+            return torch.float16
+
+        FakeCode2Wav._npu_decoder_runtime_dtype = _npu_decoder_runtime_dtype  # type: ignore[attr-defined]
+
+    logger = SimpleNamespace(info=lambda *_: None, debug=lambda *_: None, warning=lambda *_: None)
     current_platform = SimpleNamespace(is_npu=lambda: False)
+
     target = _install_fake_module(
         monkeypatch,
         "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav",
@@ -604,18 +707,29 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
     _install_fake_module(monkeypatch, "vllm_ascend.utils", maybe_trans_nz=maybe_trans_nz)
     _install_fake_module(monkeypatch, "vllm_omni")
     _install_fake_module(monkeypatch, "vllm_omni.platforms", current_omni_platform=current_platform)
-    _install_fake_module(monkeypatch, "vllm_omni.model_executor")
-    _install_fake_module(monkeypatch, "vllm_omni.model_executor.models")
-    _install_fake_module(monkeypatch, "vllm_omni.model_executor.models.qwen3_tts")
+    # Not A5: keep the FRACTAL_Z conv weight layout for 310P.
+    _install_fake_module(monkeypatch, "vllm_omni.platforms.npu", is_a5=lambda: False)
 
-    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts_code2wav.py"
+    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts.py"
     module = _load_source_module("vllm_omni_test_qwen3_tts_code2wav_npu_patch", path)
     module.apply_qwen3_tts_code2wav_patch()
+    return module, target, linear_weights, conv_weights
 
-    model = target.Qwen3TTSCode2Wav(
-        vllm_config=SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cpu"))),
+
+def _make_patched_code2wav(target, *, dtype=torch.bfloat16):
+    return target.Qwen3TTSCode2Wav(
+        vllm_config=SimpleNamespace(
+            device_config=SimpleNamespace(device=torch.device("cpu")),
+            model_config=SimpleNamespace(dtype=dtype),
+        ),
         prefix="stage1",
     )
+
+
+def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, target, linear_weights, conv_weights = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
+    model = _make_patched_code2wav(target, dtype=torch.bfloat16)
+
     assert model.load_weights(iter(())) == {"loaded"}
 
     assert model.prefix == "stage1"
@@ -626,4 +740,17 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
         model.decoder.deconv.weight.data_ptr(),
     }
     assert all(fmt == module._ACL_FORMAT_FRACTAL_Z for _, fmt in conv_weights)
+    assert model.decoder.cache_precompute_calls == 2
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_qwen3_tts_code2wav_npu_patch_preserves_stage_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+) -> None:
+    _, target, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch, platform_dtype_override=False)
+    model = _make_patched_code2wav(target, dtype=dtype)
+
+    assert model.load_weights(iter(())) == {"loaded"}
+    assert all(parameter.dtype is dtype for parameter in model.decoder.parameters())
     assert model.decoder.cache_precompute_calls == 1

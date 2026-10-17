@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: N803, E741
 """Layer-level correctness & performance test for MoT parallel linear layers.
 
@@ -32,23 +35,24 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
-from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import (
+from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import (
     MoTQKVParallelLinear,
 )
-from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import (
+from vllm_omni.diffusion.models.bagel.mot.mot_row_parallel_linear import (
     MoTRowParallelLinear,
 )
-from vllm_omni.diffusion.layers.mot.ops.mot_gemm import (
+from vllm_omni.diffusion.models.bagel.mot.ops.mot_gemm import (
     get_best_mot_config,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -119,9 +123,9 @@ def _parse_dtype(dtype_str: str) -> DTypeConfig:
         "w16a16_bf16": DTypeConfig(torch_dtype=torch.bfloat16),
         "w16a16_fp16": DTypeConfig(torch_dtype=torch.float16),
     }
-    if dtype_str in supported:
-        return supported[dtype_str]
-    pytest.skip(f"Quantized dtype '{dtype_str}' not yet implemented in layer test")
+    if dtype_str not in supported:
+        pytest.skip(f"Quantized dtype '{dtype_str}' not yet implemented in layer test")
+    return supported[dtype_str]
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +153,8 @@ def _make_indices(image_num: int, vae_chunk_size: int, device: str = "cuda") -> 
     Pattern per image like: [1 Text] + [4096 VAE] + [1 Text]
     Returns text_indices, vae_indices, and the exact total M.
     """
-    text_idx_list = []
-    vae_idx_list = []
+    text_idx_list: list[int] = []
+    vae_idx_list: list[int] = []
 
     current_idx = 0
     for _ in range(image_num):
@@ -235,6 +239,53 @@ def _reference_forward(x, text_indices, vae_indices, text_linear, vae_linear):
     output[text_indices] = out_text
     output[vae_indices] = out_vae
     return output
+
+
+def _assert_gen_expert_parallel_metadata(layer):
+    """The secondary expert must satisfy vLLM's parallel-linear contract."""
+    for attr in (
+        "tp_rank",
+        "tp_size",
+        "input_size",
+        "input_size_per_partition",
+        "output_size",
+        "output_size_per_partition",
+    ):
+        assert getattr(layer.gen_exp, attr) == getattr(layer, attr)
+
+
+def test_mot_gen_expert_parallel_metadata():
+    """Keep secondary experts compatible with vLLM online quantizers."""
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        _is_tp_sharded,
+    )
+
+    with set_current_vllm_config(VllmConfig()):
+        layers = (
+            MoTQKVParallelLinear(
+                hidden_size=16,
+                head_size=4,
+                total_num_heads=4,
+                total_num_kv_heads=2,
+                bias=False,
+                vae_bias=False,
+                params_dtype=torch.bfloat16,
+                disable_tp=True,
+            ),
+            MoTRowParallelLinear(
+                16,
+                8,
+                bias=False,
+                vae_bias=False,
+                input_is_parallel=True,
+                params_dtype=torch.bfloat16,
+                disable_tp=True,
+            ),
+        )
+
+    for layer in layers:
+        _assert_gen_expert_parallel_metadata(layer)
+        assert _is_tp_sharded(layer.gen_exp) is False
 
 
 def _check_and_report(ref: torch.Tensor, mot: torch.Tensor, tag: str):
@@ -335,6 +386,8 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str, bias: bool
             disable_tp=True,
         ).cuda()
 
+        _assert_gen_expert_parallel_metadata(mot_linear)
+
         assert text_linear.output_size_per_partition == N, (
             f"Expected output_size_per_partition={N}, "
             f"got {text_linear.output_size_per_partition}. "
@@ -423,6 +476,8 @@ def test_mot_o_proj(
             disable_tp=True,
         ).cuda()
 
+        _assert_gen_expert_parallel_metadata(mot_linear)
+
         _sync_weights(text_linear, vae_linear, mot_linear)
 
         text_idx, vae_idx, M = _make_indices(image_num, _VAE_CHUNK_SIZE)
@@ -501,6 +556,13 @@ def test_mot_qkv_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # vLLM linear layers leave weights uninitialized (torch.empty), so
+            # a freshly zeroed GPU page would make both outputs zero and the
+            # cosine-similarity gate degenerate. Seed deterministic values so
+            # und-mode is compared against a meaningful reference.
+            ref_linear.weight.normal_(mean=0.0, std=0.02)
+            if ref_linear.bias is not None:
+                ref_linear.bias.normal_(mean=0.0, std=0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)
@@ -549,6 +611,13 @@ def test_mot_row_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # vLLM linear layers leave weights uninitialized (torch.empty), so
+            # a freshly zeroed GPU page would make both outputs zero and the
+            # cosine-similarity gate degenerate. Seed deterministic values so
+            # und-mode is compared against a meaningful reference.
+            ref_linear.weight.normal_(mean=0.0, std=0.02)
+            if ref_linear.bias is not None:
+                ref_linear.bias.normal_(mean=0.0, std=0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)

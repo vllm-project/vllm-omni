@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request mutable state for step-wise diffusion execution."""
 
 from __future__ import annotations
@@ -12,6 +12,10 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.interaction.types import (
+        InteractionChunkMetadata,
+        InteractionSession,
+    )
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -80,6 +84,7 @@ class StepRequestState:
     # Opaque model-owned preprocessing result. Scheduler-owned Diffusion KV
     # request state is removed before this Worker state is built.
     prepared_layout: Any | None = None
+    external_req_id: str | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None
@@ -99,6 +104,11 @@ class StepRequestState:
     step_in_chunk: int = 0
     total_chunks: int = 1
     chunk_num_steps: int | None = None
+
+    # ── Optional interaction information in streaming output mode ──
+    interaction_sessions: dict[str, InteractionSession] = field(default_factory=dict)  # Modality -> transition progress
+    interaction_chunk_metadata: InteractionChunkMetadata | None = None  # Acknowledging completion of each interaction
+    pending_chunk_boundary: bool = False
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
@@ -187,6 +197,8 @@ class RunnerOutput(BaseRunnerOutput):
     finished: bool = False
     result: DiffusionOutput | None = None
     async_output_id: str | None = None
+    streaming_media_duration: float = 0.0
+    streaming_next_media_duration: float = 0.0
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None

@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TypeGuard, cast
+from typing import Any, TypeGuard, cast
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.io_support import supports_audio_output
+from vllm_omni.diffusion.io_support import get_diffusion_output_type, supports_audio_output
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniPromptType
@@ -106,6 +106,7 @@ def format_empty_diffusion_outputs(
     request: OmniDiffusionRequest,
     *,
     finished: bool = True,
+    custom_output: dict[str, Any] | None = None,
 ) -> list[OmniRequestOutput]:
     return [
         OmniRequestOutput.from_diffusion(
@@ -114,6 +115,7 @@ def format_empty_diffusion_outputs(
             prompt=request.prompt,
             metrics={},
             latents=None,
+            custom_output=custom_output,
             finished=finished,
         )
     ]
@@ -146,6 +148,11 @@ def format_diffusion_outputs(
     is_text_output = postprocess_output.primary_key == "text"
 
     is_audio_output = supports_audio_output(od_config.model_class_name)
+    final_output_type = (
+        postprocess_output.primary_key
+        if postprocess_output.primary_key in {"image", "video"}
+        else get_diffusion_output_type(od_config.model_class_name)
+    )
     audio_sample_rate = _metadata_audio_sample_rate(postprocess_output.metadata)
     if is_audio_output and audio_sample_rate is None:
         model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
@@ -167,6 +174,7 @@ def format_diffusion_outputs(
         postprocess_output=postprocess_output,
         is_text_output=is_text_output,
         is_audio_output=is_audio_output,
+        final_output_type=final_output_type,
         audio_sample_rate=audio_sample_rate,
         finished=diffusion_output.finished,
     )
@@ -179,6 +187,7 @@ def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) ->
         or bool(diffusion_output.started_event_ids)
         or bool(diffusion_output.active_event_ids)
         or bool(diffusion_output.completed_event_ids)
+        or bool(diffusion_output.streaming_metrics)
     )
     if not has_stream_data:
         return None
@@ -186,6 +195,11 @@ def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) ->
         DiffusionMetadata,
         {
             "generation_chunk_index": diffusion_output.chunk_index,
+            **(
+                {"output_chunk_index": diffusion_output.chunk_index, "pacing": diffusion_output.streaming_metrics}
+                if diffusion_output.streaming_metrics
+                else {}
+            ),
             "started_event_ids": diffusion_output.started_event_ids,
             "active_event_ids": diffusion_output.active_event_ids,
             "completed_event_ids": diffusion_output.completed_event_ids,
@@ -272,6 +286,7 @@ def _format_single_prompt_output(
     postprocess_output: DiffusionPostprocessOutput,
     is_text_output: bool,
     is_audio_output: bool,
+    final_output_type: str,
     audio_sample_rate: int | None,
     finished: bool = True,
 ) -> list[OmniRequestOutput]:
@@ -339,6 +354,7 @@ def _format_single_prompt_output(
             trajectory_log_probs=trajectory_log_probs,
             trajectory_decoded=trajectory_decoded,
             multimodal_output=mm_output,
+            final_output_type=final_output_type,
             stage_durations=diffusion_output.stage_durations,
             peak_memory_mb=diffusion_output.peak_memory_mb,
             finished=finished,
