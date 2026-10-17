@@ -366,7 +366,7 @@ steps:
             VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="LBH-123-AI/Minimax_h3_latent_Upscaler", filename="minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"))')
             VLLM_OMNI_SERVER_STORAGE__PATH=$(mktemp -d)
             export VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER VLLM_OMNI_SERVER_STORAGE__PATH
-            trap 'rm -rf "$VLLM_OMNI_SERVER_STORAGE__PATH"' EXIT
+            trap 'rm -rf "$$VLLM_OMNI_SERVER_STORAGE__PATH"' EXIT
             timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
       - label: ":full_moon: Diffusion X2V · MiniMax-H3 DLO Perf Test"
         key: nightly-diffusion-x2v-performance-minimax-h3
