@@ -440,6 +440,30 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     assert "kv_cache_dtype_skip_layers" not in typed_args[1]
 
 
+def test_llm_stage_keeps_quantization_method_next_to_its_config(monkeypatch):
+    from vllm.config.quantization import resolve_quantization_config
+
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
+
+    pipeline = OMNI_PIPELINES["mammoth_moda2"]
+    deploy = load_deploy_config(_DEPLOY_DIR / "mammoth_moda2.yaml")
+    deploy.stages[0].engine_extras["quantization"] = "fp8_per_channel"
+    deploy.stages[0].engine_extras["quantization_config"] = {"ignore": ["*.mlp.gate"]}
+    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model="test-model")
+
+    legacy_args = build_legacy_engine_args_dict(legacy_stages[0], "test-model")
+    typed_args = build_engine_args_dict_from_omni_stage_config(omni_config.stage_by_id(0), "test-model")
+
+    for engine_args in (legacy_args, typed_args):
+        assert engine_args["quantization"] == "fp8_per_channel"
+        assert engine_args["quantization_config"] == {"ignore": ["*.mlp.gate"]}
+    resolved = resolve_quantization_config(typed_args["quantization"], typed_args["quantization_config"])
+    assert resolved.moe is not None
+    assert resolved.ignore == ["*.mlp.gate"]
+    dit_args = build_engine_args_dict_from_omni_stage_config(omni_config.stage_by_id(1), "test-model")
+    assert "quantization" not in dit_args
+
+
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
     stage_config = VllmOmniARStageConfig(
         stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
