@@ -27,9 +27,9 @@ import torch
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.transformers_utils.repo_utils import hf_api
@@ -46,7 +46,34 @@ _AR_PATCH_SIZE = 16
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
+_BASELINE_DEPLOY_CONFIG = modify_stage_config(
+    T2I_DEPLOY_CONFIG,
+    updates={
+        "stages": {
+            0: {"limit_mm_per_prompt": {"image": 0, "video": 0}},
+            1: {"devices": "0", "parallel_config": {"use_hsdp": False}},
+        }
+    },
+)
+_HSDP_DEPLOY_CONFIG = modify_stage_config(
+    T2I_DEPLOY_CONFIG,
+    updates={
+        "stages": {
+            0: {"limit_mm_per_prompt": {"image": 0, "video": 0}},
+            1: {
+                "devices": "0,1",
+                "parallel_config": {
+                    "use_hsdp": True,
+                    "hsdp_shard_size": 2,
+                    "hsdp_replicate_size": 1,
+                },
+            },
+        }
+    },
+)
+
+_OMNI_RUNNER_PARAM = (MODEL_PATH, _BASELINE_DEPLOY_CONFIG)
+_HSDP_RUNNER_PARAM = (MODEL_PATH, _HSDP_DEPLOY_CONFIG)
 
 # Optional golden pixel reference file. Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
@@ -129,9 +156,21 @@ def test_diffusion_output_exposes_images_at_top_level():
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
-@hardware_test(res={"cuda": "H100"})
-def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
+@pytest.mark.parametrize(
+    "omni_runner,guidance_scale,use_hsdp",
+    [
+        pytest.param(_OMNI_RUNNER_PARAM, 1.0, False, id="baseline", marks=hardware_marks(res={"cuda": "H100"})),
+        pytest.param(
+            _HSDP_RUNNER_PARAM,
+            4.0,
+            True,
+            id="hsdp-cfg",
+            marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
+        ),
+    ],
+    indirect=["omni_runner"],
+)
+def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner, guidance_scale: float, use_hsdp: bool):
     """
     End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
 
@@ -154,6 +193,12 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     formatted_prompt = _format_t2i_prompt(prompt_text, ar_width, ar_height)
 
     omni = omni_runner.omni
+    parallel = next(stage for stage in omni.stage_configs if stage.stage_id == 1).parallel_config
+    assert parallel.use_hsdp is use_hsdp
+    if use_hsdp:
+        assert parallel.hsdp_shard_size == 2
+        assert parallel.hsdp_replicate_size == 1
+
     ar_sampling = SamplingParams(
         temperature=0.0,
         top_k=1,
@@ -164,7 +209,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
         height=height,
         width=width,
         seed=42,
-        guidance_scale=1.0,
+        guidance_scale=guidance_scale,
         num_inference_steps=2,
         extra_args={"cfg_range": [0.0, 1.0]},
     )
@@ -205,6 +250,9 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     assert isinstance(image, Image.Image), f"Expected PIL image, got {type(image)}"
     assert image.mode == "RGB"
     assert image.size == (width, height)
+
+    if use_hsdp:
+        return  # The optional golden fixture belongs to the baseline configuration.
 
     sampled = _sample_pixels(_pil_to_tensor(image))
 
