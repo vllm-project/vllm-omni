@@ -26,6 +26,7 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniMiniMaxH3TemporalMask,
     VLLMOmniQwenTTSParams,
     VLLMOmniRemoteLoRA,
+    VLLMOmniRestoreVideo,
     VLLMOmniSamplingParamsList,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
@@ -39,6 +40,7 @@ NODE_CLASS_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
     "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
+    "VLLMOmniRestoreVideo": VLLMOmniRestoreVideo,
     "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
     "VLLMOmniTTS": VLLMOmniTTS,
     "VLLMOmniGenerateMusic": VLLMOmniGenerateMusic,
@@ -62,6 +64,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",
+    "VLLMOmniRestoreVideo": "Restore Video (SeedVR2)",
     "VLLMOmniUnderstanding": "Multimodality Understanding",
     "VLLMOmniTTS": "TTS (Text to Speech)",
     "VLLMOmniGenerateMusic": "Generate Music",

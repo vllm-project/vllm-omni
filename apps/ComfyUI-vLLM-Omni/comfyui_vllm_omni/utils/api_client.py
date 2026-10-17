@@ -24,6 +24,7 @@ from .format import (
     base64_to_audio,
     base64_to_image_tensor,
     bytes_to_audio,
+    bytes_to_restored_video,
     bytes_to_video,
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
@@ -461,41 +462,83 @@ class VLLMOmniClient:
             if extra_params:
                 form.add_field("extra_params", json.dumps(extra_params, ensure_ascii=False))
 
+        return bytes_to_video(await self._submit_video_job(form))
+
+    async def restore_video(
+        self,
+        *,
+        model: str,
+        video: VideoInput,
+        width: int,
+        height: int,
+        seed: int,
+    ) -> VideoInput:
+        """Restore a whole clip through a served SeedVR2 instance."""
+        if video is None:
+            raise ValueError("SeedVR2 restoration requires a VIDEO input; connect Load Video or Generate Video.")
+        if not model.strip():
+            raise ValueError("Model must not be empty.")
+        if width <= 0 or height <= 0 or width % 16 or height % 16:
+            raise ValueError("SeedVR2 output width and height must be positive multiples of 16.")
+
+        frame_rate = video.get_frame_rate()
+        form = aiohttp.FormData()
+        for name, value in {
+            "model": model,
+            "prompt": " ",
+            "size": f"{width}x{height}",
+            "num_inference_steps": "1",
+            "guidance_scale": "1",
+            "seed": str(seed),
+        }.items():
+            form.add_field(name, value)
+        # Leave fps and num_frames unset: the server reads both from the source.
+        form.add_field(
+            "input_references",
+            video_to_bytes(video, "source.mp4", format="mp4"),
+            filename="source.mp4",
+            content_type="video/mp4",
+        )
+        # The MP4 response encoder can round fractional FPS. The source VIDEO
+        # remains authoritative for restoration timing.
+        return bytes_to_restored_video(await self._submit_video_job(form), frame_rate)
+
+    async def _submit_video_job(self, form: aiohttp.FormData) -> bytes:
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
             # Start the video generation job
             url = f"{self.base_url}/videos"
-            data = await url_json(session, url, "post", data=form)
+            try:
+                data = await url_json(session, url, "post", data=form)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Timed out submitting video job to vLLM-Omni") from exc
             if (job_id := data.get("id", None)) is None:
                 raise RuntimeError("API response missing job 'id' field - expected OpenAI compliant format")
-            if (job_status := data.get("status", None)) is None:
-                raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
-
-            # Poll for video generation job completion
-            deadline = asyncio.get_running_loop().time() + self.max_poll_duration
             url = f"{self.base_url}/videos/{job_id}"
-            while job_status not in {"completed", "failed"}:
-                await asyncio.sleep(self.poll_interval)
-
-                data = await url_json(session, url)
-                if (job_status := data.get("status", None)) is None:
-                    raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise RuntimeError(f"Timed out waiting for video job {job_id} to complete")
-
-            if job_status == "failed":
-                raise RuntimeError(f"Video job failed: {data}")
-
-            # Retrieve completed content
-            video_bytes = await url_bytes(session, f"{url}/content")
-
-            # Decode video and make a best effort at cleaning up server resources
             try:
-                return bytes_to_video(video_bytes)
+                return await asyncio.wait_for(
+                    self._video_job_content(session, url, data), timeout=self.max_poll_duration
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(f"Timed out waiting for video job {job_id} to complete") from exc
             finally:
                 try:
-                    await url_json(session, url, "delete")
+                    # Cleanup must not turn a timeout/cancellation into an
+                    # unbounded wait when the server is unavailable.
+                    cleanup_timeout = aiohttp.ClientTimeout(total=min(10, self.timeout.total or 10))
+                    await url_json(session, url, "delete", timeout=cleanup_timeout)
                 except Exception as exc:
                     logger.warning("Failed to clean up video job %s: %s", job_id, exc)
+
+    async def _video_job_content(self, session: aiohttp.ClientSession, url: str, data: dict) -> bytes:
+        while True:
+            if (status := data.get("status")) is None:
+                raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
+            if status == "completed":
+                return await url_bytes(session, f"{url}/content")
+            if status == "failed":
+                raise RuntimeError(f"Video job failed: {data}")
+            await asyncio.sleep(self.poll_interval)
+            data = await url_json(session, url)
 
     async def generate_understanding_chat_completion(
         self,

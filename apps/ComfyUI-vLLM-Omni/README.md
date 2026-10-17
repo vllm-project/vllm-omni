@@ -49,6 +49,8 @@ This extension offers the following nodes based on the output modalities (at **C
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
+- **Restore Video (SeedVR2)** for remote VIDEO restoration with source FPS and audio;
+  see the [standalone and H3 chaining guide](docs/seedvr2-restoration.md).
 - **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
@@ -64,7 +66,7 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 
 | Colour | Nodes | What they produce |
 | --- | --- | --- |
-| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Blue | Generate Image, Generate Video, Restore Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated or restored image, video, audio, or text. These are the only nodes that reach a server. |
 | Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
 | Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
 | Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
