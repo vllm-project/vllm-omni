@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -81,18 +81,63 @@ def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
     return True
 
 
-def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
+def _attention_isolates_packed_requests(attention_layer: Any, backend: Any = None) -> bool:
     """True if this attention layer keeps N-document packed boundaries.
 
     Requires a backend advertising ``supports_multi_doc_packed_varlen`` *and*
     that the layer is not running under ring sequence parallelism (the ring
     kernel dispatches through its own attention that ignores the packed
-    cu_seqlens regardless of the configured backend).
+    cu_seqlens regardless of the configured backend). ``backend`` defaults to
+    the layer's baseline; a forward passes the backend it will run.
     """
-    backend = getattr(attention_layer, "attn_backend", None)
+    if backend is None:
+        backend = getattr(attention_layer, "attn_backend", None)
     if backend is None or not backend.supports_multi_doc_packed_varlen():
         return False
     return not _ring_sequence_parallel_is_active(attention_layer)
+
+
+def _effective_attention_backend(attention_layer: Any) -> Any:
+    """Backend this forward runs: the scheduled candidate during an active denoise step, else the baseline."""
+    effective_attention = getattr(attention_layer, "effective_attention", None)
+    if effective_attention is None:
+        return getattr(attention_layer, "attn_backend", None)
+    return effective_attention()[1]
+
+
+def _candidate_excludes_packed_padding(record: Any) -> str | None:
+    """Schedule candidate check: every DiT forward pads its packed documents to the sequence alignment."""
+    backend = record.backend_cls
+    if (
+        backend.supports_packed_mask_free()
+        or backend.supports_prefix_kv_slicing
+        or backend.supports_attention_mask(record.spec)
+    ):
+        return None
+    return (
+        "MiniMax H3 pads every packed document, and this backend supports neither mask-free packed "
+        "padding, prefix K/V slicing nor an attention mask, so it cannot exclude the padding rows"
+    )
+
+
+def _fasth3_requires_vsa_candidate(record: Any) -> str | None:
+    """Schedule candidate check for FastH3 VSA students, registered once their gates are built."""
+    if record.backend_cls.get_name() == "FASTVIDEO_VSA":
+        return None
+    return (
+        "the FastH3 student was distilled for FASTVIDEO_VSA and its compression gates are read only by "
+        "that backend, so every DiT profile must select FASTVIDEO_VSA"
+    )
+
+
+def _vdn_requires_vdnh3_candidate(record: Any) -> str | None:
+    """Schedule candidate check for VDN-H3 checkpoints, registered by MiniMaxH3Attention.enable_vdn."""
+    if record.backend_cls.get_name() == "VDNH3_ATTN":
+        return None
+    return (
+        "the VDN-H3 checkpoint pairs its learned attention half with the VDNH3_ATTN frame window, which "
+        "every other backend ignores, so every DiT profile must select VDNH3_ATTN"
+    )
 
 
 @dataclass
@@ -244,6 +289,32 @@ class MiniMaxH3Attention(nn.Module):
         )
         if hasattr(self.to_gate_compress, "weight"):
             nn.init.zeros_(self.to_gate_compress.weight)
+        self.add_schedule_candidate_check(_fasth3_requires_vsa_candidate)
+
+    def add_schedule_candidate_check(self, check: Callable[[Any], str | None]) -> None:
+        """Register a startup check on the inner attention; test doubles without the hook skip it."""
+        add_check = getattr(self.attention, "add_schedule_candidate_check", None)
+        if add_check is not None:
+            add_check(check)
+
+    def _vsa_candidate_needs_gate(self, record: Any) -> str | None:
+        """Schedule candidate check: MiniMaxH3VSAImpl routes by H3 segments only when a VSA gate exists.
+
+        A gateless layer whose baseline is already FASTVIDEO_VSA runs the same dense fallback without
+        a schedule, so the candidate changes nothing there. This covers transformers_ref in the
+        combined partition under FastH3 VSA, which gates only self.transformer while the FastH3
+        contract resolves every self role to FASTVIDEO_VSA, and base H3 served with that baseline.
+        """
+        if record.backend_cls.get_name() != "FASTVIDEO_VSA" or self.to_gate_compress is not None:
+            return None
+        baseline = getattr(self.attention, "attn_backend", None)
+        if baseline is not None and baseline.get_name() == "FASTVIDEO_VSA":
+            return None
+        return (
+            "this attention has no VSA compression gate, so it never passes vsa_h3_prefix_segments and "
+            "FASTVIDEO_VSA would run dense SDPA at every scheduled step; serve a FastH3 VSA checkpoint or "
+            "select another backend for the profile"
+        )
 
     def enable_vdn(self, config: VDNConfig) -> None:
         """Attach the learned half of VDN-H3 hybrid attention (see ``vdnh3.py``)."""
@@ -258,6 +329,7 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=self._gate_quant_config,
             prefix=f"{self._prefix}.vdn",
         )
+        self.add_schedule_candidate_check(_vdn_requires_vdnh3_candidate)
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -323,9 +395,13 @@ class MiniMaxH3Attention(nn.Module):
         attn_mask = None
         mask_free_packed_padding = False
         use_ring = _ring_sequence_parallel_is_active(self.attention)
+        # Read once per forward: during an active scheduled denoise step this is
+        # the candidate the layer dispatches to, and the packed layout below
+        # must match that backend rather than the baseline.
+        backend = _effective_attention_backend(self.attention)
         if num_requests > 1:
-            if not _attention_isolates_packed_requests(self.attention):
-                backend_name = self.attention.attn_backend.get_name()
+            if not _attention_isolates_packed_requests(self.attention, backend):
+                backend_name = backend.get_name()
                 raise ValueError(
                     f"MiniMax H3 packed a {num_requests}-request batch, but the resolved "
                     f"attention ({backend_name}, use_ring={getattr(self.attention, 'use_ring', False)}) "
@@ -338,16 +414,14 @@ class MiniMaxH3Attention(nn.Module):
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
             mask_free_packed_padding = not use_ring and (
-                self.attention.attn_backend.supports_packed_mask_free()
+                backend.supports_packed_mask_free()
                 or (
                     reference_kv_compact
-                    and self.attention.attn_backend.get_name() == "RAINFUSION_ATTN"
+                    and backend.get_name() == "RAINFUSION_ATTN"
                     and FlashAttentionBackend.supports_packed_mask_free()
                 )
             )
-            no_mask = not use_ring and (
-                self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
-            )
+            no_mask = not use_ring and (backend.supports_prefix_kv_slicing or mask_free_packed_padding)
             # Hybrid Ulysses reshards Q to one ring partition before the ring
             # kernel runs, so a global key mask cannot pass its query-length
             # check. Ring consumes valid_kv_length directly.
@@ -709,6 +783,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.attn",
         )
+        # Startup checks for attention schedule candidates. Only DiT blocks see
+        # padded packed documents and can carry a VSA gate. The token refiner's
+        # text rows are unpadded, and FASTVIDEO_VSA falls back to dense SDPA
+        # there for the baseline too, so the refiner registers neither check.
+        self.attn.add_schedule_candidate_check(_candidate_excludes_packed_padding)
+        self.attn.add_schedule_candidate_check(self.attn._vsa_candidate_needs_gate)
         self.mlp = MiniMaxH3MLP(
             arch,
             quant_config,
