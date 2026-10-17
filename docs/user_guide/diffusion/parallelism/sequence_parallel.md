@@ -254,6 +254,17 @@ In `DiffusionParallelConfig`:
 
 ---
 
+## Compiling FA4 Ring attention
+
+FA4 Ring attention compilation requires PyTorch 2.14 or newer, CuTe
+FlashAttention-4, and `torch.compile` enabled. Set the following before starting
+the application or workers to enable experimental native P2P compilation and
+avoid graph breaks at Ring communication:
+
+```bash
+export TORCHDYNAMO_ENABLE_P2P_COMPILATION=1
+```
+
 ## Troubleshooting
 
 ### Common Issue 1: Performance Not Scaling
