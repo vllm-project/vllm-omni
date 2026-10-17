@@ -837,6 +837,37 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   await app.ui.stopSession({ terminal: false });
 });
 
+test('AURA vision-follow holds the camera until the open turn is acknowledged', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  app.ui.setPendingFrame('IDLE1');
+  app.ui.flushCapture();
+  app.ui.setPendingFrame('IDLE2');
+  app.ui.flushCapture();
+  assert.equal(app.ui.state().visionTurnLocked, true);
+  const firstCommit = app.sockets[0].sent.at(-1);
+  assert.equal(firstCommit.type, 'input_audio_buffer.commit');
+  app.ui.setPendingFrame('IDLE3');
+  app.ui.flushCapture();
+  app.ui.setPendingFrame('IDLE4');
+  app.ui.flushCapture();
+  assert.equal(visionAppends(app).length, 1, 'a second clip before acknowledgement aborts the first turn');
+  await app.ui.handleEvent({
+    type: 'error',
+    error: { code: 'commit_aborted', message: 'Commit rejected', event_id: 'someone-else' },
+  });
+  app.ui.flushCapture();
+  assert.equal(visionAppends(app).length, 1, 'another turn\'s error must not reopen the camera');
+  await app.ui.handleEvent({
+    type: 'error',
+    error: { code: 'commit_aborted', message: 'Commit rejected', event_id: firstCommit.event_id },
+  });
+  assert.equal(app.ui.state().visionTurnLocked, false);
+  app.ui.flushCapture();
+  assert.deepEqual(visionAppends(app).at(-1).video_frames, ['IDLE3', 'IDLE4']);
+  await app.ui.stopSession({ terminal: false });
+});
+
 test('AURA hold-to-talk stops local playback and does not cancel the response', async () => {
   const app = shell('aura-ptt', 'manual', { realPlayback: true });
   await app.ui.startSession();

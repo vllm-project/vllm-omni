@@ -87,6 +87,7 @@
   // AURA vision clock only. Other profiles leave this empty and never read it.
   let visionFollowQueue = [];
   let visionTurnLocked = false;
+  let visionFollowCommitId = null;
   let suppressedPlaybackId = null;
   let pttHeld = false;
   let pttUploadedInput = false;
@@ -388,13 +389,30 @@
     const silent = new Int16Array(SILENT_PCM_SAMPLES);
     const event = profile.append(int16ToBase64(silent), frames, { isSpeech: false });
     socket.send(JSON.stringify(event));
-    for (const message of profile.commitMessages()) socket.send(JSON.stringify(message));
+    for (const message of profile.commitMessages()) {
+      const stamped = { ...message };
+      if (!stamped.event_id) stamped.event_id = `web-vision-${++commitCounter}`;
+      visionFollowCommitId = stamped.event_id;
+      socket.send(JSON.stringify(stamped));
+    }
+    // Stage0 is max_num_seqs=1. Another two-frame commit before this turn
+    // is acknowledged aborts it, so the camera never gets an answer.
+    visionTurnLocked = true;
   }
 
   function releaseVisionTurn(responseId) {
     if (!profile.visionFollowWhileSpeaking || !visionTurnLocked) return;
     if (responseId && currentResponseId && responseId !== currentResponseId) return;
     visionTurnLocked = false;
+    visionFollowCommitId = null;
+  }
+
+  function releaseRejectedVisionFollow(eventId) {
+    // Only the vision commit that took the lock may give it back. A PTT
+    // commit uses the same lock to stop the camera aborting speech.
+    if (!eventId || eventId !== visionFollowCommitId) return;
+    if (currentResponseId || turnSubmitted) return;
+    releaseVisionTurn();
   }
 
   function suppressLocalPlayback() {
@@ -688,6 +706,7 @@
         if (echoTimer !== null) { clearTimeout(echoTimer); echoTimer = null; }
         beginAssistant(responseId);
         if (profile.visionFollowWhileSpeaking) visionTurnLocked = true;
+        visionFollowCommitId = null;
         break;
       case 'audio':
         await handleAudioEvent(action);
@@ -726,10 +745,12 @@
         break;
       case 'commit-settled':
         settleCommitWithoutResponse(action.eventId);
+        releaseRejectedVisionFollow(action.eventId);
         break;
       case 'error':
         if (action.fatal) { await failSession(action.message); break; }
         settleCommitWithoutResponse(event.error?.event_id);
+        releaseRejectedVisionFollow(event.error?.event_id);
         // A rejected frame or a refused update costs one operation, not the
         // call: report it and keep listening.
         appendLog(action.message, true);
@@ -908,6 +929,7 @@
       assistantActive = false;
       visionFollowQueue = [];
       visionTurnLocked = false;
+      visionFollowCommitId = null;
       suppressedPlaybackId = null;
       sendTimer = window.setInterval(flushCapture, profile.sendIntervalMs || SEND_INTERVAL_MS);
       startClock();
@@ -1035,6 +1057,7 @@
     assistantActive = false;
     visionFollowQueue = [];
     visionTurnLocked = false;
+    visionFollowCommitId = null;
     suppressedPlaybackId = null;
     pendingCapture = [];
     if (sendTimer !== null) clearInterval(sendTimer);

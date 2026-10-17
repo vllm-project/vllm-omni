@@ -226,14 +226,14 @@ class AuraDuplexPlugin(DuplexModelPlugin):
             wav, sample_rate_hz = _decode_pcm_f32le(payload)
         else:
             wav, sample_rate_hz = np.zeros(0, dtype=np.float32), int(payload.get("sample_rate_hz") or 16000)
-        # Vision-follow commits often carry empty or near-silent PCM with
-        # is_speech=False. All-zero audio crashes Qwen3ASRProcessor, and an
-        # empty Stage0 prompt is rejected ("decoder prompt cannot be empty").
-        # Also guard is_speech=True + empty-audio + frames (prompt was "").
+        # All-zero / near-zero PCM crashes Qwen3ASRProcessor, and an empty
+        # Stage0 prompt is rejected ("decoder prompt cannot be empty").
+        # Vision-follow sends that pad with is_speech=False. A quiet PTT hold
+        # sends the same zeros with is_speech=True, with or without frames.
         sample_rate_hz = int(sample_rate_hz or payload.get("sample_rate_hz") or 16000)
         wav_rms = float(np.sqrt(np.mean(np.square(wav.astype(np.float32, copy=False))))) if wav.size else 0.0
         near_silent = wav.size == 0 or not np.any(wav) or wav_rms < 1e-3
-        if mm and (not has_audio or (not is_speech and near_silent)):
+        if near_silent and (has_audio or mm):
             n = max(1600, int(sample_rate_hz) // 10)
             wav = np.linspace(1e-4, -1e-4, n, dtype=np.float32)
             has_audio = True

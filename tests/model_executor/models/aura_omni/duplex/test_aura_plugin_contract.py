@@ -202,10 +202,14 @@ def test_plan_append_vision_empty_audio_never_leaves_empty_prompt() -> None:
     frame = base64.b64encode(buf.getvalue()).decode("ascii")
     fence = DuplexFence("sess-v", epoch=0, turn_id=1)
     near = np.linspace(1e-5, -1e-5, 80, dtype="<f4")
+    zeros = np.zeros(160, dtype="<f4")
+    loud = np.full(160, 0.2, dtype="<f4")
     cases = [
         ("empty_speech_true", True, ""),
         ("empty_speech_false", False, ""),
         ("near_silent", False, base64.b64encode(near.tobytes()).decode("ascii")),
+        ("near_silent_speech", True, base64.b64encode(near.tobytes()).decode("ascii")),
+        ("all_zero_speech", True, base64.b64encode(zeros.tobytes()).decode("ascii")),
     ]
     for name, is_speech, audio in cases:
         payload = {
@@ -232,6 +236,36 @@ def test_plan_append_vision_empty_audio_never_leaves_empty_prompt() -> None:
         assert plan.prompt.get("prompt"), f"{name}: Stage0 prompt must be non-empty"
         assert "audio" in plan.prompt["multi_modal_data"], f"{name}: padded audio required"
         assert "deferred_multi_modal_data" in plan.prompt["additional_information"]
+
+    def _plan(audio: str, frames: list[str] | None) -> dict:
+        payload = {
+            "type": "audio",
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "audio": audio,
+            "final": True,
+            "aura_turn_commit": True,
+            "is_speech": True,
+        }
+        if frames is not None:
+            payload["video_frames"] = frames
+        return plugin.plan_append(
+            request_id="req",
+            fence=fence,
+            session_config={},
+            runtime_config={},
+            seq=1,
+            turn_seq=1,
+            payload=payload,
+            final=True,
+            sampling_params=SamplingParams(max_tokens=8),
+        ).prompt
+
+    loud_wav = _plan(base64.b64encode(loud.tobytes()).decode("ascii"), [frame])["multi_modal_data"]["audio"][0]
+    assert loud_wav.shape == (160,)
+    assert float(np.max(np.abs(loud_wav))) > 0.1
+    quiet_wav = _plan(base64.b64encode(zeros.tobytes()).decode("ascii"), None)["multi_modal_data"]["audio"][0]
+    assert quiet_wav.shape[0] >= 1600
 
 
 def test_project_intermediate_output_targets_stage1_only() -> None:
