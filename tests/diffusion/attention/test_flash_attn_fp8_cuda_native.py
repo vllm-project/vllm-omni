@@ -5,6 +5,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from vllm import _custom_ops as ops
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -42,7 +43,7 @@ def test_fp8_constant_v_native(seq_len, head_dim):
 @pytest.mark.parametrize("q_heads,kv_heads", [(4, 4), (4, 2), (8, 2), (4, 1)])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("head_dim", [96, 128, 192, 256])
 @torch.inference_mode()
 def test_fp8_per_tensor_native(q_heads, kv_heads, causal, dtype, head_dim):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
@@ -105,6 +106,45 @@ def test_fp8_fused_qkv_views_match_contiguous_inputs():
     actual = impl.forward_cuda(query, key, value, metadata)
     expected = impl.forward_cuda(query.contiguous(), key.contiguous(), value.contiguous(), metadata)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": ["H100", "H200"]}, num_cards=1)
+@pytest.mark.parametrize("head_dim", [16, 48, 96, 128, 192, 256])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seq", [1, 3, 5])
+@torch.inference_mode()
+def test_fp8_hadamard_normalization_and_input_ownership_native(mocker, head_dim, dtype, seq):
+    """Validate the real upstream rotation on partial tiles and fused views."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("FA3 FP8 requires SM90")
+
+    torch.manual_seed(12)
+    batch, heads = 1, 2
+    projected = torch.randn(batch, seq, 3, heads, head_dim, device="cuda", dtype=dtype)
+    original = projected.clone()
+    query, key, value = projected.unbind(dim=2)
+    rotated = []
+    upstream_hadamard = ops.hadacore_transform
+
+    def capture_rotation(x, inplace=False):
+        result = upstream_hadamard(x, inplace=inplace)
+        rotated.append(result.flatten()[: query.numel()].reshape(query.shape).float())
+        return result
+
+    mocker.patch.object(ops, "hadacore_transform", side_effect=capture_rotation)
+    impl = FlashAttentionImpl(heads, head_dim, head_dim**-0.5)
+    output = impl.forward_cuda(query, key, value, AttentionMetadata(extra={"kv_cache_dtype": "fp8"}))
+    assert len(rotated) == 2
+    actual_scores = torch.einsum("bqhd,bkhd->bhqk", *rotated)
+    reference_scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float())
+    # Normalize by input norms: a one-token QK score can be near zero even
+    # when both vectors are large, making relative score error ill-conditioned.
+    assert (actual_scores - reference_scores).norm() / (query.float().norm() * key.float().norm()) < 0.005
+    for actual, source in zip(rotated, (query, key)):
+        torch.testing.assert_close(actual.norm(dim=-1), source.float().norm(dim=-1), rtol=0.005, atol=0)
+    torch.testing.assert_close(projected, original, rtol=0, atol=0)
+    assert output.shape == query.shape and output.dtype == dtype
+    assert torch.isfinite(output).all()
 
 
 @hardware_test(res={"cuda": ["H100", "H200"]}, num_cards=1)

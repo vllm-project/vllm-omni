@@ -31,6 +31,15 @@ def _randn_bshd(
     return torch.randn(batch, seq, heads, head_dim, dtype=dtype)
 
 
+def _reference_hadamard(x: torch.Tensor) -> torch.Tensor:
+    """Independent normalized Sylvester matrix reference for the CUDA op."""
+    dim = x.shape[-1]
+    matrix = torch.ones(1, 1, dtype=torch.float32)
+    while matrix.shape[0] < dim:
+        matrix = torch.cat((torch.cat((matrix, matrix), 1), torch.cat((matrix, -matrix), 1)), 0)
+    return (x.float() @ (matrix / dim**0.5)).to(x.dtype)
+
+
 @pytest.fixture
 def cpu_fp8_quant(monkeypatch, mocker):
     # The production path uses vLLM's CUDA custom op. CPU tests substitute
@@ -39,6 +48,13 @@ def cpu_fp8_quant(monkeypatch, mocker):
     quantizer = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR, compile_native=False)
     quantize = mocker.Mock(wraps=quantizer.forward_native)
     monkeypatch.setattr(ops, "scaled_fp8_quant", quantize)
+
+    def hadacore(x, inplace=False):
+        assert not inplace
+        assert x.is_contiguous()
+        return _reference_hadamard(x)
+
+    monkeypatch.setattr(ops, "hadacore_transform", hadacore)
     return quantize
 
 
@@ -145,13 +161,14 @@ class TestQuantValidation:
         with pytest.raises(ValueError, match="packed/varlen metadata requires the float attention path"):
             impl.forward_fa_quant_cuda(_randn_bshd(1, 8), _randn_bshd(1, 8), _randn_bshd(1, 8), metadata)
 
-    def test_rejects_unsupported_head_dim(self):
-        impl = FlashAttentionImpl(num_heads=2, head_size=44, softmax_scale=44**-0.5)
-        with pytest.raises(ValueError, match="head_dim divisible by 8"):
+    @pytest.mark.parametrize("head_dim", [0, 8, 24, 44, 272])
+    def test_rejects_unsupported_head_dim(self, head_dim):
+        impl = _make_impl()
+        with pytest.raises(ValueError, match="head_dim divisible by 16"):
             impl.forward_fa_quant_cuda(
-                torch.randn(1, 8, 2, 44, dtype=torch.bfloat16),
-                torch.randn(1, 8, 2, 44, dtype=torch.bfloat16),
-                torch.randn(1, 8, 2, 44, dtype=torch.bfloat16),
+                torch.randn(1, 8, 2, head_dim, dtype=torch.bfloat16),
+                torch.randn(1, 8, 2, head_dim, dtype=torch.bfloat16),
+                torch.randn(1, 8, 2, head_dim, dtype=torch.bfloat16),
             )
 
     def test_rejects_mismatched_key_value_shapes(self):
@@ -327,8 +344,6 @@ class TestForwardFaQuantCudaNumerics:
             causal=causal,
         )
 
-        # Signed powers of two map exactly to E4M3 under amax / 448 scaling.
-        # This isolates scale broadcasting from lossy rounding/softmax amplification.
         def exact_fp8_values(shape):
             magnitudes = 2.0 ** torch.randint(0, 3, shape)
             signs = 2 * torch.randint(0, 2, shape) - 1
@@ -345,20 +360,52 @@ class TestForwardFaQuantCudaNumerics:
         for name in ("q_descale_shape", "k_descale_shape", "v_descale_shape"):
             assert fa3_kernel.calls[0][name] == (batch, kv_heads)
         assert cpu_fp8_quant.call_count == 3
-        # Flattening preserves each tensor's data without head permutations.
-        for call, tensor in zip(cpu_fp8_quant.call_args_list, (query, key, value)):
+        rotated_query = _reference_hadamard(query)
+        rotated_key = _reference_hadamard(key)
+        # Q/K rotation stays inside each head; V keeps its original basis.
+        for call, tensor in zip(cpu_fp8_quant.call_args_list, (rotated_query, rotated_key, value)):
             assert not call.kwargs  # vLLM computes dynamic per-tensor scales.
             assert call.args[0].is_contiguous()
             torch.testing.assert_close(call.args[0], tensor.reshape(batch * tensor.shape[1], -1))
-        for descale, tensor in zip(fa3_kernel.calls[0]["descales"], (query, key, value)):
+        for descale, tensor in zip(fa3_kernel.calls[0]["descales"], (rotated_query, rotated_key, value)):
             expected_scale = tensor.float().abs().amax() / torch.finfo(torch.float8_e4m3fn).max
             torch.testing.assert_close(descale, expected_scale.expand(batch, kv_heads))
         repeat = q_heads // kv_heads
+        # Isolate layout/descale/GQA correctness from FP8 rounding by using
+        # dequantized inputs for the independent attention reference.
+        dequantized = []
+        quantizer = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR, compile_native=False)
+        for tensor in (rotated_query, rotated_key, value):
+            quantized, scale = quantizer.forward_native(tensor.reshape(batch * tensor.shape[1], -1))
+            dequantized.append((quantized.float() * scale).reshape(tensor.shape))
         expected = _reference_attention(
-            query,
-            key.repeat_interleave(repeat, dim=2),
-            value.repeat_interleave(repeat, dim=2),
+            dequantized[0],
+            dequantized[1].repeat_interleave(repeat, dim=2),
+            dequantized[2].repeat_interleave(repeat, dim=2),
             head_dim**-0.5,
             causal=causal,
         )
         torch.testing.assert_close(impl_out, expected.to(torch.bfloat16))
+
+    @pytest.mark.parametrize("head_dim", [16, 48, 64, 96, 128, 192, 256])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_rotation_preserves_gqa_scores_and_inputs(self, fa3_kernel, cpu_fp8_quant, head_dim, dtype):
+        torch.manual_seed(12)
+        batch, seq, q_heads, kv_heads = 2, 5, 4, 2
+        # Views of a shared projection must not be modified by the rotation.
+        projected = torch.randn(batch, seq, q_heads + 2 * kv_heads, head_dim, dtype=dtype)
+        original = projected.clone()
+        query, key, value = projected.split((q_heads, kv_heads, kv_heads), dim=2)
+        impl = FlashAttentionImpl(q_heads, head_dim, head_dim**-0.5, num_kv_heads=kv_heads)
+        impl.forward_fa_quant_cuda(query, key, value)
+        rotated_q, rotated_k, unrotated_v = [call.args[0] for call in cpu_fp8_quant.call_args_list]
+        qf = rotated_q.reshape(query.shape).float()
+        kf = rotated_k.reshape(key.shape).float().repeat_interleave(q_heads // kv_heads, dim=2)
+        actual_scores = torch.einsum("bqhd,bkhd->bhqk", qf, kf)
+        expected_scores = torch.einsum(
+            "bqhd,bkhd->bhqk", query.float(), key.float().repeat_interleave(q_heads // kv_heads, dim=2)
+        )
+        relative_error = (actual_scores - expected_scores).norm() / expected_scores.norm()
+        assert relative_error < 0.005
+        torch.testing.assert_close(unrotated_v, value.reshape(batch * seq, -1), rtol=0, atol=0)
+        torch.testing.assert_close(projected, original, rtol=0, atol=0)

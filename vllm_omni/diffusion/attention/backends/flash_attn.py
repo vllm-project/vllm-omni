@@ -8,6 +8,7 @@ from functools import cache, partial
 from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
@@ -805,8 +806,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             reason = "K/V sequence lengths and head counts must match"
         elif query.shape[-1] != key.shape[-1] or query.shape[-1] != value.shape[-1]:
             reason = "Q/K/V head dimensions must match"
-        elif query.shape[-1] % 8 != 0 or query.shape[-1] > 256:
-            reason = f"FA3 FP8 requires head_dim divisible by 8 and <= 256, got {query.shape[-1]}"
+        elif query.shape[-1] <= 0 or query.shape[-1] % 16 != 0 or query.shape[-1] > 256:
+            reason = f"FA3 FP8 requires positive head_dim divisible by 16 and <= 256, got {query.shape[-1]}"
         elif (
             query.dtype not in (torch.bfloat16, torch.float16) or key.dtype != query.dtype or value.dtype != query.dtype
         ):
@@ -869,9 +870,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     ) -> torch.Tensor:
         """FP8 (e4m3) FlashAttention-3 path for CUDA (SM90).
 
-        vLLM computes one dynamic scale for each of Q, K and V on every
-        forward. Omni adapts dense BSHD tensors for the selected FA3 interface.
-        No calibration data or stored state is involved.
+        vLLM rotates Q/K with a normalized Hadamard transform, then computes
+        one dynamic scale for each of Q, K and V on every forward. Omni adapts
+        dense BSHD tensors for FA3. No calibration or stored state is involved.
         """
         self._validate_quant_request_cuda(query, key, value, attn_metadata)
         from vllm import _custom_ops as ops
@@ -887,11 +888,28 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "FA3 FP8 requires positive Q/KV head counts with Q heads divisible by KV heads; "
                 f"got {q_heads} Q heads and {kv_heads} KV heads"
             )
+        # Spread Q/K outliers before FP8 rounding. The same orthogonal
+        # transform preserves QK^T; V and the output basis stay unchanged.
+        # For non-power-of-two head sizes (e.g. 96), rotate equal power-of-two
+        # blocks within each head, never across head or token boundaries.
+        rotation_dim = head_dim & -head_dim
+
+        def rotate(x: torch.Tensor) -> torch.Tensor:
+            rows = x.reshape(-1, rotation_dim).contiguous()
+            # vLLM 0.31's masked Hadacore tail can read an incomplete tile.
+            # Pad whole rows to its two-chunk (512-element) launch tile;
+            # discard only padded rows, preserving each head's transform.
+            padding = -rows.shape[0] % (512 // rotation_dim)
+            if padding:
+                rows = F.pad(rows, (0, 0, 0, padding))
+            rotated = ops.hadacore_transform(rows, inplace=False)
+            return rotated[: x.numel() // rotation_dim].reshape_as(x)
+
         # The upstream dynamic per-tensor op computes and returns the scale
         # used for its FP8 conversion. Q/K/V each have an independent scale;
         # no head reordering or GQA-specific scale grouping is needed.
-        q_input = query.reshape(batch_size * q_len, -1)
-        k_input = key.reshape(batch_size * k_len, -1)
+        q_input = rotate(query).reshape(batch_size * q_len, -1)
+        k_input = rotate(key).reshape(batch_size * k_len, -1)
         v_input = value.reshape(batch_size * k_len, -1)
         # vLLM 0.31's quantizer accepts strided rows and writes contiguous FP8
         # output. Only the last input dimension must be contiguous; preserving

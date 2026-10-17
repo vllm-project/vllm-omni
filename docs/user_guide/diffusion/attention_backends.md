@@ -182,7 +182,10 @@ vllm-omni serve <model> --diffusion-kv-cache-dtype fp8
 - Leaving the option unset or using `auto` keeps native dtype execution.
 - `fp8` quantizes Q/K/V for the current attention call and dequantizes inside
   the attention kernel. Persistent model-owned KV storage is unaffected.
-- CUDA FP8 attention uses FA3.
+- CUDA FP8 attention uses FA3. Before quantization, vLLM's normalized Hadamard
+  transform rotates Q/K within each head to reduce outlier-induced rounding
+  error; V is unchanged. Non-power-of-two head dimensions use equal
+  power-of-two blocks within the head.
 - Ascend NPU passes BF16/FP16 Q/K/V and the selected precision to MindIE-SD's
   `quant_attention`, which performs the vendor-side quantization and attention.
 - `diffusion_kv_cache_skip_steps` / `diffusion_kv_cache_skip_layers` exempt
@@ -203,9 +206,10 @@ unquantized baseline before enabling it in production.
 CUDA FP8 attention returns the input dtype (BF16 or FP16), casting FA3's BF16
 output when needed. This path currently accepts dense inputs without caller
 masks, packed-sequence metadata, or piecewise spans; incompatible requests fail explicitly.
-FP8 attention requires FA3 on SM90; unsupported FA implementations are rejected.
+FP8 attention requires FA3 on SM90 and a head dimension divisible by 16 and at
+most 256; unsupported FA implementations are rejected.
 
-Dynamic quantization adds reductions, FP8 conversion, and kernel launches.
+Dynamic quantization adds Q/K rotation, reductions, FP8 conversion, and kernel launches.
 FP8 attention can therefore be slower than BF16, especially for short
 sequences. This option does not promise lower peak memory use or faster
 end-to-end generation.
