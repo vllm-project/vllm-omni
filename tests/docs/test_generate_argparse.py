@@ -22,3 +22,11 @@ def test_static_serve_parser_supports_video_output_transport() -> None:
     args = parser.parse_args(["--omni", "--video-output-transport", '{"enable_device_postprocess": true}'])
 
     assert args.video_output_transport == {"enable_device_postprocess": True}
+
+
+def test_static_serve_parser_supports_cfg_companion_timeout() -> None:
+    """The docs AST extractor must provide every CLI type helper it executes."""
+    parser = generate_argparse.create_parser_subparser_init(generate_argparse.OmniServeCommand)
+    action = next(action for action in parser._actions if action.dest == "cfg_companion_timeout")
+
+    assert action.type("2.5") == 2.5
