@@ -911,6 +911,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     del model
                     return self.load_fresh_canonical_model()
             raise
+        self._validate_attention_schedule_candidates(model)
         self._log_w4a8_fallback_load_summaries(model)
         self._attach_offload_startup_state(model)
         return model
@@ -1036,7 +1037,25 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         )
 
         cfg = getattr(self.od_config, "diffusion_attention_config", None)
-        apply_skip_softmax_calibration(cfg, model)
+        # A schedule profile can be the only spec carrying calibration, so discovery has to
+        # look past the baseline config or that candidate would stay dense at runtime.
+        schedule = getattr(self.od_config, "diffusion_attention_schedule", None)
+        apply_skip_softmax_calibration(cfg, model, schedule=schedule)
+
+    def _validate_attention_schedule_candidates(self, model: nn.Module) -> int:
+        """Reject an incompatible prepared candidate before the model is served.
+
+        The traversal resolves the same per-candidate calibration dict that stamping uses. It does
+        not read stamped impl state. Without a schedule it returns 0 and walks nothing.
+        """
+        if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
+            return 0
+
+        from vllm_omni.diffusion.attention.layer import validate_attention_schedule_candidates
+
+        validated = validate_attention_schedule_candidates(model, self.od_config)
+        logger.debug("Attention schedule: %d prepared candidate(s) passed startup checks.", validated)
+        return validated
 
     def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
         """Process weights after loading for quantization methods.
