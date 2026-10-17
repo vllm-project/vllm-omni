@@ -138,6 +138,7 @@ class DuplexModelSessionState(ABC):
     committed_audio_payload: dict[str, object] | None
     committed_audio_operation_id: str | None
     committed_audio_reserved_bytes: int
+    committed_audio_consume_started: bool
     deferred_response_create: bool
     deferred_precreate_response: bool
     continuation_owner_id: str | None
@@ -158,6 +159,15 @@ class DuplexModelSessionState(ABC):
         operation_id: str | None,
         reserved_bytes: int = 0,
     ) -> None: ...
+
+    def mark_committed_audio_consume_started(self) -> None:
+        if self.committed_audio_payload is not None:
+            self.committed_audio_consume_started = True
+
+    def mergeable_committed_audio(self) -> dict[str, object] | None:
+        if self.committed_audio_payload is None or self.committed_audio_consume_started:
+            return None
+        return self.committed_audio_payload
 
     @abstractmethod
     def clear_committed_audio(self) -> int: ...
@@ -183,6 +193,9 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     committed_audio_payload: dict[str, object] | None = None
     committed_audio_operation_id: str | None = None
     committed_audio_reserved_bytes: int = 0
+    #: True once an append task has begun submitting this retained PCM. Later
+    #: commits must not ``merge_audio_payloads`` with it (weather merge/dup).
+    committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
     continuation_owner_id: str | None = None
@@ -205,12 +218,29 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
         self.committed_audio_payload = payload
         self.committed_audio_operation_id = operation_id
         self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+        self.committed_audio_consume_started = False
+
+    def mark_committed_audio_consume_started(self) -> None:
+        if self.committed_audio_payload is not None:
+            self.committed_audio_consume_started = True
+
+    def mergeable_committed_audio(self) -> dict[str, object] | None:
+        """Retained PCM safe to concatenate into a newer commit.
+
+        Once an append has started consuming the retain, merging would splice
+        an already-submitted utterance into the next turn (merged ASR +
+        duplicate aura2tts).
+        """
+        if self.committed_audio_payload is None or self.committed_audio_consume_started:
+            return None
+        return self.committed_audio_payload
 
     def clear_committed_audio(self) -> int:
         reserved_bytes = self.committed_audio_reserved_bytes
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         self.deferred_response_create = False
         self.deferred_precreate_response = False
         return reserved_bytes

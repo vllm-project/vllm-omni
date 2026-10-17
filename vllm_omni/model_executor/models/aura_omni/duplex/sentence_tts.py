@@ -99,6 +99,26 @@ def stage1_tts_text(orchestrator: Any, output: Any, *, cache: dict[str, object] 
     return _extract_text(output)
 
 
+def _note_talker_handoff(orchestrator: Any, req_state: Any) -> None:
+    """Mark this id handed to Talker before the submit await.
+
+    Stage2 is not bound yet, and intercept has not set the release flag. A
+    commit in that window must open the next Stage0 only. Streaming stays on
+    so a later codec segment stop is not the duplex turn end.
+    """
+    streaming = getattr(req_state, "streaming", None)
+    if streaming is not None:
+        streaming.enabled = True
+    manager = getattr(orchestrator, "session_manager", None)
+    if manager is None:
+        return
+    runner = manager.runner_for_request_id(req_state.request_id)
+    if runner is None or not runner.session.capabilities.supports_concurrent_turn_requests:
+        return
+    runner.run.concurrent_turn_requests_released = True
+    runner.run.talker_handoff_request_ids.add(req_state.request_id)
+
+
 def plan_partial_stage_output(
     orchestrator: Any,
     stage_id: int,
@@ -170,7 +190,11 @@ def plan_partial_stage_output(
     # is_final_update=True is a non-resumable end sentinel: it discards this
     # text and sets streaming_input=False on the in-flight sentence, so
     # Code2Wav sees a short codec and the user hears a blip.
-    queue_close_after = bool(chunk) and finished and not close_only and prior_emits > 0
+    # A text remainder stays resumable; the followup is the one end sentinel.
+    # An empty remainder is already that sentinel, so it must not also queue
+    # a second close_only. A one-shot sentence stays a single submit.
+    queue_close_after = finished and prior_emits > 0 and not close_only
+    _note_talker_handoff(orchestrator, req_state)
     logger.info(
         "[AURA] sentence TTS req=%s finished=%s close_only=%s text_len=%d queue_close_after=%s",
         req_state.request_id,

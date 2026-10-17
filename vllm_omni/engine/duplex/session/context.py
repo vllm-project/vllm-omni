@@ -62,6 +62,10 @@ class DuplexRunState:
     #: assistant audio is still draining. Cleared on barge-in/cancel, or when
     #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
     concurrent_turn_requests_released: bool = False
+    #: Ephemeral ids whose sentence was already handed to Talker. A later commit
+    #: must not abort these, even after the release flag is cleared and before
+    #: Stage2 is bound.
+    talker_handoff_request_ids: set[str] = field(default_factory=set)
 
 
 class RunnerServices(Protocol):

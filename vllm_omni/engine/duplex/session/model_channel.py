@@ -234,6 +234,13 @@ class ModelChannel:
             )
         session.mark_model_turn_request_started(turn_id, session._clock())
 
+    def _data_plane_terminal(self, request_id: str) -> bool:
+        plane = getattr(self._ctx.plugin, "data_plane", None)
+        is_terminal = getattr(plane, "is_terminal", None)
+        if not callable(is_terminal):
+            return False
+        return bool(is_terminal(request_id))
+
     async def _append_via_data_plane(
         self,
         payload: object,
@@ -254,21 +261,42 @@ class ModelChannel:
         stage_id = self._ctx.plugin.input_stage_id(payload)
         resumable = session.capabilities.supports_core_resumable_request
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
+        draining_stages = self._draining_stage_ids()
+        draining_ids = {rid for sid, rid in session.request_resources if sid in draining_stages}
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
-        # Bump turn_id and open a fresh ephemeral request instead.
-        if not resumable and session.stage_request_submitted(stage_id, request_id):
+        # Bump turn_id and open a fresh ephemeral request instead. A Talker
+        # that is already draining shares this id even after Stage0's binding
+        # was dropped; resubmitting it aborts the utterance before Code2Wav.
+        stage0_busy = session.stage_request_submitted(stage_id, request_id)
+        handoff_inflight = request_id in getattr(self._ctx.run, "talker_handoff_request_ids", ())
+        # A finished vision turn marks this id terminal but releases the Stage0
+        # binding, so the next speech would reuse it. The projector then drops
+        # the new Stage1 text (10:12 早上好 / 我想问).
+        terminal_reuse = self._data_plane_terminal(request_id)
+        if not resumable and (stage0_busy or request_id in draining_ids or handoff_inflight or terminal_reuse):
             stale_ephemeral_id = request_id
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
             stale_keys = list(session.request_resources.keys())
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
+            # Sentence TTS submits Talker before Stage1's release flag is set.
+            # A vision follow in that window used to abort the shared request
+            # id, so the utterance never reached Code2Wav. Draining stages
+            # already bound are the same overlap the flag allows: open a new
+            # stage0 turn and leave them running.
+            draining_inflight = request_id in draining_ids or any(sid in draining_stages for sid, _ in stale_keys)
             concurrent_turn = session.capabilities.supports_concurrent_turn_requests and (
-                self._ctx.run.concurrent_turn_requests_released
+                self._ctx.run.concurrent_turn_requests_released or draining_inflight or handoff_inflight
             )
             # Prior TTS may still drain under the same response_id; acceptance
             # is gated by supports_concurrent_turn_requests, not a per-turn drain id.
-            session.complete_model_turn(fence.turn_id)
+            if session.turn_id <= fence.turn_id:
+                session.complete_model_turn(fence.turn_id)
             fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
             request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
+            while session.stage_request_submitted(stage_id, request_id) or request_id in draining_ids:
+                session.complete_model_turn(session.turn_id)
+                fence = DuplexFence(session.session_id, epoch=session.epoch, turn_id=session.turn_id)
+                request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=False)
             session.request_resources.pop((stage_id, stale_ephemeral_id), None)
             if concurrent_turn:
                 # Input gate already released after assistant text/silent final,
@@ -276,7 +304,6 @@ class ModelChannel:
                 # only — do not abort engine work. Stages the plugin marks as
                 # draining keep running under the prior response_id.
                 prior_response_id = session.active_response_id
-                draining_stages = self._draining_stage_ids()
                 for sid, rid in stale_keys:
                     if sid not in draining_stages:
                         session.request_resources.pop((sid, rid), None)
@@ -284,18 +311,25 @@ class ModelChannel:
                         # Already-draining ids keep their original response_id.
                         session.bind_draining_request(rid, prior_response_id)
                 self._ctx.run.concurrent_turn_requests_released = False
+                if handoff_inflight and prior_response_id is not None:
+                    # Stage2 may not be in request_resources yet. Keep the
+                    # handed-off id admissible so its text and later audio are
+                    # not dropped once this commit becomes the active request.
+                    session.bind_draining_request(stale_ephemeral_id, prior_response_id)
                 if prior_response_id is not None:
                     session.snapshot_active_response_for_drain()
                     new_response_id = session.begin_response(turn_id=fence.turn_id)
                     self._out.emit(self.response_created_payload(new_response_id, epoch=session.epoch))
                 else:
                     session.bind_response_turn(fence.turn_id)
-            elif stale_ids:
+            elif stale_ids or terminal_reuse:
                 # Input gate not released yet (e.g. commit while Stage1 is still
                 # running): abort the whole prior ephemeral so a later output
-                # stage is not left orphaned.
+                # stage is not left orphaned. A terminal vision id may already
+                # have dropped its resource row; still free that orchestrator id.
+                cleanup_ids = list(dict.fromkeys([*stale_ids, stale_ephemeral_id]))
                 try:
-                    await self._ctx.stage_port.cleanup(stale_ids, abort=True)
+                    await self._ctx.stage_port.cleanup(cleanup_ids, abort=True)
                 except Exception:
                     logger.warning(
                         "duplex abort of stale ephemeral request failed session=%s ids=%s",
@@ -541,7 +575,10 @@ class ModelChannel:
 
     def _build_stage_output(self, item: StageOutput) -> OmniRequestOutput:
         output = item.output
-        finished = bool(getattr(output, "finished", False)) or item.context.segment_finished
+        # A streaming segment boundary is not duplex turn EOS. context.segment_finished
+        # stays true for plugins; the projector object keeps the source finished flag.
+        # Promoting segment_finished here undoes a segment-stop clear of RequestOutput.finished.
+        source_finished = bool(getattr(output, "finished", False))
         if item.decision is not None:
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
@@ -560,17 +597,19 @@ class ModelChannel:
             engine_output = attach_duplex_output_decision(engine_output, item.decision)
         elif isinstance(output, OmniRequestOutput):
             engine_output = copy.copy(output)
-            if finished:
-                engine_output.finished = True
+            engine_output.finished = source_finished
         else:
             final_output_type = getattr(output, "final_output_type", None)
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
                 request_id=item.request_id,
-                finished=finished,
+                finished=source_finished,
                 stage_id=item.stage_id,
                 final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
             )
+            # from_stage_output copies source.finished last. Lock the projector
+            # flag to that value so a segment boundary cannot reopen turn EOS.
+            engine_output.finished = source_finished
         engine_output.stage_id = item.stage_id
         if self._ctx.plugin.projects_intermediate_outputs and item.stage_id < item.context.final_stage_id:
             engine_output.finished = False
@@ -985,6 +1024,13 @@ class ModelChannel:
             self._out.emit(payload)
             return close_reason, emitted_response
         context_text = model_result.get("model_context_text")
+        handed_to_talker = isinstance(data_plane_request_id, str) and data_plane_request_id in getattr(
+            self._ctx.run, "talker_handoff_request_ids", ()
+        )
+        if is_listen is True and handed_to_talker:
+            # Sentence TTS already gave this id real text. A later silent
+            # classification must not overwrite history or abort Talker.
+            return close_reason, emitted_response
         if isinstance(context_text, str) and isinstance(data_plane_request_id, str):
             self._ctx.plugin.commit_model_context(
                 session_id=duplex_session_id_from_request_id(data_plane_request_id),
