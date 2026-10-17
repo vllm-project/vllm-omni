@@ -389,6 +389,7 @@ class AttnProcessor:
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: RotaryEmbedding | None = None,
+        attention_mask_is_full: bool = False,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -422,6 +423,16 @@ class AttnProcessor:
             attention_mask = attention_mask.to(torch.bool)
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        if (
+            attn_metadata is not None
+            and attention_mask_is_full
+            and query.dtype in (torch.float16, torch.bfloat16)
+            and not torch.compiler.is_compiling()
+            and not attn.omni_attn.parallel_strategy.enabled
+        ):
+            # The joint-mask producer already knows every token is valid.
+            # Keep FP32 fallback and compiled/resharded mask handling unchanged.
+            attn_metadata.extra["attention_mask_mode"] = "none"
         hidden_states = attn.omni_attn(query, key, value, attn_metadata)
 
         if attention_mask is not None:
@@ -507,6 +518,7 @@ class TransformerBlock(nn.Module):
         attention_mask: torch.Tensor,
         image_rotary_emb: RotaryEmbedding,
         temb: torch.Tensor | None = None,
+        attention_mask_is_full: bool = False,
     ) -> torch.Tensor:
         if self.modulation:
             if temb is None:
@@ -518,6 +530,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                attention_mask_is_full=attention_mask_is_full,
             )
             hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
@@ -529,6 +542,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                attention_mask_is_full=attention_mask_is_full,
             )
             hidden_states = hidden_states + self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states))
@@ -825,7 +839,9 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         return text_hidden_states, img_tokens
 
-    def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+    def _apply_transformer_layers(
+        self, hidden_states, attention_mask, rotary_emb, temb, attention_mask_is_full: bool = False
+    ):
         # Call blocks with keyword arguments: Cache-DiT's Pattern_3 wrapper
         # re-invokes blocks as block(hidden_states, **kwargs), so the cached
         # and uncached paths share this exact calling convention.
@@ -835,6 +851,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 attention_mask=attention_mask,
                 image_rotary_emb=rotary_emb,
                 temb=temb,
+                attention_mask_is_full=attention_mask_is_full,
             )
         return hidden_states
 
@@ -915,7 +932,13 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
             joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
 
-        hidden_states = self._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        hidden_states = self._apply_transformer_layers(
+            joint_hidden_states,
+            attention_mask,
+            rotary_emb,
+            temb,
+            attention_mask_is_full=all(seq_len == max_seq_len for seq_len in seq_lengths),
+        )
 
         hidden_states = self.norm_out(hidden_states, temb)
 
