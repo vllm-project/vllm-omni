@@ -206,6 +206,30 @@ def require_denoise_progress_publisher(pipeline: Any, schedule: AttentionSchedul
     )
 
 
+# Pipeline classes (as registered in the diffusion model registry) that publish denoise progress
+# for every denoise forward and honour configured profiles, mapped to the model name in errors.
+ATTENTION_SCHEDULE_PIPELINES: Mapping[str, str] = {
+    "MiniMaxH3Pipeline": "MiniMax-H3",
+}
+
+
+def unsupported_attention_schedule_error(reason: str) -> ValueError:
+    """The one startup error for a schedule configuration this service cannot run yet."""
+    models = ", ".join(sorted(set(ATTENTION_SCHEDULE_PIPELINES.values())))
+    return ValueError(
+        f"Unsupported diffusion_attention_schedule: {reason}. Attention schedules currently support "
+        f"step ranges ('profiles' and 'default') on {models} only. Remove the schedule, or the "
+        "unsupported part, from this model's config."
+    )
+
+
+def require_attention_schedule_pipeline(pipeline_class_name: str | None, model_class_name: str | None) -> None:
+    """Reject configured profiles at startup on a pipeline that is not known to honour them."""
+    if pipeline_class_name in ATTENTION_SCHEDULE_PIPELINES:
+        return
+    raise unsupported_attention_schedule_error(f"model {model_class_name!r} does not support attention profiles yet")
+
+
 def select_attention_profile(schedule: AttentionSchedule, step_index: int, *, total_steps: int) -> str | None:
     """Return the selected name, or None for the original configuration in gaps."""
     _validate_step(total_steps, "total_steps", minimum=1)

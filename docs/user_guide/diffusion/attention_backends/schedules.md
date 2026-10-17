@@ -4,9 +4,10 @@ An attention schedule selects a named attention profile at zero-based denoising
 step indices. Profiles are prepared at startup; requests select ranges, not new
 backends. Steps outside a range use the base attention configuration.
 
-MiniMax-H3 publishes progress in request and step modes. Other models reject
-configured profiles at startup. Backend and model
-requirements still apply; selecting a profile does not prevent kernel fallbacks.
+MiniMax-H3 publishes progress in request and step modes. Configured profiles
+on any other model fail at startup with an `Unsupported diffusion_attention_schedule`
+error, before weights are loaded. Backend and model requirements still apply;
+selecting a profile does not prevent kernel fallbacks.
 
 ## Format
 
@@ -20,6 +21,8 @@ The server configuration contains `profiles` and `default`:
   underscores or hyphens. All profiles are validated, even unused ones.
 - The top-level `default` is a list of ranges. An empty configuration with
   no profiles is equivalent to not configuring schedules.
+- Other top-level keys are rejected at startup; a `sigma` key fails with the
+  same `Unsupported diffusion_attention_schedule` error.
 
 Each range has exactly `start`, `end` and `profile`:
 
