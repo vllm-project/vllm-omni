@@ -30,7 +30,6 @@ from vllm.transformers_utils.repo_utils import get_model_path
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
     parse_attention_schedule,
-    unsupported_attention_schedule_error,
     validate_attention_profile_name,
     validate_attention_schedule,
 )
@@ -2386,7 +2385,7 @@ class AttentionConfig:
 
 @dataclass
 class AttentionScheduleConfig:
-    """Startup-owned attention profiles and the default integer-step schedule.
+    """Startup-owned profiles with default integer-step ranges or normalized-noise windows.
 
     Profiles resolve their own roles, without merging the baseline or its
     environment fallback. Candidate construction and hardware validation happen
@@ -2395,6 +2394,8 @@ class AttentionScheduleConfig:
 
     profiles: dict[str, AttentionConfig] = field(default_factory=dict)
     default: AttentionSchedule = ()
+    # Ascending [low, high) windows; high=1 also includes 1. Cannot coexist with default ranges.
+    sigma: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.profiles, Mapping):
@@ -2411,6 +2412,18 @@ class AttentionScheduleConfig:
             raise TypeError("diffusion_attention_schedule.default must be a list of ranges, not None")
         validate_attention_schedule(default, profiles=self.profiles)
         self.default = default
+        from vllm_omni.diffusion.attention.schedule import (
+            parse_attention_sigma_schedule,
+            reject_mixed_attention_schedules,
+            validate_attention_sigma_schedule,
+        )
+
+        sigma = parse_attention_sigma_schedule(self.sigma)
+        if sigma is None:
+            raise TypeError("diffusion_attention_schedule.sigma must be a list of windows, not None")
+        validate_attention_sigma_schedule(sigma, profiles=self.profiles)
+        reject_mixed_attention_schedules(self.default, sigma)
+        self.sigma = sigma
 
 
 def parse_attention_schedule_config(
@@ -2425,10 +2438,8 @@ def parse_attention_schedule_config(
         return None
     if isinstance(value, str):
         value = json.loads(value)
-    if isinstance(value, Mapping) and "sigma" in value:
-        raise unsupported_attention_schedule_error("'sigma' windows are not supported yet")
     if isinstance(value, AttentionScheduleConfig):
-        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
+        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default, sigma=value.sigma)
     elif isinstance(value, Mapping):
         config = AttentionScheduleConfig(**dict(value))
     else:

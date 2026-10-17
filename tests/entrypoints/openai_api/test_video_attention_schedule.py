@@ -17,7 +17,11 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
 from tests.entrypoints.openai_api.test_image_server import MockGenerationResult
 from tests.entrypoints.openai_api.test_video_server import FakeAsyncOmni
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    AttentionSigmaWindow,
+    InvalidAttentionScheduleError,
+)
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.diffusion_request_utils import apply_normalized_diffusion_request_extra_args
 from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
@@ -95,6 +99,35 @@ def test_sync_video_rejects_invalid_schedule_before_generation(client, schedule)
 
     assert response.status_code == 400
     assert "attention_schedule" in response.json()["detail"]
+    assert client.app.state.openai_serving_video._engine_client.captured_sampling_params_list is None
+
+
+@pytest.mark.parametrize("value", [None, [], [{"low": 0.3, "high": 1.0, "profile": "dense"}]])
+def test_sync_video_sigma_override_moves_to_typed_field(client, value):
+    engine = client.app.state.openai_serving_video._engine_client
+    inherited = (AttentionSigmaWindow(0.0, 0.3, "sparse"),)
+    engine.default_sampling_params_list = [OmniDiffusionSamplingParams(attention_sigma_schedule=inherited)]
+    response = _post_sync(client, {"attention_sigma_schedule": value, "flow_shift": 5.0})
+    assert response.status_code == 200
+    captured = engine.captured_sampling_params_list[0]
+    expected = inherited if value is None else () if value == [] else (AttentionSigmaWindow(0.3, 1.0, "dense"),)
+    assert captured.attention_sigma_schedule == expected
+    assert "attention_sigma_schedule" not in captured.extra_args
+    assert captured.extra_args["flow_shift"] == 5.0
+
+
+def test_sync_video_rejects_invalid_sigma_before_generation(client):
+    response = _post_sync(
+        client,
+        {
+            "attention_sigma_schedule": [
+                {"low": 0.0, "high": 0.5, "profile": "sparse"},
+                {"low": 0.3, "high": 1.0, "profile": "dense"},
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "attention_sigma_schedule" in response.json()["detail"]
     assert client.app.state.openai_serving_video._engine_client.captured_sampling_params_list is None
 
 

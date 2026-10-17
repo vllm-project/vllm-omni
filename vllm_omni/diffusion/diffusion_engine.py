@@ -1678,6 +1678,7 @@ class DiffusionEngine:
                 # Startup requests use a fixed short step count; a service schedule
                 # sized for real requests would reject them, so keep the original path.
                 attention_schedule=(),
+                attention_sigma_schedule=(),
             ),
         )
 
