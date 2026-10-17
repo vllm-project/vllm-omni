@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -956,6 +957,12 @@ class WanTransformer3DModel(nn.Module):
 
         # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
         self.preserve_vsa_all_blocks = False
+
+        # The registry binds packed_modules_mapping to the pipeline class, not to this
+        # transformer, and the config may have been rebuilt from checkpoint metadata.
+        # Bind it here so ignored_layers on to_q/to_k/to_v also cover the fused to_qkv.
+        if quant_config is not None:
+            configure_quant_config(quant_config, type(self))
 
         # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
         # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
