@@ -31,6 +31,44 @@ logger = init_logger(__name__)
 RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
 
 
+def _cfg_parallel_world_size() -> int:
+    """Return the CFG-parallel world size, or 1 when the parallel state is not initialized."""
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        get_classifier_free_guidance_world_size,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return 1
+    return get_classifier_free_guidance_world_size()
+
+
+def resolve_has_separate_cfg(has_separate_cfg: bool) -> bool:
+    """Return the ``has_separate_cfg`` value to hand Cache-DiT on this rank.
+
+    Cache-DiT tells the conditional and unconditional passes apart purely by transformer-call parity:
+    with ``has_separate_cfg`` it advances its step counter only on every other call and keeps the
+    odd calls in separate ``*_cfg`` buffers. Under CFG parallel each rank runs one branch, i.e. one
+    transformer call per denoise step, so the parity bookkeeping halves the step counter: warm-up
+    and the cached-step limits cover twice as many real steps and residuals are compared two steps
+    apart, which caches far fewer steps. One call per step is the non-separate-CFG contract.
+
+    Multi-branch CFG with more branches than CFG ranks would put two calls on one rank;
+    ``CFGParallelMixin`` rejects that topology while Cache-DiT is active (see
+    ``_cache_dit_one_call_per_cfg_rank``).
+    """
+    if not has_separate_cfg:
+        return False
+    cfg_world_size = _cfg_parallel_world_size()
+    if cfg_world_size == 1:
+        return True
+    logger.info(
+        "CFG parallel (size %d) runs one branch per rank: Cache-DiT uses has_separate_cfg=False",
+        cfg_world_size,
+    )
+    return False
+
+
 @dataclass(frozen=True)
 class CacheDiTEnableResult:
     """Custom-enabler result with the exact targets needed for teardown."""
@@ -173,6 +211,12 @@ def enable_cache_for_dit(
     )
 
     transformer = get_pipeline_transformer(pipeline)
+    if block_adapter is not None:
+        block_adapter.has_separate_cfg = resolve_has_separate_cfg(block_adapter.has_separate_cfg)
+    elif not resolve_has_separate_cfg(True):
+        # Cache-DiT's built-in registry adapters (e.g. QwenImage) hard-code has_separate_cfg=True; an
+        # explicit enable_separate_cfg on the cache config takes precedence over the adapter's value.
+        db_cache_config.enable_separate_cfg = False
     cache_target = transformer if block_adapter is None else block_adapter
     if adapter_cls is not None:
         adapter_cls.apply(
@@ -232,7 +276,7 @@ def _maybe_build_block_adapter(
         transformer=transformer,
         blocks=[getattr(transformer, block_attribute) for block_attribute in block_attributes],
         forward_pattern=list(forward_patterns),
-        has_separate_cfg=adapter_config.has_separate_cfg,
+        has_separate_cfg=resolve_has_separate_cfg(adapter_config.has_separate_cfg),
         check_forward_pattern=adapter_config.check_forward_pattern,
     )
     # cache_dit marks the wrapper pipe's class as cached, and for bare-transformer
@@ -304,6 +348,9 @@ class CacheDiTBackend(CacheBackend):
                 raise ValueError(f"Pipeline {pipeline_name} has no declared DiT modules for Cache-DiT")
 
         pipeline._cache_dit_targets = tuple(self._cache_targets)
+        # Under CFG parallel, Cache-DiT counts one transformer call per rank as one denoise step
+        # (resolve_has_separate_cfg), so CFGParallelMixin must not run two branches on one rank.
+        pipeline._cache_dit_one_call_per_cfg_rank = _cfg_parallel_world_size() > 1
 
         self.enabled = True
         logger.info("Cache-dit enabled successfully on %s", pipeline_name)
@@ -327,6 +374,7 @@ class CacheDiTBackend(CacheBackend):
             self._cache_targets = []
             if hasattr(pipeline, "_cache_dit_targets"):
                 del pipeline._cache_dit_targets
+            pipeline._cache_dit_one_call_per_cfg_rank = False
             self.enabled = False
 
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
