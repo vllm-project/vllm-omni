@@ -40,6 +40,7 @@ Extending to a new MX precision with a different calling convention (e.g. dual-s
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -83,6 +84,36 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Local experiment: alg=1 and exact BF16-prefix math, with optional resident master.
+def _mx_scale_alg() -> int:
+    return int(os.environ.get("VLLM_OMNI_MXFP8_SCALE_ALG", "0"))
+
+
+def _mxfp8_use_bf16_prefix(steps: int) -> bool:
+    from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+    if not steps or not is_forward_context_available():
+        return False
+    step = get_forward_context().denoise_step_idx
+    return step is not None and 0 <= int(step) < steps
+
+
+def _mxfp8_save_prefix_master(layer, quant_config: DiffusionMXFP8Config) -> None:
+    if not quant_config.prefix_bf16_steps:
+        return
+    mode = quant_config.prefix_bf16_master_mode
+    # Keep the historical CPU transpose/contiguous layout and exact BF16 bits.
+    master = layer.weight.detach().to(device="cpu", dtype=torch.bfloat16).transpose(0, 1).contiguous()
+    if mode == "resident":
+        if layer.weight.device.type != "npu":
+            raise RuntimeError("Resident BF16 master must be prepared on the loading NPU")
+        master = master.to(device=layer.weight.device)
+    # Deliberately NOT a Parameter/buffer: DLO must not shard, empty or repoint it.
+    # Owned by the layer and released with the model; model migration is unsupported.
+    layer._mxfp8_prefix_master = master
+    layer._mxfp8_prefix_master_mode = mode
+
+
 class DiffusionMXFP8Config(QuantizationConfig):
     """W8A8 MXFP8 quantization config for diffusion transformers.
 
@@ -97,10 +128,23 @@ class DiffusionMXFP8Config(QuantizationConfig):
         self,
         is_checkpoint_mxfp8_serialized: bool = False,
         ignored_layers: list[str] | None = None,
+        prefix_bf16_steps: int = 0,
+        prefix_bf16_master_mode: str = "cpu",
     ) -> None:
         super().__init__()
+        if isinstance(prefix_bf16_steps, bool) or not isinstance(prefix_bf16_steps, int):
+            raise TypeError("prefix_bf16_steps must be an integer")
+        if prefix_bf16_steps < 0:
+            raise ValueError("prefix_bf16_steps must be non-negative")
+        if prefix_bf16_master_mode not in ("cpu", "resident"):
+            raise ValueError(f"Unknown MXFP8 prefix master mode: {prefix_bf16_master_mode}")
+        if is_checkpoint_mxfp8_serialized and prefix_bf16_steps:
+            raise ValueError("BF16 prefix fallback requires online MXFP8 weights, not a serialized checkpoint")
+
         self.is_checkpoint_mxfp8_serialized = is_checkpoint_mxfp8_serialized
         self.ignored_layers = ignored_layers or []
+        self.prefix_bf16_steps = prefix_bf16_steps
+        self.prefix_bf16_master_mode = prefix_bf16_master_mode
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -128,9 +172,13 @@ class DiffusionMXFP8Config(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
+        prefix_bf16_steps = cls.get_from_keys_or(config, ["prefix_bf16_steps"], 0)
+        prefix_bf16_master_mode = cls.get_from_keys_or(config, ["prefix_bf16_master_mode"], "cpu")
         return cls(
             is_checkpoint_mxfp8_serialized=is_serialized,
             ignored_layers=ignored_layers,
+            prefix_bf16_steps=prefix_bf16_steps,
+            prefix_bf16_master_mode=prefix_bf16_master_mode,
         )
 
     _XPU_OFFLINE_UNSUPPORTED = (
@@ -156,6 +204,8 @@ class DiffusionMXFP8Config(QuantizationConfig):
                     return NPUMxfp8LinearMethod(self)
                 return NPUMxfp8OnlineLinearMethod(self)
             if current_omni_platform.is_xpu():
+                if self.prefix_bf16_steps:
+                    raise NotImplementedError("BF16 prefix fallback is only supported for online NPU MXFP8")
                 if self.is_checkpoint_mxfp8_serialized:
                     raise NotImplementedError(self._XPU_OFFLINE_UNSUPPORTED)
                 return VllmMxfp8OnlineLinearMethod()
@@ -437,7 +487,7 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
     def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         import torch_npu
 
-        return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch_npu.float8_e4m3fn)
+        return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch_npu.float8_e4m3fn, scale_alg=_mx_scale_alg())
 
     def _quant_matmul(
         self,
@@ -481,6 +531,28 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
       apply / ops      : NPUMxfp8LinearMethod / MXFPLinearMethodBase  (shared)
     """
 
+    def _apply_inner(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if _mxfp8_use_bf16_prefix(self.quant_config.prefix_bf16_steps):
+            master = getattr(layer, "_mxfp8_prefix_master", None)
+            if master is None:
+                raise RuntimeError("BF16 prefix requested without the original master weight")
+            if layer._mxfp8_prefix_master_mode == "resident" and master.device != x.device:
+                raise RuntimeError("Resident master and activation device mismatch")
+            # Resident mode: .to returns the same tensor (no allocation or H2D).
+            # CPU mode is retained only as a numeric/performance control.
+            w = master.to(device=x.device, dtype=x.dtype)
+            out = torch.matmul(x, w)
+            if bias is not None:
+                out = out + bias.to(device=out.device, dtype=out.dtype)
+            return out.to(dtype=ori_dtype)
+        return super()._apply_inner(layer, x, bias, ori_dtype)
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -499,8 +571,12 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
+        _mxfp8_save_prefix_master(layer, self.quant_config)
+
         # NPU: quantize BF16/FP16 (N, K) → FP8 (N, K) + MX scale (N, S).
-        weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(layer.weight, dst_type=torch_npu.float8_e4m3fn)
+        weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(
+            layer.weight, dst_type=torch_npu.float8_e4m3fn, scale_alg=_mx_scale_alg()
+        )
 
         # Normalize to canonical layout shared with offline path.
         weight_scale = weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2).transpose(0, 1).contiguous()

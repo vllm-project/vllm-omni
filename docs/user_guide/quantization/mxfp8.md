@@ -203,8 +203,58 @@ omni = Omni(model="<autoround-mxfp8-model>")
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
+| `prefix_bf16_steps` | int | `0` | Online NPU only; use the original BF16 weights for denoising indices `0 <= step < K`; `0` disables the fallback |
+| `prefix_bf16_master_mode` | `cpu` or `resident` | `cpu` | Storage location for the retained BF16 weight copy when prefix fallback is enabled |
 
 ## Validation and Notes
+
+On NPU, `VLLM_OMNI_MXFP8_SCALE_ALG` selects the `scale_alg` passed to
+`torch_npu.npu_dynamic_mx_quant` for activations and online weights. It defaults
+to `0`; set it before starting the process, for example:
+
+```bash
+export VLLM_OMNI_MXFP8_SCALE_ALG=1
+```
+
+The installed torch_npu/CANN version must support the selected algorithm and
+the `scale_alg` keyword. Offline checkpoint weights are not requantized.
+
+### NPU Online Prefix BF16 Fallback
+
+Pass these options in the diffusion quantization config to compute the first K
+denoising steps with a saved BF16 weight copy, then resume MXFP8 W8A8 Linear
+computation:
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-quantization-config '{"method":"mxfp8","prefix_bf16_steps":5,"prefix_bf16_master_mode":"resident"}'
+```
+
+`prefix_bf16_steps` defaults to `0` (disabled) and must be non-negative. K
+refers to zero-based `ForwardContext.denoise_step_idx` indices `0 <= step < K`,
+so multiple CFG passes at the same step all use BF16. The step is read from
+`ForwardContext` for each Linear call. If the pipeline does not publish the
+step, inference continues on the MXFP8 path. A positive K is accepted only for
+online MXFP8 weights; pre-quantized checkpoints do not contain the BF16 master.
+
+`prefix_bf16_master_mode` defaults to `cpu`, which transfers the saved weight
+to the activation device on each fallback call. The master is stored
+transposed and contiguous, with shape `(in_features, out_features)`.
+`resident` copies that master to its loading NPU and requires activations on
+that device. Both modes retain a full BF16 copy of each local online Linear
+weight; resident mode can significantly increase accelerator memory usage. K
+larger than the actual denoising step count uses BF16 for every denoising step.
+
+The master copy is a plain tensor attribute: it is excluded from `state_dict`
+and is not moved by `module.to()` or managed by layerwise offload. Resident
+fallback is only supported while its loading device remains the activation
+device; model migration, weight reload, sleep/wake, and distributed offload of
+this copy are not supported. Reload the model to change fallback settings or
+weights. The saved weight is BF16; at fallback time it is converted to the
+activation dtype before matmul, and the result is cast back to that dtype. Bias
+is added separately. Attention quantization is unaffected.
+
+### Weight Loading Notes
 
 1. Online mode quantizes BF16 weights at load time using
    `npu_dynamic_mx_quant`. This adds a one-time overhead on the first load
