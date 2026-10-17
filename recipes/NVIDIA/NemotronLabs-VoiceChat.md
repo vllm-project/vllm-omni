@@ -46,7 +46,7 @@ NeMo modules (`nemo_vendored/`), so no `nemo_toolkit` install is needed.
 ## Pipeline
 
 | stage | arch | dtype | role |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0 thinker | `NemotronVoiceChatThinkerForConditionalGeneration` (LLM_AR) | bf16 (PARITY: fp32) | WAV + system prompt -> frame-locked text-token timeline (+ function channel) |
 | 1 talker | `NemotronVoiceChatTalker` (LLM_AR) | fp32 | text timeline -> 31-quantizer RVQ code stacks (one per 80 ms frame) |
 | 2 code2wav | `NemotronVoiceChatCode2Wav` (LLM_GENERATION) | fp32 | RVQ-VAE decode -> 22.05 kHz PCM |
@@ -158,6 +158,18 @@ vllm-omni serve /path/to/NVIDIA-NemotronLabs-VoiceChat-11B \
 ```
 
 The single-GPU profile runs all three engine processes on one device.
+
+To opt into CUDA graphs for the streaming Conformer, adapter, and projection, set the following fields on stage 0 of your duplex deploy configuration:
+
+```yaml
+stages:
+  - stage_id: 0
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mm_encoder: true
+```
+
+Perception graphs are disabled by default. On single-rank CUDA deployments, vLLM's encoder graph manager captures the first-frame and steady-frame geometries, with one frame per replay and independently owned session caches. Other frame geometries and incompatible tensor shapes, dtypes, or devices use eager perception. Multi-rank deployments, non-CUDA platforms, and `enforce_eager: true` also retain eager perception. This option does not change the existing language-model or talker graph settings.
 
 In another shell, stream only the user channel of one of NVIDIA's bundled
 stereo conversation fixtures:
