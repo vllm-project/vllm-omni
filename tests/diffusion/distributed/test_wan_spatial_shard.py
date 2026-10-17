@@ -566,9 +566,20 @@ def test_install_refuses_to_change_the_assembling_rank(monkeypatch: pytest.Monke
     vae, _ = _install_on_plain_decoder(monkeypatch, dst=None)
 
     # Same settings again: a no-op, as before.
-    wan_spatial_shard.install_wan_spatial_shard_decode(vae, object(), split_dim="width", dst=None)
+    group = vae._vllm_omni_wan_spatial_shard_group
+    wan_spatial_shard.install_wan_spatial_shard_decode(vae, group, split_dim="width", dst=None)
     with pytest.raises(ValueError, match="already patched to assemble on None"):
         wan_spatial_shard.install_wan_spatial_shard_decode(vae, object(), split_dim="width", dst=0)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_install_refuses_to_change_process_group(monkeypatch):
+    vae, _ = _install_on_plain_decoder(monkeypatch, dst=0)
+    original_forward = vae.decoder.forward
+    with pytest.raises(ValueError, match="different process group"):
+        wan_spatial_shard.install_wan_spatial_shard_decode(vae, object(), split_dim="width", dst=0)
+    assert vae.decoder.forward == original_forward
 
 
 @pytest.mark.core_model

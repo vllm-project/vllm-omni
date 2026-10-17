@@ -272,3 +272,25 @@ def test_klein_uses_distributed_vae_only_for_batch_mode(monkeypatch, tmp_path, m
     config = OmniDiffusionConfig(model=str(tmp_path), parallel_config=DiffusionParallelConfig(vae_parallel_mode=mode))
     with pytest.raises(StopAtVaeLoadError):
         module.Flux2KleinPipeline(od_config=config)
+
+
+def test_registry_configures_wan_spatial_temporal_chunk_size(monkeypatch, mocker):
+    vae = DistributedAutoencoderKLWan.__new__(DistributedAutoencoderKLWan)
+    nn.Module.__init__(vae)
+    vae.distributed_executor = mocker.Mock(spec=DistributedVaeExecutor)
+
+    class Pipeline(nn.Module):
+        def __init__(self, od_config):
+            super().__init__()
+            self.vae = vae
+
+    monkeypatch.setattr(registry.DiffusionModelRegistry, "_try_load_model_cls", lambda _: Pipeline)
+    monkeypatch.setattr(registry, "_apply_wan_vae_fastpath_if_enabled", lambda *args: None)
+    config = OmniDiffusionConfig(
+        model_class_name="test_wan_vae",
+        vae_fast_path="off",
+        vae_spatial_temporal_chunk_size=2,
+        parallel_config=DiffusionParallelConfig(vae_patch_parallel_size=2, vae_parallel_mode="spatial_shard_width"),
+    )
+    assert registry.initialize_model(config).vae.spatial_temporal_chunk_size == 2
+    vae.distributed_executor.set_parallel_size.assert_called_once_with(2, mode="spatial_shard_width")

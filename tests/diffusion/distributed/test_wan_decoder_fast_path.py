@@ -101,7 +101,7 @@ def _check_pair(reference, candidate, autocast: bool, sharded: bool, level: str 
     convs = sum(1 for m in candidate.decoder.modules() if isinstance(m, torch.nn.Conv3d | torch.nn.Conv2d)) + 1
     assert counts["conv_params_cast"] == (convs if autocast else 0)
     dist_convs = sum(1 for m in candidate.decoder.modules() if isinstance(m, WanDistCausalConv3d | WanDistConv2d))
-    assert counts["persistent_input_buffers"] == dist_convs
+    assert counts["persistent_input_buffers"] == sum(isinstance(m, WanDistConv2d) for m in candidate.decoder.modules())
     assert (dist_convs > 0) == sharded
     if level == "fused":
         assert (
@@ -125,7 +125,7 @@ def _check_pair(reference, candidate, autocast: bool, sharded: bool, level: str 
         else:
             _assert_fused_output_close(e, a, autocast)
     if sharded:
-        bufs = [m._input_buf for m in candidate.decoder.modules() if isinstance(m, WanDistCausalConv3d | WanDistConv2d)]
+        bufs = [m._input_buf for m in candidate.decoder.modules() if isinstance(m, WanDistConv2d)]
         assert all(b is not None for b in bufs)
 
 

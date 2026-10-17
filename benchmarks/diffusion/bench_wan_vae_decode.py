@@ -30,6 +30,7 @@ return the full video on rank 0 only, so equality and PSNR are computed there.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -46,6 +47,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
     OmniAutoencoderKLWan,
 )
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
+    REPORT_ATTR,
     VAE_FAST_PATH_LEVELS,
     install_wan_vae_fastpath,
 )
@@ -79,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames", type=int, default=189, help="Output frame count (1 + 4k)")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--fast-path", default=",".join(VAE_FAST_PATH_LEVELS), help="Comma-separated levels")
+    parser.add_argument(
+        "--vae-spatial-temporal-chunk-size",
+        type=int,
+        default=None,
+        help="Spatial decode chunk override; default: min(8, SP GPU count) for channels_last; 1 otherwise",
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
@@ -134,6 +142,7 @@ def load_vae(
         vae = cls.from_pretrained(args.model, subfolder=args.subfolder, torch_dtype=dtype).to(device).eval()
     if parallel:
         # Same setup as the registry: parallel decode needs tiling on.
+        vae.spatial_temporal_chunk_size = args.vae_spatial_temporal_chunk_size
         vae.use_tiling = True
         vae.set_parallel_size(args.vae_patch_parallel_size, mode=args.vae_parallel_mode)
     return vae
@@ -235,6 +244,7 @@ def run_level(
     timings = []
     output = None
     for _ in range(args.iters):
+        output = None  # Do not count the preceding video in this decode’s memory peak.
         sync()
         start = time.perf_counter()
         output = decode(vae, latents)
@@ -243,12 +253,13 @@ def run_level(
     peak = torch.tensor(torch.accelerator.max_memory_allocated() / 2**30, device=device)
     if dist.is_initialized():
         dist.all_reduce(peak, op=dist.ReduceOp.MAX)  # the largest rank decides whether the config fits
+    report = getattr(vae, REPORT_ATTR, report)
     stats = {
         "installed": report.installed,
         "reason": report.reason,
         "fused_silu": report.fused_silu_dtypes,
         "patched": dict(report.patched),
-        "time_s": min(timings),
+        "time_s": statistics.median(timings),
         "peak_gib": peak.item(),
     }
     if args.profile:
@@ -257,6 +268,7 @@ def run_level(
         profile_decode(vae, latents, args.profile_rows, verbose=rank == 0)
     assert output is not None
     del vae
+    gc.collect()  # Patched bound forwards hold reference cycles.
     torch.accelerator.empty_cache()
     return output.detach(), stats
 
@@ -352,6 +364,8 @@ def run_first_frame_ablation(args: argparse.Namespace, dtype: torch.dtype, devic
 
 def main() -> None:
     args = parse_args()
+    if args.vae_spatial_temporal_chunk_size is not None and args.vae_spatial_temporal_chunk_size < 1:
+        raise SystemExit("--vae-spatial-temporal-chunk-size must be positive")
     if args.latents and not args.first_frame_ablation:
         raise SystemExit("--latents requires --first-frame-ablation")
     if not torch.cuda.is_available():
@@ -382,15 +396,21 @@ def main() -> None:
         parallel_desc = f" vae_parallel={args.vae_parallel_mode}x{args.vae_patch_parallel_size}" if parallel else ""
         print(
             f"model={'tiny' if args.tiny else args.model} size={args.size} frames={args.frames} "
-            f"dtype={args.dtype} world_size={world_size}{parallel_desc}"
+            f"dtype={args.dtype} world_size={world_size}{parallel_desc} "
+            f"temporal_chunk_size={args.vae_spatial_temporal_chunk_size}"
         )
+        if parallel and args.vae_spatial_temporal_chunk_size is None:
+            print(
+                "Automatic chunks: off=lossless=1, channels_last=min(8, SP GPU count). "
+                "Set --vae-spatial-temporal-chunk-size explicitly for same-chunk numerical comparisons."
+            )
     golden = None
     baseline_time = None
     try:
         for level in levels:
             output, stats = run_level(args, level, dtype, device, rank=rank, parallel=parallel)
             if level == "off":
-                golden = output
+                golden = output.cpu()
                 baseline_time = stats["time_s"]
                 if args.save_output and rank == 0:
                     torch.save(output.cpu(), args.save_output)
@@ -402,16 +422,20 @@ def main() -> None:
                 continue
             speedup = baseline_time / stats["time_s"] if baseline_time else float("nan")
             line = (
-                f"[{level:13s}] decode {stats['time_s'] * 1e3:9.1f} ms  speedup {speedup:5.2f}x  "
+                f"[{level:13s}] decode median {stats['time_s'] * 1e3:9.1f} ms  speedup {speedup:5.2f}x  "
                 f"peak {stats['peak_gib']:5.2f} GiB  installed={stats['installed']}"
             )
             if level != "off":
-                equal = torch.equal(output, golden)
+                # Keep the reference off-device between arms so it does not
+                # inflate the candidate's measured peak memory.
+                reference = golden.to(output.device)
+                equal = torch.equal(output, reference)
                 line += (
-                    f"  torch_equal={equal} bits_equal={bits_equal(output, golden)} "
-                    f"max_abs_diff={(output.float() - golden.float()).abs().max().item():.3e} "
-                    f"psnr={psnr(output, golden):.2f} dB"
+                    f"  torch_equal={equal} bits_equal={bits_equal(output, reference)} "
+                    f"max_abs_diff={(output.float() - reference.float()).abs().max().item():.3e} "
+                    f"psnr={psnr(output, reference):.2f} dB"
                 )
+                del reference
                 if stats["installed"]:
                     line += f"  fused_silu={stats['fused_silu'] or 'off'}"
                 else:
