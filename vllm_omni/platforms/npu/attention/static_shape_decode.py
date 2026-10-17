@@ -191,10 +191,11 @@ def install_into_ascend_aclgraph() -> None:
                 _fc = get_forward_context()
                 from vllm.compilation import monitor as _monitor
 
-                if (not _monitor.cudagraph_capturing_enabled
-                        and _fc.cudagraph_runtime_mode != CUDAGraphMode.NONE
-                        and _fc.batch_descriptor
-                        not in self.concrete_aclgraph_entries):
+                if (
+                    not _monitor.cudagraph_capturing_enabled
+                    and _fc.cudagraph_runtime_mode != CUDAGraphMode.NONE
+                    and _fc.batch_descriptor not in self.concrete_aclgraph_entries
+                ):
                     # Request-time step with no captured graph: the stock
                     # wrapper would try to capture now and die. Run eagerly.
                     return self.runnable(*args, **kwargs)
