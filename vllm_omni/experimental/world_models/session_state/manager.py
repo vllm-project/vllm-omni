@@ -36,6 +36,14 @@ DEFAULT_MAX_SESSIONS = 64
 M = TypeVar("M", bound=StateObject)
 
 
+class SessionAdmissionError(RuntimeError):
+    """Admission refused at capacity; retry after a session is released."""
+
+
+class SessionStateLostError(RuntimeError):
+    """Continuation has no resident history; an explicit new session is required."""
+
+
 class SessionState:
     """The named ``StateObject`` collection for one session."""
 
@@ -110,10 +118,14 @@ class SessionStateManager:
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         byte_budget: int | None = None,
         lock_factory: Callable[[], AbstractContextManager[object]] = threading.Lock,
+        evict_when_full: bool = True,
     ) -> None:
         if max_sessions <= 0:
             raise ValueError(f"max_sessions must be positive, got {max_sessions}")
         self.max_sessions = max_sessions
+        # Preserve LRU by default; models with unrecoverable history opt into
+        # rejecting new sessions at capacity.
+        self.evict_when_full = evict_when_full
         # Recorded for observability; enforcement is left to an eviction
         # planner (see RFC #4480). Not scoped to a device: which pool a budget
         # applies to is a question for whoever enforces it, so read
@@ -141,10 +153,17 @@ class SessionStateManager:
         with self._lock:
             session = self._sessions.get(key)
             if session is None:
+                if not self.evict_when_full and len(self._sessions) >= self.max_sessions:
+                    raise SessionAdmissionError(
+                        f"cannot admit session {key!r}: {len(self._sessions)} of {self.max_sessions} "
+                        "session slots are in use and this store is configured not to evict. "
+                        "Either more sessions are live at once than the cap allows, or finished "
+                        "sessions were never released -- end a session explicitly, or raise the cap."
+                    )
                 self.misses += 1
                 session = SessionState()
                 self._sessions[key] = session
-                while len(self._sessions) > self.max_sessions:
+                while self.evict_when_full and len(self._sessions) > self.max_sessions:
                     # Drop the oldest from the table only; do not free its
                     # buffers. An adapter still using the session keeps its own
                     # reference, so its state survives (matching a model's own
@@ -174,6 +193,20 @@ class SessionStateManager:
             if session is None:
                 return False
             session.reset()
+            return True
+
+    def raise_max_sessions(self, max_sessions: int) -> bool:
+        """Raise the session limit without making existing sessions evictable.
+
+        Return whether the limit changed. Lowering is ignored; use
+        ``drop_session`` to release state explicitly.
+        """
+        if max_sessions <= 0:
+            raise ValueError(f"max_sessions must be positive, got {max_sessions}")
+        with self._lock:
+            if max_sessions <= self.max_sessions:
+                return False
+            self.max_sessions = max_sessions
             return True
 
     def __len__(self) -> int:
