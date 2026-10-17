@@ -73,22 +73,26 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
-_OMNI_FA3_HUB_BACKEND = "FLASH_ATTN_3_HUB"
-_OMNI_FA3_HUB_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_FA3_HUB_BACKEND}
+# Same Omni / Diffusers pair on every CUDA SKU in release CI (H100, H200, B200).
+# FLASH_ATTN_3_HUB is Hopper-only and fails on B200/A100 (#8087). TORCH_SDPA
+# matches Diffusers ``native`` and has a binding on both sides.
+_OMNI_CI_ATTN_BACKEND = "TORCH_SDPA"
+_DIFFUSERS_CI_ATTN_BACKEND = "native"
+_OMNI_CI_ATTN_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_CI_ATTN_BACKEND}
 
 
-def _assert_omni_fa3_hub_resolves() -> None:
+def _assert_omni_backend_resolves() -> None:
     from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
     from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
-    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(_OMNI_FA3_HUB_BACKEND, head_size=128)
-    expected = DiffusionAttentionBackendEnum.FLASH_ATTN_3_HUB.get_path()
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(_OMNI_CI_ATTN_BACKEND, head_size=128)
+    expected = DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
     assert path == expected, path
-    print(f"Resolved Omni attention backend: {_OMNI_FA3_HUB_BACKEND} -> {path}")
+    print(f"Resolved Omni attention backend: {_OMNI_CI_ATTN_BACKEND} -> {path}")
 
 
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    _assert_omni_fa3_hub_resolves()
+    _assert_omni_backend_resolves()
     server_args = [
         "--num-gpus",
         "1",
@@ -96,11 +100,10 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
         "300",
         "--init-timeout",
         "900",
-        "--fa-deterministic",
         "--diffusion-attention-backend",
-        _OMNI_FA3_HUB_BACKEND,
+        _OMNI_CI_ATTN_BACKEND,
     ]
-    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_CI_ATTN_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -136,7 +139,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        pipe.transformer.set_attention_backend("_flash_3_hub")
+        pipe.transformer.set_attention_backend(_DIFFUSERS_CI_ATTN_BACKEND)
         generator = torch.Generator(device="cuda").manual_seed(SEED)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT,
@@ -161,7 +164,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    _assert_omni_fa3_hub_resolves()
+    _assert_omni_backend_resolves()
     server_args = [
         "--num-gpus",
         "1",
@@ -170,9 +173,9 @@ def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
         "--init-timeout",
         "900",
         "--diffusion-attention-backend",
-        _OMNI_FA3_HUB_BACKEND,
+        _OMNI_CI_ATTN_BACKEND,
     ]
-    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_CI_ATTN_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -208,7 +211,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
             trust_remote_code=True,
             local_files_only=_local_files_only(model),
         ).to("cuda")
-        pipe.transformer.set_attention_backend("_flash_3_hub")
+        pipe.transformer.set_attention_backend(_DIFFUSERS_CI_ATTN_BACKEND)
         generator = torch.Generator(device="cuda").manual_seed(SEED_2512)
         result = pipe(  # pyright: ignore[reportCallIssue]
             prompt=PROMPT_2512,
@@ -233,7 +236,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "H200", "B200"]}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -253,7 +256,7 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "H200", "B200"]}, num_cards=1)
 def test_qwen_image_2512_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _model_2512_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_2512_ID)
