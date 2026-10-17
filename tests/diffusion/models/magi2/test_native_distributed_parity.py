@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import os
 import tempfile
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,7 @@ import torch.multiprocessing as mp
 import vllm_omni.diffusion.models.magi2.attention as attention_module
 import vllm_omni.diffusion.models.magi2.layers as layers_module
 import vllm_omni.diffusion.models.magi2.mh_moe as mh_moe_module
+import vllm_omni.diffusion.models.magi2.modeling_magi2 as modeling_module
 import vllm_omni.diffusion.models.magi2.parallel as parallel_module
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
 from vllm_omni.diffusion.models.magi2.configuration_magi2 import (
@@ -126,7 +128,13 @@ def _patched_groups(
         stack.enter_context(patch.object(mh_moe_module, "get_magi2_ep_group", return_value=ep_group))
         stack.enter_context(patch.object(parallel_module, "get_magi2_ulysses_group", return_value=sp_group))
         stack.enter_context(patch.object(attention_module, "get_magi2_ulysses_group", return_value=sp_group))
+        stack.enter_context(patch.object(modeling_module, "get_magi2_ulysses_group", return_value=sp_group))
         yield
+
+
+def _musa_ulysses_layouts():
+    """Build the model with the MUSA Ulysses exchange layouts on any device."""
+    return patch.object(modeling_module, "current_omni_platform", SimpleNamespace(is_musa=lambda: True))
 
 
 def _current_group(
@@ -179,23 +187,26 @@ def _distributed_worker(rank: int, rendezvous: str) -> None:
             rank=rank,
         )
         layouts = (
-            ("tp4", world_group, singleton),
-            ("tp2sp2", _current_group(rank, tp2_groups), _current_group(rank, sp2_groups)),
-            ("sp4", singleton, world_group),
+            ("tp4", world_group, singleton, False),
+            ("tp2sp2", _current_group(rank, tp2_groups), _current_group(rank, sp2_groups), False),
+            ("sp4", singleton, world_group, False),
+            ("sp4_musa_ulysses", singleton, world_group, True),
         )
 
-        for layout_name, tp_group, sp_group in layouts:
+        outputs = {}
+        for layout_name, tp_group, sp_group, musa_ulysses in layouts:
             tp_group = Magi2ParallelGroup(
                 tp_group.group,
                 tp_group.world_size,
                 tp_group.rank,
                 replicated_sequence=True,
             )
-            with _patched_groups(tp_group, sp_group):
+            with _patched_groups(tp_group, sp_group), _musa_ulysses_layouts() if musa_ulysses else nullcontext():
                 model = Magi2PreviewTransformer(_tiny_config())
                 assert model.load_weights(checkpoint) == set(model.state_dict())
                 with torch.no_grad():
                     actual = model(*inputs)
+            outputs[layout_name] = actual
 
             max_abs_error = (actual - expected).abs().max()
             dist.all_reduce(max_abs_error, op=dist.ReduceOp.MAX)
@@ -210,6 +221,15 @@ def _distributed_worker(rank: int, rendezvous: str) -> None:
                     f"global max absolute error={max_abs_error.item():.8g}"
                 )
             dist.barrier()
+
+        # The MUSA Ulysses layouts move the same bytes, so the outputs match bit for bit.
+        same = torch.tensor(
+            int(torch.equal(outputs["sp4_musa_ulysses"].view(torch.int32), outputs["sp4"].view(torch.int32))),
+            dtype=torch.int32,
+        )
+        dist.all_reduce(same, op=dist.ReduceOp.MIN)
+        if not same.item():
+            raise AssertionError("sp4 with the MUSA Ulysses layouts differs from sp4")
     finally:
         dist.destroy_process_group()
 
