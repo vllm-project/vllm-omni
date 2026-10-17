@@ -692,26 +692,38 @@ class Qwen2_5OmniForConditionalGeneration(
         # Mixed-mode support: In a single step, both Prefill*n and Decode*n are supported.
         # Rules:
         # - Prefill segments are wrapped with special tokens: [BOS][PAD...][EOS]
-        # - Decode segments consist of a single non-special token.
+        # - Decode segments may span one position (sequential decoding) or several
+        #   (speculative-decoding verification, preempt/resume KV replay).
         # - If additional_information is provided (can be a list split by request or a
         #   concatenated tensor plus a list of shapes), then for each request, reconstruct
         #   the thinker→talker input embeddings for the Prefill segments;
-        # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional),
-        #   add them; otherwise, keep the original embedding.
+        # - For Decode segments, add the request's ``thinker_reply`` row for each
+        #   position; past the end of the thinker reply, keep the codec embedding.
 
         payload: OmniPayload = info_dict
 
-        # Ensure we have base embeddings when only ids are provided
-        if input_embeds is None and input_ids is not None:
-            input_embeds = self.talker.embed_input_ids(input_ids)
-
-        span_len = input_ids.shape[0]
-        if span_len > 1:
-            # prefill
-            return self.thinker_to_talker_process(input_ids, input_embeds, payload)
+        span_len = int(input_ids.shape[0])
+        # Phase must come from the runner's per-request metadata (#3662), not from
+        # the span length: a speculative-decoding verify step schedules span_len ==
+        # num_draft_tokens + 1 decode positions, and a chunked prefill can end in a
+        # 1-token tail — both misroute under the span_len > 1 heuristic.
+        is_prefill_raw = payload.get("_omni_is_prefill")
+        if isinstance(is_prefill_raw, bool):
+            is_prefill = is_prefill_raw
         else:
-            # decode
-            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, payload)
+            try:
+                is_prefill = int(payload["_omni_num_computed_tokens"]) < int(payload["_omni_prompt_len"])
+            except (KeyError, TypeError, ValueError):
+                # Legacy callers without the runner metadata: fall back to the
+                # span-length heuristic (pre-#3662 behavior).
+                is_prefill = span_len > 1
+
+        if is_prefill:
+            # Ensure we have base embeddings when only ids are provided
+            if input_embeds is None and input_ids is not None:
+                input_embeds = self.talker.embed_input_ids(input_ids)
+            return self.thinker_to_talker_process(input_ids, input_embeds, payload)
+        return self.thinker_to_talker_decode(input_ids, input_embeds, payload)
 
     def thinker_to_talker_process(
         self,
@@ -801,6 +813,55 @@ class Qwen2_5OmniForConditionalGeneration(
                 torch.Tensor(prompt_token_ids_processed).to(torch.int64).to(self._module_device(self.talker))
             )
         return prompt_token_ids_processed, prompt_embeds
+
+    def thinker_to_talker_decode(self, input_ids, input_embeds, payload: OmniPayload):
+        """Assemble decode-side embeddings for a span of one or more positions.
+
+        Each decode position needs ``thinker_reply[k] + codec_embedding`` where
+        ``k`` is the position's generation offset. The offset is derived
+        statelessly from the runner metadata (``_omni_num_computed_tokens -
+        _omni_prompt_len``) instead of consuming one queue row per call, so the
+        same call handles the sequential single-token step, the multi-position
+        span of a speculative-decoding verify step, and the multi-token replay
+        span submitted when a preempted request resumes — a replay reconstructs
+        exactly the embeddings the original steps used. Positions past the end
+        of the thinker reply keep the plain codec embedding.
+
+        When the runner metadata is absent (legacy out-of-tree callers), the
+        single-position stateful path :meth:`thinker_to_talker_decode_one_step`
+        is used unchanged.
+        """
+        try:
+            offset = max(
+                0,
+                int(payload["_omni_num_computed_tokens"]) - int(payload["_omni_prompt_len"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            # Pre-#3662 callers: keep the consuming single-step behavior.
+            if input_embeds is None and input_ids is not None:
+                input_embeds = self.talker.embed_input_ids(input_ids)
+            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, payload)
+
+        span_len = int(input_ids.shape[0])
+        # Build the span embeddings from the codec ids rather than trusting the
+        # incoming buffer: in a mixed batch the runner hands decode requests a
+        # slice of a ``torch.empty`` scratch tensor (uninitialized memory), and
+        # this is the only embedding build for the span (the entry-point one is
+        # prefill-only).
+        out_dtype = input_embeds.dtype if input_embeds is not None else None
+        input_embeds = self.talker.embed_input_ids(input_ids)
+        if out_dtype is not None and input_embeds.dtype != out_dtype:
+            input_embeds = input_embeds.to(out_dtype)
+
+        embed = payload.get("embed", {})
+        q = embed.get("thinker_reply", None)
+        if isinstance(q, torch.Tensor) and q.numel() > 0:
+            rows = q[offset : offset + span_len]
+            n = int(rows.shape[0])
+            if n > 0:
+                input_embeds[:n] = input_embeds[:n] + rows.to(dtype=input_embeds.dtype, device=input_embeds.device)
+        # Stateless: ``thinker_reply`` is not consumed, so no update to merge.
+        return input_ids, input_embeds, {}
 
     def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, payload: OmniPayload):
         embed = payload.get("embed", {})
