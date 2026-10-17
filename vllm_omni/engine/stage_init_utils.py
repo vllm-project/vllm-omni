@@ -1555,7 +1555,14 @@ def build_vllm_config(
             else build_engine_args_dict(stage_config, model, stage_connector_spec=stage_connector_spec)
         )
 
-    filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+    # _to_dict attaches this private transport marker only when it flattened
+    # a typed FaultToleranceConfig. A raw dict (including one with default
+    # values) is an explicit FT config and retains vLLM's auto-enable behavior.
+    ft_config_was_typed = engine_args_dict.get("_omni_ft_config_was_typed") is True
+    filtered_engine_args_dict = filter_dataclass_kwargs(
+        OmniEngineArgs,
+        {k: v for k, v in engine_args_dict.items() if k != "_omni_ft_config_was_typed"},
+    )
     if api_process_count != 1 or api_process_rank != 0:
         filtered_engine_args_dict["_api_process_count"] = api_process_count
         filtered_engine_args_dict["_api_process_rank"] = api_process_rank
@@ -1571,6 +1578,14 @@ def build_vllm_config(
         from vllm.config import StructuredOutputsConfig
 
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
+
+    # Restore the type lost in serialization only when the source was typed.
+    # Without provenance, a dict must retain vLLM's explicit-config semantics.
+    ft_config = filtered_engine_args_dict.get("fault_tolerance_config")
+    if ft_config_was_typed and isinstance(ft_config, dict):
+        from vllm.config import FaultToleranceConfig
+
+        filtered_engine_args_dict["fault_tolerance_config"] = FaultToleranceConfig(**ft_config)
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 

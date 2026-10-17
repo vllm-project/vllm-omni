@@ -279,7 +279,15 @@ def _to_dict(x: Any) -> dict[str, Any]:
         if isinstance(x, dict):
             return dict(x)
         if is_dataclass(x) and not isinstance(x, type):
-            return asdict(x)
+            result = asdict(x)
+            # vLLM treats a dict-valued FT config as an explicit opt-in.
+            # Record whether serialization flattened an existing typed config;
+            # equality with the default config cannot establish provenance.
+            from vllm.config import FaultToleranceConfig
+
+            if isinstance(getattr(x, "fault_tolerance_config", None), FaultToleranceConfig):
+                result["_omni_ft_config_was_typed"] = True
+            return result
         return _omega_to_dict(x)
     except Exception:
         try:
