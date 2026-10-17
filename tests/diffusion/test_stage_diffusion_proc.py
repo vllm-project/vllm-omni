@@ -367,14 +367,14 @@ async def test_real_executor_rpc_finishes_before_cancellation() -> None:
     started = threading.Event()
     release = threading.Event()
 
-    def blocking_profile(*_args):
+    def blocking_rpc(*_args):
         started.set()
         assert release.wait(timeout=5)
 
     proc = object.__new__(StageDiffusionProc)
-    proc._engine = SimpleNamespace(profile=blocking_profile)
+    proc._engine = SimpleNamespace(collective_rpc=blocking_rpc)
     proc._executor = ThreadPoolExecutor(max_workers=1)
-    task = asyncio.create_task(proc._handle_collective_rpc("profile", None, (True, None), {}))
+    task = asyncio.create_task(proc._handle_collective_rpc("list_loras", None, (), {}))
     try:
         assert await asyncio.to_thread(started.wait, 1)
         task.cancel()
