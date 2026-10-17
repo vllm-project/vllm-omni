@@ -1320,9 +1320,23 @@ def extract_sensenova_u1_context(
     layer_kwargs = dict(kwargs)
     layer_kwargs.pop("cache_dit_skip", None)
     image_gen_indicators = layer_kwargs.pop("image_gen_indicators", None)
+    if inputs_embeds is None or indexes is None or image_gen_indicators is None:
+        raise ValueError("SenseNova TeaCache requires inputs_embeds, indexes, and image_gen_indicators")
     exist_und = (~image_gen_indicators).any().item()
     exist_gen = image_gen_indicators.any().item()
-    causal_mask_mapping = attention_mask
+    if not isinstance(attention_mask, dict):
+        past_len = past_key_values.get_seq_length() if past_key_values else 0
+        seq_len = inputs_embeds.shape[1]
+        total_len = past_len + seq_len
+        if seq_len > 1:
+            mask = torch.zeros(1, 1, seq_len, total_len, device=inputs_embeds.device)
+            causal = torch.tril(torch.ones(seq_len, seq_len, device=inputs_embeds.device))
+            mask[:, :, :, past_len:] = torch.where(causal == 1, 0.0, float("-inf"))
+        else:
+            mask = None
+        causal_mask_mapping = {"full_attention": mask}
+    else:
+        causal_mask_mapping = attention_mask
 
     first_layer = module.model.layers[0]
     modulated_input = first_layer.input_layernorm_mot_gen(inputs_embeds)
@@ -1345,6 +1359,7 @@ def extract_sensenova_u1_context(
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
+                use_cache=use_cache,
                 **layer_kwargs,
             )
         return (h,)

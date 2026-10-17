@@ -244,6 +244,7 @@ datasets/
 *.json
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
+!benchmarks/diffusion/evidence/**/*.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 # Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)

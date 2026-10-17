@@ -443,6 +443,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     )
                     self.cache_backend = None
 
+                # Mixed model warmups invoke nested generations without going
+                # through the runner's request-boundary refresh. Let them use
+                # whichever enabled backend remains under runner management.
+                if self.cache_backend is not None:
+                    self.pipeline._active_cache_backend = self.cache_backend
+
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
         # when the pipeline does not expose ``encode_prompt``.

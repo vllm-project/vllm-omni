@@ -1215,7 +1215,8 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+@pytest.mark.parametrize("model_class_name", ["NextStep11Pipeline", "SenseNovaU1Pipeline"])
+def test_load_model_publishes_cache_backend_only_for_supported_pipeline(monkeypatch, model_class_name):
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
@@ -1255,7 +1256,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         enable_layerwise_offload=False,
         cache_backend="cache_dit",
         cache_config={},
-        model_class_name="NextStep11Pipeline",
+        model_class_name=model_class_name,
         enforce_eager=True,
         streaming_output=False,
     )
@@ -1274,9 +1275,15 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
 
     DiffusionModelRunner.load_model(runner)
 
-    assert runner.cache_backend is None
-    assert runner.od_config.cache_backend is None
-    assert dummy_cache_backend.enabled is False
+    if model_class_name == "SenseNovaU1Pipeline":
+        assert runner.cache_backend is dummy_cache_backend
+        assert runner.pipeline._active_cache_backend is dummy_cache_backend
+        assert dummy_cache_backend.enabled is True
+    else:
+        assert runner.cache_backend is None
+        assert runner.od_config.cache_backend is None
+        assert dummy_cache_backend.enabled is False
+        assert not hasattr(runner.pipeline, "_active_cache_backend")
 
 
 @pytest.mark.core_model
