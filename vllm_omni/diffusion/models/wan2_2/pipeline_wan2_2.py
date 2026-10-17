@@ -149,6 +149,25 @@ def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionCo
         raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
 
 
+def resolve_wan_boundary_ratio(
+    engine_boundary_ratio: float | None,
+    sampling_params: OmniDiffusionSamplingParams,
+    warn_context: str | None = None,
+) -> float:
+    """Return the effective MoE boundary: engine override, then request, then 0.875.
+
+    Shared by ``forward()`` and the Cache-DiT expert split so both see the same
+    boundary for a request.
+    """
+    if engine_boundary_ratio is not None:
+        return engine_boundary_ratio
+    if sampling_params.boundary_ratio is not None:
+        return sampling_params.boundary_ratio
+    if warn_context is not None:
+        logger.warning("boundary_ratio is required for %s generation. using default value 0.875", warn_context)
+    return 0.875
+
+
 def apply_wan_request_scheduler(pipeline: Any, req: OmniDiffusionRequest) -> tuple[str, float]:
     """Rebuild ``pipeline.scheduler`` for the request's sample_solver / flow_shift.
 
@@ -1163,7 +1182,6 @@ class Wan22Pipeline(
         settings = []
         for request in batch.requests:
             sampling = request.sampling_params
-            boundary = self.boundary_ratio if self.boundary_ratio is not None else sampling.boundary_ratio
             current = {
                 "height, width and num_frames": effective_wan_dimensions(
                     sampling,
@@ -1175,7 +1193,7 @@ class Wan22Pipeline(
                     sampling, default_guidance_scale=1.0 if self.is_dmd else 4.0
                 ),
                 "num_outputs_per_prompt": sampling.num_outputs_per_prompt or 1,
-                "boundary_ratio": 0.875 if boundary is None else boundary,
+                "boundary_ratio": resolve_wan_boundary_ratio(self.boundary_ratio, sampling),
             }
             if uses_text_encoder:
                 current["max_sequence_length"] = sampling.max_sequence_length or 512
@@ -1193,10 +1211,13 @@ class Wan22Pipeline(
     def prepare_cache_refresh(self, req: OmniDiffusionRequest) -> None:
         """Apply the request's scheduler settings before the runner refreshes the cache.
 
-        The Cache-DiT dual-expert step split reads ``self.scheduler`` and
-        ``self._flow_shift``; without this, a per-request ``flow_shift`` would
-        only reach them in ``forward()``, after the split was already planned.
+        The Cache-DiT dual-expert step split reads ``self.scheduler``,
+        ``self._flow_shift`` and ``self._request_boundary_ratio``; without this,
+        a per-request ``flow_shift`` / ``boundary_ratio`` would only reach
+        ``forward()``, after the split was already planned.  The startup
+        ``self.boundary_ratio`` is left untouched.
         """
+        self._request_boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, req.sampling_params)
         if not self.is_dmd:
             apply_wan_request_scheduler(self, req)
 
@@ -1272,11 +1293,7 @@ class Wan22Pipeline(
         self._guidance_scale_2 = guidance_high
 
         # Prefer engine-configured boundary_ratio, but allow per-request fallback.
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for T2V generation. using default value 0.875")
+        boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="T2V")
 
         # validate shapes
         self.check_inputs(

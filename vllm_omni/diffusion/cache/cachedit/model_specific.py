@@ -51,8 +51,14 @@ def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[in
     Returns:
         A tuple of (num_high_noise_steps, num_low_noise_steps).
     """
-    if pipeline.boundary_ratio is not None:
-        boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
+    # Prefer the request-effective boundary that the pipeline's
+    # ``prepare_cache_refresh`` resolved (engine -> request -> 0.875, same as
+    # ``forward()``); the startup ``boundary_ratio`` may be None.
+    boundary_ratio = getattr(pipeline, "_request_boundary_ratio", None)
+    if boundary_ratio is None:
+        boundary_ratio = pipeline.boundary_ratio
+    if boundary_ratio is not None:
+        boundary_timestep = boundary_ratio * pipeline.scheduler.config.num_train_timesteps
     else:
         boundary_timestep = None
 

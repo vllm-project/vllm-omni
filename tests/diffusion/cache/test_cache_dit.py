@@ -322,7 +322,7 @@ def test_wan22_step_split_follows_request_flow_shift_override():
         _sample_solver="unipc",
         _flow_shift=5.0,
     )
-    req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"flow_shift": 12.0}))
+    req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"flow_shift": 12.0}, boundary_ratio=None))
 
     Wan22Pipeline.prepare_cache_refresh(pipeline, req)
 
@@ -333,6 +333,85 @@ def test_wan22_step_split_follows_request_flow_shift_override():
     num_high_noise_steps = int((reference.timesteps >= 875).sum())
     assert split == (num_high_noise_steps, 40 - num_high_noise_steps)
     assert split != (17, 23)
+
+
+def _wan22_split_reference(boundary_ratio, flow_shift=5.0, num_steps=40):
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
+
+    reference = build_wan_scheduler("unipc", flow_shift)
+    reference.set_timesteps(num_steps, device="cpu", shift=flow_shift)
+    num_high_noise_steps = int((reference.timesteps >= boundary_ratio * reference.config.num_train_timesteps).sum())
+    return num_high_noise_steps, num_steps - num_high_noise_steps
+
+
+@pytest.mark.parametrize(
+    ("pipeline_module", "pipeline_cls"),
+    [
+        ("pipeline_wan2_2", "Wan22Pipeline"),
+        ("pipeline_wan2_2_i2v", "Wan22I2VPipeline"),
+        ("pipeline_wan2_2_vace", "Wan22VACEPipeline"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("engine_boundary", "request_boundary", "expected_boundary"),
+    [
+        (None, None, 0.875),  # omitted everywhere: forward() defaults to 0.875
+        (None, 0.9, 0.9),  # request override when the engine has none
+        (0.875, 0.9, 0.875),  # engine override wins over the request
+    ],
+)
+def test_wan22_step_split_uses_effective_boundary(
+    pipeline_module, pipeline_cls, engine_boundary, request_boundary, expected_boundary
+):
+    """The split must use the boundary forward() resolves (engine -> request -> 0.875)."""
+    import importlib
+
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler, resolve_wan_boundary_ratio
+
+    cls = getattr(importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{pipeline_module}"), pipeline_cls)
+    pipeline = SimpleNamespace(
+        is_dmd=False,
+        od_config=SimpleNamespace(flow_shift=5.0),
+        transformer=torch.nn.Linear(1, 1),
+        scheduler=build_wan_scheduler("unipc", 5.0),
+        boundary_ratio=engine_boundary,
+        _sample_solver="unipc",
+        _flow_shift=5.0,
+    )
+    sampling_params = SimpleNamespace(extra_args={}, boundary_ratio=request_boundary)
+
+    cls.prepare_cache_refresh(pipeline, SimpleNamespace(sampling_params=sampling_params))
+
+    assert resolve_wan_boundary_ratio(engine_boundary, sampling_params) == expected_boundary
+    assert pipeline.boundary_ratio == engine_boundary  # startup value is not overwritten
+    split = cd_model_specific._split_wan22_inference_steps(pipeline, 40)
+    assert split == _wan22_split_reference(expected_boundary)
+    assert split != (40, 0)
+
+
+def test_wan22_step_split_follows_successive_request_boundaries():
+    """Each request picks its own boundary when the engine was started without one."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
+
+    pipeline = SimpleNamespace(
+        is_dmd=False,
+        od_config=SimpleNamespace(flow_shift=5.0),
+        transformer=torch.nn.Linear(1, 1),
+        scheduler=build_wan_scheduler("unipc", 5.0),
+        boundary_ratio=None,
+        _sample_solver="unipc",
+        _flow_shift=5.0,
+    )
+
+    splits = []
+    for request_boundary in (0.95, None, 0.8):
+        req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={}, boundary_ratio=request_boundary))
+        Wan22Pipeline.prepare_cache_refresh(pipeline, req)
+        splits.append(cd_model_specific._split_wan22_inference_steps(pipeline, 40))
+
+    assert splits == [_wan22_split_reference(b) for b in (0.95, 0.875, 0.8)]
+    assert len(set(splits)) == 3
+    assert pipeline.boundary_ratio is None
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")

@@ -45,6 +45,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    resolve_wan_boundary_ratio,
     resolve_wan_guidance_scales,
     retrieve_latents,
 )
@@ -470,6 +471,7 @@ class Wan22I2VPipeline(
 
         See :meth:`Wan22Pipeline.prepare_cache_refresh`.
         """
+        self._request_boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, req.sampling_params)
         apply_wan_request_scheduler(self, req)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
@@ -534,10 +536,7 @@ class Wan22I2VPipeline(
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for I2V generation. using default value 0.875")
+        boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="I2V")
 
         # Validate inputs
         self.check_inputs(
