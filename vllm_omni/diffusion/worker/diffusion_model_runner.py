@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    require_attention_schedule_pipeline,
     require_denoise_progress_publisher,
     require_no_cache_backend,
     resolve_batch_attention_schedule,
@@ -326,6 +327,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if load_format == "dummy":
             return
 
+        self._require_attention_schedule_pipeline(load_format)
+
         # Resolve environment overrides before model loading. Rank-local
         # prompt-cache hits cannot safely skip text-encoder collectives.
         enable_pec, pec_size = resolve_prompt_embed_cache_config(
@@ -473,6 +476,25 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         self._validate_service_attention_schedule()
         logger.info("Model runner: Initialization complete.")
+
+    def _require_attention_schedule_pipeline(self, load_format: str) -> None:
+        """Fail startup, before any weight is loaded, when configured profiles target an unsupported model.
+
+        A pipeline that defines ``record_denoise_step`` is not enough: profiles would apply only on the
+        paths that publish progress. Only registered pipeline classes known to publish it on every
+        denoise forward are accepted; a custom pipeline is not.
+        """
+        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        if not getattr(service, "profiles", None):
+            return
+        model_class_name = self.od_config.model_class_name
+        pipeline_class_name = None
+        if load_format != "custom_pipeline" and model_class_name is not None:
+            from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+            registered = DiffusionModelRegistry.models.get(model_class_name)
+            pipeline_class_name = getattr(registered, "class_name", None)
+        require_attention_schedule_pipeline(pipeline_class_name, model_class_name)
 
     def _validate_service_attention_schedule(self) -> None:
         """Fail startup when configured profiles can never run on this service.
