@@ -221,10 +221,10 @@ def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
 
 
 def shm_read_bytes(meta: dict[str, Any]) -> bytes:
-    """Read bytes from SharedMemory by meta {name,size} and cleanup."""
+    """Read and unlink shared memory; an omitted size reads the full segment."""
     shm = _shm.SharedMemory(name=meta["name"])  # type: ignore[index]
     mv = memoryview(shm.buf)
-    data = bytes(mv[: meta["size"]])
+    data = bytes(mv[: meta.get("size", shm.size)])
     del mv
     try:
         shm.close()

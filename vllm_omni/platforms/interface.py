@@ -3,7 +3,7 @@
 
 from contextlib import nullcontext
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,10 @@ from vllm.platforms import Platform
 from vllm.platforms.interface import PlatformEnum
 
 logger = init_logger(__name__)
+
+
+if TYPE_CHECKING:
+    from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 
 
 class OmniPlatformEnum(Enum):
@@ -68,6 +72,13 @@ class OmniPlatform(Platform):
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         raise NotImplementedError
+
+    @classmethod
+    def get_shared_memory_connector_cls(cls) -> "type[SharedMemoryConnector]":
+        """Select OS storage adaptation while retaining the SHM lifecycle."""
+        from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
+
+        return SharedMemoryConnector
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
