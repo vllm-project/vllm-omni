@@ -254,9 +254,11 @@ sets the context each `rank` piece reads beyond its edges. A latent pixel is
 - `vae_patch_parallel_size > 1` with `vae_parallel_mode="tile"` or
   `"spatial_shard_*"`. `batch` mode encodes locally, and spatial-shard modes
   shard only the decode.
-- VAE tiling is enabled (automatic for these modes) and the input is larger
-  than one tile (256 sample px in height or width). Smaller inputs use the local
-  encode.
+- VAE tiling is enabled and the input is larger than one tile (256 sample px
+  in height or width). Smaller inputs use the local encode. Pass
+  `--vae-use-tiling` (`vae_use_tiling=True`) explicitly: with `spatial_shard_*`
+  modes, tiling is not guaranteed to be enabled automatically, and without it
+  the encode runs locally and the split has no effect.
 
 Both variables are read at each encode. Set them in the environment of the
 process that starts vLLM-Omni; spawned diffusion workers inherit it:
@@ -266,7 +268,8 @@ VLLM_OMNI_WAN_VAE_ENCODE_SPLIT=rank \
 vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers --omni \
     --tensor-parallel-size 2 \
     --vae-patch-parallel-size 2 \
-    --vae-parallel-mode spatial_shard_height
+    --vae-parallel-mode spatial_shard_height \
+    --vae-use-tiling
 ```
 
 **Quality and approximation limits.** Neither split reproduces a single-GPU
