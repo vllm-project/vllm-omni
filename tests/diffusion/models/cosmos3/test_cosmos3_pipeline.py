@@ -18,8 +18,10 @@ import torch
 from PIL import Image
 from torch import nn
 
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.world_models.session_state import SessionStateManager
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -312,37 +314,38 @@ def fake_cosmos3_guardrails(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def make_cosmos3_pipeline():
-    def _make():
-        from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
-            COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT,
-            Cosmos3OmniDiffusersPipeline,
-        )
+    return _make_cosmos3_pipeline
 
-        pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
-        nn.Module.__init__(pipeline)
-        pipeline.od_config = SimpleNamespace()
-        pipeline.device = torch.device("cpu")
-        pipeline.dtype = torch.float32
-        pipeline.transformer = StubCosmos3Transformer(latent_channel_size=2)
-        pipeline.vae = StubCosmos3VAE(z_dim=2)
-        pipeline.vae_scale_factor_temporal = 4
-        pipeline.vae_scale_factor_spatial = 8
-        pipeline.scheduler = StubScheduler([9, 3], flow_shift=1.0)
-        pipeline._engine_init_flow_shift = COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT
-        pipeline._current_flow_shift = COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT
-        pipeline.is_distilled_model = False
-        pipeline.is_edge_model = False
-        pipeline._guidance_scale = None
-        pipeline._num_timesteps = None
-        pipeline._current_step_index = None
-        pipeline._current_sigma = None
-        pipeline._cosmos3_branch_caches = None
-        pipeline._cache_dit_requires_paired_cfg = False
-        pipeline._sound_tokenizer = None
-        pipeline.progress_bar = passthrough_progress_bar
-        return pipeline
 
-    return _make
+def _make_cosmos3_pipeline():
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT,
+        Cosmos3OmniDiffusersPipeline,
+    )
+
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace()
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.float32
+    pipeline.transformer = StubCosmos3Transformer(latent_channel_size=2)
+    pipeline.vae = StubCosmos3VAE(z_dim=2)
+    pipeline.vae_scale_factor_temporal = 4
+    pipeline.vae_scale_factor_spatial = 8
+    pipeline.scheduler = StubScheduler([9, 3], flow_shift=1.0)
+    pipeline._engine_init_flow_shift = COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT
+    pipeline._current_flow_shift = COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT
+    pipeline.is_distilled_model = False
+    pipeline.is_edge_model = False
+    pipeline._guidance_scale = None
+    pipeline._num_timesteps = None
+    pipeline._current_step_index = None
+    pipeline._current_sigma = None
+    pipeline._cosmos3_branch_caches = None
+    pipeline._cache_dit_requires_paired_cfg = False
+    pipeline._sound_tokenizer = None
+    pipeline.progress_bar = passthrough_progress_bar
+    return pipeline
 
 
 @pytest.fixture
@@ -1167,6 +1170,86 @@ def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
     assert pipeline.transformer.audio_proj_out.out_features == 5
 
 
+@pytest.mark.parametrize(
+    ("prompt", "mode"),
+    [
+        ("A mountain lake.", "video"),
+        ({"prompt": "A mountain lake."}, "video"),
+        ({"prompt": "A mountain lake.", "modalities": None}, "video"),
+        ({"prompt": "A mountain lake.", "modalities": []}, "video"),
+        ({"prompt": "A mountain lake.", "modalities": ["video"]}, "video"),
+        ({"prompt": "A mountain lake.", "modalities": ["text", "audio"]}, "video"),
+        ({"prompt": "A mountain lake.", "modalities": "image"}, "image"),
+        ({"prompt": "A mountain lake.", "modalities": ["image"]}, "image"),
+        ({"prompt": "A mountain lake.", "modalities": ["text", "image"]}, "image"),
+    ],
+)
+def test_preprocess_output_mode_matches_forward(make_cosmos3_pipeline, prompt, mode) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    pipeline = make_cosmos3_pipeline()
+    request = OmniDiffusionRequest(
+        request_id="mode",
+        prompt=prompt,
+        sampling_params=OmniDiffusionSamplingParams(
+            height=720, width=1280, num_frames=193, num_inference_steps=None, guidance_scale=1.0
+        ),
+    )
+
+    assert get_cosmos3_pre_process_func(pipeline.od_config)(request) is request
+    assert request.batch_compatibility_key == ("cosmos3", mode, None, False, None)
+    assert request.sampling_params.num_inference_steps is None
+    assert request.sampling_params.num_frames == 193
+    assert pipeline._is_t2i_request(DiffusionRequestBatch(requests=[request])) == (mode == "image")
+
+
+@pytest.mark.parametrize(
+    "prompt_fields",
+    [
+        {"action_mode": "policy"},
+        {"additional_information": {"action_mode": "policy"}},
+        {"generate_sound": True},
+        {"sound_gen": "true"},
+        {"edge": True},
+        {"blur": {"preset_blur_strength": "low"}},
+    ],
+)
+def test_preprocess_key_separates_prompt_level_schedule_modes(make_cosmos3_pipeline, prompt_fields) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    preprocess = get_cosmos3_pre_process_func(make_cosmos3_pipeline().od_config)
+
+    def key(request_id, **fields):
+        request = OmniDiffusionRequest(
+            request_id=request_id,
+            prompt={"prompt": "A mountain lake.", **fields},
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=None),
+        )
+        return preprocess(request).batch_compatibility_key
+
+    plain = key("plain")
+    assert key("same-plain") == plain
+    assert key("variant", **prompt_fields) != plain
+    # Transfer chunking depends on input length, so transfer requests never share a key.
+    if "edge" in prompt_fields or "blur" in prompt_fields:
+        assert key("variant-a", **prompt_fields) != key("variant-b", **prompt_fields)
+    else:
+        assert key("variant-a", **prompt_fields) == key("variant-b", **prompt_fields)
+
+
+@pytest.mark.parametrize("modalities", [["image", "video"], ["invalid"]])
+def test_preprocess_rejects_invalid_output_mode(make_cosmos3_pipeline, modalities) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    request = OmniDiffusionRequest(
+        request_id="invalid-mode",
+        prompt={"prompt": "A mountain lake.", "modalities": modalities},
+        sampling_params=OmniDiffusionSamplingParams(),
+    )
+    with pytest.raises(ValueError, match="both image and video|Incorrect modality"):
+        get_cosmos3_pre_process_func(make_cosmos3_pipeline().od_config)(request)
+
+
 def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
 
@@ -1177,6 +1260,7 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     )
 
     result = preprocess(i2v)
+    assert result.batch_compatibility_key == ("cosmos3", "video", None, False, None)
     assert (result.sampling_params.height, result.sampling_params.width) == (672, 1344)
     assert tuple(result.prompt["additional_information"]["preprocessed_image"].shape[-2:]) == (672, 1344)
 

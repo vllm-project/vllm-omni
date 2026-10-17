@@ -448,6 +448,35 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config["ulysses_mode"] == "advanced_uaa"
 
 
+def test_serve_cli_accepts_hsdp_data_parallel():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--use-hsdp",
+            "--hsdp-shard-size",
+            "8",
+            "--hsdp-data-parallel",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.hsdp_data_parallel is True
+    assert parallel_config["hsdp_data_parallel"] is True
+    assert parallel_config["data_parallel_size"] == 8
+    # Unset, so OmniDiffusionConfig can apply the HSDP data-parallel default.
+    assert args.request_batch_max_wait_ms is None
+    assert stage_cfg["engine_args"].get("request_batch_max_wait_ms") is None
+
+
 def test_serve_cli_accepts_text_encoder_tp_size():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")

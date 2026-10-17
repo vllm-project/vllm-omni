@@ -215,6 +215,51 @@ COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
 
 
+def _is_cosmos3_t2i_prompt(prompt: object) -> bool:
+    """Resolve and validate the output mode shared by admission and inference.
+
+    Only ``image`` selects T2I. Omitted modalities and the accepted ``video``,
+    ``text``, and ``audio`` values select video generation. Invalid modalities
+    and simultaneous image/video outputs raise ``ValueError`` before admission.
+    """
+    modalities = prompt.get("modalities", []) if isinstance(prompt, dict) else []
+    if modalities is None:
+        modalities = []
+    if isinstance(modalities, str):
+        modalities = [modalities]
+    if "image" in modalities and "video" in modalities:
+        raise ValueError("Cosmos3 prompt modalities cannot request both image and video output.")
+
+    accepted_modalities = ["image", "video", "text", "audio"]
+    if any(x not in accepted_modalities for x in modalities):
+        raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
+    return "image" in modalities
+
+
+def _cosmos3_batch_compatibility_key(request: OmniDiffusionRequest) -> tuple[Any, ...]:
+    """Key the forward-schedule branches that sampling params and ``extra_args`` miss.
+
+    Output mode, action, sound and transfer are resolved by ``forward`` from
+    prompt-level fields too, and each can change the default denoising steps,
+    guidance, or number of transformer calls per step. Sharded-weight DP ranks
+    must run identical collective schedules, so these must match within a wave.
+    Transfer chunk count depends on the input video length, so transfer
+    requests never share a wave.
+    """
+    prompt = request.prompt
+    sp = request.sampling_params
+    mode = "image" if _is_cosmos3_t2i_prompt(prompt) else "video"
+    pipeline_cls = Cosmos3OmniDiffusersPipeline
+    solo_id = request.request_id if resolve_transfer_config(sp, prompt) is not None else None
+    return (
+        "cosmos3",
+        mode,
+        pipeline_cls._get_action_mode(prompt, sp),
+        pipeline_cls._is_sound_request(prompt, sp),
+        solo_id,
+    )
+
+
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
     """Round a video length up to the causal VAE's ``factor * k + 1`` grid."""
     if temporal_compression_factor <= 0:
@@ -317,8 +362,10 @@ def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransfo
 def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     """Build the request preprocessor for Cosmos3 image/video inputs.
 
-    For plain T2V (no image or video in ``multi_modal_data``), the request is
-    returned unchanged after the optional guardrail check. For I2V, the
+    Every request receives a model-owned forward-schedule compatibility key
+    before admission (output mode, action, sound, transfer), because these
+    resolve different denoising schedules even with identical sampling
+    parameters. For I2V, the
     conditioning image is loaded, aspect-resized, center-cropped, and stored as
     ``additional_information.preprocessed_image``. For V2V, source frames are
     cropped to the target size and stored as
@@ -552,6 +599,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         action_mode = _request_action_mode(request)
         prompt = request.prompt
+        request.batch_compatibility_key = _cosmos3_batch_compatibility_key(request)
         if is_guardrails_enabled(od_config, request.sampling_params):
             text = prompt if isinstance(prompt, str) else prompt.get("prompt", "")
             check_text_safety(text)
@@ -1901,29 +1949,8 @@ class Cosmos3OmniDiffusersPipeline(
 
     @staticmethod
     def _is_t2i_request(req: DiffusionRequestBatch) -> bool:
-        """Return whether request-level modalities select image output.
-
-        Only ``"image"`` switches Cosmos3 into T2I. ``"video"`` and omitted
-        modalities select video output. ``"text"`` and ``"audio"`` are accepted
-        compatibility values for callers that share prompt schemas, but they do
-        not select text or audio output in this pipeline. ``"image"`` and
-        ``"video"`` cannot be requested together.
-        """
-        if not req.prompts:
-            return False
-        first_prompt = req.prompts[0]
-        modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
-        if modalities is None:
-            modalities = []
-        if isinstance(modalities, str):
-            modalities = [modalities]
-        if "image" in modalities and "video" in modalities:
-            raise ValueError("Cosmos3 prompt modalities cannot request both image and video output.")
-
-        accepted_modalities = ["image", "video", "text", "audio"]
-        if any(x not in accepted_modalities for x in modalities):
-            raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
-        return "image" in modalities
+        """Resolve image output using the same modality rules as admission."""
+        return _is_cosmos3_t2i_prompt(req.prompts[0] if req.prompts else None)
 
     def _set_timesteps(self, num_inference_steps: int, device: str | torch.device, shift: float) -> None:
         if self.is_distilled_model:
