@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
@@ -179,6 +181,13 @@ class OmniOpenAIServingVideo:
             "Video response frame conversion pool configured: workers=%d",
             self._video_frame_converter.max_workers,
         )
+        # MP4 muxing is CPU-bound and runs for seconds on large renders, so it
+        # must not run on the event loop: inline, the server answers nothing
+        # while it runs, /health and /v1/models included. One worker keeps the
+        # one-mux-at-a-time memory profile that inline encoding had, and a
+        # mux whose request is cancelled before it starts is dropped from the
+        # queue instead of being run for nobody.
+        self._video_mux_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-mux")
 
     def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
         get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
@@ -305,7 +314,11 @@ class OmniOpenAIServingVideo:
         )
 
     def shutdown(self) -> None:
+        self._video_mux_executor.shutdown(wait=False, cancel_futures=True)
         self._video_frame_converter.shutdown()
+
+    async def _run_mux(self, fn: Callable[[], Any]) -> Any:
+        return await asyncio.get_running_loop().run_in_executor(self._video_mux_executor, fn)
 
     async def abort_request(self, request_id: str) -> None:
         await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
@@ -595,14 +608,17 @@ class OmniOpenAIServingVideo:
                 **encoding_options,
             )
 
+        def encode_all() -> list[VideoData]:
+            return [
+                VideoData(
+                    b64_json=encode_video_result(idx, video),
+                    action=artifacts.actions[idx],
+                )
+                for idx, video in enumerate(artifacts.videos)
+            ]
+
         _t_encode_start = time.perf_counter()
-        video_data = [
-            VideoData(
-                b64_json=encode_video_result(idx, video),
-                action=artifacts.actions[idx],
-            )
-            for idx, video in enumerate(artifacts.videos)
-        ]
+        video_data = await self._run_mux(encode_all)
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
         return VideoGenerationResponse(
@@ -667,12 +683,14 @@ class OmniOpenAIServingVideo:
                 artifacts.actions[0],
                 video_metadata,
             )
-        video_bytes = _encode_video_bytes(
-            artifacts.videos[0],
-            fps=artifacts.output_fps,
-            video_codec_options=video_codec_options,
-            frame_converter=self._video_frame_converter,
-            **encoding_options,
+        video_bytes = await self._run_mux(
+            lambda: _encode_video_bytes(
+                artifacts.videos[0],
+                fps=artifacts.output_fps,
+                video_codec_options=video_codec_options,
+                frame_converter=self._video_frame_converter,
+                **encoding_options,
+            )
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
