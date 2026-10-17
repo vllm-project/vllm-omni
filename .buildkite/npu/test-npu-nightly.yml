@@ -347,6 +347,57 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion X2V · MiniMax-H3 DLO, LoRA and Upscale Function Test"
+        key: nightly-diffusion-x2v-function-minimax-h3
+        source_file_dependencies: diffusion_minimax_h3_function
+        timeout_in_minutes: 150
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - |
+            set -eu
+            VLLM_TEST_MINIMAX_H3_TURBO_LORA=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="lightx2v/Minimax-h3-Turbo", filename="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))')
+            export VLLM_TEST_MINIMAX_H3_TURBO_LORA
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_ref2va.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_turbo_lora.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
+            VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="LBH-123-AI/Minimax_h3_latent_Upscaler", filename="minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"))')
+            VLLM_OMNI_SERVER_STORAGE__PATH=$(mktemp -d)
+            export VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER VLLM_OMNI_SERVER_STORAGE__PATH
+            trap 'rm -rf "$$VLLM_OMNI_SERVER_STORAGE__PATH"' EXIT
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3.py -m "advanced_model and npu and A3 and diffusion and cards_2" --run-level advanced_model
+      - label: ":full_moon: Diffusion X2V · MiniMax-H3 DLO Perf Test"
+        key: nightly-diffusion-x2v-performance-minimax-h3
+        source_file_dependencies: diffusion_minimax_h3_perf
+        timeout_in_minutes: 90
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2V · MiniMax-H3 Timeline Guide Accuracy Test"
+        key: nightly-diffusion-x2v-timeline-minimax-h3
+        source_file_dependencies: diffusion_minimax_h3_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_timeline_guides.py -m "full_model and npu and A3 and diffusion and cards_2" --run-level full_model
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
         source_file_dependencies: diffusion_hunyuan_video_function
         timeout_in_minutes: 180

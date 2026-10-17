@@ -17,6 +17,7 @@ from tests.helpers.assertions import assert_video_first_frames_differ, assert_vi
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
+from vllm_omni.platforms import current_omni_platform
 
 MODEL = os.environ.get("VLLM_TEST_MINIMAX_H3_MODEL", "MiniMaxAI/MiniMax-H3")
 UPSCALER = os.environ.get("VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER")
@@ -49,22 +50,31 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
                     "--vae-parallel-mode",
                     "tile",
                     "--vae-use-tiling",
-                    "--enable-cpu-offload",
+                    *(
+                        ["--enable-distributed-layerwise-offload", "--dlo-no-use-allgather"]
+                        if current_omni_platform.is_npu()
+                        else ["--enable-cpu-offload"]
+                    ),
                     "--enforce-eager",
                     "--diffusion-attention-backend",
-                    "FLASH_ATTN",
+                    "TORCH_SDPA" if current_omni_platform.is_npu() else "FLASH_ATTN",
                     "--additional-config",
                     json.dumps({"latent_upscaler_path": UPSCALER, "latent_upscaler_dtype": "bf16"}),
                 ],
                 env_dict={"VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
             ),
             id="minimax_h3_latent_upscale_refine_tp2",
-            marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
         ),
     ],
     indirect=True,
 )
-@pytest.mark.parametrize("task", ["t2va", "fl2va"])
+@pytest.mark.parametrize(
+    "task",
+    [
+        pytest.param("t2va", marks=hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)),
+        pytest.param("fl2va", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
+    ],
+)
 def test_latent_upscale_and_refine(
     omni_server: OmniServer,
     online_client: OnlineOmniClient,
