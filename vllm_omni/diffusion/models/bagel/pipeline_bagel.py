@@ -38,6 +38,10 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.prompt_utils import (
+    pre_tokenized_negative_prompt_ids,
+    pre_tokenized_prompt_ids,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -361,6 +365,11 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
     This pipeline is self-contained and uses the ported Bagel core files.
     """
 
+    # Reads ``OmniCustomPrompt.prompt_ids`` / ``negative_prompt_ids`` verbatim
+    # instead of tokenizing ``prompt``; the diffusion engine admits requests
+    # carrying those fields only for pipelines that declare this. Inherited by
+    # ``LancePipeline``.
+    supports_pre_tokenized_prompt_ids: ClassVar[bool] = True
     _dit_modules: ClassVar[list[str]] = ["language_model.model"]
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -573,6 +582,10 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         # TODO: In online mode, sometimes it receives [{"prompts": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        # A caller may have tokenized the prompt already; those ids are then used
+        # as-is instead of the text above (see ``OmniCustomPrompt``).
+        prompt_token_ids = pre_tokenized_prompt_ids(first_prompt)
+        negative_prompt_token_ids = pre_tokenized_negative_prompt_ids(first_prompt)
 
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
         if sampling.height is None and sampling.width is None:
@@ -808,12 +821,13 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             # Strip <|im_start|>/<|im_end|> wrappers that end2end.py may have
             # already added, so prepare_prompts doesn't double-add bos/eos.
             clean_prompt = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+            text_prompt: str | list[int] = prompt_token_ids if prompt_token_ids is not None else clean_prompt
 
             # Update gen_context with text prompt
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
-                prompts=[clean_prompt],
+                prompts=[text_prompt],
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )
@@ -846,11 +860,14 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             # original BAGEL.
             prompt_negative = first_prompt.get("negative_prompt") if isinstance(first_prompt, dict) else None
             neg_prompt = prompt_negative if prompt_negative is not None else extra_args.get("negative_prompt", "")
-            if neg_prompt:
+            neg_text_prompt: str | list[int] = (
+                negative_prompt_token_ids if negative_prompt_token_ids is not None else neg_prompt
+            )
+            if neg_text_prompt:
                 neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
                     curr_kvlens=cfg_text_context["kv_lens"],
                     curr_rope=cfg_text_context["ropes"],
-                    prompts=[neg_prompt],
+                    prompts=[neg_text_prompt],
                     tokenizer=self.tokenizer,
                     new_token_ids=self.new_token_ids,
                 )
@@ -872,7 +889,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_img_context["kv_lens"],
                 curr_rope=cfg_img_context["ropes"],
-                prompts=[clean_prompt],
+                prompts=[text_prompt],
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )
