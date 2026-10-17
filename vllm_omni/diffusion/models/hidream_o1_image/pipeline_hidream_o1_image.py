@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
@@ -432,7 +433,7 @@ def get_hidream_o1_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin):
+class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, ProgressBarMixin):
     supports_request_batch = False
     dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["model.model.language_model"]
@@ -467,9 +468,6 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
     def _validate_static_config(self) -> None:
         if self.dtype != torch.bfloat16:
             raise NotImplementedError(f"only bfloat16 is supported; got {self.dtype!r}")
-        cfg_parallel_size = int(self.od_config.parallel_config.cfg_parallel_size)
-        if cfg_parallel_size > 1:
-            raise NotImplementedError(f"cfg_parallel_size={cfg_parallel_size} not supported")
 
     def _init_processor_and_model(self) -> None:
         logger.info(
@@ -620,6 +618,17 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
         mask = sample["vinput_mask"][0]
         return outputs.x_pred[0, mask].unsqueeze(0)
 
+    def predict_noise(
+        self,
+        sample: HiDreamO1TextSample,
+        z: torch.Tensor,
+        t_pixeldit: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one CFG branch and convert its x-prediction to a velocity."""
+        x_pred = self._forward_once(sample, z, t_pixeldit)
+        return (x_pred.to(torch.float32) - z.to(torch.float32)) / sigma
+
     def _build_and_validate_sample(
         self,
         prompt: str,
@@ -692,34 +701,32 @@ class HiDreamO1ImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, Progress
             device=self.device,
         )
 
+        do_true_cfg = len(samples) > 1
         with self.progress_bar(total=len(sched.timesteps)) as pbar:
             for step_t in sched.timesteps:
                 step_t_f32 = step_t.float()
                 t_pixeldit = 1.0 - step_t_f32 / 1000.0
                 sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
 
-                x_pred_cond = self._forward_once(samples[0], z, t_pixeldit)
-                v_cond = (x_pred_cond.to(torch.float32) - z.to(torch.float32)) / sigma
-
-                if len(samples) > 1:
-                    x_pred_uncond = self._forward_once(
-                        samples[1],
-                        z,
-                        t_pixeldit,
-                    )
-                    v_uncond = (x_pred_uncond.to(torch.float32) - z.to(torch.float32)) / sigma
-                    v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
-                else:
-                    v_guided = v_cond
+                positive_kwargs = {"sample": samples[0], "z": z, "t_pixeldit": t_pixeldit, "sigma": sigma}
+                negative_kwargs = dict(positive_kwargs, sample=samples[1]) if do_true_cfg else None
+                v_guided = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg,
+                    guidance_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                    cfg_normalize=False,
+                )
 
                 model_output = -v_guided
 
-                z = sched.step(
+                z = self.scheduler_step_maybe_with_cfg(
                     model_output,
                     step_t_f32,
                     z.float(),
-                    return_dict=False,
-                )[0].to(self.dtype)
+                    do_true_cfg,
+                    per_request_scheduler=sched,
+                ).to(self.dtype)
                 pbar.update()
 
         return DiffusionOutput(
