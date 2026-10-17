@@ -102,6 +102,13 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-merge-pipeline
     steps:
+      - label: "TTS · Chatterbox Turbo and Original Test"
+        source_file_dependencies: tts_chatterbox_function
+        timeout_in_minutes: 60
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_chatterbox.py tests/e2e/offline_inference/test_chatterbox.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+        mirror_hardwares: l4_1
+
       - label: "TTS · Qwen3-TTS CustomVoice Test"
         source_file_dependencies: tts_qwen3_tts_function
         commands:

@@ -2,14 +2,71 @@
 
 A model-agnostic serving benchmark for TTS models in vllm-omni. One CLI
 (`bench_tts.py`) + one YAML registry (`model_configs.yaml`) drive perf and
-quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice / VoiceDesign)
-and **VoxCPM2** today, more to come.
+quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice / VoiceDesign),
+**VoxCPM2** and **Chatterbox Turbo / Original** today, more to come.
 
 The same three task types — `voice_clone`, `default_voice`, `voice_design` —
 are wired into both the manual CLI and the DFX nightly CI matrix
 (`tests/dfx/perf/tests/test_tts.json`).
 
 ## Quick start
+
+### Chatterbox concurrency and conditioning checks
+
+Chatterbox Turbo and Original are registered in `model_configs.yaml`, so their
+HTTP load, latency and streaming-continuity measurements come from the shared
+`bench_tts.py` driver below (`audio_ttfp`, `audio_rtf`, `audio_underrun`,
+`audio_continuity_ok`), as the nightly perf job's do. Cloned-voice capacity
+needs a distinct reference per request: a repeated reference is a
+conditioning-cache hit after its first use and measures cached traffic.
+`chatterbox_conditioning.py` encodes 64 references serially and as one batch
+on CPU or an explicit CUDA device, times both and checks real-weight
+serial/batch parity: tokens must match exactly and features within 1e-4. On
+real Turbo weights one of the 64 references gets one different decoder
+prompt token in the batch, so that run exits nonzero and the recipe reports
+it. See the [H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#concurrent-http-clients)
+for measured 8- to 64-client results and their capacity and quality limitations.
+
+`chatterbox_decoder.py` sweeps batches 1–64 using real S3Gen weights and speech
+codes replayed from the checkpoint's built-in voice. It measures first,
+continuing, and final chunks, separates flow and vocoder costs, and exports a
+CPU/CUDA trace of the largest successful steady-state batch. Its 64-stream
+real-time-factor estimate assumes sequential
+decoder batches; it excludes T3, conditioning, transport, and GPU contention.
+It is not an end-to-end serving result.
+
+The flow runs in BF16, as in production; use `--fp32-flow` or `--tf32` to
+compare flow precision. Each precision run
+also saves paired `.fp32.wav` and `.selected.wav` replay chunks beside the
+JSON report for listening. Numerical similarity and these short clips do not
+replace end-to-end intelligibility and speaker-quality evaluation.
+
+Both Chatterbox variants are also registered in `bench_tts.py`. For a Qwen3-TTS
+comparison, run its `voice_clone` task and Chatterbox's `voice_clone` task against
+the same Seed-TTS metadata, references, output cap, and concurrency list after
+restarting the server for each model. The universal benchmark reports audio RTF
+and playback underruns as well as first-audio latency; use these to evaluate
+streaming real-time performance rather than request completion alone.
+Pass `--output-len 1000` for Chatterbox: the API accepts at most upstream's
+1000 new speech tokens, and the Seed-TTS dataset's default request of 2048
+is refused with a 400.
+
+```bash
+python benchmarks/tts/bench_tts.py \
+  --model ResembleAI/chatterbox-turbo \
+  --task voice_clone --locale en \
+  --dataset-path /data/seed-tts-eval-ref5s \
+  --host 127.0.0.1 --port 8091 \
+  --concurrency 8 --num-prompts 32 \
+  --output-len 1000 --output-dir results/turbo-c8
+```
+
+See the [H100 profiling report](../../recipes/ResembleAI/Chatterbox-H100.md)
+for the full-load warmup protocol and measured batch-size tradeoffs.
+
+```bash
+uv run benchmarks/tts/chatterbox_decoder.py /path/to/snapshot turbo /path/to/results.json
+```
 
 ### 1. Start the server
 
@@ -299,3 +356,56 @@ benchmarks/tts/
 - Upstream seed-tts-eval integration: vllm-project/vllm-omni#2558
 - Pipeline + Deploy schema: vllm-project/vllm-omni#2383
 - Concurrency cliff RFC: vllm-project/vllm-omni#272
+
+### Chatterbox nightly and CUDA graph comparison
+
+The Chatterbox rows in `tests/dfx/perf/tests/test_tts.json`
+(`test_chatterbox_{turbo,original}_{graph,eager}`) run with the other TTS
+models' nightly perf cases: default-voice latency for Turbo and Original,
+each paired with a server that differs only in stage 0's `enforce_eager`;
+stage 1 remains eager, with FP32 weights, the BF16 flow decoder and FP32 HiFT.
+Use the same dataset, seed, request count
+and hardware when comparing graph and eager results. These are end-to-end
+serving measurements, not isolated AR graph timings.
+
+```bash
+uv run python -m pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_tts.json \
+  -m "full_model and H100 and cards_1" -k chatterbox
+```
+
+Requires H100, cached model weights and the bundled Seed-TTS smoke dataset.
+H100 baselines come from the October 15 qualification run documented in the
+[H100 recipe](../../recipes/ResembleAI/Chatterbox-H100.md#nightly-latency-and-throughput-baselines-default-profiles).
+B200 is routed as a CI mirror without an assigned performance baseline.
+The job measures the built-in voice over HTTP; cloned-voice load is
+qualified separately in the H100 recipe.
+
+## Matched Chatterbox reference qualification
+
+`chatterbox_reference.py` compares the canonical upstream Python `generate`
+API with `Omni.generate` on an exclusive GPU, one request at a time. Use pinned
+local checkpoints and the same reference WAV. It measures whole utterances
+with FP32 weights, TF32 off and the deploy file's flow precision (BF16 by
+default; upstream is FP32 throughout), stage 0 eager unless `--cuda-graphs`,
+including fresh reference conditioning for every cloned-voice
+request, with two warmups per text and voice mode and three texts across three seeds.
+Initialization and WAV writing are excluded. Whole-device memory includes
+Omni's separate workers and is sampled every 100 ms.
+
+```bash
+uv run benchmarks/tts/chatterbox_reference.py upstream turbo /models/turbo reference.wav results/turbo
+uv run benchmarks/tts/chatterbox_reference.py omni turbo /models/turbo reference.wav results/turbo
+uv run benchmarks/tts/chatterbox_reference.py quality turbo /models/turbo reference.wav results/turbo
+```
+
+Repeat with `original` and its checkpoint. Run upstream in its reference
+environment and Omni in the project's environment; record both package lists.
+Quality evaluation runs in the project environment with the `dev` extra and
+scores every retained waveform through the shared Seed-TTS evaluator above
+(Whisper large-v3 WER; WavLM SIM to the cloned reference, since the built-in
+voice ships as embeddings rather than a recording), per backend and voice,
+plus final-phrase completion. These are narrow automated checks, not human
+listening scores. Upstream retains its Perth watermark;
+Omni uses fixed flow noise, and equal seeds do not imply equal stochastic
+token draws. See the H100 recipe for exact pins, commands and measured results.
