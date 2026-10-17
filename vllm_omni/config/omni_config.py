@@ -951,6 +951,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             parse_kv_cache_skip_selector,
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
+            validate_kv_cache_dtype_vs_attention_specs,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
@@ -1024,6 +1025,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusion_attention_config must be an AttentionConfig, mapping, or None, "
                 f"got {type(self.diffusion_attention_config)!r}"
             )
+        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
