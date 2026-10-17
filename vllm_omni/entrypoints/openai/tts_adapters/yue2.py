@@ -66,6 +66,19 @@ _DEFAULT_MAX_FRAMES = int(SEMANTIC_SAMPLING["max_tokens"])
 # would imply a control the model does not honor.
 _UNSUPPORTED_SAMPLING_PARAMS = ("temperature", "top_p", "top_k", "repetition_penalty")
 
+# Speech-request fields other TTS models read and YuE2 does not. The request
+# model accepts them, so without this check they would succeed and do nothing.
+_UNSUPPORTED_OPTIONAL_FIELDS = (
+    "ref_audio_2",
+    "speaker_embedding",
+    "x_vector_only_mode",
+    "ambient_sound",
+    "initial_codec_chunk_frames",
+    "non_streaming_mode",
+)
+
+_EXTRA_PARAMS_KEYS = ("cot", "abc")
+
 
 @register_tts_adapter
 class Yue2Adapter(ARTTSAdapter):
@@ -128,6 +141,14 @@ class Yue2Adapter(ARTTSAdapter):
             return "YuE2 has no language tag; the language follows the lyrics"
         if request.task_type is not None:
             return "YuE2 does not support 'task_type'"
+        if request.duration_seconds is not None:
+            return (
+                "YuE2 does not support 'duration_seconds'; cap the song length with "
+                f"'max_new_tokens' ({FRAMES_PER_SECOND} frames per second)"
+            )
+        for field in _UNSUPPORTED_OPTIONAL_FIELDS:
+            if getattr(request, field, None) is not None:
+                return f"YuE2 does not support '{field}'"
         if request.speed is not None and float(request.speed) != 1.0:
             return "YuE2 only supports speed=1.0; put the tempo in 'instructions', e.g. 'at 120 BPM'"
         if request.is_streaming():
@@ -139,6 +160,9 @@ class Yue2Adapter(ARTTSAdapter):
         rejected = sorted(key for key in _UNSUPPORTED_SAMPLING_PARAMS if extra.get(key) is not None)
         if rejected:
             return "YuE2 has fixed sampling and does not accept: " + ", ".join(rejected)
+        unknown = sorted(key for key, value in extra.items() if value is not None and key not in _EXTRA_PARAMS_KEYS)
+        if unknown:
+            return "YuE2 accepts only 'cot' and 'abc' in extra_params; got: " + ", ".join(unknown)
         return None
 
     async def warmup(self) -> None:
