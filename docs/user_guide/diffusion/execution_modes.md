@@ -125,6 +125,50 @@ its throughput — see the measured numbers in the
 — so keep `--max-num-seqs 1` unless you need step-level scheduling. Consult the
 selected pipeline's documentation and source for the latest support status.
 
+### Pi0.5 Robot Policy
+
+Pi0.5 supports opt-in step-wise batching through the OpenPI endpoint. From the
+repository root, after following the checkpoint and tokenizer setup in the
+[Pi0.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md):
+
+```bash
+vllm serve lerobot/pi05_base --omni \
+  --deploy-config vllm_omni/deploy/pi05_step.yaml --port 8093
+```
+
+The experimental config uses BF16, eager execution and `max_num_seqs=4`.
+Four is a starting capacity, not a model limit or a proven optimum; tune it
+for memory and latency. Step execution uses eager operators for both B=1 and
+B>1. The existing `pi05.yaml` uses FP32, full-forward, capacity one, with R0's
+fused kernels and CUDA Graphs controlled by `enforce_eager`. Use FP32 when
+validating strict numerical parity; BF16 batching requires separate
+action-quality qualification for your checkpoint and task.
+
+Send concurrent observations on independent WebSocket connections to
+`/v1/realtime/robot/openpi`. Image/text prefix encoding remains per request;
+compatible requests share denoising steps and may have different positive
+`sampling_params.num_inference_steps` values. Custom `timesteps` and `sigmas`
+are unsupported. The response remains one final action chunk, not streamed
+partial actions. Each WebSocket connection processes observations sequentially;
+in-flight inference may continue after a client disconnects.
+
+Each observation owns an R0 `Pi05KVCache`: its prefix is computed once and
+reused across that request's denoising steps. The next action-chunk request
+recomputes its prefix. Each scheduled denoise batch packs only the active
+requests' prefix KV into one reusable workspace bounded by `max_num_seqs`;
+suffix KV is scratch space overwritten by the current step. Prefix encoding
+and batched denoising follow the existing Worker/Runner execution order, with
+no per-request CUDA streams or prefix/denoise overlap.
+
+GPU correctness, BF16 action quality, and performance validation of this
+R0-based step adapter remain pending. Final D0 performance acceptance requires
+comparison with the accepted R1 backend under the
+[Pi0.5 roadmap](https://github.com/vllm-project/vllm-omni/issues/6867).
+
+Capacity one has no cross-request batching benefit and may add scheduler
+overhead. For reproducible full/step comparisons at equal precision, see the
+[Pi0.5 benchmark](https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/diffusion/pi05).
+
 ## Streaming Output
 
 Use `--diffusion-streaming-output` for a pipeline that can produce intermediate

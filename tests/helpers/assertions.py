@@ -35,6 +35,15 @@ from tests.helpers.media import (
 
 _ResponseT = TypeVar("_ResponseT")
 
+
+def assert_robot_action_chunks_close(actual, expected, *, atol: float, rtol: float) -> None:
+    """Compare finite robot action chunks with an explicitly selected tolerance."""
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    assert np.isfinite(actual).all(), "Non-finite actual action chunk"
+    assert np.isfinite(expected).all(), "Non-finite reference action chunk"
+    np.testing.assert_allclose(actual, expected, atol=atol, rtol=rtol)
+
+
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
 
