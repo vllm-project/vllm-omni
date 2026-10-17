@@ -264,7 +264,6 @@ def test_talker_inline_output_preserves_conditioning_and_tokens(
     output = runner._build_omni_model_runner_output_from_snapshot(
         scheduler_output=scheduler_output,
         hidden_states=model_output.text_hidden_states,
-        staged_hidden_states_cpu=None,
         multimodal_outputs=model_output.multimodal_outputs,
         req_ids_output_copy=["r1", "r2"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1},

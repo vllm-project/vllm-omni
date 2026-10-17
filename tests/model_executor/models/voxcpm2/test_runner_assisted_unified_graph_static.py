@@ -74,9 +74,7 @@ def test_ar_runner_without_model_hook_stays_on_normal_path():
     assert "exceptException" not in compact_request_source
 
     set_context_source = source[source.index("def _set_runner_assisted_full_attention_metadata_context") :]
-    set_context_source = set_context_source[
-        : set_context_source.index("def _prepare_prefix_cache_pooler_payload_sources")
-    ]
+    set_context_source = set_context_source[: set_context_source.index("def _build_omni_pooler_payload")]
     assert "except Exception" not in set_context_source
 
 

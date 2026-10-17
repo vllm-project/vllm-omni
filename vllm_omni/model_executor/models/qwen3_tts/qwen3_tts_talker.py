@@ -229,10 +229,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # ``hidden_states[:n].to("cpu")`` (measured at 24% of stage-0 on-CPU
         # samples at c=64 on H20).
         self.omni_pooler_payload_include_hidden = False
-        # ``codes.audio`` is only needed for future prefix-hit reconstruction
-        # after a request has produced codec rows. Keep per-step rows on GPU and
-        # materialize the CPU OmniTensorPrefixCache entry once at completion.
-        self.deferred_prefix_cache_mm_keys = {"codes.audio"}
         # Used by OmniGPUModelRunner for the GPU-side MTP fast-path.
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
