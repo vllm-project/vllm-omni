@@ -1453,6 +1453,7 @@ class LanceBagel(Bagel):
         key_values_lens=None,
         packed_key_value_indexes=None,
         precomputed_latent=None,
+        return_inputs: bool = False,
     ):
         """Lance-native VAE prefill that *actually* scatters the encoded
         latents into the LLM query sequence.
@@ -1478,7 +1479,7 @@ class LanceBagel(Bagel):
             or packed_text_ids.numel() == 0
             or (precomputed_latent is None and (padded_images is None or padded_images.numel() == 0))
         ):
-            return past_key_values
+            return (past_key_values, None) if return_inputs else past_key_values
 
         # ``vae_model.encode`` samples from the posterior via
         # ``mu + std * randn_like(std)`` (Wan2.2 VAE's ``reparameterize`` path
@@ -1552,4 +1553,14 @@ class LanceBagel(Bagel):
             is_causal=False,
             **extra_inputs,
         )
+        if return_inputs:
+            # The rows this prefill fed the layers, with the indexes that say
+            # which of them belong to the generation expert.  A trainer with no
+            # VAE rebuilds its context from these instead of the pixels.
+            return output.past_key_values, {
+                "rows": packed_query_sequence,
+                "positions": packed_position_ids,
+                "gen_indexes": packed_vae_token_indexes,
+            }
+
         return output.past_key_values
