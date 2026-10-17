@@ -1673,12 +1673,16 @@ class DuplexSessionRunner:
             else model_state.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
         )
         if flushed is not None and isinstance(realtime_item_id, str) and realtime_item_id:
+            # Stamp before merge. The merger reads this id to keep each commit's
+            # owner; assigning it afterwards drops segments and replaces a
+            # retained speech owner with a later camera item.
             flushed = {**flushed, "realtime_item_id": realtime_item_id}
-        if model_state.committed_audio_payload is not None:
+        prior_committed = model_state.mergeable_committed_audio()
+        if prior_committed is not None:
             if flushed is not None:
-                flushed = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, flushed)
+                flushed = overlap_policy.merge_audio_payloads(prior_committed, flushed)
             else:
-                flushed = model_state.committed_audio_payload
+                flushed = prior_committed
         if commit_reservation is not None:
             commit_reservation.commit()
         if flushed is None:
@@ -1864,9 +1868,10 @@ class DuplexSessionRunner:
         if isinstance(realtime_item_id, str) and realtime_item_id:
             deferred_payload = {**deferred_payload, "realtime_item_id": realtime_item_id}
         retained_payload: dict[str, object]
-        if model_state.committed_audio_payload is not None:
+        prior_committed = model_state.mergeable_committed_audio()
+        if prior_committed is not None:
             retained_payload = overlap_policy.merge_audio_payloads(
-                model_state.committed_audio_payload,
+                prior_committed,
                 deferred_payload,
             )
         else:
@@ -1909,12 +1914,15 @@ class DuplexSessionRunner:
         )
         final_payload = commit_reservation.payload
         if final_payload is not None and isinstance(realtime_item_id, str) and realtime_item_id:
+            # Stamp before merge, same as the deferred commit path. A copy made
+            # after merge would replace the retained owner.
             final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
-        if model_state.committed_audio_payload is not None:
+        prior_committed = model_state.mergeable_committed_audio()
+        if prior_committed is not None:
             if final_payload is not None:
-                final_payload = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, final_payload)
+                final_payload = overlap_policy.merge_audio_payloads(prior_committed, final_payload)
             else:
-                final_payload = model_state.committed_audio_payload
+                final_payload = prior_committed
         commit_reservation.commit()
         if final_payload is not None:
             model_state.retain_committed_audio(
