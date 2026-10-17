@@ -958,6 +958,112 @@ class TestApplyRemoveSequenceParallel:
         assert _SP_INPUT_HOOK_TEMPLATE.format("proj_in") not in proj_in_registry._hooks
         assert _SP_OUTPUT_HOOK_TEMPLATE.format("proj_out") not in proj_out_registry._hooks
 
+    def test_apply_sp_rolls_back_when_registration_fails(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.hooks.base import HookRegistry
+        from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = nn.Linear(10, 10)
+                self.second = nn.Linear(10, 10)
+
+        model = SimpleModel()
+        first_forward = model.first.forward
+        second_forward = model.second.forward
+        plan = {
+            "first": {"x": SequenceParallelInput(split_dim=1, expected_dims=3)},
+            "second": {"x": SequenceParallelInput(split_dim=1, expected_dims=3)},
+        }
+        original_register = HookRegistry.register_hook
+        calls = 0
+
+        def fail_second(self, name, hook):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected SP registration failure")
+            return original_register(self, name, hook)
+
+        monkeypatch.setattr(HookRegistry, "register_hook", fail_second)
+        with pytest.raises(RuntimeError, match="injected SP registration failure"):
+            apply_sequence_parallel(model, SequenceParallelConfig(ulysses_degree=2), plan)
+
+        assert not hasattr(model.first, "_hook_registry")
+        assert not hasattr(model.first, "_omni_original_forward")
+        assert model.first.forward.__func__ is first_forward.__func__
+        assert not hasattr(model.second, "_hook_registry")
+        assert not hasattr(model.second, "_omni_original_forward")
+        assert model.second.forward.__func__ is second_forward.__func__
+
+    def test_apply_sp_restores_existing_hook_when_registration_fails(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.hooks.base import HookRegistry
+        from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = nn.Linear(10, 10)
+                self.second = nn.Linear(10, 10)
+
+        model = SimpleModel()
+        first_plan = {"first": {"x": SequenceParallelInput(split_dim=1, expected_dims=3)}}
+        full_plan = {
+            "first": {"x": SequenceParallelInput(split_dim=1, expected_dims=3)},
+            "second": {"x": SequenceParallelInput(split_dim=1, expected_dims=3)},
+        }
+        config = SequenceParallelConfig(ulysses_degree=2)
+        apply_sequence_parallel(model, config, first_plan)
+        old_hook = model.first._hook_registry.get_hook("sp_input---first")
+
+        original_register = HookRegistry.register_hook
+        calls = 0
+
+        def fail_after_mutation(self, name, hook):
+            nonlocal calls
+            calls += 1
+            original_register(self, name, hook)
+            if calls == 2:
+                raise RuntimeError("injected post-registration failure")
+
+        monkeypatch.setattr(HookRegistry, "register_hook", fail_after_mutation)
+        with pytest.raises(RuntimeError, match="injected post-registration failure"):
+            apply_sequence_parallel(model, config, full_plan)
+
+        assert model.first._hook_registry.get_hook("sp_input---first") is old_hook
+        assert not hasattr(model.second, "_hook_registry")
+
+    def test_apply_sp_rolls_back_when_registry_creation_fails(self, monkeypatch):
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.hooks import sequence_parallel
+
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = nn.Linear(10, 10)
+
+        model = SimpleModel()
+        original_forward = model.first.forward
+        original_get_or_create = sequence_parallel.HookRegistry.get_or_create
+
+        def fail_after_registry_creation(module):
+            original_get_or_create(module)
+            raise RuntimeError("injected registry creation failure")
+
+        monkeypatch.setattr(sequence_parallel.HookRegistry, "get_or_create", fail_after_registry_creation)
+        with pytest.raises(RuntimeError, match="injected registry creation failure"):
+            sequence_parallel.apply_sequence_parallel(
+                model,
+                SequenceParallelConfig(ulysses_degree=2),
+                {"first": {"x": SequenceParallelInput(split_dim=1, expected_dims=3)}},
+            )
+
+        assert not hasattr(model.first, "_hook_registry")
+        assert not hasattr(model.first, "_omni_original_forward")
+        assert model.first.forward.__func__ is original_forward.__func__
+
     def test_apply_sp_with_wildcard(self):
         """Test apply_sequence_parallel with wildcard module names."""
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig

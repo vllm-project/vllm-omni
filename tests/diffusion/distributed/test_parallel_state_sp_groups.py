@@ -269,3 +269,23 @@ def test_tensor_dict_broadcast_preserves_subgroup_source(rank, monkeypatch):
     monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
     result = coordinator.broadcast_tensor_dict({"payload": torch.full((2,), 7.0)} if rank == 1 else None)
     assert torch.equal(result["payload"], torch.full((2,), 7.0))
+
+
+def test_all_gather_separate_tensors_supports_nonzero_dim(monkeypatch):
+    from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
+
+    coordinator = object.__new__(GroupCoordinator)
+    coordinator.device_group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def fake_all_gather_into_tensor(output, input_, group=None):
+        output.copy_(torch.arange(output.numel(), dtype=output.dtype).reshape_as(output))
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor)
+    tensors = coordinator.all_gather(torch.zeros(2, 2, 3), dim=1, separate_tensors=True)
+
+    assert len(tensors) == 2
+    assert all(tensor.shape == (2, 2, 3) for tensor in tensors)
+    assert all(tensor.is_contiguous() for tensor in tensors)
+    torch.testing.assert_close(tensors[0], torch.arange(12, dtype=torch.float32).reshape(2, 2, 3))
+    torch.testing.assert_close(tensors[1], torch.arange(12, 24, dtype=torch.float32).reshape(2, 2, 3))
