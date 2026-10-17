@@ -50,6 +50,7 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
     indexed_scale_shift_,
+    indexed_scale_shift_to_fp32,
     rms_norm_indexed_scale_shift,
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -1145,9 +1146,12 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
-        h = indexed_scale_shift_(h, shift, scale, inverse_indices)
-        # Preserve full precision through both final output projections.
-        h = h.to(_FP32_DTYPE)
+        if current_omni_platform.is_cuda():
+            # Keep BF16 affine rounding while eliminating the separate FP32
+            # cast launch and its BF16 intermediate write/read.
+            h = indexed_scale_shift_to_fp32(h, shift, scale, inverse_indices)
+        else:
+            h = indexed_scale_shift_(h, shift, scale, inverse_indices).to(_FP32_DTYPE)
         video, _ = self.video_out(h)
         audio, _ = self.audio_out(h)
         return video, audio

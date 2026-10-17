@@ -13,11 +13,64 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
     indexed_scale_shift_,
+    indexed_scale_shift_to_fp32,
     rms_norm_indexed_scale_shift,
 )
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(
+                    not current_omni_platform.is_cuda() or not HAS_TRITON, reason="CUDA/Triton required"
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(("rows", "hidden_size"), [(0, 7), (1, 129), (11, 5376)])
+def test_indexed_scale_shift_to_fp32_matches_two_launch_path(device, dtype, rows, hidden_size) -> None:
+    torch.manual_seed(17)
+    # Different row strides, chunked AdaLN banks and sliced indices reproduce
+    # the layout contract without assuming the output shares the input stride.
+    x = torch.randn(rows * 2, hidden_size, device=device, dtype=dtype)[::2]
+    shift, scale = torch.randn(4, hidden_size * 2, device=device, dtype=dtype).chunk(2, dim=-1)
+    indices = (torch.arange(rows * 2, device=device) % 4)[::2]
+    before = x.clone()
+    expected = indexed_scale_shift_(x.clone(), shift, scale, indices).float()
+    actual = indexed_scale_shift_to_fp32(x, shift, scale, indices)
+
+    assert actual.dtype == torch.float32
+    assert actual.shape == x.shape
+    assert torch.equal(actual, expected)
+    assert torch.equal(x, before)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not current_omni_platform.is_cuda() or not HAS_TRITON, reason="CUDA/Triton required")
+def test_indexed_scale_shift_to_fp32_retains_bf16_rounding() -> None:
+    x = torch.full((2, 5376), 1.125, device="cuda", dtype=torch.bfloat16)
+    shift = torch.zeros(1, 5376, device="cuda", dtype=x.dtype)
+    scale = torch.full_like(shift, 0.09375)
+    indices = torch.zeros(2, device="cuda", dtype=torch.int64)
+
+    actual = indexed_scale_shift_to_fp32(x, shift, scale, indices)
+    expected = indexed_scale_shift_(x.clone(), shift, scale, indices).float()
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, torch.full_like(actual, 1.234375))
+    # Storing the FP32 affine value directly would incorrectly retain the
+    # pre-rounding halfway value 1.23046875 in both output heads.
+    assert not torch.equal(actual, torch.full_like(actual, 1.23046875))
 
 
 @pytest.mark.cpu
