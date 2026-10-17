@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Qwen3 Code Predictor -- optimized re-prefill, no KV cache.
+"""Qwen3 Code Predictor -- re-prefill with optional KV reuse.
 
 Shared by Qwen3-Omni and Qwen3-TTS talker models.
 
@@ -718,7 +718,7 @@ class CodePredictorWrapper(nn.Module):
       5. Inline sampling (top-k + top-p) -- no custom op overhead.
       6. Optional manual CUDA graph capture per batch-size bucket.
 
-    ``code_predictor_kv_cache`` (CUDA, opt-in) switches to incremental K/V
+    ``code_predictor_kv_cache`` (opt-in; ``"eager"`` uses native Torch) switches to incremental K/V
     decoding: at large batches the re-prefill FLOPs are not negligible.
     """
 
@@ -804,11 +804,14 @@ class CodePredictorWrapper(nn.Module):
             prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
         )
         self._prefix_reprefill_seq_lens = tuple(self._prefix_seq_lens(self._num_groups + 1))
-        # Incremental decoding (opt-in, CUDA): each AR step runs only its new
+        # Incremental decoding (opt-in): each AR step runs only its new
         # position against a static K/V buffer instead of re-prefilling the
         # whole prefix (at batch 64 the re-prefill runs 17x the positions).
-        self._kv_cache_enabled = (
-            self._parse_bool_config(prefix_graph_cfg.get("code_predictor_kv_cache")) and current_omni_platform.is_cuda()
+        # Explicit "eager" mode reuses KV through native Torch without compilation.
+        cache_mode = prefix_graph_cfg.get("code_predictor_kv_cache")
+        self._eager_kv_cache = cache_mode == "eager"
+        self._kv_cache_enabled = self._eager_kv_cache or (
+            self._parse_bool_config(cache_mode) and current_omni_platform.is_cuda()
         )
         self._short_kv_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_short_kv"))
         self._short_kv_enabled = False
@@ -883,18 +886,27 @@ class CodePredictorWrapper(nn.Module):
         self._model_dtype = next(self.model.parameters()).dtype
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
-        if self._model_dtype == torch.float16 or not current_omni_platform.supports_torch_inductor():
+        if self._model_dtype == torch.float16 or (
+            not current_omni_platform.supports_torch_inductor() and not self._eager_kv_cache
+        ):
             # The fp16 body runs in fp32 under autocast; keep re-prefill there.
             self._kv_cache_enabled = False
 
         # Torch 2.13 XPU Dynamo can double-register built-in handlers when
         # spawned workers compile this predictor. Keep this narrow path eager
         # until the upstream XPU compiler issue is resolved.
-        if current_omni_platform.is_xpu() or not current_omni_platform.supports_torch_inductor():
+        if (
+            self._eager_kv_cache
+            or current_omni_platform.is_xpu()
+            or not current_omni_platform.supports_torch_inductor()
+        ):
             # NPU or other platforms without Inductor support
             self._compiled_model_fwd = self.model.forward
+            if self._kv_cache_enabled:
+                self._compiled_kv_fwd = self.model.forward_cached
+                self._ensure_kv_steps(next(self.model.parameters()).device)
 
-            if current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
+            if current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs and not self._eager_kv_cache:
                 # For NPU, use eager + NPU graphs (no torch.compile)
                 self._warmup_buckets()
                 self._capture_npu_graphs()

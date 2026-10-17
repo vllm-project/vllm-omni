@@ -141,6 +141,31 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  mps:
+    # The MPS integration does not support compilation or graph capture.
+    stages:
+      - stage_id: 0
+        dtype: bfloat16
+        enforce_eager: true
+        async_scheduling: false
+        max_num_seqs: 8
+        kv_cache_memory_bytes: 536870912
+        additional_config:
+          code_predictor_kv_cache: eager
+        # The vllm-metal preview supports greedy decoding only.
+        default_sampling_params:
+          temperature: 0.0
+          top_k: -1
+          top_p: 1.0
+          min_tokens: 0  # Positive min_tokens is unsupported in the preview.
+          repetition_penalty: 1.5
+        # The predictor has its own sampler; keep it greedy too.
+        subtalker_sampling_params:
+          do_sample: false
+      - stage_id: 1
+        enforce_eager: true
+        async_scheduling: false
+        max_num_seqs: 8
   rocm:
     # MRV2 is not qualified on ROCm; keep the legacy V1 runner.
     model_runner: v1
