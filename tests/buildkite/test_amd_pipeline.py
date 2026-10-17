@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from importlib.util import find_spec
+from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
 
@@ -15,6 +15,7 @@ AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
+AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
@@ -57,6 +58,11 @@ OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
 QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+
+COMBINER_SPEC = spec_from_file_location("combine_test_suites", AMD_SUITE_COMBINER)
+assert COMBINER_SPEC is not None and COMBINER_SPEC.loader is not None
+COMBINER = module_from_spec(COMBINER_SPEC)
+COMBINER_SPEC.loader.exec_module(COMBINER)
 
 
 def _find_step(label: str, pipeline_path: Path = AMD_MERGE_PIPELINE) -> dict:
@@ -173,6 +179,15 @@ def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> 
     assert "record_cache_metadata" not in all_commands
 
 
+def _leaf_steps(pipeline_path: Path) -> list[dict]:
+    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    return [step for entry in pipeline["steps"] for step in entry.get("steps", [entry])]
+
+
+def _step_signature(step: dict) -> str:
+    return yaml.safe_dump(step, sort_keys=True)
+
+
 def _find_steps_selecting_path(pipeline_path: Path, test_path: str) -> list[dict]:
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     matches = []
@@ -228,6 +243,56 @@ def _find_diffusion_cpu_shard_step(pipeline_path: Path) -> dict:
     walk(pipeline.get("steps", []))
     assert len(matches) == 1, f"expected one diffusion CPU shard step in {pipeline_path}"
     return matches[0]
+
+
+def test_ready_merge_composition_preserves_the_structural_union() -> None:
+    ready_steps = _leaf_steps(AMD_READY_PIPELINE)
+    merge_steps = _leaf_steps(AMD_MERGE_PIPELINE)
+    ready_signatures = {_step_signature(step) for step in ready_steps}
+    merge_signatures = {_step_signature(step) for step in merge_steps}
+
+    shared = ready_signatures & merge_signatures
+    ready_only = ready_signatures - merge_signatures
+    merge_only = merge_signatures - ready_signatures
+    assert shared
+    assert ready_only
+    assert merge_only
+
+    combined = COMBINER.combine_test_suites(
+        (
+            f"READY_TESTS:{AMD_READY_PIPELINE}",
+            f"MERGE_TESTS:{AMD_MERGE_PIPELINE}",
+        )
+    )
+    assert [group["group"] for group in combined["steps"]] == [
+        "READY_TESTS",
+        "MERGE_TESTS",
+    ]
+    combined_ready_steps, combined_merge_steps = (group["steps"] for group in combined["steps"])
+    combined_steps = combined_ready_steps + combined_merge_steps
+    combined_signatures = [_step_signature(step) for step in combined_steps]
+
+    assert {_step_signature(step) for step in combined_ready_steps} == ready_signatures
+    assert {_step_signature(step) for step in combined_merge_steps} == merge_only
+    assert len(combined_signatures) == len(set(combined_signatures))
+    assert set(combined_signatures) == ready_signatures | merge_signatures
+    assert sum(step.get("parallelism", 1) for step in combined_steps) < sum(
+        step.get("parallelism", 1) for step in ready_steps + merge_steps
+    )
+
+
+@pytest.mark.parametrize("extra_pipeline", [AMD_NIGHTLY_PIPELINE, AMD_WEEKLY_PIPELINE], ids=["nightly", "weekly"])
+def test_combined_extra_tier_preserves_every_distinct_step(extra_pipeline: Path) -> None:
+    pipelines = [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, extra_pipeline]
+    extra_group = "NIGHTLY_TESTS" if extra_pipeline == AMD_NIGHTLY_PIPELINE else "WEEKLY_TESTS"
+    groups = ["READY_TESTS", "MERGE_TESTS", extra_group]
+    raw_signatures = {_step_signature(step) for path in pipelines for step in _leaf_steps(path)}
+
+    combined = COMBINER.combine_test_suites(tuple(f"{group}:{path}" for group, path in zip(groups, pipelines)))
+    combined_signatures = [_step_signature(step) for group in combined["steps"] for step in group["steps"]]
+
+    assert len(combined_signatures) == len(set(combined_signatures))
+    assert set(combined_signatures) == raw_signatures
 
 
 def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() -> None:
