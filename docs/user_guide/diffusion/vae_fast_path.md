@@ -42,7 +42,7 @@ stages:
 
 ## Behavior and limitations
 
-- Only CUDA is supported. On other platforms the reference decoder runs.
+- Only CUDA and XPU are supported. On other platforms the reference decoder runs.
 - The fast path is installed once per VAE instance when the pipeline is
   initialized. It rebinds the forwards of the loaded decoder modules; parameter
   names, `state_dict` keys and weight loading are unchanged.

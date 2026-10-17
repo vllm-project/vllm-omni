@@ -40,6 +40,15 @@ import torch
 import torch.nn.functional as F
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+# Devices whose Triton backend runs the fused kernels: NVIDIA (CUDA) and Intel (XPU) GPUs.
+KERNEL_DEVICE_TYPES = frozenset({"cuda", "xpu"})
+
+
+def on_kernel_device(x: torch.Tensor) -> bool:
+    """Whether ``x`` lives on a device the fused Triton kernels can run on."""
+    return x.device.type in KERNEL_DEVICE_TYPES
+
+
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # These kernels are HBM bound; a wide block gives every thread more independent
 # loads to overlap. 2048/4 measured ~6% faster than 1024/4 on the decoder's
@@ -104,7 +113,7 @@ def rms_norm_scale(
     ``x`` must be a contiguous ``(N, C, S)`` tensor, ``denom`` a contiguous fp32
     ``(N, 1, S)`` tensor and ``gamma`` a contiguous ``(C,)`` tensor of ``x``'s dtype.
     """
-    if not HAS_TRITON or not x.is_cuda:
+    if not HAS_TRITON or not on_kernel_device(x):
         return None
     if x.dim() != 3 or x.dtype not in _SUPPORTED_DTYPES:
         return None
@@ -170,7 +179,7 @@ def silu_epilogue_is_exact(device: torch.device, dtype: torch.dtype) -> bool:
     if cached is not None:
         return cached
     result = False
-    if HAS_TRITON and device.type == "cuda":
+    if HAS_TRITON and device.type in KERNEL_DEVICE_TYPES:
         try:
             bits = torch.arange(0, 65536, dtype=torch.int32, device=device).to(torch.int16)
             x = bits.view(dtype).reshape(1, 1, -1)

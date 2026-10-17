@@ -27,6 +27,7 @@ from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
 
 from . import triton_data_movement as dm
 from . import triton_rms_norm_cl as cl
+from ._utils import on_kernel_device
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Grid axis 1 (tiles per plane) is limited by CUDA; larger planes decline.
@@ -158,7 +159,7 @@ def norm_act_cat_time(
     """
     if (
         not HAS_TRITON
-        or not x.is_cuda
+        or not on_kernel_device(x)
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or x.ndim != 5
