@@ -17,6 +17,15 @@ Model-agnostic serving benchmarks for TTS models, including Qwen3-TTS and VoxCPM
 - **Dataset**: Seed-TTS full or text-only datasets, plus bundled smoke/design prompts under `build_dataset/`
 - **Key metrics**: TTFP (time to first audio packet), E2E latency, RTF (real-time factor), throughput (audio seconds / wall-clock second)
 
+### [Duplex VAD](duplex_vad/README.md) — Realtime Turn Detection
+
+Isolated CPU comparison of the duplex engine's `server_vad` (Silero) and `semantic_vad`
+(Silero + Smart Turn) turn detectors, without model serving.
+
+- **Layout**: `duplex_vad/bench_vad_latency.py`
+- **Dataset**: clips labeled complete/incomplete, e.g. `pipecat-ai/smart-turn-data-v3.2-test`
+- **Key metrics**: per-call model latency, per-chunk detector cost, endpoint delay, false cutoffs, memory
+
 ### [Diffusion](diffusion/README.md) — Image and Video Generation
 
 Online-serving benchmark for diffusion image/video models, sending requests to the configured vLLM serving endpoint (`/v1/chat/completions`, `/v1/images/generations`, or `/v1/videos`, depending on backend/task).

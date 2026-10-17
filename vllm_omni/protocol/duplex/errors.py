@@ -69,6 +69,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "invalid_input_modality": "invalid_request_error",
     "invalid_function_call_output": "invalid_request_error",
     "server_vad_unavailable": "server_error",
+    "semantic_vad_unavailable": "server_error",
 }
 
 

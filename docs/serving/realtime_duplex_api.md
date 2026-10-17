@@ -536,9 +536,17 @@ Semantic divergences hidden behind shared names:
   before any commit; a commit may end in `response.listen` and no
   response, and the model may open a response with no commit at all.
   OpenAI: commit ⇒ item, `response.create` ⇒ exactly one response.
-- `turn_detection.interrupt_response=false` is rejected;
-  `create_response` is ignored; `semantic_vad` is unsupported; the VAD
-  runs per session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+- `turn_detection.interrupt_response=false` is rejected; the VAD runs per
+  session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+  `semantic_vad` (Silero + Smart Turn v3.2, `eagerness` low/medium/high/auto;
+  setup in the [realtime web guide](../../examples/online_serving/realtime_web/README.md#semantic-vad-silero--smart-turn))
+  is accepted for turn-based sessions only; auto-responding (native duplex)
+  sessions refuse it with `unsupported_turn_detection`. On turn-based sessions
+  the detector's commit honours `create_response`.
+- Re-sending the same normalized `turn_detection` settings preserves the active
+  speech and pause state. Changing settings (including switching modes or
+  disabling VAD) while input is pending rejects the entire `session.update`
+  with `unsupported_turn_detection`; commit or clear input before retrying.
 - `rate_limits.updated` is always an empty list (compatibility only).
 - Cancellation never reuses a `response_id`; truncation is driven by
   `playback.ack` as well as `conversation.item.truncate`.
@@ -1440,9 +1448,9 @@ them out into typed events before they reach a client.
   Text-to-speech has its own shape here — put the text in
   `extra_body.duplex_initial_user_text` on `session.update`, then stream audio
   units (silence is enough). The seeded turn is what the model answers.
-- `turn_detection` supports only `server_vad` with `interrupt_response=true`;
-  `semantic_vad`, `interrupt_response=false`, and `create_response` are not
-  supported.
+- `turn_detection` supports `server_vad` and, for turn-based sessions,
+  `semantic_vad`, both with `interrupt_response=true`; `interrupt_response=false`
+  is not supported.
 - `input_audio_transcription` and `input_audio_noise_reduction` are accepted
   and echoed but no separate transcription or noise-reduction stage runs;
   transcripts come from the model.

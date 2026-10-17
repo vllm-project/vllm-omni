@@ -314,8 +314,18 @@ class SileroStreamingVAD:
         return int(self._pending.nbytes)
 
     @property
+    def samples_until_frame(self) -> int:
+        """Samples needed to finish the next scoring frame."""
+        return self._WINDOW_SAMPLES - self._pending.size
+
+    @property
     def speech_active(self) -> bool:
         return self._speech_active
+
+    @property
+    def speech_pending(self) -> bool:
+        """An onset is being confirmed against ``min_speech_duration_ms``."""
+        return self._candidate_samples > 0
 
     def reset(self) -> None:
         """Drop stream state while preserving the session-relative audio clock.
@@ -336,6 +346,11 @@ class SileroStreamingVAD:
     # Input                                                              #
     # ------------------------------------------------------------------ #
 
+    @property
+    def processed_ms(self) -> int:
+        """Session-relative end of the audio scored so far."""
+        return round(self._processed_samples * 1000 / self._SAMPLE_RATE_HZ)
+
     def process_base64(
         self,
         audio: object,
@@ -343,6 +358,10 @@ class SileroStreamingVAD:
         fmt: object,
         sample_rate_hz: object,
     ) -> StreamingVADResult:
+        return self.process(self.decode_base64(audio, fmt=fmt, sample_rate_hz=sample_rate_hz))
+
+    def decode_base64(self, audio: object, *, fmt: object, sample_rate_hz: object) -> np.ndarray:
+        """Decode one appended chunk to 16 kHz float32 samples."""
         if not isinstance(audio, str):
             raise ValueError("Silero server VAD requires base64 audio")
         try:
@@ -364,7 +383,7 @@ class SileroStreamingVAD:
         else:
             raise ValueError("Silero server VAD requires pcm_f32le or pcm16 audio")
 
-        return self.process(self._to_16k(samples, rate))
+        return self._to_16k(samples, rate)
 
     def _to_16k(self, samples: np.ndarray, rate: int) -> np.ndarray:
         """Resample to 16 kHz, carrying the fractional sample-count remainder.

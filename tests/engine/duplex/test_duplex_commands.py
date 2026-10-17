@@ -247,7 +247,7 @@ def test_malformed_append_raises_command_error_with_code(body: dict[str, object]
         ({"type": "conversation.item.truncate", "item_id": "item_1"}, "bad_event"),
         ({"type": "session.update", "session": {"output_audio_format": "opus"}}, "unsupported_audio_format"),
         (
-            {"type": "session.update", "session": {"turn_detection": {"type": "semantic_vad"}}},
+            {"type": "session.update", "session": {"turn_detection": {"type": "foo_vad"}}},
             "unsupported_turn_detection",
         ),
         ({"type": "response.create", "response": {"output_audio_format": "opus"}}, "unsupported_audio_format"),

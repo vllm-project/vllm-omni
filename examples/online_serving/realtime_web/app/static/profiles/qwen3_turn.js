@@ -75,7 +75,7 @@
           const turnDetection = input && 'turn_detection' in input
             ? input.turn_detection : event.session?.turn_detection;
           if (turnDetection !== undefined) {
-            interruptOnSpeech = vad && turnDetection?.type === 'server_vad'
+            interruptOnSpeech = vad && ['server_vad', 'semantic_vad'].includes(turnDetection?.type)
               && turnDetection.interrupt_response !== false;
           }
         }

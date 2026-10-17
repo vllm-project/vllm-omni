@@ -178,6 +178,44 @@ The bundled duplex deploy allows four audio inputs and eight images per prompt.
 Use headphones to avoid speaker audio triggering VAD interruption. Reference
 voices and tool calls are not supported by this plugin.
 
+### Semantic VAD (Silero + Smart Turn)
+
+`turn_detection: {"type": "semantic_vad", "eagerness": "auto"}` keeps Silero
+for speech activity and asks the [Smart Turn v3.2](https://github.com/pipecat-ai/smart-turn)
+classifier whether the user has finished whenever Silero hears a pause. A
+complete turn commits at once; a thinking pause stays inside the same utterance
+until speech resumes or the silence reaches the limit. `eagerness` sets both:
+
+| eagerness | pause that asks Smart Turn | longest wait |
+| --- | --- | --- |
+| `high` | 300 ms | 2 s |
+| `medium` / `auto` | 500 ms | 4 s |
+| `low` | 800 ms | 8 s |
+
+It is available on turn-based sessions; auto-responding (native duplex) sessions
+refuse it.
+
+The engine runs the pinned int8 CPU artifact
+`pipecat-ai/smart-turn-v3/smart-turn-v3.2-cpu.onnx` and does not download it
+while serving. Pre-download it into the Hugging Face cache, or point the overlay at a
+local copy next to the Silero artifact:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  server_vad_model_path: /path/to/silero_vad.onnx
+  semantic_vad_model_path: /path/to/smart-turn-v3.2-cpu.onnx
+```
+
+```bash
+hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx \
+    --revision f766f81d3cfdf7737ac64aad813d91bbfd56bf93
+```
+
+A missing or mismatched artifact fails the session's first audio chunk with
+`semantic_vad_unavailable`, and turn detection stays off for the rest of that
+session.
+
 ### Using the Qwen3 web UI
 
 The shared UI supports both explicit turns and Server VAD. Use the manual UI

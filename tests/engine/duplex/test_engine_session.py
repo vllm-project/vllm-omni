@@ -631,7 +631,7 @@ def test_from_realtime_rejects_unsupported_audio_formats():
 
 def test_from_realtime_validates_turn_detection():
     with pytest.raises(DuplexConfigError) as excinfo:
-        DuplexSessionConfig.from_realtime({"turn_detection": {"type": "semantic_vad"}})
+        DuplexSessionConfig.from_realtime({"turn_detection": {"type": "foo_vad"}})
     assert excinfo.value.code == "unsupported_turn_detection"
     assert excinfo.value.param == "turn_detection"
 

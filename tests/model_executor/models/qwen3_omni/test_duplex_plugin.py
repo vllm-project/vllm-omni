@@ -21,7 +21,9 @@ from tests.engine.duplex.test_session_runner import (
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
+    AppendAudio,
     CancelResponse,
+    ClearInput,
     ClearOutputAudio,
     Commit,
     CreateResponse,
@@ -443,6 +445,199 @@ async def test_late_playback_ack_keeps_answer_before_new_user_input():
         assert [m["role"] for m in h.session.history] == ["user", "assistant", "user"]
         assert h.session.history[1]["content"] == "first answer"
         assert h.session.active_response_id == current_response
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.fixture
+def scripted_turn_detectors(monkeypatch):
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    def build_detector(config, backend_provider=None, semantic_backend_provider=None):
+        detector = (
+            SemanticTurnDetector(config, turn_scorer=lambda _: 0.1)
+            if config.type == "semantic_vad"
+            else original_build(config, backend_provider, semantic_backend_provider)
+        )
+        detector.vad._frame_scorer = lambda frame: 0.95 if np.abs(frame).max() > 0.1 else 0.02
+        return detector
+
+    original_build = TurnDetectionConfig.build_detector
+    monkeypatch.setattr(TurnDetectionConfig, "build_detector", build_detector)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("mode", ["semantic_vad", "server_vad"])
+@pytest.mark.parametrize("paused", [False, True])
+@pytest.mark.asyncio
+async def test_identical_vad_update_preserves_pending_audio(scripted_turn_detectors, nested, mode, paused):
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": {"type": mode}}))
+        detector = h.runner.control._detector
+        events = await h.run(append_audio(value=0.2, is_speech=None))
+        if paused:
+            pause_samples = 16000 if mode == "semantic_vad" else 3200
+            events += await h.run(append_audio(samples=pause_samples, value=0.0, is_speech=None))
+        assert h.runner.model_state.audio_buffer.has_pending()
+        assert not h.port.submissions
+        # Re-send the normalized public echo, including defaults, through either spelling.
+        turn_detection = dict(h.session.as_public_dict()["turn_detection"])
+        patch = (
+            {"audio": {"input": {"turn_detection": turn_detection}}} if nested else {"turn_detection": turn_detection}
+        )
+        updated = await h.run(UpdateSession(patch=patch))
+        assert [event.type for event in updated] == ["session.updated"]
+        for _ in range(10):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        assert sum(event.type == "input_audio_buffer.speech_started" for event in events) == 1
+        assert sum(event.type == "input_audio_buffer.speech_stopped" for event in events) == 1
+        assert h.runner.control._detector is detector
+        assert len(h.port.submissions) == 1
+        audio, rate = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert rate == 16000
+        assert np.count_nonzero(audio == np.float32(0.2)) == 16000
+        expected_end_ms = 5024 if mode == "semantic_vad" else 1536
+        assert audio.size == expected_end_ms * 16, "the update must not restart the silence deadline"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "turn_detection",
+    [
+        {"type": "semantic_vad", "eagerness": "high"},
+        {"type": "semantic_vad", "create_response": False},
+        {"type": "server_vad"},
+        None,
+    ],
+)
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.asyncio
+async def test_vad_changes_reject_pending_input_atomically(scripted_turn_detectors, turn_detection, nested):
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}))
+        await h.run(append_audio(value=0.2, is_speech=None))
+        await h.run(append_audio(value=0.0, is_speech=None))
+        detector = h.runner.control._detector
+        config, runtime = h.session.config, dict(h.session.runtime_config)
+        generation = h.session.config_generation
+        pending_bytes = h.runner.model_state.audio_buffer.pending_byte_count
+
+        def update():
+            patch = (
+                {"audio": {"input": {"turn_detection": turn_detection}}}
+                if nested
+                else {"turn_detection": turn_detection}
+            )
+            return UpdateSession(patch={**patch, "temperature": 0.3}, event_id="vad-update")
+
+        rejected = await h.run(update())
+        assert [event.type for event in rejected] == ["error"]
+        assert rejected[0].code == "unsupported_turn_detection"
+        assert rejected[0].related_event_id == "vad-update"
+        assert "commit or clear" in rejected[0].message
+        assert h.session.config is config and h.session.runtime_config == runtime
+        assert h.session.config_generation == generation
+        assert h.runner.control._detector is detector
+        assert h.runner.model_state.audio_buffer.pending_byte_count == pending_bytes
+
+        events = []
+        for _ in range(10):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        assert len(h.port.submissions) == 1
+        audio, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert audio.size == 5024 * 16
+        assert np.count_nonzero(audio == np.float32(0.2)) == 16000
+
+        # Once the old input is committed, the same requested change can succeed.
+        accepted = await h.run(update())
+        assert [event.type for event in accepted] == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        assert h.runner.control._detector is not detector
+        if turn_detection is None:
+            assert h.runner.control._detector is None
+        else:
+            for key, value in turn_detection.items():
+                assert accepted[0].session["turn_detection"][key] == value
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_enabling_vad_requires_pending_manual_input_to_be_cleared(scripted_turn_detectors):
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": None}))
+        await h.run(append_audio(value=0.2))
+        pending_bytes = h.runner.model_state.audio_buffer.pending_byte_count
+        rejected = await h.run(UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}))
+        assert [event.type for event in rejected] == ["error"]
+        assert rejected[0].code == "unsupported_turn_detection"
+        assert h.runner.control._detector is None
+        assert h.runner.model_state.audio_buffer.pending_byte_count == pending_bytes
+
+        await h.run(ClearInput())
+        accepted = await h.run(UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}))
+        assert [event.type for event in accepted] == ["session.updated"]
+        events = await h.run(append_audio(value=0.4, is_speech=None))
+        for _ in range(6):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        audio, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert np.count_nonzero(audio == np.float32(0.4)) == 16000
+        assert not np.any(audio == np.float32(0.2))
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["server_vad", "semantic_vad"])
+@pytest.mark.parametrize("overlap_policy", ["listen_only", "barge_in_on_speech"])
+@pytest.mark.parametrize("queued_appends", [False, True])
+@pytest.mark.asyncio
+async def test_large_vad_append_submits_separate_audio_turns(mode, overlap_policy, queued_appends):
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"overlap_policy": overlap_policy}))
+        config = TurnDetectionConfig(type=mode)
+        detector = (
+            SemanticTurnDetector(config, turn_scorer=lambda _: 0.1)
+            if mode == "semantic_vad"
+            else config.build_detector()
+        )
+        detector.vad._frame_scorer = lambda frame: 0.95 if np.abs(frame).max() > 0.1 else 0.02
+        h.runner.control._detector = detector
+        audio = np.concatenate([np.full(16000, 0.2), np.zeros(80000), np.full(16000, 0.4), np.zeros(80000)])
+        for chunk in np.split(audio, 2) if queued_appends else [audio]:
+            h.submit(AppendAudio(audio=chunk.astype("<f4").tobytes(), format="pcm_f32le", sample_rate_hz=16000))
+        events = await h.settle()
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 2
+        assert not any(event.type == "error" for event in events)
+        if overlap_policy == "listen_only":
+            assert len(h.port.submissions) == 1
+            first, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+            assert np.count_nonzero(first == np.float32(0.2)) == 16000
+            assert not np.any(first == np.float32(0.4))
+            request_id = h.port.submissions[0].context.request_id
+            await h.deliver_and_settle(tts_output(request_id, samples=0, text="first", finished=True), stage_id=0)
+            await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
+            assert len(h.port.submissions) == 2
+        else:
+            assert len(h.port.submissions) in (1, 2)
+            if len(h.port.submissions) == 2:
+                first, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+                assert np.count_nonzero(first == np.float32(0.2)) == 16000
+                assert not np.any(first == np.float32(0.4))
+        # With barge-in, the second turn can cancel the first before its
+        # background submission runs. Its audio must still be a separate turn.
+        second, _ = h.port.submissions[-1].prompt["multi_modal_data"]["audio"][-1]
+        assert np.count_nonzero(second == np.float32(0.4)) == 16000
+        assert not np.any(second == np.float32(0.2))
     finally:
         await h.manager.shutdown()
 

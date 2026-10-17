@@ -38,6 +38,11 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.smart_turn import (
+    SMART_TURN_FILENAME,
+    SMART_TURN_REPO_ID,
+    SMART_TURN_REVISION,
+)
 from vllm_omni.engine.duplex.vad import (
     SILERO_VAD_FILENAME,
     SILERO_VAD_REPO_ID,
@@ -48,6 +53,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = os.environ.get("VLLM_OMNI_TEST_QWEN3_OMNI_MODEL", "Qwen/Qwen3-Omni-30B-A3B-Instruct")
 SERVER_VAD_MODEL_PATH = os.environ.get("VLLM_OMNI_TEST_SILERO_VAD_MODEL_PATH")
+SEMANTIC_VAD_MODEL_PATH = os.environ.get("VLLM_OMNI_TEST_SMART_TURN_MODEL_PATH")
 
 # Synthetic input for realtime E2E (``generate_synthetic_audio``); distinct cache file per phrase.
 REALTIME_SYNTH_PHRASE_TEXT = (
@@ -270,6 +276,8 @@ async def _run_server_vad_audio_roundtrips(
     *,
     chunk_ms: int = 100,
     turns: int = 2,
+    turn_detection: dict | None = None,
+    silence_ms: int = 1500,
 ) -> list[list[dict]]:
     chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
     turn_events: list[list[dict]] = []
@@ -285,7 +293,7 @@ async def _run_server_vad_audio_roundtrips(
                         "audio": {
                             "input": {
                                 "format": {"type": "audio/pcm", "rate": 16_000},
-                                "turn_detection": {"type": "server_vad"},
+                                "turn_detection": turn_detection or {"type": "server_vad"},
                             }
                         },
                     },
@@ -293,13 +301,68 @@ async def _run_server_vad_audio_roundtrips(
             )
         )
 
-        silence = bytes(16_000 * 2 * 3 // 2)
+        silence = bytes(16_000 * 2 * silence_ms // 1000)
         for _ in range(turns):
             await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
             await _append_pcm16_chunks(ws, silence, chunk_bytes)
             turn_events.append(await _receive_server_vad_turn(ws))
 
     return turn_events
+
+
+def _assert_auto_committed_turns(turns: list[list[dict]]) -> None:
+    """Each turn: one speech start/stop, one commit and one completed audio response, in order."""
+    required_sequence = [
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+        "response.created",
+        "response.output_audio.delta",
+        "response.output_audio.done",
+        "response.done",
+    ]
+    input_item_ids: list[str] = []
+    response_ids: list[str] = []
+    for events in turns:
+        event_types = [event["type"] for event in events]
+        for event_type in required_sequence:
+            if event_type != "response.output_audio.delta":
+                assert event_types.count(event_type) == 1, event_types
+        positions = [event_types.index(event_type) for event_type in required_sequence]
+        assert positions == sorted(positions)
+
+        started = next(event for event in events if event["type"] == "input_audio_buffer.speech_started")
+        stopped = next(event for event in events if event["type"] == "input_audio_buffer.speech_stopped")
+        committed = next(event for event in events if event["type"] == "input_audio_buffer.committed")
+        created = next(event for event in events if event["type"] == "response.created")["response"]
+        done = next(event for event in events if event["type"] == "response.done")["response"]
+
+        assert started["item_id"] == stopped["item_id"] == committed["item_id"]
+        input_item_id = committed["item_id"]
+        history_events = [
+            event
+            for event in events
+            if event["type"] in {"conversation.item.added", "conversation.item.done"}
+            and event["item"]["id"] == input_item_id
+        ]
+        assert [event["type"] for event in history_events] == [
+            "conversation.item.added",
+            "conversation.item.done",
+        ]
+        assert all(event["item"]["role"] == "user" for event in history_events)
+        output_pcm = b"".join(
+            base64.b64decode(event["delta"])
+            for event in events
+            if event["type"] == "response.output_audio.delta" and event.get("delta")
+        )
+        assert output_pcm
+        assert created["id"] == done["id"]
+        assert done["status"] == "completed"
+        input_item_ids.append(input_item_id)
+        response_ids.append(created["id"])
+
+    assert len(set(input_item_ids)) == 2
+    assert len(set(response_ids)) == 2
 
 
 def _output_text(response: dict) -> str:
@@ -387,6 +450,17 @@ async def _run_client_vad_replay(
 
     assert not [error for error in errors if error.get("error", {}).get("type") == "server_error"]
     return [completed_answers[response_id] for response_id in response_order if response_id in completed_answers]
+
+
+@pytest.fixture(scope="class")
+def cached_smart_turn_artifact() -> str:
+    """Prepare the pinned Smart Turn artifact before the serving subprocess starts."""
+    if SEMANTIC_VAD_MODEL_PATH is not None:
+        return SEMANTIC_VAD_MODEL_PATH
+
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=SMART_TURN_REPO_ID, filename=SMART_TURN_FILENAME, revision=SMART_TURN_REVISION)
 
 
 @pytest.fixture(scope="class")
@@ -587,57 +661,7 @@ class TestQwen3OmniRealtimeWebSocket:
         assert effective_turn_detection["silence_duration_ms"] == 500
         assert effective_turn_detection["create_response"] is True
         assert effective_turn_detection["interrupt_response"] is False
-        required_sequence = [
-            "input_audio_buffer.speech_started",
-            "input_audio_buffer.speech_stopped",
-            "input_audio_buffer.committed",
-            "response.created",
-            "response.output_audio.delta",
-            "response.output_audio.done",
-            "response.done",
-        ]
-        input_item_ids: list[str] = []
-        response_ids: list[str] = []
-        for events in turns:
-            event_types = [event["type"] for event in events]
-            for event_type in required_sequence:
-                if event_type != "response.output_audio.delta":
-                    assert event_types.count(event_type) == 1, event_types
-            positions = [event_types.index(event_type) for event_type in required_sequence]
-            assert positions == sorted(positions)
-
-            started = next(event for event in events if event["type"] == "input_audio_buffer.speech_started")
-            stopped = next(event for event in events if event["type"] == "input_audio_buffer.speech_stopped")
-            committed = next(event for event in events if event["type"] == "input_audio_buffer.committed")
-            created = next(event for event in events if event["type"] == "response.created")["response"]
-            done = next(event for event in events if event["type"] == "response.done")["response"]
-
-            assert started["item_id"] == stopped["item_id"] == committed["item_id"]
-            input_item_id = committed["item_id"]
-            history_events = [
-                event
-                for event in events
-                if event["type"] in {"conversation.item.added", "conversation.item.done"}
-                and event["item"]["id"] == input_item_id
-            ]
-            assert [event["type"] for event in history_events] == [
-                "conversation.item.added",
-                "conversation.item.done",
-            ]
-            assert all(event["item"]["role"] == "user" for event in history_events)
-            output_pcm = b"".join(
-                base64.b64decode(event["delta"])
-                for event in events
-                if event["type"] == "response.output_audio.delta" and event.get("delta")
-            )
-            assert output_pcm
-            assert created["id"] == done["id"]
-            assert done["status"] == "completed"
-            input_item_ids.append(input_item_id)
-            response_ids.append(created["id"])
-
-        assert len(set(input_item_ids)) == 2
-        assert len(set(response_ids)) == 2
+        _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
@@ -679,7 +703,7 @@ class _DuplexTestRuntime(NamedTuple):
 
 
 @pytest.fixture(scope="class")
-def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, run_level):
+def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
     """Load real weights once for all interruption repetitions and history checks."""
     from transformers import AutoProcessor
 
@@ -692,7 +716,10 @@ def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, run_level):
         yaml.safe_dump(
             {
                 "base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"),
-                "duplex_session": {"server_vad_model_path": cached_silero_vad_artifact},
+                "duplex_session": {
+                    "server_vad_model_path": cached_silero_vad_artifact,
+                    "semantic_vad_model_path": cached_smart_turn_artifact,
+                },
             }
         )
     )
@@ -1065,6 +1092,34 @@ class TestQwen3OmniDuplexPlayback:
                 qwen_duplex_server, tmp_path / f"events-{repetition}.json", generation_finished=generation_finished
             )
         )
+
+    @pytest.mark.advanced_model
+    def test_semantic_vad_multi_turn_without_client_commit(self, qwen_duplex_server) -> None:
+        """Two Qwen turns are endpointed by Silero + Smart Turn without client commits."""
+        server = qwen_duplex_server.server
+        turns = asyncio.run(
+            _run_server_vad_audio_roundtrips(
+                server.host,
+                server.port,
+                server.model,
+                _server_vad_pcm16_input(),
+                chunk_ms=100,
+                turns=2,
+                turn_detection={"type": "semantic_vad", "eagerness": "auto"},
+                # Longer than the 4 s ``auto`` limit, so the turn ends even
+                # when Smart Turn calls it incomplete.
+                silence_ms=5000,
+            )
+        )
+
+        assert len(turns) == 2
+        updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
+        # The normalized (defaults filled) setting is the top-level ``turn_detection``.
+        effective_turn_detection = updated_session["turn_detection"]
+        assert effective_turn_detection["type"] == "semantic_vad"
+        assert effective_turn_detection["eagerness"] == "auto"
+        assert effective_turn_detection["create_response"] is True
+        _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):

@@ -76,6 +76,7 @@ from vllm_omni.engine.duplex.plugin import (
 )
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
+    clear_input_buffer,
     discard_pending_input_audio,
     note_input_append,
     resolve_cancel_response,
@@ -565,9 +566,6 @@ class DuplexSessionRunner:
                 retained_committed_payload=payload,
             )
             return
-        if item.kind == "commit":
-            await self._on_commit(dict(item.payload))
-            return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
 
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
@@ -722,10 +720,11 @@ class DuplexSessionRunner:
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
         session.cancel_pending_input()
+        # A clear starts a new turn: drop the detector's speech (and semantic
+        # pause) state too, or a later stop would commit the cleared turn.
+        self.control.reset_vad()
         projector = self.out.projector
         if projector is not None:
-            from vllm_omni.engine.duplex.realtime_events import clear_input_buffer
-
             clear_input_buffer(projector)
         self._emit_events([InputCleared()])
 
@@ -853,7 +852,6 @@ class DuplexSessionRunner:
 
     async def _on_append_audio(self, event: dict[str, object]) -> None:
         session = self.session
-        model_state = self.model_state
         session.mark_user_input_activity()
         audio = event.get("audio") or event.get("data")
         video_frames_raw = event.get("video_frames")
@@ -881,6 +879,7 @@ class DuplexSessionRunner:
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
         client_force_listen = bool(event.get("force_listen", False))
+        detected: list[tuple[dict[str, object], TurnDetectionResult | None]]
         if video_only:
             # No PCM to decode; frames alone are the turn content.
             fmt = "pcm_f32le"
@@ -891,7 +890,7 @@ class DuplexSessionRunner:
             event["sample_rate_hz"] = sample_rate_hz
             event["is_speech"] = False
             event["video_frames"] = video_frames
-            vad_result = None
+            detected = [(event, None)]
         else:
             try:
                 converted: tuple[object, object, int | float | None] = await self.offload(
@@ -912,7 +911,8 @@ class DuplexSessionRunner:
             event["audio"] = audio
             event["format"] = fmt
             event["sample_rate_hz"] = sample_rate_hz
-            vad_result = await self.control.run_turn_detection(event)
+            detected = await self.control.run_turn_detection(event)
+        for segment, vad_result in detected:
             if (
                 vad_result is not None
                 and not session.capabilities.supports_core_resumable_request
@@ -920,7 +920,18 @@ class DuplexSessionRunner:
             ):
                 # VAD's force_listen hint controls native model decoding. Committed
                 # turn models already buffer speech; it must not suppress barge-in.
-                event.pop("force_listen", None)
+                segment.pop("force_listen", None)
+            await self._append_detected_audio(segment, vad_result)
+
+    async def _append_detected_audio(self, event: dict[str, object], vad_result: TurnDetectionResult | None) -> None:
+        """Buffer one segment and apply its commit before accepting the next one."""
+        session = self.session
+        model_state = self.model_state
+        audio = event.get("audio")
+        fmt = event.get("format")
+        sample_rate_hz = event.get("sample_rate_hz")
+        video_frames = event.get("video_frames")
+        video_only = bool(video_frames) and not audio
         projector = self._require_projector()
         self._emit_events(
             note_input_append(
@@ -972,7 +983,7 @@ class DuplexSessionRunner:
             if action == "drop":
                 duration_ms = overlap_policy.input_audio_duration_ms(event, payload)
                 self._emit_events(discard_pending_input_audio(projector, duration_ms))
-                self._maybe_schedule_vad_commit(vad_result)
+                await self._maybe_commit_vad_turn(vad_result)
                 return
             if action == "listen":
                 buffer_overlap_audio = bool(decision.get("buffer_audio", True))
@@ -1003,12 +1014,12 @@ class DuplexSessionRunner:
                         "reason": "silence_or_noise",
                     }
                 )
-                self._maybe_schedule_vad_commit(vad_result)
+                await self._maybe_commit_vad_turn(vad_result)
                 return
         if overlap_policy.should_force_listen_for_auto_response_overlap(event, payload, auto_responds=auto_responds):
             payload["force_listen"] = True
         if not buffer_overlap_audio:
-            self._maybe_schedule_vad_commit(vad_result)
+            await self._maybe_commit_vad_turn(vad_result)
             return
         session.mark_user_input_activity()
         model_state.input_since_commit = True
@@ -1060,16 +1071,16 @@ class DuplexSessionRunner:
             # when the buffer waits until commit to start the append.
             if not session.capabilities.supports_core_resumable_request:
                 self._reset_failed_append_tail()
-            self._maybe_schedule_vad_commit(vad_result)
+            await self._maybe_commit_vad_turn(vad_result)
             return
         if pcm_reservation.byte_count == 0:
             session.release_input_bytes(raw_audio_bytes)
         append_payload = pcm_reservation.payload
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
-        self._maybe_schedule_vad_commit(vad_result)
+        await self._maybe_commit_vad_turn(vad_result)
 
-    def _maybe_schedule_vad_commit(self, vad_result: TurnDetectionResult | None) -> None:
-        """Server VAD ended the user turn: run the same commit the old translator synthesized."""
+    async def _maybe_commit_vad_turn(self, vad_result: TurnDetectionResult | None) -> None:
+        """Commit at the detected boundary, before later audio can enter the buffer."""
         if vad_result is None or not vad_result.should_commit:
             return
         if self._session_auto_responds():
@@ -1084,10 +1095,10 @@ class DuplexSessionRunner:
         command = Commit(final=True, create_response=vad_result.create_response)
         resolved = resolve_commit(self._require_projector(), command)
         self._emit_events(resolved.events)
-        if resolved.reset_vad:
-            self.control.reset_vad()
+        # Detection already reset at this boundary and may have scored later
+        # segments of the same append. Resetting here would erase their state.
         if resolved.payload is not None:
-            self._mailbox.put_nowait(_Internal("commit", resolved.payload))
+            await self._on_commit(resolved.payload)
 
     def _clear_completed_pending_silence(self) -> None:
         task = self.model_state.pending_silence_task
@@ -1410,6 +1421,9 @@ class DuplexSessionRunner:
             model_state.input_since_commit = False
             model_state.speech_since_commit = False
             model_state.clear_committed_audio()
+            self.control.reset_vad()
+            if self.out.projector is not None:
+                clear_input_buffer(self.out.projector)
         had_append = await self.tasks.cancel_append_tasks(
             response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
         )
