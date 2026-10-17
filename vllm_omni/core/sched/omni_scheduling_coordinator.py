@@ -19,6 +19,8 @@ from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
 logger = init_logger(__name__)
 
+_LIST_PARTITION_MIN_QUEUE_SIZE = 128
+
 
 def uses_native_mrv2_data_plane(
     model_config: Any,
@@ -443,6 +445,11 @@ class OmniSchedulingCoordinator:
         target_status: RequestStatus,
         chunk_ready_req_ids: set[str],
     ) -> None:
+        is_list_queue = isinstance(queue, list)
+        retained_requests: list[Any] | None = (
+            [] if is_list_queue and len(queue) > _LIST_PARTITION_MIN_QUEUE_SIZE else None
+        )
+        remove_request = queue.remove if is_list_queue else queue.remove_request
         queue_snapshot = list(queue)
         for request in queue_snapshot:
             request_can_run = self._request_can_run(request, chunk_ready_req_ids)
@@ -450,8 +457,12 @@ class OmniSchedulingCoordinator:
                 if request_can_run:
                     if request.request_id in chunk_ready_req_ids:
                         self.requests_with_ready_chunks.add(request.request_id)
+                    if retained_requests is not None:
+                        retained_requests.append(request)
                     continue
                 if request.status == RequestStatus.WAITING_FOR_INPUT:
+                    if retained_requests is not None:
+                        retained_requests.append(request)
                     continue
                 self.pending_chunk_registrations.append(
                     OmniChunkRecvHandle(
@@ -467,12 +478,15 @@ class OmniSchedulingCoordinator:
                     if request.request_id in chunk_ready_req_ids:
                         self.requests_with_ready_chunks.add(request.request_id)
                     self._waiting_since.pop(request.request_id, None)
+                    if retained_requests is not None:
+                        retained_requests.append(request)
                     continue
-            if isinstance(queue, list):
-                queue.remove(request)
-            else:
-                queue.remove_request(request)
+            if retained_requests is None:
+                remove_request(request)
             waiting_for_chunk_list.append(request)
+
+        if retained_requests is not None:
+            queue[:] = retained_requests
 
     def _request_can_run(
         self,

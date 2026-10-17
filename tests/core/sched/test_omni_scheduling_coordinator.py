@@ -143,6 +143,66 @@ def test_chunk_waiting_removes_request_from_running_list():
     assert list(coord._waiting_for_chunk_running) == [req]
 
 
+def test_chunk_waiting_partitions_running_list_without_remove_scans(monkeypatch):
+    class CountingList(list):
+        def __init__(self, items):
+            super().__init__(items)
+            self.remove_calls = 0
+
+        def remove(self, item):
+            self.remove_calls += 1
+            super().remove(item)
+
+    coord = OmniSchedulingCoordinator(
+        scheduler_max_num_seqs=10,
+        stage_id=1,
+        async_chunk=True,
+    )
+    monkeypatch.setattr(coord_mod, "_LIST_PARTITION_MIN_QUEUE_SIZE", 0)
+    moved_first = _make_request("moved-first", status=RequestStatus.RUNNING)
+    ready_first = _make_request("ready-first", status=RequestStatus.RUNNING)
+    waiting_for_input = _make_request(
+        "waiting-for-input",
+        status=RequestStatus.WAITING_FOR_INPUT,
+    )
+    moved_second = _make_request("moved-second", status=RequestStatus.RUNNING)
+    restored_running = _make_request(
+        "restored-running",
+        status=RequestStatus.WAITING_FOR_CHUNK,
+    )
+    ready_second = _make_request("ready-second", status=RequestStatus.RUNNING)
+    running = CountingList(
+        [
+            moved_first,
+            ready_first,
+            waiting_for_input,
+            moved_second,
+            restored_running,
+            ready_second,
+        ]
+    )
+
+    coord.process_pending_chunks(
+        MockQueue(),
+        running,
+        {"ready-first", "restored-running", "ready-second"},
+        set(),
+    )
+
+    assert running == [
+        ready_first,
+        waiting_for_input,
+        restored_running,
+        ready_second,
+    ]
+    assert list(coord._waiting_for_chunk_running) == [moved_first, moved_second]
+    assert running.remove_calls == 0
+    assert [handle.request_id for handle in coord.pending_chunk_registrations] == [
+        "moved-first",
+        "moved-second",
+    ]
+
+
 class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
     """Test update_request_metadata applies scheduling metadata to requests."""
 
