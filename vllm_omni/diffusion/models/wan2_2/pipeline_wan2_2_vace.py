@@ -194,6 +194,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
 
+    # VACE's forward() defaults to 50 steps, not the base pipeline's 40.
+    default_num_inference_steps: int = 50
+
     def __init__(
         self,
         *,
@@ -504,7 +507,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         negative_prompt: str | None = None,
         height: int = 480,
         width: int = 832,
-        num_inference_steps: int = 50,
+        num_inference_steps: int | None = None,
         guidance_scale: float = 5.0,
         frame_num: int = 81,
         output_type: str | None = "np",
@@ -573,7 +576,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         height = common.height or height
         width = common.width or width
         num_frames = common.num_frames or frame_num
-        num_inference_steps = common.num_inference_steps or num_inference_steps
+        num_inference_steps = common.num_inference_steps or num_inference_steps or self.default_num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         generator = req.collate_request_generators(num_outputs_per_prompt, None)
         request_latents = req.collate_request_tensors("latents", None)

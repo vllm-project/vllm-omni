@@ -416,6 +416,10 @@ class Wan22Pipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts. The
+    # DMD checkpoint overrides it in __init__ with its fixed three transitions.
+    default_num_inference_steps: int = 40
     _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
@@ -602,6 +606,8 @@ class Wan22Pipeline(
         else:
             raise RuntimeError("No transformer loaded")
 
+        if self.is_dmd:
+            self.default_num_inference_steps = len(FASTWAN_DMD_TIMESTEPS)
         self._sample_solver = "euler" if self.is_dmd else "unipc"
         self._flow_shift = (
             FASTWAN_DMD_SCHEDULER_SHIFT
@@ -1239,7 +1245,9 @@ class Wan22Pipeline(
             # request-level step counts, including the engine's 1-step warmup.
             num_steps = len(FASTWAN_DMD_TIMESTEPS)
         else:
-            num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+            num_steps = (
+                self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
+            )
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
