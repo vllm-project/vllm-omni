@@ -209,7 +209,7 @@ Use the profile that matches the per-GPU memory capacity:
 
 | Profile | GPUs | Starting shape | Resident DiT blocks | Attention | Execution | Status |
 | --- | ---: | ---: | ---: | --- | --- | --- |
-| `rtx5090` | 2 x 32 GB | 1344x768 | 20 | cuDNN attention | eager | Target-hardware validated |
+| `rtx5090` | 2 x 32 GB | 1344x768 | 20 | cuDNN attention | eager | Validated before SM120 exact VAE ops; see below |
 | `rtx4090` | 2 x 24 GB | 1024x576 | 12 | cuDNN attention | eager | Capacity-proxy starting point |
 
 This topology uses all available parallel capacity: TP2 shards both the DiT
@@ -223,6 +223,12 @@ quantize or change the BF16/FP32 denoise math. Re-measure peak memory before
 increasing it on a different request shape.
 
 ### RTX 5090 target-hardware validation
+
+These measurements predate the SM120 exact VAE operator dispatch and decoder
+Linear FP16 precast. Their end-to-end and memory figures have not been
+revalidated with that path enabled. The new operator evidence is limited
+to a single RTX 5090 D v2 using tiled eager decode without DLO; it does
+not validate this two-GPU DLO and `--vae-patch-parallel-size 2` route.
 
 At vLLM-Omni commit `ae6577ea`, one full 50-step T2VA request completed on
 2 x RTX 5090 without OOM:
