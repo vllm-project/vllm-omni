@@ -576,6 +576,11 @@ class DailyOmniDataset(BenchmarkDataset):
                 "For offline/air-gapped environments, download qa.json and use qa_json_path."
             )
 
+        if pack_mode == "minicpm-interleave" and input_mode != "audio":
+            from vllm_omni.benchmarks.media_preflight import check_minicpm_media_dependencies
+
+            check_minicpm_media_dependencies(include_audio=input_mode == "all")
+
         # Store configuration
         self.qa_json_path = Path(qa_json_path) if qa_json_path else None
         self.dataset_path = dataset_path
@@ -1260,7 +1265,6 @@ class DailyOmniDataset(BenchmarkDataset):
     ) -> tuple[list[Any], list[Any]]:
         """Port of MiniCPM ``get_video_frame_audio_segments`` (stack_frames=1, 1fps)."""
         import numpy as np
-        from vllm.multimodal.media.audio import load_audio
 
         num_video_frames, avg_fps = _probe_video_frames_and_fps(video_path)
         duration = num_video_frames / avg_fps
@@ -1281,6 +1285,8 @@ class DailyOmniDataset(BenchmarkDataset):
 
         audio_segments: list[Any] = []
         if include_audio:
+            from vllm.multimodal.media.audio import load_audio
+
             load_path = str(audio_path) if audio_path is not None else str(video_path)
             audio_np, sr = load_audio(load_path, sr=_MINICPM_AUDIO_SR, mono=True)
             for i, start_time in enumerate(timestamps):

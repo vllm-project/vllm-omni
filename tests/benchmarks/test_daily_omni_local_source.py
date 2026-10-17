@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline Daily-Omni sources: local mirrors must not fall back to the Hub id."""
 
 import json
 import os
+import sys
 import tarfile
 from pathlib import Path
 
@@ -131,7 +133,9 @@ def test_dataset_loads_hub_id_without_network(tmp_path: Path, monkeypatch: pytes
     """The regression this file exists for: a Hub id must not require ``load_dataset``."""
     snapshot = _stage_offline_hub_cache(tmp_path, monkeypatch)
     # Any use of `datasets` here means we went back to the path that cannot read the hub cache.
-    monkeypatch.setattr("vllm_omni.benchmarks.data_modules.daily_omni_dataset.load_dataset", None)
+    # The packing tests load this module via spec_from_file_location; patch the
+    # actual module rather than depending on parent-package attribute binding.
+    monkeypatch.setattr(sys.modules[DailyOmniDataset.__module__], "load_dataset", None)
 
     dataset = DailyOmniDataset(dataset_path=_HUB_ID, random_seed=0)
 
@@ -141,7 +145,7 @@ def test_dataset_loads_hub_id_without_network(tmp_path: Path, monkeypatch: pytes
 
 def test_uncached_hub_id_reports_both_attempts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _stage_offline_hub_cache(tmp_path, monkeypatch, with_qa=False)
-    monkeypatch.setattr("vllm_omni.benchmarks.data_modules.daily_omni_dataset.load_dataset", None)
+    monkeypatch.setattr(sys.modules[DailyOmniDataset.__module__], "load_dataset", None)
 
     with pytest.raises(RuntimeError) as excinfo:
         DailyOmniDataset(dataset_path="someone-else/Daily-Omni", random_seed=0)
