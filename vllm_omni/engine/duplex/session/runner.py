@@ -483,7 +483,14 @@ class DuplexSessionRunner:
                 raise
             except Exception as exc:
                 logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
-                self._emit_error("internal_error", str(exc))
+                # The serving reader waits for this command's id. An unstamped
+                # internal_error never matches, so the connection parks forever.
+                event_id = getattr(item, "event_id", None)
+                self._emit_error(
+                    "internal_error",
+                    str(exc),
+                    event_id=event_id if isinstance(event_id, str) and event_id else None,
+                )
 
     async def _stop_worker(self) -> None:
         worker = self._worker
