@@ -150,6 +150,34 @@ def test_evict_before_allocating_replacement(graph_case, monkeypatch):
 
 
 @pytest.mark.cpu
+def test_warmup_stream_is_created_once_per_device(monkeypatch):
+    """Warm-up must reuse one stream per device (vllm-omni#8750).
+
+    A fresh ``torch.cuda.Stream()`` per capture adds a new ``(cuBLAS handle,
+    stream)`` key to the process-wide cuBLAS workspace map. Each new key keeps
+    another workspace allocated (32 MiB by default) for the life of the process,
+    so the resident footprint grew with the number of graphs ever captured and was
+    not bounded by ``max_entries``.
+    """
+    created = []
+
+    class FakeStream:
+        def __init__(self, device=None):
+            created.append(device)
+
+    monkeypatch.setattr(decode_graph.torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(decode_graph, "_WARMUP_STREAMS", {})
+
+    first = decode_graph._get_warmup_stream(torch.device("cuda", 0))
+    second = decode_graph._get_warmup_stream(torch.device("cuda", 0))
+    other = decode_graph._get_warmup_stream(torch.device("cuda", 1))
+
+    assert first is second, "the same device must reuse its warm-up stream"
+    assert other is not first, "a different device must get its own stream"
+    assert len(created) == 2, f"expected one stream per device, created {len(created)}"
+
+
+@pytest.mark.cpu
 def test_registration_preserves_request_cache_and_separates_layouts(graph_case):
     manager, device, _ = graph_case
     first, second = make_cache(device, 1.0), make_cache(device, 5.0)
