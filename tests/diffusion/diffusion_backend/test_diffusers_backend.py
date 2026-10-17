@@ -143,6 +143,82 @@ class TestPipelineArgumentsHandling:
         assert isinstance(output.output, MockPipelineOutput)
         assert output.output.image is stub_image
 
+    def test_adapter_rejects_ids_only_prompt_in_request_path(self):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = {"prompt_ids": [101, 102, 103]}
+
+        with pytest.raises(
+            ValueError,
+            match=r"DiffusersAdapterPipeline does not support prompt field\(s\).*prompt_ids",
+        ):
+            adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+    def test_adapter_rejects_bare_token_ids_in_request_path(self):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = [101, 102, 103]
+
+        with pytest.raises(
+            ValueError,
+            match=r"DiffusersAdapterPipeline does not support a token-ID prompt at index 0",
+        ):
+            adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("prompt_ids", [101, 102, 103]),
+            ("prompt_token_ids", [101, 102, 103]),
+            ("negative_prompt_ids", [201, 202]),
+            ("negative_prompt_token_ids", [201, 202]),
+            ("prompt_mask", torch.ones(3, dtype=torch.bool)),
+            ("negative_prompt_mask", torch.ones(2, dtype=torch.bool)),
+            ("prompt_embeds", torch.zeros(3, 4)),
+            ("negative_prompt_embeds", torch.zeros(2, 4)),
+        ],
+    )
+    def test_adapter_rejects_unsupported_prompt_fields_even_with_text(self, field, value):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = {"prompt": "a supported text prompt", field: value}
+
+        with pytest.raises(
+            ValueError,
+            match=rf"DiffusersAdapterPipeline does not support prompt field\(s\).*{field}",
+        ):
+            adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+    @pytest.mark.parametrize(
+        "field",
+        ("prompt_ids", "prompt_token_ids", "negative_prompt_ids", "negative_prompt_token_ids"),
+    )
+    def test_adapter_treats_empty_id_fields_as_absent(self, field):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+        request = _make_request()
+        request.prompt = {"prompt": "a supported text prompt", field: []}
+
+        kwargs = adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+
+        assert kwargs["prompt"] == "a supported text prompt"
+
+    def test_adapter_rejects_unsupported_field_in_nonfirst_prompt(self):
+        adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+
+        with pytest.raises(
+            ValueError,
+            match=r"DiffusersAdapterPipeline does not support prompt field\(s\) at index 1: prompt_embeds",
+        ):
+            adapter._extract_input(
+                [
+                    {"prompt": "first prompt"},
+                    {
+                        "prompt": "second prompt",
+                        "prompt_embeds": torch.zeros(2, 4),
+                    },
+                ]
+            )
+
     @staticmethod
     def _make_adapter(backend: str, set_attention_backend):
         adapter = DiffusersAdapterPipeline(
