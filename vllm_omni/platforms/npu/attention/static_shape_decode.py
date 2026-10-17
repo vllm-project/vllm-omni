@@ -176,12 +176,32 @@ def install_into_ascend_aclgraph() -> None:
             # the runner took a non-static path for this step (seen when the
             # KV pool is large enough to change the capacity-bucket table).
             # Passing through to the stock wrapper would hit its "no entry ->
-            # capture now" branch at request time -- engine-fatal. Dispatch to
-            # the runnable directly, same as the decline branch below. Capture
-            # passes keep the stock call: capture time is exactly when
-            # capturing is legal.
+            # capture now" branch at request time -- engine-fatal. Dodge the
+            # stock call only for that exact case: a runtime step whose batch
+            # descriptor has no captured entry. Eager steps (runtime mode
+            # NONE) and ordinary decode steps whose graph is already captured
+            # still go through the stock call, so decode keeps its graph
+            # replay instead of silently degrading to eager. Capture passes
+            # keep the stock call: capture time is exactly when capturing is
+            # legal.
             if _capture_bucket is None:
-                return self.runnable(*args, **kwargs)
+                from vllm.config import CUDAGraphMode
+                from vllm.forward_context import get_forward_context
+
+                _fc = get_forward_context()
+                from vllm.compilation import monitor as _monitor
+
+                if (not _monitor.cudagraph_capturing_enabled
+                        and _fc.cudagraph_runtime_mode != CUDAGraphMode.NONE
+                        and _fc.batch_descriptor
+                        not in self.concrete_aclgraph_entries):
+                    # Request-time step with no captured graph: the stock
+                    # wrapper would try to capture now and die. Run eagerly.
+                    return self.runnable(*args, **kwargs)
+                # Capture-window steps (cudagraph_capturing_enabled=True) and
+                # steps whose graph is already captured fall through to the
+                # stock call, so the lazy capture still happens and decode
+                # keeps its graph replay.
             return original_call(self, *args, **kwargs)
         captured_here = _is_static_shape_graph_here(capacity)
         # A runtime step the capture passes never covered has no fixed graph to
