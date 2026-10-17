@@ -33,6 +33,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.utils import shutdown
 
+from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError, parse_attention_schedule
 from vllm_omni.diffusion.data import (
     DiffusionRequestAbortedError,
     is_diffusion_request_started_output,
@@ -46,7 +47,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, absorb_attention_schedule_extra_args
 from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -177,6 +178,17 @@ class StageDiffusionProc:
             if not isinstance(lora_req, LoRARequest):
                 sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
 
+        # Construction parses the request schedule. Classify its failures as the scheduler does on
+        # the inline client, so a malformed schedule stays HTTP 400 instead of a plain error (500).
+        schedule = SimpleNamespace(
+            attention_schedule=sampling_params_dict.get("attention_schedule"),
+            extra_args=sampling_params_dict.get("extra_args"),
+        )
+        try:
+            schedule.attention_schedule = parse_attention_schedule(schedule.attention_schedule)
+            absorb_attention_schedule_extra_args(schedule)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
         return OmniDiffusionSamplingParams(**sampling_params_dict)
 
     async def _process_request(

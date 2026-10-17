@@ -441,7 +441,10 @@ class SequenceParallelSplitHook(ModelHook):
         via `shard_group` to build masks. Legacy singleton padding fields are
         also populated for single-sequence models.
         """
-        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_capability
+        from vllm_omni.diffusion.attention.selector import (
+            BASELINE_CAPABILITY_LABEL,
+            resolve_capability_backends,
+        )
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
             get_sequence_parallel_rank,
@@ -470,25 +473,36 @@ class SequenceParallelSplitHook(ModelHook):
             # Keyed groups record their length even when no padding is needed.
             return sp_shard(x, dim, validate=False)
 
-        # Check backend compatibility
+        # Check backend compatibility for the baseline AND every schedule profile with an explicit
+        # spec: the runtime may switch to a profile mid-denoise, so a padding layout is only usable
+        # if each of them can consume the mask.
         attention_config = None
+        schedule = None
         if is_forward_context_available():
             od_config = get_forward_context().omni_diffusion_config
             if od_config is not None:
                 attention_config = od_config.diffusion_attention_config
+                schedule = getattr(od_config, "diffusion_attention_schedule", None)
 
-        attn_backend = get_attn_backend_for_capability(
+        for label, attn_backend, attention_spec in resolve_capability_backends(
             role="self",
             attention_config=attention_config,
-        )
-        attention_spec = None
-        if attention_config is not None:
-            attention_spec, _ = attention_config.resolve_with_source(role="self")
-        if not attn_backend.supports_attention_mask(attention_spec):
+            schedule=schedule,
+        ):
+            if attn_backend.supports_attention_mask(attention_spec):
+                continue
+            if label == BASELINE_CAPABILITY_LABEL:
+                raise ValueError(
+                    f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
+                    f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
+                    f"Please switch to SDPA or Ascend attention backend."
+                )
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
-                f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
-                f"Please switch to SDPA or Ascend attention backend."
+                f"Attention schedule profile {label.split(':', 1)[1]!r} selects {attn_backend.get_name()} "
+                f"which does not support attention_mask, so auto_pad cannot be honored for every "
+                f"prepared candidate. Remove that profile, select a mask-capable backend for it, "
+                f"or disable auto_pad."
             )
 
         # Ring attention does not support attention_mask

@@ -79,17 +79,80 @@ def propagate_skip_softmax_calibration(specs: list, model: str | None, tf_config
     logger.info("Loaded skip-softmax calibration from checkpoint (%d curve(s): %s).", len(experts), ", ".join(experts))
 
 
-def apply_skip_softmax_calibration(attention_config: Any, model: Any) -> None:
-    cfg = attention_config
-    specs = getattr(cfg, "per_role", None)
-    calibration = None
-    for spec in (getattr(cfg, "default", None), *(specs.values() if specs else ())):
-        calibration = calibration or getattr(spec, "skip_calibration", None)
-    if not calibration:
-        return
+def collect_calibration_specs(attention_config: Any, schedule: Any = None) -> list:
+    """Baseline specs plus every schedule profile's specs, in a stable order.
 
-    stamped = apply_to_pipeline(model, calibration)
-    logger.info("Skip-softmax: stamped calibration onto %d attention layer(s).", stamped)
+    Both calibration discovery and the target-sparsity-without-calibration check have to see
+    non-active profiles, otherwise a profile the service default never references keeps an
+    undetected calibration gap. Without a schedule this returns exactly the baseline specs.
+    """
+    specs: list = []
+
+    def _extend(cfg: Any) -> None:
+        if cfg is None:
+            return
+        default = getattr(cfg, "default", None)
+        if default is not None:
+            specs.append(default)
+        per_role = getattr(cfg, "per_role", None) or {}
+        specs.extend(spec for spec in per_role.values() if spec is not None)
+
+    _extend(attention_config)
+    profiles = getattr(schedule, "profiles", None) or {}
+    for name in sorted(profiles):
+        _extend(profiles[name])
+    return specs
+
+
+def layer_calibration_is_ignored(module_name: str, calibration: dict | None) -> bool:
+    """Whether this layer stays dense because the calibration explicitly ignores it.
+
+    Separates a preserved legitimate dense fallback from a layer whose expert simply carries no
+    curve: ``resolve_layer_calibration`` returns ``None`` for both, but only the first one is
+    acceptable when a profile asked for ``target_sparsity``.
+    """
+    if not calibration:
+        return False
+    by_expert = calibration.get("by_expert")
+    if by_expert:
+        key = select_expert(module_name, by_expert.keys())
+        if key is None:
+            return False
+        entry = by_expert[key]
+    else:
+        entry = calibration
+    return is_ignored(module_name, entry.get("ignore"))
+
+
+def resolve_effective_calibration(attention_config: Any, schedule: Any = None) -> dict | None:
+    """Fallback calibration for the baseline and for candidates that carry none of their own.
+
+    This is the first non-empty ``skip_calibration`` over ``collect_calibration_specs`` (baseline
+    default, baseline per-role, then profiles in sorted order). A prepared candidate with its own
+    ``skip_calibration`` is stamped and validated from that dict instead.
+    """
+    for spec in collect_calibration_specs(attention_config, schedule):
+        calibration = getattr(spec, "skip_calibration", None)
+        if calibration:
+            return calibration
+    return None
+
+
+def calibration_for_candidate(record: Any, fallback: dict | None) -> dict | None:
+    """The dict that stamping writes onto this candidate impl."""
+    spec = getattr(record, "spec", None)
+    own = getattr(spec, "skip_calibration", None) if spec is not None else None
+    if own:
+        return own
+    return fallback
+
+
+def apply_skip_softmax_calibration(attention_config: Any, model: Any, schedule: Any = None) -> None:
+    fallback = resolve_effective_calibration(attention_config, schedule)
+    stamped = apply_to_pipeline(model, fallback)
+    if not stamped:
+        return
+    logger.debug("Skip-softmax: stamped calibration onto %d attention impl(s).", stamped)
 
 
 _EXPERT_PREFIXES = ("transformer.", "transformer_2.")
@@ -136,17 +199,36 @@ def resolve_layer_calibration(module_name: str, calibration: dict) -> dict | Non
     return {"a": entry.get("a"), "b": entry.get("b")}
 
 
-def apply_to_pipeline(pipeline, calibration: dict) -> int:
-    if not calibration:
+def _stamp_impl(impl, module_name: str, calibration: dict | None, seen: set[int]) -> int:
+    if impl is None or calibration is None or id(impl) in seen:
         return 0
+    set_layer = getattr(impl, "set_layer_calibration", None)
+    if set_layer is None:
+        return 0
+    per = resolve_layer_calibration(module_name, calibration)
+    if not per or per.get("a") is None or per.get("b") is None:
+        return 0
+    set_layer(per["a"], per["b"])
+    seen.add(id(impl))
+    return 1
+
+
+def apply_to_pipeline(pipeline, calibration: dict | None) -> int:
+    """Stamp the baseline from ``calibration`` and each candidate from its own dict or that fallback.
+
+    A shared candidate impl is stamped once. With no schedule, candidates are empty and this is the
+    baseline path. ``calibration`` may be None when every stampable curve lives on a candidate spec.
+    """
     stamped = 0
     for name, module in pipeline.named_modules():
-        impl = getattr(module, "attention", None)
-        set_layer = getattr(impl, "set_layer_calibration", None)
-        if set_layer is None:
-            continue
-        per = resolve_layer_calibration(name, calibration)
-        if per and per.get("a") is not None and per.get("b") is not None:
-            set_layer(per["a"], per["b"])
-            stamped += 1
+        seen: set[int] = set()
+        baseline = getattr(module, "attention", None)
+        stamped += _stamp_impl(baseline, name, calibration, seen)
+        candidates = getattr(module, "_schedule_candidates", None) or {}
+        # Records are not necessarily hashable (tests use SimpleNamespace). Identity dedup is
+        # by impl object inside _stamp_impl, so a shared impl is stamped once even if two names
+        # point at it.
+        for record in candidates.values():
+            own = calibration_for_candidate(record, calibration)
+            stamped += _stamp_impl(getattr(record, "impl", None), name, own, seen)
     return stamped
