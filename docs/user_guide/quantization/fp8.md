@@ -119,12 +119,13 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a
 model-specific guide says otherwise.
 
-### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
+### Multi-Stage Diffusion Model (BAGEL, GLM-Image, MammothModa2)
 
-| Model     | Scope                                    | Status        | Notes                                           |
-| --------- | ---------------------------------------- | ------------- | ----------------------------------------------- |
-| BAGEL     | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
-| GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline          |
+| Model        | Scope                                    | Status               | Notes                                                                           |
+| ------------ | ---------------------------------------- | -------------------- | ------------------------------------------------------------------------------- |
+| BAGEL        | Stage-specific transformer or DiT module | Not validated        | Route FP8 to the intended stage before enabling                                 |
+| GLM-Image    | Stage-specific transformer or DiT module | Not validated        | Validate quality against BF16 baseline                                          |
+| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Set `quantization: fp8` on stage 1 in the deploy YAML; keep the AR stage in BF16 |
 
 ## Configuration
 
