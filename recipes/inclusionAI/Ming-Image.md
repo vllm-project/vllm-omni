@@ -39,6 +39,17 @@ vllm serve "$MODEL" --omni --deploy-config vllm_omni/deploy/ming_image.yaml --po
 
 For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer`.
 
+### Attention Backend
+
+On 2x H100, FlashAttention is the recommended default for both Design and Design-Layer. To override the diffusion attention backend:
+
+```bash
+vllm serve "$MODEL" --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --diffusion-attention-backend FLASH_ATTN \
+  --port 8091
+```
+
 ## Text-to-image
 
 Note that a prompt refiner is expected to describe the prompts with details; we will refine with more example inputs soon.
