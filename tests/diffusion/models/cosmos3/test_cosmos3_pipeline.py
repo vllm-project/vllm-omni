@@ -3269,3 +3269,164 @@ class TestForwardRouting:
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))
+
+
+@pytest.mark.parametrize(
+    ("text_cfg_below_one", "expected_calls"),
+    [
+        (False, [(2, True)]),
+        (True, [(2, True), (1, True)]),
+    ],
+)
+def test_diffuse_transfer_guidance_below_one_runs_text_cfg_only_when_opted_in(
+    make_cosmos3_pipeline, sequential_cfg_parallel, text_cfg_below_one, expected_calls
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=0.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+        text_cfg_below_one=text_cfg_below_one,
+    )
+
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == expected_calls
+
+
+def test_diffuse_transfer_runs_model_dtype_transformer_on_float32_state(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+    transformer_input_dtypes: list[torch.dtype] = []
+    stub_forward = pipeline.transformer.forward
+
+    def recording_forward(*, hidden_states: torch.Tensor, **kwargs: Any):
+        transformer_input_dtypes.append(hidden_states.dtype)
+        return stub_forward(hidden_states=hidden_states, **kwargs)
+
+    pipeline.transformer.forward = recording_forward
+    # 1 + 2**-12 rounds to 1 in BF16; the float32 sampler state must keep it.
+    latents = torch.full((1, 2, 1, 1, 1), 1.0 + 2**-12)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert transformer_input_dtypes == [torch.bfloat16]
+    assert result.dtype == torch.float32
+    # The stub velocity is its cond token plus the control bonus: 2 + 100.
+    assert torch.equal(result, latents + 102.0)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_diffuse_transfer_releases_unipc_history_on_completion_or_failure(make_cosmos3_pipeline, fail) -> None:
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler = FlowUniPCMultistepScheduler()
+    pipeline.scheduler.set_timesteps(3, device="cpu")
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    original_predict = pipeline.predict_noise
+    calls = 0
+
+    def predict(**kwargs):
+        nonlocal calls
+        calls += 1
+        if fail and calls == 2:
+            assert pipeline.scheduler.last_sample is not None
+            raise RuntimeError("prediction failed")
+        return original_predict(**kwargs)
+
+    pipeline.predict_noise = predict
+    kwargs = dict(
+        latents=latents,
+        timesteps=pipeline.scheduler.timesteps,
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="prediction failed"):
+            pipeline.diffuse_transfer(**kwargs)
+    else:
+        result = pipeline.diffuse_transfer(**kwargs)
+        assert torch.isfinite(result).all()
+
+    assert pipeline.scheduler.model_outputs == [None] * pipeline.scheduler.config.solver_order
+    assert pipeline.scheduler.timestep_list == [None] * pipeline.scheduler.config.solver_order
+    assert pipeline.scheduler.last_sample is None
+    assert pipeline._cosmos3_branch_caches is None
+    # A completed or abandoned solve can start again with the same scheduler.
+    pipeline.scheduler.set_timesteps(3, device="cpu")
+    actual = pipeline.scheduler.step(torch.ones_like(latents), pipeline.scheduler.timesteps[0], latents).prev_sample
+    fresh = FlowUniPCMultistepScheduler()
+    fresh.set_timesteps(3, device="cpu")
+    expected = fresh.step(torch.ones_like(latents), fresh.timesteps[0], latents).prev_sample
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("open_interval", [False, True])
+@pytest.mark.parametrize("guidance,control_guidance", [(3.0, 1.0), (1.0, 3.0), (3.0, 3.0)])
+def test_diffuse_transfer_interval_bounds_and_cfg_normalization(
+    make_cosmos3_pipeline, open_interval, guidance, control_guidance
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    cfg_calls = []
+
+    def predict_cfg(**kwargs):
+        cfg_calls.append(kwargs["cfg_normalize"])
+        return torch.zeros_like(latents)
+
+    pipeline.predict_noise_with_multi_branch_cfg = predict_cfg
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([9, 7, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance,
+        control_guidance=control_guidance,
+        control_guidance_interval=(3, 9),
+        guidance_interval=(3, 9),
+        control_latents=[],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+        normalize_cfg=True,
+        open_guidance_interval=open_interval,
+    )
+    assert cfg_calls == [True] * (1 if open_interval else 3)
