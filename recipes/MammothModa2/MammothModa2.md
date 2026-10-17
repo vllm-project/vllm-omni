@@ -66,6 +66,51 @@ stage 0 and 0.3 for stage 1. The A800 validation section below also shows a
 two-GPU placement with one stage per GPU for attributable timing and memory;
 the measured results are summarized below.
 
+## NPU
+
+### 1x Ascend 910B3 64GB, MammothModa2-Preview
+
+#### Environment and deployment
+
+- Accelerator: one Ascend 910B3 with 64 GB device memory
+- Runtime: vLLM-Omni with vllm-ascend and torch-npu; follow the
+  [NPU installation guide](../../docs/getting_started/installation/npu.md)
+- Deploy config: `vllm_omni/deploy/mammoth_moda2.yaml`, both stages on device 0
+- Execution: eager, request mode, one request
+- AR/DiT `gpu_memory_utilization`: 0.5/0.3, as committed; these are configuration
+  budgets, not measured peak-memory values
+- Successful-run software versions, code revision, and host memory: not yet
+  recorded; include OS, Python, CANN/driver, PyTorch, torch-npu, vLLM,
+  vllm-ascend, and vLLM-Omni revisions with future validation results
+
+#### Offline command
+
+Use the local Preview checkpoint and run from the repository root:
+
+```bash
+python3 examples/offline_inference/text_to_image/text_to_image.py \
+  --model /project/models/MammothModa2-Preview \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+  --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --extra-body '{"text_guidance_scale": 4.0, "cfg_range": [0.0, 1.0], "num_inference_steps": 50}' \
+  --enable-diffusion-pipeline-profiler \
+  --log-stats \
+  --output mammoth_t2i.png
+```
+
+#### Verification
+
+The reported scope is 1024x1024, seed 42, 50 diffusion steps, guidance 4.0, and CFG range [0, 1].
+
+Check the saved image in the inference environment (requires Pillow):
+
+```bash
+python3 -c 'from PIL import Image; im = Image.open("mammoth_t2i.png"); im.load(); assert im.size == (1024, 1024); assert im.mode == "RGB"; print(im.size, im.mode)'
+```
+
 ## GPU
 
 ### Optional FP8 AR KV cache
