@@ -44,10 +44,11 @@ import asyncio
 import json
 import signal
 from argparse import Namespace
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -691,7 +692,18 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
 
 
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
-def test_multi_api_duplex_reconnect_rejected_on_each_worker(path: str) -> None:
+@pytest.mark.parametrize(
+    ("replica_policy", "resume_supported", "reason"),
+    [
+        ("legacy", False, "replica_policy=least_sessions"),
+        ("legacy", True, "replica_policy=least_sessions"),
+        ("least_sessions", True, "resume routing"),
+        ("least_sessions", None, "resume routing"),
+    ],
+)
+def test_multi_api_duplex_reconnect_rejected_on_each_worker(
+    path: str, replica_policy: str, resume_supported: bool | None, reason: str
+) -> None:
     class SessionHandler:
         async def handle_realtime_session(self, _websocket) -> None:
             pytest.fail("Multi-API requests must not access process-local sessions")
@@ -706,18 +718,96 @@ def test_multi_api_duplex_reconnect_rejected_on_each_worker(path: str) -> None:
         app = FastAPI()
         app.state.api_server_count = 2
         app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+        )
         app.state.openai_serving_duplex = SessionHandler()
         app.state.duplex_warmup_done = PendingWarmup()
         app.include_router(api_server.router)
         with TestClient(app) as client, client.websocket_connect(path) as websocket:
-            assert websocket.receive_json()["code"] == "multi_api_duplex_unsupported"
+            error = websocket.receive_json()
+            assert error["code"] == "multi_api_duplex_unsupported"
+            assert reason in error["error"]
             with pytest.raises(WebSocketDisconnect) as exc:
                 websocket.receive_text()
             assert exc.value.code == 1008
 
 
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
+def test_multi_api_duplex_nonresumable_least_sessions_reaches_each_worker(path: str) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, websocket) -> None:
+            await websocket.accept()
+            await websocket.send_json({"type": "session.created"})
+            await websocket.close()
+
+    for worker_index in (0, 1):
+        app = FastAPI()
+        app.state.api_server_count = 2
+        app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+        )
+        app.state.openai_serving_duplex = SessionHandler()
+        app.include_router(api_server.router)
+        with TestClient(app) as client, client.websocket_connect(path) as websocket:
+            assert websocket.receive_json() == {"type": "session.created"}
+
+
+@pytest.mark.parametrize("count", [0, -1, True, "2"])
+def test_multi_api_duplex_invalid_topology_rejected(count: object) -> None:
+    app = FastAPI()
+    app.state.api_server_count = count
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+    )
+    app.include_router(api_server.router)
+    with TestClient(app) as client, client.websocket_connect("/v1/duplex") as websocket:
+        error = websocket.receive_json()
+        assert error["code"] == "multi_api_duplex_unsupported"
+        assert "initialized API worker topology" in error["error"]
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+        assert exc.value.code == 1008
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplex_query", ["0", "false"])
+async def test_multi_api_nonduplex_realtime_bypasses_duplex_guard(monkeypatch, duplex_query: str) -> None:
+    calls: list[str] = []
+
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
+
+    async def unexpected_guard(_websocket) -> NoReturn:
+        fail: Callable[[str], NoReturn] = pytest.fail
+        fail("Non-duplex requests must not use the duplex topology guard")
+
+    monkeypatch.setattr(api_server, "_reject_multi_api_duplex", unexpected_guard)
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                api_server_count=2,
+                openai_serving_duplex=object(),
+                openai_realtime_handler=_TurnBasedHandler(),
+            )
+        ),
+        query_params={"duplex": duplex_query},
+    )
+    await api_server.realtime_websocket(websocket)
+    assert calls == ["turn_based"]
+
+
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
-def test_single_api_duplex_session_still_reaches_handler(path: str) -> None:
+@pytest.mark.parametrize("replica_policy", ["legacy", "least_sessions"])
+@pytest.mark.parametrize("resume_supported", [False, True])
+def test_single_api_duplex_session_still_reaches_handler(
+    path: str, replica_policy: str, resume_supported: bool
+) -> None:
     class SessionHandler:
         async def handle_realtime_session(self, websocket) -> None:
             await websocket.accept()
@@ -726,6 +816,10 @@ def test_single_api_duplex_session_still_reaches_handler(path: str) -> None:
 
     app = FastAPI()
     app.state.api_server_count = 1
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+    )
     app.state.openai_serving_duplex = SessionHandler()
     app.include_router(api_server.router)
     with TestClient(app) as client, client.websocket_connect(path) as websocket:

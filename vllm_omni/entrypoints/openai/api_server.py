@@ -494,9 +494,9 @@ async def omni_run_server_worker(
         app.state.duplex_warmup_done = asyncio.Event() if warmup_kind is not None else None
         warmup_task: asyncio.Task | None = None
         if warmup_kind is not None:
-            # Scheduled before serve_http (which may not return until
-            # shutdown); the coroutine retries its self-connect until the
-            # server socket is accepting.
+            # Scheduled before serve_http (which may not return until shutdown).
+            # One frontend retries a self-connect; multiple frontends warm
+            # their owned replica groups through the local engine.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
         shutdown_task = await serve_http(
@@ -1866,16 +1866,27 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
 
 async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
-    # Session credentials and replay state are local to each frontend; a shared
-    # listening socket cannot route reconnects back to the session owner.
     count = getattr(websocket.app.state, "api_server_count", None)
     if count is None or (type(count) is int and count == 1):
         return False
+    error = "Duplex sessions require initialized API worker topology."
+    if type(count) is int and count > 1:
+        engine_client = getattr(websocket.app.state, "engine_client", None)
+        config = getattr(engine_client, "duplex_session_config", None)
+        capabilities = getattr(engine_client, "duplex_capabilities", None)
+        if getattr(config, "replica_policy", None) != "least_sessions":
+            error = "Duplex sessions with multiple API workers require replica_policy=least_sessions."
+        elif getattr(capabilities, "supports_session_resume", None) is not False:
+            # Session credentials and replay state are local to each frontend;
+            # the shared socket cannot route reconnects back to their owner.
+            error = "Duplex session resume routing across API workers is not supported."
+        else:
+            return False
     await websocket.accept()
     await websocket.send_json(
         {
             "type": "error",
-            "error": "Duplex sessions require a single API worker with initialized topology.",
+            "error": error,
             "code": "multi_api_duplex_unsupported",
         }
     )

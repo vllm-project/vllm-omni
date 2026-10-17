@@ -399,11 +399,12 @@ class StageRuntime:
         lock_fds: list[int] = []
         locked_devices: set[int] = set()
         launch: StageEngineLaunch | None = None
-        exited_contexts = 0
+        exited_contexts: set[int] = set()
+        handshake_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        stop_handshakes = threading.Event()
         # With several API servers every replica is spawned before the first
-        # handshake, and handshakes complete in launch order. A replica may
-        # then wait for every earlier replica to initialize before the
-        # front-end answers it, so its handshake wait covers all of them.
+        # handshake. Replicas sharing devices still initialize in launch
+        # order, so keep the conservative wait budget for the longest chain.
         handshake_timeout_s = (
             float(timeout) * sum(len(plan.replicas) for plan in stage_plans) if num_api_servers > 1 else None
         )
@@ -464,7 +465,7 @@ class StageRuntime:
                             raise RuntimeError(f"LLM stage {plan.stage_id} launcher returned no resources")
                         resources.append(stage_resources)
                     if num_api_servers == 1:
-                        exited_contexts += 1
+                        exited_contexts.add(len(entered_contexts) - 1)
                         launch_context.__exit__(None, None, None)
                     addresses = stage_resources.addresses
                     # The generic resource bundle allows no addresses (e.g.
@@ -512,21 +513,59 @@ class StageRuntime:
             )
             yield launch
 
-            while exited_contexts < len(entered_contexts):
-                entered_context = entered_contexts[exited_contexts]
-                exited_contexts += 1
-                entered_context.__exit__(None, None, None)
+            if num_api_servers > 1:
+                replicas = [replica for plan in stage_plans for replica in plan.replicas]
+                handshake_groups: dict[str, list[int]] = {}
+                for index, key in enumerate(self._init_group_keys(replicas)):
+                    handshake_groups.setdefault(key, []).append(index)
+                handshake_state_lock = threading.Lock()
+
+                def complete_group(indices: list[int]) -> None:
+                    for index in indices:
+                        with handshake_state_lock:
+                            if stop_handshakes.is_set():
+                                return
+                            # A failed __exit__ also consumes its context.
+                            exited_contexts.add(index)
+                        try:
+                            entered_contexts[index].__exit__(None, None, None)
+                        except BaseException:
+                            stop_handshakes.set()
+                            raise
+
+                # The HELLO reply starts model initialization, so waiting for
+                # READY in launch order would serialize even disjoint GPUs.
+                # Match the frontend attachment scheduler's device groups.
+                if len(handshake_groups) == 1:
+                    complete_group(next(iter(handshake_groups.values())))
+                elif handshake_groups:
+                    handshake_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=len(handshake_groups), thread_name_prefix="stage-handshake"
+                    )
+                    futures = [handshake_executor.submit(complete_group, group) for group in handshake_groups.values()]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
         except BaseException as exc:
+            stop_handshakes.set()
+            # Terminating engines wakes handshake pollers via their process
+            # sentinels. Do this before joining any still-running workers.
             if launch is not None:
                 launch.shutdown()
             else:
                 StageEngineLaunch(client_configs=client_configs, resources=resources).shutdown()
+            if handshake_executor is not None:
+                handshake_executor.shutdown(wait=True, cancel_futures=True)
+                handshake_executor = None
             exc_info = (type(exc), exc, exc.__traceback__)
-            for pending_context in reversed(entered_contexts[exited_contexts:]):
+            for index in reversed(range(len(entered_contexts))):
+                if index in exited_contexts:
+                    continue
                 with contextlib.suppress(BaseException):
-                    pending_context.__exit__(*exc_info)
+                    entered_contexts[index].__exit__(*exc_info)
             raise
         finally:
+            if handshake_executor is not None:
+                handshake_executor.shutdown(wait=True)
             if lock_fds:
                 release_device_locks(lock_fds)
 

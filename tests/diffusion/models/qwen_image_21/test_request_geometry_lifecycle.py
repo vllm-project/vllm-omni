@@ -105,3 +105,30 @@ def test_dropped_step_request_releases_geometry_and_prefix_without_explicit_fina
 def test_caller_owned_plain_list_uses_uncached_geometry():
     model = _Pipeline("success").transformer
     assert model._geometry_for_request([{}], torch.ones(1, 4), ()) is None
+
+
+def test_step_cache_identity_and_cfg_geometry_are_request_owned():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
+
+    model = _Pipeline("success").transformer
+    cache = QwenImage21KVCache([{}])
+    state = SimpleNamespace(extra={"kv_cache": cache})
+    assembled, scatter = QwenImage21Pipeline._assemble_kv_cache([state])
+    assert assembled is not cache and scatter
+    mask = torch.tensor([[False, False, True]])
+    cond_key = (((1, 2, 2),), "cond", 0, 0)
+    uncond_key = (((1, 2, 2),), "uncond", 0, 0)
+    cond = model._geometry_for_request(cache, mask, cond_key)
+    cond["sentinel"] = object()
+    uncond = model._geometry_for_request(cache, mask.clone(), uncond_key)
+    cache[0]["cond"] = {"key": torch.ones(1, 4, 8)}
+    assembled, scatter = QwenImage21Pipeline._assemble_kv_cache([state])
+    assert assembled is cache and not scatter
+    assert model._geometry_for_request(assembled, mask.clone(), cond_key) is cond
+    assert model._geometry_for_request(assembled, mask.clone(), uncond_key) is uncond
+    assert cond is not uncond
+    changed = (((1, 4, 4),), "cond", 0, 0)
+    assert model._geometry_for_request(cache, mask, changed) is not cond
+    assert model._geometry_for_request(QwenImage21KVCache([{}]), mask, cond_key) is not cond

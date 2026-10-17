@@ -3,6 +3,7 @@
 # Adapted from Helios (https://github.com/BestWishYsh/Helios)
 
 import math
+import weakref
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -27,7 +28,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelOutput
-from vllm_omni.diffusion.models.helios.cross_attn_cache import SourceTensorLRUCache
+from vllm_omni.diffusion.models.helios.conditioning_cache import (
+    HeliosConditioningCache,
+    active_conditioning_cache,
+    tensor_version,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -445,6 +450,9 @@ class HeliosCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            computation="cross",
+            cross_parallel_layout="local_q_replicated_kv",
+            qkv_layout="BSND",
             # Text K/V is replicated on every SP rank, so Ulysses must not be
             # used here: its all-to-all would treat the per-rank replicas as
             # sequence shards and ws-fold duplicate the keys. Sharded Q over
@@ -790,52 +798,62 @@ class HeliosTransformer3DModel(nn.Module):
         # 5. Output norm & projection
         self.norm_out = HeliosOutputNorm(inner_dim, eps)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
-        self._cross_attn_cache_size = 2
-        # Cross-attention projection reuse is intra-request: the source
-        # encoder hidden states are held alive across the denoise steps of a
-        # single request.  SourceTensorLRUCache guards each entry with a
-        # weakref to the source so an allocator address reused after the
-        # source is freed cannot produce a cross-prompt false hit.
-        self._projected_encoder_cache = SourceTensorLRUCache(self._cross_attn_cache_size)
-        self._cross_attn_kv_cache = SourceTensorLRUCache(self._cross_attn_cache_size)
+        self._conditioning_owner = object()
+        self._conditioning_revision = 0
+        self._conditioning_dependencies = ()
+        self._conditioning_versions = ()
 
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
     def clear_cross_attention_cache(self) -> None:
-        self._projected_encoder_cache.clear()
-        self._cross_attn_kv_cache.clear()
+        """Invalidate active request projections before the next lookup.
+
+        Call after non-tensor adapter/configuration changes as well as weight
+        loading. Request owners release storage on completion or cancellation.
+        """
+        self._conditioning_revision += 1
 
     def _cache_enabled(self) -> bool:
         return not self.training and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
 
-    def _project_encoder_hidden_states(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self._cache_enabled():
-            return self.condition_embedder.text_embedder(encoder_hidden_states)
-
-        cached = self._projected_encoder_cache.get(encoder_hidden_states)
-        if cached is not None:
-            return cached
-
-        projected = self.condition_embedder.text_embedder(encoder_hidden_states)
-        self._projected_encoder_cache.put(encoder_hidden_states, projected)
-        return projected
-
-    def _get_cross_attn_key_values(
-        self,
-        encoder_hidden_states: torch.Tensor,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
-        if not self._cache_enabled():
+    def _conditioning_projection_revision(self):
+        # Track all projection parameters, including norm/quantization/adapter
+        # parameters registered in these modules. Inference-mode parameters lack
+        # a reliable counter, so disable reuse for that case.
+        modules = [self.condition_embedder.text_embedder, *(block.attn2 for block in self.blocks)]
+        dependencies = tuple(t for module in modules for t in (*module.parameters(), *module.buffers()))
+        versions = tuple((tensor_version(t), t.dtype, t.device) for t in dependencies)
+        if any(version is None for version, _, _ in versions):
             return None
+        same_objects = len(dependencies) == len(self._conditioning_dependencies) and all(
+            current is previous() for current, previous in zip(dependencies, self._conditioning_dependencies)
+        )
+        if not same_objects or versions != self._conditioning_versions:
+            self._conditioning_revision += 1
+            self._conditioning_dependencies = tuple(weakref.ref(t) for t in dependencies)
+            self._conditioning_versions = versions
+        device_type = next(self.parameters()).device.type
+        autocast = (torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type))
+        return self._conditioning_owner, self._conditioning_revision, autocast
 
-        cached = self._cross_attn_kv_cache.get(encoder_hidden_states)
-        if cached is not None:
-            return cached
+    def _prepare_conditioning(self, source, cache, branch):
+        if cache is None or not self._cache_enabled():
+            projected = self.condition_embedder.text_embedder(source)
+            return projected, None
+        revision = self._conditioning_projection_revision()
+        if revision is None:
+            # Drop any prior value before using unversioned weights.
+            cache.invalidate()
+            projected = self.condition_embedder.text_embedder(source)
+            return projected, None
 
-        key_values = [block.attn2.project_kv(encoder_hidden_states) for block in self.blocks]
-        self._cross_attn_kv_cache.put(encoder_hidden_states, key_values)
-        return key_values
+        def build(value):
+            projected = self.condition_embedder.text_embedder(value)
+            return projected, [block.attn2.project_kv(projected) for block in self.blocks]
+
+        return cache.prepare(source, branch=branch, projection_revision=revision, build=build)
 
     def forward(
         self,
@@ -851,6 +869,8 @@ class HeliosTransformer3DModel(nn.Module):
         latents_history_long: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        conditioning_cache: HeliosConditioningCache | None = None,
+        conditioning_branch: str = "positive",
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size = hidden_states.shape[0]
         p_t, p_h, p_w = self.config.patch_size
@@ -962,7 +982,11 @@ class HeliosTransformer3DModel(nn.Module):
             encoder_hidden_states,
             is_return_encoder_hidden_states=False,
         )
-        encoder_hidden_states = self._project_encoder_hidden_states(encoder_hidden_states)
+        if conditioning_cache is None and self._cache_enabled():
+            conditioning_cache = active_conditioning_cache()
+        encoder_hidden_states, cross_attn_key_values = self._prepare_conditioning(
+            encoder_hidden_states, conditioning_cache, conditioning_branch
+        )
         timestep_proj = timestep_proj.unflatten(-1, (6, -1))
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
@@ -995,7 +1019,6 @@ class HeliosTransformer3DModel(nn.Module):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
         rotary_emb = rotary_emb.contiguous()
-        cross_attn_key_values = self._get_cross_attn_key_values(encoder_hidden_states)
 
         for block_idx, block in enumerate(self.blocks):
             cross_attn_key_value = None if cross_attn_key_values is None else cross_attn_key_values[block_idx]
@@ -1031,6 +1054,7 @@ class HeliosTransformer3DModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with QKV fusion, FFN remapping, and TP norm sharding."""
+        self.clear_cross_attention_cache()
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 

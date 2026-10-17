@@ -1166,8 +1166,8 @@ def launch_stage_replica(
             stage_visible_devices=stage_visible_devices,
             spawn_device_lock=spawn_device_lock,
             omni_parallel_stage_init=omni_parallel_stage_init,
-        ) as resources:
-            engine_manager, coordinator, addresses = resources
+        ) as engine_resources:
+            engine_manager, coordinator, addresses = engine_resources
             yield StageReplicaResources(
                 manager=engine_manager,
                 coordinator=coordinator,
@@ -1208,11 +1208,16 @@ def launch_stage_replica(
             omni_handshake_timeout_s=handshake_timeout_s,
         )
 
+    resources = StageReplicaResources(manager=engine_manager, addresses=addresses)
+    if num_api_servers > 1:
+        # The parent spawns every replica before starting API workers. Its
+        # device-group workers then resume these contexts to handshake in
+        # parallel. Create/use/close the ZMQ socket on that same worker;
+        # EngineCore's DEALER can connect before the ROUTER binds.
+        yield resources
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
-        yield StageReplicaResources(
-            manager=engine_manager,
-            addresses=addresses,
-        )
+        if num_api_servers == 1:
+            yield resources
         engine_launch = CoreEngineLaunch(
             engine_manager=engine_manager,
             coordinator=None,
