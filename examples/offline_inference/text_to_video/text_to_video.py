@@ -450,6 +450,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
+        "--expert-parallel-size",
+        type=int,
+        default=None,
+        help="Expert-parallel degree for models with head-sharded experts; defaults to the sequence-parallel degree.",
+    )
+    parser.add_argument(
         "--lora-path",
         type=str,
         nargs="+",
@@ -561,6 +567,7 @@ def main():
         hsdp_replicate_size=args.hsdp_replicate_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
+        expert_parallel_size=args.expert_parallel_size,
         enforce_eager=args.enforce_eager,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
