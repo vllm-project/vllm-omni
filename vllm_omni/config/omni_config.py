@@ -827,6 +827,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
     diffusion_attention_config: Any = None
+    diffusion_attention_schedule: Any = None
     cache_strategy: str = "none"
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
@@ -948,6 +949,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             TransformerConfig,
             VideoOutputTransportConfig,
             build_attention_config,
+            parse_attention_schedule_config,
             parse_kv_cache_skip_selector,
             validate_dlo_host_registration_options,
             validate_host_weight_runtime_options,
@@ -1024,6 +1026,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusion_attention_config must be an AttentionConfig, mapping, or None, "
                 f"got {type(self.diffusion_attention_config)!r}"
             )
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
