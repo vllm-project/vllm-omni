@@ -10,6 +10,8 @@ transformer linear was built with ``quant_config=None``. These tests cover:
 - auto-detected startup metadata defers to the checkpoint's own config.json
 - the quant config reaches every transformer-block linear with its module path
   as prefix, while the audio injector, embedders and proj_out stay unquantized
+- the transformer binds its packed QKV mapping to the quant config, so a real
+  ignored_layers skip policy on to_q/to_k/to_v covers the fused to_qkv
 
 All tests are pure-CPU and do not load model weights.
 """
@@ -22,6 +24,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v as s2v_pipeline_module
 import vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer as s2v_transformer_module
@@ -63,6 +66,26 @@ class _RecordingQuantConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             self.prefixes.append(prefix)
             return UnquantizedLinearMethod()
+        return None
+
+
+class _QuantizedMarker(UnquantizedLinearMethod):
+    """Stands in for a real quantized method so linears still build on CPU."""
+
+
+class _SkipPolicyQuantConfig(_RecordingQuantConfig):
+    """Applies vLLM's real ignored_layers policy, as DiffusionMXFP8Config does."""
+
+    def __init__(self, ignored_layers: list[str]) -> None:
+        super().__init__()
+        self.ignored_layers = ignored_layers
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if isinstance(layer, LinearBase):
+            self.prefixes.append(prefix)
+            if is_layer_skipped(prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping):
+                return UnquantizedLinearMethod()
+            return _QuantizedMarker()
         return None
 
 
@@ -252,3 +275,34 @@ def test_s2v_without_quant_config_builds_unquantized_linears(tp1_group):
     linears = [module for module in model.modules() if isinstance(module, LinearBase)]
     assert linears
     assert all(isinstance(module.quant_method, UnquantizedLinearMethod) for module in linears)
+
+
+def test_s2v_binds_packed_qkv_mapping_to_quant_config(tp1_group):
+    """The registry binds packed_modules_mapping to Wan22S2VPipeline, which has none;
+    the transformer must bind its own so fused to_qkv resolves to to_q/to_k/to_v."""
+    quant_config = _SkipPolicyQuantConfig(ignored_layers=[])
+    assert quant_config.packed_modules_mapping == {}
+
+    _tiny_s2v_transformer(quant_config)
+
+    assert quant_config.packed_modules_mapping == WanS2VTransformer3DModel.packed_modules_mapping
+
+
+def test_s2v_ignored_qkv_shards_skip_fused_to_qkv(tp1_group):
+    ignored = [f"blocks.0.self_attn.{name}" for name in ("to_q", "to_k", "to_v")]
+    model = _tiny_s2v_transformer(_SkipPolicyQuantConfig(ignored_layers=ignored))
+
+    methods = {
+        name: type(module.quant_method) for name, module in model.named_modules() if isinstance(module, LinearBase)
+    }
+    assert methods["blocks.0.self_attn.to_qkv"] is UnquantizedLinearMethod
+    # Only the ignored layer is skipped: the other block and linears stay quantized.
+    assert methods["blocks.1.self_attn.to_qkv"] is _QuantizedMarker
+    assert methods["blocks.0.self_attn.to_out"] is _QuantizedMarker
+    assert methods["blocks.0.cross_attn.to_q"] is _QuantizedMarker
+
+
+def test_s2v_partially_ignored_qkv_shards_are_rejected(tp1_group):
+    """Mixed precision inside the fused to_qkv cannot be honored and must fail loudly."""
+    with pytest.raises(ValueError, match="some but not all shards"):
+        _tiny_s2v_transformer(_SkipPolicyQuantConfig(ignored_layers=["blocks.0.self_attn.to_q"]))
