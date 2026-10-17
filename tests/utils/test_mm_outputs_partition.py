@@ -19,13 +19,17 @@ def test_partition_thinker_latent_payload():
 
 
 def test_partition_talker_intermediate_codes():
+    # codes.* is a client root but must ALSO stay in the inter-stage payload:
+    # async_chunk code2wav/decoder stages read codes from inter-stage, so the
+    # two channels share the key (same dual-routing contract as meta.*).
     payload = {
         "codes.audio": torch.zeros(3, 2),
         "hidden": torch.zeros(3, 16),
     }
     inter, client = partition_flat_payload(payload)
     assert inter == payload
-    assert client == {}
+    assert set(client) == {"codes.audio"}
+    assert client["codes.audio"] is payload["codes.audio"]
 
 
 def test_partition_code2wav_client_audio():

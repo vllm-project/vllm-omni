@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 
+from vllm_omni.transformers_utils.processors.longcat_next import (
+    LongcatNextAudioProcessor,
+    LongcatNextProcessor,
+)
 from vllm_omni.transformers_utils.processors.ming import (
     MingFlashOmniProcessor,
     MingImageProcessor,
@@ -9,6 +13,8 @@ from vllm_omni.transformers_utils.processors.ming import (
 )
 
 __all__ = [
+    "LongcatNextAudioProcessor",
+    "LongcatNextProcessor",
     "MingFlashOmniProcessor",
     "MingImageProcessor",
     "MingWhisperFeatureExtractor",
