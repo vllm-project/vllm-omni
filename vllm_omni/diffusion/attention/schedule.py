@@ -209,7 +209,12 @@ def require_denoise_progress_publisher(pipeline: Any, schedule: AttentionSchedul
 # Pipeline classes (as registered in the diffusion model registry) that publish denoise progress
 # for every denoise forward and honour configured profiles, mapped to the model name in errors.
 ATTENTION_SCHEDULE_PIPELINES: Mapping[str, str] = {
+    "HunyuanImage3Pipeline": "HunyuanImage-3.0",
     "MiniMaxH3Pipeline": "MiniMax-H3",
+    "Wan22I2VPipeline": "Wan2.2",
+    "Wan22Pipeline": "Wan2.2",
+    "Wan22S2VPipeline": "Wan2.2",
+    "Wan22VACEPipeline": "Wan2.2",
 }
 
 

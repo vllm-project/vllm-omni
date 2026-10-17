@@ -4,10 +4,12 @@ An attention schedule selects a named attention profile at zero-based denoising
 step indices. Profiles are prepared at startup; requests select ranges, not new
 backends. Steps outside a range use the base attention configuration.
 
-MiniMax-H3 publishes progress in request and step modes. Configured profiles
-on any other model fail at startup with an `Unsupported diffusion_attention_schedule`
-error, before weights are loaded. Backend and model requirements still apply;
-selecting a profile does not prevent kernel fallbacks.
+Wan2.2 T2V, I2V, S2V and VACE publish progress in request mode.
+MiniMax-H3 and HunyuanImage-3.0 publish it in request and step modes.
+Configured profiles on any other model fail at startup with an
+`Unsupported diffusion_attention_schedule` error, before weights are loaded.
+Backend and model requirements still apply; selecting a profile does not
+prevent kernel fallbacks.
 
 ## Format
 
@@ -36,14 +38,14 @@ Ranges must be ordered and non-overlapping. Adjacent ranges are allowed;
 an open-ended range must be last. Gaps use the base configuration.
 Ranges are not clipped: they must fit the actual timestep sequence, which may
 differ from `num_inference_steps`. CFG evaluations share one step index.
-Each H3 seed/continuation window restarts at step 0.
+Each S2V clip and each H3 seed/continuation window restarts at step 0.
 Prompt encoding and decoding run with the base configuration.
 
 ## Server configuration
 
 This example keeps the base backend for steps 0–9 and selects Skip-Softmax
 from step 10 onward. It requires a model/platform that supports
-[TRTLLM attention](trtllm.md#requirements).
+[TRTLLM attention](trtllm.md#requirements); it is not suitable for HunyuanImage-3.0.
 
 ```bash
 vllm-omni serve <model> \
@@ -71,8 +73,8 @@ Set all backend options within the profile, including `quant`,
 
 Set `diffusion_attention_schedule` on the diffusion stage in a deploy YAML,
 using the same object as the server flag. Set its base configuration separately
-with `diffusion_attention_config`. In the bundled disaggregated H3
-deployment, the diffusion stage is `stage_id: 1`.
+with `diffusion_attention_config`. In the bundled disaggregated H3 and
+HunyuanImage-3.0 deployments, the diffusion stage is `stage_id: 1`.
 
 CLI overrides deep-merge profile mappings into the stage configuration.
 A CLI `default` list replaces the stage list rather than appending ranges.
@@ -92,7 +94,7 @@ Put the field in the endpoint's model-specific extras:
 
 - `/v1/videos` and `/v1/videos/sync`: JSON-encoded `extra_params` form field.
 - `/v1/images/generations`: `extra_params`, only for a single diffusion stage;
-  multi-stage image deployments ignore it.
+  multi-stage image deployments ignore it. Use chat for the bundled Hunyuan deployment.
 - Diffusion `/v1/chat/completions`: `extra_args` at the root or inside
   `extra_body`, but not both. With the OpenAI client, use
   `extra_body={"extra_args": {"attention_schedule": [...]}}`.
@@ -107,8 +109,8 @@ schedule request handling.
 
 Requests co-batch only with equal normalized request schedules after stage
 defaults. Omitted schedules and explicit server-equivalent ranges remain
-distinct batch keys. Scheduled H3 step batches run one transformer forward
-per request so each uses its own progress.
+distinct batch keys. Scheduled H3 and Hunyuan step batches run one transformer
+forward per request so each uses its own progress.
 
 Malformed or unknown-profile schedules return HTTP 400 before dispatch.
 Out-of-bounds ranges fail before denoising and retain the client error through
@@ -134,8 +136,9 @@ errors on the job record rather than the creation response.
   Ring and scheduler-managed paged KV require profiles equivalent to the base
   backend and options. AllGather-KV rejects TRTLLM and sparse RainFusion.
   Configured KV-cache quantization requires dtype support in every candidate.
-- H3 DiT profiles must exclude packed padding; VSA profiles require the VSA
-  gate or a VSA base, and gated FastH3 layers accept only VSA.
+- Hunyuan image attention requires mask support. Wan VSA profiles require a
+  VSA base that constructs its gate. H3 DiT profiles must exclude packed padding;
+  VSA profiles require the VSA gate or a VSA base, and gated FastH3 layers accept only VSA.
 - Model-owned kernels reject profiles. TRTLLM `target_sparsity` needs a
   per-layer calibration curve unless the layer is explicitly ignored.
 
