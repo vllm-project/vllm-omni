@@ -9,6 +9,7 @@ import threading
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -37,12 +38,44 @@ stages:
 def test_stage_cli_builds_headless_replica_cmd(tmp_path: Path) -> None:
     server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), ["--disable-log-stats"])
 
-    cmd = server._build_stage_cmd(1, headless=True, replica_id=2)
+    cmd = server._build_stage_cmd(1, headless=True)
 
     assert "--headless" in cmd
     assert cmd[cmd.index("--stage-id") + 1] == "1"
-    assert cmd[cmd.index("--replica-id") + 1] == "2"
+    # ``--replica-id`` is ignored by serve; one process must own all local
+    # replicas so ``devices: "1,2,3"`` is split one card per replica.
+    assert "--replica-id" not in cmd
+    assert cmd[cmd.index("--omni-dp-size-local") + 1] == "3"
     assert cmd[cmd.index("--deploy-config") + 1] == server.stage_config_path
+
+
+def test_stage_cli_omits_dp_size_local_for_single_replica_stage(tmp_path: Path) -> None:
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
+
+    cmd = server._build_stage_cmd(0, headless=False)
+
+    assert "--omni-dp-size-local" not in cmd
+    assert "--replica-id" not in cmd
+
+
+def test_stage_cli_launches_one_process_per_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
+    launched: list[tuple[int, bool]] = []
+
+    def _fake_launch(stage_id: int, *, headless: bool) -> None:
+        launched.append((stage_id, headless))
+
+    sock = MagicMock()
+    sock.__enter__.return_value = sock
+    sock.connect_ex.return_value = 0
+    monkeypatch.setattr(server, "_launch_stage", _fake_launch)
+    monkeypatch.setattr(server, "_ensure_stage_processes_alive", lambda: None)
+    monkeypatch.setattr("tests.helpers.runtime.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime.socket, "socket", lambda *args, **kwargs: sock)
+
+    server._start_server()
+
+    assert launched == [(0, False), (1, True)]
 
 
 def test_stage_cli_loads_stage_ids_and_replica_counts(tmp_path: Path) -> None:
@@ -102,16 +135,15 @@ def test_stage_cli_enter_rolls_back_launched_stages_on_startup_failure(
     killed: list[int] = []
     monkeypatch.setattr(server, "_kill_process_tree", lambda pid: killed.append(pid))
 
-    def _fake_launch(stage_id: int, *, headless: bool, replica_id: int = 0) -> None:
-        stage_key = (stage_id, replica_id)
-        server.stage_procs[stage_key] = proc  # type: ignore[assignment]
-        server._stage_log_paths[stage_key] = log_path
-        server._stage_log_files[stage_key] = log_fh
-        if stage_id == 0 and replica_id == 0:
+    def _fake_launch(stage_id: int, *, headless: bool) -> None:
+        server.stage_procs[stage_id] = proc  # type: ignore[assignment]
+        server._stage_log_paths[stage_id] = log_path
+        server._stage_log_files[stage_id] = log_fh
+        if stage_id == 0:
             server.proc = proc  # type: ignore[assignment]
 
     def _fail_alive() -> None:
-        raise RuntimeError("Stage 0 replica 0 exited with code 1")
+        raise RuntimeError("Stage 0 exited with code 1")
 
     monkeypatch.setattr(server, "_launch_stage", _fake_launch)
     monkeypatch.setattr(server, "_ensure_stage_processes_alive", _fail_alive)
