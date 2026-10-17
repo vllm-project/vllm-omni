@@ -563,6 +563,10 @@ class TransformerConfig:
     def get(self, key: str, default: Any | None = None) -> Any:
         return self.params.get(key, default)
 
+    @property
+    def model_type(self) -> str | None:
+        return self.params.get("model_type") or self.params.get("_class_name")
+
     def __getattr__(self, item: str) -> Any:
         params = object.__getattribute__(self, "params")
         try:

@@ -818,6 +818,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
 
 _DIFFUSION_PREFIX_CACHE_FUNCS = {
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_prefix_cache_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_prefix_cache_func",
 }
 
 

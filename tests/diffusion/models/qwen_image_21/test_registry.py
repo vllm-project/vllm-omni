@@ -26,14 +26,21 @@ def test_pipeline_declares_request_batching_and_step_execution():
 
 def test_process_funcs_resolve_to_the_pipeline_module():
     from vllm_omni.diffusion.models.qwen_image_21 import pipeline_qwen_image_21
-    from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS, _DIFFUSION_PRE_PROCESS_FUNCS
+    from vllm_omni.diffusion.registry import (
+        _DIFFUSION_POST_PROCESS_FUNCS,
+        _DIFFUSION_PRE_PROCESS_FUNCS,
+        _DIFFUSION_PREFIX_CACHE_FUNCS,
+    )
 
     pre_name = _DIFFUSION_PRE_PROCESS_FUNCS["QwenImage21Pipeline"]
     post_name = _DIFFUSION_POST_PROCESS_FUNCS["QwenImage21Pipeline"]
+    prefix_cache_name = _DIFFUSION_PREFIX_CACHE_FUNCS["QwenImage21Pipeline"]
     assert pre_name == "get_qwen_image_21_pre_process_func"
     assert post_name == "get_qwen_image_21_post_process_func"
+    assert prefix_cache_name == "get_qwen_image_21_prefix_cache_func"
     assert callable(getattr(pipeline_qwen_image_21, pre_name))
     assert callable(getattr(pipeline_qwen_image_21, post_name))
+    assert callable(getattr(pipeline_qwen_image_21, prefix_cache_name))
 
 
 def test_multimodal_metadata_caps_condition_images_at_four():
@@ -44,6 +51,8 @@ def test_multimodal_metadata_caps_condition_images_at_four():
     assert metadata.supports_multimodal_inputs
     assert metadata.max_multimodal_image_inputs == 4
     assert metadata.max_multimodal_image_inputs == QWEN_IMAGE_21_MAX_INPUT_IMAGES
+    assert metadata.prefix_cache_hash_block_size == 1
+    assert metadata.requires_batch_invariant_paged_hsdp_ulysses
 
 
 def test_model_index_resolves_and_enriches(tmp_path):

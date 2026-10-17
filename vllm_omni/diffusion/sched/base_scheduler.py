@@ -26,6 +26,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -114,13 +115,20 @@ class BaseScheduler(ABC):
                 raise ValueError("paged_scheduler Diffusion KV requires native scheduler/hash block sizes")
             if kv_vllm_config is None:
                 raise ValueError("paged_scheduler Diffusion KV requires the native VllmConfig used for cache sizing")
+            enable_prefix_caching = bool(getattr(kv_vllm_config.cache_config, "enable_prefix_caching", False))
+            model_metadata = get_diffusion_model_metadata(getattr(od_config, "model_class_name", None))
+            fine_grained_block_size = model_metadata.prefix_cache_hash_block_size if enable_prefix_caching else None
+            if fine_grained_block_size is not None:
+                if fine_grained_block_size <= 0:
+                    raise ValueError("prefix_cache_hash_block_size must be positive")
+                hash_block_size = fine_grained_block_size
             self._diffusion_kv_manager = DiffusionKVCacheManager(
                 kv_cache_config,
                 max_model_len=kv_vllm_config.model_config.max_model_len,
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
-                enable_prefix_caching=bool(getattr(kv_vllm_config.cache_config, "enable_prefix_caching", False)),
+                enable_prefix_caching=enable_prefix_caching,
                 prefix_caching_hash_algo=getattr(
                     kv_vllm_config.cache_config,
                     "prefix_caching_hash_algo",
@@ -299,6 +307,7 @@ class BaseScheduler(ABC):
             scheduler_output.kv_transfer_request_ids = self._kv_transfer_request_ids
             self._kv_transfer_request_ids = set()
         if self._native_prefetch_enabled:
+            assert self._kv_connector is not None
             scheduler_output.kv_required_request_ids = self._loading_sequence_ids(self._running)
             # Flush current-request metadata before staging B. Mooncake
             # batches ready requests from the same producer into one write;
@@ -330,6 +339,9 @@ class BaseScheduler(ABC):
         if state is None or state.is_finished() or not state.diffusion_kv_requests:
             return
         manager = self._diffusion_kv_manager
+        connector = self._kv_connector
+        if manager is None or connector is None:
+            return
         if manager.has_request(request_id):
             return
         matched_tokens = []
@@ -342,7 +354,7 @@ class BaseScheduler(ABC):
                 or params["num_transfer_tokens"] <= 0
             ):
                 return
-            num_tokens, _ = self._kv_connector.get_num_new_matched_tokens(request, 0)
+            num_tokens, _ = connector.get_num_new_matched_tokens(request, 0)
             if num_tokens is None:
                 return
             matched_tokens.append(num_tokens)
@@ -368,7 +380,7 @@ class BaseScheduler(ABC):
         self._kv_request_generations[request_id] = allocation.allocation_generation
         try:
             transfer_ids = commit_kv_load(
-                self._kv_connector, manager.native_manager, state.diffusion_kv_requests, matched_tokens
+                connector, manager.native_manager, state.diffusion_kv_requests, matched_tokens
             )
         except KVTransferRegistrationError as exc:
             # Rollback may already notify the producer to release its pages.
@@ -651,6 +663,8 @@ class BaseScheduler(ABC):
         # already been popped by the Engine and are deliberately ignored, even
         # if a new, non-terminal request has since reused the same ID.
         if self._diffusion_kv_manager is not None:
+            for new_req in sched_output.scheduled_new_reqs:
+                self._diffusion_kv_manager.complete_block_copies(new_req.request_id)
             for request_id, status in statuses.items():
                 if status == DiffusionRequestStatus.FINISHED_COMPLETED:
                     self._diffusion_kv_manager.publish_request(request_id)

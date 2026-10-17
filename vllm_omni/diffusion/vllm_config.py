@@ -49,6 +49,12 @@ def resolve_diffusion_max_model_len(od_config: OmniDiffusionConfig) -> int:
         if value is not None and int(value) > 0:
             return int(value)
 
+    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+    model_default = get_diffusion_model_metadata(getattr(od_config, "model_class_name", None)).default_max_model_len
+    if model_default is not None and model_default > 0:
+        return int(model_default)
+
     mode = getattr(getattr(od_config, "diffusion_kv_mode", None), "value", None)
     if mode == "paged_scheduler":
         raise ValueError(
