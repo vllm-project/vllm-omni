@@ -18,6 +18,7 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
@@ -80,6 +81,25 @@ logger = init_logger(__name__)
 # retry removes the pair before closing the lease.
 _ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
 _ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
+
+# PyTorch rounds pinned host blocks up to a power of two and frees them with
+# cudaFreeHost. DLO's long-lived ~300 MB shards then pin ~66% more host memory
+# than they hold, and releasing it at worker exit can outlast the executor's
+# shutdown grace period. Exact-size cudaHostRegister blocks avoid both.
+_PINNED_HOST_ALLOCATOR_SETTINGS = {
+    "pinned_max_round_threshold_mb": "64",
+    "pinned_use_cuda_host_register": "True",
+    "pinned_num_register_threads": "8",
+}
+
+
+def _configure_pinned_host_allocator() -> None:
+    """Apply DLO's pinned-allocator settings the user has not chosen explicitly."""
+    user_conf = ",".join(os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"))
+    settings = [f"{key}:{value}" for key, value in _PINNED_HOST_ALLOCATOR_SETTINGS.items() if key not in user_conf]
+    if settings:
+        # Only affects later allocations; blocks pinned earlier keep their own free path.
+        torch._C._accelerator_setAllocatorSettings(",".join(settings))
 
 
 def _retain_active_hwr_registration(
@@ -1617,6 +1637,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self.enabled:
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
             return
+
+        if self.config.pin_cpu_memory and current_omni_platform.is_cuda():
+            _configure_pinned_host_allocator()
 
         # Initialize DP group (if not already done by early init)
         if self.dp_group is None and self._has_multirank_allgather():
