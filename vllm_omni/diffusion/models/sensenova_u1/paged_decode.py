@@ -292,16 +292,15 @@ class PagedDecodeCache:
     def to_dynamic_cache(self, cache) -> None:
         """Write the decoded K/V back so the generation stage sees one cache.
 
-        Only decode is paged; the DiT stage that follows reads the ordinary
-        cache, so the two are reconciled once at the hand-off rather than kept
-        in sync on every step.
+        Both paths store tokens in [S,H,D] order. Copy into request-owned
+        storage before the pipeline reuses the paged buffers for another request.
         """
         n = self._length
         for i, layer in enumerate(cache.layers):
             keys = self.k[i].view(-1, self.kv_heads, self.head_dim)[:n]
             values = self.v[i].view(-1, self.kv_heads, self.head_dim)[:n]
-            layer.keys = keys.transpose(0, 1).unsqueeze(0).contiguous()
-            layer.values = values.transpose(0, 1).unsqueeze(0).contiguous()
+            layer.keys = keys.clone().transpose(0, 1).unsqueeze(0)
+            layer.values = values.clone().transpose(0, 1).unsqueeze(0)
 
 
 class DecodeGraphRunner:

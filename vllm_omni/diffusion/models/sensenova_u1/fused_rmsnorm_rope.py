@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -11,6 +11,8 @@ def qk_norm_rope_kernel(
     k,
     query,
     key,
+    value,
+    value_output,
     q_norm_weight,
     k_norm_weight,
     q_norm_hw_weight,
@@ -46,6 +48,15 @@ def qk_norm_rope_kernel(
     cos_w_stride_b: tl.constexpr,
     cos_w_stride_s: tl.constexpr,
     cos_w_stride_d: tl.constexpr,
+    value_stride_b: tl.constexpr,
+    value_stride_s: tl.constexpr,
+    value_stride_h: tl.constexpr,
+    value_stride_d: tl.constexpr,
+    value_out_stride_b: tl.constexpr,
+    value_out_stride_h: tl.constexpr,
+    value_out_stride_s: tl.constexpr,
+    value_out_stride_d: tl.constexpr,
+    write_value: tl.constexpr,
     head_q: tl.constexpr,
     head_dim: tl.constexpr,
     eps: tl.constexpr = 1e-6,
@@ -169,6 +180,16 @@ def qk_norm_rope_kernel(
         key + batch_idx * key_stride_b + head_idx * key_stride_h + token_idx * key_stride_s,
     )
     tl.store(out_base + offs * tl.where(is_q, query_stride_d, key_stride_d), out)
+    if write_value:
+        if not is_q:
+            src = value + batch_idx * value_stride_b + token_idx * value_stride_s + head_idx * value_stride_h
+            dst = (
+                value_output
+                + batch_idx * value_out_stride_b
+                + head_idx * value_out_stride_h
+                + token_idx * value_out_stride_s
+            )
+            tl.store(dst + offs * value_out_stride_d, tl.load(src + offs * value_stride_d))
 
 
 def triton_qk_norm_rope(
@@ -185,12 +206,22 @@ def triton_qk_norm_rope(
     cos_w,
     sin_w,
     eps,
+    *,
+    key_output=None,
+    value=None,
+    value_output=None,
 ):
     batch_size, seq_len, head_q, head_dim = q.shape
     head_k = k.shape[2]
 
-    query = torch.empty((batch_size, head_q, seq_len, head_dim), device=q.device, dtype=q.dtype)
-    key = torch.empty((batch_size, head_k, seq_len, head_dim), device=k.device, dtype=k.dtype)
+    query = torch.empty((batch_size, seq_len, head_q, head_dim), device=q.device, dtype=q.dtype).transpose(1, 2)
+    key = key_output
+    if key is not None and key.shape != (batch_size, head_k, seq_len, head_dim):
+        raise ValueError("key_output must match the projected K shape")
+    if value_output is not None and (value is None or value_output.shape != (batch_size, head_k, seq_len, head_dim)):
+        raise ValueError("value_output requires V and must match its projected shape")
+    if key is None:
+        key = torch.empty((batch_size, seq_len, head_k, head_dim), device=k.device, dtype=k.dtype).transpose(1, 2)
     grid = (
         seq_len,
         head_q + head_k,
@@ -202,6 +233,8 @@ def triton_qk_norm_rope(
         k,
         query,
         key,
+        value,
+        value_output,
         q_norm_weight,
         k_norm_weight,
         q_norm_hw_weight,
@@ -237,6 +270,9 @@ def triton_qk_norm_rope(
         cos_w.stride(0),
         cos_w.stride(1),
         cos_w.stride(2),
+        *(value.stride() if value is not None else (0, 0, 0, 0)),
+        *(value_output.stride() if value_output is not None else (0, 0, 0, 0)),
+        write_value=value_output is not None,
         head_q=head_q,
         head_dim=head_dim,
         eps=eps,
