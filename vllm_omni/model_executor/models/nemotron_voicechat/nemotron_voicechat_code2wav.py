@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-2 Code2Wav for NemotronVoiceChat: RVQ-VAE codec decode to 22.05 kHz PCM.
 
 ``LLM_GENERATION`` stage consuming the talker's per-frame 31-quantizer code
@@ -17,6 +17,7 @@ signal upstream), never clamped.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -24,10 +25,53 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_vae_codec import CausalConv1dCache
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
+
+
+class _BatchedCausalConv1dCache(CausalConv1dCache):
+    """Present independent request caches as rows of one decoder call."""
+
+    def __init__(self, caches: list[CausalConv1dCache]) -> None:
+        super().__init__()
+        self.caches = caches
+
+    def update(
+        self,
+        states: torch.Tensor,
+        layer_id: int | str,
+        padding: int,
+        padding_value: int = 0,
+        flush: bool = False,
+    ) -> torch.Tensor:
+        previous = []
+        for cache, row in zip(self.caches, states.split(1), strict=True):
+            tail = cache.cache.get(layer_id)
+            if tail is None:
+                tail = row.new_full((1, row.shape[1], padding), padding_value)
+            if tail.shape != (1, row.shape[1], padding):
+                raise ValueError("Nemotron VoiceChat codec cache has incompatible channels or padding")
+            previous.append(tail)
+        padded = torch.cat((torch.cat(previous), states), dim=2)
+        for index, cache in enumerate(self.caches):
+            if flush:
+                cache.cache.pop(layer_id, None)
+            else:
+                # Own only this request's tail; a view would retain the whole
+                # batch after other requests finish or move to another group.
+                cache.cache[layer_id] = padded[index : index + 1, :, -padding:].clone()
+        return padded
+
+
+@dataclass
+class _DecodeRequest:
+    index: int
+    codes: torch.Tensor
+    cache: CausalConv1dCache | None
+    left_context_frames: int
 
 
 def validate_code_stack(codes: torch.Tensor, num_quantizers: int, codebook_size: int) -> torch.Tensor:
@@ -94,7 +138,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         # Shared per-request causal-conv caches; ALSO used by duplex serving,
         # whose per-segment payloads mark themselves with meta.codec_streaming
         # + meta.request_id (independent of the hf_override).
-        self._stream_caches: dict[str, Any] = {}
+        self._stream_caches: dict[str, CausalConv1dCache] = {}
 
         # Constructed in load_weights (owns the tts_model.audio_codec.* subtree).
         self.audio_codec: nn.Module | None = None
@@ -157,6 +201,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         if self.audio_codec is None:
             raise RuntimeError("NemotronVoiceChatCode2Wav.forward called before load_weights().")
         device = next(self.audio_codec.parameters()).device
+        requests: list[_DecodeRequest] = []
 
         for i in range(num_req):
             runtime_info = infos[i] if i < len(infos) else None
@@ -215,36 +260,45 @@ class NemotronVoiceChatCode2Wav(nn.Module):
                 # keyed by the talker-forwarded meta.request_id.
                 if not isinstance(cache_request_id, str) or not cache_request_id:
                     raise ValueError("Nemotron VoiceChat incremental codec input lacks meta.request_id")
-                from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_vae_codec import (
-                    CausalConv1dCache,
-                )
-
                 codec_cache = self._stream_caches.setdefault(cache_request_id, CausalConv1dCache())
             elif self._use_codec_cache and is_stream_chunk and request_id is not None:
                 # Async-chunk streaming: cumulative payload; decode ONLY the
                 # frames past the already-emitted prefix, with the causal-conv
                 # left context carried in the per-request cache.
-                from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_vae_codec import (
-                    CausalConv1dCache,
-                )
-
                 codec_cache = self._stream_caches.setdefault(request_id, CausalConv1dCache())
                 decode_codes = codes[left_context_frames:]
-            lens = torch.tensor([decode_codes.shape[0]], device=device, dtype=torch.long)
+            requests.append(_DecodeRequest(i, decode_codes, codec_cache, left_context_frames))
+
+        # Requests sharing one stream cache must advance in input order, even
+        # when their frame counts differ. Keep that uncommon case serial.
+        cache_ids = [id(request.cache) for request in requests if request.cache is not None]
+        serial = len(cache_ids) != len(set(cache_ids))
+        groups: dict[tuple[int, bool, int | None], list[_DecodeRequest]] = {}
+        for request in requests:
+            key = (request.codes.shape[0], request.cache is not None, request.index if serial else None)
+            groups.setdefault(key, []).append(request)
+
+        for group in groups.values():
+            codes = (
+                group[0].codes.unsqueeze(0) if len(group) == 1 else torch.stack([request.codes for request in group])
+            )
+            caches = [request.cache for request in group if request.cache is not None]
+            codec_cache = None
+            if caches:
+                codec_cache = caches[0] if len(group) == 1 else _BatchedCausalConv1dCache(caches)
+            lens = torch.full((len(group),), codes.shape[1], device=device, dtype=torch.long)
             # NeMo decodes the codec strictly in fp32.
             with torch.autocast(device_type=device.type, enabled=False):
-                wav, wav_len = self.audio_codec.decode(decode_codes.unsqueeze(0), lens, cache=codec_cache)
-            wav = wav.reshape(-1)[: int(wav_len.reshape(-1)[0])]
-            if left_context_frames > 0 and codec_cache is None:
-                # Prefix re-decode path: slice off the samples already emitted.
-                wav = wav[left_context_frames * self._wav_per_frame :]
-            audios[i] = wav.detach().to(dtype=torch.float32).cpu()
-            logger.debug(
-                "Nemotron VoiceChat code2wav output: request=%s frames=%s samples=%s",
-                cache_request_id,
-                frames,
-                int(audios[i].numel()),
-            )
+                wav, wav_len = self.audio_codec.decode(codes, lens, cache=codec_cache)
+            lengths = wav_len.reshape(-1).tolist()
+            for request, row, length in zip(group, wav, lengths, strict=True):
+                audio = row.reshape(-1)[:length]
+                if request.left_context_frames > 0 and request.cache is None:
+                    # Prefix re-decode path: omit samples already emitted.
+                    audio = audio[request.left_context_frames * self._wav_per_frame :]
+                # Trim on the device before copying: prefix re-decode must
+                # never transfer already-emitted audio back to the client.
+                audios[request.index] = audio.detach().to(dtype=torch.float32).cpu()
 
         return OmniOutput(
             text_hidden_states=None,
