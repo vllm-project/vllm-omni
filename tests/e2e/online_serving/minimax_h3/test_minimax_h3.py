@@ -64,12 +64,17 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
                 env_dict={"VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
             ),
             id="minimax_h3_latent_upscale_refine_tp2",
-            marks=hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2),
         ),
     ],
     indirect=True,
 )
-@pytest.mark.parametrize("task", ["t2va", "fl2va"])
+@pytest.mark.parametrize(
+    "task",
+    [
+        pytest.param("t2va", marks=hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)),
+        pytest.param("fl2va", marks=hardware_marks(res={"cuda": "H100"}, num_cards=2)),
+    ],
+)
 def test_latent_upscale_and_refine(
     omni_server: OmniServer,
     online_client: OnlineOmniClient,
