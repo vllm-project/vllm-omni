@@ -158,3 +158,11 @@ class ComponentQuantizationConfig(QuantizationConfig):
     @property
     def default_config(self) -> QuantizationConfig | None:
         return self._default
+
+    @property
+    def is_checkpoint_quantized(self) -> bool:
+        """Whether every configured quantized component is checkpoint-native."""
+        configs = [config for config in self._components.values() if config is not None]
+        if self._default is not None:
+            configs.append(self._default)
+        return bool(configs) and all(getattr(config, "is_checkpoint_quantized", False) for config in configs)
