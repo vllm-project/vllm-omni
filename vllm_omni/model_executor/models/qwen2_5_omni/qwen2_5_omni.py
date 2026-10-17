@@ -17,7 +17,12 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
 )
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    supports_encoder_cudagraph,
+)
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
 )
@@ -56,6 +61,24 @@ TALKER_CODEC_BOS_TOKEN_ID = 8293
 
 
 logger = init_logger(__name__)
+
+# The encoder CUDA graph protocol, forwarded from the thinker to the stage
+# wrapper that the runner inspects.
+_THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
+    "supports_encoder_cudagraph",
+    "encoder_cudagraph_single_replay",
+    "get_encoder_cudagraph_config",
+    "get_input_modality",
+    "get_max_frames_per_video",
+    "get_encoder_cudagraph_budget_range",
+    "get_encoder_cudagraph_item_specs",
+    "select_encoder_cudagraph_items",
+    "prepare_encoder_cudagraph_capture_inputs",
+    "prepare_encoder_cudagraph_replay_buffers",
+    "encoder_cudagraph_forward",
+    "encoder_eager_forward",
+    "postprocess_encoder_output",
+)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -104,6 +127,12 @@ class Qwen2_5OmniForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.token2wav = None
+            if supports_encoder_cudagraph(self.thinker):
+                # Expose the protocol on this stage instance only. Defining
+                # these methods on the shared class also advertises an encoder
+                # for talker/token2wav under runtime structural protocol checks.
+                for name in _THINKER_ENCODER_CUDAGRAPH_MEMBERS:
+                    setattr(self, name, getattr(self.thinker, name))
 
         elif self.model_stage == "talker":
             multimodal_config.skip_mm_profiling = True

@@ -12,9 +12,11 @@
 #   * code2wav / generation stages:  always true (cudagraph incompatible with
 #     the custom generation loop — set explicitly everywhere).
 #   * AR stages (thinker, talker):   model-dependent. Qwen2.5-Omni runs eager
-#     on CUDA (thinker uses custom ops that don't trace cleanly); NPU / XPU
-#     overrides are documented below. Qwen3-Omni / Qwen3-TTS AR stages use the
-#     default (false = cudagraph on).
+#     on CUDA by default. Its thinker also runs compiled with
+#     `enforce_eager: false`, which the thinker's image encoder CUDA graphs
+#     need (see the Qwen2.5-Omni online serving example). NPU / XPU overrides
+#     are documented below. Qwen3-Omni / Qwen3-TTS AR stages use the default
+#     (false = cudagraph on).
 async_chunk: false
 
 stages:

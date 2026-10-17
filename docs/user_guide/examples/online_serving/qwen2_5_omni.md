@@ -20,6 +20,22 @@ To use a custom deploy config, launch the server with the command below:
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
 ```
 
+On CUDA, to replay the thinker's image encoder from CUDA graphs (images only),
+turn on CUDA graphs for the thinker stage, which the default deploy config runs eagerly.
+This also compiles the thinker's language model and captures its decode graphs:
+
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 \
+  --stage-overrides '{"0": {"enforce_eager": false, "compilation_config": {"cudagraph_mm_encoder": true}}}'
+```
+
+The thinker then captures one encoder graph per token budget (64 to 256 image
+tokens and up to 4 images per replay by default). A step's images replay
+together when one captured graph holds them all; otherwise they run through the
+eager encoder in one call (default model runner). Set `encoder_cudagraph_token_budgets` and
+`encoder_cudagraph_max_vision_items_per_batch` in the same `compilation_config`
+to change them; each captured budget adds graph memory on the thinker's GPU.
+
 ### Send Multi-modal Request
 
 Get into the example folder
