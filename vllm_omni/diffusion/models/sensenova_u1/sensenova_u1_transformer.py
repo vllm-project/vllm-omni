@@ -40,6 +40,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, SensenovaCachedAdapter
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -64,13 +65,34 @@ class SenseNovaU1CausalLMOutput:
 
 
 def create_block_causal_mask(index: torch.Tensor):
-    """Block-wise causal mask from 1D time-index. Returns (1, 1, L, L)."""
+    """Block-wise causal mask from 1D time-index. Returns (1, 1, L, L).
+
+    On NPU the mask is bool with True=attend — the dtype the FLASH_ATTN
+    (mindiesd) backend consumes (additive float would be passed through
+    unconverted and silently corrupt the output). Other platforms keep the
+    additive 0.0/-inf float mask the SDPA fallback historically consumes.
+    """
     L = index.size(0)
     idx_i = index.unsqueeze(1).expand(L, L)
     idx_j = index.unsqueeze(0).expand(L, L)
     arange = torch.arange(L, device=index.device)
     mask = (idx_j == idx_i) | (arange.unsqueeze(0) <= arange.unsqueeze(1))
+    if current_omni_platform.is_npu():
+        return mask[None, None]
     return torch.where(mask[None, None], 0.0, float("-inf"))
+
+
+def create_prefix_causal_mask(seq_len: int, total_len: int, past_len: int, device):
+    """Bool mask (True=attend) for the KV-cache path on NPU, (1, 1, seq_len, total_len).
+
+    Prefix keys stay attendable and current keys are sequence-causal — the bool
+    form of the additive 0.0/-inf mask the non-NPU branch of
+    ``SenseNovaU1Model.forward`` builds inline.
+    """
+    causal = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+    mask = torch.ones(1, 1, seq_len, total_len, dtype=torch.bool, device=device)
+    mask[:, :, :, past_len:] = causal
+    return mask
 
 
 def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int):
@@ -421,7 +443,12 @@ class SenseNovaU1Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn",
         )
-        self.attn.attention = self.attn.sdpa_fallback
+        if not current_omni_platform.is_npu():
+            # Keep the historical SDPA override on non-NPU platforms: the CUDA
+            # flash path expects a 2D [B, S] mask, while this model feeds a 4D
+            # additive mask. On NPU the platform default backend is fine —
+            # FLASH_ATTN (mindiesd) natively takes the 4D mask, SDPA the fallback.
+            self.attn.attention = self.attn.sdpa_fallback
 
     @staticmethod
     def _align_mask_dtype(mask: torch.Tensor | None, query: torch.Tensor) -> torch.Tensor | None:
@@ -474,10 +501,45 @@ class SenseNovaU1Attention(nn.Module):
         (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = position_embeddings
 
         value_states = v.transpose(1, 2)  # [B, H, S, D]
-        try:
-            from .fused_rmsnorm_rope import triton_qk_norm_rope
-        except ImportError:
+
+        # NPU: Triton kernels are CUDA-only (launching them on Ascend NPU
+        # crashes with SIGSEGV), so use the native-Ascend fused path instead:
+        # the same rms-norm + 3D rope semantics expressed with torch_npu ops.
+        # Falls back to the pure-PyTorch path below if the ops are unavailable.
+        if current_omni_platform.is_npu():
+            try:
+                from .npu_fused_rmsnorm_rope import npu_qk_norm_rope
+
+                query_states, key_states = npu_qk_norm_rope(
+                    q,
+                    k,
+                    q_norm.weight,
+                    k_norm.weight,
+                    q_norm_hw.weight,
+                    k_norm_hw.weight,
+                    cos_t,
+                    sin_t,
+                    cos_h,
+                    sin_h,
+                    cos_w,
+                    sin_w,
+                    self.config.rms_norm_eps,
+                )
+                return query_states, key_states, value_states
+            except ImportError as exc:
+                logger.warning("Fused NPU qk norm rope unavailable (%s); using PyTorch fallback", exc)
+
+        if current_omni_platform.is_npu():
+            # Triton kernels target CUDA; importing the module on Ascend NPU can
+            # crash the process with SIGSEGV (triton's CUDA driver probe), so the
+            # import is skipped entirely and the pure-PyTorch fused path below,
+            # which is fully supported on NPU, is used instead.
             triton_qk_norm_rope = None
+        else:
+            try:
+                from .fused_rmsnorm_rope import triton_qk_norm_rope
+            except ImportError:
+                triton_qk_norm_rope = None
         if triton_qk_norm_rope is not None:
             query_states, key_states = triton_qk_norm_rope(
                 q,
@@ -788,9 +850,15 @@ class SenseNovaU1Model(nn.Module):
             seq_len = inputs_embeds.shape[1]
             total_len = past_len + seq_len
             if seq_len > 1:
-                mask = torch.zeros(1, 1, seq_len, total_len, device=inputs_embeds.device)
-                causal = torch.tril(torch.ones(seq_len, seq_len, device=inputs_embeds.device))
-                mask[:, :, :, past_len:] = torch.where(causal == 1, 0.0, float("-inf"))
+                if current_omni_platform.is_npu():
+                    # Bool mask, True=attend: the dtype the FLASH_ATTN (mindiesd)
+                    # backend consumes. Prefix keys stay attendable, matching the
+                    # additive 0.0/-inf form built by the original path below.
+                    mask = create_prefix_causal_mask(seq_len, total_len, past_len, inputs_embeds.device)
+                else:
+                    mask = torch.zeros(1, 1, seq_len, total_len, device=inputs_embeds.device)
+                    causal = torch.tril(torch.ones(seq_len, seq_len, device=inputs_embeds.device))
+                    mask[:, :, :, past_len:] = torch.where(causal == 1, 0.0, float("-inf"))
             else:
                 # A single query token attends to every cached key, so the mask
                 # this branch used to build was all zeros. Passing it changed no
