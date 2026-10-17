@@ -102,7 +102,7 @@ th {
 | `IndexTTS2TalkerForConditionalGeneration` | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✅︎ | | | | — |
 | `IndexTTS25TalkerForConditionalGeneration` | IndexTTS-2.5 | native `checkpoints/` bundle | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/IndexTeam/IndexTTS-2_5.md) |
 | `NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` | ✅︎ | ✅︎ | | ✅︎ | — |
-| `MiMoAudioModel` | MiMo-Audio-7B-Instruct | `XiaomiMiMo/MiMo-Audio-7B-Instruct` | ✅︎ | ✅︎ | | | — |
+| `MiMoAudioModel` | MiMo-Audio-7B-Instruct | `XiaomiMiMo/MiMo-Audio-7B-Instruct` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `MiMoV2ASRForCausalLM` | MiMo-V2.5-ASR | `XiaomiMiMo/MiMo-V2.5-ASR` | ✅︎ | ✅︎ | | | — |
 | `Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✅︎ | ✅︎ | | ✅︎ | — |
