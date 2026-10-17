@@ -28,9 +28,9 @@ def request_memory_tolerant(
     Like upstream ``request_memory()`` but tolerates multi-stage GPU sharing:
     if ``free_memory < requested_memory`` (because another stage on the same
     GPU has already consumed memory), caps the requested budget to the actual
-    free memory instead of raising ``ValueError``. The downstream memory
-    profiler subtracts the model and runtime allocations from this capped
-    budget when sizing the KV cache.
+    free memory instead of raising ``ValueError``.  The downstream
+    ``OmniGPUWorkerBase.determine_available_memory()`` uses device-level
+    profiling to compute the KV cache budget regardless.
 
     Logs a warning when the budget is capped so operators can detect
     under-provisioned GPU memory.
@@ -44,8 +44,8 @@ def request_memory_tolerant(
             "desired GPU memory utilization (%.2f, %s GiB). "
             "Capping requested memory to available free memory (%s GiB). "
             "This is expected when multiple Omni stages share a GPU; "
-            "determine_available_memory() will subtract the model and runtime "
-            "allocations from this capped budget when sizing the KV cache.",
+            "the device-level profiling in determine_available_memory() "
+            "will compute the correct KV cache budget.",
             init_snapshot.device_,
             format_gib(init_snapshot.free_memory),
             format_gib(init_snapshot.total_memory),
