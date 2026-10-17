@@ -119,11 +119,6 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
         {"temperature": 0.9, "top_k": 50, "max_tokens": 4096, "repetition_penalty": 1.05},
         {
             "temperature": 0.0,
-            "top_p": 1.0,
-            # Deploy YAML literal. The resolver check below compares it verbatim;
-            # the runtime check normalizes it through SamplingParams, which turns
-            # the greedy-sampling sentinel -1 into 0.
-            "top_k": -1,
             "max_tokens": 65536,
             "repetition_penalty": 1.1,
         },
@@ -135,11 +130,9 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
         # The resolver keeps the deploy values verbatim; the pipeline only adds
         # its own ``detokenize`` / ``stop_token_ids`` constraints on top.
         assert expected.items() <= (stage.model_config.default_sampling_params or {}).items()
-        # The runtime object is a SamplingParams built from those values, so it
-        # carries vLLM's normalization: greedy sampling (temperature 0) stores
-        # top_k=0, top_p=1.0 and min_p=0.0 even when the YAML spells the
-        # disabled top_k as -1, and backend defaults such as ``detokenize=True``
-        # appear. Compare against the same normalization, not the raw literals.
+        # Runtime SamplingParams may normalize greedy sampling and add backend
+        # defaults. Compare against the normalized resolved deploy values,
+        # rather than assuming removed YAML keys are still present.
         normalized = SamplingParams(**expected)
         assert all(getattr(runtime_params, name) == getattr(normalized, name) for name in expected)
 
