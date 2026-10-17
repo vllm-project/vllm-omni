@@ -5702,6 +5702,62 @@ class TestTTSAsyncOffloading:
         assert stage0_params.extra_args["tts_local_seed"] == 42
         assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
 
+    @pytest.fixture
+    def moss_tts_server(self, mocker: MockerFixture):
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
+            return_value=set(),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.tts_adapters.base.load_codec_frame_rate",
+            return_value=None,
+        )
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(
+            model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5",
+            hf_config=mocker.MagicMock(),
+        )
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048, seed=42, extra_args=None)]
+        mock_engine_client.tts_batch_max_items = 32
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="moss_tts_local"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        yield server
+        server.shutdown()
+
+    def test_prepare_speech_generation_moss_default_seed_sets_tts_local_seed(
+        self, moss_tts_server, mocker: MockerFixture
+    ):
+        """Deploy default seed should seed MOSS-TTS residual MTP sampling."""
+        moss_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        moss_tts_server._adapter.build = mocker.AsyncMock(
+            return_value=PreparedRequest(
+                prompt={"prompt": "hello"},
+                tts_params={},
+                model_type="moss_tts",
+            )
+        )
+        request = OpenAICreateSpeechRequest(input="hello")
+
+        asyncio.run(moss_tts_server._prepare_speech_generation(request))
+
+        stage0_params = moss_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.extra_args["tts_local_seed"] == 42
+        assert moss_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
+
     def test_prepare_speech_generation_uses_adapter_model_type_label(
         self,
         voxtral_server,
