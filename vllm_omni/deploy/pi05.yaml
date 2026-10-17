@@ -1,5 +1,5 @@
-# π0.5 VLA: one diffusion stage, one GPU, eager, bsz 1 (OpenPI policy serving is
-# one observation -> one action reply). Every key below is documented in
+# π0.5 VLA: one diffusion stage, one GPU, fused Triton kernels under CUDA graphs, bsz 1 (OpenPI policy serving
+# is one observation -> one action reply). Every key below is documented in
 # recipes/lerobot/Pi05.md.
 
 pipeline: pi05
@@ -13,7 +13,7 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
-    enforce_eager: true
+    enforce_eager: false
     model_class_name: Pi05Pipeline
     model_config:
       paligemma_variant: gemma_2b
