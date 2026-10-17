@@ -40,13 +40,13 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
+    apply_wan_request_scheduler,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
     load_wan_weights_with_optional_gate,
-    resolve_wan_flow_shift,
+    resolve_wan_boundary_ratio,
     resolve_wan_guidance_scales,
-    resolve_wan_sample_solver,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
@@ -466,6 +466,14 @@ class Wan22I2VPipeline(
             quant_config = None
         return create_transformer_from_config(config, quant_config=quant_config, component=component)
 
+    def prepare_cache_refresh(self, req: OmniDiffusionRequest) -> None:
+        """Apply the request's scheduler settings before the runner refreshes the cache.
+
+        See :meth:`Wan22Pipeline.prepare_cache_refresh`.
+        """
+        self._request_boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, req.sampling_params)
+        apply_wan_request_scheduler(self, req)
+
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
@@ -528,10 +536,7 @@ class Wan22I2VPipeline(
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for I2V generation. using default value 0.875")
+        boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="I2V")
 
         # Validate inputs
         self.check_inputs(
@@ -621,13 +626,7 @@ class Wan22I2VPipeline(
             current_omni_platform.synchronize()
             _t_img_enc_ms = (time.perf_counter() - _t_img_enc_start) * 1000
 
-        first_request = req.requests[0]
-        sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
-        flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
-        if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-            self._sample_solver = sample_solver
-            self._flow_shift = flow_shift
+        sample_solver, flow_shift = apply_wan_request_scheduler(self, req.requests[0])
 
         # Timesteps
         if sample_solver == "unipc":

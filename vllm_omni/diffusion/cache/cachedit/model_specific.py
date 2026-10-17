@@ -29,6 +29,7 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
+    _make_pipeline_transformer_getter,
     _maybe_build_block_adapter,
     enable_cache_for_dit,
 )
@@ -50,14 +51,22 @@ def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[in
     Returns:
         A tuple of (num_high_noise_steps, num_low_noise_steps).
     """
-    if pipeline.boundary_ratio is not None:
-        boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
+    # Prefer the request-effective boundary that the pipeline's
+    # ``prepare_cache_refresh`` resolved (engine -> request -> 0.875, same as
+    # ``forward()``); the startup ``boundary_ratio`` may be None.
+    boundary_ratio = getattr(pipeline, "_request_boundary_ratio", None)
+    if boundary_ratio is None:
+        boundary_ratio = pipeline.boundary_ratio
+    if boundary_ratio is not None:
+        boundary_timestep = boundary_ratio * pipeline.scheduler.config.num_train_timesteps
     else:
         boundary_timestep = None
 
     # Set timesteps to calculate the split
     device = next(pipeline.transformer.parameters()).device
-    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+    # The Wan UniPC scheduler is built with shift=1.0 and takes the flow shift
+    # here; the Euler scheduler ignores it and keeps its built-in shift.
+    pipeline.scheduler.set_timesteps(num_inference_steps, device=device, shift=pipeline._flow_shift)
 
     timesteps = pipeline.scheduler.timesteps
     num_high_noise_steps = 0  # high-noise steps for transformer
@@ -86,17 +95,31 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     db_cache_config = projected_config.to_db_cache_config()
     calibrator_config = projected_config.to_calibrator_config()
 
-    if getattr(pipeline, "transformer_2", None) is None:
-        logger.info("transformer_2 not found, enabling cache-dit for single transformer mode")
+    transformer = getattr(pipeline, "transformer", None)
+    transformer_2 = getattr(pipeline, "transformer_2", None)
+
+    if transformer is None and transformer_2 is None:
+        raise ValueError(f"{type(pipeline).__name__} has no loaded transformer to enable cache-dit on")
+
+    if transformer is None or transformer_2 is None:
+        # Only one expert is resident.  Either the checkpoint is single-expert
+        # (Wan2.1-style), or it is a Wan2.2 MoE checkpoint run with
+        # boundary_ratio pinned to 1.0 / 0.0, which makes Wan22Pipeline load
+        # only the low-noise / high-noise expert respectively.  Both cases must
+        # key off whichever attribute actually holds a module: assuming the
+        # survivor is always ``transformer`` crashes the low-noise-only run.
+        active_name = "transformer" if transformer is not None else "transformer_2"
+        active_transformer = transformer if transformer is not None else transformer_2
+        logger.info("Enabling cache-dit for single transformer mode on %s", active_name)
         cache_dit.enable_cache(
             BlockAdapter(
-                transformer=pipeline.transformer,
+                transformer=active_transformer,
                 # For VACE, cache only the main denoising blocks. The
                 # conditioning branch (vace_blocks) has a different forward
                 # contract and produces per-step hints from the current latent
                 # plus vace_context; keeping it outside CacheDiT preserves the
                 # control signal while still accelerating the repeated backbone.
-                blocks=[pipeline.transformer.blocks],
+                blocks=[active_transformer.blocks],
                 forward_pattern=[ForwardPattern.Pattern_2],
                 params_modifiers=[
                     ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
@@ -106,7 +129,11 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
-        return _build_cache_context_refresh(cache_config)
+        # The refresh callback must read the same attribute we cached; the
+        # default getter hardcodes ``pipeline.transformer``, which is None here
+        # when only the low-noise expert was loaded.  A single expert also runs
+        # every step, so no high/low split is applied.
+        return _build_cache_context_refresh(cache_config, _make_pipeline_transformer_getter(active_name))
 
     cache_dit.enable_cache(
         BlockAdapter(

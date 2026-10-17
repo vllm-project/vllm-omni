@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
+    resolve_wan_boundary_ratio,
     resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
@@ -497,6 +498,11 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
 
         return torch.stack(mask_list)
 
+    def prepare_cache_refresh(self, req: OmniDiffusionRequest) -> None:
+        # VACE denoises with the startup scheduler and ignores per-request
+        # sample_solver / flow_shift, so only the effective boundary is needed.
+        self._request_boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, req.sampling_params)
+
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -709,10 +715,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         # stays None and diffuse() uses the same transformer for every step.
         boundary_timestep = None
         if self.transformer_2 is not None:
-            boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-            if boundary_ratio is None:
-                boundary_ratio = 0.875
-                logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
+            boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="Wan2.2 VACE")
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
         latents = self.diffuse(
