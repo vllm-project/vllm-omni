@@ -11,13 +11,19 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
     Wan22S2VPipeline,
     _make_clip_generators,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import WanS2VTransformer3DModel
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -60,7 +66,7 @@ def _make_s2v_sampling(**overrides):
         "extra_args": {},
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return OmniDiffusionSamplingParams(**values)
 
 
 def _make_s2v_validation_pipeline() -> Wan22S2VPipeline:
@@ -890,3 +896,128 @@ def test_s2v_preencode_keeps_the_full_decode_path_untouched() -> None:
     assert outputs[0].output[0].shape[0] == 2
     np.testing.assert_array_equal(outputs[0].output[1], audio_a)
     np.testing.assert_array_equal(outputs[1].output[1], audio_b)
+
+
+def _denoise_progress():
+    context = get_forward_context()
+    return context.denoise_step_idx, context.total_denoise_steps, context.attention_schedule_denoise_active
+
+
+class _ProgressRecordingS2VTransformer(nn.Module):
+    """Records the published denoise progress when the clip loop encodes audio."""
+
+    casual_audio_encoder = None
+
+    def __init__(self, events: list[tuple[object, ...]]) -> None:
+        super().__init__()
+        self.events = events
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return torch.float32
+
+    def encode_audio(self, audio, motion_frames):
+        del motion_frames
+        self.events.append(("audio", *_denoise_progress()))
+        return {"audio_emb": audio}
+
+
+class _ThreeStepS2VScheduler:
+    """Builds 3 timesteps whatever step count is requested, and leaves latents unchanged."""
+
+    def __init__(self) -> None:
+        self.timesteps = torch.tensor([900, 500, 100])
+
+    def set_timesteps(self, num_steps, device=None, shift=None) -> None:
+        del num_steps, device, shift
+
+    def step(self, noise_pred, t, latents, return_dict=False, generator=None):
+        del noise_pred, t, return_dict, generator
+        return (latents,)
+
+
+def _run_two_clip_s2v_forward(monkeypatch, schedule, events: list[tuple[object, ...]]) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform",
+        SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None),
+    )
+    pipeline = object.__new__(Wan22S2VPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = _ProgressRecordingS2VTransformer(events)
+    pipeline.vae = SimpleNamespace(
+        dtype=torch.float32,
+        decode=lambda latents, return_dict=False: (torch.zeros(1, 3, 8, 16, 16),),
+    )
+    pipeline.od_config = OmniDiffusionConfig(enable_cpu_offload=False)
+    pipeline.scheduler = _ThreeStepS2VScheduler()
+    pipeline._flow_shift = 3.0
+    pipeline.vae_scale_factor_spatial = 8
+    pipeline.resolution_divisor = 16
+    pipeline.motion_frames = 7
+    pipeline.drop_first_motion = True
+    pipeline._DEFAULT_INFER_FRAMES = 8
+    pipeline._guidance_scale = None
+    pipeline._num_timesteps = None
+    pipeline.progress_bar = noop_progress_bar
+    pipeline.check_inputs = lambda *args, **kwargs: None
+    pipeline.encode_prompt = lambda **kwargs: (torch.zeros(1, 2, 3), None)
+    # 16 audio frames at 8 frames per clip: two clips.
+    pipeline.encode_audio = lambda *args, **kwargs: (torch.zeros(1, 1, 2, 16), 2, 16)
+    pipeline.encode_ref_image = lambda *args, **kwargs: torch.zeros(1, 16, 1, 2, 2)
+    pipeline.prepare_motion_latents = lambda pixels, **kwargs: torch.zeros(pixels.shape[0], 16, 2, 2, 2)
+    pipeline.prepare_latents = lambda **kwargs: torch.zeros(16, 2, 2, 2)
+    pipeline._denormalize_latents = lambda latents: latents
+
+    def fake_predict_noise_maybe_with_cfg(**kwargs):
+        events.append(("denoise", *_denoise_progress()))
+        return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+    pipeline.predict_noise_maybe_with_cfg = fake_predict_noise_maybe_with_cfg
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                request_id="a",
+                prompt={
+                    "prompt": "speak",
+                    "multi_modal_data": {"image": PIL.Image.new("RGB", (16, 16)), "audio": np.zeros(16000)},
+                },
+                # The scheduler builds 3 steps; the requested 40 must not reach the schedule check.
+                sampling_params=_make_s2v_sampling(num_inference_steps=40),
+            )
+        ]
+    )
+    with set_forward_context(), bind_attention_schedule(schedule):
+        try:
+            pipeline.forward(batch)
+        finally:
+            events.append(("end", *_denoise_progress()))
+
+
+@pytest.mark.parametrize("scheduled", [True, False], ids=["scheduled", "unscheduled"])
+def test_s2v_forward_applies_schedule_to_each_clip_and_clears_between_clips(monkeypatch, scheduled: bool) -> None:
+    schedule = (AttentionScheduleRange(start=1, end=None, profile="candidate"),) if scheduled else None
+    events: list[tuple[object, ...]] = []
+
+    _run_two_clip_s2v_forward(monkeypatch, schedule, events)
+
+    total = 3 if scheduled else None
+    denoise = [("denoise", step, total, scheduled) for step in range(3)]
+    # Each clip restarts at step 0 and is checked against its own 3 steps. With a schedule, audio
+    # encoding before the second clip and the work after the last clip see no active step. Without
+    # one, the last step stays published.
+    between = ("audio", None, None, False) if scheduled else ("audio", 2, None, False)
+    end = ("end", None, None, False) if scheduled else ("end", 2, None, False)
+    assert events == [("audio", None, None, False), *denoise, between, *denoise, end]
+
+
+def test_s2v_forward_rejects_schedule_past_clip_total_before_first_forward(monkeypatch) -> None:
+    schedule = (AttentionScheduleRange(start=0, end=4, profile="candidate"),)
+    events: list[tuple[object, ...]] = []
+
+    with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=3"):
+        _run_two_clip_s2v_forward(monkeypatch, schedule, events)
+
+    # The first clip's check fails after audio encoding and before any denoise forward.
+    assert events == [("audio", None, None, False), ("end", None, None, False)]
