@@ -15,7 +15,11 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.diffusion.attention.schedule import AttentionSchedule, parse_attention_schedule
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    InvalidAttentionScheduleError,
+    parse_attention_schedule,
+)
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -473,6 +477,16 @@ class OmniDiffusionSamplingParams:
         lora_request = params.get("lora_request")
         if lora_request is not None and not isinstance(lora_request, LoRARequest):
             params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
+        # Construction parses the request schedule. Classify its failures as the scheduler does on
+        # the inline client, so a malformed schedule stays HTTP 400 instead of a plain error (500).
+        # Only the schedule fields are set here, so every other field keeps its valid default.
+        try:
+            cls(
+                attention_schedule=params.get("attention_schedule"),
+                extra_args=dict(params.get("extra_args") or {}),
+            )
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
         return cls(**params)
 
 
