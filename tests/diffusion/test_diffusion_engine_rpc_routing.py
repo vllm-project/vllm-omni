@@ -506,7 +506,6 @@ async def test_executor_only_called_from_busy_loop_thread():
     )
 
 
-
 def _inline_client_profile(engine: DiffusionEngine, executor: ThreadPoolExecutor):
     from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 
@@ -556,6 +555,7 @@ async def test_profile_before_first_request_runs_on_busy_loop_thread(make_profil
         f"profiler start, inference and stop must share the busy-loop thread "
         f"(expected {{{engine.worker_thread.ident}}}, got {call_threads})"
     )
+
 
 @pytest.mark.asyncio
 async def test_executor_calls_never_overlap_under_load():
