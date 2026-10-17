@@ -954,7 +954,6 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     snapshot = getattr(server, "reliability_fault_snapshot", None)
     if not isinstance(snapshot, dict):
         pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
-        raise RuntimeError
     assert isinstance(snapshot, dict)
     tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
     if not tree_pids:
