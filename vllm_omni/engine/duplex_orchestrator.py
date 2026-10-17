@@ -41,6 +41,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     build_engine_core_request_from_tokens,
 )
+from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -90,6 +91,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             runtime_config=self.duplex_session_config,
             model_config=model_config,
             log_stats=self.log_stats,
+            tracer=self.tracer,
         )
 
     # ------------------------------------------------------------------ #
@@ -227,6 +229,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=close_session,
+            trace_error=type(exc).__name__,
         )
         return True
 
@@ -236,6 +239,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         *,
         abort: bool = False,
         release_owners: bool = False,
+        trace_error: str | None = None,
     ) -> list[OutputMessage]:
         if not request_ids:
             return []
@@ -257,7 +261,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
         try:
-            outputs = await super()._cleanup_request_ids(cleanup_ids, abort=abort)
+            outputs = await super()._cleanup_request_ids(
+                cleanup_ids, abort=abort, release_owners=release_owners, trace_error=trace_error
+            )
         except BaseException:
             if closing_session_ids:
                 self.session_manager.defer_request_cleanups(closing_session_ids)
@@ -334,6 +340,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
         request_state = self.request_states.get(context.request_id)
         if request_state is None:
+            session_trace = self.session_manager.session_traces.get(context.session_id)
             request_state = DuplexOrchestratorRequestState(
                 request_id=context.request_id,
                 prompt=None,
@@ -345,6 +352,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 session_id=context.session_id,
                 fence=context.fence,
                 config_generation=context.config_generation,
+                # Resumable stage resources survive turns, so their parent is the session.
+                trace=RequestTrace(self.tracer, context.request_id, session_trace.headers())
+                if self.tracer is not None and session_trace is not None
+                else None,
             )
             self.request_states[context.request_id] = request_state
         elif isinstance(request_state, DuplexOrchestratorRequestState):

@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+from opentelemetry import trace
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
@@ -40,6 +41,7 @@ from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     ErrorEvent,
     OutputAudioCleared,
+    ResponseCreated,
     ResponseDone,
     SessionClosed,
     SessionExpired,
@@ -59,6 +61,7 @@ from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfi
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
+from vllm_omni.tracing import SessionTrace
 
 if TYPE_CHECKING:
     import janus
@@ -112,9 +115,12 @@ class DuplexSessionManager:
         log_stats: bool = False,
         clock: Callable[[], float] | None = None,
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
+        tracer: trace.Tracer | None = None,
     ) -> None:
         validate_duplex_plugin_sampling(plugin, sampling_defaults=tuple(stage_port.sampling_defaults()))
         self.plugin = plugin
+        self.tracer = tracer
+        self.session_traces: dict[str, SessionTrace] = {}
         self.stage_port = stage_port
         self.model_config = model_config
         self.log_stats = bool(log_stats)
@@ -405,17 +411,30 @@ class DuplexSessionManager:
                 ):
                     return
             output.put(event)
-            return
-        if isinstance(event, SessionClosed):
-            self._outputs.pop(session_id, None)
-            self._output_failed.discard(session_id)
-        elif not isinstance(event, ErrorEvent):
-            # A closed/rolled-back session must not move late audio back into
-            # the unbounded shared queue after its output buffer is removed.
-            return
-        # Only closure notifications and errors without a live session use the
-        # engine-wide queue. Audio never accumulates there before the bounded buffer.
-        self._output_sink.put_nowait(DuplexSessionEventMessage(session_id=session_id, event=event))
+        else:
+            if isinstance(event, SessionClosed):
+                self._outputs.pop(session_id, None)
+                self._output_failed.discard(session_id)
+            elif not isinstance(event, ErrorEvent):
+                # A closed/rolled-back session must not move late audio back into
+                # the unbounded shared queue after its output buffer is removed.
+                return
+            # Only closure notifications and errors without a live session use the
+            # engine-wide queue. Audio never accumulates there before the bounded buffer.
+            self._output_sink.put_nowait(DuplexSessionEventMessage(session_id=session_id, event=event))
+        session_trace = self.session_traces.get(session_id)
+        if session_trace is not None:
+            if isinstance(event, ResponseCreated | ResponseDone):
+                response_id = event.response_id or event.response.get("id")
+                if isinstance(response_id, str):
+                    if isinstance(event, ResponseCreated):
+                        session_trace.start_turn(response_id)
+                    else:
+                        session_trace.finish_turn(response_id, event.status or "completed")
+            elif isinstance(event, ErrorEvent):
+                session_trace.span.add_event("omni.session.error", {"error.type": event.code})
+            elif isinstance(event, SessionClosed | SessionExpired):
+                self.session_traces.pop(session_id).end(event.reason)
 
     async def _put_result(
         self,
@@ -554,6 +573,8 @@ class DuplexSessionManager:
             # sessions run concurrently and must not all pass the check above.
             self._admitting.add(session_id)
             holds_admission_slot = True
+            if self.tracer is not None:
+                self.session_traces[session_id] = SessionTrace(self.tracer, session_id, message.trace_headers)
             config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
             try:
@@ -602,10 +623,14 @@ class DuplexSessionManager:
             # open burned one slot for good. Nobody is answered: the caller's
             # RPC waiter is being torn down with us or times out.
             logger.info("open_duplex_session cancelled for %s; rolling the admission back", session_id)
+            if holds_admission_slot and (session_trace := self.session_traces.pop(session_id, None)) is not None:
+                session_trace.end("cancelled")
             await self._rollback_open(session_id, session=session, runner=runner)
             raise
         except Exception as exc:
             error_code, _, _ = self._control_error(exc)
+            if holds_admission_slot and (session_trace := self.session_traces.pop(session_id, None)) is not None:
+                session_trace.end("error", error_code)
             if error_code in {"resource_exhausted", "session_exists"}:
                 logger.info("open_duplex_session rejected: %s", exc)
             else:
@@ -1011,6 +1036,9 @@ class DuplexSessionManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for session_trace in self.session_traces.values():
+            session_trace.end("shutdown")
+        self.session_traces.clear()
         self._session_control_tails.clear()
         self._closing.clear()
         self._session_snapshots.clear()
