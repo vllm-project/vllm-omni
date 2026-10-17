@@ -5,6 +5,7 @@
 import importlib.util
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -67,16 +68,25 @@ def test_supported_methods():
     assert "bitsandbytes" in SUPPORTED_QUANTIZATION_METHODS
 
 
-def test_quantization_integration():
+@pytest.fixture
+def diffusion_model_metadata(tmp_path: Path) -> str:
+    (tmp_path / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
+    transformer = tmp_path / "transformer"
+    transformer.mkdir()
+    (transformer / "config.json").write_text("{}")
+    return str(tmp_path)
+
+
+def test_quantization_integration(diffusion_model_metadata: str):
     """Test end-to-end quantization flow through OmniDiffusionConfig."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    config = OmniDiffusionConfig(model="test", quantization_config="bitsandbytes")
+    config = OmniDiffusionConfig(model=diffusion_model_metadata, quantization_config="bitsandbytes")
     assert config.quantization_config is not None
     assert config.quantization_config.get_name() == "bitsandbytes"
 
     config2 = OmniDiffusionConfig(
-        model="test",
+        model=diffusion_model_metadata,
         quantization_config={
             "method": "bitsandbytes",
             "quant_type": "nf4",
@@ -89,14 +99,14 @@ def test_quantization_integration():
     assert config2.quantization_config.compress_statistics is True
 
 
-def test_quantization_dict_not_mutated():
+def test_quantization_dict_not_mutated(diffusion_model_metadata: str):
     """Test that passing a dict to quantization_config doesn't mutate it."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     original_dict = {"method": "bitsandbytes", "quant_type": "nf4"}
     dict_copy = original_dict.copy()
 
-    OmniDiffusionConfig(model="test", quantization_config=original_dict)
+    OmniDiffusionConfig(model=diffusion_model_metadata, quantization_config=original_dict)
 
     assert original_dict == dict_copy
 
@@ -256,3 +266,35 @@ class TestCudaBnBSmoke:
 
         assert output.shape == (2, 16, 128)
         assert output.dtype == torch.float16
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "ignored,prefix,skipped",
+    [
+        ("to_out", "layers.0.attention.to_out.0", True),
+        ("w2", "layers.0.feed_forward.w2", True),
+        ("w13", "layers.0.feed_forward.w13", True),
+        ("layers.0.attention.to_out.0", "layers.0.attention.to_out.0", True),
+        ("to_out", "layers.0.attention.to_qkv", False),
+        ("w2", "layers.0.feed_forward.w13", False),
+    ],
+)
+def test_ignored_layers_match_qualified_prefixes(monkeypatch, ignored, prefix, skipped):
+    """Documented short patterns must still match qualified Z-Image layers."""
+    config = build_quant_config("bitsandbytes", ignored_layers=[ignored])
+    config.packed_modules_mapping = {"w13": ["w1", "w3"]}
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    layer = object.__new__(LinearBase)
+    method = config.get_quant_method(layer, prefix)
+    assert isinstance(method, UnquantizedLinearMethod) is skipped
+
+
+@pytest.mark.cpu
+def test_ignored_layers_reject_partial_fused_shards(monkeypatch):
+    config = build_quant_config("bitsandbytes", ignored_layers=["w3"])
+    config.packed_modules_mapping = {"w13": ["w1", "w3"]}
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    layer = object.__new__(LinearBase)
+    with pytest.raises(ValueError, match="some but not all shards"):
+        config.get_quant_method(layer, "layers.0.feed_forward.w13")

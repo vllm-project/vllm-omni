@@ -102,6 +102,7 @@ class DiffusionBitsAndBytesConfig(QuantizationConfig):
                 prefix=prefix,
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
+                match_mode="substring",
             ):
                 return UnquantizedLinearMethod()
             if current_omni_platform.is_cuda():
