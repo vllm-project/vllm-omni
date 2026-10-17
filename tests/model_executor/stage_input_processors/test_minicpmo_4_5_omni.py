@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.engine.orchestrator import StreamingInputState
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     llm2tts,
@@ -608,6 +609,100 @@ def test_native_duplex_transcript_decodes_the_talker_condition_slice() -> None:
     assert first_info["meta"]["native_duplex_segment_text"] == "杭州和"
     assert second_info["ids"]["tts"] == [24, 25]
     assert second_info["meta"]["native_duplex_segment_text"] == "上海之间大"
+
+
+@pytest.mark.parametrize(
+    "text,complete",
+    [
+        ("See you then.", True),
+        ("可以去看看哦。", True),
+        ('He said "go!"', True),
+        ("像之前电影当中的", False),
+        ("Wait, ", False),
+        ("", False),
+    ],
+)
+def test_native_duplex_turn_end_closes_text_only_after_a_sentence_end(text, complete) -> None:
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 9310, 9308],
+        row_ids=[101, 102, 9304, 21, 9310],
+    )
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        source_token_decoder=lambda ids, **_: text if 21 in ids else "",
+    )
+
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert info["meta"]["turn_end"] is True
+    assert info["meta"]["turn_text_ends_sentence"] is complete
+    # The condition is the forwarded rows plus <audio_bos>, with <text_eos> before it once closed.
+    assert info["meta"]["next_stage_prompt_len"] == len(info["ids"]["tts"]) + (2 if complete else 1)
+
+
+@pytest.mark.parametrize(
+    "unit_text,after_turn_eos,complete",
+    [
+        # The period sampled after <|turn_eos|> never reaches the Talker: the turn stops mid-sentence.
+        ("So the", ".", False),
+        # The word sampled after <|turn_eos|> is dropped from the handoff: the turn ends a sentence.
+        ("Sure, here it is.", "And", True),
+    ],
+)
+def test_native_duplex_turn_end_reads_only_the_text_handed_to_the_talker(unit_text, after_turn_eos, complete) -> None:
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 9310, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 9310, 22],
+    )
+    token_text = {21: unit_text, 22: after_turn_eos}
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        source_token_decoder=lambda ids, **_: "".join(token_text.get(int(i), "") for i in ids),
+    )
+
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [21, 9310]
+    assert info["meta"]["turn_end"] is True
+    assert info["meta"]["turn_text_ends_sentence"] is complete
+    assert info["meta"]["next_stage_prompt_len"] == len(info["ids"]["tts"]) + (2 if complete else 1)
+
+
+def test_native_duplex_turn_end_uses_the_last_text_of_the_turn() -> None:
+    prompt_ids = [101, 102]
+    token_text = {21: "Sure, here it is.", 22: "And", 23: "more."}
+
+    def output(token_ids: list[int]):
+        return _output(
+            prompt_ids=prompt_ids,
+            output_ids=token_ids,
+            latent=torch.zeros((len(prompt_ids) + len(token_ids), 1)),
+            multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": dict(_NATIVE_META)},
+        )
+
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        source_token_decoder=lambda ids, **_: " ".join(token_text[int(i)] for i in ids if int(i) in token_text),
+    )
+    first_ids = [9304, 21, 9308]
+    first = llm2tts([output(first_ids)], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    # The turn ends in a unit that carries only <|turn_eos|>: the sentence ended in the unit before.
+    second = llm2tts([output([*first_ids, 9304, 9310, 9308])], prompt=[{}], _streaming_context=context)[0][
+        "model_intermediate_buffer"
+    ]
+    assert first["meta"]["turn_text_ends_sentence"] is False
+    assert second["meta"]["turn_end"] is True
+    assert second["meta"]["turn_text_ends_sentence"] is True
+
+    # The next turn starts over: a turn-end unit without text of its own does not
+    # inherit the previous turn's sentence end.
+    context.bridge_states["duplex"]["model_turn_id"] = 8
+    third_ids = [9304, 9310, 9308]
+    third = llm2tts([output(third_ids)], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    assert third["meta"]["turn_end"] is True
+    assert third["meta"]["turn_text_ends_sentence"] is False
 
 
 def test_native_duplex_requires_tokenizer_boundary_metadata() -> None:
