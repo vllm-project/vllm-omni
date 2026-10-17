@@ -99,6 +99,9 @@ EXCLUDED_MODELS = [
     "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
+    # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
+    # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
+    "CausVidWanPipeline",
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",

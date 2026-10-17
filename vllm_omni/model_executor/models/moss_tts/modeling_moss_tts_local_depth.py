@@ -253,17 +253,21 @@ class MossTTSLocalDepthTransformer(nn.Module):
                 table[channel, start : start + 256].copy_(torch.cat((q.flatten(1), k.flatten(1), v), dim=-1))
         self._qkv_lookup = table
         self._lookup_n_vq = n_vq
-        cuda_kernels = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
-        self._fused_attention = cuda_kernels and attn.head_dim <= 128 and n_vq <= 16
+        # These fused kernels promise bit-identical sampling and attention on
+        # NVIDIA. HIP uses the portable paths, whose numerics are already
+        # qualified independently on ROCm.
+        nvidia_kernels = (
+            device.type == "cuda" and dtype in (torch.bfloat16, torch.float16) and current_omni_platform.is_cuda()
+        )
+        self._fused_attention = nvidia_kernels and attn.head_dim <= 128 and n_vq <= 16
         self._auto_fused_linear = (
-            cuda_kernels
+            nvidia_kernels
             and dtype == torch.bfloat16
             and self.hidden_size == 2560
             and block.mlp.fc_in.out_features == 9728
-            and current_omni_platform.is_cuda()
             and current_omni_platform.is_device_capability(90, device.index or 0)
         )
-        self._fused_sampling = cuda_kernels
+        self._fused_sampling = nvidia_kernels
         logger.info("MOSS-TTS local QKV lookup prepared: %.1f MiB", table.numel() * table.element_size() / 2**20)
         logger.info("MOSS local fused kernels: attention=%s sampling=%s", self._fused_attention, self._fused_sampling)
 
@@ -284,7 +288,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
             else:
                 hidden = hidden + block.mlp.fc_out(intermediate)
             return self.ln_f(hidden)
-        if hidden.is_cuda:
+        if hidden.is_cuda and current_omni_platform.is_cuda():
             # Each residual add fused with the LayerNorm after it.
             from vllm_omni.model_executor.models.moss_tts.local_kernels import add_layer_norm
 

@@ -35,6 +35,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .configuration_moss_audio_tokenizer_v2 import MossAudioTokenizerConfig
+from .triton_launch import cuda_pdl_launch_kwargs
 
 logger = logging.get_logger(__name__)
 
@@ -1471,8 +1472,8 @@ def rope_qk_(qkv: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
             triton.next_power_of_2(H),
             D // 2,
             USE_PDL=_USE_PDL,
-            launch_pdl=_USE_PDL,
             num_warps=4,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
         )
 
 
@@ -1538,8 +1539,8 @@ def add_layer_norm(
             update is not None,
             norm.bias is not None,
             USE_PDL=_USE_PDL,
-            launch_pdl=_USE_PDL,
             num_warps=4 if N <= 2048 else 8,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
         )
     return res, out
 

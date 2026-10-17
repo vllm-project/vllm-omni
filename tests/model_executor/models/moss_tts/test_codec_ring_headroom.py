@@ -18,7 +18,7 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_audio_tokenizer
     MossAudioTokenizerConfig,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 TRANSFORMER = {
     "module_type": "Transformer",
@@ -91,6 +91,7 @@ def stream_decode(model, codes, chunk_frames, *, headroom):
         model.close_decoder_state_pool()
 
 
+@pytest.mark.cpu
 @torch.no_grad()
 def test_ring_headroom_sizes_each_layer_for_one_chunk():
     model = tiny_codec()
@@ -111,6 +112,7 @@ def test_ring_headroom_sizes_each_layer_for_one_chunk():
         model.close_decoder_state_pool()
 
 
+@pytest.mark.cpu
 @torch.no_grad()
 def test_chunked_streaming_matches_whole_sequence_only_with_headroom():
     model = tiny_codec()
@@ -126,6 +128,7 @@ def test_chunked_streaming_matches_whole_sequence_only_with_headroom():
     assert not torch.allclose(legacy, reference, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.cpu
 @torch.no_grad()
 def test_padded_terminal_tail_matches_exact_tail_with_headroom():
     model = tiny_codec()
@@ -147,6 +150,7 @@ def test_padded_terminal_tail_matches_exact_tail_with_headroom():
     torch.testing.assert_close(outputs["padded"], outputs["exact"], rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.cpu
 @torch.no_grad()
 def test_packed_pool_preserves_distinct_scratch_slots_and_decode_state():
     """Packed padding owns separate slots; it must not use main's single null slot."""
@@ -174,8 +178,8 @@ def test_packed_pool_preserves_distinct_scratch_slots_and_decode_state():
         packed.close_decoder_state_pool()
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
     import copy
@@ -236,8 +240,8 @@ def test_packed_session_matches_mixed_length_streams_and_slot_reuse():
         torch.testing.assert_close(audio, snapshot, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
     import copy
@@ -296,8 +300,8 @@ def test_packed_decoder_splits_long_chunks_into_ordered_rounds():
     assert set(decoder._stream_req_slots) == {"long"}
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @torch.no_grad()
 def test_one_frame_one_batch_retains_ordinary_decode():
     from vllm.config import CompilationConfig, VllmConfig

@@ -672,6 +672,9 @@ class DuplexSessionRuntimeConfig:
     max_pending_output_bytes_per_session: int = 2 * 1024 * 1024
     max_pending_output_events_per_session: int = 512
     max_sessions: int = 1
+    replica_policy: Literal["legacy", "least_sessions"] = "legacy"
+    max_sessions_per_replica: int | None = None
+    replica_groups: list[dict[int, int]] | None = None
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
     # framework carries appends as one-way commands on the runner's ordered
@@ -689,6 +692,28 @@ class DuplexSessionRuntimeConfig:
     warmup_frames: int = 0
 
     def __post_init__(self) -> None:
+        if self.replica_policy not in ("legacy", "least_sessions"):
+            raise ValueError("duplex_session.replica_policy must be 'legacy' or 'least_sessions'")
+        if self.max_sessions_per_replica is not None and (
+            isinstance(self.max_sessions_per_replica, bool)
+            or not isinstance(self.max_sessions_per_replica, int)
+            or self.max_sessions_per_replica < 1
+        ):
+            raise ValueError("duplex_session.max_sessions_per_replica must be an integer >= 1 or null")
+        if self.replica_policy == "least_sessions" and self.max_sessions_per_replica is None:
+            raise ValueError("duplex_session.max_sessions_per_replica is required for replica_policy='least_sessions'")
+        if self.replica_groups is not None:
+            if not isinstance(self.replica_groups, list) or not self.replica_groups:
+                raise ValueError("duplex_session.replica_groups must be a nonempty list of stage-to-replica mappings")
+            for index, group in enumerate(self.replica_groups):
+                if not isinstance(group, dict) or not group:
+                    raise ValueError(
+                        f"duplex_session.replica_groups[{index}] must be a nonempty stage-to-replica mapping"
+                    )
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in group):
+                    raise ValueError(f"duplex_session.replica_groups[{index}] stage IDs must be nonnegative integers")
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in group.values()):
+                    raise ValueError(f"duplex_session.replica_groups[{index}] replica IDs must be nonnegative integers")
         positive = {
             "disconnect_grace_s": self.disconnect_grace_s,
             "reaper_interval_s": self.reaper_interval_s,
@@ -710,6 +735,14 @@ class DuplexSessionRuntimeConfig:
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
+
+    @property
+    def worker_max_sessions(self) -> int:
+        """Model-owned state capacity of one worker replica."""
+        if self.replica_policy == "least_sessions":
+            assert self.max_sessions_per_replica is not None
+            return self.max_sessions_per_replica
+        return self.max_sessions
 
 
 @dataclass
@@ -1235,10 +1268,9 @@ def _build_engine_args(
     engine_args["async_chunk"] = resolve_stage_async_chunk(deploy, ds)
     engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
-        # The engine admission limit is also the authoritative capacity for
-        # model-owned streaming state. Propagate it to every stage instead of
-        # making individual models duplicate the value in connector extras.
-        engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
+        # Session placement caps model-owned state per replica. Legacy deploys
+        # retain the global admission limit as their worker capacity.
+        engine_args["duplex_max_sessions"] = deploy.duplex_session.worker_max_sessions
     # The runner selection is a deploy-topology decision owned by the
     # ``model_runner`` field; do not let an opaque ``engine_extras`` entry
     # silently veto or force it per stage.

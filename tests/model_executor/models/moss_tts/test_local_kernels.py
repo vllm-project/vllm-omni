@@ -135,6 +135,7 @@ def test_fused_sampling_graph_rng():
     assert ((result >= 0) & (result < 25)).all()
 
 
+@pytest.mark.nvidia_only
 @torch.inference_mode()
 def test_fused_frame_sampling_and_replay():
     from tests.model_executor.models.moss_tts.test_local_depth_qkv_lookup import _models

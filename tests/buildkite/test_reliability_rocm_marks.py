@@ -99,6 +99,31 @@ def test_qwen_hard_oom_tests_use_absolute_free_memory_ceiling() -> None:
     assert all(item.arg != "max_free_bytes" for item in recovery_calls[0].keywords)
 
 
+def test_qwen_hard_oom_tests_use_the_hip_eager_server_params() -> None:
+    path = RELIABILITY_DIR / "test_reliability_qwen3_omni.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    }
+
+    for test_name in QWEN_HARD_OOM_TESTS:
+        parametrizations = [
+            decorator
+            for decorator in functions[test_name].decorator_list
+            if isinstance(decorator, ast.Call) and _decorator_name(decorator) == "parametrize"
+        ]
+        server_parametrize = next(
+            decorator
+            for decorator in parametrizations
+            if decorator.args
+            and isinstance(decorator.args[0], ast.Constant)
+            and decorator.args[0].value == "omni_server_function"
+        )
+        assert isinstance(server_parametrize.args[1], ast.Name)
+        assert server_parametrize.args[1].id == "QWEN_OOM_PARAMS"
+
+
 def test_nightly_pipeline_does_not_own_fault_injection_files() -> None:
     nightly = NIGHTLY_PIPELINE.read_text(encoding="utf-8")
     for filename in FAULT_CARD_COUNTS:

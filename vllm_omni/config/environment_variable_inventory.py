@@ -181,6 +181,8 @@ _MODEL_PROMOTE = (
     "NEMOTRON_VOICECHAT_LLM_PATH",
     "OMNIVOICE_CUDA_GRAPH",
     "OMNIVOICE_TF32",
+    # Qwen-Image-2.1 runtime controls should migrate to typed model config.
+    "QWEN21_FUSION_PRECISE",
     "VLLM_GEPARD_CHUNK_FRAMES",
     "VLLM_GEPARD_FIRST_CHUNK_FRAMES",
     "VLLM_GEPARD_LOOKBACK_FRAMES",

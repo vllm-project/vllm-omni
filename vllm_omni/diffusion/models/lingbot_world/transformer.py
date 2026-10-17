@@ -491,6 +491,8 @@ class LingBotCrossAttention(nn.Module):
             softmax_scale=self.head_dim**-0.5,
             causal=False,
             role="cross",
+            computation="cross",
+            cross_parallel_layout="local_q_replicated_kv",
             qkv_layout="BSND",
             prefix=prefix,
             skip_sequence_parallel=True,

@@ -12,6 +12,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from .triton_launch import cuda_pdl_launch_kwargs
+
 _gdc_launch = tl.extra.cuda.gdc_launch_dependents
 _gdc_wait = tl.extra.cuda.gdc_wait
 libdevice = tl.extra.cuda.libdevice
@@ -525,8 +527,8 @@ def sample_attend(
         group,
         attend,
         USE_PDL=_USE_PDL,
-        launch_pdl=_USE_PDL,
         num_warps=num_warps,
+        **cuda_pdl_launch_kwargs(_USE_PDL),
     )
     return (out, residual) if attend else None
 
@@ -736,7 +738,7 @@ def add_layer_norm(
             float(norm.eps),
             triton.next_power_of_2(N),
             USE_PDL=_USE_PDL,
-            launch_pdl=_USE_PDL,
             num_warps=4 if N <= 2048 else 8,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
         )
     return res, out
