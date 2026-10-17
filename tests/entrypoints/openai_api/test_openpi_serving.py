@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -520,6 +521,62 @@ def test_extract_actions_does_not_iterate_result_object():
     actions = serving._extract_actions(IterableResult())
 
     np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+
+@pytest.mark.parametrize("metadata", [{"actions": {"horizon": 2}}, {"actions": []}, []])
+def test_extract_actions_rejects_invalid_action_metadata(metadata):
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+    result = OmniRequestOutput.from_diffusion(
+        request_id="contract-test", images=[], multimodal_output={"actions": [[1.0, 2.0]], "metadata": metadata}
+    )
+    with pytest.raises(ValueError):
+        serving._extract_actions(result)
+
+
+def test_extract_actions_checks_handshake_constraints():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=_engine_with_policy_config({"action_horizon": 2, "action_dim": 2})
+    )
+    with pytest.raises(ValueError, match="horizon"):
+        serving._extract_actions(
+            OmniRequestOutput.from_diffusion(
+                request_id="contract-test", images=[], multimodal_output={"actions": [[1.0, 2.0]]}
+            )
+        )
+
+
+@pytest.mark.parametrize("horizon", [2, 3])
+def test_websocket_action_contract_preserves_response_and_generic_errors(monkeypatch, horizon):
+    monkeypatch.setattr(openpi_connection, "_pack", _json_pack)
+    monkeypatch.setattr(openpi_connection, "_unpack", _json_unpack)
+
+    class ContractEngine(RecordingEngine):
+        async def generate(self, **kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id=kwargs["request_id"],
+                images=[],
+                multimodal_output={
+                    "actions": [[1.0, 2.0], [3.0, 4.0]],
+                    "metadata": {"actions": {"horizon": horizon, "valid_steps": 1}},
+                },
+            )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=ContractEngine())
+    app = FastAPI()
+
+    @app.websocket("/v1/realtime/robot/openpi")
+    async def endpoint(websocket: WebSocket):
+        await openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection()
+
+    with TestClient(app) as client, client.websocket_connect("/v1/realtime/robot/openpi") as websocket:
+        assert _json_unpack(websocket.receive_bytes()) == serving.policy_server_config.to_dict()
+        websocket.send_bytes(_json_pack({"prompt": "pick"}))
+        response = _json_unpack(websocket.receive_bytes())
+        if horizon == 2:
+            # Keep all generated steps and the existing actions-only wire response.
+            assert response == [[1.0, 2.0], [3.0, 4.0]]
+        else:
+            assert response == {"type": "error", "message": "Internal inference error"}
 
 
 def test_drop_session_calls_dreamzero_close_hook():

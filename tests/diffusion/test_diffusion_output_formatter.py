@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -16,6 +17,8 @@ from vllm_omni.diffusion.output_formatter import (
     normalize_diffusion_postprocess_output,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.entrypoints.openpi.action_contract import ActionOutput
+from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
@@ -39,6 +42,47 @@ def _request(
 
 def _config(model_class_name: str = "mock_model") -> SimpleNamespace:
     return SimpleNamespace(model_class_name=model_class_name)
+
+
+@pytest.mark.parametrize("named", [False, True])
+def test_robot_policy_envelope_formats_into_validated_openpi_actions(monkeypatch, named):
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    dense_actions = np.zeros((4, 3), dtype=np.float32)
+    actions: ActionOutput = dense_actions
+    config = {"action_horizon": 4, "action_space": "joint_position"}
+    metadata = {"horizon": 4, "valid_steps": 2, "raw_action_dim": 32, "action_mode": "policy", "domain_id": 7}
+    if named:
+        actions = {"arm": dense_actions[None], "gripper": np.zeros((1, 4, 1), dtype=np.float32)}
+        config["action_keys"] = ["arm", "gripper"]
+    else:
+        config["action_dim"] = 3
+        metadata["action_dim"] = 3
+    envelope = {"payload": {"actions": actions}, "metadata": {"actions": metadata}}
+    postprocess_output = normalize_diffusion_postprocess_output(envelope)
+    [result] = format_diffusion_outputs(
+        request=_request(),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output={"actions": actions}),
+        output_data=envelope,
+        postprocess_output=postprocess_output,
+    )
+    engine = SimpleNamespace(model_config={"policy_server_config": config})
+    serving = ServingRealtimeRobotOpenPI(engine_client=engine)
+    extracted = serving._extract_actions(result)
+    assert result.multimodal_output["metadata"]["actions"] == metadata
+    if named:
+        assert isinstance(extracted, dict)
+        assert isinstance(actions, dict)
+        assert set(extracted) == set(actions)
+        for key in actions:
+            np.testing.assert_array_equal(extracted[key], actions[key])
+    else:
+        assert isinstance(extracted, np.ndarray)
+        np.testing.assert_array_equal(extracted, actions)
+    # Dynamic metadata must reach the validator, not just survive formatting.
+    result.multimodal_output["metadata"]["actions"]["horizon"] = 3
+    with pytest.raises(ValueError, match="horizon"):
+        serving._extract_actions(result)
 
 
 def test_formatter_preserves_single_video_audio_actions_and_metadata(
