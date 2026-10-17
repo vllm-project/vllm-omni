@@ -79,7 +79,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
-from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolve_diffusion_moe_lora_token_capacity
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -600,6 +600,11 @@ class DiffusionWorker:
 
         lora_backend = self.od_config.lora_backend
         if lora_backend == LoRABackend.PEFT:
+            assert self.vllm_config is not None
+            max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                self.od_config,
+                self.vllm_config,
+            )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=self.model_runner.pipeline,
                 device=self.device,
@@ -607,6 +612,7 @@ class DiffusionWorker:
                 max_cached_adapters=self.od_config.max_cpu_loras,
                 lora_path=lora_path,
                 lora_scale=self.od_config.lora_scale,
+                max_num_batched_tokens=max_num_batched_tokens,
             )
         elif lora_backend == LoRABackend.DISTILL:
             pipeline = self.model_runner.pipeline
