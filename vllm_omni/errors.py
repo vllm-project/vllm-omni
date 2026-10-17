@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Request-scoped client error types shared across vLLM-Omni entrypoints."""
 
@@ -60,6 +60,28 @@ def is_client_error_status(status_code: int | None) -> bool:
     return status_code is not None and 400 <= int(status_code) < 500
 
 
+def client_error_or(
+    message: str,
+    *,
+    status_code: int | None,
+    error_type: str | None,
+    fallback: Callable[[str], BaseException],
+) -> BaseException:
+    """Return a client error for 4xx statuses, otherwise ``fallback(message)``.
+
+    Centralizes the "client-error-or-fallback" decision shared by the engine
+    and executor error paths so the status mapping lives in one place. Use
+    this form when the exception is handed to a Future instead of raised.
+    """
+    if is_client_error_status(status_code):
+        return client_error_from_metadata(
+            message,
+            status_code=status_code,
+            error_type=error_type,
+        )
+    return fallback(message)
+
+
 def raise_client_error_or(
     message: str,
     *,
@@ -67,15 +89,5 @@ def raise_client_error_or(
     error_type: str | None,
     fallback: Callable[[str], BaseException],
 ) -> NoReturn:
-    """Raise a client error for 4xx statuses, otherwise raise ``fallback(message)``.
-
-    Centralizes the "client-error-or-fallback" decision shared by the engine
-    error paths so the status mapping lives in one place.
-    """
-    if is_client_error_status(status_code):
-        raise client_error_from_metadata(
-            message,
-            status_code=status_code,
-            error_type=error_type,
-        )
-    raise fallback(message)
+    """Raise the exception selected by :func:`client_error_or`."""
+    raise client_error_or(message, status_code=status_code, error_type=error_type, fallback=fallback)
