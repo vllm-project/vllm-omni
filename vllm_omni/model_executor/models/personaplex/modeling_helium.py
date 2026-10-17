@@ -9,6 +9,7 @@ embeddings or depformer; PersonaPlex feeds temporal `inputs_embeds` directly.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from itertools import islice
 
 import torch
@@ -33,6 +34,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
 
 from vllm_omni.model_executor.models.personaplex.configuration_helium import (
     HeliumConfig,
@@ -102,6 +104,85 @@ class HeliumMLP(nn.Module):
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
+
+
+def moshi_attention_window(context: int) -> int:
+    """How many keys, counting its own, a Moshi streaming query attends to.
+
+    Moshi's ``RingKVCache`` holds ``context`` cells but labels the oldest as the
+    next write position, so once it wraps a query attends to the last
+    ``context - 1`` keys (``personaplex_temporal._ringkv_positions`` keeps the
+    same convention). vLLM's sliding window counts the query too, so this is
+    the window that matches Moshi at every position.
+    """
+    return context - 1
+
+
+def check_rope_covers_context(max_model_len: int, max_position_embeddings: int) -> None:
+    """Refuse a context that would read RoPE past Helium's table.
+
+    vllm-omni lets an explicit max_model_len exceed the config's
+    max_position_embeddings (it sets VLLM_ALLOW_LONG_MAX_MODEL_LEN), and vLLM
+    then only warns. Helium's rotary table has one row per position, so a
+    sequence that grows past it would index out of range mid-call.
+    """
+    if max_model_len > max_position_embeddings:
+        raise ValueError(
+            f"max_model_len {max_model_len} exceeds Helium's RoPE table of {max_position_embeddings} "
+            "positions; raise max_position_embeddings with it (PersonaPlex Stage 0: "
+            "hf_overrides.temporal_config.max_position_embeddings)."
+        )
+
+
+def check_window_bounds_kv_cache(max_model_len: int, context: int, kv_cache_spec: KVCacheSpec | None) -> None:
+    """Refuse a context past Helium's window unless the layer's KV cache is windowed.
+
+    A call longer than the window relies on the attention layer resolving to
+    a ``SlidingWindowSpec``: only then does the KV manager free the pages
+    behind the window. With any other spec a long call keeps every page until
+    the pool runs out, so fail at startup instead.
+    """
+    if max_model_len <= context:
+        return
+    window = moshi_attention_window(context)
+    if isinstance(kv_cache_spec, SlidingWindowSpec) and kv_cache_spec.sliding_window == window:
+        return
+    resolved = type(kv_cache_spec).__name__
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        resolved += f"(sliding_window={kv_cache_spec.sliding_window})"
+    raise ValueError(
+        f"max_model_len {max_model_len} runs past Helium's {context}-frame window, which needs a "
+        f"SlidingWindowSpec of {window} keys so the KV behind the window is freed, but the attention "
+        f"backend resolved {resolved}. Use a backend with sliding-window support, or keep "
+        f"max_model_len within {context}."
+    )
+
+
+def check_window_bounds_kv_caches(
+    max_model_len: int,
+    context: int,
+    kv_cache_specs: Iterable[KVCacheSpec | None],
+    *,
+    num_layers: int,
+) -> None:
+    """Check the resolved KV spec of every attention layer on this rank.
+
+    ``kv_cache_specs`` is only consumed when the context exceeds the window.
+    A rank that holds layers but yields no spec was not checked at all, so it
+    is refused too; a rank with no layers (an empty pipeline-parallel slice)
+    holds no Helium KV and has nothing to check.
+    """
+    if max_model_len <= context:
+        return
+    checked = 0
+    for kv_cache_spec in kv_cache_specs:
+        check_window_bounds_kv_cache(max_model_len, context, kv_cache_spec)
+        checked += 1
+    if checked == 0 and num_layers > 0:
+        raise ValueError(
+            f"max_model_len {max_model_len} runs past Helium's {context}-frame window, but none of this "
+            f"rank's {num_layers} layers exposed an attention layer whose KV cache spec could be checked."
+        )
 
 
 def _get_helium_rope(config: HeliumConfig):
@@ -178,7 +259,7 @@ class HeliumAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
-            per_layer_sliding_window=config.sliding_window,
+            per_layer_sliding_window=moshi_attention_window(config.sliding_window),
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
@@ -306,6 +387,7 @@ class HeliumModel(nn.Module):
         # Helium backbone from its temporal sub-config while the engine's top-level
         # hf_config is the composite PersonaPlexConfig. Defaults to the engine's.
         config = config or vllm_config.model_config.hf_config
+        check_rope_covers_context(vllm_config.model_config.max_model_len, config.max_position_embeddings)
         self.config = config
         self.quant_config = vllm_config.quant_config
         self.vocab_size = config.vocab_size
@@ -314,6 +396,12 @@ class HeliumModel(nn.Module):
             config.num_hidden_layers,
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix, config=config),
             prefix=f"{prefix}.layers",
+        )
+        check_window_bounds_kv_caches(
+            vllm_config.model_config.max_model_len,
+            config.sliding_window,
+            (module.get_kv_cache_spec(vllm_config) for module in self.modules() if isinstance(module, Attention)),
+            num_layers=self.end_layer - self.start_layer,
         )
         if get_pp_group().is_last_rank:
             self.norm = HeliumRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
