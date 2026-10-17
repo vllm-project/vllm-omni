@@ -491,14 +491,15 @@ class MiniMaxH3Qwen3VLVisionRotaryEmbedding(nn.Module):
         self.dim = dim
         self.theta = theta
         # Plain attribute (not a registered buffer): the reference keeps this
-        # table in float32 and module-wide dtype casts must not touch it.
-        self._inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        # table in float32 and module-wide dtype casts must not touch it. Build
+        # it on CPU so model construction under a CUDA default-device context
+        # produces the same values as CPU/meta construction.
+        self._inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float, device="cpu") / dim))
 
-    def forward(self, seqlen: int) -> torch.Tensor:
-        inv_freq = self._inv_freq.to(device=self._inv_freq.device)
-        seq = torch.arange(seqlen, device=inv_freq.device, dtype=torch.float)
-        freqs = torch.outer(seq, inv_freq)
-        return freqs
+    def forward(self, seqlen: int, device: torch.device) -> torch.Tensor:
+        seq = torch.arange(seqlen, device="cpu", dtype=torch.float)
+        freqs = torch.outer(seq, self._inv_freq)
+        return freqs.to(device)
 
 
 class MiniMaxH3Qwen3VLVisionPatchMerger(nn.Module):
@@ -643,7 +644,7 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         merge_size = self.spatial_merge_size
         grid_thw_list = grid_thw.tolist()
         max_hw = max(max(h, w) for _, h, w in grid_thw_list)
-        freq_table = self.rotary_pos_emb(max_hw).to(device=grid_thw.device)
+        freq_table = self.rotary_pos_emb(max_hw, grid_thw.device)
         device = freq_table.device
         total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
         pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
