@@ -17,11 +17,13 @@ from vllm_omni.diffusion.models.pi05.config import (
     UnsupportedCheckpointCapabilityError,
     resolve_excluded_action_indices,
 )
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     GemmaVariantConfig,
     PaliGemmaWithActionExpertPi05,
     Pi05AdaRMSNorm,
     Pi05ForActionPrediction,
+    Pi05KVCache,
     create_sinusoidal_pos_embedding,
     get_gemma_config,
     make_att_2d_masks,
@@ -49,6 +51,8 @@ __all__ = [
     "UnsupportedCheckpointCapabilityError",
     "resolve_excluded_action_indices",
     "Pi05ForActionPrediction",
+    "Pi05KVCache",
+    "Pi05CUDAGraphs",
     "PaliGemmaWithActionExpertPi05",
     "Pi05AdaRMSNorm",
     "GemmaVariantConfig",

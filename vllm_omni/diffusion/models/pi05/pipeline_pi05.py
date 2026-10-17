@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from contextlib import nullcontext
 from dataclasses import fields as dataclass_fields
 
 import numpy as np
@@ -33,8 +35,11 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
+from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
+from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -89,7 +94,7 @@ _LEROBOT_FLOAT32_IN_BFLOAT16 = (
 
 
 def _to_bfloat16_for_inference(model: Pi05ForActionPrediction) -> None:
-    """Apply LeRobot's mixed-precision inference layout explicitly."""
+    """Apply the mixed-precision weight layout; decoder activations are separate."""
     inner_model = model.paligemma_with_expert
     for name, param in inner_model.named_parameters():
         target_dtype = (
@@ -130,7 +135,9 @@ class Pi05Pipeline(nn.Module):
         self.model_dir = self._resolve_model_dir(od_config.model)
         self.config = self._build_config(od_config)
 
-        custom_args = od_config.custom_pipeline_args or {}
+        custom_args = getattr(od_config, "custom_pipeline_args", None) or {}
+        self.vision_options = Pi05VisionOptions.from_pipeline_args(custom_args)
+        self.runtime_options = Pi05RuntimeOptions.from_pipeline_args(custom_args)
         self.tokenizer_source = str(custom_args.get("tokenizer", self._resolve_tokenizer_source()))
 
         self._torch_dtype = self._resolve_dtype(od_config)
@@ -138,8 +145,34 @@ class Pi05Pipeline(nn.Module):
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
+        # OpenPI serving is one observation per call (``max_num_seqs: 1``).
+        # Reusable buffers must also accept writes from ordinary no_grad callers
+        # after an outer inference_mode initialization scope has ended.
+        with torch.inference_mode(False), torch.no_grad():
+            self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
+            self._install_cuda_graphs(od_config)
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
+
+    def to(self, *args, **kwargs):
+        # The custom-pipeline loader repeats device placement after construction.
+        # Our graphs are already captured, so only an actual no-op is safe.
+        model = getattr(self, "model", None)
+        if model is None or model.cuda_graphs is None:
+            return super().to(*args, **kwargs)
+        device, dtype, _non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
+        if device is not None and device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        if (
+            dtype is not None
+            or memory_format is not None
+            or (device is not None and any(tensor.device != device for tensor in self.parameters()))
+            or (device is not None and any(tensor.device != device for tensor in self.buffers()))
+        ):
+            raise RuntimeError(
+                "Pi0.5 device/dtype/memory-format changes after CUDA Graph capture require a new pipeline."
+            )
+        return self
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -162,10 +195,14 @@ class Pi05Pipeline(nn.Module):
 
     def _build_config(self, od_config: OmniDiffusionConfig) -> Pi05Config:
         """Read the config from the checkpoint, then let the deploy yaml override it."""
+        model_config = dict(od_config.model_config or {})
+        custom_args = getattr(od_config, "custom_pipeline_args", None) or {}
+        if "pi05_lm_precision" in custom_args:
+            model_config["lm_precision"] = custom_args["pi05_lm_precision"]
         checkpoint_config = Pi05Config.from_pretrained(self.model_dir) if self.model_dir else None
         if checkpoint_config is None:
-            return Pi05Config.from_model_config(od_config.model_config)
-        if not od_config.model_config:
+            return Pi05Config.from_model_config(model_config)
+        if not model_config:
             return checkpoint_config
 
         resolved = {
@@ -175,7 +212,7 @@ class Pi05Pipeline(nn.Module):
         # Comparing against the dataclass default instead would report every
         # serving-only field, such as policy_server_config, on every start.
         declared_keys = _checkpoint_declared_keys(self.model_dir)
-        for key, value in od_config.model_config.items():
+        for key, value in model_config.items():
             if key in resolved and key in declared_keys and _comparable(value) != _comparable(resolved[key]):
                 logger.warning(
                     "Pi05Pipeline: the deploy config sets %s=%r, overriding %r from the checkpoint.",
@@ -183,7 +220,7 @@ class Pi05Pipeline(nn.Module):
                     value,
                     resolved[key],
                 )
-        resolved.update(od_config.model_config)
+        resolved.update(model_config)
         return Pi05Config.from_model_config(resolved)
 
     def _resolve_tokenizer_source(self) -> str:
@@ -234,12 +271,63 @@ class Pi05Pipeline(nn.Module):
         if not self.has_real_checkpoint():
             expected = os.path.join(self.model_dir or "<missing-model-dir>", "model.safetensors")
             raise FileNotFoundError(f"π0.5 serving requires checkpoint weights at {expected}.")
-        model = Pi05ForActionPrediction(self.config)
-        _set_inference_dtype(model, self._torch_dtype)
-        model.to(device=self._device)
-        self._load_checkpoint(model)
-        model.eval()
+        # Cached projections use parameter version counters for invalidation.
+        # Serving may construct us inside inference_mode; keep these weights
+        # and tables as ordinary tensors, without recording gradients.
+        init_context = torch.inference_mode(False) if self.runtime_options.precompute_adarms else nullcontext()
+        with init_context, torch.no_grad():
+            model = Pi05ForActionPrediction(self.config)
+            _set_inference_dtype(model, self._torch_dtype)
+            model.configure_vision(self.vision_options)
+            model.configure_runtime(self.runtime_options)
+            model.to(device=self._device)
+            self._load_checkpoint(model)
+            model.eval()
+            model.prepare_runtime_caches()
+        logger.info(
+            "Pi05Pipeline: vision precision=%s, LM precision=%s, camera batching=%s, "
+            "runtime=%s (experimental options).",
+            self.vision_options.precision,
+            getattr(self.config, "lm_precision", "legacy"),
+            self.vision_options.batch_cameras,
+            self.runtime_options,
+        )
         return model
+
+    def _install_cuda_graphs(self, od_config: OmniDiffusionConfig) -> None:
+        """Pick the ``sample_actions`` execution path.
+
+        The stage's ``enforce_eager`` (deploy yaml, or ``--enforce-eager`` on the
+        CLI, which takes precedence) keeps the eager baseline. Otherwise the
+        optimized path is set up here, at init: the fused Triton kernels are
+        enabled, and the CUDA graphs are captured over them and installed. A
+        failure of either raises rather than silently serving eagerly.
+        """
+        if od_config.enforce_eager:
+            logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
+            return
+        if self._device.type != "cuda":
+            logger.warning(
+                "Pi05Pipeline: CUDA graphs need a CUDA device, got %s; sample_actions runs eagerly.",
+                self._device,
+            )
+            return
+        try:
+            self.model.enable_fused_kernels()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
+                "config, or pass --enforce-eager, to serve eagerly."
+            ) from exc
+        graphs = Pi05CUDAGraphs(self.model)
+        start = time.perf_counter()
+        graphs.capture()
+        self.model.cuda_graphs = graphs
+        logger.info(
+            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s; "
+            "sample_actions runs its optimized path.",
+            time.perf_counter() - start,
+        )
 
     def _load_checkpoint(self, model: Pi05ForActionPrediction) -> None:
         import safetensors.torch
