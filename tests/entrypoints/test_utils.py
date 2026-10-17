@@ -6,8 +6,10 @@
 import logging
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
+import huggingface_hub
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -495,6 +497,115 @@ class TestResolveOmniConfig:
         assert engine_args["extras"]["ltx2_use_conv_vae"] is True
         assert engine_args["extras"]["keep"] == "global"
         assert engine_args["streaming_output"] is True
+
+    @staticmethod
+    def _hub_cache_with(
+        tmp_path: Path, repo_id: str, files: tuple[str, ...] | None, *, interrupted: bool = False
+    ) -> str:
+        """Lay out a Hub cache entry (refs/main plus one snapshot) holding only ``files``.
+
+        ``files=None`` leaves the model out of the cache; ``interrupted`` adds an ``*.incomplete`` blob.
+        """
+        cache_dir = tmp_path / "hub"
+        cache_dir.mkdir()
+        if files is None:
+            return str(cache_dir)
+        commit = "0" * 40
+        repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
+        (repo_dir / "refs").mkdir(parents=True)
+        (repo_dir / "refs" / "main").write_text(commit)
+        (repo_dir / "snapshots" / commit).mkdir(parents=True)
+        for name in files:
+            path = repo_dir / "snapshots" / commit / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}")
+        if interrupted:
+            (repo_dir / "blobs").mkdir()
+            (repo_dir / "blobs" / "0123abcd.incomplete").touch()
+        return str(cache_dir)
+
+    @staticmethod
+    def _unresolved_model_error(
+        mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, model: str, *, offline: bool, cache_dir: str
+    ) -> str:
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", offline)
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", cache_dir)
+        mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+        mocker.patch("vllm_omni.config.resolver._resolve_generic_diffusion_model_class", return_value=(False, None))
+        with pytest.raises(ValueError, match="did not resolve to a registered Omni pipeline") as exc_info:
+            resolve_omni_config(
+                model,
+                trust_remote_code=False,
+                deploy_config_path=None,
+                cli_overrides=None,
+                stage_overrides=None,
+                strategy_config_path=None,
+            )
+        return str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("cached_files", "interrupted", "diagnosis"),
+        [
+            pytest.param(None, False, "not in the local cache", id="not-downloaded"),
+            # #1697: component folders were cached, but model_index.json was not.
+            pytest.param(
+                ("scheduler/scheduler_config.json", "transformer/config.json"),
+                False,
+                "is incomplete",
+                id="partial-pipeline",
+            ),
+            pytest.param(("model.safetensors",), True, "is incomplete", id="interrupted-download"),
+            # A complete repository without these files looks the same offline, so the hint must not guess.
+            pytest.param(("model.safetensors",), False, "otherwise the repository has no", id="cause-unknown"),
+        ],
+    )
+    def test_unresolved_model_explains_offline_cache_miss(
+        self,
+        tmp_path: Path,
+        mocker: MockerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        cached_files: tuple[str, ...] | None,
+        interrupted: bool,
+        diagnosis: str,
+    ):
+        cache_dir = self._hub_cache_with(tmp_path, "acme/partial-pipeline", cached_files, interrupted=interrupted)
+
+        message = self._unresolved_model_error(
+            mocker, monkeypatch, "acme/partial-pipeline", offline=True, cache_dir=cache_dir
+        )
+
+        assert "HF_HUB_OFFLINE" in message
+        assert cache_dir in message
+        assert "`hf download acme/partial-pipeline`" in message
+        assert diagnosis in message
+
+    @pytest.mark.parametrize(
+        ("offline", "cached_files", "model"),
+        [
+            pytest.param(False, (), "acme/partial-pipeline", id="online"),
+            pytest.param(True, ("model_index.json",), "acme/partial-pipeline", id="index-cached"),
+            pytest.param(True, (), "local/model", id="existing-local-dir"),
+            pytest.param(True, (), "/no/such/model/dir", id="missing-local-path"),
+        ],
+    )
+    def test_unresolved_model_keeps_generic_error_without_offline_cache_miss(
+        self,
+        tmp_path: Path,
+        mocker: MockerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+        offline: bool,
+        cached_files: tuple[str, ...],
+        model: str,
+    ):
+        cache_dir = self._hub_cache_with(tmp_path, "acme/partial-pipeline", cached_files)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "local" / "model").mkdir(parents=True)
+
+        message = self._unresolved_model_error(mocker, monkeypatch, model, offline=offline, cache_dir=cache_dir)
+
+        assert (
+            message == f"Model {model!r} did not resolve to a registered Omni pipeline or a supported diffusion model."
+        )
 
     def test_registered_pipeline_uses_structured_metadata_and_preserves_override_trust(self, mocker: MockerFixture):
         endpoint_restriction = SimpleNamespace(name="chat")
