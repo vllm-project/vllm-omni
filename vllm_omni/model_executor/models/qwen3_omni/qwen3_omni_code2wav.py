@@ -337,7 +337,11 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
 
         # Stage 1: Code Embedding
         # Add offset to separate layer vocabularies, then embed and average
-        hidden = self.code_embedding(codes + self.code_offset).mean(1)
+        embedded_codes = self.code_embedding(codes + self.code_offset)
+        # vLLM batch-invariant reductions may return FP32 for low-precision
+        # input. Preserve the embedding/transformer dtype at this boundary.
+        hidden = embedded_codes.mean(1).to(embedded_codes.dtype)
+        del embedded_codes
         # Shape: [batch, seq_len, hidden_size]
 
         # Stage 2: Pre-Transformer (add temporal context)
