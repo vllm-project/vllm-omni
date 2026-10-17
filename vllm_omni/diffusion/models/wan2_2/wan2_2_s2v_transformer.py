@@ -29,6 +29,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -1271,6 +1272,12 @@ class WanS2VTransformer3DModel(nn.Module):
         # Embeddings
         self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.condition_embedder = WanS2VConditionEmbedder(dim, freq_dim, text_dim, text_len)
+
+        # The registry binds packed_modules_mapping to the pipeline class, not to this
+        # transformer, and the config may have been rebuilt from checkpoint metadata.
+        # Bind it here so ignored_layers on to_q/to_k/to_v also cover the fused to_qkv.
+        if quant_config is not None:
+            configure_quant_config(quant_config, type(self))
 
         # Transformer blocks (TP-enabled). Only these are quantized: the audio injector,
         # motioner and embedders keep BF16 weights, as T2V's embedders do.
