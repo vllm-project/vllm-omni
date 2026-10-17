@@ -444,6 +444,7 @@ class OmniSchedulingCoordinator:
         chunk_ready_req_ids: set[str],
     ) -> None:
         queue_snapshot = list(queue)
+        moved: list[Request] | None = None
         for request in queue_snapshot:
             request_can_run = self._request_can_run(request, chunk_ready_req_ids)
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
@@ -468,11 +469,19 @@ class OmniSchedulingCoordinator:
                         self.requests_with_ready_chunks.add(request.request_id)
                     self._waiting_since.pop(request.request_id, None)
                     continue
-            if isinstance(queue, list):
-                queue.remove(request)
-            else:
-                queue.remove_request(request)
+            if moved is None:
+                moved = []
+            moved.append(request)
             waiting_for_chunk_list.append(request)
+
+        # Allocate/filter retained requests only after a move. The common
+        # no-migration path keeps the original per-request work unchanged.
+        if moved is not None:
+            if isinstance(queue, list):
+                moved_ids = {id(request) for request in moved}
+                queue[:] = [request for request in queue_snapshot if id(request) not in moved_ids]
+            else:
+                queue.remove_requests(moved)
 
     def _request_can_run(
         self,
