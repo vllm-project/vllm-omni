@@ -148,27 +148,68 @@ def test_distributed_small_latent_callback_ownership(vae, monkeypatch, rank):
     assert callback.call_count == (2 if rank == 0 else 0)
 
 
-@pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width", "tile"])
-def test_distributed_chunked_routing(monkeypatch, mode):
+def _bare_distributed_vae(monkeypatch, *, mode, use_tiling, world_size=2):
     vae = DistributedAutoencoderKLWan.__new__(DistributedAutoencoderKLWan)
     torch.nn.Module.__init__(vae)
-    vae.use_tiling = True
+    vae.use_tiling = use_tiling
     vae.use_slicing = False
     vae.tile_sample_min_height = vae.tile_sample_min_width = 2
     vae.spatial_compression_ratio = 2
-    vae.distributed_executor = SimpleNamespace(group=None, parallel_mode=mode, parallel_size=2)
+    vae.distributed_executor = SimpleNamespace(group=None, parallel_mode=mode, parallel_size=2, execute=Mock())
     monkeypatch.setattr(vae, "is_distributed_enabled", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda **kwargs: world_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda **kwargs: 0)
+    return vae
+
+
+@pytest.mark.parametrize("use_tiling", [True, False])
+@pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width", "tile"])
+def test_distributed_chunked_routing(monkeypatch, mode, use_tiling):
+    # use_tiling=False is a fresh serving instance: the registry no longer forces tiling for spatial_shard_*.
+    vae = _bare_distributed_vae(monkeypatch, mode=mode, use_tiling=use_tiling)
     decode = Mock()
     monkeypatch.setattr(wan_spatial_shard, "spatial_shard_decode", decode)
+    temporal = Mock()
+    monkeypatch.setattr(vae, "_decode_temporal", temporal)
     callback = Mock()
     z = torch.zeros(1, 2, 2, 2, 2)
-    if mode == "tile":
+    if mode == "tile" and use_tiling:
         with pytest.raises(ValueError, match="require spatial-shard"):
             vae.decode_with_chunks(z, on_chunk=callback)
         decode.assert_not_called()
+    elif mode == "tile":
+        assert vae.decode_with_chunks(z, on_chunk=callback) is None
+        decode.assert_not_called()
+        temporal.assert_called_once_with(z, on_chunk=callback)
     else:
         assert vae.decode_with_chunks(z, on_chunk=callback) is None
         decode.assert_called_once_with(
             vae, z, group=None, return_dict=True, split_dim=mode.removeprefix("spatial_shard_"), on_chunk=callback
         )
+        temporal.assert_not_called()
+
+
+@pytest.mark.parametrize("large", [True, False])
+@pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
+def test_partial_vae_group_decode_falls_back_to_tile_parallel(monkeypatch, mode, large):
+    # vae_patch_parallel_size=2 inside a 4-rank DiT group cannot shard; without native tiling a
+    # large latent must still take the tile-parallel executor rather than a full decode per rank.
+    vae = _bare_distributed_vae(monkeypatch, mode=mode, use_tiling=False, world_size=4)
+    decode = Mock()
+    monkeypatch.setattr(wan_spatial_shard, "spatial_shard_decode", decode)
+    temporal = Mock()
+    monkeypatch.setattr(vae, "_decode_temporal", temporal)
+    merged = torch.ones(1, 3, 1, 4, 4)
+    vae.distributed_executor.execute.return_value = merged
+    z = torch.zeros(1, 2, 1, 2, 2) if large else torch.zeros(1, 2, 1, 1, 1)
+
+    out = vae._decode(z, return_dict=False)
+
+    decode.assert_not_called()
+    if large:
+        vae.distributed_executor.execute.assert_called_once()
+        assert out[0] is merged
+        temporal.assert_not_called()
+    else:
+        vae.distributed_executor.execute.assert_not_called()
+        temporal.assert_called_once_with(z, return_dict=False)

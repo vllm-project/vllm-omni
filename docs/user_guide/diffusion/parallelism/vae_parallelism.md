@@ -218,7 +218,7 @@ vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
 **Constraints and behavior:**
 
 - Spatial-shard decode is **decode-only** and currently implemented for the **Wan** VAE. Other models ignore `spatial_shard_*` modes.
-- It requires `vae_patch_parallel_size` to **match the DiT process group size**. If it does not, the VAE logs a warning and **falls back to tile-parallel decode** at runtime.
+- It requires `vae_patch_parallel_size` to **match the DiT process group size**. If it does not, the VAE logs a warning and **falls back to tile-parallel decode** at runtime for latents larger than one tile, whether or not `vae_use_tiling` is set. Chunked (streaming) decode has no tile-parallel path: there it decodes locally on every rank, or raises if `vae_use_tiling` is set.
 - `spatial_shard_height` and `spatial_shard_width` are mutually exclusive for a given VAE instance (the decoder is patched in place for a single split dimension).
 
 For end-to-end latency/throughput, launch serving with the desired `vae_parallel_mode` and use the existing diffusion serving benchmark:
