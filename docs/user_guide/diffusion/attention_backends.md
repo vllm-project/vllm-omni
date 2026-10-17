@@ -22,6 +22,7 @@ For the internal selector, registry, and platform contract, see
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 | Run VDN-H3 (Video DeltaNet MiniMax-H3) hybrid-attention checkpoints on CUDA | [VDN-H3 Hybrid Attention](attention_backends/vdnh3_attn.md) |
+| Switch attention at fixed denoising steps | [Attention Schedules](attention_backends/schedules.md) |
 
 ## Backend options
 

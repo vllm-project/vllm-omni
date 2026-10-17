@@ -10,7 +10,9 @@ Tests cover:
 - AttentionMetadata.extra field
 """
 
-from dataclasses import replace
+import copy
+import json
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -34,10 +36,12 @@ from vllm_omni.diffusion.config import (
 )
 from vllm_omni.diffusion.data import (
     AttentionConfig,
+    AttentionScheduleConfig,
     AttentionSpec,
     OmniDiffusionConfig,
     build_attention_config,
     parse_attention_config,
+    parse_attention_schedule_config,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -200,6 +204,97 @@ class TestAttentionSpec:
         cfg = RainFusionConfig.from_backend_kwargs(kwargs)
         assert cfg.precision == "mix"
         assert type(cfg.precision) is str
+
+
+class TestAttentionScheduleConfig:
+    @pytest.mark.parametrize(
+        "raw",
+        [None, {}, {"profiles": {}}, {"profiles": {}, "default": []}, "{}", AttentionScheduleConfig()],
+        ids=["none", "empty", "no-profiles", "no-profiles-empty-default", "json", "typed"],
+    )
+    def test_schedule_without_profiles_is_no_schedule(self, raw):
+        # No schedule adds no compile boundary; a config that can select nothing is no schedule.
+        assert parse_attention_schedule_config(raw) is None
+        assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is None
+
+    def test_profiles_resolve_roles_without_baseline_or_environment_merging(self, monkeypatch):
+        monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "SAGE_ATTN")
+        config = OmniDiffusionConfig(
+            diffusion_attention_config={"per_role": {"baseline.only": "FLASH_ATTN"}},
+            diffusion_attention_schedule={
+                "profiles": {
+                    "named": {
+                        "default": "TORCH_SDPA",
+                        "per_role": {"video.self": "FLASH_ATTN", "self": "TRTLLM_ATTN"},
+                    },
+                    "platform": {},
+                }
+            },
+        )
+        profile = config.diffusion_attention_schedule.profiles["named"]
+        assert profile.resolve_with_source("video.self", "self")[0].backend == "FLASH_ATTN"
+        assert profile.resolve_with_source("other.self", "self")[0].backend == "TRTLLM_ATTN"
+        assert profile.resolve_with_source("baseline.only")[0].backend == "TORCH_SDPA"
+        assert config.diffusion_attention_schedule.profiles["platform"].resolve_with_source("baseline.only") == (
+            None,
+            None,
+        )
+        assert config.diffusion_attention_config.default.backend == "SAGE_ATTN"
+
+    @pytest.mark.parametrize("typed", [False, True])
+    def test_schedule_profiles_are_detached_and_round_trip(self, typed):
+        raw = {
+            "profiles": {"sparse": {"default": {"backend": "TRTLLM_ATTN", "skip_softmax": {"threshold": 0.1}}}},
+            "default": [{"start": 3, "end": None, "profile": "sparse"}],
+        }
+        source = AttentionScheduleConfig(**raw) if typed else raw
+        saved = copy.deepcopy(source)
+        config = parse_attention_schedule_config(source)
+        config.profiles["sparse"].default.skip_softmax.threshold = 0.2
+        assert source == saved
+        restored = parse_attention_schedule_config(json.loads(json.dumps(asdict(config))))
+        assert restored == config
+        assert restored is not config
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"profiles": {"bad.name": {}}},
+            {"profiles": {"3bad": {}}},
+            {"profiles": {"sparse": None}},
+            {"profiles": []},
+            {"profiles": {"sparse": "TRTLLM_ATTN"}},
+            {"default": [{"start": 0, "end": None, "profile": "unknown"}]},
+            {"default": None},
+            {"profiles": {}, "typo": []},
+        ],
+    )
+    def test_invalid_server_schedules_fail_during_config_creation(self, raw):
+        with pytest.raises((TypeError, ValueError)):
+            OmniDiffusionConfig(diffusion_attention_schedule=raw)
+
+    def test_unused_profiles_still_validate_backend_parameters(self):
+        with pytest.raises(ValueError, match="skip_softmax"):
+            OmniDiffusionConfig(
+                diffusion_attention_schedule={
+                    "profiles": {"unused": {"default": {"backend": "TORCH_SDPA", "skip_softmax": {"threshold": 0.1}}}}
+                }
+            )
+
+    def test_schedule_profiles_reject_full_compile_granularity(self):
+        # The eager boundary that scheduled attention layers call while compiling is tested under
+        # regional compilation only, so config creation rejects profiles with 'full', as it rejects
+        # 'full' with HSDP, sequence parallelism or offload.
+        raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}}
+        with pytest.raises(ValueError, match="'full' is incompatible with diffusion_attention_schedule"):
+            OmniDiffusionConfig(diffusion_attention_schedule=raw, diffusion_compile_granularity="full")
+        # The same profiles load with regional compilation, and a schedule without profiles is no
+        # schedule, so it loads with 'full'.
+        assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is not None
+        unscheduled = OmniDiffusionConfig(
+            diffusion_attention_schedule={"profiles": {}}, diffusion_compile_granularity="full"
+        )
+        assert unscheduled.diffusion_attention_schedule is None
 
 
 class TestAttentionConfig:
@@ -946,11 +1041,12 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             sdpa_fallback=SimpleNamespace(
                 forward=lambda *args: pytest.fail("unexpected SDPA fallback"),
             ),
-            _assert_metadata_compatible=lambda metadata: None,
+            _assert_metadata_compatible=lambda metadata, **kwargs: None,
             _has_custom_attention=False,
             _scheduler_paged_kv=False,
             paged_kv_cache_role=None,
         )
+        fake_attention.effective_attention = lambda: (fake_attention.attention, None, None)
         query = torch.randn(1, 2, 4, 8, dtype=torch.float32)
 
         output = Attention._run_local_attention(fake_attention, query, query, query, None)
