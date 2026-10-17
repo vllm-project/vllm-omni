@@ -145,8 +145,17 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
     enable_ep: bool,
     use_hsdp: bool,
     hsdp_replicate_size: int = 1,
+    set_proc_title: bool = True,
 ) -> None:
-    """Set the worker process title and log prefix from initialized groups."""
+    """Set the worker process title and log prefix from initialized groups.
+
+    ``set_proc_title=False`` keeps the worker log prefix but leaves the current
+    process title untouched. The UniProc executor runs the worker inline in the
+    engine/API-server process, so renaming it to ``vLLM-Omni::DiffusionWorker``
+    would misidentify the serving process (and let process-kill fault injection
+    hit the API server itself); only dedicated worker processes (mp/ray) adopt
+    the title.
+    """
     process_name = "DiffusionWorker"
     if model_parallel_is_initialized():
         dp_group = get_dp_group()
@@ -178,7 +187,8 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
             if ep_group.world_size > 1:
                 process_name += f"_EP{ep_group.rank_in_group}"
 
-    set_process_title(name=process_name, prefix="vLLM-Omni")
+    if set_proc_title:
+        set_process_title(name=process_name, prefix="vLLM-Omni")
     decorate_logs(process_name)
 
 
@@ -252,11 +262,13 @@ class DiffusionWorker:
         od_config: OmniDiffusionConfig,
         skip_load_model: bool = False,
         distributed_init_method: str | None = None,
+        set_proc_title: bool = True,
     ):
         self.distributed_init_method = distributed_init_method
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
+        self.set_proc_title = set_proc_title
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionModelRunner | None = None
@@ -377,6 +389,7 @@ class DiffusionWorker:
                 enable_ep=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
                 hsdp_replicate_size=parallel_config.hsdp_replicate_size,
+                set_proc_title=self.set_proc_title,
             )
             if (
                 getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1704,6 +1717,7 @@ class WorkerWrapperBase:
         custom_pipeline_args: dict[str, Any] | None = None,
         rank: int | None = None,
         distributed_init_method: str | None = None,
+        set_proc_title: bool = True,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
@@ -1718,6 +1732,10 @@ class WorkerWrapperBase:
                 multiprocessing.
             distributed_init_method: Explicit rendezvous URL, or None for the
                 local launcher's environment-based rendezvous.
+            set_proc_title: Whether the worker may rename the current process.
+                The UniProc executor (inline worker in the engine/API-server
+                process) passes ``False`` so it does not overwrite the serving
+                process title.
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
@@ -1740,6 +1758,8 @@ class WorkerWrapperBase:
         }
         if distributed_init_method is not None:
             worker_init_kwargs["distributed_init_method"] = distributed_init_method
+        if not set_proc_title:
+            worker_init_kwargs["set_proc_title"] = set_proc_title
         worker = worker_class(**worker_init_kwargs)
         try:
             # Re-initialize pipeline with custom pipeline if provided.

@@ -337,7 +337,10 @@ steps:
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: NonBlocking
-  timeout_in_minutes: 20
+  # Build 13918 selected 1635 cases and was killed at 20 minutes while AITER
+  # compiled the masked varlen module, with about half the nodes still queued.
+  # The command timeout leaves five minutes for the summary artifact.
+  timeout_in_minutes: 50
   artifact_paths:
     - "artifacts/rocm-r2-01/**/*"
   commands:
@@ -352,6 +355,7 @@ steps:
     # Verbose pytest output and JUnit retain node IDs without a second
     # collection-only pass over the same GPU-backed test tree.
     - >-
+      timeout --signal=TERM --kill-after=2m 45m
       pytest -s -v -ra
       tests/model_executor/
       -m 'core_model and cuda and not nvidia_only and not

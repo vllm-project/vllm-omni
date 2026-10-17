@@ -17,7 +17,9 @@ markers; post-fault **process** cleanup assertions use the full captured
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import http.client
+import inspect
 import json
 import logging
 import os
@@ -158,6 +160,68 @@ def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] |
     return error_obj
 
 
+_ALLOC_ATTEMPT_TIMEOUT_SEC = 2.0
+
+
+def reliability_scenarios_for_eager_oom(
+    scenarios: list[dict[str, Any]],
+    *,
+    is_hip: bool,
+    stage_ids: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Clone scenarios and force selected HIP stages to allocate eagerly.
+
+    External sidecars only consume device-global free memory. A server can
+    otherwise reuse captured graph pools or cached profile buffers, causing an
+    OOM probe to succeed without making a new device allocation.
+    """
+    cloned = copy.deepcopy(scenarios)
+    if not is_hip:
+        return cloned
+    for scenario in cloned:
+        server_params = scenario["server_params"]
+        updates = server_params.setdefault("update", {})
+        stages = updates.setdefault("stages", {})
+        for stage_id in stage_ids:
+            stages.setdefault(int(stage_id), {})["enforce_eager"] = True
+    return cloned
+
+
+def allocate_device_chunk(
+    req_elems: int,
+    *,
+    allocate: Callable[[int], Any],
+    free_bytes: Callable[[], int],
+    timeout_sec: float = _ALLOC_ATTEMPT_TIMEOUT_SEC,
+) -> Any | None:
+    """Return one chunk, or None when the allocator rejects or stalls.
+
+    A ``RuntimeError``, a call that exceeds ``timeout_sec``, or a call that
+    does not reduce reported free memory is rejection. HIP can log an OOM and
+    retry inside ``allocate`` without raising; the timeout lets the sidecar
+    print READY instead of blocking the startup wait.
+    """
+    import threading
+
+    free_before = int(free_bytes())
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["chunk"] = allocate(req_elems)
+        except RuntimeError as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    if thread.is_alive() or "error" in box or "chunk" not in box:
+        return None
+    if int(free_bytes()) >= free_before:
+        return None
+    return box["chunk"]
+
+
 def _build_sidecar_cmd(
     device: int,
     target_mem_ratio: float,
@@ -165,7 +229,13 @@ def _build_sidecar_cmd(
     strict: bool,
     max_free_bytes: int | None,
 ) -> list[str]:
-    sidecar = r"""
+    sidecar = (
+        "from __future__ import annotations\n"
+        "from collections.abc import Callable\n"
+        "from typing import Any\n"
+        f"_ALLOC_ATTEMPT_TIMEOUT_SEC = {_ALLOC_ATTEMPT_TIMEOUT_SEC!r}\n\n"
+        + inspect.getsource(allocate_device_chunk)
+        + r"""
 import sys
 import time
 import torch
@@ -187,35 +257,48 @@ target_bytes = max(ratio_target_bytes, ceiling_target_bytes)
 chunk_bytes = 256 * 1024 * 1024
 chunks = []
 allocated = 0
+rejected = False
+
+def _take(req_elems):
+    return allocate_device_chunk(
+        req_elems,
+        allocate=lambda n: torch.empty((n,), dtype=torch.float16, device=f"cuda:{device}"),
+        free_bytes=lambda: torch.cuda.mem_get_info(device)[0],
+    )
 
 while allocated < target_bytes:
     req_bytes = min(chunk_bytes, target_bytes - allocated)
     req_elems = max(1, req_bytes // 2)  # float16 -> 2 bytes
-    try:
-        chunk = torch.empty((req_elems,), dtype=torch.float16, device=f"cuda:{device}")
-        chunks.append(chunk)
-        allocated += chunk.numel() * 2
-    except RuntimeError:
+    chunk = _take(req_elems)
+    if chunk is None:
+        rejected = True
         break
+    chunks.append(chunk)
+    allocated += chunk.numel() * 2
 
-# In strict mode, keep filling with smaller chunks until allocator rejects.
-# This minimizes residual free memory and makes fault-path assertions steadier.
-if strict:
+# Strict mode keeps filling with smaller chunks until the allocator rejects.
+# Rejection is a raised error, a stalled call, or an alloc that does not
+# reduce free memory. HIP can log OOM and retry without raising.
+if strict and not rejected:
     tail_chunk_bytes = [64 * 1024 * 1024, 16 * 1024 * 1024, 4 * 1024 * 1024, 1 * 1024 * 1024]
     for tail_bytes in tail_chunk_bytes:
         while True:
-            req_elems = max(1, tail_bytes // 2)
-            try:
-                chunk = torch.empty((req_elems,), dtype=torch.float16, device=f"cuda:{device}")
-                chunks.append(chunk)
-                allocated += chunk.numel() * 2
-            except RuntimeError:
+            chunk = _take(max(1, tail_bytes // 2))
+            if chunk is None:
+                rejected = True
                 break
+            chunks.append(chunk)
+            allocated += chunk.numel() * 2
+        if rejected:
+            break
 
 achieved_ratio = allocated / max(1, props.total_memory)
 achieved_free_ratio = allocated / max(1, int(free_before))
 free_after, _ = torch.cuda.mem_get_info(device)
-ratio_target_missed = strict and allocated < ratio_target_bytes
+# A full device is readiness, even when the byte target was not met.
+residual_floor = 64 * 1024 * 1024 if max_free_bytes is None else max_free_bytes
+allocator_full = rejected and int(free_after) <= residual_floor
+ratio_target_missed = strict and allocated < ratio_target_bytes and not allocator_full
 free_ceiling_missed = max_free_bytes is not None and int(free_after) > max_free_bytes
 if ratio_target_missed or free_ceiling_missed:
     print(
@@ -248,6 +331,7 @@ if hold_seconds <= 0:
 time.sleep(hold_seconds)
 print("DONE", flush=True)
 """
+    )
     return [
         sys.executable,
         "-u",
@@ -541,6 +625,27 @@ def _resolve_runtime_worker_markers(
             )
         )
     return tuple(dict.fromkeys(merged))
+
+
+def _pid_is_dead(pid: int) -> bool:
+    """True when ``pid`` is gone or only a zombie remains."""
+    if not psutil.pid_exists(pid):
+        return True
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return True
+
+
+def _wait_until_pid_dead(pid: int, timeout_sec: float) -> bool:
+    """Poll until ``pid`` is dead or ``timeout_sec`` elapses."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        if _pid_is_dead(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _pid_looks_like_runtime_worker(pid: int, markers: Sequence[str]) -> bool:
@@ -1007,6 +1112,17 @@ def make_server_tree_kill_fault_injector(
     return _inject
 
 
+def _server_is_single_process_uniproc(server: Any) -> bool:
+    """True when the server tree holds only the root process (UniProc inline worker).
+
+    The UniProc executor runs the diffusion worker inside the API-server process,
+    so there is no dedicated worker process to kill; killing the root would take
+    the whole server down. Multi-process deployments (``mp``/``ray``) spawn worker
+    subprocesses as descendants of the root.
+    """
+    return len(_list_server_process_tree(server)) <= 1
+
+
 def make_process_kill_fault_injector(
     *,
     grep_patterns: str | Sequence[str],
@@ -1015,6 +1131,11 @@ def make_process_kill_fault_injector(
     post_kill_wait_seconds: float = 0.0,
 ) -> FaultInjector:
     """Build a post-ready injector that kills processes matched by ordered ``grep_patterns``.
+
+    The worker-kill scenario needs a dedicated worker process: when the server
+    tree holds only the root (UniProc / single process), the injector skips
+    unconditionally — there is no worker to kill, and matching the serving
+    process would tear the whole server down.
 
     Matching is tried in two phases per pattern (first hit wins):
 
@@ -1037,6 +1158,11 @@ def make_process_kill_fault_injector(
 
     def _inject(server: Any) -> None:
         _log_server_process_tree(server)
+        if _server_is_single_process_uniproc(server):
+            pytest.skip(
+                "worker-kill scenario invalid: UniProc single-process deployment has no "
+                "dedicated worker process to kill"
+            )
         server_tree = set(_list_server_process_tree(server))
         if not server_tree:
             logger.warning(
@@ -1055,17 +1181,36 @@ def make_process_kill_fault_injector(
                     flush=True,
                 )
                 os.kill(pid, sig)
+                waited_from = time.monotonic()
+                dead = _wait_until_pid_dead(pid, post_kill_wait_seconds)
+                remaining = post_kill_wait_seconds - (time.monotonic() - waited_from)
+                if dead and remaining > 0:
+                    time.sleep(remaining)
+                print(
+                    f"[reliability][process-kill] killed pid={pid} stage={name} signal={signal_name} dead={int(dead)}",
+                    flush=True,
+                )
+                if signal_name == "SIGKILL" and not dead:
+                    raise RuntimeError(f"pid {pid} ({name}) still alive after SIGKILL")
+            host = getattr(server, "host", None)
+            port = getattr(server, "port", None)
+            if host is not None and port is not None:
+                try:
+                    status, _body = get_health_raw(str(host), int(port), timeout_sec=5)
+                    print(
+                        f"[reliability][process-kill] post-kill health status={status}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 - log the probe, do not hide the kill
+                    print(
+                        f"[reliability][process-kill] post-kill health error={exc!r}",
+                        flush=True,
+                    )
             print(
                 f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
                 f"killed_pids={filtered} killed_count={len(filtered)}",
                 flush=True,
             )
-            if post_kill_wait_seconds > 0:
-                print(
-                    f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
-                    flush=True,
-                )
-                time.sleep(post_kill_wait_seconds)
 
         for pattern in patterns:
             print(

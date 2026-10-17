@@ -71,6 +71,14 @@ def _router_inputs(
 ROUTE_WEIGHT_RTOL = 1e-6
 ROUTE_WEIGHT_ATOL = 1e-6
 
+# ``hardware_test`` selects the CUDA lane without skipping other platforms.
+# These cases assert the fused kernel's lowest-expert tie break. Off NVIDIA
+# CUDA the router falls back to ``torch.topk``, which leaves that order open.
+_requires_fused_cuda_tie_break = pytest.mark.skipif(
+    not current_omni_platform.is_cuda(),
+    reason="MAGI-2 fused routing tie-break is NVIDIA CUDA only",
+)
+
 
 def _resolvable_rows(
     logits: torch.Tensor,
@@ -152,6 +160,7 @@ def test_selection_bias_does_not_reach_the_route_weight() -> None:
     torch.testing.assert_close(probs, expected, rtol=ROUTE_WEIGHT_RTOL, atol=ROUTE_WEIGHT_ATOL)
 
 
+@_requires_fused_cuda_tie_break
 @hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 def test_fused_routing_ties_break_towards_the_lowest_expert() -> None:
     """Exact ties are undefined for torch.topk; the fused kernel is explicit."""
@@ -199,6 +208,7 @@ def test_narrow_dtype_expert_bias_matches_reference(bias_dtype: torch.dtype) -> 
     """Upcasting a narrow bias is exactly the promotion the reference performs."""
 
     logits, expert_bias = _router_inputs(4, 128, 64, device="cuda")
+    assert expert_bias is not None
     expert_bias = expert_bias.to(bias_dtype)
     reference = _reference_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
     fused = compute_topk_probs_and_indices(logits, 5, expert_bias=expert_bias)
@@ -211,6 +221,7 @@ def test_narrow_dtype_expert_bias_matches_reference(bias_dtype: torch.dtype) -> 
     )
 
 
+@_requires_fused_cuda_tie_break
 @hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 def test_exhausted_selection_scores_still_pick_distinct_experts() -> None:
     """Selecting an expert must retire it even when every candidate left is -inf.
@@ -230,6 +241,7 @@ def test_exhausted_selection_scores_still_pick_distinct_experts() -> None:
     assert indices[0, 0].tolist() == [2, 0, 1]
 
 
+@_requires_fused_cuda_tie_break
 @hardware_test(res={"cuda": ["B200", "H100", "L4"]}, num_cards=1)
 @pytest.mark.parametrize("route_norm", [True, False])
 def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> None:
@@ -242,6 +254,7 @@ def test_nan_router_logits_rank_first_and_stay_in_range(route_norm: bool) -> Non
 
     heads, tokens, experts, top_k = 2, 16, 12, 4
     logits, expert_bias = _router_inputs(heads, tokens, experts, device="cuda")
+    assert expert_bias is not None
     logits[0, 0] = float("nan")
     logits[1, 3, [9, 4]] = float("nan")
     # A NaN bias also makes the selection score NaN, but not the route weight.

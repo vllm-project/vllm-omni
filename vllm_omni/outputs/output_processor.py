@@ -21,6 +21,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.multimodal_accumulation import (
@@ -84,6 +85,32 @@ def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, ne
     record[_TPOT_ELAPSED_MS] = total_elapsed_ms
     record[_TPOT_INTERVALS] = total_intervals
     record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
+
+
+def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
+    """Return the observed queue/prefill/decode split of a finished request.
+
+    The intervals match vLLM's ``FinishedRequestStats`` (queued_time,
+    prefill_time, decode_time). vLLM leaves a timestamp at 0.0 when its
+    engine-core event never arrived; subtracting it would invent a duration,
+    so such intervals, and any that would be negative, are omitted instead
+    of reported as 0.
+    """
+    metrics: dict[str, float | int] = {}
+    queued_ts, scheduled_ts = stats.queued_ts, stats.scheduled_ts
+    first_ts, last_ts = stats.first_token_ts, stats.last_token_ts
+    if queued_ts > 0 and scheduled_ts >= queued_ts:
+        metrics[defs.VLLM_QUEUED_MS] = (scheduled_ts - queued_ts) * 1000.0
+    if scheduled_ts > 0 and first_ts >= scheduled_ts:
+        metrics[defs.VLLM_PREFILL_MS] = (first_ts - scheduled_ts) * 1000.0
+    if first_ts > 0 and last_ts >= first_ts:
+        metrics[defs.VLLM_DECODE_MS] = (last_ts - first_ts) * 1000.0
+    if queued_ts > 0 or scheduled_ts > 0:
+        # PREEMPTED rides the same engine-core event stream as QUEUED and
+        # SCHEDULED, so a zero count only means something once that stream
+        # was observed.
+        metrics[defs.VLLM_NUM_PREEMPTIONS] = int(stats.num_preemptions)
+    return metrics
 
 
 class OmniRequestState(RequestState):
@@ -889,6 +916,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_stats=native_stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
+        self._native_text_metric_record(req_state.external_req_id).update(_native_phase_metrics(native_stats))
         if not iteration_stats.finished_requests:
             return
 

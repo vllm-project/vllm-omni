@@ -76,6 +76,7 @@ JOYAI_VL_INTERACTION_ASR_PIPELINE = PipelineConfig(
     model_type="joyai_vl_interaction_asr",
     model_arch="Qwen3ASRForConditionalGeneration",
     default_deploy_config_name="joyai_vl_interaction_asr.yaml",
+    duplex_plugin=JOYAI_VL_INTERACTION_PIPELINE.duplex_plugin,
     stages=(
         # Not ``owns_tokenizer``: JoyAI stays the served model, so request
         # sampling params and the frontend model config target it, not ASR.

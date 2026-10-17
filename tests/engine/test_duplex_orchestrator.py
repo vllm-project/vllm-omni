@@ -350,6 +350,35 @@ def ephemeral_submissions(mocker):
 
 
 @pytest.mark.asyncio
+async def test_nonzero_entry_stage_retains_direct_entry_routing(mocker):
+    orchestrator, clients, _, _ = _build(stages=4)
+    context = DuplexStageRequestContext(
+        request_id="camera-only",
+        session_id="camera",
+        fence=DuplexFence("camera"),
+        stage_id=1,
+        final_stage_id=3,
+        config_generation=0,
+        sampling_params=orchestrator.sampling_defaults(),
+    )
+    orchestrator.ensure_request(context)
+    assert orchestrator.request_states[context.request_id].entry_stage_id == 1
+
+    async def build_request(request_id, stage_id, prompt, params, *, resumable):
+        return build_engine_core_request_from_tokens(request_id, prompt, params, resumable=resumable)
+
+    mocker.patch.object(orchestrator, "_build_next_stage_request", side_effect=build_request)
+    result = await orchestrator.submit(
+        DuplexStageSubmission(
+            context=context, prompt={"prompt_token_ids": [1]}, already_submitted=False, resumable=False
+        )
+    )
+    assert result.stage_id == 1
+    assert not clients[0].add_request_calls and len(clients[1].add_request_calls) == 1
+    await orchestrator.cleanup([context.request_id])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
 async def test_ephemeral_prewarm_does_not_hold_stage_input_lock(ephemeral_submissions, mocker, outcome):
     orchestrator, clients, submissions, _ = ephemeral_submissions

@@ -197,6 +197,20 @@ def test_validate_deployment_requires_a_plugin_and_duplex_session_mode() -> None
         engine._validate_deployment()
 
 
+def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
+    from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_ASR_PIPELINE
+
+    engine = object.__new__(DuplexOmniEngine)
+    engine.plugin = object()
+    engine.pipeline_config = JOYAI_VL_INTERACTION_ASR_PIPELINE
+    engine.duplex_session_config = object()
+    configs = [object(), object(), object(), object()]
+    engine.stage_pools = [SimpleNamespace(stage_vllm_config=SimpleNamespace(model_config=config)) for config in configs]
+    monkeypatch.setattr("vllm_omni.engine.duplex_orchestrator.DuplexOrchestrator", lambda **kwargs: kwargs)
+    result = engine._create_orchestrator()
+    assert result["model_config"] is configs[1]
+
+
 @pytest.mark.asyncio
 async def test_async_wrappers_run_the_blocking_calls_off_the_event_loop() -> None:
     loop = asyncio.get_running_loop()

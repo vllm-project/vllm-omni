@@ -2467,6 +2467,29 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
+@pytest.mark.parametrize("guidance_scale", [0.0, 1.0, 3.0, 5.0])
+@pytest.mark.parametrize("cfg_normalize", [False, True])
+def test_transfer_control_delta_is_independent_of_text_guidance(
+    make_cosmos3_pipeline, guidance_scale, cfg_normalize
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    cond_no_control = torch.tensor([2.0, 4.0])
+    cond_full = torch.tensor([6.0, 10.0])
+    uncond_full = torch.tensor([1.0, 3.0])
+    expected = uncond_full + guidance_scale * (cond_no_control - uncond_full)
+    if guidance_scale != 0.0:
+        expected += 1.5 * (cond_full - cond_no_control)
+    if cfg_normalize:
+        expected = pipeline.cfg_normalize_function(cond_full, expected)
+
+    actual = pipeline.combine_multi_branch_cfg_noise(
+        [cond_full, cond_no_control, uncond_full],
+        {"mode": "cosmos3_transfer", "guidance_scale": guidance_scale, "control_guidance": 1.5},
+        cfg_normalize=cfg_normalize,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -2497,7 +2520,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
-    torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+    torch.testing.assert_close(result, torch.full_like(latents, -46.0))
 
 
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2648,7 +2671,7 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
         (2, False),
         (2, True),
     ]
-    torch.testing.assert_close(result, torch.full_like(latents, 508.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 208.0))
 
 
 @pytest.mark.parametrize(

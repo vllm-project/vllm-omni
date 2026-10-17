@@ -500,6 +500,7 @@ class DuplexSessionManager:
         *,
         stage_id: int,
         fence: DuplexFence | None = None,
+        final_stage_id: int | None = None,
     ) -> DuplexStageRequestContext | None:
         """Reserve the session's stage request id and register it with the stage port."""
         if stage_id >= self.stage_port.stage_count:
@@ -513,7 +514,7 @@ class DuplexSessionManager:
             session_id=session.session_id,
             fence=effective_fence,
             stage_id=stage_id,
-            final_stage_id=self.stage_port.stage_count - 1,
+            final_stage_id=self.stage_port.stage_count - 1 if final_stage_id is None else final_stage_id,
             config_generation=session.config_generation,
             sampling_params=self.sampling_params_for(session),
             session_config=session.config.as_dict(),

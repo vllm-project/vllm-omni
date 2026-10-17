@@ -130,6 +130,25 @@ class TestWorkerWrapperBaseInitialization:
             skip_load_model=False,
         )
 
+    def test_set_proc_title_false_is_forwarded(self, mocker: MockerFixture, mock_od_config):
+        """``set_proc_title=False`` (UniProc inline worker) must reach the worker."""
+        mock_worker_init = mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
+
+        WorkerWrapperBase(
+            gpu_id=0,
+            od_config=mock_od_config,
+            base_worker_class=DiffusionWorker,
+            set_proc_title=False,
+        )
+
+        mock_worker_init.assert_called_once_with(
+            local_rank=0,
+            rank=0,
+            od_config=mock_od_config,
+            skip_load_model=False,
+            set_proc_title=False,
+        )
+
     def test_custom_pipeline_args_without_pipeline_class_loads_normally(self, mocker: MockerFixture, mock_od_config):
         """Test native pipeline args do not trigger custom pipeline re-initialization."""
         custom_args = {"components_path": "/tmp/anima-components"}
