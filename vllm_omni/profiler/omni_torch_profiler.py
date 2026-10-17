@@ -87,6 +87,9 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
 
         Override in subclasses to provide platform-specific defaults.
         """
+        env = os.environ.get("OMNI_PROFILER_ACTIVITIES", "")
+        if env:
+            return [a.strip() for a in env.split(",") if a.strip()]
         return ["CPU", "CUDA"]
 
     def _create_profiler(
