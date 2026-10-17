@@ -268,14 +268,15 @@ def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:
 
 
 class TestReplaceSessionWithStreamingUpdate:
-    def test_resets_tokens_and_prompt_from_update(self) -> None:
+    @pytest.mark.parametrize("max_tokens", [4, 32])
+    def test_resets_tokens_and_prompt_from_update(self, max_tokens: int) -> None:
         sched = _SchedulerStub()
         session = _make_request()
         session.append_output_token_ids([7, 8])
         session.num_computed_tokens = 99
         session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
 
-        update = _make_update(prompt_token_ids=[40, 41, 42])
+        update = _make_update(prompt_token_ids=[40, 41, 42], max_tokens=max_tokens)
         sched.num_waiting_for_streaming_input = 3
         sched._update_request_as_session(session, update)
 
@@ -286,6 +287,7 @@ class TestReplaceSessionWithStreamingUpdate:
         assert session.num_prompt_tokens == 3
         assert session.arrival_time == 200.0
         assert session.sampling_params is update.sampling_params
+        assert session.max_tokens == update.max_tokens
         assert session.status == RequestStatus.WAITING
         assert sched.num_waiting_for_streaming_input == 2
 
