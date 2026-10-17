@@ -130,6 +130,7 @@ class PlaybackLedger:
 @dataclass
 class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
+    revision: int = 0
     #: User items added by ``conversation.item.create`` that no response has
     #: answered yet. A turn can start from these alone, the way the Realtime
     #: protocol allows, without any audio having been committed.
@@ -462,9 +463,21 @@ class DuplexEngineSession:
         return self._input.commit_seq
 
     @property
+    def history_revision(self) -> int:
+        """Monotonic version of committed history, including edits and playback cuts."""
+        return self._conversation.revision
+
+    @property
     def history(self) -> tuple[dict[str, object], ...]:
         placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
         return tuple(dict(message) for message in self._conversation.messages if id(message) not in placeholders)
+
+    def history_snapshot(self) -> tuple[tuple[dict[str, object], ...], tuple[str | None, ...]]:
+        """Snapshot committed messages and their aligned, optional item identities."""
+        placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
+        item_ids = {id(message): item_id for item_id, message in self._conversation.item_ids.items()}
+        messages = [message for message in self._conversation.messages if id(message) not in placeholders]
+        return tuple(dict(message) for message in messages), tuple(item_ids.get(id(message)) for message in messages)
 
     @property
     def active_request_id(self) -> str | None:
@@ -542,6 +555,7 @@ class DuplexEngineSession:
         message: dict[str, object],
     ) -> dict[str, object]:
         """Materialize or update a response item without changing its order."""
+        self._conversation.revision += 1
         existing = self._conversation.item_ids.get(item_id)
         if existing is not None:
             if existing is not message:
@@ -668,6 +682,7 @@ class DuplexEngineSession:
 
     def append_history_message(self, message: dict[str, object]) -> None:
         self._conversation.messages.append(message)
+        self._conversation.revision += 1
 
     def notify_new_user_item(self) -> None:
         """Record a user item that a later ``response.create`` may answer."""
@@ -739,7 +754,7 @@ class DuplexEngineSession:
         message = _object_dict(role="user", content=[input_audio_part])
         if transcript:
             message["transcript"] = transcript
-        self._conversation.messages.append(message)
+        self.append_history_message(message)
         self.turn_state = DuplexTurnState.USER_COMMITTED
         return DuplexCommittedInput(
             message=message,
@@ -784,6 +799,7 @@ class DuplexEngineSession:
             return False
         audio_part["transcript"] = transcript
         message["transcript"] = transcript
+        self._conversation.revision += 1
         return True
 
     def complete_model_turn(self, turn_id: int) -> None:
@@ -1344,7 +1360,7 @@ class DuplexEngineSession:
             if item_id is not None and item_id in self._conversation.history_item_placeholders:
                 self._store_history_item_message(item_id, message)
             else:
-                self._conversation.messages.append(message)
+                self.append_history_message(message)
         effective_playback_policy = playback_commit_policy or self.config.playback_commit_policy
         if (
             response_id is not None
@@ -1438,6 +1454,7 @@ class DuplexEngineSession:
             self._conversation.assistant_response_snapshots.pop(response_id, None)
         if message is None:
             return pending is not None or removed_placeholder
+        self._conversation.revision += 1
         # Distinct response items can have identical (including empty) content.
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not message
@@ -1509,7 +1526,7 @@ class DuplexEngineSession:
                     if item_id.startswith("item_"):
                         self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
                 return changed
-            self._conversation.messages.append(message)
+            self.append_history_message(message)
             self._conversation.item_ids[item_id] = message
             if item_id in self._conversation.pending_item_audio_text_marks:
                 self._conversation.item_audio_text_marks[item_id] = list(
@@ -1529,6 +1546,8 @@ class DuplexEngineSession:
             marks=self._conversation.item_audio_text_marks.get(item_id),
             playback=playback,
         )
+        if changed:
+            self._conversation.revision += 1
         if changed and self._message_text_len(message) <= 0:
             self._conversation.item_ids.pop(item_id, None)
             self._conversation.item_audio_text_marks.pop(item_id, None)

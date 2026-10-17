@@ -395,12 +395,57 @@ def test_truncate_history_item_uses_response_alignment_marks():
     item_id = f"item_{response_id}"
     session.register_history_item(item_id, committed)
 
+    revision = session.history_revision
     assert session.truncate_history_item(item_id, audio_end_ms=1_000) is True
+    assert session.history_revision > revision
 
     assert session.history[-1] == {"role": "assistant", "content": "hello"}
     assert session.history_item_ids[item_id] == {"role": "assistant", "content": "hello"}
+    revision = session.history_revision
     assert session.delete_history_item(item_id) is True
+    assert session.history_revision > revision
     assert session.history == ()
+
+
+def test_history_revision_tracks_append_and_same_length_edit():
+    session = _session()
+    revision = session.history_revision
+    message = {"role": "user", "content": "first"}
+    session.append_history_message(message)
+    assert session.history_revision > revision
+    session.register_history_item("input-1", message)
+    revision = session.history_revision
+    session.register_history_item("input-1", {"role": "user", "content": "other"})
+    assert session.history_revision > revision
+    assert session.history == ({"role": "user", "content": "other"},)
+
+
+def test_history_snapshot_aligns_item_identity_across_late_playback_materialization():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = {"role": "user", "content": "same question"}
+    session.append_history_message(first)
+    session.register_history_item("q1", first)
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.reserve_history_item(item_id)
+    session.append_assistant_text("played answer")
+    session.mark_audio_sent(duration_ms=1_000, text_chars=13)
+    assert session.end_response(commit_text=True) is None
+    second = {"role": "user", "content": "same question"}
+    session.append_history_message(second)
+    session.register_history_item("q2", second)
+    session.append_history_message({"role": "user", "content": "anonymous"})
+    messages, item_ids = session.history_snapshot()
+    assert messages == session.history
+    assert item_ids == ("q1", "q2", None)
+
+    apply_playback_ack(session, {"response_id": response_id, "played_ms": 1_000})
+    messages, item_ids = session.history_snapshot()
+    assert messages == session.history
+    assert item_ids == ("q1", item_id, "q2", None)
+    assert messages[1]["content"] == "played answer"
+    assert session.delete_history_item(item_id)
+    assert session.history_snapshot()[1] == ("q1", "q2", None)
 
 
 # ---- turn signals / model turns ----
@@ -425,8 +470,11 @@ def test_input_transcription_is_idempotent_and_does_not_restore_edited_items(edi
         session.register_history_item("spoken-input", replacement.message)
         assert session.input_audio_part("spoken-input") == audio_part
         assert session.input_audio_part("spoken-input") is not audio_part
+    revision = session.history_revision
     assert session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part) is (edit is None)
+    assert session.history_revision == revision + int(edit is None)
     assert not session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part)
+    assert session.history_revision == revision + int(edit is None)
     if edit is None:
         assert session.history[0]["content"][0]["transcript"] == "Watch the pot."
     elif edit == "replace":
@@ -929,7 +977,7 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self))
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -1097,7 +1145,7 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     wall = {"t": 1_000.0}
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self))
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -1117,7 +1165,7 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self))
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))
