@@ -66,21 +66,45 @@ logger = init_logger(__name__)
 
 
 @contextmanager
-def _deterministic_ltx_vocoder():
-    previous = torch.backends.cudnn.deterministic
+def _deterministic_ltx_vocoder(*, disable_cudnn: bool = False):
+    previous_deterministic = torch.backends.cudnn.deterministic
+    previous_enabled = torch.backends.cudnn.enabled
     try:
-        torch.backends.cudnn.deterministic = True
+        if disable_cudnn:
+            torch.backends.cudnn.enabled = False
+        else:
+            torch.backends.cudnn.deterministic = True
         yield
     finally:
-        torch.backends.cudnn.deterministic = previous
+        torch.backends.cudnn.deterministic = previous_deterministic
+        torch.backends.cudnn.enabled = previous_enabled
+
+
+def _is_rocm_device(device_type: str) -> bool:
+    return device_type == "cuda" and torch.version.hip is not None
 
 
 def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
     """Run the BWE vocoder in FP32, matching the official LTX pipeline."""
     device_type = generated_mel.device.type
-    cudnn_context = _deterministic_ltx_vocoder() if device_type == "cuda" else nullcontext()
+    cudnn_context = (
+        _deterministic_ltx_vocoder(disable_cudnn=_is_rocm_device(device_type))
+        if device_type == "cuda"
+        else nullcontext()
+    )
     with cudnn_context:
         if not hasattr(vocoder, "bwe_generator"):
+            if _is_rocm_device(device_type):
+                input_dtype = generated_mel.dtype
+                parameter = next(vocoder.parameters(), None)
+                module_dtype = parameter.dtype if parameter is not None else None
+                if module_dtype is not None and module_dtype != torch.float32:
+                    vocoder.float()
+                try:
+                    return vocoder(generated_mel.float()).to(input_dtype)
+                finally:
+                    if module_dtype is not None and module_dtype != torch.float32:
+                        vocoder.to(module_dtype)
             return vocoder(generated_mel)
 
         input_dtype = generated_mel.dtype
