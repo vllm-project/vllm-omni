@@ -57,6 +57,24 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
+def _looks_like_dreamx_cam(model_name: str, cfg: Mapping | None = None) -> bool:
+    """Detect DreamX-World-5B-Cam transformer-only (no model_index.json) checkpoints."""
+    try:
+        if cfg is None:
+            raw = get_hf_file_to_dict("config.json", model_name)
+            cfg = raw if isinstance(raw, Mapping) else {}
+        if cfg.get("model_type") != "ti2v":
+            return False
+        if cfg.get("cam_method") != "prope":
+            return False
+        if not cfg.get("add_control_adapter"):
+            return False
+        class_name = str(cfg.get("_class_name", ""))
+        return "Wan" in class_name
+    except Exception:
+        return False
+
+
 def _looks_like_magi2(model_name: str) -> bool:
     """Detect the official Hub ID or a complete local Preview checkpoint."""
     normalized = str(model_name).strip().rstrip("/")
@@ -181,4 +199,9 @@ def is_diffusion_model(model_name: str) -> bool:
     except Exception as e:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_hidream_o1(model_name)
+    return (
+        _looks_like_bagel(model_name)
+        or _looks_like_dreamzero(model_name)
+        or _looks_like_hidream_o1(model_name)
+        or _looks_like_dreamx_cam(model_name)
+    )

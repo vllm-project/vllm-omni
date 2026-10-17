@@ -51,6 +51,14 @@ Usage:
         --image input.jpg --prompt "The scene comes to life with smooth, natural motion." \
         --num-frames 189 --num-inference-steps 35 --guidance-scale 6.0 --fps 24 \
         --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false}'
+
+    # DreamX-World-5B-Cam I2V (camera/action; auto-detected from model id).
+    # Image + caption: upstream configs/dreamx/eval.json (demo/007.jpg).
+    python image_to_video.py --model GD-ML/DreamX-World-5B-Cam \
+        --image demo/007.jpg --prompt "<caption from eval.json>" \
+        --height 704 --width 1280 --num-frames 121 --fps 24 \
+        --num-inference-steps 50 --guidance-scale 3.0 --flow-shift 3.0 --seed 42 \
+        --extra-body '{"action_seq": ["w", "wj"], "action_speed_list": [4, 6]}'
 """
 
 import argparse
@@ -426,6 +434,9 @@ def main():
     is_sana = resolved_model_class_name == "SanaImageToVideoPipeline" or "sana-video" in model_name
     is_cosmos = "cosmos" in model_name or "cosmos" in model_class_name_lower
     is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
+    is_dreamx = "dreamx" in model_name or (model_class_name is not None and "wancamera" in model_class_name.lower())
+    if model_class_name is None and is_dreamx:
+        model_class_name = "WanCameraPipeline"
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -438,7 +449,7 @@ def main():
         raise ValueError("Provide --image, --last-image, or at least one --reference-image.")
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
-    # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
+    # Cosmos3/DreamX would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
     if video_defaults is not None:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
             video_defaults.fps,
@@ -470,6 +481,17 @@ def main():
             10.0,
             1280 * 720,
             16,
+        )
+    elif is_dreamx:
+        # DreamX-World-5B-Cam: 704x1280, 121 frames @ 24fps, CFG 3.0, 50 steps, flow_shift 3.0.
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            3.0,
+            121,
+            50,
+            3.0,
+            704 * 1280,
+            32,
         )
     elif is_ltx2_distilled:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
@@ -518,6 +540,9 @@ def main():
     if video_defaults is not None:
         height = height or video_defaults.height
         width = width or video_defaults.width
+    elif is_dreamx:
+        height = height or 704
+        width = width or 1280
     elif height is None or width is None:
         calc_height, calc_width = calculate_dimensions(dimension_image, max_area=d_max_area, mod_value=d_mod)
         height = height or calc_height
