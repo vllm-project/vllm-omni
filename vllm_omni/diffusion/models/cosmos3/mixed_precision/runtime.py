@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Format-agnostic schedule state, linear discovery, and dispatch."""
 
@@ -45,6 +45,10 @@ class Cosmos3MixedPrecisionLinearMethod(LinearMethodBase):
         self.module_name = module_name
         self.path = path
 
+    def get_base_quant_method(self) -> LinearMethodBase:
+        """Expose the storage/backend method while retaining MAPS dispatch."""
+        return self.base_method
+
     def create_weights(self, *args, **kwargs) -> None:
         self.base_method.create_weights(*args, **kwargs)
 
@@ -64,7 +68,7 @@ class Cosmos3MixedPrecisionLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.runtime.use_high_precision(self.path):
-            return self.base_method.apply(layer, x, bias)
+            return self.strategy.apply_native(self.base_method, layer, x, bias)
         return self.strategy.apply_high(layer, x, bias)
 
 

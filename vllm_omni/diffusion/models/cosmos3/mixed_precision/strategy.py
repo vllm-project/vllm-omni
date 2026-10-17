@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from vllm.config.quantization import QuantSpec
+from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.utils import nvfp4_emulation_utils
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -15,6 +16,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+
+from vllm_omni.diffusion.quantization.hsdp_fp8 import fp8_kernel_weight_view
 
 _NVFP4_BLOCK_SIZE = 16
 
@@ -60,6 +63,15 @@ class Cosmos3PrecisionStrategy:
         """Materialize the live quantized weight as a dense BF16 matrix."""
         raise NotImplementedError
 
+    def apply_native(
+        self,
+        method: LinearMethodBase,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return method.apply(layer, x, bias)
+
     def apply_high(
         self,
         layer: torch.nn.Module,
@@ -100,7 +112,7 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
         weight_scale = getattr(layer, "weight_scale", None)
         if not isinstance(weight_scale, torch.Tensor) or weight_scale.numel() != 1:
             raise ValueError(f"{module_name} requires serialized tensorwise FP8 weights")
-        fp8_kernel = getattr(method, "fp8_linear", None)
+        fp8_kernel = getattr(method, "kernel", None)
         from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
             MarlinFP8ScaledMMLinearKernel,
         )
@@ -139,7 +151,8 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     def materialize(self, layer: torch.nn.Module) -> torch.Tensor:
         input_size = int(layer.input_size_per_partition)
         output_size = int(layer.output_size_per_partition)
-        weight = layer.weight[:input_size, :output_size]
+        row_major = getattr(layer, "_omni_fp8_fsdp_row_major", False)
+        weight = fp8_kernel_weight_view(layer.weight, row_major=row_major)[:input_size, :output_size]
         scale = layer.weight_scale.reshape(1).to(device=weight.device, dtype=torch.float32)
         return (weight.to(torch.float32) * scale).t().to(torch.bfloat16)
 
@@ -149,6 +162,20 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
 
     def accepts(self, method: object | None) -> bool:
         return _has_spec(method, _NVFP4_W4A4_SPEC)
+
+    def apply_native(
+        self,
+        method: LinearMethodBase,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if getattr(layer, "_cosmos3_nvfp4_scale_swizzled", True):
+            return method.apply(layer, x, bias)
+        # vLLM's emulation quantizer accepts matrices, while Cosmos passes
+        # batched activations. Quantization remains independent per input row.
+        output = method.apply(layer, x.reshape(-1, x.shape[-1]), bias)
+        return output.reshape(*x.shape[:-1], output.shape[-1])
 
     def validate_before_processing(
         self,
@@ -160,6 +187,9 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
         from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
             CutlassNvFp4LinearKernel,
         )
+        from vllm.model_executor.kernels.linear.nvfp4.emulation import (
+            EmulationNvFp4LinearKernel,
+        )
         from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
             FlashInferCuteDslNvFp4LinearKernel,
             FlashInferCutlassNvFp4LinearKernel,
@@ -169,16 +199,23 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
             CutlassNvFp4LinearKernel,
             FlashInferCuteDslNvFp4LinearKernel,
             FlashInferCutlassNvFp4LinearKernel,
+            EmulationNvFp4LinearKernel,
         )
         if not isinstance(kernel, compatible_kernels):
             kernel_name = type(kernel).__name__ if kernel is not None else "none"
             raise ValueError(
                 f"{module_name} selected unsupported NVFP4 backend {kernel_name}; "
-                "live W4A16 dequantization requires a CUTLASS-compatible layout"
+                "MAPS requires canonical packed weights with CUTLASS or emulation scales. "
+                "Marlin repacks weights and runs W4A16 without activation quantization; "
+                "select linear_backend='emulation' for emulated W4A4 on GPUs without native FP4"
             )
         global_scale = _nvfp4_global_scale(layer)
         if global_scale is None or global_scale.numel() != 1:
             raise ValueError(f"{module_name} is missing ModelOpt NVFP4 scales")
+        # Emulation retains row-major block scales; CUTLASS-family kernels
+        # swizzle them during post-load processing. Preserve the live layout
+        # rather than copying weights or changing the checkpoint-native path.
+        layer._cosmos3_nvfp4_scale_swizzled = not isinstance(kernel, EmulationNvFp4LinearKernel)
 
     def validate_after_processing(
         self,
@@ -217,7 +254,7 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
             layer.weight_global_scale,
             torch.bfloat16,
             _NVFP4_BLOCK_SIZE,
-            True,
+            getattr(layer, "_cosmos3_nvfp4_scale_swizzled", True),
         )
 
 
