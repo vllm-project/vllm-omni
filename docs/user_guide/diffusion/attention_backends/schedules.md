@@ -4,10 +4,12 @@ An attention schedule selects a named attention profile at zero-based denoising
 step indices. Profiles are prepared at startup; requests select ranges, not new
 backends. Steps outside a range use the base attention configuration.
 
-MiniMax-H3 publishes progress in request and step modes. Configured profiles
-on any other model fail at startup with an `Unsupported diffusion_attention_schedule`
-error, before weights are loaded. Backend and model requirements still apply,
-and a backend's own kernel fallbacks still run when a profile selects it.
+Wan2.2 T2V, I2V, S2V and VACE publish progress in request mode.
+MiniMax-H3 and HunyuanImage-3.0 publish it in request and step modes.
+Configured profiles on any other model fail at startup with an
+`Unsupported diffusion_attention_schedule` error, before weights are loaded.
+Backend and model requirements still apply, and a backend's own kernel
+fallbacks still run when a profile selects it.
 A backend that a profile names is an explicit selection: if it cannot use a
 dense 4D attention mask, the step fails instead of falling back to SDPA. A
 role that the profile leaves out uses the platform default and falls back to
@@ -45,14 +47,14 @@ last step. An open-ended range that starts at or after the end of the sequence
 selects nothing, so `{"start": 6, "end": null}` leaves a request with 6 or
 fewer steps on the base configuration.
 CFG evaluations share one step index.
-Each H3 seed/continuation window restarts at step 0.
+Each S2V clip and each H3 seed/continuation window restarts at step 0.
 Prompt encoding and decoding run with the base configuration.
 
 ## Server configuration
 
 This example keeps the base backend for steps 0–9 and selects Skip-Softmax
 from step 10 onward. It requires a model/platform that supports
-[TRTLLM attention](trtllm.md#requirements).
+[TRTLLM attention](trtllm.md#requirements); it is not suitable for HunyuanImage-3.0.
 
 ```bash
 vllm-omni serve <model> \
@@ -83,10 +85,11 @@ that sets `dtype_qk` or `dtype_vo`.
 
 Set `diffusion_attention_schedule` on the diffusion stage in a deploy YAML,
 using the same object as the server flag. Set its base configuration separately
-with `diffusion_attention_config`. In the bundled disaggregated H3
-deployments, the diffusion stage is `stage_id: 1`. The separate decode stage of
-`minimax_h3_disaggregated_decode` runs no denoising and ignores request
-schedules; configure the schedule on stage 1 only, not through the global flag.
+with `diffusion_attention_config`. In the bundled disaggregated H3 and
+HunyuanImage-3.0 deployments, the diffusion stage is `stage_id: 1`. The separate
+decode stage of `minimax_h3_disaggregated_decode` runs no denoising and ignores
+request schedules; configure the schedule on stage 1 only, not through the
+global flag.
 
 CLI overrides deep-merge profile mappings into the stage configuration.
 A CLI `default` list replaces the stage list rather than appending ranges.
@@ -109,7 +112,7 @@ Put the field in the endpoint's model-specific extras:
 
 - `/v1/videos` and `/v1/videos/sync`: JSON-encoded `extra_params` form field.
 - `/v1/images/generations`: `extra_params`, only for a single diffusion stage;
-  multi-stage image deployments ignore it.
+  multi-stage image deployments ignore it. Use chat for the bundled Hunyuan deployment.
 - Diffusion `/v1/chat/completions`: `extra_args` at the root or inside
   `extra_body`, but not both. With the OpenAI client, use
   `extra_body={"extra_args": {"attention_schedule": [...]}}`.
@@ -131,7 +134,8 @@ omitted schedule.
 A scheduled H3 step batch keeps one packed transformer forward when every
 request is at the same step and sigma and the selected profile's backends
 isolate packed requests; otherwise it runs one forward per request so each
-uses its own progress.
+uses its own progress. A scheduled HunyuanImage-3.0 step batch always runs one
+transformer forward per request.
 
 Malformed schedules return HTTP 400 before dispatch. An unknown profile fails
 when the diffusion stage admits the request, so a disaggregated deployment has
@@ -157,11 +161,13 @@ errors on the job record rather than the creation response.
   Step mode rejects these H3 options regardless of schedule. Non-empty
   default ranges with a `latent_refine` default in `--additional-config`
   fail at startup.
-- Ring attention requires profiles equivalent to the base backend and options.
-  AllGather-KV rejects TRTLLM and sparse RainFusion.
+- Auto-padding sequence parallelism requires mask-capable profiles.
+  Ring and scheduler-managed paged KV require profiles equivalent to the base
+  backend and options. AllGather-KV rejects TRTLLM and sparse RainFusion.
   Configured KV-cache quantization requires dtype support in every candidate.
-- H3 DiT profiles must exclude packed padding; VSA profiles require the VSA
-  gate or a VSA base, and gated FastH3 layers accept only VSA.
+- Hunyuan image attention requires mask support. Wan VSA profiles require a
+  VSA base that constructs its gate. H3 DiT profiles must exclude packed padding;
+  VSA profiles require the VSA gate or a VSA base, and gated FastH3 layers accept only VSA.
   FastH3 checkpoints pin VSA sparsity, so their profiles cannot set
   `fastvideo_vsa_topk`. They also check each VSA profile's provider and
   precision at startup, because warm-up runs only the base. FastH3 deltas fused
