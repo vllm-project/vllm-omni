@@ -44,6 +44,13 @@ logger = init_logger(__name__)
 
 _DEQUEUE_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
+# Bound for execute RPCs on paths where a stuck rank does not poison a
+# collective (request-mode dispatch without AllGather, step-mode). Defaults to
+# unlimited: real request-mode generations routinely exceed the DLO wave bound
+# (a 50-step i2v needs >900s; more steps/frames need more). Set
+# VLLM_OMNI_EXECUTE_RPC_TIMEOUT to bound those RPCs instead.
+_EXECUTE_RPC_TIMEOUT_ENV = os.environ.get("VLLM_OMNI_EXECUTE_RPC_TIMEOUT")
+_EXECUTE_RPC_TIMEOUT_S: float | None = float(_EXECUTE_RPC_TIMEOUT_ENV) if _EXECUTE_RPC_TIMEOUT_ENV is not None else None
 _WORKER_SHUTDOWN_GRACE_S = 15.0
 _WORKER_TERMINATE_GRACE_S = 5.0
 _WORKER_KILL_GRACE_S = 5.0
@@ -493,17 +500,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         t = threading.Thread(target=_monitor, daemon=True, name="diffusion-worker-monitor")
         t.start()
 
-    def _fail_closed_on_dp_wave_timeout(self, exc: TimeoutError) -> None:
-        """Shut down every rank after a partial DP wave times out.
+    def _fail_closed_on_dp_wave_timeout(self, exc: TimeoutError, timeout_s: float | None = None) -> None:
+        """Shut down every rank after a bounded execute RPC times out.
 
-        Once one rank is stuck in a DLO AllGather, that process group cannot be
-        reused safely. Shutting down the executor converts an otherwise
-        permanent request hang into a bounded engine failure and lets the
-        caller restart.
+        When the bound came from a DLO AllGather wave, the rank that never
+        replied leaves that process group unusable, so it cannot be reused
+        safely. On the general execute paths a timed-out rank is equally
+        unrecoverable from the executor's perspective. Shutting down converts
+        an otherwise permanent request hang into a bounded engine failure and
+        lets the caller restart.
         """
+        bound = "an unbounded wait" if timeout_s is None else f"{timeout_s:.1f}s"
         logger.error(
-            "DLO DP collective wave timed out after %.1fs; shutting down the worker group: %s",
-            _DLO_DP_WAVE_TIMEOUT_S,
+            "Diffusion execute RPC timed out after %s; shutting down the worker group: %s",
+            bound,
             exc,
         )
         self._is_failed = True
@@ -607,7 +617,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         raise RuntimeError(f"Unexpected response type [{i}]: {type(res)!r}")
             except Exception as exc:
                 if isinstance(exc, TimeoutError):
-                    self._fail_closed_on_dp_wave_timeout(exc)
+                    self._fail_closed_on_dp_wave_timeout(exc, _DLO_DP_WAVE_TIMEOUT_S)
                 for new_req in new_reqs:
                     runner_outputs.append(
                         RunnerOutput(
@@ -619,13 +629,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     )
             return BatchRunnerOutput.from_list(runner_outputs)
 
+        # AllGather waves keep the unconditional DLO wave bound: a stuck rank
+        # poisons the collective. Every other request-mode dispatch runs under
+        # the general execute bound, which defaults to unlimited so long real
+        # generations are not cut short.
+        allgather_active = any_selected_component_uses_allgather(self.od_config)
+        rpc_timeout_s = _DLO_DP_WAVE_TIMEOUT_S if allgather_active else _EXECUTE_RPC_TIMEOUT_S
+
         for new_req in new_reqs:
             req = new_req.req
             try:
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
-                timeout_options: dict[str, Any] = {"timeout": _DLO_DP_WAVE_TIMEOUT_S}
+                timeout_options: dict[str, Any] = {"timeout": rpc_timeout_s}
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,
@@ -656,7 +673,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     raise RuntimeError(f"Unexpected response type: {type(result)!r}")
             except Exception as exc:
                 if isinstance(exc, TimeoutError):
-                    self._fail_closed_on_dp_wave_timeout(exc)
+                    self._fail_closed_on_dp_wave_timeout(exc, rpc_timeout_s)
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
@@ -699,13 +716,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 args=(scheduler_output, self.od_config),
                 unique_reply_rank=0,
                 exec_all_ranks=True,
-                timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                timeout=_EXECUTE_RPC_TIMEOUT_S,
             )
         except TimeoutError as exc:
-            # A rank that never replied leaves the process group unusable, so
-            # tear the worker group down instead of letting the next wave hang
-            # on it too. Mirrors the execute_request() contract.
-            self._fail_closed_on_dp_wave_timeout(exc)
+            # A rank that never replied leaves the executor unable to make
+            # progress on the next wave too, so tear the worker group down.
+            # The bound itself is the general execute timeout (unlimited by
+            # default), not the DLO wave timeout.
+            self._fail_closed_on_dp_wave_timeout(exc, _EXECUTE_RPC_TIMEOUT_S)
             raise
         if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
             # Propagate async_output_id to per-request RunnerOutputs so the
@@ -758,10 +776,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 args=(scheduler_output,),
                 unique_reply_rank=0,
                 exec_all_ranks=True,
-                timeout=_DLO_DP_WAVE_TIMEOUT_S,
+                timeout=_EXECUTE_RPC_TIMEOUT_S,
             )
         except TimeoutError as exc:
-            self._fail_closed_on_dp_wave_timeout(exc)
+            self._fail_closed_on_dp_wave_timeout(exc, _EXECUTE_RPC_TIMEOUT_S)
             raise
 
         if isinstance(result, BaseRunnerOutput):
