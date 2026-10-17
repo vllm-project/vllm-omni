@@ -99,8 +99,6 @@ def call_model_sampler(
     """
     wants_extra_args = getattr(model, "model_sampler_wants_extra_args", False)
     wants_sampling_params = getattr(model, "model_sampler_wants_sampling_params", False)
-    if not wants_extra_args and not wants_sampling_params:
-        return model_sample(logits, sampling_metadata)
     kwargs: dict[str, Any] = {}
     if wants_extra_args:
         kwargs["per_req_extra_args"] = build_model_sampler_extra_args(input_batch, requests)
@@ -110,6 +108,14 @@ def call_model_sampler(
             getattr(request_states.get(req_id), "sampling_params", None)
             for req_id in getattr(input_batch, "req_ids", [])
         ]
+    if getattr(model, "model_sampler_wants_penalty_flags", False):
+        # These CPU sets track active requests; never inspect the GPU penalty
+        # tensors here. Unknown runner implementations keep the generic path.
+        presence = getattr(input_batch, "presence_penalties_reqs", None)
+        frequency = getattr(input_batch, "frequency_penalties_reqs", None)
+        kwargs["skip_standard_penalties"] = (
+            isinstance(presence, set) and isinstance(frequency, set) and not presence and not frequency
+        )
     return model_sample(logits, sampling_metadata, **kwargs)
 
 

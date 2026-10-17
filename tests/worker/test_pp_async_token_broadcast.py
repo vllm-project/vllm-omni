@@ -89,7 +89,7 @@ def _last_rank_runner(
         spec_decode_metadata=None,
         spec_decode_common_attn_metadata=None,
         hidden_states=hidden,
-        hidden_states_cpu=None,
+        staged_hidden_states=None,
         sample_hidden_states=hidden,
         aux_hidden_states=None,
         ec_connector_output=None,
