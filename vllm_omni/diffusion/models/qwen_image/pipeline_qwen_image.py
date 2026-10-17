@@ -279,6 +279,8 @@ class QwenImagePipeline(
 
     supports_step_execution: ClassVar[bool] = True
 
+    supports_weight_reload: ClassVar[bool] = True
+
     def __init__(
         self,
         *,

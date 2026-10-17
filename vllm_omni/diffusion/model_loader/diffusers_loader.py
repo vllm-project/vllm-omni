@@ -52,6 +52,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
+from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.component_utils import encoder_component_type
 from vllm_omni.diffusion.offloader.config import (
@@ -1281,6 +1282,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")
+        prepare_model_for_weight_reload(model, self.od_config, target_device)
         return model
 
     def _load_model_with_pre_sharded_hsdp(

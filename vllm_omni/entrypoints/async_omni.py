@@ -1288,21 +1288,108 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             request_id,
         )
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
-        """Start a new weight update.
+    def _weight_transfer_stage_ids(self) -> list[int]:
+        """Positional stage indices that have weight transfer configured.
 
-        Omni does not currently support weight transfer, so this is a no-op.
+        Mirrors the deploy semantics: pipeline-wide ``weight_transfer_config``
+        enables every stage; a stage-level override restricts it to that stage.
+        Stages without the feature must not receive lifecycle RPCs — their
+        workers would reject the methods.
+
+        Stage types expose the resolved config differently:
+        - AR/generation: ``pool.stage_vllm_config`` is an upstream
+          ``VllmConfig`` (its ``weight_transfer_config`` field).
+        - Diffusion (inline): ``pool.stage_client.od_config``.
+        - Diffusion (subprocess): ``pool.stage_client.proc_manager.od_config``.
         """
-        logger.debug("Weight update start requested (no-op in omni)")
+        enabled: list[int] = []
+        for index, pool in enumerate(getattr(self.engine, "stage_pools", [])):
+            cfg = getattr(pool, "stage_vllm_config", None)
+            if getattr(cfg, "weight_transfer_config", None) is not None:
+                enabled.append(index)
+                continue
+            diffusion_cfg = getattr(cfg, "diffusion_config", None)
+            if getattr(diffusion_cfg, "weight_transfer_config", None) is not None:
+                enabled.append(index)
+                continue
+            client = getattr(pool, "stage_client", None)
+            od_config = getattr(client, "od_config", None)
+            if od_config is None:
+                od_config = getattr(getattr(client, "proc_manager", None), "od_config", None)
+            if getattr(od_config, "weight_transfer_config", None) is not None:
+                enabled.append(index)
+        return enabled
+
+    @property
+    def weight_transfer_enabled(self) -> bool:
+        """Whether any stage was configured with weight transfer.
+
+        Used to gate the weight-transfer HTTP routes: the admin endpoints are
+        only mounted when the feature is actually enabled via
+        ``weight_transfer_config`` in the deploy config.
+        """
+        return bool(self._weight_transfer_stage_ids())
+
+    async def _weight_transfer_rpc(self, method: str, args: tuple[Any, ...] = ()) -> list[Any]:
+        """Run a weight-transfer lifecycle RPC on the enabled stages, failing on errors.
+
+        ``StagePool.collective_rpc`` reports per-stage failures as
+        ``{"supported": False, "error": ...}`` result dicts instead of raising,
+        so a naive call could return 200 to the HTTP client while one stage
+        silently failed. Any error result therefore raises here; each worker's
+        lifecycle methods reset their own per-stage state on failure, so the
+        surviving stages are left in a consistent idle state and the trainer
+        can retry the full protocol.
+        """
+        stage_ids = self._weight_transfer_stage_ids()
+        if not stage_ids:
+            raise RuntimeError("No stage has weight transfer enabled. Set weight_transfer_config in the deploy config.")
+        results = await self.collective_rpc(method=method, args=args, stage_ids=stage_ids)
+        for result in results:
+            if isinstance(result, dict) and (result.get("error") is not None or result.get("supported") is False):
+                raise RuntimeError(f"{method} failed on a stage: {result.get('error', result)}")
+        return results
+
+    async def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """Initialize weight transfer mechanism across all stages.
+
+        Args:
+            init_info: Backend-specific initialization information
+        """
+        await self._weight_transfer_rpc("init_weight_transfer_engine", (init_info,))
+        logger.info("[%s] Weight transfer engine initialized", self._name)
+
+    async def start_weight_update(self) -> None:
+        """Start a new weight update session across configured stages.
+
+        Each worker delegates preparation to its configured WTE backend,
+        which owns whether the update uses layerwise reload.
+        """
+        await self._weight_transfer_rpc("start_weight_update")
+        logger.info("[%s] Weight update session started", self._name)
+
+    async def update_weights(self, update_info: dict) -> None:
+        """Send weight update chunk to all stages.
+
+        Args:
+            update_info: Backend-specific update information containing weight data
+        """
+        await self._weight_transfer_rpc("update_weights", (update_info,))
+        logger.debug("[%s] Weight chunk forwarded to stages", self._name)
 
     async def finish_weight_update(self, weight_version: str | None = None) -> None:
-        """Finish the current weight update.
+        """Finish the current weight update session across all stages.
 
-        Omni does not currently support weight transfer, so this is a no-op.
-        ``weight_version`` is accepted for upstream ``EngineClient`` protocol
-        compatibility (RLHF weight-transfer routers pass it positionally).
+        Calls ``finish_weight_update()`` on every stage's worker, finalizing
+        the weight transfer and resetting the update target.
+
+        Args:
+            weight_version: Accepted for upstream ``EngineClient`` protocol
+                compatibility (RLHF weight-transfer routers pass it positionally).
+                Currently unused by omni stages.
         """
-        logger.debug("Weight update finish requested (no-op in omni)")
+        await self._weight_transfer_rpc("finish_weight_update")
+        logger.info("[%s] Weight update session finished", self._name)
 
     async def do_log_stats(self) -> None:
         """Log statistics.
