@@ -1006,6 +1006,8 @@ class Flux2KleinPipeline(
             sigmas=sigmas,
             mu=mu,
         )
+        # get_timesteps may replace this with the img2img strength offset.
+        self.scheduler.set_begin_index(0)
         if reference_image is not None or mask_image is not None:
             timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
             if num_inference_steps < 1:
@@ -1016,9 +1018,7 @@ class Flux2KleinPipeline(
         self._num_timesteps = len(timesteps)
 
         # 7. Denoising loop
-        # We set the index here to remove DtoH sync, helpful especially during compilation.
-        # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
-        self.scheduler.set_begin_index(0)
+        # Keep the scheduler begin index resolved above, including img2img strength.
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -1063,14 +1063,15 @@ class Flux2KleinPipeline(
                 latents.size(1) if (image_latents is not None or reference_image_latents is not None) else None
             )
 
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=self.do_classifier_free_guidance,
-                true_cfg_scale=guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-                output_slice=output_slice,
-            )
+            with self._cache_step_metadata(i, len(timesteps)):
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=self.do_classifier_free_guidance,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                    output_slice=output_slice,
+                )
 
             latents_dtype = latents.dtype
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync

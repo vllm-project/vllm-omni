@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import (
     Flux2KleinPipeline,
@@ -117,3 +120,47 @@ def test_check_inputs_accepts_none():
 def test_check_inputs_accepts_positive(steps):
     pipe = _make_pipeline()
     pipe.check_inputs(prompt="valid prompt", height=512, width=512, num_inference_steps=steps)
+
+
+def test_forward_preserves_strength_schedule_at_first_prediction(monkeypatch):
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    class StopAfterFirstPredictionError(Exception):
+        pass
+
+    pipe = _make_pipeline()
+    torch.nn.Module.__init__(pipe)
+    pipe.latent_channels = 4
+    pipe._execution_device = torch.device("cpu")
+    pipe.transformer = SimpleNamespace(config=SimpleNamespace(in_channels=16), dtype=torch.float32)
+    pipe.scheduler = FlowMatchEulerDiscreteScheduler()
+    pipe.vae = SimpleNamespace(dtype=torch.float32)
+    pipe.check_inputs = lambda **kwargs: None
+    pipe.encode_prompt = lambda **kwargs: (torch.zeros(1, 2, 4), torch.zeros(1, 2, 4))
+    pipe.prepare_latents = lambda **kwargs: (torch.zeros(1, 4, 4), torch.zeros(1, 4, 4))
+    pipe.prepare_image_latents = pipe.prepare_latents
+    pipe._cache_context_factory = lambda name: nullcontext()
+
+    def check_first_prediction(**kwargs):
+        assert pipe.scheduler.begin_index == 2
+        assert pipe.num_timesteps == 2
+        assert pipe.current_step_index == 0
+        assert float(pipe.current_sigma) == pytest.approx(0.6)
+        raise StopAfterFirstPredictionError
+
+    monkeypatch.setattr(pipe, "predict_noise", check_first_prediction)
+
+    sampling = OmniDiffusionSamplingParams(
+        height=32,
+        width=32,
+        num_inference_steps=4,
+        sigmas=[1.0, 0.8, 0.6, 0.4],
+        strength=0.5,
+        output_type="latent",
+    )
+    request = SimpleNamespace(
+        sampling_params=sampling,
+        prompts=[{"prompt": "edit", "multi_modal_data": {"reference_image": torch.zeros(1, 4, 2, 2)}}],
+    )
+    with pytest.raises(StopAfterFirstPredictionError):
+        pipe.forward(request)

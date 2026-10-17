@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CFG Parallel Mixin for Qwen Image series
 Shared by
 - QwenImagePipeline
@@ -112,14 +112,15 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 output_slice = latents.size(1) if image_latents is not None else None
 
                 # Predict noise with automatic CFG parallel handling
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg,
-                    true_cfg_scale,
-                    positive_kwargs,
-                    negative_kwargs,
-                    cfg_normalize,
-                    output_slice,
-                )
+                with self._cache_step_metadata(i, len(timesteps)):
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg,
+                        true_cfg_scale,
+                        positive_kwargs,
+                        negative_kwargs,
+                        cfg_normalize,
+                        output_slice,
+                    )
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
