@@ -79,7 +79,7 @@ def test_reset_slots_matches_eager_fills():
 
 
 def test_uva_index_uploads_survive_steps_in_flight():
-    """A mixed eager step uploads four row lists; later steps must not overwrite them.
+    """A step uploads row lists through per-site pools; later steps must not overwrite them.
 
     The GPU is held back, so every read below happens after the CPU issued
     three whole steps (two in flight plus the next), as with async scheduling.
@@ -90,7 +90,7 @@ def test_uva_index_uploads_survive_steps_in_flight():
     depth = 4  # vLLM's default of two concurrent batches, plus two
     state._uva = uva = _UvaIndexPools(16, depth)
     table = torch.arange(1000, device="cuda", dtype=torch.long)
-    sites = [uva.eager_slots, uva.eager_offsets, uva.eager_mtp_slots, uva.rows]
+    sites = [uva.eager_slots, uva.eager_offsets]
     # Load the kernels first: a lazy module load would wait for the sleep.
     table.index_select(0, table[:2]).long()
     torch.accelerator.synchronize()
@@ -103,3 +103,99 @@ def test_uva_index_uploads_survive_steps_in_flight():
     torch.accelerator.synchronize()
     for rows, selected in reads:
         assert selected.tolist() == rows
+
+
+def _rows(gen, n, limit):
+    return torch.randperm(limit, device="cuda", generator=gen)[:n]
+
+
+@pytest.mark.parametrize("bsz", [1, 7, 128])
+def test_add_rows_matches_select_add_copy(bsz):
+    from vllm_omni.model_executor.models.moss_tts.local_state_kernels import add_rows
+
+    gen = torch.Generator(device="cuda").manual_seed(bsz)
+    embeds = torch.randn((3 * bsz + 5, H), device="cuda", generator=gen).to(torch.bfloat16)
+    pool = torch.randn((CAP, H), device="cuda", generator=gen).to(torch.bfloat16)
+    slots, offsets = _rows(gen, bsz, CAP), _rows(gen, bsz, embeds.shape[0])
+    expected = embeds.clone()
+    expected.index_copy_(0, offsets, expected.index_select(0, offsets) + pool.index_select(0, slots))
+    index = _uva(np.stack([slots.cpu().numpy(), offsets.cpu().numpy()], axis=1).astype(np.int64))
+    add_rows(index[:, 1], pool, embeds, src_index=index[:, 0])
+    assert torch.equal(embeds, expected)
+
+    # Implicit source rows and a strided device index (reference conditioning).
+    audio = torch.randn((bsz, H), device="cuda", generator=gen).to(torch.bfloat16)
+    packed = torch.zeros((bsz, NVQ + 1), dtype=torch.long, device="cuda")
+    packed[:, 0] = offsets
+    expected.index_copy_(0, offsets, expected.index_select(0, offsets) + audio)
+    add_rows(packed[:, 0], audio, embeds)
+    assert torch.equal(embeds, expected)
+
+
+def test_snapshot_hidden_matches_last_token_index_copy():
+    from vllm_omni.model_executor.models.moss_tts.local_state_kernels import snapshot_hidden
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    counts = [5, 1, 1, 3, 1]
+    starts = torch.tensor(np.cumsum([0, *counts]), dtype=torch.int32, device="cuda")
+    slots = _rows(gen, len(counts), CAP).to(torch.int32)
+    hidden = torch.randn((sum(counts) + 7, H), device="cuda", generator=gen).to(torch.bfloat16)
+    pool = torch.randn((CAP, H), device="cuda", generator=gen).to(torch.bfloat16)
+    expected = pool.clone()
+    expected.index_copy_(0, slots.long(), hidden.index_select(0, starts[1:] - 1))
+    snapshot_hidden(starts, slots, hidden, pool, len(counts))
+    assert torch.equal(pool, expected)
+
+
+@pytest.mark.parametrize("bsz", [1, 7, 128])
+def test_eager_mtp_gather_scatter_match_eager_ops(bsz):
+    from vllm_omni.model_executor.models.moss_tts.local_state_kernels import gather_eager_mtp, scatter_eager_mtp
+
+    gen = torch.Generator(device="cuda").manual_seed(bsz)
+    hidden_pool = torch.randn((CAP, H), device="cuda", generator=gen).to(torch.bfloat16)
+    keep, active = (torch.rand(CAP, device="cuda", generator=gen) > 0.5 for _ in range(2))
+    slots = _rows(gen, bsz, CAP)
+    first = torch.rand(bsz, device="cuda", generator=gen) > 0.5
+    ids = torch.full((bsz,), 9, dtype=torch.long, device="cuda")
+    emb, hidden, step = (torch.randn((bsz, H), device="cuda", generator=gen).to(torch.bfloat16) for _ in range(3))
+    expected_step = step.clone()
+    expected_step[:, 0].copy_(active.index_select(0, slots) & (keep.index_select(0, slots) | first))
+    index = _uva(np.stack([slots.cpu().numpy(), first.cpu().numpy()], axis=1).astype(np.int64))
+    gather_eager_mtp(index, hidden_pool, keep, active, ids, emb, hidden, step)
+    assert not ids.any() and not emb.any()
+    assert torch.equal(hidden, hidden_pool.index_select(0, slots))
+    assert torch.equal(step, expected_step)
+
+    # Graph outputs are padded past bsz; codes may be a strided view.
+    contribution = torch.randn((bsz + 3, H), device="cuda", generator=gen).to(torch.bfloat16)
+    codes = torch.randint(0, PAD + 1, (bsz + 3, 2 * NVQ), device="cuda", generator=gen)[:, :NVQ]
+    codes[: bsz // 2] = PAD
+    eager_emb = torch.randn((CAP, H), device="cuda", generator=gen).to(torch.bfloat16)
+    codes_pool = torch.randint(0, PAD + 1, (CAP, NVQ), device="cuda", generator=gen)
+    expected = [eager_emb.clone(), codes_pool.clone(), keep.clone()]
+    expected[0].index_copy_(0, slots, contribution[:bsz])
+    expected[1].index_copy_(0, slots, codes[:bsz])
+    expected[2].index_copy_(0, slots, codes[:bsz].ne(PAD).any(dim=-1))
+    scatter_eager_mtp(index, contribution[:bsz], codes[:bsz], eager_emb, codes_pool, keep, PAD)
+    for actual, reference in zip((eager_emb, codes_pool, keep), expected):
+        assert torch.equal(actual, reference)
+
+
+@pytest.mark.parametrize("all_rows", [False, True])
+def test_gather_codes_matches_index_select_and_keep(all_rows):
+    from vllm_omni.model_executor.models.moss_tts.local_state_kernels import gather_codes
+
+    gen = torch.Generator(device="cuda").manual_seed(int(all_rows))
+    codes_pool = torch.randint(0, PAD + 1, (CAP, NVQ), device="cuda", generator=gen)
+    codes_pool[::3] = PAD
+    num_reqs = 40
+    rows = list(range(num_reqs)) if all_rows else [0, 3, 4, 17, 39]
+    slots = _rows(gen, len(rows), CAP)
+    expected_codes = codes_pool.index_select(0, slots)
+    expected_keep = torch.ones(num_reqs, dtype=torch.bool, device="cuda")
+    expected_keep[rows] = expected_codes.ne(PAD).any(dim=-1)
+    out = torch.empty_like(expected_codes)
+    keep = torch.ones(num_reqs, dtype=torch.bool, device="cuda")
+    gather_codes(_uva(np.stack([slots.cpu().numpy(), rows], axis=1).astype(np.int64)), codes_pool, out, keep, PAD)
+    assert torch.equal(out, expected_codes)
+    assert torch.equal(keep, expected_keep)

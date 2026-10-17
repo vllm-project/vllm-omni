@@ -82,6 +82,48 @@ def test_eager_frames_match_canonical_one_step_earlier(device, mocker, first_onl
         assert call.args[2].tolist() == [True]
 
 
+@pytest.mark.parametrize("first_only", [False, True])
+def test_uva_slot_kernels_match_eager_ops(mocker, first_only):
+    """The CUDA UVA path (fused slot kernels, cached unseeded rows) matches the eager-op path."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.utils.platform_utils import is_uva_available
+
+    from vllm_omni.model_executor.models.moss_tts.local_model_state import _UvaIndexPools
+
+    if not is_uva_available():
+        pytest.skip("UVA required")
+    device = torch.device("cuda")
+    schedule = [([3, 0], [2, 2]), ([3, 0], [2, 1]), ([3, 0], [1, 1]), ([0, 3], [1, 1]), ([3, 0], [1, 1])]
+    states = [_state(MossLocalModelState, device) for _ in range(2)]
+    states[1]._uva = _UvaIndexPools(5, 4)
+    publishes = []
+    for state in states:
+        state._local_eager_mtp = not first_only
+        state._early_first_audio = MossEarlyFirstAudioState(state, None)
+        state._first_audio_sender = object()
+        publishes.append(mocker.patch.object(state._early_first_audio, "_publish", side_effect=lambda ids, *_: ids))
+        _admit(state, 3, "long", 17)
+        _admit(state, 0, "short", 17)
+        for slot in (3, 0):
+            state.intermediate_buffer.buffers[slot]["sampling_params"] = SamplingParams(max_tokens=10)
+    runs = []
+    for state in states:
+        torch.manual_seed(0)  # unseeded MTP rows draw from the global generator
+        runs.append(_run(state, device, schedule, stop_step=4 if first_only else 3))
+    (ref_embeds, ref_frames), (uva_embeds, uva_frames) = runs
+    for ref, actual in zip(ref_embeds, uva_embeds, strict=True):
+        torch.testing.assert_close(ref, actual, rtol=0, atol=0)
+    assert ref_frames.keys() == uva_frames.keys()
+    for slot in ref_frames:
+        assert len(ref_frames[slot]) == len(uva_frames[slot]) > 0
+        for (ri, rf), (ui, uf) in zip(ref_frames[slot], uva_frames[slot]):
+            assert ri == ui
+            torch.testing.assert_close(rf, uf, rtol=0, atol=0)
+    calls = [[(c.args[0], c.args[1].tolist(), c.args[2].tolist()) for c in p.call_args_list] for p in publishes]
+    assert calls[0] == calls[1] and calls[0]
+
+
 def test_stopped_stream_does_not_emit_again(device):
     state = _state(MossLocalModelState, device)
     state._local_eager_mtp = True
