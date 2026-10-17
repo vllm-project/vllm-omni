@@ -186,6 +186,31 @@ steps:
             '
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · SenseNova-U1 Pixel Accuracy"
+        timeout_in_minutes: 30
+        source_file_dependencies: diffusion_sensenova_u1_accuracy
+        artifact_paths:
+          - sensenova-accuracy/**/*
+        commands:
+          - |
+            export SENSENOVA_U1_ARTIFACT_DIR=sensenova-accuracy
+            export SENSENOVA_U1_CI_IMAGE="936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$$BUILDKITE_COMMIT"
+            mkdir -p "$$SENSENOVA_U1_ARTIFACT_DIR"
+            set +e
+            pytest -sv tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img_pixel_accuracy \
+              -m 'advanced_model and diffusion and cuda and H100 and cards_1' \
+              --run-level advanced_model --junitxml=sensenova-accuracy/text2img.xml
+            text2img_exit=$$?
+            pytest -sv tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img_pixel_accuracy \
+              -m 'advanced_model and diffusion and cuda and H100 and cards_1' \
+              --run-level advanced_model --junitxml=sensenova-accuracy/img2img.xml
+            img2img_exit=$$?
+            if [ "$$text2img_exit" -ne 0 ]; then
+              exit "$$text2img_exit"
+            fi
+            exit "$$img2img_exit"
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · Wan22 Test"
         source_file_dependencies: diffusion_wan22_function
         commands:

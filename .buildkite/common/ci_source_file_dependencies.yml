@@ -189,6 +189,11 @@ x-lingbot-video: &lingbot_video
 x-lingbot-world: &lingbot_world
   - vllm_omni/diffusion/models/lingbot_world/
 
+x-sensenova-u1: &sensenova_u1
+  - vllm_omni/diffusion/models/sensenova_u1/
+  - vllm_omni/model_extras/sensenova_u1.py
+  - vllm_omni/transformers_utils/configs/sensenova_u1.py
+
 
 source_file_dependencies:
   # Hardware presets and shared test helpers. Not a job key — do not attach this
@@ -496,6 +501,57 @@ source_file_dependencies:
     - *qwen_image
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
+
+  diffusion_sensenova_u1_accuracy:
+    - *sensenova_u1
+    - tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py
+    - tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py
+    - tests/e2e/accuracy/sensenova_u1.py
+    - tests/e2e/accuracy/sensenova_u1_reference.json
+    - tests/helpers/runtime.py
+    # Shared offline inference inputs, without selecting unrelated model trees.
+    - vllm_omni/config/
+    - vllm_omni/engine/
+    - vllm_omni/entrypoints/client_request_state.py
+    - vllm_omni/entrypoints/omni.py
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/utils.py
+    - vllm_omni/inputs/
+    - vllm_omni/outputs/
+    - vllm_omni/model_extras/registry.py
+    - vllm_omni/model_executor/model_loader/weight_utils.py
+    - vllm_omni/transformers_utils/configs/__init__.py
+    - vllm_omni/transformers_utils/repo_utils.py
+    - vllm_omni/platforms/__init__.py
+    - vllm_omni/platforms/interface.py
+    - vllm_omni/platforms/cuda/
+    - vllm_omni/diffusion/config.py
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/diffusion_engine.py
+    - vllm_omni/diffusion/envs.py
+    - vllm_omni/diffusion/forward_context.py
+    - vllm_omni/diffusion/inline_stage_diffusion_client.py
+    - vllm_omni/diffusion/io_support.py
+    - vllm_omni/diffusion/model_metadata.py
+    - vllm_omni/diffusion/output_formatter.py
+    - vllm_omni/diffusion/registry.py
+    - vllm_omni/diffusion/request.py
+    - vllm_omni/diffusion/stage_diffusion_client.py
+    - vllm_omni/diffusion/stage_diffusion_proc.py
+    - vllm_omni/diffusion/vllm_config.py
+    - vllm_omni/diffusion/attention/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/executor/
+    - vllm_omni/diffusion/layers/
+    - vllm_omni/diffusion/model_loader/
+    - vllm_omni/diffusion/models/interface.py
+    - vllm_omni/diffusion/sched/
+    - vllm_omni/diffusion/utils/
+    - vllm_omni/diffusion/worker/
+    - requirements/common.txt
+    - requirements/cuda.txt
+    - docker/Dockerfile.ci
+    - pyproject.toml
 
   diffusion_qwen_image_21_accuracy:
     - *qwen_image_21

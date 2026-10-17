@@ -664,6 +664,88 @@ def test_source_file_dependencies_key_expands_from_registry() -> None:
     assert "Diffusion · Qwen Image Test" not in _surviving_labels(doc, ["vllm_omni/unrelated.py"])
 
 
+@pytest.mark.parametrize(
+    ("changed_file", "selected"),
+    [
+        ("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py", False),
+        ("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py", False),
+        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", False),
+        ("vllm_omni/diffusion/models/sensenova_u1/pipeline_sensenova_u1.py", True),
+        ("vllm_omni/transformers_utils/configs/sensenova_u1.py", True),
+        ("vllm_omni/model_extras/sensenova_u1.py", True),
+        ("tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py", True),
+        ("tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py", True),
+        ("tests/e2e/accuracy/sensenova_u1.py", True),
+        ("tests/e2e/accuracy/sensenova_u1_reference.json", True),
+        ("vllm_omni/diffusion/attention/layer.py", True),
+        ("vllm_omni/diffusion/layers/fused_moe.py", True),
+        ("vllm_omni/diffusion/worker/diffusion_model_runner.py", True),
+        ("vllm_omni/engine/async_omni_engine.py", True),
+        ("vllm_omni/entrypoints/omni.py", True),
+        ("vllm_omni/entrypoints/client_request_state.py", True),
+        ("vllm_omni/entrypoints/utils.py", True),
+        ("vllm_omni/inputs/data.py", True),
+        ("vllm_omni/transformers_utils/repo_utils.py", True),
+        ("vllm_omni/platforms/__init__.py", True),
+        ("vllm_omni/platforms/cuda/platform.py", True),
+        ("vllm_omni/diffusion/model_metadata.py", True),
+        ("vllm_omni/diffusion/io_support.py", True),
+        ("vllm_omni/diffusion/sched/request_scheduler.py", True),
+        ("requirements/common.txt", True),
+    ],
+)
+def test_sensenova_accuracy_merge_source_filter(
+    monkeypatch: pytest.MonkeyPatch, changed_file: str, selected: bool
+) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda/test-merge.yml")
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    labels = _surviving_labels(doc, [changed_file], pipeline_path=path)
+    assert ("Diffusion · SenseNova-U1 Pixel Accuracy" in labels) is selected
+
+
+def test_sensenova_accuracy_runtime_dependency_preserves_other_merge_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda/test-merge.yml")
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    changed_files = ["tests/helpers/runtime.py"]
+    labels = _surviving_labels(doc, changed_files, pipeline_path=path)
+    accuracy_label = "Diffusion · SenseNova-U1 Pixel Accuracy"
+    assert {accuracy_label, "Omni · Qwen3-Omni Async-Chunk SHM Leak"} <= labels
+
+    # The SHM job already matches runtime.py, so adding this dependency must not
+    # change fallback behavior or suppress any previously selected merge job.
+    step = next(step for step in _iter_steps(doc) if step.get("label") == accuracy_label)
+    step.pop("source_file_dependencies")
+    assert labels == _surviving_labels(doc, changed_files, pipeline_path=path)
+
+
+@pytest.mark.parametrize(("changed_files", "selected"), [(None, True), ([], False)])
+def test_sensenova_accuracy_merge_without_diff(
+    monkeypatch: pytest.MonkeyPatch, changed_files: list[str] | None, selected: bool
+) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda/test-merge.yml")
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=changed_files, pipeline_path=path)
+    labels = {step.get("label") for step in _iter_steps(rendered)}
+    assert ("Diffusion · SenseNova-U1 Pixel Accuracy" in labels) is selected
+
+
+def test_sensenova_accuracy_scheduled_e2e_bypasses_source_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+
+    class Context:
+        changed_files = ["vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py"]
+
+    path = Path(".buildkite/cuda/test-merge.yml")
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    changed_files = _changed_files_for_source_filter(Context(), force_all=False, e2e_only=True)
+    rendered = _render_test_pipeline(doc, changed_files=changed_files, pipeline_path=path, e2e_only=True)
+    labels = {step.get("label") for step in _iter_steps(rendered)}
+    assert "Diffusion · SenseNova-U1 Pixel Accuracy" in labels
+
+
 def test_registry_lists_pytest_targets() -> None:
     _load_source_file_dependencies.cache_clear()
     resolved = _resolve_source_file_dependencies(
