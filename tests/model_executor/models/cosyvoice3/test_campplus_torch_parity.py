@@ -11,6 +11,13 @@ exact production transform of ``StepAudio2Token2WavCore._prepare_prompt``:
 with a deterministic synthetic 16 kHz waveform so the test needs no audio
 asset. Requires a real Ascend NPU and the onnx asset, so the default CI run
 skips it; ``CAMPPLUS_ONNX_PATH`` overrides the asset path.
+
+CI note: no ``test-npu-*.yml`` workflow collects this file yet and the
+default asset path is machine-local, so in CI it currently always skips.
+It is meant as a device-side regression gate — run it on any machine with
+an A2 (single-card, 910B) queue slot and the model snapshot. Wiring a CI
+job that points ``CAMPPLUS_ONNX_PATH`` at the HF snapshot is left for a
+follow-up once the NPU queue layout settles.
 """
 
 import hashlib
@@ -80,7 +87,7 @@ def _run_ort(feat: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(out[0])
 
 
-@hardware_test(res={"npu": "A3"}, num_cards=1)
+@hardware_test(res={"npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("n_frames", _TOKEN_LENGTHS)
 def test_campplus_torch_matches_onnx_cpu(n_frames: int) -> None:
     feat = _make_fbank(n_frames)
