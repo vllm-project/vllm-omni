@@ -21,9 +21,35 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
+    from vllm.lora.request import LoRARequest
+
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 logger = init_logger(__name__)
+
+
+def _prompt_list(prompts: OmniPromptType | Sequence[OmniPromptType]) -> list[OmniPromptType]:
+    if isinstance(prompts, str) or not isinstance(prompts, Sequence):
+        return [prompts]
+    return list(prompts)
+
+
+def _lora_request_to_seq(
+    lora_request: Sequence[LoRARequest | None] | LoRARequest | None,
+    num_requests: int,
+) -> list[LoRARequest | None]:
+    """Give each prompt its LoRA request, as vLLM's ``LLM.generate`` does.
+
+    One request (or ``None``) applies to every prompt; a sequence must match
+    the prompts in length and maps its i-th entry to the i-th prompt.
+    """
+    if isinstance(lora_request, Sequence):
+        if len(lora_request) != num_requests:
+            raise ValueError(
+                f"The lengths of prompts ({num_requests}) and lora_request ({len(lora_request)}) must be the same."
+            )
+        return list(lora_request)
+    return [lora_request] * num_requests
 
 
 class Omni(OmniBase):
@@ -63,6 +89,7 @@ class Omni(OmniBase):
         *,
         py_generator: Literal[True],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: Sequence[LoRARequest | None] | LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None]: ...
 
     @overload
@@ -73,6 +100,7 @@ class Omni(OmniBase):
         *,
         py_generator: Literal[False] = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: Sequence[LoRARequest | None] | LoRARequest | None = None,
     ) -> list[OmniRequestOutput]: ...
 
     def generate(
@@ -82,7 +110,35 @@ class Omni(OmniBase):
         *,
         py_generator: bool = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: Sequence[LoRARequest | None] | LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
+        """Generate outputs for one or more prompts.
+
+        Args:
+            prompts: A prompt or a sequence of prompts.
+            sampling_params_list: Sampling params per stage. ``None`` uses the
+                stage defaults.
+            py_generator: Return a generator instead of a list.
+            use_tqdm: Show a progress bar, or pass a ``tqdm``-like factory.
+            lora_request: LoRA request(s) for the stage-0 LLM/AR stage, with
+                the same semantics as vLLM's ``LLM.generate``. One request
+                applies to every prompt; a sequence must have one entry per
+                prompt and maps the i-th entry to the i-th prompt (``None``
+                for no adapter). It is not forwarded to later stages or to CFG
+                companion requests. Diffusion stages take LoRA from
+                ``OmniDiffusionSamplingParams.lora_request`` instead.
+
+        Raises:
+            ValueError: If a ``lora_request`` sequence does not match the
+                prompts in length, or a ``lora_request`` is given when stage 0
+                is a diffusion stage or when prefill-decode disaggregation is
+                enabled, where it would be silently dropped, or when stage 0
+                was started without LoRA enabled.
+        """
+        # Validate before the try block, so a bad argument does not close the engine.
+        lora_requests = _lora_request_to_seq(lora_request, len(_prompt_list(prompts)))
+        if any(request is not None for request in lora_requests):
+            self._check_lora_request_supported()
         # Expand sampling params for PD disaggregation (user may provide N-1 params)
         if (
             sampling_params_list is not None
@@ -93,23 +149,46 @@ class Omni(OmniBase):
         sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
         try:
             if py_generator:
-                return self._run_generation_with_generator(prompts, sampling_params_list, use_tqdm)
-            return list(self._run_generation(prompts, sampling_params_list, use_tqdm))
+                return self._run_generation_with_generator(
+                    prompts, sampling_params_list, use_tqdm, lora_request=lora_requests
+                )
+            return list(self._run_generation(prompts, sampling_params_list, use_tqdm, lora_request=lora_requests))
         except Exception as e:
             logger.exception("[Omni] Failed to run generation: %s", e)
             self.close()
             raise
+
+    def _check_lora_request_supported(self) -> None:
+        """Reject a request-level LoRA in pipelines that would silently drop it."""
+        if self.engine.get_stage_metadata(0).stage_type == "diffusion":
+            raise ValueError(
+                "lora_request applies to a stage-0 LLM/AR stage; for a diffusion stage, "
+                "set OmniDiffusionSamplingParams.lora_request instead."
+            )
+        if self._get_pd_separation_pair() is not None:
+            raise ValueError(
+                "lora_request is not supported with prefill-decode disaggregation: "
+                "the decode stage would run without the adapter."
+            )
+        stage_vllm_configs = getattr(self.engine, "stage_vllm_configs", None) or [None]
+        if stage_vllm_configs[0] is not None and stage_vllm_configs[0].lora_config is None:
+            raise ValueError(
+                "lora_request needs LoRA enabled on stage 0, e.g. "
+                'Omni(model, stage_overrides={"0": {"enable_lora": True, "max_lora_rank": 16}}).'
+            )
 
     def _run_generation_with_generator(
         self,
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: Sequence[LoRARequest | None] | LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None]:
         yield from self._run_generation(
             prompts,
             sampling_params_list,
             use_tqdm,
+            lora_request=lora_request,
         )
 
     def _run_generation(
@@ -117,14 +196,13 @@ class Omni(OmniBase):
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        lora_request: Sequence[LoRARequest | None] | LoRARequest | None = None,
     ) -> Generator[OmniRequestOutput, None, None]:
         try:
             sampling_params_list = self._maybe_force_final_only_for_llm_stages(sampling_params_list)
 
-            if isinstance(prompts, str) or not isinstance(prompts, Sequence):
-                request_prompts: list[OmniPromptType] = [prompts]
-            else:
-                request_prompts = list(prompts)
+            request_prompts = _prompt_list(prompts)
+            request_loras = _lora_request_to_seq(lora_request, len(request_prompts))
 
             if not request_prompts:
                 return
@@ -134,7 +212,7 @@ class Omni(OmniBase):
             wall_start_ts = time.time()
             req_final_stage_ids: dict[str, int] = {}
 
-            for req_id, prompt in zip(request_ids, request_prompts):
+            for req_id, prompt, prompt_lora in zip(request_ids, request_prompts, request_loras):
                 prompt_modalities = prompt.get("modalities", None) if isinstance(prompt, dict) else None
                 final_stage_id = self._compute_final_stage_id(prompt_modalities)
                 final_output_stage_ids = self._compute_final_output_stage_ids(prompt_modalities) or [final_stage_id]
@@ -163,6 +241,7 @@ class Omni(OmniBase):
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id,
                     final_output_stage_ids=final_output_stage_ids,
+                    lora_request=prompt_lora,
                 )
                 submit_ts = time.time()
                 req_state.metrics.stage_first_ts[0] = submit_ts
