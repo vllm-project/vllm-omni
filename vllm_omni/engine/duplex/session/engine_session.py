@@ -390,13 +390,14 @@ class DuplexEngineSession:
     def release_resources_for_request_ids(self, request_ids: Iterable[str]) -> list[str]:
         """Drop bindings for these request ids, whichever fence they sit on.
 
-        ``cancel_fence`` only releases the fence being cancelled. Overlapped
-        draining output stages belong to an older turn fence and would
-        otherwise stay until the session closes.
+        Fence-scoped cancellation only releases the fence being cancelled.
+        Overlapped draining output stages belong to an older turn fence and
+        would otherwise stay until the session closes.
         """
         wanted = {request_id for request_id in request_ids if isinstance(request_id, str) and request_id}
         if not wanted:
             return []
+
         released = list(
             dict.fromkeys(
                 resource.request_id for resource in self.request_resources.values() if resource.request_id in wanted
@@ -409,12 +410,11 @@ class DuplexEngineSession:
         }
         return released
 
-    def cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
-        stale = self.prepare_cancel_fence(cancelled_fence, next_fence)
-        self.release_fence(cancelled_fence)
-        return stale
-
-    def prepare_cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
+    def prepare_cancel_fence(
+        self,
+        cancelled_fence: DuplexFence,
+        next_fence: DuplexFence,
+    ) -> list[str]:
         """Advance the cancellation fence without dropping cleanup records."""
         current = self.accepted_fence
         if cancelled_fence.session_id != self.session_id:

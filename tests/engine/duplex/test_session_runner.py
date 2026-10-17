@@ -80,6 +80,7 @@ class RecordingStagePort(DuplexStagePort):
         #: When set, ``submit`` parks on it after signalling ``submit_started``.
         self.submit_gate: asyncio.Event | None = None
         self.submit_started = asyncio.Event()
+        self.cleanup_failures_remaining = 0
 
     @property
     def stage_count(self) -> int:
@@ -106,6 +107,9 @@ class RecordingStagePort(DuplexStagePort):
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         self.cleanups.append((list(request_ids), abort))
+        if self.cleanup_failures_remaining:
+            self.cleanup_failures_remaining -= 1
+            raise RuntimeError("transient cleanup failure")
 
     async def abort_requests(self, request_ids: list[str]) -> None:
         self.aborts.append(list(request_ids))
@@ -946,6 +950,34 @@ async def test_close_invalidates_draining_audio_before_stage_abort_finishes() ->
         assert h.manager.active_count() == 0
     finally:
         release_abort.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancel_cleanup_failure_retains_requests_for_close_retry() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
+        h.port.cleanup_failures_remaining = 1
+
+        events = await h.run(commands.BargeIn())
+
+        assert h.session.epoch == 1
+        assert find(events, "error").code == "runtime_signal_failed"
+        assert h.port.cleanups == [([request_id], True)]
+        assert h.session.resource_request_ids() == [request_id]
+
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close", session_id=SESSION_ID, reason="client_close")
+        )
+        result = await asyncio.wait_for(h.results.get(), timeout=2.0)
+
+        assert result.ok and result.operation == "close"
+        assert h.port.cleanups == [([request_id], True), ([request_id], True)]
+        assert h.session.resource_request_ids() == []
+    finally:
         await close_harness(h)
 
 
