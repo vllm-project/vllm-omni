@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import base64
 import io
@@ -381,7 +384,7 @@ def run_inference_api(
         else:
             # Streaming mode: yield incremental updates
             text_content = ""
-            audio_output = None
+            wav_params: dict[int, tuple[int, int, str]] = {}
 
             for chunk in chat_completion:
                 for choice in chunk.choices:
@@ -393,29 +396,43 @@ def run_inference_api(
                     # Handle audio modality
                     if getattr(chunk, "modality", None) == "audio" and content:
                         try:
-                            # Decode base64 audio
                             audio_data = base64.b64decode(content)
-                            # Load audio from bytes
-                            audio_np, sample_rate = sf.read(io.BytesIO(audio_data))
-                            # Convert to mono if needed
-                            if audio_np.ndim > 1:
-                                audio_np = audio_np[:, 0]
-                            audio_output = (int(sample_rate), audio_np.astype(np.float32))
-                            # Yield current text and audio
-                            yield text_content if text_content else "", audio_output
+                            if choice.index in wav_params:
+                                sample_rate, channels, subtype = wav_params[choice.index]
+                                audio_np, _ = sf.read(
+                                    io.BytesIO(audio_data),
+                                    format="RAW",
+                                    samplerate=sample_rate,
+                                    channels=channels,
+                                    subtype=subtype,
+                                    endian="LITTLE",
+                                    dtype="float32",
+                                )
+                            else:
+                                with sf.SoundFile(io.BytesIO(audio_data)) as audio_file:
+                                    sample_rate = int(audio_file.samplerate)
+                                    audio_np = audio_file.read(dtype="float32")
+                                    # Only the first WAV chunk carries its header.
+                                    # Cache parameters per choice for later PCM chunks.
+                                    if audio_file.format == "WAV":
+                                        wav_params[choice.index] = (
+                                            sample_rate,
+                                            audio_file.channels,
+                                            audio_file.subtype,
+                                        )
+                            yield text_content if text_content else "", (sample_rate, audio_np)
                         except Exception:  # pylint: disable=broad-except
                             # If audio processing fails, just yield text
-                            yield text_content if text_content else "", None
+                            yield text_content if text_content else "", gr.skip()
 
                     # Handle text modality
                     elif getattr(chunk, "modality", None) == "text":
                         if content:
                             text_content += content
-                            # Yield updated text content (keep existing audio if any)
-                            yield text_content, audio_output
+                            # Update text without sending the previous audio chunk again.
+                            yield text_content, gr.skip()
 
-            # Final yield with accumulated text and last audio (if any)
-            yield text_content if text_content else "No text output.", audio_output
+            yield text_content if text_content else "No text output.", gr.skip()
 
     except Exception as exc:  # pylint: disable=broad-except
         error_msg = f"Inference failed: {exc}"

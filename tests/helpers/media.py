@@ -672,13 +672,19 @@ class _AudioBuffer:
 
 
 def _merge_base64_audio_to_segment(base64_list: list[str]) -> _AudioBuffer:
+    raw_chunks = [base64.b64decode(b64.split(",", 1)[-1]) for b64 in base64_list]
+    if raw_chunks and raw_chunks[0].startswith(b"RIFF"):
+        # Chat WAV streams have one header, followed by raw PCM chunks.
+        # Decode the complete stream to preserve its native rate and channels.
+        waveform, sr = sf.read(io.BytesIO(b"".join(raw_chunks)), dtype="float32")
+        return _AudioBuffer(waveform, int(sr))
+
     from vllm.multimodal.media.audio import AudioMediaIO
 
     io_ = AudioMediaIO()
     chunks: list[np.ndarray] = []
     sample_rate: int | None = None
-    for b64 in base64_list:
-        raw = base64.b64decode(b64.split(",", 1)[-1])
+    for raw in raw_chunks:
         waveform, sr = io_.load_bytes(raw)
         if sample_rate is None:
             sample_rate = int(sr)
