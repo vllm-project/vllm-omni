@@ -271,6 +271,36 @@ def test_decode_fork_rejects_empty_plan():
         _decode_temporal_streaming_uint8(model, torch.randn(1, 3, 0, 4, 4), None, None, 0, 0, None)
 
 
+def test_decode_fork_accepts_explicit_null_callback():
+    z = torch.randn(1, 3, 4, 4, 4)
+    expected = _DecodeModel().legacy_streaming(z.clone(), None, None, 2, 0, None)
+    actual = _decode_temporal_streaming_uint8(_DecodeModel(), z.clone(), None, None, 2, 0, None, output_callback=None)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_install_preserves_raw_callback_contract_across_reinstallation():
+    from types import SimpleNamespace
+
+    calls = []
+    raw = torch.randn(1, 3, 4, 4, 4)
+
+    def original(*args, output_callback=None):
+        calls.append(args)
+        output_callback(raw, 0, 4)
+        return None
+
+    model = SimpleNamespace(_decode_temporal_streaming=original, processor=_FakeProcessor())
+    install_temporal_stream_patches(model)
+    install_temporal_stream_patches(model)
+    delivered = []
+    result = model._decode_temporal_streaming(
+        raw, None, None, 2, 0, None, output_callback=lambda *args: delivered.append(args)
+    )
+    assert result is None and len(calls) == 1
+    assert delivered[0][0] is raw
+    assert delivered[0][1:] == (0, 4)
+
+
 # ---------------------------------------------------------------------------
 # install + escape hatch
 # ---------------------------------------------------------------------------
