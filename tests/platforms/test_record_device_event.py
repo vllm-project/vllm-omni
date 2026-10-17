@@ -106,23 +106,32 @@ class TestXPUOmniPlatformRecordDeviceEvent:
 
 
 class TestNPUOmniPlatformRecordDeviceEvent:
-    """Test NPUOmniPlatform.record_device_event with mocked torch.npu."""
+    """Test NPUOmniPlatform.record_device_event with mocked torch.npu.
+
+    The recorded event is the only cross-stream ordering primitive: the async
+    output thread waits on it through the public ``torch.Stream`` wrapper before
+    its D2H copies. The method must not touch host-side stream state -- a
+    ``current_stream().synchronize()`` blocks the worker's event loop for the
+    whole device tail without ordering any other stream (#7894).
+    """
 
     def test_returns_none_on_failure(self, mocker):
-        """When torch.npu.current_stream().synchronize() fails, return None."""
+        """When event recording fails, return None."""
         try:
             from vllm_omni.platforms.npu.platform import NPUOmniPlatform
         except ModuleNotFoundError:
             pytest.skip("vllm_ascend not available")
 
+        mock_event = mocker.MagicMock()
+        mock_event.record.side_effect = RuntimeError("no NPU")
         mock_torch = mocker.MagicMock()
-        mock_torch.npu.current_stream.return_value.synchronize.side_effect = RuntimeError("no NPU")
+        mock_torch.Event.return_value = mock_event
         mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
 
         result = NPUOmniPlatform.record_device_event()
         assert result is None
 
-    def test_synchronizes_stream_then_records_generic_event(self, mocker):
+    def test_records_generic_event_without_host_sync(self, mocker):
         """NPU should return an event consumable by the generic torch.Stream."""
         try:
             from vllm_omni.platforms.npu.platform import NPUOmniPlatform
@@ -130,19 +139,18 @@ class TestNPUOmniPlatformRecordDeviceEvent:
             pytest.skip("vllm_ascend not available")
 
         mock_event = mocker.MagicMock()
-        mock_stream = mocker.MagicMock()
         mock_torch = mocker.MagicMock()
-        mock_torch.npu.current_stream.return_value = mock_stream
         mock_torch.Event.return_value = mock_event
         mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
 
         result = NPUOmniPlatform.record_device_event()
 
-        # Stream should be synced first (HCCL ordering)
-        mock_stream.synchronize.assert_called_once()
-        # Then a backend-neutral event should be created and recorded.  The
-        # worker waits on it through the public torch.Stream wrapper.
+        # A backend-neutral event should be created and recorded; the worker
+        # waits on it through the public torch.Stream wrapper.
         mock_torch.Event.assert_called_once()
         mock_torch.npu.Event.assert_not_called()
         mock_event.record.assert_called_once()
         assert result is mock_event
+        # The host-side stream must neither be synchronized nor even consulted:
+        # ordering comes from the event handshake, not from draining the stream.
+        mock_torch.npu.current_stream.assert_not_called()
