@@ -5,7 +5,7 @@
 
 import functools
 from contextlib import ExitStack
-from typing import Any
+from typing import Any, cast
 
 import cache_dit
 import torch
@@ -30,9 +30,12 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
     _maybe_build_block_adapter,
+    _maybe_get_cached_adapter_cls,
     enable_cache_for_dit,
 )
 from vllm_omni.diffusion.cache.cachedit.config import CacheDiTConfig
+from vllm_omni.diffusion.data import DiffusionCacheConfig
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
 logger = init_logger(__name__)
 
@@ -149,7 +152,9 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     )
 
     refresh_trans_one = _build_cache_context_refresh(cache_config)
-    refresh_trans_two = _build_cache_context_refresh(cache_config, lambda pipeline: pipeline.transformer_2)
+    refresh_trans_two = _build_cache_context_refresh(
+        cache_config, lambda pipeline: cast(torch.nn.Module, getattr(pipeline, "transformer_2"))
+    )
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for both transformers with new num_inference_steps.
@@ -779,6 +784,29 @@ class SensenovaCachedAdapter(CachedAdapter):
         return total_cached_blocks
 
 
+def _get_sensenova_u1_transformer(pipeline: SupportsComponentDiscovery) -> torch.nn.Module:
+    language_model = getattr(pipeline, "language_model")
+    return cast(torch.nn.Module, getattr(language_model, "model"))
+
+
+def enable_cache_for_sensenova_u1(
+    pipeline: SupportsComponentDiscovery, cache_config: DiffusionCacheConfig
+) -> CacheDiTEnableResult:
+    """Enable Cache-DiT on SenseNova-U1's nested decoder model."""
+    get_transformer = _get_sensenova_u1_transformer
+    block_adapter = _maybe_build_block_adapter(pipeline, get_transformer)
+    adapter_cls = _maybe_get_cached_adapter_cls(pipeline, get_transformer)
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter=block_adapter,
+        adapter_cls=adapter_cls,
+        get_pipeline_transformer=get_transformer,
+    )
+    target = get_transformer(pipeline) if block_adapter is None else block_adapter
+    return CacheDiTEnableResult(refresh=refresh, targets=(target,))
+
+
 def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
     """Enable cache-dit for Cosmos3.
 
@@ -957,6 +985,7 @@ def register_custom_dit_enablers() -> None:
             "Kandinsky6TI2VAPipeline": enable_cache_for_kandinsky6,
             "Magi2Pipeline": enable_cache_for_magi2,
             "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
+            "SenseNovaU1Pipeline": enable_cache_for_sensenova_u1,
         }
     )
 
