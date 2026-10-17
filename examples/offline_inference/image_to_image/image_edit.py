@@ -39,6 +39,16 @@ Usage (multiple images):
         --cfg-scale 4.0 \
         --guidance-scale 1.0
 
+Usage (Mage-Flow Edit, one to three references):
+    python image_edit.py \
+        --model microsoft/Mage-Flow-Edit-Turbo \
+        --image input1.png input2.png input3.png \
+        --prompt "Combine the subject, setting, and palette" \
+        --height 512 --width 512 \
+        --num-inference-steps 4 \
+        --guidance-scale 1.0 \
+        --extra-args '{"mage_vision_long_edge": 384}'
+
 Usage (JoyAI-Image-Edit, single image):
     python image_edit.py \
         --model jdopensource/JoyAI-Image-Edit-Diffusers \
