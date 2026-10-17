@@ -117,6 +117,7 @@ from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
@@ -130,7 +131,10 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
-from vllm_omni.model_executor.models.qwen3_omni.vision_encoder_cudagraph import Qwen3OmniVisionEncoderCudaGraphMixin
+from vllm_omni.model_executor.models.qwen3_omni.vision_encoder_cudagraph import (
+    Qwen3OmniVisionEncoderCudaGraphMixin,
+    supports_npu_encoder_graphs,
+)
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
     ComponentQuantizationConfig,
@@ -1008,6 +1012,12 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         audio_input: Qwen2_5OmniAudioFeatureInputs,
     ) -> tuple[torch.Tensor, ...]:
         input_features = audio_input["input_features"]
+        graphs = getattr(self, "_audio_encoder_graphs", None)
+        if graphs is not None:
+            lengths = audio_input["audio_feature_lengths"].tolist()
+            outputs = graphs.execute(input_features.to(self.audio_tower.dtype), lengths)
+            if outputs is not None:
+                return outputs
         # vLLM 0.29 marks audio_feature_lengths keep_on_cpu, and the audio tower
         # derives device placement from feature_lens, so move it explicitly.
         # Mirrors upstream Qwen3OmniMoeThinker._process_audio_input.
@@ -1070,6 +1080,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     supported_languages = ISO639_1_SUPPORTED_LANGS
 
+    def capture_audio_encoder_cudagraph(self, graph_pool):
+        graphs = getattr(self, "_audio_encoder_graphs", None)
+        if graphs is not None:
+            graphs.capture(graph_pool)
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -1083,6 +1098,17 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # Only OmniModelConfig declares use_v2_model_runner. Upstream runners
+        # (plain `vllm serve`, V1 or MRv2) build the plain encoder manager,
+        # which never checks encoder_cudagraph_replay_supported.
+        if vllm_config.compilation_config.cudagraph_mm_encoder and getattr(
+            vllm_config.model_config, "use_v2_model_runner", True
+        ):
+            raise ValueError(
+                "Qwen3-Omni encoder graphs require the vLLM-Omni V1 runner (--omni with "
+                "model_runner=v1); upstream runners and MRv2 do not apply the encoder replay "
+                "bounds. Set cudagraph_mm_encoder=false otherwise."
+            )
         self.vllm_config = vllm_config  # needed for torch compile forward context
         hf_config = vllm_config.model_config.hf_config
         thinker_config: Qwen3OmniMoeThinkerConfig = getattr(hf_config, "thinker_config", None) or hf_config
@@ -1168,6 +1194,30 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 self.deepstack_input_embeds_num_tokens = 0
 
         self._enable_image_encoder_cudagraph()
+        self._audio_encoder_graphs = None
+        if (
+            vllm_config.compilation_config.cudagraph_mm_encoder
+            and not getattr(vllm_config.model_config, "enforce_eager", False)
+            and (
+                torch.device(vllm_config.device_config.device).type == "cuda"
+                or (torch.device(vllm_config.device_config.device).type == "npu" and supports_npu_encoder_graphs())
+            )
+            and self.multimodal_config.get_limit_per_prompt("audio") > 0
+            and self.multimodal_config.mm_encoder_attn_dtype is None
+            and (
+                supports_npu_encoder_graphs()
+                or self.audio_tower.attn_backend in {AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.TRITON_ATTN}
+            )
+            and get_pp_group().is_first_rank
+        ):
+            from .audio_encoder_cudagraph import Qwen3OmniAudioEncoderCudaGraphs
+
+            if supports_npu_encoder_graphs():
+                from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import Qwen3OmniAudioEncoderNpuGraphs
+
+                self._audio_encoder_graphs = Qwen3OmniAudioEncoderNpuGraphs(self.audio_tower)
+            else:
+                self._audio_encoder_graphs = Qwen3OmniAudioEncoderCudaGraphs(self.audio_tower)
 
         with self._mark_language_model(vllm_config):
             lm_vllm_config = vllm_config.with_hf_config(

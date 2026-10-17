@@ -74,18 +74,60 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     "2": {"max_num_seqs": 4}
   }'
 
-# Replay the thinker's image encoder from CUDA graphs (images only)
+# Encoder graphs on the CUDA V1 runner. The shipped stage-0 profile already
+# enables these budgets.
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}}}'
+  --stage-overrides '{"0": {"compilation_config": {
+    "custom_ops": ["+rotary_embedding"],
+    "cudagraph_mm_encoder": true,
+    "encoder_cudagraph_token_budgets": [256, 512, 1024, 2048, 4096],
+    "encoder_cudagraph_max_vision_items_per_batch": 16,
+    "encoder_cudagraph_max_frames_per_batch": 128
+  }}}'
 ```
 
-With the encoder graphs on, the thinker captures one graph per token budget
-(64 to 256 image tokens and up to 4 images per replay by default). A step's
-images replay together when one captured graph holds them all; otherwise they
-run through the eager encoder in one call. Set `encoder_cudagraph_token_budgets`
-and `encoder_cudagraph_max_vision_items_per_batch` in the same
-`compilation_config` to change them; each captured budget adds graph memory on
-the thinker's GPU.
+The shipped CUDA and NPU V1 profiles enable encoder graphs with the budgets
+above. Supported NPUs exclude 310P. MRv2 keeps them off and rejects
+`cudagraph_mm_encoder: true`: its encoder manager does not enforce the
+spatial and frame bounds required by these captures. Use `model_runner: v1`
+for encoder graphs. `cudagraph_mode: NONE` skips encoder capture as well.
+
+The budgets above and the automatically inferred budgets stop at 4096. Raise them
+(8192 or 16384) only when KV headroom
+remains. Audio capture is one full-width graph for each of chunk counts 1..64
+(a 60-second clip, including a one-frame tail). Short tail rows replay that
+graph; batches above 64 chunks stay eager. Benchmark both settings at the
+concurrency you serve before enabling them.
+
+Vision supports images and video frames, including DeepStack outputs. A group
+outside the configured token/item/frame bounds runs eagerly. To opt in on NPU,
+set `cudagraph_mm_encoder: true` in its stage-0 platform configuration while
+preserving `cudagraph_mode: PIECEWISE` and the budgets through 4096.
+Compilation-config overlays replace the whole mapping, so retain required
+fields such as CUDA's `custom_ops: ["+rotary_embedding"]` when overriding it.
+Automatic KV sizing reserves captured graph memory before allocating KV.
+
+Audio captures the full CNN and transformer once per chunk count. A short
+tail keeps the eager CNN padding, but its extra positions are separate
+attention sequences and are discarded. The transformer GEMM dimensions are
+padded, which can change floating-point rounding; validate accuracy on the
+target backend and workload. Clip boundaries remain replay inputs. Chunk counts
+outside 1..64 retain the eager path. One clip shorter than a CNN window
+(100 mel frames) replays a graph captured at that exact width, so the conv
+matches eager. Several short clips in one batch still run eager. Encoder graph
+outputs own their storage so later replays cannot overwrite embeddings cached
+for an earlier request.
+Audio graphs share one input feature buffer across chunk counts. Repeated clip
+lengths reuse each graph's device indices and sequence boundaries; changed
+lengths refresh them before replay. Consecutive identical lengths also reuse a
+single cached CPU replay plan, which is discarded when graphs are cleared or
+recaptured.
+On NPU, attention sequence boundaries are rebound through Ascend FIA graph
+task updates on every replay; audio shape entries are separate from vision
+budgets. Both towers use NPUGraph, while CUDA retains CUDAGraph.
+Audio-only deployments also capture the audio tower. Explicitly setting
+`cudagraph_mm_encoder: false` disables both audio and vision graphs. Eager
+model configurations and unsupported attention backends retain eager encoders.
 
 ### Stage-based launch (one stage per process)
 

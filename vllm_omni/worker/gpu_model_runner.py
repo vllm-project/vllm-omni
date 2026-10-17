@@ -296,12 +296,57 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         )
 
     @torch.inference_mode()
+    def profile_encoder_cudagraph_memory(self) -> int:
+        """Measure encoder graphs before allocating the language model KV cache."""
+        import gc
+
+        from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+        from vllm.config import set_current_vllm_config
+        from vllm.distributed.parallel_state import graph_capture
+        from vllm.platforms import current_platform
+
+        if current_omni_platform.is_npu():
+            from vllm_ascend.worker.model_runner_v1 import graph_capture
+
+        # Match capture_model: NONE never captures an encoder manager either.
+        if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            return 0
+        manager = self._create_encoder_cudagraph_manager()
+        if manager is None:
+            return 0
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        free_before = torch.accelerator.get_memory_info()[0]
+        try:
+            with set_current_vllm_config(self.vllm_config), self._freeze_gc(), graph_capture(device=self.device):
+                set_cudagraph_capturing_enabled(True)
+                try:
+                    manager.capture(graph_pool=current_platform.graph_pool_handle())
+                finally:
+                    set_cudagraph_capturing_enabled(False)
+            torch.accelerator.synchronize()
+            return max(0, free_before - torch.accelerator.get_memory_info()[0])
+        finally:
+            manager.clear()
+            gc.collect()
+            torch.accelerator.empty_cache()
+
+    @torch.inference_mode()
     def _create_encoder_cudagraph_manager(self):
         raw_model = self.get_model()
-        if not getattr(raw_model, "encoder_cudagraph_single_replay", False):
-            return super()._create_encoder_cudagraph_manager()
         from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 
+        if (
+            self.compilation_config.cudagraph_mm_encoder
+            and self.supports_mm_inputs
+            and getattr(raw_model, "_audio_encoder_graphs", None) is not None
+            and not supports_encoder_cudagraph(raw_model)
+        ):
+            from vllm_omni.worker.encoder_cudagraph import AudioOnlyEncoderCudaGraphManager
+
+            return AudioOnlyEncoderCudaGraphManager(raw_model)
+        if not getattr(raw_model, "encoder_cudagraph_single_replay", False):
+            return super()._create_encoder_cudagraph_manager()
         from vllm_omni.worker.encoder_cudagraph import SingleReplayEncoderCudaGraphManager
 
         if not (
@@ -310,6 +355,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             and supports_encoder_cudagraph(raw_model)
         ):
             return None
+        if self.device.type == "npu":
+            from vllm_omni.platforms.npu.models.qwen3_omni_encoder_graphs import SingleReplayEncoderNpuGraphManager
+
+            return SingleReplayEncoderNpuGraphManager(
+                vllm_config=self.vllm_config, device=self.device, dtype=self.dtype, model=raw_model
+            )
         return SingleReplayEncoderCudaGraphManager(
             vllm_config=self.vllm_config, device=self.device, dtype=self.dtype, model=raw_model
         )
