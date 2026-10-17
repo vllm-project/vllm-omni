@@ -193,6 +193,38 @@ also applies here.
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.
 
+### MixFusion (Mixed-Resolution Step Batching)
+
+`StepBatchSamplingParamsKey` includes height/width/resolution, so plain step
+batching never co-schedules mixed resolutions. MixFusion relaxes those three
+fields out of the key so different resolutions can share one step batch, at the
+cost of a pipeline contract the scheduler must not assume generically:
+
+- A pipeline opts in with `supports_mixfusion: ClassVar[bool] = True`
+  (read via `getattr`, not part of the runtime protocol check). Currently
+  only `QwenImagePipeline` sets it.
+- The engine resolves the capability through the registry at startup and
+  rejects server-level `enable_mixfusion` on pipelines without it.
+- The scheduler resolves the capability in `initialize()` and only then
+  applies the shape relaxation. On an unsupported pipeline, a request-level
+  `extra_args={"enable_mixfusion": True}` degrades to a no-op: resolution
+  stays in the key and per-prompt `additional_information` requests keep
+  their key.
+
+With the capability present, `QwenImagePipeline.denoise_step` dispatches on
+list latents to `_denoise_step_mixfusion`, which packs eligible requests into
+ragged latents (text-then-image token order per request) and runs one packed
+forward. Requests fall back to `_denoise_step_serial_ragged` when they carry
+image latents (edit path), raise `zero_cond_t`, run with SP>1, have active
+forward hooks, or run with `do_true_cfg`; per-request thresholds
+(`mixfusion_min_chunk_tokens`, `mixfusion_max_chunks`) are aggregated as
+max/min across the batch. On NPU the flat varlen attention backend is
+unavailable and packed batches run per-request dense attention.
+
+Known limitation: the packed dispatch does not thread `attention_kwargs`
+into the packed forward; features that rely on it (e.g. LoRA scales,
+TeaCache) must extend `_denoise_step_mixfusion` first.
+
 ## Model Author Guidelines
 
 When converting a request-level pipeline:
@@ -228,6 +260,9 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
   request-mode extras remain unsupported.
 - Step continuous batching remains experimental; use `max_num_seqs=1` for the
   conservative step path.
+- MixFusion shape relaxation requires the pipeline `supports_mixfusion`
+  capability (Qwen-Image only); edit/zero_cond_t requests, SP>1, active
+  forward hooks, and `do_true_cfg` fall back to serial ragged execution.
 
 ## Related Implementation
 
