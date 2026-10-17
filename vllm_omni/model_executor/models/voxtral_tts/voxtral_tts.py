@@ -119,6 +119,17 @@ class VoxtralTTSForConditionalGeneration(
             self.requires_raw_input_tokens = True
             self.set_custom_preprocess(self.tts_preprocess)
             self.set_custom_postprocess(self.tts_postprocess)
+            # Opt the generator stage into the runner's async output snapshot
+            # (GPUARModelRunner._snapshot_omni_output_tensors_for_async_output):
+            # codes.audio frames are copied to pinned host memory once per step
+            # on the side copy stream, so generator2tokenizer_async_chunk
+            # receives CPU tensors and does no D2H of its own. The postprocess
+            # must then run eagerly on the live GPU tensors before the snapshot;
+            # codes are the generator's only downstream payload, so hidden
+            # states stay out of the snapshot and the pooler payload.
+            self.use_async_omni_output = True
+            self.eager_omni_postprocess_before_async_output = True
+            self.omni_pooler_payload_include_hidden = False
             self.audio_generation = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config,
