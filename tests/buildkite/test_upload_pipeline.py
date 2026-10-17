@@ -39,6 +39,17 @@ BOOTSTRAP_STEPS_TEMPLATE = """steps:
 """
 
 
+def test_exclusive_h100_reservation_keeps_four_card_inference_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    expanded = _expand_mirror_hardwares({"label": "LingBot performance", "mirror_hardwares": "h100_4_exclusive"})
+    assert expanded is not None
+    container = expanded["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 8
+    assert expanded["agents"]["queue"] == "mithril-h100-pool"
+    monkeypatch.setenv("MIRROR_HW", "b200")
+    assert _expand_mirror_hardwares({"mirror_hardwares": "h100_4_exclusive"}) is None
+
+
 def _render(changed_files: list[str]) -> str:
     decision = resolve_ci_decision(changed_files)
     return _render_bootstrap_pipeline(
@@ -106,6 +117,36 @@ def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
     by_key = {step["key"]: step for step in doc["steps"]}
     assert "upload-ready-pipeline" not in by_key
     assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
+
+
+@pytest.mark.parametrize(
+    "changed_files", [["tests/dfx/lingbot_world/runner.py"], [".buildkite/npu/test-npu-weekly.yml"]]
+)
+def test_npu_weekly_is_admitted_for_schedule_and_pr_label(changed_files: list[str]) -> None:
+    path = Path(".buildkite/npu/bootstrap-upload-steps.yml")
+    rendered = _render_bootstrap_pipeline(
+        _load_bootstrap_steps(path), decision=resolve_ci_decision(changed_files), path=path
+    )
+    by_key = {step["key"]: step for step in yaml.safe_load(rendered)["steps"]}
+    condition = by_key["upload-weekly-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in condition
+    assert 'labels includes "weekly-test"' in condition
+    assert "NON_CRITICAL" not in condition
+    image_condition = by_key["image-build-a2"].get("if")
+    if image_condition is not None:
+        assert 'labels includes "weekly-test"' in image_condition
+
+
+def test_npu_docs_only_weekly_keeps_only_scheduled_admission() -> None:
+    path = Path(".buildkite/npu/bootstrap-upload-steps.yml")
+    rendered = _render_bootstrap_pipeline(
+        _load_bootstrap_steps(path), decision=resolve_ci_decision(["docs/foo.md"]), path=path
+    )
+    by_key = {step["key"]: step for step in yaml.safe_load(rendered)["steps"]}
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-weekly-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["image-build-a2"]["if"]
+    assert "weekly-test" not in rendered
+    assert "upload-ready-pipeline" not in by_key
 
 
 def test_nightly_label_if_is_only_nightly_test() -> None:
@@ -1001,3 +1042,23 @@ def test_qwen_image_21_accuracy_model_dependencies(
     assert any("test_qwen_image_21.py" in command for command in step["commands"])
     assert any(selector in command for command in step["commands"])
     assert "tests/e2e/accuracy/artifacts/qwen_image_21/**/*" in step["artifact_paths"]
+
+
+@pytest.mark.parametrize("filename", ["test-npu-nightly.yml", "test-npu-weekly.yml"])
+def test_lingbot_npu_infra_retry_does_not_retry_test_failures(filename: str) -> None:
+    path = Path(".buildkite/npu") / filename
+    rendered = _render_test_pipeline(
+        yaml.safe_load(path.read_text()),
+        changed_files=["tests/dfx/lingbot_world/runner.py"],
+        pipeline_path=path,
+    )
+    steps = [
+        step
+        for step in _iter_steps(rendered)
+        if str(step.get("key", "")).startswith("lingbot-npu-")
+        and step.get("agents", {}).get("resource_class") == "npu-4"
+    ]
+    assert len(steps) == (1 if "nightly" in filename else 2)
+    for step in steps:
+        assert step["retry"] == {"automatic": [{"exit_status": -1, "limit": 1}, {"exit_status": 128, "limit": 1}]}
+        assert not step.get("soft_fail")

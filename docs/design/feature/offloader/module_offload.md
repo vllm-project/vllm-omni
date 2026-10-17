@@ -7,7 +7,8 @@ groups. For commands and model support, see the
 ## Generic hook path
 
 `ModelLevelOffloadBackend.enable()` discovers DiTs, encoders, and VAEs. It
-makes encoders and VAEs device resident for initialization, then installs
+makes unselected DiTs, encoders and VAEs device resident for initialization,
+then installs
 `SequentialOffloadHook` instances:
 
 - each DiT hook offloads selected encoders and other selected DiTs before
@@ -19,6 +20,11 @@ All execution-stage modules still receive a hook so an unselected resident
 stage can evict a selected component before it runs. Only components listed in
 `diffusion_offload_config.components` are eligible to move to CPU.
 
+Unselected DiTs must be ready before direct conditioning or KV projections,
+which can run before their top-level forward hook. Initial DiT placement uses
+the same tensor mover as the hooks so cached wrappers can retain owner references
+without recursive module traversal.
+
 The hook moves parameters and buffers without recursively calling
 `module.to()`. This avoids recursion through modules that retain references to
 other transformer blocks. Host tensors are pinned when configured; DTensors
@@ -28,6 +34,12 @@ Before forward returns control to the model, the hook synchronizes the active
 platform so compute cannot race the transfer. XPU uses blocking device-to-host
 copies because its allocator cannot safely evict storage while an asynchronous
 copy is pending.
+
+Pipelines with work between component forwards can explicitly bound a hooked
+encoder with `sequential_offload_component`. LingBot scopes prompt encoding this
+way so selected text weights are released before VAE conditioning and DiT work,
+including when encoding fails. A prompt-cache hit reuses embeddings without
+restaging the encoder.
 
 ## Split-model delegation
 

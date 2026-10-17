@@ -1,0 +1,95 @@
+{
+  "timeout_s": 21600,
+  "min_psnr_db": 40,
+  "reject_uniform_frames": true,
+  "pixel_window_seconds": 2,
+  "binary_activity_dimensions": [
+    "dynamic_degree"
+  ],
+  "max_reference_spreads": {
+    "cuda": {
+      "vbench": {
+        "subject_consistency": 0.03,
+        "background_consistency": 0.03,
+        "aesthetic_quality": 0.03,
+        "imaging_quality": 0.02,
+        "temporal_flickering": 0.02,
+        "motion_smoothness": 0.015
+      },
+      "wbench": {
+        "aesthetic_quality": 0.025,
+        "imaging_quality": 0.03,
+        "temporal_flickering": 0.025,
+        "motion_smoothness": 0.025,
+        "hpsv3_quality": 0.085
+      }
+    },
+    "npu": {
+      "vbench": {
+        "subject_consistency": 0.02,
+        "background_consistency": 0.03,
+        "aesthetic_quality": 0.02,
+        "imaging_quality": 0.02,
+        "temporal_flickering": 0.01,
+        "motion_smoothness": 0.01
+      },
+      "wbench": {
+        "aesthetic_quality": 0.01,
+        "imaging_quality": 0.01,
+        "temporal_flickering": 0.01,
+        "motion_smoothness": 0.01,
+        "hpsv3_quality": 0.05
+      }
+    }
+  },
+  "candidate_tolerances": {
+    "cuda": {
+      "vbench": {
+        "dynamic_degree": 0.34,
+        "subject_consistency": 0.01,
+        "background_consistency": 0.01,
+        "aesthetic_quality": 0.025,
+        "imaging_quality": 0.01,
+        "temporal_flickering": 0.01,
+        "motion_smoothness": 0.01
+      },
+      "wbench": {
+        "dynamic_degree": 0.34,
+        "aesthetic_quality": 0.01,
+        "imaging_quality": 0.01,
+        "temporal_flickering": 0.01,
+        "motion_smoothness": 0.01,
+        "hpsv3_quality": 0.02
+      }
+    },
+    "npu": {
+      "vbench": {
+        "dynamic_degree": 0.34,
+        "subject_consistency": 0.01,
+        "background_consistency": 0.01,
+        "aesthetic_quality": 0.01,
+        "imaging_quality": 0.01,
+        "temporal_flickering": 0.01,
+        "motion_smoothness": 0.01
+      },
+      "wbench": {
+        "dynamic_degree": 0.34,
+        "aesthetic_quality": 0.01,
+        "imaging_quality": 0.01,
+        "temporal_flickering": 0.01,
+        "motion_smoothness": 0.01,
+        "hpsv3_quality": 0.02
+      }
+    }
+  },
+  "pixel_budgets": {
+    "cuda": {
+      "psnr_drop_db": 3,
+      "ssim_drop": 0.04
+    },
+    "npu": {
+      "psnr_drop_db": 3,
+      "ssim_drop": 0.03
+    }
+  }
+}

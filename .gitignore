@@ -245,6 +245,12 @@ datasets/
 !recipes/cosmos3/negative_prompt.json
 !benchmarks/mammoth_moda2/reference_results.json
 !tests/dfx/perf/tests/*.json
+!tests/dfx/lingbot_world/*.lock.json
+!tests/dfx/lingbot_world/quality.json
+!tests/dfx/lingbot_world/configs/*.json
+!tests/dfx/lingbot_world/calibration/*.json
+!tests/dfx/lingbot_world/calibration/history/cuda_nightly_reference_unrecorded.json
+!tests/dfx/lingbot_world/calibration/history/cuda_nightly_quality_population_unrecorded.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 # Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)
 !tests/e2e/accuracy/omni_duplex_eval/*.json
@@ -288,3 +294,7 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
+
+# LingBot regression artifacts and isolated evaluator environments
+lingbot-artifacts/
+.lingbot-ci/

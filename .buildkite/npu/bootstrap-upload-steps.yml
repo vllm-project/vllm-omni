@@ -110,3 +110,18 @@ steps:
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/npu/test-npu-nightly.yml
     agents:
       queue: "medium_cpu_queue_premerge"
+
+  - label: "Upload Weekly Pipeline"
+    depends_on:
+      - image-build-a2
+      - image-build-a3
+    key: upload-weekly-pipeline
+    commands:
+      - |
+        EXTRA=""
+        if [ "${BUILDKITE_BRANCH}" = "main" ]; then
+          EXTRA="--all"
+        fi
+        python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/npu/test-npu-weekly.yml
+    agents:
+      queue: medium_cpu_queue_premerge

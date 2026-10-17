@@ -1,0 +1,486 @@
+{
+  "build": 9189,
+  "candidate_data_used": false,
+  "inputs": [
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/0/boardwalk-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "36a617842f032dad07f22a7094b819dcf055394d210fbf2d9edd04dd56cf8a98"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/1/boardwalk-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "2cdf2c742e9828561c17441ba47954bfefdc6bb08b6094b3f6cb9f095c6ba72d"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/2/boardwalk-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "858c315dc047aa544059e074e5afff75bd78a05b7a949ba9fbf526b566d55483"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/0/blossom-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "4a2e4a95ad952e8645be51acd10841187111bdb4126e5a4051631800340fcff4"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/1/blossom-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "2cfb6a2d599d30755f4decab610d5f6ee2dc2cb642610a7e8768fdf613f6eb76"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/2/blossom-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "5bdb81f5bda55b2a1443886bae986d4d9403a6db46bcc4c9bb222fa34a8b44c9"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/0/street-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "d7e13138175d4984a3ac554fa5b3cb2600e8897b48a8a70c8630bc2e0d877e04"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/1/street-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "85f859dffec317d14257dcae9173f7c8fc22d9059f84358efacbed90e986610e"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-nightly/reference/2/street-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "23de04a2474cb78a4b1a1c82c41e1019db55d9282b9a5067da47caecb8846e31"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/npu-long-measurements/pair-1/reference/1/boardwalk-42/benchmark.json",
+      "build": 9189,
+      "job_id": "01a14868-262c-44d2-be3d-365ee7ada43a",
+      "pipeline": "vllm-omni-npu-ci",
+      "sha256": "8bbeb940a0215edaa2cbaa1b043f0dde9b6c801a954a6febe9cce3dde3fa5a6e"
+    }
+  ],
+  "long_reference_intrastart_windows": {
+    "132": {
+      "cv": 0.019565928059653917,
+      "p95_values_ms": [
+        3949.3520461022854,
+        3929.064874816686,
+        3925.42919581756,
+        3828.28207667917,
+        3841.9680600985885,
+        3940.2062317356467,
+        3717.365380376577,
+        3932.6809111982584
+      ],
+      "range_ms": [
+        3717.365380376577,
+        3949.3520461022854
+      ],
+      "windows": 8
+    },
+    "198": {
+      "cv": 0.01395713822247913,
+      "p95_values_ms": [
+        3957.5042428448796,
+        3909.2110099270935,
+        3855.970661807804,
+        3813.776562921701
+      ],
+      "range_ms": [
+        3813.776562921701,
+        3957.5042428448796
+      ],
+      "windows": 4
+    },
+    "264": {
+      "cv": 0.00532979949439255,
+      "p95_values_ms": [
+        3940.843384247273,
+        3888.876007031649,
+        3890.916321799159,
+        3905.438499338925
+      ],
+      "range_ms": [
+        3888.876007031649,
+        3940.843384247273
+      ],
+      "windows": 4
+    },
+    "33": {
+      "cv": 0.05742520691166988,
+      "p95_values_ms": [
+        3963.1327856332064,
+        3508.8883876800533,
+        3302.6090338826175,
+        3875.962407141924,
+        3863.5837636888027,
+        3953.890358284116,
+        3814.762841910124,
+        3754.9148537218566,
+        3609.904764965176,
+        3955.854720249772,
+        3924.968062341213,
+        3559.8175145685673,
+        3689.087910950184,
+        3827.4399150162935,
+        3664.229728281497,
+        3963.629912957549,
+        3631.7451547831292,
+        3558.931954950094,
+        3289.954811707139,
+        3869.7403606027365,
+        3889.7323723882437,
+        3485.5843156576157,
+        3941.4220452308655,
+        3863.089743256569,
+        3902.3069225251675,
+        3579.4312335550785,
+        3101.195827499032,
+        3824.153856560588,
+        3744.5823598653074,
+        3800.4800025373697,
+        3920.0711760669947,
+        3953.761873394251,
+        3918.5188978910446,
+        3841.4518017321825
+      ],
+      "range_ms": [
+        3101.195827499032,
+        3963.629912957549
+      ],
+      "windows": 34
+    },
+    "66": {
+      "cv": 0.037367018177983186,
+      "p95_values_ms": [
+        3954.7261921688914,
+        3806.785883847624,
+        3956.640216521919,
+        3860.1338006556034,
+        3905.1846461370587,
+        3895.702028181404,
+        3756.620709784329,
+        3950.2124986611307,
+        3485.1670153439045,
+        3890.00711357221,
+        3924.457684159279,
+        3928.446921519935,
+        3497.822066769004,
+        3853.6117295734584,
+        3904.2402636259794,
+        3945.348917040974
+      ],
+      "range_ms": [
+        3485.1670153439045,
+        3956.640216521919
+      ],
+      "windows": 16
+    },
+    "99": {
+      "cv": 0.020181196908421163,
+      "p95_values_ms": [
+        3944.287831708789,
+        3958.7479228153825,
+        3792.2342078760257,
+        3932.4087768793106,
+        3778.3113559707995,
+        3757.624760828912,
+        3936.1446449533105,
+        3810.3262055665255,
+        3798.904251120984,
+        3931.6481094807386
+      ],
+      "range_ms": [
+        3757.624760828912,
+        3958.7479228153825
+      ],
+      "windows": 10
+    }
+  },
+  "long_reference_job": "01a14868-262c-44d2-be3d-365ee7ada43a",
+  "long_reference_window_protocol": {
+    "discard_incomplete_tail": true,
+    "dispersion": "population standard deviation divided by mean of window P95 values",
+    "does_not_establish_seven_session_profile_acceptance": true,
+    "independent_start_count": 1,
+    "measured_sessions": 2,
+    "nonoverlapping_observation_counts": [
+      33,
+      66,
+      99,
+      132,
+      198,
+      264
+    ],
+    "percentile": "workload.percentile(values, 0.95)",
+    "source_num_chunks": 600,
+    "steady_selector": "session.chunks[6:-1]"
+  },
+  "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+  "nightly_job": "01a1488b-ad9c-4818-b30c-df1cf323238b",
+  "nightly_reference": {
+    "blossom-42": {
+      "cv": {
+        "mean_ms": 0.0042818056625802394,
+        "p50_ms": 0.012025240551516755,
+        "p95_ms": 0.05297976173656263
+      },
+      "reference": [
+        {
+          "mean_ms": 3105.331417850473,
+          "p50_ms": 3072.673734277487,
+          "p95_ms": 3386.5857630968094,
+          "samples": 33
+        },
+        {
+          "mean_ms": 3073.079826028058,
+          "p50_ms": 3014.8348808288574,
+          "p95_ms": 3856.8631295114756,
+          "samples": 33
+        },
+        {
+          "mean_ms": 3091.977453197945,
+          "p50_ms": 3103.7469375878572,
+          "p95_ms": 3643.2966131716967,
+          "samples": 33
+        }
+      ]
+    },
+    "boardwalk-42": {
+      "cv": {
+        "mean_ms": 0.001994342231030479,
+        "p50_ms": 0.0017464486227927196,
+        "p95_ms": 0.07141243116881407
+      },
+      "reference": [
+        {
+          "mean_ms": 3090.995787953337,
+          "p50_ms": 3058.8673390448093,
+          "p95_ms": 3270.443883538246,
+          "samples": 33
+        },
+        {
+          "mean_ms": 3076.077327922438,
+          "p50_ms": 3051.4151379466057,
+          "p95_ms": 3830.9502229094505,
+          "samples": 33
+        },
+        {
+          "mean_ms": 3081.749235251636,
+          "p50_ms": 3064.453599974513,
+          "p95_ms": 3344.3059239536524,
+          "samples": 33
+        }
+      ]
+    },
+    "street-42": {
+      "cv": {
+        "mean_ms": 0.009834657537965585,
+        "p50_ms": 0.0009709462981694885,
+        "p95_ms": 0.027995081972594718
+      },
+      "reference": [
+        {
+          "mean_ms": 3113.62012029823,
+          "p50_ms": 3057.5084891170263,
+          "p95_ms": 3668.110560253262,
+          "samples": 33
+        },
+        {
+          "mean_ms": 3044.7232067923655,
+          "p50_ms": 3052.34120413661,
+          "p95_ms": 3911.3755721598864,
+          "samples": 33
+        },
+        {
+          "mean_ms": 3055.8108617410517,
+          "p50_ms": 3050.5058094859123,
+          "p95_ms": 3714.885434508323,
+          "samples": 33
+        }
+      ]
+    }
+  },
+  "original_profile_sha256": "af9b7d3937a52ecbc9a291e05c02d384f55168447bce824e808fc2048e207f42",
+  "pipeline": "vllm-omni-npu-ci",
+  "reference_revision": "8d7c354674c7e1dc57544f248689574fccb71af9",
+  "schema_version": 1,
+  "scope": "Reference-only sampling design for NPU cadence profiles. Actual recorded zero-switch nightly40 and long600 references motivate at least200 observations for P95. Long request length differs; cropped windows diagnose sampling dispersion, not fresh-profile or candidate acceptance. Every changed profile needs independent target validation.",
+  "selected_profile_sha256": "8277a518608f0fcf6512c4dd2aa2172dc905d9a19f4f7eb8e199652921863ef5",
+  "selection": {
+    "candidate_regression_fraction_unchanged": 0.05,
+    "expected_upper_tail_observations": 10,
+    "measured_sessions": 7,
+    "minimum_observations": 200,
+    "p99_hard_gate_minimum_unchanged": 1000,
+    "quantile": 0.95,
+    "reference_cv_ceiling_unchanged": 0.03,
+    "rule": "At least 10 expected upper-tail observations: ceil(10/(1-0.95))=200. Round up to complete40-chunk sessions after the existing6 warmup and terminal exclusions. This is a sampling guard, not a confidence bound.",
+    "selected_steady_samples": 231,
+    "steady_samples_per_session": 33
+  },
+  "source_contract": {
+    "deploy_sha256": "fa9a6bc5adfb9fd7fd993955675a694761c2832418583c3b7bdb17f6bfbd1c70",
+    "engine_environment": {
+      "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH": "0",
+      "VLLM_OMNI_AR_DIFFUSION_KV_GATHER": "0"
+    },
+    "hardware": {
+      "allocation": {
+        "devices": [
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "0",
+            "total_bytes": 65452113920
+          },
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "1",
+            "total_bytes": 65452113920
+          },
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "2",
+            "total_bytes": 65452113920
+          },
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "3",
+            "total_bytes": 65452113920
+          },
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "4",
+            "total_bytes": 65452113920
+          },
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "5",
+            "total_bytes": 65452113920
+          },
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "6",
+            "total_bytes": 65452113920
+          },
+          {
+            "name": "Ascend910B3",
+            "runtime_id": "7",
+            "total_bytes": 65452113920
+          }
+        ],
+        "platform": "npu",
+        "reserved_cards": 8,
+        "visible_devices": "0,1,2,3",
+        "visible_dies": 4
+      },
+      "cards": 4,
+      "devices": [
+        {
+          "name": "Ascend910B3",
+          "total_bytes": 65452113920
+        },
+        {
+          "name": "Ascend910B3",
+          "total_bytes": 65452113920
+        },
+        {
+          "name": "Ascend910B3",
+          "total_bytes": 65452113920
+        },
+        {
+          "name": "Ascend910B3",
+          "total_bytes": 65452113920
+        }
+      ],
+      "dies": 4,
+      "packages": {
+        "diffusers": "0.40.0",
+        "torch": "2.10.0+cpu",
+        "torch-npu": "2.10.0.post4",
+        "transformers": "5.14.1",
+        "vllm": "0.31.0+empty",
+        "vllm-ascend": "0.19.1rc2.dev2590+ge25912733"
+      },
+      "platform": "npu"
+    },
+    "profile": {
+      "cards": 4,
+      "cases": [
+        {
+          "camera_pattern": "forward",
+          "id": "boardwalk-42",
+          "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+          "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+          "seed": 42
+        },
+        {
+          "camera_pattern": "orbit",
+          "id": "blossom-42",
+          "image": "cherry_blossom",
+          "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+          "seed": 42
+        },
+        {
+          "camera_pattern": "hold",
+          "id": "street-42",
+          "image": "stop_sign",
+          "prompt": "A street corner with a stop sign and surrounding buildings.",
+          "seed": 42
+        }
+      ],
+      "chunk_timeout_s": 120,
+      "cpu_threads_per_worker": 1,
+      "deploy_config": "tests/dfx/lingbot_world/configs/npu_usp4_offload.yaml",
+      "dies": 4,
+      "first_chunk_timeout_s": 900,
+      "height": 480,
+      "lifecycle_checks": true,
+      "max_reference_cv": 0.03,
+      "memory_growth_budget_bytes": 268435456,
+      "min_steady_samples": 33,
+      "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+      "mux_fps": 16,
+      "num_chunks": 40,
+      "performance_regression_fraction": 0.05,
+      "platform": "npu",
+      "precision": "bfloat16",
+      "precision_atol": 0.0,
+      "precision_rtol": 0.0,
+      "precision_timeout_s": 600,
+      "reference_revision": "8d7c354674c7e1dc57544f248689574fccb71af9",
+      "reserved_cards": 8,
+      "schema_version": 1,
+      "startup_timeout_s": 1200,
+      "target_fps": 12,
+      "transient_noise_sigma": 3.0,
+      "warmup_chunks": 6,
+      "warmup_num_chunks": 8,
+      "width": 832
+    }
+  },
+  "source_revision": "94cc1effb556a534292346631348b86d44644212",
+  "weekly_sampling_selection": {
+    "measured_sessions": 2,
+    "num_chunks": 160,
+    "original_profile_sha256": "d034e409d6327184f6aafbc88e95ebbdeb601c2edfbdd0dd1d968780f5eae11d",
+    "rule": "Apply the same minimum200 P95 observations, rounded upward to complete160-chunk sessions. All18 cases, seeds/camera controls, warmup, referenceCV3%, candidate5% and 1440-minute job budgets remain unchanged.",
+    "selected_profile_sha256": "3a52f8f91b36d4e4eed1c9fbd23e5a54b16b99a5d14877abedf5cc36182bbe0b",
+    "selected_steady_samples": 306,
+    "steady_samples_per_session": 153
+  }
+}

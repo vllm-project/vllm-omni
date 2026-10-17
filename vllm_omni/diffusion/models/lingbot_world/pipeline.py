@@ -9,7 +9,7 @@ import math
 import os
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -68,7 +68,9 @@ from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
 from vllm_omni.diffusion.offloader.config import (
+    TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
+    resolve_offload,
     resolve_offload_strategy,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -1548,7 +1550,16 @@ class LingBotWorldCausalDMDPipeline(
         )
         input_ids = text_inputs.input_ids.to(self.device)
         attention_mask = text_inputs.attention_mask.to(self.device)
-        prompt_embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
+        offload = resolve_offload(getattr(self, "od_config", None))
+        encoder_context: AbstractContextManager[None] = nullcontext()
+        if offload.strategy is OffloadStrategy.MODEL_LEVEL and offload.offloads(TEXT_ENCODER_COMPONENT):
+            from vllm_omni.diffusion.offloader.sequential_backend import sequential_offload_component
+
+            # Release selected text weights before VAE conditioning/DiT work,
+            # including failed encodes; cache hits never restage the encoder.
+            encoder_context = sequential_offload_component(self.text_encoder)
+        with encoder_context:
+            prompt_embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=dtype)
         prompt_embeds = prompt_embeds * attention_mask.unsqueeze(-1).to(dtype=prompt_embeds.dtype)
         self._prompt_embeds_cache[key] = prompt_embeds

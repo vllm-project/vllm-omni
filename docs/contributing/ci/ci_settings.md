@@ -64,7 +64,7 @@ Canonical layout (prefer these paths for new changes):
 | Platform | Bootstrap entry | Test job files | Upload mechanism | Job hardware in YAML |
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
 | **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
-| **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
+| **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml`, `test-npu-weekly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
 | **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml`, `test-amd-nightly.yml`, `test-amd-weekly.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
 
@@ -135,9 +135,11 @@ Canonical layout (prefer these paths for new changes):
 
     **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3, A3, A5, and 310P CI images, then uploads child test pipelines.
 
-    **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
+    **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4), `test-npu-weekly.yml` (L5).
 
     **L2 trigger:** PR label `ready` (CUDA/AMD L2). PR labels `ready` + `npu-test` trigger NPU CI only.
+
+    **L5 trigger:** PR label `weekly-test`, or scheduled `main` with `WEEKLY=1`. NPU weekly does not run under `NON_CRITICAL=1` alone. Docs-only PR labels still honor `skip_all`; scheduled main weekly retains coverage.
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
@@ -157,7 +159,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Adding a job**
 
-    1. Edit `test-npu-ready.yml` (L2) or `test-npu-nightly.yml` (L4).
+    1. Edit `test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4), or `test-npu-weekly.yml` (L5).
     2. Add a step with `mirror_hardwares` (add a new preset in `ci_mirror_hardwares.yml` first if needed).
     3. Set `commands` to your pytest file and markers. For L4, set `source_file_dependencies` to a job key from `ci_source_file_dependencies.yml` that aliases the model anchor and lists that pytest file.
     4. Dry-run:
@@ -246,7 +248,7 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`. AMD applies `skip_ci.py gate` only to selected ready/merge specs. An explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff. AMD weekly remains runnable for scheduled `main` + `WEEKLY=1`; a PR `weekly-test` selection still honors `skip_all`.
+**`skip_all` exceptions:** For CUDA/NPU, PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`; on `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4, while `WEEKLY=1` builds the image and uploads L5. CUDA additionally runs L5 for `NON_CRITICAL=1` and uploads L2/L3 with `--e2e` for `main` + `WEEKLY=1`. AMD applies `skip_ci.py gate` only to selected ready/merge specs. An explicitly selected AMD nightly spec (`nightly-test`, `NIGHTLY=1`, or a nightly debug override) remains runnable even for a docs-only diff. AMD weekly remains runnable for scheduled `main` + `WEEKLY=1`; a PR `weekly-test` selection still honors `skip_all`.
 
 **Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
@@ -264,7 +266,7 @@ Register new files in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `
 | L3 | `.buildkite/amd/test-amd-merge.yml` | amd |
 | L4/L5 | `.buildkite/cuda/test-nightly.yml`, `test-weekly.yml` | cuda |
 | L4/L5 | `.buildkite/amd/test-amd-nightly.yml`, `test-amd-weekly.yml` | amd |
-| L4/L5 | `.buildkite/npu/test-npu-nightly.yml` | npu |
+| L4/L5 | `.buildkite/npu/test-npu-nightly.yml`, `test-npu-weekly.yml` | npu |
 
 ##### Yaml-gated category branches
 

@@ -630,3 +630,34 @@ steps:
       - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"
     agents:
       queue: "medium_cpu_queue_premerge"
+
+  - group: "LingBot World CUDA nightly regression"
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    steps:
+      - label: "LingBot World · CUDA measured reference/candidate"
+        key: lingbot-cuda-nightly-generation
+        source_file_dependencies: lingbot_world_regression
+        timeout_in_minutes: 240
+        mirror_hardwares: h100_4_exclusive
+        # Retry a lost agent once; pytest, OOM and cancellation remain failures.
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 1
+        artifact_paths:
+          - "lingbot-artifacts/cuda-nightly/**/*"
+        commands:
+          - bash .buildkite/common/scripts/run-lingbot-ci.sh generate tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly
+      - label: "LingBot World · CUDA videos WBench/VBench gate on GPU"
+        key: lingbot-cuda-nightly-quality
+        source_file_dependencies: lingbot_world_regression
+        depends_on:
+          - step: lingbot-cuda-nightly-generation
+            allow_failure: true
+        timeout_in_minutes: 480
+        mirror_hardwares: h100_1
+        artifact_paths:
+          - "lingbot-artifacts/cuda-nightly-quality/**/*"
+        commands:
+          - bash .buildkite/common/scripts/run-lingbot-ci.sh evaluate tests/dfx/lingbot_world/configs/cuda_nightly.json lingbot-artifacts/cuda-nightly-quality lingbot-artifacts/cuda-nightly

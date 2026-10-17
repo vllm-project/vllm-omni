@@ -1,0 +1,2264 @@
+{
+  "asset_lock_sha256": "18f352ed2b20b48ca8ccf5de3489d961571f3d180d2abe710828bb5c2613fa81",
+  "binary_activity": {
+    "allowed_count_change": 1,
+    "candidate_fractional_tolerance": 0.34,
+    "interpretation": "Native scores are binary. Compare three-trial activity incidence per scene; do not apply a fractional range ceiling to individual binary classifications. This is not a confidence test.",
+    "maximum_between_cohort_count_change": 1.0,
+    "reference_active_counts": {
+      "blossom-42": [
+        0.0,
+        1.0
+      ],
+      "boardwalk-42": [
+        0.0,
+        0.0
+      ],
+      "street-42": [
+        3.0,
+        3.0
+      ]
+    }
+  },
+  "candidate_budget_calibration": {
+    "cuda_pixels": {
+      "calibration_build": 17431,
+      "current_reference_video_sha256": [
+        {
+          "path": "reference/0/street-42/rollout.mp4",
+          "sha256": "2919f9871a062a588e6c7bd8285eaec03951542338bd5168b1222ffa83bea291"
+        },
+        {
+          "path": "reference/2/street-42/rollout.mp4",
+          "sha256": "704db194a3e65a111f9889f5ab4e02385ba92dcd348c7e146b10b42f1d00d3a3"
+        },
+        {
+          "path": "reference/1/street-42/rollout.mp4",
+          "sha256": "ae46db1326e4490f67dbcc56381027b1436d5576a2006a8f283fa9acfcab477d"
+        },
+        {
+          "path": "reference/0/boardwalk-42/rollout.mp4",
+          "sha256": "8bc30672286b7115fff0457f608bc6339711517ee01de579bec3b2b0a0b88bb4"
+        },
+        {
+          "path": "reference/0/blossom-42/rollout.mp4",
+          "sha256": "21c2541608eeeef4d8141c8fa976f96a999a07d2b7ab4da65d730400be2914c0"
+        },
+        {
+          "path": "reference/1/boardwalk-42/rollout.mp4",
+          "sha256": "3f3785575b40ede6c900f367bfac500e322d95245907931e3c55c41f8144ee41"
+        },
+        {
+          "path": "reference/2/boardwalk-42/rollout.mp4",
+          "sha256": "918de8c0e81a14133b0ca9438c46c662fcc6d6170ecb68fe7070e425888a5dca"
+        },
+        {
+          "path": "reference/2/blossom-42/rollout.mp4",
+          "sha256": "098259b0535688b560b34f157df8aebeee4f5a68418f603d2be27e8e3bd03a95"
+        },
+        {
+          "path": "reference/1/blossom-42/rollout.mp4",
+          "sha256": "8e83262b7cc3e877051bae22786441884f34788b3451e353ce2750db9349e340"
+        }
+      ],
+      "heldout_reference_video_sha256": [
+        {
+          "path": "reference/1/street-42/rollout.mp4",
+          "sha256": "3fe8d0a7792118d25ca6c16cd46704413b4e0f7af4628edff61c68e85a031671"
+        },
+        {
+          "path": "reference/0/street-42/rollout.mp4",
+          "sha256": "6f660477c1c9f8ec35f505f4d7b81edbffb419a967203cc3f691253973746fef"
+        },
+        {
+          "path": "reference/2/street-42/rollout.mp4",
+          "sha256": "c72c40b99dc602aac90b17d011df75f64bd6a1d2b6611ae2a76122b2f7949c9c"
+        },
+        {
+          "path": "reference/2/blossom-42/rollout.mp4",
+          "sha256": "078ccc71d1e8da4a38dff97a5bbfcef2b9dd031e6fe0f054a74d8798869d66e3"
+        },
+        {
+          "path": "reference/2/boardwalk-42/rollout.mp4",
+          "sha256": "ce8b86b9b7c0ec5f759776f25ba0fda8fdd7ade997bda97cbc694b57c364fd5d"
+        },
+        {
+          "path": "reference/0/blossom-42/rollout.mp4",
+          "sha256": "c8cc91047606f0ab414c01cc74e9ad7cc22b27e921855953ddf7ab944d00d0cc"
+        },
+        {
+          "path": "reference/1/boardwalk-42/rollout.mp4",
+          "sha256": "ab3a4db9bc43d2e96dbdfe4364a85bdc9a6396f1ddca3b3d1039d0e59fc27c3e"
+        },
+        {
+          "path": "reference/0/boardwalk-42/rollout.mp4",
+          "sha256": "6adcdd9c7ae4f72c35abcc008bdde4a91a22b54b19a0f9b3dd47d2cda751b186"
+        },
+        {
+          "path": "reference/1/blossom-42/rollout.mp4",
+          "sha256": "067b270c200714c97bc4fa8f50c41cb682cd92be9c592f0bcc0b6da4238deb0b"
+        }
+      ],
+      "maximum_reference_only_psnr_deficit_db": 2.5349972806994217,
+      "maximum_reference_only_ssim_deficit": 0.031969425636848126,
+      "previous_psnr_drop_db": 3,
+      "previous_ssim_drop": 0.03,
+      "reason": "All reference-only PSNR holdouts pass3dB; one reference-only SSIM holdout exceeds0.03.",
+      "reference_holdout_build": 17426,
+      "reference_ssim_samples": {
+        "blossom-42": {
+          "heldout_reference_metric_sha256": [
+            "a4183dab19de0564cfb7d823e0d278a72449d2c30f369bd59b36e0e13c071fd8",
+            "3cf24c6a69397cc6650c47daa4c63b297f6e323c755e1dc38cf8a6196c7fd9ba",
+            "ab2e30f07401fac5d321ac97e457d2fc0794c765b0286fd3685e2c99fa6c3da0"
+          ],
+          "heldout_reference_ssim": [
+            0.40316479016692053,
+            0.3578233443583207,
+            0.3222544450341252
+          ],
+          "reference_metric_sha256": [
+            "91437e924157681f276e1ec5884f0dd765bda59238d0127f8258a28c429799d7",
+            "9aa86e8cc9b0ef4a0d81131be8dc11d5fe60b67f2d021ac4558f4f8ef0113a1c",
+            "ba6c1c8bcd5e399ae946fefe2839698573239d44a3d12d727eea63efeb9fa7f6"
+          ],
+          "reference_ssim": [
+            0.28894405789732075,
+            0.3876007253812473,
+            0.30557278504646995
+          ]
+        },
+        "boardwalk-42": {
+          "heldout_reference_metric_sha256": [
+            "a8bb698b7b8fd000bfb37a70b4b705107519d3539768a3e586fa11d4885a0654",
+            "96ac19aea4c489e53b5c30ac243faf89a47ae3c0f76fa8cb3faf4c591c440954",
+            "b9cfddeaf0837fa7950cc6d4f159f80b48a459b08ecfe2d1ce0684179050e93b"
+          ],
+          "heldout_reference_ssim": [
+            0.4146077200964361,
+            0.47112555613762275,
+            0.5328211487734605
+          ],
+          "reference_metric_sha256": [
+            "b7fc6a51d272795cd7fb79dcda6a78546cff3bfe2b7a27b5932513638628dfe7",
+            "93ca7dba9fdd2c018e0559decef411b980b280bb729b20535845c3748584c87b",
+            "79049fe817d9b65b2f1750dec8b12ba000539ac0ffd22ff0d9381c2492eefe2b"
+          ],
+          "reference_ssim": [
+            0.48844435409774534,
+            0.4909667820823819,
+            0.4465771457332842
+          ]
+        },
+        "street-42": {
+          "heldout_reference_metric_sha256": [
+            "0271c33326d15e1470e639e251ddb3f19bd85ff5fabf9b6948f0e9359925664d",
+            "d007197fc7573d5d0bfdb01bd6223f03d8d653f496414c1b0b60459084dc56f5",
+            "fc2cf8dc3ddb339d30715a4a2cd4ae6eb6158c87130c6a2696e9a69d358c25f9"
+          ],
+          "heldout_reference_ssim": [
+            0.2547907928797005,
+            0.2626963820365233,
+            0.3103147055635111
+          ],
+          "reference_metric_sha256": [
+            "1a530b26d067bdc5577d372fabe1f145e8f92d2afa8218d9ac585961a3afa9c3",
+            "b89a0f2572cbf845f01290a38973dc8dc54a0787e7d491133cae0e4390225fed",
+            "47953a53549bdd91bf73c6b604224d7d4cd22857f95462701588b944335cb309"
+          ],
+          "reference_ssim": [
+            0.2719940550806502,
+            0.2717086143120291,
+            0.28815763759143004
+          ]
+        }
+      },
+      "selected_psnr_drop_db": 3,
+      "selected_ssim_drop": 0.04
+    },
+    "cuda_vbench_aesthetic_quality": {
+      "maximum_reference_only_deficit": 0.018552005290985107,
+      "previous_tolerance": 0.01,
+      "selected_tolerance": 0.025
+    },
+    "npu": "Unchanged; requires independent NPU reference-only calibration.",
+    "rule": "For a failed budget, multiply maximum reference-only deficit by1.25 and round upward (native scores0.005,SSIM0.005). Retain budgets whose held-out references already pass. This is not a confidence interval.",
+    "scope": "Reference-only cross-cohort holdouts. Candidate videos and scores excluded. Existing budgets change only when held-out same-code references exceed them. Preliminary until fresh target-head validation."
+  },
+  "continuous_reference_calibration": {
+    "dimensions": {
+      "vbench": {
+        "aesthetic_quality": {
+          "derived_ceiling": 0.03,
+          "previous_ceiling": 0.02,
+          "selected_ceiling": 0.03,
+          "six_reference_ranges": {
+            "blossom-42": 0.011408567428588867,
+            "boardwalk-42": 0.021547257900238037,
+            "street-42": 0.018325597047805786
+          }
+        },
+        "background_consistency": {
+          "derived_ceiling": 0.02,
+          "previous_ceiling": 0.03,
+          "selected_ceiling": 0.03,
+          "six_reference_ranges": {
+            "blossom-42": 0.009448139607405426,
+            "boardwalk-42": 0.00859826352415971,
+            "street-42": 0.015417275308560963
+          }
+        },
+        "imaging_quality": {
+          "derived_ceiling": 0.015,
+          "previous_ceiling": 0.02,
+          "selected_ceiling": 0.02,
+          "six_reference_ranges": {
+            "blossom-42": 0.011494040179302556,
+            "boardwalk-42": 0.007220429394479977,
+            "street-42": 0.006105638260111679
+          }
+        },
+        "motion_smoothness": {
+          "derived_ceiling": 0.015,
+          "previous_ceiling": 0.01,
+          "selected_ceiling": 0.015,
+          "six_reference_ranges": {
+            "blossom-42": 0.003792919786614335,
+            "boardwalk-42": 0.0030312050112276667,
+            "street-42": 0.011301264109134679
+          }
+        },
+        "subject_consistency": {
+          "derived_ceiling": 0.03,
+          "previous_ceiling": 0.02,
+          "selected_ceiling": 0.03,
+          "six_reference_ranges": {
+            "blossom-42": 0.009483779303166018,
+            "boardwalk-42": 0.015609290043846924,
+            "street-42": 0.02209966582786127
+          }
+        },
+        "temporal_flickering": {
+          "derived_ceiling": 0.02,
+          "previous_ceiling": 0.01,
+          "selected_ceiling": 0.02,
+          "six_reference_ranges": {
+            "blossom-42": 0.00442848205566404,
+            "boardwalk-42": 0.01065362294514971,
+            "street-42": 0.012058710584453514
+          }
+        }
+      },
+      "wbench": {
+        "aesthetic_quality": {
+          "derived_ceiling": 0.025,
+          "previous_ceiling": 0.01,
+          "selected_ceiling": 0.025,
+          "six_reference_ranges": {
+            "blossom-42": 0.008788940906524711,
+            "boardwalk-42": 0.014709691206614361,
+            "street-42": 0.018366435368855738
+          }
+        },
+        "hpsv3_quality": {
+          "derived_ceiling": 0.05,
+          "previous_ceiling": 0.05,
+          "selected_ceiling": 0.05,
+          "six_reference_ranges": {
+            "blossom-42": 0.015114150758072542,
+            "boardwalk-42": 0.039359619234474064,
+            "street-42": 0.038802383950063524
+          }
+        },
+        "imaging_quality": {
+          "derived_ceiling": 0.02,
+          "previous_ceiling": 0.01,
+          "selected_ceiling": 0.02,
+          "six_reference_ranges": {
+            "blossom-42": 0.005886909484863367,
+            "boardwalk-42": 0.0068831596374512305,
+            "street-42": 0.013899133046468282
+          }
+        },
+        "motion_smoothness": {
+          "derived_ceiling": 0.025,
+          "previous_ceiling": 0.01,
+          "selected_ceiling": 0.025,
+          "six_reference_ranges": {
+            "blossom-42": 0.002584220544049609,
+            "boardwalk-42": 0.0007713193804105289,
+            "street-42": 0.017995664156185365
+          }
+        },
+        "temporal_flickering": {
+          "derived_ceiling": 0.025,
+          "previous_ceiling": 0.01,
+          "selected_ceiling": 0.025,
+          "six_reference_ranges": {
+            "blossom-42": 0.007669224458582202,
+            "boardwalk-42": 0.009796740962009887,
+            "street-42": 0.017892964680989665
+          }
+        }
+      }
+    },
+    "margin_fraction": 0.25,
+    "pending_validation": [
+      "fresh final-head CUDA nightly and all weekly/long target profiles",
+      "target-H100 native WBench scoring",
+      "NPU reference calibration on its own platform; no CUDA override applied"
+    ],
+    "round_up_step": 0.005,
+    "rule": "For each continuous dimension, take the maximum six-reference range across scenes, multiply by1.25, round upward to0.005, and retain the larger existing ceiling. This calculation does not set candidate or pixel budgets; their independent reference-only holdout calibration is recorded separately.",
+    "scope": "Reference-only preliminary CUDA nightly ceilings; no candidate scores used. Not a confidence interval. Other CUDA profiles and target H100 WBench scoring need held-out validation. NPU keeps separate existing ceilings until its own calibration. The older WBench reference cohort reserved four H100 slots, while the newer cohort reserved all eight and exposed four; this preliminary reference ceiling is not evidence of final isolated-run acceptance."
+  },
+  "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+  "evaluator_lock_sha256": "3944139af9027ddbb45f73bcaa14718405b77e15436f301df18b35a5bc16775c",
+  "evaluator_requirements_sha256": "06474312fc6285ca1a0227d36dcb0aab9dffa11ed8d3f135e38a75d50ade7f8a",
+  "hardware": {
+    "cards": 4,
+    "devices": [
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "total_bytes": 85017624576
+      },
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "total_bytes": 85017624576
+      },
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "total_bytes": 85017624576
+      },
+      {
+        "name": "NVIDIA H100 80GB HBM3",
+        "total_bytes": 85017624576
+      }
+    ],
+    "dies": 4,
+    "packages": {
+      "diffusers": "0.40.0",
+      "torch": "2.13.0+cu130",
+      "transformers": "5.14.1",
+      "vllm": "0.31.0"
+    },
+    "platform": "cuda"
+  },
+  "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+  "p95_reference_cv_calibration": {
+    "candidate_regression_fraction": 0.05,
+    "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+    "final_source_validation_required": true,
+    "maximum_training_p95_cv": 0.03248342731010667,
+    "mean_p50_ceiling": 0.03,
+    "previous_ceiling": 0.03,
+    "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379",
+    "reserve_fraction": 0.25,
+    "round_up_cv": 0.005,
+    "rule": "Maximum training-case P95 population CV across three independent starts, plus25% reserve, rounded up to0.005. Mean/P50 reference CV and candidate regression fractions stay unchanged.",
+    "scope": "H100 P95 reference-CV ceiling only: fit earlier frozen-reference weekly cohort, validate on all18 newer weekly cases plus independent nightly and long references. Candidate measurements excluded. Historical engine environment overrides were not recorded; fresh pinned final-source validation remains mandatory.",
+    "selected_ceiling": 0.045,
+    "training_cohort": {
+      "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17443",
+      "case_shard": 2,
+      "job": "01a145df-c549-4f3d-bb59-1715ff5320bd",
+      "profile": "tests/dfx/lingbot_world/configs/cuda_weekly.json",
+      "profile_sha256": "f7527808585afbf165f64d97f185c7b9bd76abfef2a7dab6456417b7c3bbc36f",
+      "reference_cases": {
+        "blossom-314-hold": {
+          "benchmarks": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-314-hold/benchmark.json",
+              "sha256": "d01a7aa5a9ebbdb11f8d353fc95e51220b42a741f6bafaa083ae78b20e311678"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-314-hold/benchmark.json",
+              "sha256": "1858ada248c9d7647004a20bdbdb053b117b831f71b4f253469907d90ebb3be4"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-314-hold/benchmark.json",
+              "sha256": "36a6a520042ace615a38fa9b3738ea6c8fcbea59eba5afea1d26f6d4022968ec"
+            }
+          ],
+          "p95_cv": 0.01356191227067341,
+          "p95_values_ms": [
+            792.2224557027221,
+            773.0439611710608,
+            798.0532146058977
+          ]
+        },
+        "blossom-42-hold": {
+          "benchmarks": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-42-hold/benchmark.json",
+              "sha256": "acc32b6659048a65de9dc01bca7c206b42a52453c1a2bf98453dc1cbd67f8c55"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-42-hold/benchmark.json",
+              "sha256": "75fa023c6cfb72f7600b17741275ecbcce9843a35bcd4afbd67bfd1c1d44772a"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-42-hold/benchmark.json",
+              "sha256": "37f36e09a37acdb1af1a21458b8df657281a69e17bf15c57035db3cd9b24e58d"
+            }
+          ],
+          "p95_cv": 0.00926209036308498,
+          "p95_values_ms": [
+            786.6064111702144,
+            786.8044920265675,
+            802.2634790278971
+          ]
+        },
+        "boardwalk-314-hold": {
+          "benchmarks": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-314-hold/benchmark.json",
+              "sha256": "d281641b0aeba2c1e932a711ee91a3f08d90dec3ea698f35a3ac50774c3a57bf"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-314-hold/benchmark.json",
+              "sha256": "75000a1571cb0ef8a70bb3611d84292f1b58369a6da1c62b0e3fec5b1f5966af"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-314-hold/benchmark.json",
+              "sha256": "1a20384943135f50d4ebe82a259d6832f1f228d828f2e3d9e57501129dac5af3"
+            }
+          ],
+          "p95_cv": 0.03248342731010667,
+          "p95_values_ms": [
+            857.6589472591877,
+            800.439286325127,
+            801.8983076326549
+          ]
+        },
+        "boardwalk-42-hold": {
+          "benchmarks": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-42-hold/benchmark.json",
+              "sha256": "43ab01d492b3f62b6b0748ac6410d1102c6dfe0f85d50f64a232c42c970a23bf"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-42-hold/benchmark.json",
+              "sha256": "fd45f02e364ab123f163310aa094c1425023808847f54441d9d2fc8a7bdc181a"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-42-hold/benchmark.json",
+              "sha256": "ff7b93871ca6a51020a400e54a56fe0dd7d04d751d6d98ceeda0eb8468b22111"
+            }
+          ],
+          "p95_cv": 0.0064225659336287575,
+          "p95_values_ms": [
+            801.5745924785733,
+            791.59563947469,
+            790.0689812377095
+          ]
+        },
+        "street-314-hold": {
+          "benchmarks": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-314-hold/benchmark.json",
+              "sha256": "dab0bd2e37e69b85b53b3a8603cbab7c9a376774f48eaebc5be9936da7e1725a"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-314-hold/benchmark.json",
+              "sha256": "882d62cb13b658f19182fa66c8b01aa0f7c2354c88987d06b78078f8167a0534"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-314-hold/benchmark.json",
+              "sha256": "0a836d8d562d95364e17a461d51e6a081b74c133ea480dfca29ca3920ee3a88f"
+            }
+          ],
+          "p95_cv": 0.014060274411443838,
+          "p95_values_ms": [
+            795.89789127931,
+            809.869122505188,
+            782.4536412023008
+          ]
+        },
+        "street-42-hold": {
+          "benchmarks": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-42-hold/benchmark.json",
+              "sha256": "4986d69a381f4aea0e3ab717e67289cde922c225a54397734c52e6512b48f49f"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-42-hold/benchmark.json",
+              "sha256": "8600d3ffee8dbc4948b9cfb2fc0601e76c6465c58eed64691dcea62202c9147e"
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-42-hold/benchmark.json",
+              "sha256": "c8dc84d0b9752d712839e486fe884b55ac98b791787f05141c7a8b90101a93ad"
+            }
+          ],
+          "p95_cv": 0.01448319177549404,
+          "p95_values_ms": [
+            804.5633286237717,
+            778.028455004096,
+            783.6053276434541
+          ]
+        }
+      },
+      "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+    },
+    "validation_case_count": 22,
+    "validation_cohorts": [
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17454",
+        "case_shard": 0,
+        "job": "01a14756-bd38-4ad9-b0d0-d15e963b1303",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_weekly.json",
+        "profile_sha256": "f7527808585afbf165f64d97f185c7b9bd76abfef2a7dab6456417b7c3bbc36f",
+        "reference_cases": {
+          "blossom-314-forward": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/0/blossom-314-forward/benchmark.json",
+                "sha256": "e0869ddbb1ada825e602ca4f046ee9667e1fbf67bd9d977c15ebde046028a315"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/1/blossom-314-forward/benchmark.json",
+                "sha256": "771084643af5735889c8b319eed38ad2f9d6a10122ced7e5a58c5dd8065fdecb"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/2/blossom-314-forward/benchmark.json",
+                "sha256": "5317d836ee2ad569c44de00ceb5bd9a6f7cba1eb2c3d8f99df9c2b57a75961c7"
+              }
+            ],
+            "p95_cv": 0.020110602362747594,
+            "p95_values_ms": [
+              830.6421438232064,
+              812.7218520268798,
+              790.7423082739115
+            ]
+          },
+          "blossom-42-forward": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/0/blossom-42-forward/benchmark.json",
+                "sha256": "750cfce814bda0e88ce05171882a8b6ffd11d26f51aad0dc62e86ef9dca95dd9"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/1/blossom-42-forward/benchmark.json",
+                "sha256": "94639eb4d261831a53dda21cf8b3f4171d8c0a35f1860109cad15d90ebbc9470"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/2/blossom-42-forward/benchmark.json",
+                "sha256": "dd635746fd4cf5699ee7cf698afbb15b8d93731f9581a458db5586e34c506825"
+              }
+            ],
+            "p95_cv": 0.01909319011770844,
+            "p95_values_ms": [
+              818.8756378367545,
+              796.8028757721186,
+              781.7198459059
+            ]
+          },
+          "boardwalk-314-forward": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/0/boardwalk-314-forward/benchmark.json",
+                "sha256": "72a18a6fc6fe7eab821347eeba399ba432afeada759cf763f58707ee79188394"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/1/boardwalk-314-forward/benchmark.json",
+                "sha256": "7a7aa582cfbd5f45ffd45df8785a8c97432d4d6fa26c0b1ec7429df8f778d482"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/2/boardwalk-314-forward/benchmark.json",
+                "sha256": "50074880a5de8cf413399893aa4e148f706f479f369adb281e27137039e83d14"
+              }
+            ],
+            "p95_cv": 0.010299382248446511,
+            "p95_values_ms": [
+              829.1665015742184,
+              815.8718513324858,
+              808.8511383160949
+            ]
+          },
+          "boardwalk-42-forward": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/0/boardwalk-42-forward/benchmark.json",
+                "sha256": "7e625cbb6dcb49bde46fe0efeb9be045d0fa6a947ee13417ec815eaf53e4cace"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/1/boardwalk-42-forward/benchmark.json",
+                "sha256": "a289af103de48007d633f8276b20ee21710a0b8bd8a688a4cba818dda0e13ace"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/2/boardwalk-42-forward/benchmark.json",
+                "sha256": "5e28ae06fedba4587c97c7b09feef9c15d708a7e0bb1dfd197a7e333dcb550bd"
+              }
+            ],
+            "p95_cv": 0.004767808863051205,
+            "p95_values_ms": [
+              785.9320318326354,
+              786.6706533357501,
+              794.2551685497165
+            ]
+          },
+          "street-314-forward": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/0/street-314-forward/benchmark.json",
+                "sha256": "606282b208b8e407fa1aa8b81d6727c0223cef68dd4bb0084fc2e0cdc1af1974"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/1/street-314-forward/benchmark.json",
+                "sha256": "7aa626caefd6a346cc3e43d3720eb9116a1f40dd5e7f10ce61ddc4c5cfddaf39"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/2/street-314-forward/benchmark.json",
+                "sha256": "99502bc45c0ade58d35c19f78c9e17ed89add2175669e6ad4dbbda5fce4a20b0"
+              }
+            ],
+            "p95_cv": 0.015504667803000648,
+            "p95_values_ms": [
+              801.1812260374428,
+              815.367946214974,
+              784.9877541884781
+            ]
+          },
+          "street-42-forward": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/0/street-42-forward/benchmark.json",
+                "sha256": "ee641c2296d1c2dcd4770eb5daff0b3aaf0f81ba468ac11be8457ed5b23d6e30"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/1/street-42-forward/benchmark.json",
+                "sha256": "ee5d712b9a356c8a705cb5709072533cbddfc7803d8db8109e0549b4be3083cf"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-0/reference/2/street-42-forward/benchmark.json",
+                "sha256": "4a90fdbd7903cef6a3a9c3047a88516852a806701be89d9809b9df1117dae317"
+              }
+            ],
+            "p95_cv": 0.03490783400407099,
+            "p95_values_ms": [
+              846.9265669584275,
+              781.2687741592526,
+              795.4999722540379
+            ]
+          }
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      },
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17454",
+        "case_shard": 1,
+        "job": "01a14756-bd38-46c4-a281-d15cff6c7c24",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_weekly.json",
+        "profile_sha256": "f7527808585afbf165f64d97f185c7b9bd76abfef2a7dab6456417b7c3bbc36f",
+        "reference_cases": {
+          "blossom-314-orbit": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/0/blossom-314-orbit/benchmark.json",
+                "sha256": "9c90a7de860522108c817274d88271237e9649ba9aa12e1156afe68dcefcb27f"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/1/blossom-314-orbit/benchmark.json",
+                "sha256": "e4a6fa195a5b9ed25dc6aec0f59f571bf9273a5dc68eca4c0e239804bd221ca4"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/2/blossom-314-orbit/benchmark.json",
+                "sha256": "a45d665fb8c8f04b6bba69feab3abfc56a4b6effa6dd93a06d26319206ceea26"
+              }
+            ],
+            "p95_cv": 0.007545285674268206,
+            "p95_values_ms": [
+              806.1170163564384,
+              794.2887985613197,
+              792.5821786280721
+            ]
+          },
+          "blossom-42-orbit": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/0/blossom-42-orbit/benchmark.json",
+                "sha256": "5a6f97400e2f0f4db8423614dc038ec74d9863ade9803946edf42619fe4de7c0"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/1/blossom-42-orbit/benchmark.json",
+                "sha256": "16ca10470017f7a0072bd2fa692c9a96321379cd3e287cc08af116f9ab92174e"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/2/blossom-42-orbit/benchmark.json",
+                "sha256": "14a32db5c5f391e60789d173e827f6425b9bb23c107ef613fad66be1a9b13f95"
+              }
+            ],
+            "p95_cv": 0.014017781893824818,
+            "p95_values_ms": [
+              806.1256322078408,
+              784.5082472078502,
+              810.0047771818936
+            ]
+          },
+          "boardwalk-314-orbit": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/0/boardwalk-314-orbit/benchmark.json",
+                "sha256": "780359093821a32a968530f9c61523174632fbc2145c0c145baf228c118b3c6f"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/1/boardwalk-314-orbit/benchmark.json",
+                "sha256": "5a04f18f1aef8a52773f748f6dab0cd4bffa5b71bed570a493f191c44c31da41"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/2/boardwalk-314-orbit/benchmark.json",
+                "sha256": "63b2f9ffd9b8dd921f1a92303d1e8e357e96e8a930d196cc37e6df7de0552c49"
+              }
+            ],
+            "p95_cv": 0.0035442425788756227,
+            "p95_values_ms": [
+              792.5361757166684,
+              788.6113365646454,
+              785.7124713715166
+            ]
+          },
+          "boardwalk-42-orbit": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/0/boardwalk-42-orbit/benchmark.json",
+                "sha256": "43d9411d187029092625628d69213f9b07fe32d99b974a4ad8156637ffbfba1f"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/1/boardwalk-42-orbit/benchmark.json",
+                "sha256": "75e4d6c57d9fd2bd2fb099332495b0511977459ae907f5522d93c3df4fce52e8"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/2/boardwalk-42-orbit/benchmark.json",
+                "sha256": "dc3ca58c1ea814b37211e0b69373d6ede4745c346ccb7ca3f4a36f70f861a48b"
+              }
+            ],
+            "p95_cv": 0.0015237508713690988,
+            "p95_values_ms": [
+              792.5584147684276,
+              789.9612478911878,
+              792.4801964778453
+            ]
+          },
+          "street-314-orbit": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/0/street-314-orbit/benchmark.json",
+                "sha256": "da7aabd2b23b437c704426d6129fa4a89d2f6dbdef2b36beee7a56fa6c0081d0"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/1/street-314-orbit/benchmark.json",
+                "sha256": "d57f360e0f442eae500c2e4ff25d35e6b433f4c3a3d202a46653523dda0f32ac"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/2/street-314-orbit/benchmark.json",
+                "sha256": "d5759b800cad4ef09ad6c44dbc12b14080f46bad8f4f4c7ffa196b8e839126d6"
+              }
+            ],
+            "p95_cv": 0.017259876589474525,
+            "p95_values_ms": [
+              841.3862899877131,
+              816.0507102031261,
+              808.1258193124086
+            ]
+          },
+          "street-42-orbit": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/0/street-42-orbit/benchmark.json",
+                "sha256": "913c6b8e18dd8bd61acf34dfee123c951dce7a9582c0790cc7190a78cd28bdc0"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/1/street-42-orbit/benchmark.json",
+                "sha256": "42b351c14b7fdc493c9fdb84bd2d0cca0b9819d79aca144c639d4fb599f1010c"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-1/reference/2/street-42-orbit/benchmark.json",
+                "sha256": "f24e1397c23b53663ba22da396d4306eb555dc4cd85e3f654fe9e84c879d2d27"
+              }
+            ],
+            "p95_cv": 0.019832979594858653,
+            "p95_values_ms": [
+              807.3541028425097,
+              777.9162440914661,
+              771.5983615722507
+            ]
+          }
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      },
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17454",
+        "case_shard": 2,
+        "job": "01a14756-bd39-46d6-a31a-5f4060b084ff",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_weekly.json",
+        "profile_sha256": "f7527808585afbf165f64d97f185c7b9bd76abfef2a7dab6456417b7c3bbc36f",
+        "reference_cases": {
+          "blossom-314-hold": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-314-hold/benchmark.json",
+                "sha256": "a2265c249803f7627c30ec96f907ee14079b0003a2ae70cb07dfa965620cbe4a"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-314-hold/benchmark.json",
+                "sha256": "1117669a04bf7d95d20a5a3d441d08f12c4530213d61babf4529c59a93f5933e"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-314-hold/benchmark.json",
+                "sha256": "9e9aeb740525c80cf2c019125916d894411631abd35ea08aa6ec94538d547459"
+              }
+            ],
+            "p95_cv": 0.010862375959832778,
+            "p95_values_ms": [
+              807.0485079661012,
+              802.4500800296664,
+              786.7798067629337
+            ]
+          },
+          "blossom-42-hold": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-42-hold/benchmark.json",
+                "sha256": "085c1522a04108966d2298a2435d94ddc5dc1b24af6a5679a866faef430a116d"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-42-hold/benchmark.json",
+                "sha256": "58286e22fe545e3fe3f09010152ffa19e008ef0614bb44aeaafea140613adae0"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-42-hold/benchmark.json",
+                "sha256": "dc14445103bf925b7849ca0f332a24fae1c50da7af2beb84be13690a65297080"
+              }
+            ],
+            "p95_cv": 0.0178422423741473,
+            "p95_values_ms": [
+              785.5468582361937,
+              820.5243278294802,
+              800.891873985529
+            ]
+          },
+          "boardwalk-314-hold": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-314-hold/benchmark.json",
+                "sha256": "a40ce2327c2da311b49bfcdc9720dc32b77d64dee26f8ab7029dd56b156abe0e"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-314-hold/benchmark.json",
+                "sha256": "0188807fa6c54b05a8ef582decce44dec15433c746685cb342e04a858f3fa8f3"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-314-hold/benchmark.json",
+                "sha256": "074852071536810279185b0cafaef588fc42dbc5e64409bb79fe36aa87162496"
+              }
+            ],
+            "p95_cv": 0.00692557828999458,
+            "p95_values_ms": [
+              814.4621716812253,
+              810.86171772331,
+              801.1953677982092
+            ]
+          },
+          "boardwalk-42-hold": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-42-hold/benchmark.json",
+                "sha256": "aca70cd74575f4f76258e35f66199a1093b5d9e4bbc1059f48143eeab2741aa8"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-42-hold/benchmark.json",
+                "sha256": "035797586199c94396e8916367cbbd024f4387224fbf947a3ca7c15e61ec9506"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-42-hold/benchmark.json",
+                "sha256": "39ad60f871ae89f9e1bd9f3949c2cfa7840cadc0b995c57f7bee18392029054d"
+              }
+            ],
+            "p95_cv": 0.0189802676601439,
+            "p95_values_ms": [
+              830.6314941495657,
+              793.7777806073427,
+              819.7832353413106
+            ]
+          },
+          "street-314-hold": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-314-hold/benchmark.json",
+                "sha256": "e5c3c53484467f239d3e60acefc510aa54a0e73194cb1a1f325d1f2a98e37440"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-314-hold/benchmark.json",
+                "sha256": "941408014bfa2ec0fc96c20e6489e546ee873f4c8595aa5b82e85937ecaae323"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-314-hold/benchmark.json",
+                "sha256": "52682991d8f43447abdebda12e8dc224a6521c58f40cf65a8c18300baeaa5fe5"
+              }
+            ],
+            "p95_cv": 0.02870319334333312,
+            "p95_values_ms": [
+              847.0000339671969,
+              790.340948291123,
+              828.5237805917859
+            ]
+          },
+          "street-42-hold": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-42-hold/benchmark.json",
+                "sha256": "406b0850ccb3cef9620abaa271fcb741d3fe891c423e4dddfa075680fe6abfa9"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-42-hold/benchmark.json",
+                "sha256": "27b9fa2948169e5a500b531db0e501e09ae905ccb335698421cdaac0226ef50b"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-42-hold/benchmark.json",
+                "sha256": "9da0dc6d56a2cab15ecce02c9301c399093082a0e5e350cf408cbec37c7cfd5d"
+              }
+            ],
+            "p95_cv": 0.018862240358401658,
+            "p95_values_ms": [
+              818.9317855983974,
+              782.2157258167863,
+              804.9077436327934
+            ]
+          }
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      },
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17454",
+        "case_shard": null,
+        "job": "01a14756-990e-48e7-9bf0-c11ba4bcbf52",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_nightly.json",
+        "profile_sha256": "114c78865742db11668ca2e95ed5d1e79d8de202cab65ed3ceb6407afbeaf422",
+        "reference_cases": {
+          "blossom-42": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/0/blossom-42/benchmark.json",
+                "sha256": "083471b0c126e0541b580c528f917fcb96a1aa49809ad5f25df4da9b04b2b7db"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/1/blossom-42/benchmark.json",
+                "sha256": "615d3c2727ec0c600d6698b6697ad6244afe446a406e484cd0f17d8807d2fab0"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/2/blossom-42/benchmark.json",
+                "sha256": "270308869fc1142f0628319f37ea50fb713964b3bd50e3ab6309ba3a5e5bb06c"
+              }
+            ],
+            "p95_cv": 0.0025653992202178534,
+            "p95_values_ms": [
+              941.594560444355,
+              935.7498452067375,
+              939.3700528889894
+            ]
+          },
+          "boardwalk-42": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/0/boardwalk-42/benchmark.json",
+                "sha256": "c71a48b1f0fb31daf8162c1394dbf7ba157354ee55bab2b889b483b36b304736"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/1/boardwalk-42/benchmark.json",
+                "sha256": "f7c213eba4edd4be7105a834977687c9ccc4950bfb2ce15820a15b53c8e02869"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/2/boardwalk-42/benchmark.json",
+                "sha256": "3c631cc5143fe557db62fe96892a2c878a8d483b8fd42a3fee14d7e17e907e8f"
+              }
+            ],
+            "p95_cv": 0.006975241352459319,
+            "p95_values_ms": [
+              944.490435346961,
+              929.3958015739918,
+              932.3940306901932
+            ]
+          },
+          "street-42": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/0/street-42/benchmark.json",
+                "sha256": "4b4f8c7a9848c6e59aa7071e0d4ec036b4542852bfeaebe7a33dd6ebfd35747f"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/1/street-42/benchmark.json",
+                "sha256": "0e62b13e2ad2fbbb035d46890090c5846da6a84ae2afc22ebd6600c865a2bda0"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-nightly/reference/2/street-42/benchmark.json",
+                "sha256": "84699dccd5e103a418838d0d004d007f966daae409d273d5383413461d8bdd33"
+              }
+            ],
+            "p95_cv": 0.0050259728343013755,
+            "p95_values_ms": [
+              946.9733078032732,
+              937.4024549499154,
+              936.5482600405812
+            ]
+          }
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      },
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17454",
+        "case_shard": null,
+        "job": "01a14756-bd3b-4bc5-a261-e9a1eb21396d",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_long.json",
+        "profile_sha256": "d87c90461e91c8d23511f33bdc8e3b115d50c668847f8c893d30177f76ac2063",
+        "reference_cases": {
+          "boardwalk-42": {
+            "benchmarks": [
+              {
+                "artifact": "lingbot-artifacts/cuda-long/reference/0/boardwalk-42/benchmark.json",
+                "sha256": "c761fc8d0790e06d7fdbfa05b911be94e26c5d298ed5479519f136b631097514"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-long/reference/1/boardwalk-42/benchmark.json",
+                "sha256": "681a63558bf2b550be6047a058748062aabc1d3cdfa831b17b44868f0defa540"
+              },
+              {
+                "artifact": "lingbot-artifacts/cuda-long/reference/2/boardwalk-42/benchmark.json",
+                "sha256": "975fde4ca53f4f05197fa6e81e2649474f6ca17c4e86a3343d71520a9369495f"
+              }
+            ],
+            "p95_cv": 0.004026032071510923,
+            "p95_values_ms": [
+              910.8309184994141,
+              902.9935072503577,
+              903.2027207540523
+            ]
+          }
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      }
+    ],
+    "validation_maximum_p95_cv": 0.03490783400407099,
+    "validation_violations_at_previous_ceiling": 1,
+    "validation_violations_at_selected_ceiling": 0
+  },
+  "reference_cohorts": [
+    {
+      "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17426",
+      "evaluator_device": "NVIDIA H100 80GB HBM3",
+      "generation_reserved_cards": 8,
+      "quality_job_id": "01a1446f-5c0e-4e4a-8b37-3b1a531fe030",
+      "raw_scores_sha256": "101acbdf503ab6f91563aeba2b531356796519e528ab7c44028a5c9fe153e3d6",
+      "reference_scores": {
+        "blossom-42": [
+          {
+            "aesthetic_quality": 0.8130990862846375,
+            "background_consistency": 0.9305589179030987,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7694880599495749,
+            "motion_smoothness": 0.9796959518983875,
+            "subject_consistency": 0.939613218067073,
+            "temporal_flickering": 0.9477358126172832
+          },
+          {
+            "aesthetic_quality": 0.8214132785797119,
+            "background_consistency": 0.9303681189272585,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7619087910202315,
+            "motion_smoothness": 0.9767908138521717,
+            "subject_consistency": 0.9390999912088659,
+            "temporal_flickering": 0.9449010101019167
+          },
+          {
+            "aesthetic_quality": 0.8228815793991089,
+            "background_consistency": 0.9292130670627626,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.771997596212903,
+            "motion_smoothness": 0.980583733638786,
+            "subject_consistency": 0.9452014119059098,
+            "temporal_flickering": 0.9493294921575808
+          }
+        ],
+        "boardwalk-42": [
+          {
+            "aesthetic_quality": 0.6691150665283203,
+            "background_consistency": 0.9586838153230042,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7904589739785505,
+            "motion_smoothness": 0.979329194575329,
+            "subject_consistency": 0.9334461480504325,
+            "temporal_flickering": 0.94596279742671
+          },
+          {
+            "aesthetic_quality": 0.6794388294219971,
+            "background_consistency": 0.9616114512211135,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7926256671641607,
+            "motion_smoothness": 0.9800011844760371,
+            "subject_consistency": 0.9409085606076136,
+            "temporal_flickering": 0.9478472466562309
+          },
+          {
+            "aesthetic_quality": 0.6905967593193054,
+            "background_consistency": 0.9604379349396008,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7954700897024862,
+            "motion_smoothness": 0.9810579014493712,
+            "subject_consistency": 0.9413303848074264,
+            "temporal_flickering": 0.9497282215193206
+          }
+        ],
+        "street-42": [
+          {
+            "aesthetic_quality": 0.47482141852378845,
+            "background_consistency": 0.8904701040572479,
+            "dynamic_degree": 1.0,
+            "imaging_quality": 0.7945558523182099,
+            "motion_smoothness": 0.9565547284481446,
+            "subject_consistency": 0.8811228154774975,
+            "temporal_flickering": 0.9283578760483686
+          },
+          {
+            "aesthetic_quality": 0.4830860495567322,
+            "background_consistency": 0.879547888491334,
+            "dynamic_degree": 1.0,
+            "imaging_quality": 0.7948546889842931,
+            "motion_smoothness": 0.9574416409034705,
+            "subject_consistency": 0.8860473667247957,
+            "temporal_flickering": 0.9294403599757775
+          },
+          {
+            "aesthetic_quality": 0.4647604525089264,
+            "background_consistency": 0.894965163799895,
+            "dynamic_degree": 1.0,
+            "imaging_quality": 0.7970862707302006,
+            "motion_smoothness": 0.9617848124198145,
+            "subject_consistency": 0.9012267162569431,
+            "temporal_flickering": 0.9330842036826937
+          }
+        ]
+      }
+    },
+    {
+      "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17431",
+      "evaluator_device": "NVIDIA H100 80GB HBM3",
+      "generation_reserved_cards": 8,
+      "quality_job_id": "01a1449f-079f-4795-b793-b23b3a34aa66",
+      "raw_scores_sha256": "274c593cf4706365ca2a96171200a354bcbc84f1b7cf842bc461c21103c483e5",
+      "reference_scores": {
+        "blossom-42": [
+          {
+            "aesthetic_quality": 0.8245076537132263,
+            "background_consistency": 0.9289335363051471,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7686568212609122,
+            "motion_smoothness": 0.9795027498905702,
+            "subject_consistency": 0.9357176326027438,
+            "temporal_flickering": 0.9482575771855373
+          },
+          {
+            "aesthetic_quality": 0.816409170627594,
+            "background_consistency": 0.9211107782956933,
+            "dynamic_degree": 1.0,
+            "imaging_quality": 0.7655702241461733,
+            "motion_smoothness": 0.9772272689772081,
+            "subject_consistency": 0.9389146902606267,
+            "temporal_flickering": 0.9449710247563381
+          },
+          {
+            "aesthetic_quality": 0.8226545453071594,
+            "background_consistency": 0.9274948504792542,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.773402831199534,
+            "motion_smoothness": 0.980237512991622,
+            "subject_consistency": 0.9382056702836221,
+            "temporal_flickering": 0.9478287004957012
+          }
+        ],
+        "boardwalk-42": [
+          {
+            "aesthetic_quality": 0.689387857913971,
+            "background_consistency": 0.9643226431197479,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7952452036219824,
+            "motion_smoothness": 0.981461515224491,
+            "subject_consistency": 0.9421354979276657,
+            "temporal_flickering": 0.9537210015689626
+          },
+          {
+            "aesthetic_quality": 0.6906623244285583,
+            "background_consistency": 0.9666004341189601,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7976794033730304,
+            "motion_smoothness": 0.9823603995865566,
+            "subject_consistency": 0.9490554380942794,
+            "temporal_flickering": 0.9566164203718597
+          },
+          {
+            "aesthetic_quality": 0.6876670718193054,
+            "background_consistency": 0.9580021705948004,
+            "dynamic_degree": 0.0,
+            "imaging_quality": 0.7931957619145231,
+            "motion_smoothness": 0.9809584875538325,
+            "subject_consistency": 0.9414073859317964,
+            "temporal_flickering": 0.9505350673899932
+          }
+        ],
+        "street-42": [
+          {
+            "aesthetic_quality": 0.48256611824035645,
+            "background_consistency": 0.8921478015034139,
+            "dynamic_degree": 1.0,
+            "imaging_quality": 0.7959298771632293,
+            "motion_smoothness": 0.9606395757598383,
+            "subject_consistency": 0.9018108152291354,
+            "temporal_flickering": 0.9328676410749847
+          },
+          {
+            "aesthetic_quality": 0.4661608636379242,
+            "background_consistency": 0.8864982027967437,
+            "dynamic_degree": 1.0,
+            "imaging_quality": 0.7988018328588714,
+            "motion_smoothness": 0.9674940599609785,
+            "subject_consistency": 0.9032224813053588,
+            "temporal_flickering": 0.9404165866328221
+          },
+          {
+            "aesthetic_quality": 0.474180668592453,
+            "background_consistency": 0.8826155462184874,
+            "dynamic_degree": 1.0,
+            "imaging_quality": 0.7926961945987597,
+            "motion_smoothness": 0.9561927958518438,
+            "subject_consistency": 0.8812431246042252,
+            "temporal_flickering": 0.9286153232350068
+          }
+        ]
+      }
+    }
+  ],
+  "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379",
+  "schema_version": 1,
+  "scope": "Reference-only CUDA performance/quality calibration evidence, including target-H100 holdouts. Historical environment overrides were not retained; final-source acceptance and NPU calibration remain separate.",
+  "startup_stall_calibration": {
+    "cases": {
+      "blossom-42": [
+        [
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 85.88048908859491
+              }
+            ],
+            "raw_benchmark_sha256": "7a32e0018e96c7563ec7fdb05ef55a84522541d67368de43740fedfa77220849",
+            "startup_stall_ms": 85.88048908859491,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 244.17201802134514
+              }
+            ],
+            "raw_benchmark_sha256": "61253a42938031e7be01093931ad2409c9e50f7c9323265096a98c07ff238128",
+            "startup_stall_ms": 244.17201802134514,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 105.2381843328476
+              }
+            ],
+            "raw_benchmark_sha256": "96f137b7fa8e56bcaabb128480c97edf30c80ad9f490d5fa796198ee5d6e389d",
+            "startup_stall_ms": 105.2381843328476,
+            "steady_stall_ms": 0.0
+          }
+        ],
+        [
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 90.4412679374218
+              }
+            ],
+            "raw_benchmark_sha256": "21b8e73e97858e187fc97f7f5b5c179a3f09739833a0b06ce1b0e6fea3ede253",
+            "startup_stall_ms": 90.4412679374218,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 100.3675339743495
+              }
+            ],
+            "raw_benchmark_sha256": "4bd15dd81d8097250dce299f513736f663d1a9747fc43825701d756c80b777ce",
+            "startup_stall_ms": 100.3675339743495,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 136.39382366091013
+              }
+            ],
+            "raw_benchmark_sha256": "d04796fb5b39ce2ec145eed34901fc921130dbd9570fcfb3651a1263a3754785",
+            "startup_stall_ms": 136.39382366091013,
+            "steady_stall_ms": 0.0
+          }
+        ]
+      ],
+      "boardwalk-42": [
+        [
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 108.34144242107868
+              }
+            ],
+            "raw_benchmark_sha256": "5fc366f7d9c77288192d8e639b113d5c0642443eb38df25e148c9e57a412528d",
+            "startup_stall_ms": 108.34144242107868,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 83.93332920968533
+              }
+            ],
+            "raw_benchmark_sha256": "3e2d2160a0ddb9c6b8d421c9fcd47547aaf85d722048dfc95a9c5ed8e18a1834",
+            "startup_stall_ms": 83.93332920968533,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 96.13172989338636
+              }
+            ],
+            "raw_benchmark_sha256": "9037c6b1e521ce4c22828aa90c53ea3e74a5b7f435e4756edb5428f091d1b1b5",
+            "startup_stall_ms": 96.13172989338636,
+            "steady_stall_ms": 0.0
+          }
+        ],
+        [
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 89.01932835578918
+              }
+            ],
+            "raw_benchmark_sha256": "390b9935b1db4d7d8a5c5192874dfe2b5d24fa580d0d2e857c3cf2e9dc7cbe4b",
+            "startup_stall_ms": 89.01932835578918,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 156.73006512224674
+              }
+            ],
+            "raw_benchmark_sha256": "61386f72466647e2f2ef43e0bfb04b7201e925158f9ee26ff8eb4f9b1db02735",
+            "startup_stall_ms": 156.73006512224674,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 118.58916003257036
+              }
+            ],
+            "raw_benchmark_sha256": "943934339cebc4d36824386781aa2b0dcf6e528de3fc8777161fb0951cba1aa1",
+            "startup_stall_ms": 118.58916003257036,
+            "steady_stall_ms": 0.0
+          }
+        ]
+      ],
+      "street-42": [
+        [
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 95.96176166087389
+              }
+            ],
+            "raw_benchmark_sha256": "1123bb12abb6ef4f07ac8ec02be7e13a3bc0a8081e34454c1c34b1f4b6e93e08",
+            "startup_stall_ms": 95.96176166087389,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 87.45428454130888
+              }
+            ],
+            "raw_benchmark_sha256": "5837fd4992bba5f3df3304628c0d528e2623162c3d9ce0393ed3db2342fbbf33",
+            "startup_stall_ms": 87.45428454130888,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 68.16449388861656
+              }
+            ],
+            "raw_benchmark_sha256": "fa0ba6dd61757c93348bc163060047f978a1a6aeeb3eb7535f8e3290f0b7731d",
+            "startup_stall_ms": 68.16449388861656,
+            "steady_stall_ms": 0.0
+          }
+        ],
+        [
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 129.3812757357955
+              }
+            ],
+            "raw_benchmark_sha256": "a849a3d7982f4375bb88df5b80a81eecac37f7c85962a9b0337b881c75b88e57",
+            "startup_stall_ms": 129.3812757357955,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 61.159877106547356
+              }
+            ],
+            "raw_benchmark_sha256": "36334bb12dbc934210dd8683ef9f27c07d962cf76d8db3208449dc80987097da",
+            "startup_stall_ms": 61.159877106547356,
+            "steady_stall_ms": 0.0
+          },
+          {
+            "events": [
+              {
+                "chunk": 1,
+                "stall_ms": 96.9708301126957
+              }
+            ],
+            "raw_benchmark_sha256": "d4637fafc47e29d0d26306aee51ee3f69f4ad393e800ac7586a036cfbbc89bdb",
+            "startup_stall_ms": 96.9708301126957,
+            "steady_stall_ms": 0.0
+          }
+        ]
+      ]
+    },
+    "maximum_reference_startup_excess_ms": 107.77819436043501,
+    "playback_buffer_chunks": 1,
+    "reference_steady_stalls_all_zero": true,
+    "reserve_fraction": 0.25,
+    "round_up_ms": 1,
+    "rule": "Maximum held-out reference startup stall minus its calibration cohort maximum, over both cohort directions and all scenes; add25%reserve and round up to1ms. Apply as a floor only to total-stall allowance and also gate post-startup stalls independently, with no floor. Startup is max(2,warmup_chunks) media blocks.",
+    "scope": "CUDA-only reference-only startup playback noise. Candidate observations excluded. NPU keeps zero floor until its own calibration. Fresh target validation remains required.",
+    "selected_floor_ms": 135,
+    "source_builds": [
+      17426,
+      17431
+    ],
+    "startup_chunks": 6,
+    "target_fps": 12
+  },
+  "target_h100_hps_reference_calibration": {
+    "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17443",
+    "evaluator_hardware": {
+      "cards": 1,
+      "devices": [
+        {
+          "name": "NVIDIA H100 80GB HBM3",
+          "total_bytes": 85017624576
+        }
+      ],
+      "dies": 1,
+      "packages": {
+        "diffusers": "0.40.0",
+        "torch": "2.13.0+cu130",
+        "transformers": "5.14.1",
+        "vllm": "0.31.0"
+      },
+      "platform": "cuda"
+    },
+    "evaluator_lock_sha256": "3944139af9027ddbb45f73bcaa14718405b77e15436f301df18b35a5bc16775c",
+    "evaluator_requirements_sha256": "06474312fc6285ca1a0227d36dcb0aab9dffa11ed8d3f135e38a75d50ade7f8a",
+    "generation_manifest_sha256": "3e2fa677eefd2e4623297f90c07caeb467353753b2066237d94c10349f882e30",
+    "independent_reference_starts": 3,
+    "margin_fraction": 0.25,
+    "maximum_reference_range": 0.064710581354398,
+    "previous_ceiling": 0.05,
+    "profile_sha256": "9abd0259507318f750419ad1d3fc4411c4936e1a81b8c31900f245c25d3351c7",
+    "published_head": "95f438a598241945f65c6af58e0896bc2ed08b1a",
+    "quality_job": "01a145df-c788-4b61-95db-a12edb635b51",
+    "raw_scores_sha256": "c270e8265ef5c00295b0090186976b2dbf94ca44e58abfa0eed0ca3e62f07d94",
+    "reference_ranges": {
+      "blossom-42": 0.008042873073417778,
+      "boardwalk-42": 0.064710581354398,
+      "street-42": 0.006086608952965311
+    },
+    "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379",
+    "reference_scores": {
+      "blossom-42": {
+        "scores": [
+          0.8255133690951357,
+          0.8271781207856151,
+          0.8335562421685535
+        ],
+        "video_sha256": [
+          "1688b1220113996436dbc488f14396c7d2fbabb369c6d9cbe8118481650660b8",
+          "cc818f7e030e50f28a42d5d675824ee11857476a3c0412136cda0fa1f34b1179",
+          "29881cc82d453b2a30f4e2127b968a67e49720c58f5b7eb1dcaa76f7dc0a72b1"
+        ]
+      },
+      "boardwalk-42": {
+        "scores": [
+          0.7929218443361273,
+          0.8576324256905253,
+          0.8036637856542805
+        ],
+        "video_sha256": [
+          "20a230e213c951e695991148688e680a4528e99456cbf369f29715db246c3d0f",
+          "e6bd344ccc74e4a28323b7f9e87cbf28cc5b2c92d0616c11cd7765230b9d7ab6",
+          "a99728a4f3f6e5eb6875dabf1d50b480c240a6e161142f1a7de7b9cff947d0f4"
+        ]
+      },
+      "street-42": {
+        "scores": [
+          0.9127710341717157,
+          0.9066844252187504,
+          0.9069372541480057
+        ],
+        "video_sha256": [
+          "d11c7289d7526fc8d1ec77a2742b7d6b7352ae59052cc8920ad7a1ca5a6bd826",
+          "fc7c16227fa6dc4782ba806b0d77ec073ea1434013047a09b982fbceebe3061a",
+          "f4c2eec0bbb3a98bcf6670860cb70101164c38c9807dd54a07d8d15eadfb87cf"
+        ]
+      }
+    },
+    "round_up_step": 0.005,
+    "scope": "Reference-only target-H100 nightly HPSv3 calibration. Candidate scores excluded; fresh independent target-runner validation and all weekly/long profiles remain required.",
+    "selected_ceiling": 0.085,
+    "unchanged_candidate_tolerance": 0.02
+  },
+  "target_h100_long_imaging_reference_calibration": {
+    "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17443",
+    "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+    "evaluator_hardware": {
+      "cards": 1,
+      "devices": [
+        {
+          "name": "NVIDIA H100 80GB HBM3",
+          "total_bytes": 85017624576
+        }
+      ],
+      "dies": 1,
+      "packages": {
+        "diffusers": "0.40.0",
+        "torch": "2.13.0+cu130",
+        "transformers": "5.14.1",
+        "vllm": "0.31.0"
+      },
+      "platform": "cuda"
+    },
+    "evaluator_lock_sha256": "3944139af9027ddbb45f73bcaa14718405b77e15436f301df18b35a5bc16775c",
+    "evaluator_requirements_sha256": "06474312fc6285ca1a0227d36dcb0aab9dffa11ed8d3f135e38a75d50ade7f8a",
+    "evaluator_torch_version": "2.4.0+cu124",
+    "generation_job": "01a145df-c54b-4e10-a84d-c70760ced662",
+    "generation_manifest_sha256": "bae0bfa46b23883413c3d4f82a19129113b8fb28ca52b59b94dd890dde2b53ec",
+    "independent_reference_starts": 3,
+    "margin_fraction": 0.25,
+    "maximum_reference_range": 0.02171683116488965,
+    "pending_validation": "Independent target-H100 long reference starts at the final published source.",
+    "previous_ceiling": 0.02,
+    "profile": "tests/dfx/lingbot_world/configs/cuda_long.json",
+    "profile_sha256": "d87c90461e91c8d23511f33bdc8e3b115d50c668847f8c893d30177f76ac2063",
+    "published_head": "95f438a598241945f65c6af58e0896bc2ed08b1a",
+    "quality_job": "01a145df-c54c-4da4-9184-5924ef7ca79a",
+    "quality_report_sha256": "7325ac15823f3a21eae69ebc3145926497ac54802186cfb5c72778e4ef8495d0",
+    "raw_scores_sha256": "c74c3d61539a4138b3199e8ccf4b0a384d14464def56fb6df1046ac1bf82b368",
+    "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379",
+    "reference_scores": {
+      "boardwalk-42": {
+        "scores": [
+          0.668117504204644,
+          0.6464006730397543,
+          0.6607238544887966
+        ],
+        "video_sha256": [
+          "83d8778c4f2bed0dc2082c38538c0d8e4eebd19edc7fcb918b963566af7ab54d",
+          "d1a98f61209448074ea570d2d17ff633e36e6e0ace35c8fca7743fba841a5a6b",
+          "b851597f352b48ac0b8555f18886820cb8fa4902518a35908b3273a4ee5e0848"
+        ]
+      }
+    },
+    "round_up_step": 0.005,
+    "scope": "Frozen-reference H100 600-chunk WBench imaging calibration only; candidate scores are excluded. Current independent long campaign remains the holdout. This does not establish final-head acceptance.",
+    "selected_ceiling": 0.03,
+    "unchanged_candidate_tolerance": 0.01
+  },
+  "ttfc_calibration": {
+    "holdout_cohorts": [
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17443",
+        "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+        "hardware_contract_sha256": "e130063031e11c3a1b478b8fe60be9986951bf1ea28ae35139219cf205511495",
+        "job": "01a145df-c549-4f3d-bb59-1715ff5320bd",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_weekly.json",
+        "profile_sha256": "f7527808585afbf165f64d97f185c7b9bd76abfef2a7dab6456417b7c3bbc36f",
+        "reference_cases": {
+          "blossom-314-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-314-hold/benchmark.json",
+              "benchmark_sha256": "d01a7aa5a9ebbdb11f8d353fc95e51220b42a741f6bafaa083ae78b20e311678",
+              "repeat": 0,
+              "ttfc_ms": 1377.8787828050554
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-314-hold/benchmark.json",
+              "benchmark_sha256": "1858ada248c9d7647004a20bdbdb053b117b831f71b4f253469907d90ebb3be4",
+              "repeat": 1,
+              "ttfc_ms": 1351.8211729824543
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-314-hold/benchmark.json",
+              "benchmark_sha256": "36a6a520042ace615a38fa9b3738ea6c8fcbea59eba5afea1d26f6d4022968ec",
+              "repeat": 2,
+              "ttfc_ms": 1403.4446668811142
+            }
+          ],
+          "blossom-42-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-42-hold/benchmark.json",
+              "benchmark_sha256": "acc32b6659048a65de9dc01bca7c206b42a52453c1a2bf98453dc1cbd67f8c55",
+              "repeat": 0,
+              "ttfc_ms": 1324.0103907883167
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-42-hold/benchmark.json",
+              "benchmark_sha256": "75fa023c6cfb72f7600b17741275ecbcce9843a35bcd4afbd67bfd1c1d44772a",
+              "repeat": 1,
+              "ttfc_ms": 1348.935766145587
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-42-hold/benchmark.json",
+              "benchmark_sha256": "37f36e09a37acdb1af1a21458b8df657281a69e17bf15c57035db3cd9b24e58d",
+              "repeat": 2,
+              "ttfc_ms": 1355.6992840021849
+            }
+          ],
+          "boardwalk-314-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-314-hold/benchmark.json",
+              "benchmark_sha256": "d281641b0aeba2c1e932a711ee91a3f08d90dec3ea698f35a3ac50774c3a57bf",
+              "repeat": 0,
+              "ttfc_ms": 1487.5204977579415
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-314-hold/benchmark.json",
+              "benchmark_sha256": "75000a1571cb0ef8a70bb3611d84292f1b58369a6da1c62b0e3fec5b1f5966af",
+              "repeat": 1,
+              "ttfc_ms": 1472.1106090582907
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-314-hold/benchmark.json",
+              "benchmark_sha256": "1a20384943135f50d4ebe82a259d6832f1f228d828f2e3d9e57501129dac5af3",
+              "repeat": 2,
+              "ttfc_ms": 1480.4711220785975
+            }
+          ],
+          "boardwalk-42-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-42-hold/benchmark.json",
+              "benchmark_sha256": "43ab01d492b3f62b6b0748ac6410d1102c6dfe0f85d50f64a232c42c970a23bf",
+              "repeat": 0,
+              "ttfc_ms": 1491.1213791929185
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-42-hold/benchmark.json",
+              "benchmark_sha256": "fd45f02e364ab123f163310aa094c1425023808847f54441d9d2fc8a7bdc181a",
+              "repeat": 1,
+              "ttfc_ms": 1508.1263352185488
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-42-hold/benchmark.json",
+              "benchmark_sha256": "ff7b93871ca6a51020a400e54a56fe0dd7d04d751d6d98ceeda0eb8468b22111",
+              "repeat": 2,
+              "ttfc_ms": 1450.8042810484767
+            }
+          ],
+          "street-314-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-314-hold/benchmark.json",
+              "benchmark_sha256": "dab0bd2e37e69b85b53b3a8603cbab7c9a376774f48eaebc5be9936da7e1725a",
+              "repeat": 0,
+              "ttfc_ms": 1322.6466891355813
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-314-hold/benchmark.json",
+              "benchmark_sha256": "882d62cb13b658f19182fa66c8b01aa0f7c2354c88987d06b78078f8167a0534",
+              "repeat": 1,
+              "ttfc_ms": 1300.0205168500543
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-314-hold/benchmark.json",
+              "benchmark_sha256": "0a836d8d562d95364e17a461d51e6a081b74c133ea480dfca29ca3920ee3a88f",
+              "repeat": 2,
+              "ttfc_ms": 1295.0869253836572
+            }
+          ],
+          "street-42-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-42-hold/benchmark.json",
+              "benchmark_sha256": "4986d69a381f4aea0e3ab717e67289cde922c225a54397734c52e6512b48f49f",
+              "repeat": 0,
+              "ttfc_ms": 1300.9710819460452
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-42-hold/benchmark.json",
+              "benchmark_sha256": "8600d3ffee8dbc4948b9cfb2fc0601e76c6465c58eed64691dcea62202c9147e",
+              "repeat": 1,
+              "ttfc_ms": 1335.2295742370188
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-42-hold/benchmark.json",
+              "benchmark_sha256": "c8dc84d0b9752d712839e486fe884b55ac98b791787f05141c7a8b90101a93ad",
+              "repeat": 2,
+              "ttfc_ms": 1311.7867400869727
+            }
+          ]
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      },
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17454",
+        "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+        "hardware_contract_sha256": "7327c86e8fe1a297eb69649adf883b27b5c48053b978f6d928f9a55e1a832e11",
+        "job": "01a14756-bd39-46d6-a31a-5f4060b084ff",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_weekly.json",
+        "profile_sha256": "f7527808585afbf165f64d97f185c7b9bd76abfef2a7dab6456417b7c3bbc36f",
+        "reference_cases": {
+          "blossom-314-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-314-hold/benchmark.json",
+              "benchmark_sha256": "a2265c249803f7627c30ec96f907ee14079b0003a2ae70cb07dfa965620cbe4a",
+              "repeat": 0,
+              "ttfc_ms": 1370.5015694722533
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-314-hold/benchmark.json",
+              "benchmark_sha256": "1117669a04bf7d95d20a5a3d441d08f12c4530213d61babf4529c59a93f5933e",
+              "repeat": 1,
+              "ttfc_ms": 1368.7126599252224
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-314-hold/benchmark.json",
+              "benchmark_sha256": "9e9aeb740525c80cf2c019125916d894411631abd35ea08aa6ec94538d547459",
+              "repeat": 2,
+              "ttfc_ms": 1354.0295623242855
+            }
+          ],
+          "blossom-42-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/blossom-42-hold/benchmark.json",
+              "benchmark_sha256": "085c1522a04108966d2298a2435d94ddc5dc1b24af6a5679a866faef430a116d",
+              "repeat": 0,
+              "ttfc_ms": 1337.1935980394483
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/blossom-42-hold/benchmark.json",
+              "benchmark_sha256": "58286e22fe545e3fe3f09010152ffa19e008ef0614bb44aeaafea140613adae0",
+              "repeat": 1,
+              "ttfc_ms": 1383.1124901771545
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/blossom-42-hold/benchmark.json",
+              "benchmark_sha256": "dc14445103bf925b7849ca0f332a24fae1c50da7af2beb84be13690a65297080",
+              "repeat": 2,
+              "ttfc_ms": 1351.3149125501513
+            }
+          ],
+          "boardwalk-314-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-314-hold/benchmark.json",
+              "benchmark_sha256": "a40ce2327c2da311b49bfcdc9720dc32b77d64dee26f8ab7029dd56b156abe0e",
+              "repeat": 0,
+              "ttfc_ms": 1677.4787325412035
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-314-hold/benchmark.json",
+              "benchmark_sha256": "0188807fa6c54b05a8ef582decce44dec15433c746685cb342e04a858f3fa8f3",
+              "repeat": 1,
+              "ttfc_ms": 1481.855783611536
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-314-hold/benchmark.json",
+              "benchmark_sha256": "074852071536810279185b0cafaef588fc42dbc5e64409bb79fe36aa87162496",
+              "repeat": 2,
+              "ttfc_ms": 1451.6487810760736
+            }
+          ],
+          "boardwalk-42-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/boardwalk-42-hold/benchmark.json",
+              "benchmark_sha256": "aca70cd74575f4f76258e35f66199a1093b5d9e4bbc1059f48143eeab2741aa8",
+              "repeat": 0,
+              "ttfc_ms": 1665.5328338965774
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/boardwalk-42-hold/benchmark.json",
+              "benchmark_sha256": "035797586199c94396e8916367cbbd024f4387224fbf947a3ca7c15e61ec9506",
+              "repeat": 1,
+              "ttfc_ms": 1511.0821835696697
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/boardwalk-42-hold/benchmark.json",
+              "benchmark_sha256": "39ad60f871ae89f9e1bd9f3949c2cfa7840cadc0b995c57f7bee18392029054d",
+              "repeat": 2,
+              "ttfc_ms": 1480.0847377628088
+            }
+          ],
+          "street-314-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-314-hold/benchmark.json",
+              "benchmark_sha256": "e5c3c53484467f239d3e60acefc510aa54a0e73194cb1a1f325d1f2a98e37440",
+              "repeat": 0,
+              "ttfc_ms": 1287.1775990352035
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-314-hold/benchmark.json",
+              "benchmark_sha256": "941408014bfa2ec0fc96c20e6489e546ee873f4c8595aa5b82e85937ecaae323",
+              "repeat": 1,
+              "ttfc_ms": 1432.7401965856552
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-314-hold/benchmark.json",
+              "benchmark_sha256": "52682991d8f43447abdebda12e8dc224a6521c58f40cf65a8c18300baeaa5fe5",
+              "repeat": 2,
+              "ttfc_ms": 1299.5113600045443
+            }
+          ],
+          "street-42-hold": [
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/0/street-42-hold/benchmark.json",
+              "benchmark_sha256": "406b0850ccb3cef9620abaa271fcb741d3fe891c423e4dddfa075680fe6abfa9",
+              "repeat": 0,
+              "ttfc_ms": 1318.3177514001727
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/1/street-42-hold/benchmark.json",
+              "benchmark_sha256": "27b9fa2948169e5a500b531db0e501e09ae905ccb335698421cdaac0226ef50b",
+              "repeat": 1,
+              "ttfc_ms": 1318.1941201910377
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-weekly/shard-2/reference/2/street-42-hold/benchmark.json",
+              "benchmark_sha256": "9da0dc6d56a2cab15ecce02c9301c399093082a0e5e350cf408cbec37c7cfd5d",
+              "repeat": 2,
+              "ttfc_ms": 1308.9622808620334
+            }
+          ]
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      }
+    ],
+    "holdout_false_rejections": 0,
+    "holdout_reference_comparisons": 36,
+    "independent_final_head_validation_required": true,
+    "maximum_reference_excess_ms": 174.79138216003776,
+    "old_holdout_false_rejections": 3,
+    "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379",
+    "reserve_fraction": 0.25,
+    "round_up_ms": 5,
+    "rule": "Maximum positive held-out reference TTFC minus the training-cohort maximum, across matching cases in both directions; add25% reserve and round up to5ms.",
+    "scope": "H100 TTFC floor fitted to two nightly frozen-reference cohorts only; validated on two separate weekly cohorts. Candidate inputs excluded. Does not accept final-head candidate performance.",
+    "selected_floor_ms": 220,
+    "training_cohorts": [
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17443",
+        "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+        "hardware_contract_sha256": "8c66e71246b2c22f189881cd99805b2f40539897142d257281e8225ee44366c8",
+        "job": "01a145df-c788-427d-b4de-fd232a817763",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_nightly.json",
+        "profile_sha256": "114c78865742db11668ca2e95ed5d1e79d8de202cab65ed3ceb6407afbeaf422",
+        "reference_cases": {
+          "blossom-42": [
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/0/blossom-42/benchmark.json",
+              "benchmark_sha256": "d393b79ab4953344bfee16d9f80ea559240f6f08889d1145ad724f61afc0855b",
+              "repeat": 0,
+              "ttfc_ms": 1359.7984588705003
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/1/blossom-42/benchmark.json",
+              "benchmark_sha256": "3375f65aa105be761b905cb588dd5f216c7e89c4aede60d37d7a745dba74fdfb",
+              "repeat": 1,
+              "ttfc_ms": 1350.985619938001
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/2/blossom-42/benchmark.json",
+              "benchmark_sha256": "767fceb97837a5e7091fb2c2b85acbc60466c275f2c89671eddf5fad3031884a",
+              "repeat": 2,
+              "ttfc_ms": 1357.2098419535905
+            }
+          ],
+          "boardwalk-42": [
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/0/boardwalk-42/benchmark.json",
+              "benchmark_sha256": "1251b4708865cf11fae759d66af8840b4c1ddbdf2efceb9e68ac73bcf7059d4f",
+              "repeat": 0,
+              "ttfc_ms": 1443.2917749509215
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/1/boardwalk-42/benchmark.json",
+              "benchmark_sha256": "d242b254c008bafa5126749653f370fd382b6e9a9f3075420cbcff8be7d55a4b",
+              "repeat": 1,
+              "ttfc_ms": 1481.2550190836191
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/2/boardwalk-42/benchmark.json",
+              "benchmark_sha256": "15932fd6bd8beeaa803a0df51381614bcf91b0dead7ae418af25e622ff59f020",
+              "repeat": 2,
+              "ttfc_ms": 1452.9830371029675
+            }
+          ],
+          "street-42": [
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/0/street-42/benchmark.json",
+              "benchmark_sha256": "87c3c8f88d85c5fa90f77992a7938020b70134f1d383c9e3faf2ed0c183bd561",
+              "repeat": 0,
+              "ttfc_ms": 1268.2746869977564
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/1/street-42/benchmark.json",
+              "benchmark_sha256": "157ca97eb8f5ba2107fd4b12f3de3d61fa2c86fe90ed1712081b37e4d49107db",
+              "repeat": 1,
+              "ttfc_ms": 1273.9500561729074
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/2/street-42/benchmark.json",
+              "benchmark_sha256": "15d1351d631649943049fd57c13883debbf4c3cc38b61620020172fa73ffba55",
+              "repeat": 2,
+              "ttfc_ms": 1498.1426228769124
+            }
+          ]
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      },
+      {
+        "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17454",
+        "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+        "hardware_contract_sha256": "0f86a821264f57ade7c4acbff18816ce47002a9cd99efc71d8478c5a950abee8",
+        "job": "01a14756-990e-48e7-9bf0-c11ba4bcbf52",
+        "profile": "tests/dfx/lingbot_world/configs/cuda_nightly.json",
+        "profile_sha256": "114c78865742db11668ca2e95ed5d1e79d8de202cab65ed3ceb6407afbeaf422",
+        "reference_cases": {
+          "blossom-42": [
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/0/blossom-42/benchmark.json",
+              "benchmark_sha256": "083471b0c126e0541b580c528f917fcb96a1aa49809ad5f25df4da9b04b2b7db",
+              "repeat": 0,
+              "ttfc_ms": 1364.6319136023521
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/1/blossom-42/benchmark.json",
+              "benchmark_sha256": "615d3c2727ec0c600d6698b6697ad6244afe446a406e484cd0f17d8807d2fab0",
+              "repeat": 1,
+              "ttfc_ms": 1356.9708140566945
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/2/blossom-42/benchmark.json",
+              "benchmark_sha256": "270308869fc1142f0628319f37ea50fb713964b3bd50e3ab6309ba3a5e5bb06c",
+              "repeat": 2,
+              "ttfc_ms": 1402.2837206721306
+            }
+          ],
+          "boardwalk-42": [
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/0/boardwalk-42/benchmark.json",
+              "benchmark_sha256": "c71a48b1f0fb31daf8162c1394dbf7ba157354ee55bab2b889b483b36b304736",
+              "repeat": 0,
+              "ttfc_ms": 1474.1388950496912
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/1/boardwalk-42/benchmark.json",
+              "benchmark_sha256": "f7c213eba4edd4be7105a834977687c9ccc4950bfb2ce15820a15b53c8e02869",
+              "repeat": 1,
+              "ttfc_ms": 1518.9075702801347
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/2/boardwalk-42/benchmark.json",
+              "benchmark_sha256": "3c631cc5143fe557db62fe96892a2c878a8d483b8fd42a3fee14d7e17e907e8f",
+              "repeat": 2,
+              "ttfc_ms": 1491.6289076209068
+            }
+          ],
+          "street-42": [
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/0/street-42/benchmark.json",
+              "benchmark_sha256": "4b4f8c7a9848c6e59aa7071e0d4ec036b4542852bfeaebe7a33dd6ebfd35747f",
+              "repeat": 0,
+              "ttfc_ms": 1291.4687125012279
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/1/street-42/benchmark.json",
+              "benchmark_sha256": "0e62b13e2ad2fbbb035d46890090c5846da6a84ae2afc22ebd6600c865a2bda0",
+              "repeat": 1,
+              "ttfc_ms": 1323.3512407168746
+            },
+            {
+              "artifact": "lingbot-artifacts/cuda-nightly/reference/2/street-42/benchmark.json",
+              "benchmark_sha256": "84699dccd5e103a418838d0d004d007f966daae409d273d5383413461d8bdd33",
+              "repeat": 2,
+              "ttfc_ms": 1268.969881348312
+            }
+          ]
+        },
+        "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379"
+      }
+    ],
+    "training_reference_comparisons": 18
+  },
+  "vbench_revision": "fd18b3d055cb0fc6f066ca90fe2c3c8cbb698490",
+  "wbench_reference_cohorts": [
+    {
+      "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17394",
+      "evaluator_device": "NVIDIA L20X",
+      "generation_reserved_cards": 4,
+      "raw_scores_sha256": "decc989072eb13fede3baefdd777e807dbbcaba35b168e4dbef2e3e366f46012",
+      "reference_scores": {
+        "blossom-42": [
+          {
+            "aesthetic_quality": 0.8085547471046446,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8349307201015621,
+            "imaging_quality": 0.6811857477823894,
+            "motion_smoothness": 0.9688209021510817,
+            "temporal_flickering": 0.9181458641501034
+          },
+          {
+            "aesthetic_quality": 0.8064824891090393,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8282416953709295,
+            "imaging_quality": 0.6830886395772298,
+            "motion_smoothness": 0.9691169854026012,
+            "temporal_flickering": 0.9182294882980048
+          },
+          {
+            "aesthetic_quality": 0.8061018411318462,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8277495697507292,
+            "imaging_quality": 0.6832051315307617,
+            "motion_smoothness": 0.9698223269440694,
+            "temporal_flickering": 0.9206979265400007
+          }
+        ],
+        "boardwalk-42": [
+          {
+            "aesthetic_quality": 0.6896912185351053,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8504192277077481,
+            "imaging_quality": 0.7197980066935222,
+            "motion_smoothness": 0.9777894509558788,
+            "temporal_flickering": 0.9283668966854319
+          },
+          {
+            "aesthetic_quality": 0.6953577995300293,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8110596084732741,
+            "imaging_quality": 0.7177646268208822,
+            "motion_smoothness": 0.9773086847507668,
+            "temporal_flickering": 0.9293277216892616
+          },
+          {
+            "aesthetic_quality": 0.6984590403238932,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8325942473542672,
+            "imaging_quality": 0.7193088849385579,
+            "motion_smoothness": 0.9779766561798489,
+            "temporal_flickering": 0.9368636636173024
+          }
+        ],
+        "street-42": [
+          {
+            "aesthetic_quality": 0.48368048191070556,
+            "dynamic_degree": 1.0,
+            "hpsv3_quality": 0.9134334082541348,
+            "imaging_quality": 0.7324947725931803,
+            "motion_smoothness": 0.9444998080578071,
+            "temporal_flickering": 0.8942429037655101
+          },
+          {
+            "aesthetic_quality": 0.4842900013923645,
+            "dynamic_degree": 1.0,
+            "hpsv3_quality": 0.9008543120451843,
+            "imaging_quality": 0.7254427235921224,
+            "motion_smoothness": 0.944031366262254,
+            "temporal_flickering": 0.8973958482929304
+          },
+          {
+            "aesthetic_quality": 0.486151282787323,
+            "dynamic_degree": 1.0,
+            "hpsv3_quality": 0.8943545945991483,
+            "imaging_quality": 0.7291483910878499,
+            "motion_smoothness": 0.9465301139977421,
+            "temporal_flickering": 0.8999538646024816
+          }
+        ]
+      },
+      "scope": "H100-generated videos; independently scored with pinned WBench on L20X; target-H100 scoring validation remains pending",
+      "wbench_revision": "fdd7e74c400d7b5f8310e07dd94c129eaf6c6f61"
+    },
+    {
+      "build_url": "https://buildkite.com/vllm/vllm-omni/builds/17431",
+      "evaluator_device": "NVIDIA L20X",
+      "generation_reserved_cards": 8,
+      "raw_scores_sha256": "c2634fe2022ebd4abf98227fa7e5dd031a6ef7135ca20ad6013771fede5acef1",
+      "reference_scores": {
+        "blossom-42": [
+          {
+            "aesthetic_quality": 0.8025863019625346,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8384112811468099,
+            "imaging_quality": 0.6802690416971842,
+            "motion_smoothness": 0.9690958283569524,
+            "temporal_flickering": 0.917606637992111
+          },
+          {
+            "aesthetic_quality": 0.8041338801383973,
+            "dynamic_degree": 1.0,
+            "hpsv3_quality": 0.8372021901452248,
+            "imaging_quality": 0.6861559511820475,
+            "motion_smoothness": 0.9672381064000198,
+            "temporal_flickering": 0.9130287020814185
+          },
+          {
+            "aesthetic_quality": 0.8113752428690593,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8232971303887373,
+            "imaging_quality": 0.6840494092305501,
+            "motion_smoothness": 0.9685262816948046,
+            "temporal_flickering": 0.9170685263241038
+          }
+        ],
+        "boardwalk-42": [
+          {
+            "aesthetic_quality": 0.6996754574775697,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8433663041132748,
+            "imaging_quality": 0.7171819801330567,
+            "motion_smoothness": 0.9774988497826543,
+            "temporal_flickering": 0.931474079805262
+          },
+          {
+            "aesthetic_quality": 0.7044009097417196,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8454582149489053,
+            "imaging_quality": 0.7218591295878092,
+            "motion_smoothness": 0.9780630837758054,
+            "temporal_flickering": 0.9354734158983418
+          },
+          {
+            "aesthetic_quality": 0.6973098929723104,
+            "dynamic_degree": 0.0,
+            "hpsv3_quality": 0.8261187737308949,
+            "imaging_quality": 0.714975969950358,
+            "motion_smoothness": 0.9772917643953949,
+            "temporal_flickering": 0.9270669226552926
+          }
+        ],
+        "street-42": [
+          {
+            "aesthetic_quality": 0.5020469172795613,
+            "dynamic_degree": 1.0,
+            "hpsv3_quality": 0.9115739917617114,
+            "imaging_quality": 0.7300586827596028,
+            "motion_smoothness": 0.9444188953272674,
+            "temporal_flickering": 0.9022380978453393
+          },
+          {
+            "aesthetic_quality": 0.49536964893341057,
+            "dynamic_degree": 1.0,
+            "hpsv3_quality": 0.9148117298672753,
+            "imaging_quality": 0.7393418566385906,
+            "motion_smoothness": 0.9563152879615898,
+            "temporal_flickering": 0.9121358684464997
+          },
+          {
+            "aesthetic_quality": 0.4879542529582977,
+            "dynamic_degree": 1.0,
+            "hpsv3_quality": 0.9331569785492119,
+            "imaging_quality": 0.7283145847320558,
+            "motion_smoothness": 0.9383196238054045,
+            "temporal_flickering": 0.8975757299685011
+          }
+        ]
+      },
+      "scope": "H100-generated videos; independently scored with pinned WBench on L20X; target-H100 scoring validation remains pending",
+      "wbench_revision": "fdd7e74c400d7b5f8310e07dd94c129eaf6c6f61"
+    }
+  ],
+  "workload": {
+    "cards": 4,
+    "cases": [
+      {
+        "camera_pattern": "forward",
+        "id": "boardwalk-42",
+        "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+        "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+        "seed": 42
+      },
+      {
+        "camera_pattern": "orbit",
+        "id": "blossom-42",
+        "image": "cherry_blossom",
+        "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+        "seed": 42
+      },
+      {
+        "camera_pattern": "hold",
+        "id": "street-42",
+        "image": "stop_sign",
+        "prompt": "A street corner with a stop sign and surrounding buildings.",
+        "seed": 42
+      }
+    ],
+    "chunk_timeout_s": 120,
+    "deploy_config": "benchmarks/lingbot_world/configs/usp4_compiled.yaml",
+    "dies": 4,
+    "first_chunk_timeout_s": 900,
+    "height": 480,
+    "lifecycle_checks": true,
+    "max_reference_cv": 0.03,
+    "memory_growth_budget_bytes": 268435456,
+    "min_steady_samples": 33,
+    "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+    "mux_fps": 16,
+    "num_chunks": 40,
+    "performance_regression_fraction": 0.05,
+    "platform": "cuda",
+    "precision": "bfloat16",
+    "precision_atol": 0.0,
+    "precision_rtol": 0.0,
+    "precision_timeout_s": 600,
+    "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379",
+    "reserved_cards": 8,
+    "schema_version": 1,
+    "startup_timeout_s": 1200,
+    "target_fps": 12,
+    "transient_noise_sigma": 3.0,
+    "warmup_chunks": 6,
+    "warmup_num_chunks": 8,
+    "width": 832
+  }
+}

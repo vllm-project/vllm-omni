@@ -1,0 +1,37 @@
+{
+  "images": {
+    "2560px-Gfp-wisconsin-madison-the-nature-boardwalk": "f04df6c31f27340e2984daa6d731eaa17d42e89ad9a3c73df58e19bda7e591ee",
+    "cherry_blossom": "f288740fd2cffa42468e3dc2263f9529961656c1d79ab586d37dd93f591f0bfc",
+    "stop_sign": "4fa94f43f1671cf7204efa3a4adab58549cbf4c510a62c0d984727bf34f27cf2"
+  },
+  "model_files": {
+    "README.md": "a6f94880047e35fe1b2df43934396937365ef116ee8fe3e754737130411ebddb",
+    "assets/teaser.png": "8d0ec018a9996580ff0264c58fa036a5ed97c9369ce824566636d06e9020009a",
+    "model_index.json": "0a439c3869d30998c60e030abb3dc80830ffe7a15af286db8151e5ebd74d6c19",
+    "scheduler/scheduler_config.json": "571a3eed68bcd943a61b9fea8efa9e141472216ada59f928c8b5128ce24b32e0",
+    "text_encoder/config.json": "a2bcb24699f6c009a2427432bdd483ef8b2b42a712abc9503759cdc77d171f07",
+    "text_encoder/model-00001-of-00003.safetensors": "a8e861969c7433e707cc5a74065d795d36cca07ec96eb6763eb4083df7248f58",
+    "text_encoder/model-00002-of-00003.safetensors": "d57d948ece4837d850b7a859a4415121d57cacf8b9ee1d4db200c67f592902d7",
+    "text_encoder/model-00003-of-00003.safetensors": "0da9ee284e21d1406df708788db1d502d95d75f69faa25cd26151bf8829b7c5f",
+    "text_encoder/model.safetensors.index.json": "31c4c7bcce679eaa0dd4667462394ddb013dc2f748e0bffc893dc9146a320dab",
+    "tokenizer/special_tokens_map.json": "456b58fd240a06c743a7c2cf8008bec501240d68ebd1fc4018ea569505fea270",
+    "tokenizer/spiece.model": "e3909a67b780650b35cf529ac782ad2b6b26e6d1f849d3fbb6a872905f452458",
+    "tokenizer/tokenizer.json": "20a46ac256746594ed7e1e3ef733b83fbc5a6f0922aa7480eda961743de080ef",
+    "tokenizer/tokenizer_config.json": "1d8d2a216bf8e70ac15b7ddcea566c4dd0433c024b39a58ca5e4c66bd78defbd",
+    "transformer/config.json": "a88c49fffd93fe39adc93ba9ab4dda58442de4fb149cf6d4aaafbf256dc6a02e",
+    "transformer/diffusion_pytorch_model-00001-of-00008.safetensors": "a4927c8b5514a4d1fd525076bcaed38e24da8739e462d7e3fc2c9667174ffa3b",
+    "transformer/diffusion_pytorch_model-00002-of-00008.safetensors": "52f72063dbd8b664206b9a7eb9635fba864e428805acf3f7f1bc0ebff0dc7f37",
+    "transformer/diffusion_pytorch_model-00003-of-00008.safetensors": "4543a0e867c72aecb5d50ba3e5e2b200af1c13036d41bbaaf1cad1b8990b6235",
+    "transformer/diffusion_pytorch_model-00004-of-00008.safetensors": "0f9a0dc28917196ff52790713527b4367a42515563302a92c41df4637eb03f0d",
+    "transformer/diffusion_pytorch_model-00005-of-00008.safetensors": "78e2c70c6a033c929d4079294d5fb8925a8e23bd35e6f97cf9df5203e31fd88c",
+    "transformer/diffusion_pytorch_model-00006-of-00008.safetensors": "468a83ecac653804f73ddb8ff0336909409c4a543ad79a187a09012c670140fe",
+    "transformer/diffusion_pytorch_model-00007-of-00008.safetensors": "9c7106f02612df4bcb37fc1f418b70114cc6109115c7578fe56c2ef3a2403265",
+    "transformer/diffusion_pytorch_model-00008-of-00008.safetensors": "a1a82c8720a12d46fbbbddccf9c841ea1ac21e13cf84bffadb4d23e9804c5fc7",
+    "transformer/diffusion_pytorch_model.safetensors.index.json": "d8bf5a1c94cdad4a9dd8b9ec4f5e89505ffbc227205a1b5a6c3bf04f7ba48d81",
+    "vae/config.json": "47e8bcf55e93e9c182e1962a8c7a0650faeb34ea0f66826d6f8aaa9f73e08ec9",
+    "vae/diffusion_pytorch_model.safetensors": "d6e524b3fffede1787a74e81b30976dce5400c4439ba64222168e607ed19e793"
+  },
+  "model_id": "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+  "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+  "schema_version": 1
+}

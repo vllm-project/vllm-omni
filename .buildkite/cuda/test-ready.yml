@@ -30,8 +30,19 @@ steps:
 
       - label: "Simple · Other Test"
         timeout_in_minutes: 20
+        artifact_paths:
+          - "artifacts/cuda-other/*"
         commands:
-          - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
+          - |
+            bash -o pipefail <<'BASH'
+            export CPU_OTHER_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/cuda-other"
+            mkdir -p "$$CPU_OTHER_ARTIFACT_DIR"
+            export PYTHONUNBUFFERED=1
+            pytest -sv tests/ -m 'core_model and cpu' \
+              --ignore=tests/diffusion --ignore=tests/model_executor \
+              --ignore=tests/entrypoints --ignore=tests/engine \
+              --junitxml="$$CPU_OTHER_ARTIFACT_DIR/pytest.xml" 2>&1 | tee "$$CPU_OTHER_ARTIFACT_DIR/pytest.log"
+            BASH
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
@@ -289,3 +300,25 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
+
+  - group: "LingBot World PR gates"
+    depends_on: upload-ready-pipeline
+    steps:
+      - label: "LingBot World · CPU regression gates"
+        key: ready-lingbot-world-unit
+        source_file_dependencies: lingbot_world_regression
+        timeout_in_minutes: 20
+        mirror_hardwares: l4_1
+        artifact_paths:
+          - "lingbot-artifacts/unit/**/*"
+        commands:
+          - bash .buildkite/common/scripts/run-lingbot-ci.sh unit tests/dfx/lingbot_world/quality.json lingbot-artifacts/unit
+      - label: "LingBot World · real-checkpoint stream and cancellation"
+        key: ready-lingbot-world-smoke
+        source_file_dependencies: lingbot_world_regression
+        timeout_in_minutes: 45
+        mirror_hardwares: h100_1
+        artifact_paths:
+          - "lingbot-artifacts/cuda-smoke/**/*"
+        commands:
+          - bash .buildkite/common/scripts/run-lingbot-ci.sh smoke tests/dfx/lingbot_world/configs/cuda_smoke.json lingbot-artifacts/cuda-smoke

@@ -429,11 +429,15 @@ class PlaybackResult:
     total_stall_s: float
     playback_span_s: float
     first_underrun_chunk: int | None
+    startup_stall_s: float = 0.0
+    steady_stall_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "underrun_count": self.underrun_count,
             "total_stall_ms": self.total_stall_s * 1000.0,
+            "startup_stall_ms": self.startup_stall_s * 1000.0,
+            "steady_stall_ms": self.steady_stall_s * 1000.0,
             "playback_span_s": self.playback_span_s,
             "stall_ratio": (self.total_stall_s / self.playback_span_s) if self.playback_span_s > 0 else 0.0,
             "first_underrun_chunk": self.first_underrun_chunk,
@@ -445,6 +449,7 @@ def simulate_playback(
     *,
     fps: float,
     buffer_chunks: int = 1,
+    startup_chunks: int = 2,
 ) -> PlaybackResult:
     """Replay arrivals against a wall clock and count stalls.
 
@@ -453,11 +458,15 @@ def simulate_playback(
     it is an underrun, and the player resumes only when the bytes land -- which
     is what a viewer experiences, and what a single p99 number cannot tell you:
     the same p99 is harmless behind a three-chunk buffer and fatal behind none.
+    ``startup_chunks`` labels stalls before that media-block boundary separately
+    from later stalls. Both components remain included in the total.
     """
     if fps <= 0:
         raise ValueError("fps must be positive.")
     if buffer_chunks < 1:
         raise ValueError("buffer_chunks must be at least 1.")
+    if startup_chunks < 0:
+        raise ValueError("startup_chunks must be nonnegative.")
     if not records:
         return PlaybackResult(0, 0.0, 0.0, None)
     if buffer_chunks > len(records):
@@ -468,6 +477,8 @@ def simulate_playback(
     cursor = start
     underruns = 0
     total_stall = 0.0
+    startup_stall = 0.0
+    steady_stall = 0.0
     first_underrun: int | None = None
 
     for record in ordered:
@@ -475,6 +486,10 @@ def simulate_playback(
             stall = record.arrival_s - cursor
             underruns += 1
             total_stall += stall
+            if record.index < startup_chunks:
+                startup_stall += stall
+            else:
+                steady_stall += stall
             if first_underrun is None:
                 first_underrun = record.index
             cursor = record.arrival_s
@@ -485,6 +500,8 @@ def simulate_playback(
         total_stall_s=total_stall,
         playback_span_s=cursor - start,
         first_underrun_chunk=first_underrun,
+        startup_stall_s=startup_stall,
+        steady_stall_s=steady_stall,
     )
 
 
@@ -578,8 +595,10 @@ def compute_metrics(
         ordered,
         fps=fps,
         buffer_chunks=playback_buffer_chunks,
+        startup_chunks=max(2, warmup_chunks),
     ).to_dict()
     metrics["playback"]["buffer_chunks"] = playback_buffer_chunks
+    metrics["playback"]["startup_chunks"] = max(2, warmup_chunks)
     return metrics
 
 

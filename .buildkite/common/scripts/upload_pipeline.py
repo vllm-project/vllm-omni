@@ -114,6 +114,11 @@ NIGHTLY_LABEL_IF = (
 WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
 WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
 WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
+# NPU has weekly model regressions, without CUDA's NON_CRITICAL tier.
+NPU_WEEKLY_MAIN_IF = WEEKLY_E2E_IF
+NPU_WEEKLY_LABEL_IF = (
+    f'({NPU_WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
+)
 READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
 MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
 MERGE_MAIN_IF = (
@@ -158,21 +163,23 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     if platform == "npu":
         ready_upload = READY_LABEL_IF
         merge_upload = BOOTSTRAP_DISABLED_IF
-        weekly_label_if = BOOTSTRAP_DISABLED_IF
+        weekly_main_if = NPU_WEEKLY_MAIN_IF
+        weekly_label_if = NPU_WEEKLY_LABEL_IF
     else:
         ready_upload = READY_UPLOAD_IF
         merge_upload = MERGE_UPLOAD_IF
+        weekly_main_if = WEEKLY_MAIN_IF
         weekly_label_if = WEEKLY_LABEL_IF
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
-        # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
-        # main+WEEKLY=1 also uploads L2/L3 (those steps then pass --e2e).
-        image_expr = f"({NIGHTLY_MAIN_IF}) || ({WEEKLY_MAIN_IF})" if platform == "cuda" else NIGHTLY_MAIN_IF
+        # NIGHTLY=1 still runs L4 and WEEKLY=1 runs L5. CUDA also retains
+        # NON_CRITICAL=1 and main+WEEKLY=1 L2/L3 (with --e2e).
+        image_expr = f"({NIGHTLY_MAIN_IF}) || ({weekly_main_if})"
         ready_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
         merge_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
         nightly_expr = NIGHTLY_MAIN_IF
-        weekly_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        weekly_expr = weekly_main_if
     elif decision.skip_l2_l3:
         l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
         l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
@@ -180,11 +187,9 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         ready_expr = ready_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
         merge_expr = merge_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
         nightly_expr = NIGHTLY_LABEL_IF
-        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        weekly_expr = weekly_label_if
 
-        image_parts = [f"({NIGHTLY_LABEL_IF})"]
-        if platform == "cuda":
-            image_parts.append(f"({weekly_label_if})")
+        image_parts = [f"({NIGHTLY_LABEL_IF})", f"({weekly_label_if})"]
         if l2_enabled:
             image_parts.insert(0, f"({ready_upload})")
         if l3_enabled:
@@ -195,7 +200,7 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         ready_expr = ready_upload
         merge_expr = merge_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
         nightly_expr = NIGHTLY_LABEL_IF
-        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        weekly_expr = weekly_label_if
 
     return {
         "image": _format_bootstrap_if(image_expr),

@@ -14,16 +14,24 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       timeout_in_minutes: 90
+      artifact_paths:
+        - "artifacts/amd-model-executor-cpu/*"
       commands:
         - export VLLM_ROCM_USE_AITER=0
+        - export MODEL_EXECUTOR_CPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/amd-model-executor-cpu"
+        - mkdir -p "$$MODEL_EXECUTOR_CPU_ARTIFACT_DIR"
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - >-
-          pytest -sv tests/model_executor
-          -m 'core_model and cpu and not omni'
-          --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end
-          --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
-          --shard-id=$$BUILDKITE_PARALLEL_JOB
+        - |
+          set -o pipefail
+          export PYTHONUNBUFFERED=1
+          pytest -sv tests/model_executor \
+            -m 'core_model and cpu and not omni' \
+            --deselect=tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py::test_mimi_streaming_step_matches_legacy_end_to_end \
+            --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT \
+            --shard-id=$$BUILDKITE_PARALLEL_JOB \
+            --junitxml="$$MODEL_EXECUTOR_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}.xml" \
+            2>&1 | tee "$$MODEL_EXECUTOR_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}.log"
 
     - label: "Simple · Omni Processor Snapshot Smoke"
       agent_pool: mi300_1
@@ -142,11 +150,22 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      artifact_paths:
+        - "artifacts/amd-other/*"
       commands:
         - export VLLM_ROCM_USE_AITER=0
+        - export CPU_OTHER_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/amd-other"
+        - mkdir -p "$$CPU_OTHER_ARTIFACT_DIR"
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine  --ignore=tests/diffusion/cache/test_teacache_extractors.py"
+        - |
+          set -o pipefail
+          export PYTHONUNBUFFERED=1
+          pytest -sv tests/ -m 'core_model and cpu' \
+            --ignore=tests/diffusion --ignore=tests/model_executor \
+            --ignore=tests/entrypoints --ignore=tests/engine \
+            --ignore=tests/diffusion/cache/test_teacache_extractors.py \
+            --junitxml="$$CPU_OTHER_ARTIFACT_DIR/pytest.xml" 2>&1 | tee "$$CPU_OTHER_ARTIFACT_DIR/pytest.log"
 
 - label: "Custom Pipeline Test"
   agent_pool: mi300_1
