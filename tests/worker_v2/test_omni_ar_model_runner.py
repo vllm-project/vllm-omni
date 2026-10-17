@@ -41,6 +41,25 @@ class _FakeEvent:
         pass
 
 
+@pytest.mark.parametrize("pin_memory", [False, True])
+def test_cpu_copy_records_source_lifetime_only_while_async(mocker, pin_memory):
+    source = mocker.Mock(spec=torch.Tensor)
+    source.detach.return_value = source
+    source.device = torch.device("cuda")
+    destination = mocker.Mock(spec=torch.Tensor)
+    mocker.patch.object(torch, "empty_like", return_value=destination)
+    stream = _FakeStream()
+
+    result = omni_ar_model_runner._async_copy_tensor(source, copy_stream=stream, pin_memory=pin_memory)
+
+    assert result is destination
+    destination.copy_.assert_called_once_with(source, non_blocking=pin_memory)
+    if pin_memory:
+        source.record_stream.assert_called_once_with(stream)
+    else:
+        source.record_stream.assert_not_called()
+
+
 def _async_output(req_ids=("req-0",), **overrides) -> OmniAsyncOutput:
     rid2idx = {rid: i for i, rid in enumerate(req_ids)}
     mro = omni_ar_model_runner.OmniModelRunnerOutput(list(req_ids), rid2idx, None, prompt_logprobs_dict={})

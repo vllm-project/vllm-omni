@@ -32,6 +32,10 @@ last_reviewed: 2026-07-16
 Execution platforms isolate hardware-specific capability detection, worker
 selection, patches, kernels, and configuration adjustments.
 
+External platforms use `Operator.register_oot(Implementation)` before model
+construction and implement `forward_oot`. Overrides preserve the operator's
+constructor, parameters, and outputs; `forward_native` is the default fallback.
+
 ## Candidate invariants
 
 ### PLATFORM-INV-001: Capabilities are explicit
