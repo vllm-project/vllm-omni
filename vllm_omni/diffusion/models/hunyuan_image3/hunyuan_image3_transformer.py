@@ -4,6 +4,7 @@
 import inspect
 import logging
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -76,6 +77,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    begin_scheduled_denoise,
     get_forward_context,
     get_paged_kv_computed_tokens,
     is_forward_context_available,
@@ -1275,6 +1277,17 @@ class ImageKVCacheManager(nn.Module):
         return self._forward_dense_legacy(query, key, value, attention_mask, **kwargs)
 
 
+def _require_attention_mask_support(record) -> str | None:
+    """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
+
+    The dense path sends a 4D attention mask on every forward. The paged path sends none; there,
+    startup validation already requires every candidate to match the baseline paged backend.
+    """
+    if record.backend_cls.supports_attention_mask(record.spec):
+        return None
+    return "HunyuanImage3 image attention sends a 4D attention mask on every dense forward"
+
+
 @dataclass
 class CausalMMOutputWithPast(CausalLMOutputWithPast):
     diffusion_prediction: torch.Tensor | None = None
@@ -2172,6 +2185,10 @@ class HunyuanImage3Model(nn.Module):
         self.pre_processor = HunyuanImagePreprocessor()
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
+        # The dense image attention path always sends a mask. Startup validation runs this check only with a schedule.
+        for module in self.modules():
+            if isinstance(module, ImageKVCacheManager):
+                module.attn.add_schedule_candidate_check(_require_attention_mask_support)
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
@@ -2656,6 +2673,23 @@ class ClassifierFreeGuidance:
 @dataclass
 class HunyuanImage3Text2ImagePipelineOutput(BaseOutput):
     samples: list[Any] | np.ndarray
+
+
+@contextmanager
+def _clear_denoise_progress_on_exit():
+    """Clear the published denoise step on any exit and restore the timestep and total seen on entry.
+
+    The denoise loop publishes a timestep and total only when a schedule is bound; without one, the
+    restore assigns the values those fields already hold.
+    """
+    ctx = get_forward_context() if is_forward_context_available() else None
+    previous = (ctx.denoise_timestep, ctx.total_denoise_steps) if ctx is not None else (None, None)
+    try:
+        yield
+    finally:
+        set_forward_context_denoise_step_idx(None)
+        if ctx is not None:
+            ctx.denoise_timestep, ctx.total_denoise_steps = previous
 
 
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
@@ -3202,6 +3236,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             timesteps,
             sigmas,
         )
+        # Check a bound schedule against the sequence this call runs, before any forward below, including
+        # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
+        scheduled_total = begin_scheduled_denoise(len(timesteps))
 
         # Prepare latent variables
         latents = self.prepare_latents(
@@ -3278,9 +3315,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             tc_prev_pred = None
             tc_cnt = 0
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        with self.progress_bar(total=num_inference_steps) as progress_bar, _clear_denoise_progress_on_exit():
             for i, t in enumerate(timesteps):
-                set_forward_context_denoise_step_idx(i)
+                if scheduled_total is None:
+                    set_forward_context_denoise_step_idx(i)
+                else:
+                    self.model.record_denoise_step(i, t, scheduler=self.scheduler, total_steps=scheduled_total)
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
@@ -3330,6 +3370,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         **model_kwargs,
                     )
 
+                    # Later steps reuse the prompt K/V computed at step 0 under whatever profile step 0 selected.
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                         model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
@@ -3383,8 +3424,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
-        set_forward_context_denoise_step_idx(None)
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
