@@ -867,6 +867,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # shared engine config.
     enable_cuda_graph_decode: bool = True
     fa_deterministic: bool = False
+    aiter_bf16_cvt_mode: int = 2
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
