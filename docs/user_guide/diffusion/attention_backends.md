@@ -18,6 +18,7 @@ For the internal selector, registry, and platform contract, see
 | Select a conservative or platform-native dense kernel | [Dense Backends](attention_backends/dense_backends.md) |
 | Use FlashInfer trtllm-gen FMHA, Skip-Softmax, or TRTLLM SAGE quantization | [TRTLLM Attention](attention_backends/trtllm.md) |
 | Install and use SageAttention 2.2 or SageAttention3 | [SageAttention](attention_backends/sage.md) |
+| Use SageAttention on AMD Radeon RDNA4 (gfx1201) through aiter | [AITER SageAttention](attention_backends/aiter_sage.md) |
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
@@ -34,6 +35,7 @@ For the internal selector, registry, and platform contract, see
 | `TRTLLM_ATTN` | Dense, sparse, or quantized | Datacenter Blackwell with `head_dim=128` and compatible packed paths | [TRTLLM Attention](attention_backends/trtllm.md) |
 | `SAGE_ATTN` | Quantized | SageAttention 2.2 INT8 attention | [SageAttention](attention_backends/sage.md#sage_attn) |
 | `SAGE_ATTN_3` | Quantized | SageAttention3 on Blackwell | [SageAttention](attention_backends/sage.md#sage_attn_3) |
+| `AITER_SAGE` | Quantized | aiter SageAttention (INT8 QK, FP8 PV) on ROCm gfx1201 | [AITER SageAttention](attention_backends/aiter_sage.md) |
 | `FLASH_ATTN_HUB` | Hub kernel | FlashAttention 2 from Hugging Face `kernels` | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
