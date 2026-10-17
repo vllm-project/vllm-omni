@@ -446,6 +446,7 @@ class DiffusionWorker:
                 memory_pool_context_fn=self._maybe_get_memory_pool_context,
                 load_format=load_format,
                 custom_pipeline_name=custom_pipeline_name,
+                initialize_lora=self.init_lora_manager,
             )
             current_omni_platform.synchronize()
             gc.collect()
@@ -585,6 +586,11 @@ class DiffusionWorker:
         pipeline = self.model_runner.pipeline
         if pipeline is None:
             return
+        if self.lora_manager is not None:
+            if self.lora_manager.pipeline is pipeline:
+                return
+            self.lora_manager.close()
+            self.lora_manager = None
 
         # A release whose weights cannot be expressed as switchable LoRA layers
         # is fused into the checkpoint while the pipeline loads. There is then
@@ -599,7 +605,7 @@ class DiffusionWorker:
             lora_path = lora_path[0]
 
         lora_backend = self.od_config.lora_backend
-        if lora_backend == LoRABackend.PEFT:
+        if lora_backend == LoRABackend.PEFT or getattr(pipeline, "diffusion_lora_fixed_adapter", False) is True:
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=self.model_runner.pipeline,
                 device=self.device,
@@ -697,7 +703,7 @@ class DiffusionWorker:
 
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
+                self.lora_manager.set_request_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
             except Exception as exc:
                 if req.sampling_params.lora_request is not None:
                     raise
@@ -730,7 +736,7 @@ class DiffusionWorker:
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+                self.lora_manager.set_request_adapter(sp.lora_request, sp.lora_scale)
             except Exception as exc:
                 if sp.lora_request is not None:
                     raise
@@ -804,7 +810,7 @@ class DiffusionWorker:
                 break
 
         try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+            self.lora_manager.set_request_adapter(lora_request, lora_scale)
         except Exception as exc:
             if lora_request is not None:
                 raise
@@ -1068,6 +1074,12 @@ class DiffusionWorker:
         # wrapper becoming unreachable is not sufficient for deterministic
         # teardown between sequential engine instances.
         model_runner = getattr(self, "model_runner", None)
+        lora_manager = getattr(self, "lora_manager", None)
+        if lora_manager is not None:
+            lora_manager.close()
+        # The manager still references its pipeline after close. Drop this
+        # local before cleanup tracebacks or CuMem pool release can retain it.
+        del lora_manager
         self.model_runner = None
         self.lora_manager = None
         self.profiler = None
