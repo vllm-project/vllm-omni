@@ -1665,7 +1665,37 @@ def extract_cosmos3_context(
 #
 # Note: Use the transformer class name as specified in pipelines as TeaCache hooks operate
 # on the transformer module and multiple pipelines can share the same transformer.
+def extract_wan_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states_image: torch.Tensor | None = None,
+    intermediate_tensors: Any = None,
+    return_dict: bool = True,
+    attention_kwargs: dict[str, Any] | None = None,
+) -> CacheContext:
+    """Cache only local Wan blocks; always preserve PP receive/send and output projection."""
+    if encoder_hidden_states_image is not None or timestep.ndim != 1:
+        raise ValueError("Wan TeaCache currently supports T2V with one-dimensional timesteps only")
+    hidden_states, temb, block_kwargs, output_shape = module._prepare_forward(
+        hidden_states, timestep, encoder_hidden_states, encoder_hidden_states_image, intermediate_tensors
+    )
+    block = module.blocks[module.start_layer]
+    shift, scale = (block.scale_shift_table + block_kwargs["timestep_proj"]).chunk(6, dim=1)[:2]
+    modulated_input = block.norm1(hidden_states, scale, shift).type_as(hidden_states)
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=lambda: (module._run_local_blocks(hidden_states, **block_kwargs),),
+        postprocess=lambda output: module._finish_forward(output, temb, output_shape, return_dict),
+    )
+
+
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
+    "WanTransformer3DModel": extract_wan_context,
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
     "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,

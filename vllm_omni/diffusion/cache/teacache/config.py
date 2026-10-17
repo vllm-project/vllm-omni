@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import math
 from dataclasses import dataclass
 
 # Model-specific polynomial coefficients for rescaling L1 distances
@@ -151,18 +152,32 @@ class TeaCacheConfig:
         transformer_type: Transformer class name (e.g., "QwenImageTransformer2DModel").
             Auto-detected from pipeline.transformer.__class__.__name__ in backend.
             Defaults to "QwenImageTransformer2DModel".
+        warmup_steps: Initial full-compute calls per branch and request.
+        max_input_distance: Upper calibrated relative input distance; larger
+            distances require full computation. None disables this guard.
+        clamp_negative_prediction: Clamp a negative polynomial prediction to
+            zero instead of taking its absolute value, for calibrated Wan profiles.
     """
 
     rel_l1_thresh: float | None = None
     coefficients: list[float] | None = None
     transformer_type: str = "QwenImageTransformer2DModel"
+    warmup_steps: int = 0
+    max_input_distance: float | None = None
+    clamp_negative_prediction: bool = False
 
     def __post_init__(self) -> None:
         """Validate and set default coefficients."""
+        if isinstance(self.warmup_steps, bool) or not isinstance(self.warmup_steps, int) or self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be a nonnegative integer")
+        if self.max_input_distance is not None and (
+            not math.isfinite(self.max_input_distance) or self.max_input_distance < 0
+        ):
+            raise ValueError("max_input_distance must be finite and nonnegative")
         threshold = self.rel_l1_thresh
         if threshold is None:
             threshold = _MODEL_DEFAULT_REL_L1_THRESH.get(self.transformer_type, _DEFAULT_REL_L1_THRESH)
-        if threshold <= 0:
+        if not math.isfinite(threshold) or threshold <= 0:
             raise ValueError(f"rel_l1_thresh must be positive, got {threshold}")
         self.rel_l1_thresh = threshold
 
