@@ -27,7 +27,8 @@ repos:
     rev: v1.49.0
     hooks:
       - id: typos
-        # only for staged files
+        # Preserve upstream spellings and keyword arguments in vendored Token2Wav.
+        exclude: ^vllm_omni/model_executor/models/lychee_fd/token2wav_modules/
 
   - repo: https://github.com/rhysd/actionlint
     # v1.7.8+ sets `go 1.24.0` in go.mod, which older Go toolchains (and most
