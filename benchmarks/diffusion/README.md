@@ -183,3 +183,129 @@ and checks bitwise repeatability for repeated requests at the same hit boundary.
 Images, logs, deployment YAMLs, hit traces and quality metrics are saved under
 pytest's temporary output directory. `HUNYUAN_IMAGE3_MODEL` selects a local model;
 DFX uses the repository's normal model/cache resolution.
+
+## MixFusion benchmarks
+
+MixFusion packs a multi-request, mixed-resolution DiT batch into one flat varlen
+attention call instead of padding every request to the longest sequence. It only
+pays off when the per-request token counts share a large common divisor: the
+chunk size is their GCD, so `1024x1024` + `1024x768` (4096 + 3072 tokens, GCD
+1024) batch well, while `1024x1024` + `640x640` (4096 + 1600, GCD 64) fall below
+the 256-token minimum and run independently instead.
+
+Four entry points cover different levels of the stack.
+
+### Synthetic DiT-like stack
+
+`mixfusion_kernel_benchmark.py` builds a HunyuanImage-3.0-shaped transformer stack
+(RMSNorm, fused QKV, SwiGLU MLP) at the requested hidden size and times three
+layouts of the same sequences: independent, padded, and MixFusion. It never loads
+a checkpoint, so it isolates the attention/layout effect and runs in seconds;
+sweep resolutions here before spending GPU time on a real model.
+
+```bash
+python benchmarks/diffusion/mixfusion_kernel_benchmark.py \
+  --image-sizes 1024x1024,512x512 --layers 4 --hidden-size 4096 \
+  --heads 32 --dtype bfloat16 --iters 20
+```
+
+Its JSON reports `correctness` (max-abs diff against independent), `time_ms` per
+strategy, `speedup`, `peak_memory_mb`, and `relative_work`.
+
+### Real pipeline
+
+`mixfusion_benefit.py` loads the real pipeline through `DiffusionEngine` and
+compares one-request-at-a-time serving against the same prompts admitted
+concurrently. `--family` selects the model family and its defaults:
+
+| | `--family qwen` | `--family hunyuan` |
+| --- | --- | --- |
+| Default model | `Qwen/Qwen-Image` | `tencent/HunyuanImage-3.0-Instruct` |
+| Resolution carried in | sampling params | prompt dict |
+| Small-GCD pre-check | yes | n/a |
+
+```bash
+DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN \
+python benchmarks/diffusion/mixfusion_benefit.py \
+  --family qwen --model Qwen/Qwen-Image \
+  --image-sizes 1024x1024,1024x768 --steps 8 --iters 3
+
+python benchmarks/diffusion/mixfusion_benefit.py \
+  --family hunyuan --model tencent/HunyuanImage-3.0-Instruct \
+  --image-sizes 1024x1024,512x512 --steps 20 --iters 3 \
+  --tensor-parallel-size 4 --quantization fp8
+```
+
+Pass `--no-enable-mixfusion` for a batching-only control run, and
+`--json-output <path>` to also write the result JSON to disk.
+
+`--output-type latent --dump-outputs-dir <dir>` saves the final latents as one
+`.pt` per request (used by the parity tooling below).
+
+### Full-matrix A/B endorsement harness
+
+For PR-scale A/B endorsements (e.g. main vs a MixFusion PR head), a set of
+scripts drives `mixfusion_benefit.py` over two repo checkouts and aggregates
+the evidence:
+
+| script | role |
+| --- | --- |
+| `mixfusion_ab_bench.sh` | per-case driver: the 9-case timing matrix (A/B x W1/W2/W3 x mixfusion off/on) into `$RESULTS` |
+| `mixfusion_ab_matrix.sh` | thin wrapper fixing `RESULTS=results_v3` |
+| `mixfusion_ab_parity.sh` | latent dump matrix (both sides, `--output-type latent`, one `.pt` per request) into `$PARITY`, incl. A-vs-A noise-floor controls |
+| `mixfusion_ab_summarize.py` | aggregates `$RESULTS` + `$PARITY` into a markdown report: timing, flat-varlen evidence, latent parity with an explicit noise-band tolerance, and an image-level PSNR/SSIM layer |
+| `mixfusion_ab_image_parity.py` | decodes dumped latents through the same VAE and compares images pairwise (PSNR/SSIM/max pixel diff) |
+| `mixfusion_ab_latent_diff.py` | quick pairwise diff of two dump dirs |
+
+Workloads: W1 = single 1024x1024 request, W2 = 8x 1024x1024, W3 = 8 mixed
+(1024x1024 x2, 1024x768 x2, 768x1024 x2, 512x512 x2).
+
+Both sides run the *same* driver code: `VLLM_OMNI_ROOT` + `PYTHONPATH` point
+the engine at the intended checkout (`A_WT` baseline, `B_WT` candidate), so the
+comparison isolates the candidate's changes. The candidate should sit on top
+of the measured baseline commit. If one side auto-compiles graphs while the
+other does not, keep eager on both (the default, `EAGER=0` to disable).
+
+```bash
+export A_WT=/path/to/baseline B_WT=/path/to/candidate
+export RESULTS=$PWD/results_v3 PARITY=$PWD/parity_v3
+bash benchmarks/diffusion/mixfusion_ab_matrix.sh   # 9 timing cases, resumable
+bash benchmarks/diffusion/mixfusion_ab_parity.sh   # 13 dump cases, resumable
+python benchmarks/diffusion/mixfusion_ab_summarize.py \
+  --a-worktree "$A_WT" --b-worktree "$B_WT" --report report.md
+```
+
+Each timing case is a fresh engine process; `result.json` files and `done`
+markers make the runs resumable, `PILOT=1` switches to a steps=8 smoke run,
+and `ONLY=<case>` re-runs a single case (`FORCE=1` to overwrite). The report's
+acceptance bar: no B-off regression on any workload, W1 bit-identical to A,
+and every A-vs-B-on image pair >= 40 dB PSNR / >= 0.98 SSIM after the
+same-VAE decode.
+
+Large batches need a normal-sized `/dev/shm` (the dump path copies result
+tensors through shared memory); raise the container limit or the 8-request
+cases can fail in the engine's output transfer.
+
+### Online serving
+
+To measure MixFusion through the OpenAI-compatible server, replay a trace with
+mixed resolutions and attach the extra args to every request:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --port 8099
+```
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+ --base-url http://localhost:8099 --model Qwen/Qwen-Image --task t2i \
+ --dataset trace --num-prompts 20 --max-concurrency 4 \
+ --warmup-requests 4 --warmup-concurrency 4 \
+ --extra-body '{"extra_args": {"enable_mixfusion": true}}'
+```
+
+The trace supplies per-request `width`/`height`; `--extra-body` is merged into
+every request body. Warm the same in-flight shape as the measured run, otherwise
+the first batch still pays compile/CUDA-graph capture cost.
+
+`OMNI_PROFILER_ACTIVITIES` narrows the pipeline profiler's activity list (default
+`CPU,CUDA`), for example `OMNI_PROFILER_ACTIVITIES=CPU,CUDA,NPU`.
