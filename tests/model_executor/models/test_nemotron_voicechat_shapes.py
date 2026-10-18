@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Golden shape test for the NemotronVoiceChat frame-locked timeline contract.
 
 Pins the exact prefill/off-by-one arithmetic against values verified with the
@@ -176,6 +176,27 @@ def test_postprocess_appends_function_token_to_timeline(monkeypatch: pytest.Monk
     assert update["nvc_function_tokens"].tolist() == [7, 8, 9, expected]
 
 
+@pytest.mark.parametrize("with_spans", [False, True])
+def test_function_feedback_ignores_graph_padding(with_spans: bool) -> None:
+    import torch
+
+    thinker = _bare_thinker()
+    thinker._sessions = {"req": {}}
+    thinker.function_head = torch.nn.Identity()
+    hidden = torch.zeros(24, 16)
+    hidden[22, 12] = 1
+    hidden[23, 0] = 1
+    output = thinker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": "req"}],
+        request_token_spans=[(0, 23)] if with_spans else None,
+    )
+    assert output.text_hidden_states is hidden
+    update = thinker.postprocess(hidden[:23], request_id="req", multimodal_outputs=output.multimodal_outputs)
+    assert int(update["nvc_prev_function_token"]) == 12
+    assert thinker._sessions["req"]["func_token"] == 12
+
+
 def test_postprocess_skips_intermediate_prefill_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     import torch
 
@@ -239,7 +260,7 @@ def test_code2wav_reuses_and_clears_per_request_streaming_cache() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.anchor = nn.Parameter(torch.zeros(()))
-            self.caches = []
+            self.caches: list[object] = []
 
         def decode(self, codes, lengths, *, cache):
             self.caches.append(cache)
