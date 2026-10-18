@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -87,6 +87,31 @@ class _QuantizedRemappedModelOptModel(nn.Module):
         prefix = "transformer.orig.proj."
         if name.startswith(prefix):
             return "runtime.proj." + name[len(prefix) :]
+        return name
+
+
+class _RoutedRemappedModelOptModel(nn.Module):
+    """FP8 target whose emitted name retains a packed-loader shard route."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime = nn.Module()
+        self.runtime.qkv = nn.Module()
+        self.runtime.qkv.register_parameter(
+            "weight",
+            nn.Parameter(torch.empty(2, 2, dtype=torch.float8_e4m3fn), requires_grad=False),
+        )
+        self.runtime.qkv.register_parameter(
+            "weight_scale",
+            nn.Parameter(torch.empty(1), requires_grad=False),
+        )
+
+    @staticmethod
+    def remap_checkpoint_key(name: str) -> tuple[str, str] | str:
+        prefix = "transformer.orig.to_q."
+        if name.startswith(prefix):
+            suffix = name[len(prefix) :]
+            return f"runtime.qkv.{suffix}", f"runtime.qkv.to_q.{suffix}"
         return name
 
 
@@ -215,6 +240,36 @@ def test_modelopt_adapter_remaps_and_keeps_scales_for_quantized_target():
     # float32 since torch.equal has no FP8 CPU kernel.
     assert emitted["runtime.proj.weight"].dtype == torch.float8_e4m3fn
     assert torch.equal(emitted["runtime.proj.weight"].to(torch.float32), fp8_weight.to(torch.float32))
+
+
+def test_modelopt_adapter_preserves_remapped_packed_loader_route():
+    model = _RoutedRemappedModelOptModel()
+    adapter = ModelOptFp8CheckpointAdapter(model, _make_source())
+    weight = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([0.5])
+
+    adapted = list(
+        adapter.adapt(
+            iter(
+                [
+                    ("transformer.orig.to_q.weight_scale", scale),
+                    ("transformer.orig.to_q.weight", weight),
+                ]
+            )
+        )
+    )
+
+    assert [name for name, _ in adapted] == [
+        "runtime.qkv.to_q.weight_scale",
+        "runtime.qkv.to_q.weight",
+    ]
+
+
+def test_modelopt_adapter_rejects_full_precision_weight_for_fp8_target():
+    adapter = ModelOptFp8CheckpointAdapter(_RoutedRemappedModelOptModel(), _make_source())
+
+    with pytest.raises(ValueError, match="precision plan was not applied"):
+        list(adapter.adapt(iter([("transformer.orig.to_q.weight", torch.ones(2, 2))])))
 
 
 def test_modelopt_nvfp4_adapter_remaps_quantized_weights_and_scales():
