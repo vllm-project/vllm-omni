@@ -242,6 +242,19 @@ def create_transformers_model_with_vllm_linears(
     return model
 
 
+def calculate_shift(
+    image_seq_len,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+):
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    mu = image_seq_len * m + b
+    return mu
+
+
 def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:
