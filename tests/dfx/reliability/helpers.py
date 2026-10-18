@@ -30,13 +30,19 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TypedDict
 
 import psutil
 import pytest
+
+from tests.dfx.conftest import create_reliability_omni_server_params
+from tests.helpers.runtime import OmniServerParams
 
 logger = logging.getLogger(__name__)
 
@@ -1004,6 +1010,52 @@ def assert_post_fault_api_unreachable(online_client: Any, *, scenario: str) -> N
     )
 
 
+SIGTERM_CLEANUP_GRACE_SEC = 60.0
+PARTIAL_ISOLATION_HTTP_TIMEOUT_SEC = 30.0
+_RELIABILITY_SERVER_LOG_DIR: Path | None = None
+
+
+def _reliability_server_log_dir() -> Path:
+    """One temp directory per process. Paths inside it are unique per param build."""
+    global _RELIABILITY_SERVER_LOG_DIR
+    if _RELIABILITY_SERVER_LOG_DIR is None:
+        _RELIABILITY_SERVER_LOG_DIR = Path(tempfile.mkdtemp(prefix="vllm-omni-reliability-"))
+    return _RELIABILITY_SERVER_LOG_DIR
+
+
+def reliability_params_with_server_log(params: Sequence[Any], stem: str) -> list[Any]:
+    """Copy server params so the serve process log is written to a file.
+
+    Each call gets a new file. Partial-isolation and normal-exit both use the
+    lifecycle server set, and xdist can run them together; a shared path would
+    let one test truncate or mix the log the other test asserts on.
+    ``params`` items are ``OmniServerParams``.
+    """
+    logged = []
+    for param in params:
+        model_name = str(getattr(param, "model", "server")).rsplit("/", 1)[-1]
+        path = _reliability_server_log_dir() / f"{stem}-{uuid.uuid4().hex}-{model_name}.log"
+        logged.append(param._replace(log_path=str(path)))
+    return logged
+
+
+def assert_api_still_listening(online_client: Any, *, scenario: str) -> None:
+    """The API process is still bound. HTTP 200 and HTTP 503 both count."""
+    status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+    assert status in (200, 503), f"[{scenario}] expected /health 200 or 503 while the API is still up, got {status}"
+
+
+def sigterm_serve_root_and_assert_cleanup(
+    server: Any,
+    *,
+    scenario: str,
+    grace_sec: float = SIGTERM_CLEANUP_GRACE_SEC,
+) -> None:
+    """Send one SIGTERM to the serve root and require the process tree and GPU to clear."""
+    make_server_root_kill_fault_injector(signal_name="SIGTERM", post_kill_wait_seconds=0.0)(server)
+    assert_no_server_tree_process_residual_and_gpu_release(server, scenario=scenario, timeout_sec=grace_sec)
+
+
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
     """Wall-clock budget for fault-snapshot PIDs / GPU to clear after ``signal_name``."""
     if signal_name == "SIGKILL":
@@ -1323,3 +1375,180 @@ def make_process_kill_fault_injector(
         pytest.skip("no matching runtime process found for kill injection")
 
     return _inject
+
+
+# (signal name, skip reason). ``None`` means the signal runs.
+SignalSpec = tuple[str, str | None]
+
+# SIGTERM and SIGKILL, both executed. Serve-root adds SIGINT on top of this pair.
+TERM_KILL_SIGNALS: tuple[SignalSpec, ...] = (("SIGTERM", None), ("SIGKILL", None))
+SERVE_ROOT_SIGNALS: tuple[SignalSpec, ...] = (
+    ("SIGTERM", None),
+    ("SIGINT", None),
+    ("SIGKILL", None),
+)
+
+INFLIGHT_INJECTION_REQUEST_RATE = 0.3
+INFLIGHT_INJECTION_REQUEST_COUNT = 10
+
+
+class FaultModel:
+    """One model's deploy, hardware, and request probes for a fault scenario."""
+
+    model_id: str
+    res: dict[str, str]
+    num_cards: int
+    extra_marks: tuple[Any, ...] = ()
+    scenarios: list[dict[str, Any]]
+    deploy_dir: Any
+    lifecycle_scenario: str | None = None
+    eager_oom_stage_ids: tuple[int, ...] | None = None
+    worker_pattern: str
+    isolation_pattern: str
+    hard_oom_config: dict[str, Any]
+    recover_oom_config: dict[str, Any] | None = None
+    fault_error_keywords: tuple[str, ...]
+    process_kill_error_keywords: tuple[str, ...]
+    with_load_timeout_sec: float = 120.0
+    concurrent_workers: int = 3
+    concurrent_timeout_sec: float = 40.0
+    health_miss_skip: str | None = None
+    worker_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
+    serve_root_signals: tuple[SignalSpec, ...] = SERVE_ROOT_SIGNALS
+    serve_root_with_load_signals: tuple[SignalSpec, ...] = SERVE_ROOT_SIGNALS
+    tree_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
+    tree_with_load_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
+    oom_large_fail_message: str = "expected request failure during GPU OOM injection"
+    oom_concurrent_fail_message: str = "expected concurrent request failure under OOM injection"
+
+    def servers(self, server_set: str) -> list[tuple[str, OmniServerParams]]:
+        scenarios = list(self.scenarios)
+        logged = False
+        if server_set == "lifecycle":
+            if self.lifecycle_scenario is not None:
+                scenarios = [item for item in scenarios if item["test_name"] == self.lifecycle_scenario]
+            logged = True
+        elif server_set == "oom" and self.eager_oom_stage_ids:
+            import torch
+
+            scenarios = reliability_scenarios_for_eager_oom(
+                scenarios,
+                is_hip=bool(getattr(torch.version, "hip", None)),
+                stage_ids=self.eager_oom_stage_ids,
+            )
+        elif server_set not in ("default", "oom"):
+            raise ValueError(f"unknown server set {server_set!r} for {self.model_id}")
+        params = create_reliability_omni_server_params(scenarios, self.deploy_dir)
+        if logged:
+            params = reliability_params_with_server_log(params, self.model_id)
+        return [(str(item["test_name"]), param) for item, param in zip(scenarios, params, strict=True)]
+
+    def warmup(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def submit_worker_load(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def submit_serve_load(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def submit_concurrent(self, client: Any, server: Any) -> Any:
+        self.warmup(client, server)
+        return None
+
+    def assert_fast_fail(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def isolation_warmup(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def isolation_after(self, client: Any, server: Any) -> None:
+        self.assert_fast_fail(client, server)
+
+    def oom_large_probe(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def oom_concurrent_probe(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def run_error_contract(self, server: Any, client: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def run_oom_recovery(self, server: Any, client: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+
+def _skip_marks(reason: str | None) -> list[Any]:
+    if not reason:
+        return []
+    return [pytest.mark.skip(reason=reason)]
+
+
+class FaultScenario:
+    """Shared fault steps. A model test calls ``run`` with its ``FaultModel``."""
+
+    server_set: str = "default"
+    signals_attr: str | None = None
+
+    def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
+        raise NotImplementedError(type(self).__name__)
+
+
+def server_params(
+    model: FaultModel,
+    *,
+    server_set: str = "default",
+    skip_reason: str | None = None,
+) -> list[Any]:
+    """One indirect server param per scenario of ``model``."""
+    return [
+        pytest.param(server, marks=_skip_marks(skip_reason), id=scenario_name)
+        for scenario_name, server in model.servers(server_set)
+    ]
+
+
+def server_and_signal_params(
+    model: FaultModel,
+    signals_attr: str,
+    *,
+    server_set: str = "default",
+    skip_reason: str | None = None,
+) -> list[Any]:
+    """Server param plus a direct signal name. A fault skip covers every signal."""
+    items: list[Any] = []
+    for scenario_name, server in model.servers(server_set):
+        for signal_name, signal_skip in getattr(model, signals_attr):
+            items.append(
+                pytest.param(
+                    server,
+                    signal_name,
+                    marks=_skip_marks(skip_reason or signal_skip),
+                    id=f"{scenario_name}__{signal_name.lower()}",
+                )
+            )
+    return items
+
+
+def scenario_params(
+    model: FaultModel,
+    scenario: type[FaultScenario],
+    *,
+    skip_reason: str | None = None,
+) -> Any:
+    """Parametrize ``omni_server_function`` from the scenario's server set and signals."""
+    if scenario.signals_attr is None:
+        return pytest.mark.parametrize(
+            "omni_server_function",
+            server_params(model, server_set=scenario.server_set, skip_reason=skip_reason),
+            indirect=True,
+        )
+    return pytest.mark.parametrize(
+        ("omni_server_function", "signal_name"),
+        server_and_signal_params(
+            model,
+            scenario.signals_attr,
+            server_set=scenario.server_set,
+            skip_reason=skip_reason,
+        ),
+        indirect=["omni_server_function"],
+    )
