@@ -247,3 +247,48 @@ async def test_output_drain_raises_when_orchestrator_dead() -> None:
             await engine.get_outputs_async(timeout=0.05)
     finally:
         engine.output_queue.close()
+
+
+@pytest.mark.asyncio
+async def test_output_drain_sink_shutdown_wakes_waiting_reader() -> None:
+    """An exiting orchestrator thread shuts the sink down; a reader parked on an
+    empty queue is woken and raises at once instead of waiting out ``timeout``
+    (``is_alive`` is still True here, so only the shutdown can end the wait)."""
+    engine = _drain_engine(alive=True)
+    try:
+        reader = asyncio.ensure_future(engine.get_outputs_async(timeout=5.0))
+        await asyncio.sleep(0.02)
+        assert not reader.done()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timer = threading.Timer(0.05, engine._output_sink.shutdown)
+        timer.start()
+        with pytest.raises(RuntimeError, match="Orchestrator died"):
+            await reader
+        timer.join()
+        assert loop.time() - started < 1.0
+    finally:
+        engine.output_queue.close()
+
+
+@pytest.mark.asyncio
+async def test_output_drain_delivers_fatal_before_shutdown_raises() -> None:
+    """Mirrors a crash: the thread enqueues a fatal error, then shuts the sink
+    down. The waiting reader gets the message first; the next read raises."""
+    engine = _drain_engine(alive=True)
+    try:
+        reader = asyncio.ensure_future(engine.get_outputs_async(timeout=5.0))
+        await asyncio.sleep(0.02)
+
+        def _crash() -> None:
+            engine._output_sink.put_nowait("fatal-error")
+            engine._output_sink.shutdown()
+
+        thread = threading.Thread(target=_crash)
+        thread.start()
+        assert await reader == ["fatal-error"]
+        thread.join()
+        with pytest.raises(RuntimeError, match="Orchestrator died"):
+            await engine.get_outputs_async(timeout=1.0)
+    finally:
+        engine.output_queue.close()
