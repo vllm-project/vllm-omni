@@ -692,6 +692,45 @@ async def test_commit_projects_the_user_item_and_does_not_resubmit_consumed_audi
 
 
 @pytest.mark.asyncio
+async def test_auto_response_commit_releases_residual_audio_before_the_next_turn() -> None:
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        for turn in range(2):
+            # Match streaming input with a partial final model unit. Give the
+            # turns different PCM so replaying the first tail cannot go unnoticed.
+            value = 0.05 + turn * 0.05
+            for _ in range(7):
+                await h.run(append_audio(3200, value=value))
+            await h.run(commands.Commit())
+
+            assert h.runner.model_state.committed_audio_payload is None
+            assert h.session.pending_input_bytes == 0
+            assert len(h.port.submissions) == (turn + 1) * 2
+            streaming_append = h.port.submissions[-2].prompt["model_intermediate_buffer"]["duplex"]
+            assert streaming_append["final"] is False
+            assert base64.b64decode(streaming_append["payload"]["audio"]) == pcm_f32(16000, value=value)
+            final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+            assert final_append["final"] is True
+            assert base64.b64decode(final_append["payload"]["audio"]) == (
+                pcm_f32(6400, value=value) + pcm_f32(9600, value=0.0)
+            )
+
+            samples = (turn + 1) * 24000
+            await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=samples, turn_id=turn))
+            events = await h.deliver_and_settle(
+                tts_output(h.stage0_request_id(), samples=samples, turn_end=True, turn_id=turn)
+            )
+            done = find(events, "response.done")
+            assert done.status == "completed"
+            ack = await h.run(commands.AckPlayback(played_ms=1000, response_id=done.response_id))
+            assert types(ack) == ["playback.acknowledged"]
+            assert ack[0].details["history_committed"] is True
+            assert ack[0].details["playback"]["committed_ms"] == 1000
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_touches_the_lease_and_acks() -> None:
     clock = {"now": 100.0}
     h = await open_harness(clock=lambda: clock["now"])

@@ -1324,7 +1324,15 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # Qwen3 backbone. get_text_config() is sufficient for vLLM to size
         # KV cache / heads correctly, as long as AutoConfig resolves to the
         # local MossTTSLocalConfig rather than the HF remote-code class.
-        self.model = Qwen3Model(
+        # On CUDA the backbone runs explicit kernels instead of vLLM's custom
+        # ops for its norms, activation and Q/K norm + RoPE.
+        if current_omni_platform.is_cuda():
+            from .modeling_moss_tts_backbone import MossQwen3Model
+
+            backbone_cls = MossQwen3Model
+        else:
+            backbone_cls = Qwen3Model
+        self.model = backbone_cls(
             vllm_config=vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
@@ -1351,11 +1359,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [nn.Linear(hidden_size, self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
         )
         self.local_text_lm_head = nn.Linear(hidden_size, 2, bias=False)
-        self.local_transformer = MossTTSLocalDepthTransformer(
-            self.config.gpt2_config,
-            hidden_size=hidden_size,
-            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", None),
-        )
+        self.local_transformer = MossTTSLocalDepthTransformer(self.config.gpt2_config, hidden_size=hidden_size)
 
         self._batch_state: list[dict[str, Any]] | None = None
         # Stacked embedding cache built after load_weights() for vectorised
@@ -1858,15 +1862,13 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
 
-        # Build derived tables after loading, before compiling/capturing MTP.
+        # Build derived tables after loading, before capturing MTP.
         # Other devices and FP32 retain the existing frame-local KV path.
         if current_omni_platform.is_cuda() and self.local_transformer.ln_f.weight.dtype in (
             torch.bfloat16,
             torch.float16,
         ):
             self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
-        if not self.vllm_config.model_config.enforce_eager:
-            self.local_transformer.setup_compile()
 
         logger.info(
             "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",

@@ -504,3 +504,93 @@ def test_flash_attention_padding_rows_are_zero_and_preserve_state():
     assert out.count_nonzero() == 0
     torch.testing.assert_close(cache, before, rtol=0, atol=0)
     assert out.transpose(1, 2).is_contiguous()
+
+
+def test_packed_block_entries_list_each_segment_block_in_order():
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import packed_block_entries
+
+    lengths = torch.tensor([1, 15, 0, 33, 16], device="cuda")
+    seg, blk = packed_block_entries(lengths, 16, 9)
+    assert seg[:6].tolist() == [0, 1, 3, 3, 3, 4]
+    assert blk[:6].tolist() == [0, 0, 0, 1, 2, 0]
+    assert blk[6:].tolist() == [9, 9, 9]
+
+
+@pytest.mark.parametrize("block_m", [16, 64])
+@pytest.mark.parametrize("capacity,context", [(125, 125), (140, 125), (400, 400)])
+def test_packed_flash_attention_matches_per_segment_launches_exactly(block_m, capacity, context):
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+        _launch_flash,
+        packed_block_entries,
+        slot_ring_flash_attention_packed,
+    )
+
+    torch.manual_seed(7)
+    heads, head_dim, states = 3, 64, 10
+    lengths_list = [1, 15, 0, 7, 33, 64, 130, 2]
+    n = sum(lengths_list) + 5  # trailing tokens owned by no segment
+    projected = torch.randn(1, n, 3, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = (projected[:, :, i].transpose(1, 2) for i in range(3))
+    cache = torch.randn(2, states, heads, capacity, head_dim, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([3, 0, 9, 5, 1, 7, 2, 8], device="cuda")
+    starts = torch.tensor([0, 5, 0, capacity - 1, capacity + 9, 3 * capacity + 5, 1 << 33, 2], device="cuda")
+    lengths = torch.tensor(lengths_list, device="cuda")
+    tok = torch.cumsum(lengths, 0) - lengths
+    expected_cache = cache.clone()
+    expected = {}
+    config = (block_m, 8 if capacity <= 256 else 4, 2)
+    for s, length in enumerate(lengths_list):
+        if length:
+            rows = slice(int(tok[s]), int(tok[s]) + length)
+            expected[s] = _launch_flash(
+                q[:, :, rows],
+                k[:, :, rows],
+                v[:, :, rows],
+                expected_cache,
+                starts[s : s + 1],
+                slots[s : s + 1],
+                lengths[s : s + 1].to(torch.int32),
+                context,
+                row_starts=True,
+                config=config,
+            )[0]
+    seg, blk = packed_block_entries(lengths, block_m, n // block_m + len(lengths_list))
+    got = slot_ring_flash_attention_packed(q, k, v, cache, starts, slots, lengths, tok, seg, blk, context, block_m)
+    assert torch.equal(cache, expected_cache)
+    for s, out in expected.items():
+        assert torch.equal(got[0, :, int(tok[s]) : int(tok[s]) + lengths_list[s]], out)
+
+
+@pytest.mark.parametrize("launch", [(16, 32, 2, 2), (32, 64, 4, 2), (64, 32, 4, 3)])
+def test_packed_flash_attention_retiled_launch_matches_to_rounding(launch):
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+        packed_block_entries,
+        slot_ring_flash_attention_packed,
+    )
+
+    torch.manual_seed(11)
+    heads, head_dim, states, capacity = 3, 64, 6, 250
+    lengths_list = [1, 15, 30, 0, 7]
+    n = sum(lengths_list)
+    projected = torch.randn(1, n, 3, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = (projected[:, :, i].transpose(1, 2) for i in range(3))
+    base = torch.randn(2, states, heads, capacity, head_dim, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([4, 0, 2, 5, 1], device="cuda")
+    starts = torch.tensor([0, capacity - 3, 3 * capacity + 1, 0, 9], device="cuda")
+    lengths = torch.tensor(lengths_list, device="cuda")
+    tok = torch.cumsum(lengths, 0) - lengths
+
+    def run(block_m, block_n, warps, stages):
+        cache = base.clone()
+        seg, blk = packed_block_entries(lengths, block_m, n // block_m + len(lengths_list))
+        out = slot_ring_flash_attention_packed(
+            q, k, v, cache, starts, slots, lengths, tok, seg, blk, capacity, block_m, block_n, warps, stages
+        )
+        return out, cache
+
+    ref, ref_cache = run(16, 0, 0, 0)
+    got, cache = run(*launch)
+    assert torch.equal(cache, ref_cache)
+    for s, length in enumerate(lengths_list):
+        rows = slice(int(tok[s]), int(tok[s]) + length)
+        torch.testing.assert_close(got[0, :, rows], ref[0, :, rows], atol=2e-2, rtol=2e-2)

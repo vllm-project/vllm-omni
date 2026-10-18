@@ -73,6 +73,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
     PcmAppendReservation,
+    settle_response_runtime,
 )
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
@@ -353,6 +354,7 @@ class DuplexSessionRunner:
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
             session.end_response(commit_text=False)
+            settle_response_runtime(self.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self.emit(
             {
                 "type": "response.done",
@@ -453,7 +455,9 @@ class DuplexSessionRunner:
             await asyncio.gather(active_response_task, return_exceptions=True)
         self.tasks.active_response_task = None
         if session.active_response_id is not None:
+            closing_response_id = session.active_response_id
             session.end_response(commit_text=False)
+            settle_response_runtime(self.plugin, session, committed=False, response_id=closing_response_id)
         self._cleanup_duplex_session_state()
         session.close()
         await self._stop_worker()
@@ -570,6 +574,20 @@ class DuplexSessionRunner:
             return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
 
+    def _settle_playback_committed_answer(self, events) -> None:
+        """Drop a tool pair only when this ACK stored that response's answer."""
+        for event in events:
+            if not isinstance(event, PlaybackAcknowledged):
+                continue
+            details = event.details
+            if not isinstance(details, Mapping) or not details.get("history_committed"):
+                continue
+            item_id = details.get("item_id")
+            response_id = (
+                item_id.removeprefix("item_") if isinstance(item_id, str) and item_id.startswith("item_") else None
+            )
+            settle_response_runtime(self.plugin, self.session, committed=True, response_id=response_id)
+
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
         """Run one internal event dictionary through the matching handler."""
         event_type = payload.get("type")
@@ -578,7 +596,9 @@ class DuplexSessionRunner:
         elif event_type in {"input_audio_buffer.commit", "input.commit", "response.create"}:
             await self._on_commit(payload)
         elif event_type == "playback.ack":
-            self._emit_events(playback_ledger.apply_playback_ack(self.session, payload))
+            events = playback_ledger.apply_playback_ack(self.session, payload)
+            self._emit_events(events)
+            self._settle_playback_committed_answer(events)
         elif event_type in _CANCEL_EVENTS:
             await self._on_cancel(payload)
         elif event_type == "turn.signal":
@@ -657,6 +677,7 @@ class DuplexSessionRunner:
         elif isinstance(command, AckPlayback):
             events = playback_ledger.apply_playback_ack(self.session, command.payload())
             self._emit_events(events)
+            self._settle_playback_committed_answer(events)
             # A camera commit can arrive after response.done while its audio
             # is still playing. In that case the final ACK, not another model
             # terminal event, releases the next observation.
@@ -829,8 +850,11 @@ class DuplexSessionRunner:
             cancelled = True
         if not cancelled and playback_was_active:
             old_epoch = session.epoch
+            playback_response_id = session.last_response_id
             committed_ms = session.playback.committed_ms
-            helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
+            helpers.commit_played_response_history(session, playback_response_id, committed_ms)
+            if committed_ms <= 0 and isinstance(playback_response_id, str):
+                settle_response_runtime(self.plugin, session, committed=False, response_id=playback_response_id)
             new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
             self.emit(
                 {
@@ -1439,8 +1463,14 @@ class DuplexSessionRunner:
             cancelled = True
         if not cancelled and playback_was_active:
             old_epoch = session.epoch
+            playback_response_id = session.last_response_id
             committed_ms = session.playback.committed_ms
-            helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
+            helpers.commit_played_response_history(session, playback_response_id, committed_ms)
+            # Generation already finished. A clear or cancel before any
+            # committed audio never reaches the playback ACK, so the tool
+            # pair would stay inflight and drop out of the next prompt.
+            if committed_ms <= 0 and isinstance(playback_response_id, str):
+                settle_response_runtime(self.plugin, session, committed=False, response_id=playback_response_id)
             new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
             self.emit(
                 {
@@ -1517,11 +1547,21 @@ class DuplexSessionRunner:
         old_epoch = session.epoch
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
+        audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
         committed_message = session.end_response(
             commit_text=self.model.should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
+        )
+        # Playback clear keeps the id. A cancel before any audio was sent does
+        # not, so the retry can own the tool pair.
+        settle_response_runtime(
+            self.plugin,
+            session,
+            committed=committed_message is not None,
+            response_id=old_response_id,
+            release_owner=committed_message is None and committed_ms == 0 and not audio_started,
         )
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"
@@ -1775,6 +1815,13 @@ class DuplexSessionRunner:
             return
         if session.unanswered_user_items() and session.capabilities.supports_text_only_turn:
             session.reset_unanswered_user_items()
+            await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
+            return
+        if session.capabilities.supports_text_only_turn and self.plugin.has_pending_tool_followup(
+            session.runtime_config
+        ):
+            # The plugin drops the waiting result only after this append is
+            # accepted, so a failed submit leaves the next response.create armed.
             await self._start_append({"type": "conversation"}, final=True, precreate_response=True)
             return
         if session.unanswered_user_items():

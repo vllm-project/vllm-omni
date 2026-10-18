@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexConfigError, realtime_item_to_history_message
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -297,10 +298,14 @@ class SessionControl:
             if not await self._wait_for_append_tail():
                 return
             try:
+                prepared_item = prepared_function_call_output(item, self._out.require_projector().conversation_items)
+                # history_len is the length now. A plugin that recorded the call
+                # at function_call.done uses that stored length instead.
                 candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                     session.config,
                     dict(session.runtime_config),
-                    item,
+                    prepared_item,
+                    history_len=len(session.history),
                 )
             except DuplexRuntimeConfigError as exc:
                 self._out.emit_error(exc.code, str(exc))
@@ -315,13 +320,17 @@ class SessionControl:
                     "created": True,
                 }
             )
-            self._ctx.services.spawn(
-                self._model.maybe_continue_response(
-                    expected_epoch=session.epoch,
-                    expected_model_turn_id=session.turn_id,
-                ),
-                name="duplex-continue",
-            )
+            # A half-duplex follow-up waits for response.create. The plugin
+            # says whether a result is still waiting. Only a resumable session
+            # continues the request that is already open.
+            if session.capabilities.supports_core_resumable_request:
+                self._ctx.services.spawn(
+                    self._model.maybe_continue_response(
+                        expected_epoch=session.epoch,
+                        expected_model_turn_id=session.turn_id,
+                    ),
+                    name="duplex-continue",
+                )
             return
         item_payload = item if isinstance(item, dict) else None
         raw_parts = item_payload.get("content", []) if item_payload is not None else []

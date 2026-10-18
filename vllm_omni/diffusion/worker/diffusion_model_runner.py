@@ -1104,7 +1104,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         surviving requests retain their own state and are repacked on the next step.
         """
         for request_id in request_ids:
-            self.state_cache.pop(request_id, None)
+            state = self.state_cache.pop(request_id, None)
+            release = getattr(getattr(self, "pipeline", None), "release_step_request", None)
+            if state is not None and callable(release):
+                release(state)
         batch = getattr(self, "input_batch", None)
         if batch is not None and any(request_id in batch.request_ids for request_id in request_ids):
             self.input_batch = None

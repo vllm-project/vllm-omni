@@ -188,6 +188,11 @@ class Magi2Attention(nn.Module):
         gates: torch.Tensor,
         modality_dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
+        # Only the token count varies between calls; pinning the head count
+        # and head size lets a dynamic-shape compile index the attention output
+        # with constants.
+        torch._check(attention.shape[1:-1].numel() == self.num_heads_q)
+        torch._check(attention.shape[-1] == self.head_dim)
         output = modality_dispatcher.permute(attention)
         output = output * torch.sigmoid(gates)
         output = output.reshape(-1, self.q_size).to(self.config.params_dtype)
