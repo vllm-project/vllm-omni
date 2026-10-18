@@ -167,12 +167,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit", "tea_cache"],
+        choices=["cache_dit", "tea_cache", "sea_cache"],
         help=(
             "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache), "
+            "'sea_cache' (spectral latent caching with residual extrapolation). "
             "Default: None (no cache acceleration)."
         ),
+    )
+    parser.add_argument(
+        "--cache-config",
+        type=functools.partial(parse_json_object, flag_name="--cache-config"),
+        default=None,
+        help="Override cache parameters with a JSON object, e.g. '{\"sea_threshold\": 0.25}'.",
     )
     parser.add_argument(
         "--enable-cache-dit-summary",
@@ -557,6 +564,9 @@ def main():
     elif cache_backend == "tea_cache":
         # Let TeaCache select the model-specific threshold and coefficients.
         cache_config = {}
+
+    if args.cache_config is not None:
+        cache_config = {**(cache_config or {}), **args.cache_config}
 
     profiler_enabled = args.profiler_config is not None
 
