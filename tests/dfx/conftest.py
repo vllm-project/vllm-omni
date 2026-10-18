@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import threading
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,6 @@ from tests.helpers.hardware import get_runtime_resource_label as get_runtime_res
 from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
-from vllm_omni.platforms import current_omni_platform
 
 
 def _named_pytest_marks(names: list[str]) -> list[pytest.MarkDecorator]:
@@ -294,17 +294,6 @@ def _create_unique_server_params(
     return unique_params
 
 
-def configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Resolve stage config for XPU vs CUDA/ROCm."""
-    out: list[dict[str, Any]] = []
-    for config in configs:
-        config_copy = json.loads(json.dumps(config))
-        if current_omni_platform.is_xpu():
-            config_copy["server_params"]["stage_config_name"] = "xpu/qwen3_omni_ci.yaml"
-        out.append(config_copy)
-    return out
-
-
 def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[str] | None]:
     mapping: dict[str, list[str] | None] = {}
     for cfg in configs:
@@ -318,9 +307,8 @@ def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str,
 def create_reliability_omni_server_params(
     configs: list[dict[str, Any]], stage_configs_dir: Path
 ) -> list[OmniServerParams]:
-    adjusted_configs = configs_with_platform_stage_configs(configs)
-    unique_params = _create_unique_server_params(adjusted_configs, stage_configs_dir)
-    server_args_by_name = extract_server_args_by_test_name(adjusted_configs)
+    unique_params = _create_unique_server_params(configs, stage_configs_dir)
+    server_args_by_name = extract_server_args_by_test_name(configs)
     return [
         OmniServerParams(
             model=model,
@@ -351,7 +339,7 @@ def parse_stage_devices(stage_config_path: str) -> str:
     return ",".join(str(x) for x in sorted(devices))
 
 
-def resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | None) -> str:
+def resolve_oom_device_spec(config: Mapping[str, Any], stage_config_path: str | None) -> str:
     explicit = config.get("device")
     if explicit is not None:
         return str(explicit)

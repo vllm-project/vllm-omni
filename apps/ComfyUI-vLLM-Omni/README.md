@@ -72,6 +72,8 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 
 Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
 
+The `model` field of every node that talks to a server doubles as a dropdown of what the server actually serves: the list is fetched through the ComfyUI backend (so `localhost` resolves to the host running ComfyUI, not to the machine the browser is on), refetched when the `url` field changes or the **↻ refresh models** button is clicked, and falls back to plain free text whenever the list cannot be fetched -- a server that is down must never make the node unfillable. A value saved in a workflow is always kept, even when it is not in the fetched list.
+
 **Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
 
 To build a simple workflow yourself,

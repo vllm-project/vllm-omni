@@ -1727,44 +1727,34 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights for all components of the omni model."""
+        """Stream weights into the active component of the omni model."""
         loaded_weights = set()
-        thinker_weights = []
-        talker_weights = []
+        known_prefixes = ("thinker.", "talker.", "code2wav.")
+        first_frame_decoder = getattr(self, "first_frame_decoder", None)
         code2wav_weights = []
 
-        # Separate weights by component
-        for k, v in weights:
-            if k.startswith("thinker."):
-                thinker_weights.append((k, v))
-            elif k.startswith("talker."):
-                talker_weights.append((k, v))
-            elif k.startswith("code2wav."):
-                code2wav_weights.append((k, v))
-            else:
-                logger.warning(f"Unknown weight prefix: {k}")
-        # Load thinker weights
-        if self.thinker and thinker_weights:
-            thinker_loaded = self.thinker.load_weights(thinker_weights)
+        def stage_weights(prefix: str) -> Iterable[tuple[str, torch.Tensor]]:
+            for name, weight in weights:
+                if name.startswith(prefix):
+                    yield name, weight
+                elif first_frame_decoder is not None and name.startswith("code2wav."):
+                    # The Talker also needs Code2Wav weights for its first frame.
+                    # Keep CPU copies so deferred loading cannot retain GPU shards.
+                    code2wav_weights.append((name, weight.to(device="cpu", copy=True)))
+                elif not name.startswith(known_prefixes):
+                    logger.warning(f"Unknown weight prefix: {name}")
+
+        if self.thinker:
+            thinker_loaded = self.thinker.load_weights(stage_weights("thinker."))
             thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
             loaded_weights.update(thinker_loaded)
-
-        # Load talker weights
-        if self.talker and talker_weights:
-            talker_loaded = self.talker.load_weights(talker_weights)
+        elif self.talker:
+            talker_loaded = self.talker.load_weights(stage_weights("talker."))
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
             loaded_weights.update(talker_loaded)
             loaded_weights.update(self._init_special_tokens_embeddings())
-
-        # The Talker's first-frame decoder is a Code2Wav copy (same code2wav.* weights).
-        first_frame_decoder = getattr(self, "first_frame_decoder", None)
-        if first_frame_decoder is not None and code2wav_weights:
-            decoder_loaded = first_frame_decoder.load_weights(code2wav_weights)
-            loaded_weights.update(add_prefix_to_loaded_weights(decoder_loaded, "first_frame_decoder.code2wav"))
-
-        # Load code2wav weights
-        if self.code2wav and code2wav_weights:
-            code2wav_loaded = self.code2wav.load_weights(code2wav_weights)
+        elif self.code2wav:
+            code2wav_loaded = self.code2wav.load_weights(stage_weights("code2wav."))
             code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
             loaded_weights.update(code2wav_loaded)
 
@@ -1778,6 +1768,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                     "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
                     exc_info=True,
                 )
+
+        if first_frame_decoder is not None and code2wav_weights:
+            decoder_loaded = first_frame_decoder.load_weights(code2wav_weights)
+            loaded_weights.update(add_prefix_to_loaded_weights(decoder_loaded, "first_frame_decoder.code2wav"))
 
         # Log summary
         logger.info(
