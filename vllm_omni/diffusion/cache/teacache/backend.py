@@ -239,6 +239,10 @@ class TeaCacheBackend(CacheBackend):
                 f"transformer_class={teacache_config.transformer_type}"
             )
 
+        # Nested model warmups run inside a single runner request. Expose this
+        # enabled backend so they can establish their own request boundaries.
+        pipeline._active_cache_backend = self
+
         # Mark as enabled
         self.enabled = True
 

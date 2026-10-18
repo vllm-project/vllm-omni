@@ -30,6 +30,7 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
     _maybe_build_block_adapter,
+    _maybe_get_cached_adapter_cls,
     enable_cache_for_dit,
 )
 from vllm_omni.diffusion.cache.cachedit.config import CacheDiTConfig
@@ -779,6 +780,16 @@ class SensenovaCachedAdapter(CachedAdapter):
         return total_cached_blocks
 
 
+def enable_cache_for_sensenova_u1(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache the inner decoder while keeping the outer LM as the offload unit."""
+    block_adapter = _maybe_build_block_adapter(pipeline)
+    if block_adapter is None:
+        raise ValueError("SenseNova decoder does not declare a Cache-DiT adapter")
+    adapter_cls = _maybe_get_cached_adapter_cls(pipeline)
+    refresh = enable_cache_for_dit(pipeline, cache_config, block_adapter, adapter_cls)
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
 def enable_cache_for_cosmos3(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
     """Enable cache-dit for Cosmos3.
 
@@ -957,6 +968,7 @@ def register_custom_dit_enablers() -> None:
             "Kandinsky6TI2VAPipeline": enable_cache_for_kandinsky6,
             "Magi2Pipeline": enable_cache_for_magi2,
             "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
+            "SenseNovaU1Pipeline": enable_cache_for_sensenova_u1,
         }
     )
 

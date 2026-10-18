@@ -1,0 +1,82 @@
+{
+  "model": "sensenova/SenseNova-U1.5-8B-MoT",
+  "model_revision": "9feeeab8a2792514d109cd34589342a2cc1d4ab2",
+  "benchmark_sha": "ed5c7a3c8f2daeecac24c8d786b128cfaa0a6cbf",
+  "server_sha": "a038b38179e9c788d3af6a8e73f94652afb247e4",
+  "hardware": "1x NVIDIA H20-3e 143771 MiB, CUDA_VISIBLE_DEVICES=0, TP=1",
+  "warmup_config": "none",
+  "cases": [
+    "t2i:1024x1024",
+    "t2t",
+    "i2t",
+    "t2i:1536x1536"
+  ],
+  "rounds": 2,
+  "steps": 8,
+  "cfg_scale": 1.0,
+  "image_seed": 42,
+  "p50_s": 2.0915,
+  "p100_s": 57.79,
+  "by_case": {
+    "t2i:1024x1024": {
+      "p50_s": 2.0915,
+      "p100_s": 2.409
+    },
+    "t2t": {
+      "p50_s": 28.927,
+      "p100_s": 57.79
+    },
+    "i2t": {
+      "p50_s": 0.1945,
+      "p100_s": 0.313
+    },
+    "t2i:1536x1536": {
+      "p50_s": 4.092499999999999,
+      "p100_s": 4.175
+    }
+  },
+  "requests": [
+    {
+      "round": 0,
+      "case": "t2i:1024x1024",
+      "latency_s": 2.409
+    },
+    {
+      "round": 0,
+      "case": "t2t",
+      "latency_s": 57.79
+    },
+    {
+      "round": 0,
+      "case": "i2t",
+      "latency_s": 0.313
+    },
+    {
+      "round": 0,
+      "case": "t2i:1536x1536",
+      "latency_s": 4.175
+    },
+    {
+      "round": 1,
+      "case": "t2i:1024x1024",
+      "latency_s": 1.774
+    },
+    {
+      "round": 1,
+      "case": "t2t",
+      "latency_s": 0.064
+    },
+    {
+      "round": 1,
+      "case": "i2t",
+      "latency_s": 0.076
+    },
+    {
+      "round": 1,
+      "case": "t2i:1536x1536",
+      "latency_s": 4.01
+    }
+  ],
+  "serving_recompiles": 0,
+  "serving_decode_graph_captures": 1
+}
