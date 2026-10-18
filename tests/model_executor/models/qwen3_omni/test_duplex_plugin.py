@@ -211,6 +211,49 @@ async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("next_input", [False, True])
+@pytest.mark.parametrize("delete_before_ack", [False, True])
+async def test_audio_without_transcript_accepts_playback_ack(cancelled, next_input, delete_before_ack):
+    h = await open_qwen()
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True), stage_id=0)
+        audio = await h.deliver_and_settle(tts_output(request_id, text="", finished=not cancelled), stage_id=2)
+        assert any(event.type == "response.output_audio.delta" for event in audio)
+        if cancelled:
+            await h.run(CancelResponse())
+        assert h.session.active_response_id is None
+        assert all(message["role"] == "user" for message in h.session.history)
+        if next_input:
+            await h.run(append_audio())
+            await h.run(Commit(final=True, create_response=True))
+        current_response = h.session.active_response_id
+        history = h.session.history
+        if delete_before_ack:
+            assert h.session.delete_history_item(f"item_{response_id}") is True
+            ack = await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+            assert response_id not in h.session._playback.by_response
+            assert h.session.history == history
+            return
+        for played_ms in (500, 1000):
+            ack = await h.run(AckPlayback(response_id=response_id, played_ms=played_ms))
+            assert [event.type for event in ack] == ["playback.acknowledged"], [event.to_realtime() for event in ack]
+            assert ack[0].details["history_committed"] is False
+            assert ack[0].details["playback"]["played_ms"] == played_ms
+            assert h.session.history == history
+            assert h.session.active_response_id == current_response
+        # Fully played audio must not leave response bookkeeping behind.
+        assert response_id not in h.session._playback.by_response
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_cancel_drops_old_output_and_accepts_next_turn():
     h = await open_qwen()
     try:

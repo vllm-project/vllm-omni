@@ -12,7 +12,7 @@
     const hint = 'This Qwen deployment needs session_mode: duplex with Server VAD enabled.';
     return {
       title: 'Qwen3-Omni Voice', eyebrow: vad ? 'Engine-owned duplex call' : 'Turn-based Realtime call',
-      policy: vad ? 'Server VAD • interruptible responses' : 'Send turn • one response at a time',
+      policy: vad ? 'Semantic VAD • interruptible responses' : 'Send turn • one response at a time',
       description: vad
         ? 'Pause to send your turn; speak again to interrupt. Microphone upload continues during playback. Requires the Qwen duplex plugin and Silero. Optional camera frames accompany each spoken turn.'
         : 'Speak, then press Send turn. Microphone upload pauses while the model answers. Conversation history stays on the Realtime session. No barge-in or camera input.',
@@ -35,8 +35,8 @@
         interruptOnSpeech = vad;
         const session = { model: config.model, audio: { input: {
           format: { type: 'audio/pcm', rate: 24000 },
-          turn_detection: vad ? { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300,
-            silence_duration_ms: 500, create_response: true, interrupt_response: true } : null,
+          turn_detection: vad ? { type: 'semantic_vad', eagerness: 'auto',
+            create_response: true, interrupt_response: true } : null,
         } } };
         if (vad) session.overlap_policy = 'barge_in_on_speech';
         else session.type = 'realtime';

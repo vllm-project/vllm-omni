@@ -44,6 +44,7 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
     if response_id is None and item_id is None and session.active_response_id is not None:
         response_id = session.active_response_id
         item_id = f"item_{response_id}"
+    audio_only = response_id is not None and session.has_audio_only_response(response_id)
     if response_id is not None:
         expected_item_id = f"item_{response_id}"
         if item_id is None:
@@ -54,11 +55,12 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             return [
                 error_event("playback_item_not_found", f"No assistant response item is registered for {response_id}.")
             ]
-        if session.playback_ack_is_too_late(response_id, item_id):
+        if not audio_only and session.playback_ack_is_too_late(response_id, item_id):
             return [
                 error_event("playback_ack_too_late", "playback.ack arrived after a later user input was committed.")
             ]
-        session.reserve_history_item(item_id)
+        if not audio_only:
+            session.reserve_history_item(item_id)
     elif item_id is not None:
         return [error_event("playback_item_not_found", "playback.ack requires a response-owned assistant item.")]
     hard_truncate = event.get("truncate") is True
@@ -69,19 +71,19 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
         playback = session.acknowledge_playback(int(played_ms), committed_cursor, response_id=response_id)
     committed_history = False
     if isinstance(item_id, str) and item_id:
-        expected_item_id = f"item_{response_id}" if response_id is not None else None
-        if (
-            expected_item_id == item_id
-            and item_id not in session.history_item_ids
-            and item_id not in session.pending_history_item_ids
-        ):
-            session.register_history_item(item_id, None)
-        committed_history = session.truncate_history_item(
-            item_id,
-            audio_end_ms=committed_cursor,
-            playback=playback,
-            hard=hard_truncate,
-        )
+        if not audio_only:
+            if (
+                item_id == f"item_{response_id}"
+                and item_id not in session.history_item_ids
+                and item_id not in session.pending_history_item_ids
+            ):
+                session.register_history_item(item_id, None)
+            committed_history = session.truncate_history_item(
+                item_id,
+                audio_end_ms=committed_cursor,
+                playback=playback,
+                hard=hard_truncate,
+            )
     elif session.pending_history_item_ids:
         pending_ids = list(session.pending_history_item_ids)
         if len(pending_ids) == 1:
@@ -131,7 +133,7 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             }
         )
     ]
-    if committed_history and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
+    if (committed_history or audio_only) and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
         session.release_response_playback(response_id)
         session.release_response_history_snapshot(response_id)
     return events

@@ -161,7 +161,7 @@ def test_build_detector_picks_the_detector_by_type() -> None:
 
     assert isinstance(semantic, SemanticTurnDetector)
     assert semantic.max_silence_ms == SEMANTIC_VAD_MAX_SILENCE_MS["low"] == 8000
-    assert semantic.candidate_silence_ms == SEMANTIC_VAD_CANDIDATE_SILENCE_MS["low"] == 800
+    assert semantic.candidate_silence_ms == SEMANTIC_VAD_CANDIDATE_SILENCE_MS["low"] == 1500
     assert isinstance(server, ServerTurnDetector)
 
 
@@ -201,6 +201,24 @@ def test_a_short_noise_burst_does_not_extend_the_silence_limit() -> None:
     assert _commit_ms(results, chunk_ms=32) == 4320
 
 
+@pytest.mark.parametrize("eagerness", ["high", "auto", "low"])
+def test_hysteresis_delaying_a_candidate_does_not_extend_the_silence_limit(eagerness: str) -> None:
+    turn = _ScriptedTurn(0.1)
+    detector = SemanticTurnDetector(
+        TurnDetectionConfig(type="semantic_vad", eagerness=eagerness),
+        turn_scorer=turn,
+        frame_scorer=lambda frame: float(frame[0]),
+    )
+    # One low frame starts silence. The hysteresis band preserves that timer
+    # but cannot close the candidate, even after candidate_silence_ms elapses.
+    band_ms = (detector.candidate_silence_ms // 32 + 10) * 32
+    results = _feed(detector, [(0.9, 288), (0.1, 32), (0.45, band_ms), (0.1, 9000)], chunk_ms=32)
+
+    assert len(turn.windows) == 1
+    deadline_ms = 288 + -(-detector.max_silence_ms // 32) * 32
+    assert [r.audio_end_ms for r in results if r.should_commit] == [deadline_ms]
+
+
 @pytest.mark.parametrize("chunk_ms", [20, 100, 200, 12000])
 def test_multiple_turns_and_scoring_windows_are_independent_of_wire_chunk_size(chunk_ms: int) -> None:
     turn = _ScriptedTurn(0.1, 0.1)
@@ -216,14 +234,14 @@ def test_multiple_turns_and_scoring_windows_are_independent_of_wire_chunk_size(c
 
 def test_a_complete_turn_commits_at_the_first_pause() -> None:
     turn = _ScriptedTurn(0.9)
-    results = _feed(_detector(turn), [(SPEECH, 1000), (0.0, 900)])
+    results = _feed(_detector(turn), [(SPEECH, 1000), (0.0, 1600)])
 
     assert _count(results, "speech_started") == 1
     assert _count(results, "speech_stopped") == 1
     assert _count(results, "should_commit") == 1
-    # ``auto`` makes 500 ms of silence a candidate: 16 Silero frames after the
+    # ``auto`` makes 1200 ms of silence a candidate: 38 Silero frames after the
     # frame-aligned end of speech (1024 ms), then the 100 ms chunk grid.
-    assert _commit_ms(results) == 1600
+    assert _commit_ms(results) == 2300
     assert len(turn.windows) == 1
     committed = next(result for result in results if result.should_commit)
     assert committed.turn_complete_probability == pytest.approx(0.9)
@@ -231,21 +249,31 @@ def test_a_complete_turn_commits_at_the_first_pause() -> None:
     assert committed.as_payload()["turn_complete_probability"] == pytest.approx(0.9)
 
 
+def test_default_waits_through_a_short_clause_pause_before_scoring() -> None:
+    # Even a confidently complete model answer must not split a 900 ms
+    # hesitation: the default only calls it after the 1200 ms candidate pause.
+    turn = _ScriptedTurn(0.99)
+    results = _feed(_detector(turn), [(SPEECH, 800), (0.0, 900), (SPEECH, 800), (0.0, 1600)])
+    assert len(turn.windows) == 1
+    assert _count(results, "speech_started") == _count(results, "should_commit") == 1
+    assert 3700 <= _commit_ms(results) <= 3800
+
+
 def test_a_thinking_pause_stays_inside_the_turn() -> None:
     turn = _ScriptedTurn(0.1, 0.8)
     detector = _detector(turn)
-    results = _feed(detector, [(SPEECH, 1000), (0.0, 900), (SPEECH, 800), (0.0, 800)])
+    results = _feed(detector, [(SPEECH, 1000), (0.0, 1600), (SPEECH, 800), (0.0, 1600)])
 
     assert _count(results, "speech_started") == 1, "resumed speech must not start a second turn"
     assert _count(results, "speech_stopped") == 1
     assert _count(results, "should_commit") == 1
-    # The second pause starts at 2700 ms; 500 ms on the 32 ms frame grid, then the chunk grid.
-    assert 3200 <= _commit_ms(results) <= 3300
+    # The second pause starts at 3400 ms; 1200 ms on the frame grid, then the chunk grid.
+    assert 4600 <= _commit_ms(results) <= 4700
     # Re-scored with the whole, longer turn the second time.
     assert len(turn.windows) == 2
     assert turn.windows[1].size > turn.windows[0].size
     # The pause chunks stay speech so a turn session buffers them.
-    pause = results[10:19]
+    pause = results[10:26]
     assert all(result.is_speech and result.speech_active for result in pause)
     assert not any(result.speech_stopped for result in pause)
 
@@ -268,33 +296,36 @@ def test_silence_between_turns_is_not_speech() -> None:
 
 def test_stopped_and_active_are_never_reported_together() -> None:
     turn = _ScriptedTurn(0.1, 0.1, 0.9)
-    results = _feed(_detector(turn), [(SPEECH, 500), (0.0, 700), (SPEECH, 500), (0.0, 700), (SPEECH, 300), (0.0, 800)])
+    results = _feed(
+        _detector(turn), [(SPEECH, 500), (0.0, 1600), (SPEECH, 500), (0.0, 1600), (SPEECH, 300), (0.0, 1600)]
+    )
     assert not any(result.speech_stopped and result.speech_active for result in results)
     assert _count(results, "speech_started") == 1
+    assert _count(results, "should_commit") == 1
 
 
 @pytest.mark.parametrize("chunk_ms", [20, 100, 400])
 def test_decisions_do_not_depend_on_chunking(chunk_ms: int) -> None:
     turn = _ScriptedTurn(0.1, 0.9)
-    results = _feed(_detector(turn), [(SPEECH, 1200), (0.0, 900), (SPEECH, 800), (0.0, 1200)], chunk_ms=chunk_ms)
+    results = _feed(_detector(turn), [(SPEECH, 1200), (0.0, 1600), (SPEECH, 800), (0.0, 1600)], chunk_ms=chunk_ms)
 
     assert _count(results, "speech_started") == 1
     assert _count(results, "should_commit") == 1
     assert len(turn.windows) == 2
-    # Commit lands within one frame and one chunk of 500 ms after the second pause began.
-    assert 2900 + 500 <= _commit_ms(results, chunk_ms) <= 2900 + 500 + 32 + chunk_ms
+    # Commit lands within one frame and one chunk of 1200 ms after the second pause began.
+    assert 3600 + 1200 <= _commit_ms(results, chunk_ms) <= 3600 + 1200 + 32 + chunk_ms
 
 
 def test_the_detector_resets_itself_after_a_commit() -> None:
     turn = _ScriptedTurn(0.9, 0.9)
     detector = _detector(turn)
-    first = _feed(detector, [(SPEECH, 600), (0.0, 700)])
-    second = _feed(detector, [(SPEECH, 600), (0.0, 700)])
+    first = _feed(detector, [(SPEECH, 600), (0.0, 1600)])
+    second = _feed(detector, [(SPEECH, 600), (0.0, 1600)])
 
     assert _count(first, "should_commit") == _count(second, "should_commit") == 1
     assert _count(second, "speech_started") == 1
     started = next(result for result in second if result.speech_started)
-    assert started.audio_start_ms is not None and started.audio_start_ms >= 1300 - 300 - 32
+    assert started.audio_start_ms is not None and started.audio_start_ms >= 2200 - 300 - 32
 
 
 def test_reset_drops_a_pending_pause() -> None:
@@ -318,8 +349,8 @@ def test_a_failed_inference_falls_back_to_the_silence_limit() -> None:
 def test_sessions_sharing_one_scorer_keep_their_own_state() -> None:
     shared = _ScriptedTurn(0.1, 0.9)
     a, b = _detector(shared), _detector(shared)
-    paused = _feed(a, [(SPEECH, 600), (0.0, 700)])
-    complete = _feed(b, [(SPEECH, 600), (0.0, 700)])
+    paused = _feed(a, [(SPEECH, 600), (0.0, 1600)])
+    complete = _feed(b, [(SPEECH, 600), (0.0, 1600)])
 
     assert _count(paused, "should_commit") == 0 and paused[-1].speech_active
     assert _count(complete, "should_commit") == 1
@@ -327,11 +358,11 @@ def test_sessions_sharing_one_scorer_keep_their_own_state() -> None:
 
 def test_smart_turn_sees_the_turn_with_its_prefix_padding_only() -> None:
     turn = _ScriptedTurn(0.9)
-    _feed(_detector(turn), [(0.0, 3000), (SPEECH, 1000), (0.0, 700)])
+    _feed(_detector(turn), [(0.0, 3000), (SPEECH, 1000), (0.0, 1600)])
     window = turn.windows[0]
     # From the start of speech minus 300 ms of padding (2700 ms) to the chunk
-    # that ended the 500 ms pause (4600 ms), not the 3 s of silence before it.
-    assert 1700 * RATE // 1000 <= window.size <= 2100 * RATE // 1000
+    # that ended the 1200 ms pause, not the 3 s of silence before it.
+    assert 2400 * RATE // 1000 <= window.size <= 2700 * RATE // 1000
 
 
 def test_the_window_does_not_drift_into_earlier_turns() -> None:
@@ -341,13 +372,13 @@ def test_the_window_does_not_drift_into_earlier_turns() -> None:
     detector = _detector(turn)
     for _ in range(turns):
         # 100 ms chunks are not a multiple of Silero's 512-sample frame.
-        assert _count(_feed(detector, [(SPEECH, 1000), (0.0, 700)]), "should_commit") == 1
+        assert _count(_feed(detector, [(SPEECH, 1000), (0.0, 1600)]), "should_commit") == 1
     # The first turn's prefix padding is clipped at the start of the stream;
     # every later turn sees the same window, however many resets came before.
     sizes = [window.size for window in turn.windows[1:]]
     assert max(sizes) - min(sizes) <= 512, sizes
     # Speech plus padding plus the candidate pause, never a previous turn.
-    assert max(sizes) <= 2000 * RATE // 1000
+    assert max(sizes) <= 2600 * RATE // 1000
 
 
 def test_a_non_string_eagerness_is_refused() -> None:
@@ -357,7 +388,7 @@ def test_a_non_string_eagerness_is_refused() -> None:
 
 def test_a_long_turn_is_cut_to_the_last_eight_seconds() -> None:
     turn = _ScriptedTurn(0.9)
-    _feed(_detector(turn), [(SPEECH, 10_000), (0.0, 700)])
+    _feed(_detector(turn), [(SPEECH, 10_000), (0.0, 1600)])
     assert turn.windows[0].size == SMART_TURN_WINDOW_SAMPLES
 
 
@@ -373,7 +404,7 @@ def test_the_window_pads_at_the_front() -> None:
 
 def test_a_session_update_swaps_and_resets_the_old_detector() -> None:
     old = _detector(_ScriptedTurn(0.1))
-    _feed(old, [(SPEECH, 600), (0.0, 700)])
+    _feed(old, [(SPEECH, 600), (0.0, 1600)])
     payload: dict[str, object] = {"turn_detection": {"type": "server_vad"}}
     pending = PendingTurnDetectionUpdate.prepare(payload)
 

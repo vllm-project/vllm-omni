@@ -189,14 +189,27 @@ until speech resumes or the silence reaches the limit. `eagerness` sets both:
 | eagerness | pause that asks Smart Turn | longest wait |
 | --- | --- | --- |
 | `high` | 300 ms | 2 s |
-| `medium` / `auto` | 500 ms | 4 s |
-| `low` | 800 ms | 8 s |
+| `medium` / `auto` | 1200 ms | 4 s |
+| `low` | 1500 ms | 8 s |
+
+The default favors avoiding interruptions during clause pauses. A complete
+utterance also waits approximately 1.2 seconds before classification; use
+`high` when lower latency matters more. Timing is measured from received audio
+on Silero's 32 ms frame grid, not from gaps in network delivery. The longest
+wait starts at the actual beginning of the detected silence.
+
+Smart Turn runs once per candidate pause. An incomplete result waits for
+new speech or the silence limit; silence alone does not trigger repeated
+classification. The completion threshold is 0.5 for the pinned INT8 model.
+False completions and false incompletions remain possible, and audio beyond
+the most recent eight seconds is outside the classifier's context.
 
 It is available on turn-based sessions; auto-responding (native duplex) sessions
 refuse it.
 
-The engine runs the pinned int8 CPU artifact
-`pipecat-ai/smart-turn-v3/smart-turn-v3.2-cpu.onnx` and does not download it
+The engine runs the pinned INT8 artifact
+`pipecat-ai/smart-turn-v3/smart-turn-v3.2-cpu.onnx` on **CPUExecutionProvider**.
+It does not require a GPU and does not download the artifact
 while serving. Pre-download it into the Hugging Face cache, or point the overlay at a
 local copy next to the Silero artifact:
 

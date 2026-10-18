@@ -69,6 +69,9 @@ class StreamingVADResult:
     speech_probability: float = 0.0
     speech_start_ms: int | None = None
     speech_end_ms: int | None = None
+    # Actual start of the silence that produced speech_stopped. Hysteresis
+    # can delay the stop beyond silence_duration_ms.
+    silence_start_ms: int | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +432,7 @@ class SileroStreamingVAD:
         stopped = False
         start_ms: int | None = None
         end_ms: int | None = None
+        silence_start_ms: int | None = None
         max_probability = 0.0
         contained_speech = self._speech_active
         min_speech_samples = max(1, round(self.config.min_speech_duration_ms * self._SAMPLE_RATE_HZ / 1000))
@@ -461,6 +465,9 @@ class SileroStreamingVAD:
                 self._silence_samples += self._WINDOW_SAMPLES
                 if not below_negative_threshold or self._silence_samples < min_silence_samples:
                     continue
+                silence_start_ms = round(
+                    (self._processed_samples - self._silence_samples) * 1000 / self._SAMPLE_RATE_HZ
+                )
                 self._speech_active = False
                 self._silence_samples = 0
                 stopped = True
@@ -495,7 +502,7 @@ class SileroStreamingVAD:
         self._pending = pending[offset:].copy()
 
         return StreamingVADResult(
-            contained_speech, self._speech_active, started, stopped, max_probability, start_ms, end_ms
+            contained_speech, self._speech_active, started, stopped, max_probability, start_ms, end_ms, silence_start_ms
         )
 
     def _score_frame(self, frame: np.ndarray) -> float:

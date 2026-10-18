@@ -125,6 +125,8 @@ RESPONSE_REQUEST_MEASUREMENT_ORIGIN: dict[str, str] = {
 class PlaybackLedger:
     current: DuplexPlaybackCursor = field(default_factory=DuplexPlaybackCursor)
     by_response: dict[str, DuplexPlaybackCursor] = field(default_factory=dict)
+    # Finished/cancelled audio can still need an ACK without any text history.
+    audio_only_responses: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -503,10 +505,13 @@ class DuplexEngineSession:
     def last_assistant_audio_text_marks(self) -> tuple[DuplexAssistantAudioTextMark, ...]:
         return tuple(self._conversation.last_assistant_audio_text_marks)
 
+    def has_audio_only_response(self, response_id: str) -> bool:
+        return response_id in self._playback.audio_only_responses
+
     def has_assistant_response_item(self, response_id: str, item_id: str) -> bool:
         if item_id != f"item_{response_id}":
             return False
-        if self.active_response_id == response_id:
+        if self.active_response_id == response_id or self.has_audio_only_response(response_id):
             return True
         message = self._conversation.item_ids.get(item_id) or self._conversation.pending_item_ids.get(item_id)
         if isinstance(message, dict) and message.get("role") == "assistant":
@@ -1280,6 +1285,7 @@ class DuplexEngineSession:
         if response_id is None or response_id == self.active_response_id:
             return
         self._playback.by_response.pop(response_id, None)
+        self._playback.audio_only_responses.discard(response_id)
 
     def release_finished_drain_response(self, response_id: str | None) -> None:
         """Drop unused books for a response whose TTS just finished.
@@ -1355,6 +1361,8 @@ class DuplexEngineSession:
             self.register_history_item(f"item_{response_id}", None)
         elif response_id is not None and not assistant_text:
             self._discard_history_item_placeholder(f"item_{response_id}")
+            if self._playback.current.sent_ms > 0:
+                self._playback.audio_only_responses.add(response_id)
         self._response.assistant_text_buffer.clear()
         if not preserve_request:
             self._response.active_request_id = None
@@ -1426,6 +1434,9 @@ class DuplexEngineSession:
 
     def delete_history_item(self, item_id: str) -> bool:
         response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
+        audio_only = response_id is not None and self.has_audio_only_response(response_id)
+        if audio_only:
+            self.release_response_playback(response_id)
         message = self._conversation.item_ids.pop(item_id, None)
         self._conversation.item_audio_text_marks.pop(item_id, None)
         pending = self._conversation.pending_item_ids.pop(item_id, None)
@@ -1437,7 +1448,7 @@ class DuplexEngineSession:
         if response_id is not None:
             self._conversation.assistant_response_snapshots.pop(response_id, None)
         if message is None:
-            return pending is not None or removed_placeholder
+            return pending is not None or removed_placeholder or audio_only
         # Distinct response items can have identical (including empty) content.
         self._conversation.messages = [
             candidate for candidate in self._conversation.messages if candidate is not message

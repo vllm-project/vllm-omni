@@ -99,13 +99,13 @@ _SERVER_VAD_FIELDS = frozenset(
 _SEMANTIC_VAD_FIELDS = frozenset({"type", "eagerness", "create_response", "interrupt_response"})
 
 #: Silence that makes a pause a candidate end of turn, by ``eagerness``
-#: (``auto`` is ``medium``). Smart Turn's own recommendation is 200 ms, but on
-#: its labeled test set a pause that short is reached inside most utterances
-#: (breaths, clause gaps) where the prefix already *sounds* complete, so 200 ms
-#: cut more turns short than ``server_vad``'s 500 ms. At each of these lengths
-#: ``semantic_vad`` cuts fewer turns than ``server_vad`` with the same silence,
-#: and almost none at a real thinking pause.
-SEMANTIC_VAD_CANDIDATE_SILENCE_MS = {"high": 300, "medium": 500, "auto": 500, "low": 800}
+#: (``auto`` is ``medium``). The default favors keeping clause pauses inside
+#: a turn: Smart Turn can confidently classify a short prefix as complete.
+#: Waiting longer gives speech a chance to resume before that decision, at
+#: the cost of the same additional latency on complete utterances. ``high``
+#: remains the low-latency option. These delays do not guarantee semantic
+#: correctness; the classifier can still mistake a longer thinking pause.
+SEMANTIC_VAD_CANDIDATE_SILENCE_MS = {"high": 300, "medium": 1200, "auto": 1200, "low": 1500}
 #: Longest silence ``semantic_vad`` waits through after Smart Turn calls the
 #: turn incomplete, measured from the start of the pause.
 SEMANTIC_VAD_MAX_SILENCE_MS = {"high": 2000, "medium": 4000, "auto": 4000, "low": 8000}
@@ -545,9 +545,10 @@ class SemanticTurnDetector:
             elif inner.speech_stopped:
                 # Silero saw the candidate silence. Decide on the whole turn so
                 # far; a resumed-then-paused turn is re-scored with more context.
-                stop_ms = inner.speech_end_ms if inner.speech_end_ms is not None else self._vad.processed_ms
-                # Silero counts the candidate silence in whole 32 ms frames.
-                self._pause_start_ms = max(0, stop_ms - -(-self._candidate_silence_ms // 32) * 32)
+                # Use Silero's actual pause start. Its hysteresis band can
+                # delay speech_stopped beyond the minimum candidate silence;
+                # subtracting that minimum would move the timeout deadline.
+                self._pause_start_ms = inner.silence_start_ms
                 try:
                     probability = float(scorer(self._turn_window()))
                 except Exception:

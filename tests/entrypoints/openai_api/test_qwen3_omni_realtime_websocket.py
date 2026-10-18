@@ -278,34 +278,49 @@ async def _run_server_vad_audio_roundtrips(
     turns: int = 2,
     turn_detection: dict | None = None,
     silence_ms: int = 1500,
+    duplex: bool = False,
 ) -> list[list[dict]]:
     chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
     turn_events: list[list[dict]] = []
 
-    async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "type": "realtime",
-                        "model": model,
-                        "audio": {
-                            "input": {
-                                "format": {"type": "audio/pcm", "rate": 16_000},
-                                "turn_detection": turn_detection or {"type": "server_vad"},
-                            }
+    query = "?duplex=1" if duplex else ""
+    async with websockets.connect(f"ws://{host}:{port}/v1/realtime{query}", max_size=64 * 1024 * 1024) as ws:
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "model": model,
+                            "audio": {
+                                "input": {
+                                    "format": {"type": "audio/pcm", "rate": 16_000},
+                                    "turn_detection": turn_detection or {"type": "server_vad"},
+                                }
+                            },
                         },
-                    },
-                }
+                    }
+                )
             )
-        )
 
-        silence = bytes(16_000 * 2 * silence_ms // 1000)
-        for _ in range(turns):
-            await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
-            await _append_pcm16_chunks(ws, silence, chunk_bytes)
-            turn_events.append(await _receive_server_vad_turn(ws))
+            silence = bytes(16_000 * 2 * silence_ms // 1000)
+            for _ in range(turns):
+                await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
+                await _append_pcm16_chunks(ws, silence, chunk_bytes)
+                turn_events.append(await _receive_server_vad_turn(ws))
+        finally:
+            if duplex:
+                # Disconnect leaves a resumable duplex session holding the
+                # admission slot. Wait for its release before the next test.
+                await ws.send(json.dumps({"type": "session.close"}))
+                closing_events: list[dict] = []
+                await _duplex_receive_until(
+                    ws,
+                    closing_events,
+                    lambda: any(e["type"] == "session.closed" for e in closing_events),
+                    timeout_s=15,
+                )
 
     return turn_events
 
@@ -694,6 +709,7 @@ _DUPLEX_REPEATS_ADVANCED = 5
 _DUPLEX_REPEATS_FULL = 20
 _DUPLEX_LONG_INSTRUCTIONS = "Answer the user's question in English using at least eight complete sentences."
 _DUPLEX_SHORT_INSTRUCTIONS = "Answer the user's question in one short English sentence."
+_SEMANTIC_VAD_ASSETS = Path(__file__).resolve().parents[2] / "assets" / "semantic_vad"
 
 
 class _DuplexTestRuntime(NamedTuple):
@@ -765,9 +781,11 @@ async def _duplex_receive_until(ws, events: list[dict], predicate, *, timeout_s:
     await asyncio.wait_for(receive(), timeout=timeout_s)
 
 
-async def _duplex_send_pcm(ws, pcm: bytes, *, paced: bool = False, trailing_silence: bool = True) -> None:
+async def _duplex_send_pcm(
+    ws, pcm: bytes, *, paced: bool = False, trailing_silence: bool = True, silence_ms: int = 1000
+) -> None:
     if trailing_silence:
-        pcm += bytes(24000 * 2)  # One second exceeds the configured 500 ms endpoint.
+        pcm += bytes(24000 * 2 * silence_ms // 1000)
     chunk_bytes = 24000 * 2 // 5
     for offset in range(0, len(pcm), chunk_bytes):
         await ws.send(
@@ -808,7 +826,15 @@ async def _duplex_add_image(ws) -> None:
 
 
 @asynccontextmanager
-async def _duplex_recorded_session(runtime, log_path: Path, *, instructions: str, vad: bool = True):
+async def _duplex_recorded_session(
+    runtime,
+    log_path: Path,
+    *,
+    instructions: str,
+    vad: bool = True,
+    turn_detection: dict | None = None,
+    include_image: bool = True,
+):
     events: list[dict] = []
     server = runtime.server
     async with websockets.connect(
@@ -829,7 +855,8 @@ async def _duplex_recorded_session(runtime, log_path: Path, *, instructions: str
                             "audio": {
                                 "input": {
                                     "format": {"type": "audio/pcm", "rate": 24000},
-                                    "turn_detection": {
+                                    "turn_detection": turn_detection
+                                    or {
                                         "type": "server_vad",
                                         "threshold": 0.5,
                                         "prefix_padding_ms": 300,
@@ -849,10 +876,12 @@ async def _duplex_recorded_session(runtime, log_path: Path, *, instructions: str
             await _duplex_receive_until(ws, events, lambda: any(e["type"] == "session.updated" for e in events))
             session = next(e["session"] for e in events if e["type"] == "session.updated")
             if vad:
-                accepted = session["audio"]["input"]["turn_detection"]
+                accepted = session["turn_detection"]
                 assert accepted["interrupt_response"] is True
                 assert accepted["create_response"] is True
-            await _duplex_add_image(ws)
+                assert accepted["type"] == (turn_detection or {"type": "server_vad"})["type"]
+            if include_image:
+                await _duplex_add_image(ws)
             yield ws, events, session["id"]
             failed = False
         finally:
@@ -926,13 +955,18 @@ def _duplex_assert_completed_audio(events: list[dict], response_id: str) -> None
     ), "The follow-up must produce text as well as audio"
 
 
-async def _run_duplex_playback_interruption(runtime, log_path: Path, *, generation_finished: bool) -> None:
-    async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_LONG_INSTRUCTIONS) as (
+async def _run_duplex_playback_interruption(
+    runtime, log_path: Path, *, generation_finished: bool, turn_detection: dict | None = None
+) -> None:
+    silence_ms = 5000 if turn_detection and turn_detection["type"] == "semantic_vad" else 1000
+    async with _duplex_recorded_session(
+        runtime, log_path, instructions=_DUPLEX_LONG_INSTRUCTIONS, turn_detection=turn_detection
+    ) as (
         ws,
         events,
         session_id,
     ):
-        await _duplex_send_pcm(ws, _duplex_fixture_pcm(validated_input_wav()))
+        await _duplex_send_pcm(ws, _duplex_fixture_pcm(validated_input_wav()), silence_ms=silence_ms)
         await _duplex_receive_until(ws, events, lambda: any(e["type"] == "response.created" for e in events))
         old_id = next(_duplex_response_id(e) for e in events if e["type"] == "response.created")
         assert old_id
@@ -959,7 +993,12 @@ async def _run_duplex_playback_interruption(runtime, log_path: Path, *, generati
         assert ack["playback"]["sent_ms"] > 100
         cursor = len(events)
         sender = asyncio.create_task(
-            _duplex_send_pcm(ws, _duplex_fixture_pcm(validated_soft_interrupt_wav(), duration_s=4.7), paced=True)
+            _duplex_send_pcm(
+                ws,
+                _duplex_fixture_pcm(validated_soft_interrupt_wav(), duration_s=4.7),
+                paced=True,
+                silence_ms=silence_ms,
+            )
         )
         try:
             await _duplex_receive_until(
@@ -999,8 +1038,33 @@ async def _run_duplex_playback_interruption(runtime, log_path: Path, *, generati
         boundary = events.index(terminals[0])
     assert not _duplex_response_events(events[boundary + 1 :], old_id, "response.output_audio.delta")
     assert new_id and new_id != old_id
+    assert sum(e["type"] == "input_audio_buffer.committed" for e in events) == 2
+    assert sum(e["type"] == "response.created" for e in events) == 2
     _duplex_assert_completed_audio(events, new_id)
     _duplex_assert_prompt(runtime, session_id, audio_count=2, instructions=_DUPLEX_LONG_INSTRUCTIONS, request_count=2)
+
+
+async def _run_semantic_vad_endpoint(runtime, log_path: Path, *, fixture: str) -> list[dict]:
+    """Replay a whole annotated utterance, including pauses, without client commits."""
+    pcm = _duplex_fixture_pcm(_SEMANTIC_VAD_ASSETS / fixture)
+    async with _duplex_recorded_session(
+        runtime,
+        log_path,
+        instructions=_DUPLEX_SHORT_INSTRUCTIONS,
+        turn_detection={"type": "semantic_vad", "eagerness": "auto"},
+        include_image=False,
+    ) as (ws, events, _):
+        sender = asyncio.create_task(_duplex_send_pcm(ws, pcm, paced=True, silence_ms=5000))
+        try:
+            await _duplex_receive_until(ws, events, lambda: any(e["type"] == "response.done" for e in events))
+            await sender
+        finally:
+            sender.cancel()
+            with suppress(asyncio.CancelledError):
+                await sender
+    # session.closed is ordered after all appends. Include late events so an
+    # early first reply cannot hide a second commit/reply during the same input.
+    return events
 
 
 async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
@@ -1068,6 +1132,63 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 class TestQwen3OmniDuplexPlayback:
     @pytest.mark.advanced_model
+    @pytest.mark.parametrize(
+        ("fixture", "min_silence_ms", "max_silence_ms"),
+        [
+            pytest.param("complete.wav", 1000, 1700, id="complete-before-timeout"),
+            pytest.param("short_pause.wav", 1000, 1700, id="hold-800ms-clause-pause"),
+            pytest.param("thinking_pause.wav", 1000, 1700, id="hold-3800ms-incomplete-pause"),
+            pytest.param("abandoned.wav", 3800, 4400, id="incomplete-timeout"),
+        ],
+    )
+    def test_semantic_vad_endpoint_timing(
+        self, qwen_duplex_server, tmp_path: Path, fixture: str, min_silence_ms: int, max_silence_ms: int
+    ) -> None:
+        """Guard the 1200 ms default, real semantic hold, and 4000 ms fallback."""
+        events = asyncio.run(_run_semantic_vad_endpoint(qwen_duplex_server, tmp_path / "events.json", fixture=fixture))
+        event_types = [event["type"] for event in events]
+        sequence = [
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+            "response.created",
+            "response.output_audio.done",
+            "response.done",
+        ]
+        for event_type in sequence:
+            assert event_types.count(event_type) == 1, event_types
+        positions = [event_types.index(event_type) for event_type in sequence]
+        assert positions == sorted(positions)
+        started, stopped, committed = (events[position] for position in positions[:3])
+        assert started["item_id"] == stopped["item_id"] == committed["item_id"]
+        # The fixtures end at the annotated speech end, without trailing silence.
+        # Use the input audio clock, not network or GPU response latency. Bounds
+        # allow Silero frame rounding and a small acoustic end-of-speech offset.
+        with wave.open(str(_SEMANTIC_VAD_ASSETS / fixture), "rb") as wav:
+            speech_end_ms = wav.getnframes() * 1000 / wav.getframerate()
+        silence_ms = stopped["audio_end_ms"] - speech_end_ms
+        assert min_silence_ms <= silence_ms <= max_silence_ms, (fixture, silence_ms, stopped)
+        response_id = _duplex_response_id(events[positions[3]])
+        assert response_id
+        _duplex_assert_completed_audio(events, response_id)
+
+    @pytest.mark.advanced_model
+    @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
+    @pytest.mark.parametrize("repetition", range(2))
+    def test_semantic_vad_speech_interrupts_playback(
+        self, qwen_duplex_server, tmp_path: Path, generation_finished: bool, repetition: int
+    ) -> None:
+        """One spoken interruption produces exactly one follow-up with semantic VAD."""
+        asyncio.run(
+            _run_duplex_playback_interruption(
+                qwen_duplex_server,
+                tmp_path / f"events-{repetition}.json",
+                generation_finished=generation_finished,
+                turn_detection={"type": "semantic_vad", "eagerness": "auto"},
+            )
+        )
+
+    @pytest.mark.advanced_model
     @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
     @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_ADVANCED))
     def test_speech_interrupts_playback(
@@ -1109,6 +1230,7 @@ class TestQwen3OmniDuplexPlayback:
                 # Longer than the 4 s ``auto`` limit, so the turn ends even
                 # when Smart Turn calls it incomplete.
                 silence_ms=5000,
+                duplex=True,
             )
         )
 
