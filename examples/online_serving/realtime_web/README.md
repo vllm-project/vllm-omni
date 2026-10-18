@@ -9,6 +9,7 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `minicpm-native` | Model-controlled listen/speak, continuous audio input | Frames accompany audio | Yes |
 | `qwen3-turn --manual` | Press **Send turn**; mic pauses while the reply plays | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
+| `qwen3-turn --semantic-vad` | Silero detects pauses; Smart Turn checks completion; speech interrupts replies | Sampled frames with each spoken turn | Yes |
 | `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
 | `joyai-turn` | Latest observation once per second while idle, or **Send observation**; waits for response completion and playback | Camera frames without audio input | Yes |
 | `joyai-turn --speech-input` | Hold to talk; release commits speech, then camera observations resume while idle | Latest frame with speech and camera-only observations | Yes |
@@ -309,7 +310,7 @@ native camera protocol, where Stage 0 interleaves frames at unit boundaries.
 
 This is a supported subset, not full OpenAI Realtime API compatibility.
 `duplex=1`, `overlap_policy`, `playback.ack`, and `session.close` remain vLLM-Omni
-extensions. This demo does not add WebRTC, semantic VAD, or tool calling.
+extensions. This demo does not add WebRTC or tool calling.
 
 ## Shared host options
 
@@ -324,7 +325,9 @@ This Qwen3 UI profile requires the server-VAD deployment above.
 
 - `--backend` / `--ws-backend`: backend WebSocket origin (not the full `/v1/realtime` URL).
 - `--model`: override the wrapper's model name.
-- `--manual` / `--vad`: Qwen turn control; manual turns are the default.
+- `--manual` / `--vad` / `--semantic-vad`: Qwen turn control; manual turns are
+  the default. `--vad` uses Silero only; `--semantic-vad` requires `qwen3-turn`
+  and both Silero and Smart Turn artifacts (see [Semantic VAD](#semantic-vad-silero--smart-turn)).
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).
