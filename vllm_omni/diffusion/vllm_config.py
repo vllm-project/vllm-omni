@@ -241,6 +241,16 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     kv_transfer_config = getattr(od_config, "kv_transfer_config", None)
     if kv_transfer_config is not None:
         vllm_config.kv_transfer_config = cast(KVTransferConfig, kv_transfer_config)
+
+    # Weight transfer (RL training). Accepts the raw deploy dict or a
+    # pre-built config, mirroring upstream EngineArgs' dict coercion.
+    weight_transfer_config = getattr(od_config, "weight_transfer_config", None)
+    if weight_transfer_config is not None:
+        from vllm.config.weight_transfer import WeightTransferConfig
+
+        if isinstance(weight_transfer_config, dict):
+            weight_transfer_config = WeightTransferConfig(**weight_transfer_config)
+        vllm_config.weight_transfer_config = weight_transfer_config
     return vllm_config
 
 

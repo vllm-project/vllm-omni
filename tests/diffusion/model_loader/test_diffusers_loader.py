@@ -795,6 +795,7 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
+        weight_transfer_config=None,
     )
 
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
