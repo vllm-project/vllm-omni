@@ -16,7 +16,7 @@ import zmq
 from vllm.utils import network_utils
 from vllm.v1.engine.utils import EngineZmqAddresses
 
-from vllm_omni.engine import stage_engine_core_proc_manager, stage_engine_startup
+from vllm_omni.engine import stage_engine_core_proc_manager, stage_engine_startup, stage_init_deadline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -74,7 +74,7 @@ def fake_startup(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     monkeypatch.setattr(stage_engine_core_proc_manager, "StageEngineCoreProcManager", manager)
     monkeypatch.setattr(stage_engine_startup, "zmq_socket_ctx", socket_ctx)
-    monkeypatch.setattr(stage_engine_startup, "wait_for_engine_startup", wait_for_startup)
+    monkeypatch.setattr(stage_init_deadline, "wait_for_engine_startup", wait_for_startup)
     return state
 
 
@@ -154,7 +154,7 @@ def test_multi_api_dealer_queues_hello_before_router_binds(
         assert reply_received.wait(timeout=3), "The DEALER did not receive INIT"
 
     monkeypatch.setattr(stage_engine_startup, "zmq_socket_ctx", real_socket_ctx)
-    monkeypatch.setattr(stage_engine_startup, "wait_for_engine_startup", wait_for_startup)
+    monkeypatch.setattr(stage_init_deadline, "wait_for_engine_startup", wait_for_startup)
     context = stage_engine_startup.launch_stage_replica(
         vllm_config=fake_startup.config,
         executor_class=object,
