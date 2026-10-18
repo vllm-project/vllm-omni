@@ -60,6 +60,7 @@ recipes/
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
 | [`k2-fsa/OmniVoice.md`](./k2-fsa/OmniVoice.md) | Offline and online multilingual text-to-speech | 1x AMD MI300X (ROCm 7.2) |
 | [`lerobot/Pi05.md`](./lerobot/Pi05.md) | Online OpenPI serving for the π0.5 vision-language-action policy | 1x H100 80GB |
+| [`IFM/PAN2.md`](./IFM/PAN2.md) | PAN 2 text-to-video and image-to-video, offline and `/v1/videos` | 1x, 4x, or 8x GPUs with 141 GB or more (H200, B200, B300) |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
 | [`Microsoft/VibeVoice-1.5B-H100.md`](./Microsoft/VibeVoice-1.5B-H100.md) | Offline single-speaker TTS with optional voice clone (eager) | 1x H100 80GB |
