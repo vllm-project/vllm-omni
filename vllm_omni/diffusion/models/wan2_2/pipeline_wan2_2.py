@@ -104,6 +104,19 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     )
 
 
+def refresh_cache_for_denoise_schedule(pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None) -> None:
+    """Size an active Cache-DiT context to the schedule forward() resolved for this request.
+
+    The model runner refreshes cache state before forward() starts, when the
+    request's sample solver, flow shift and boundary are not resolved yet. Call
+    this once they are, so each expert's step budget is counted from the exact
+    timesteps diffuse() will route to it.
+    """
+    refresh = getattr(pipeline, "_cache_dit_refresh_for_schedule", None)
+    if refresh is not None:
+        refresh(pipeline, timesteps, boundary_timestep)
+
+
 def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     """Load Wan weights and discard optional VSA gates absent from the checkpoint."""
     gate_param_names = {name for name, _ in model.named_parameters() if ".to_gate_compress." in name}
@@ -1354,6 +1367,7 @@ class Wan22Pipeline(
         boundary_timestep = None
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()

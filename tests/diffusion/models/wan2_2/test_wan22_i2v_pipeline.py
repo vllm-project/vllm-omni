@@ -313,7 +313,17 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch, s
 
     pipeline.encode_prompt = _fake_encode_prompt  # type: ignore[method-assign]
     pipeline.prepare_latents = _fake_prepare_latents  # type: ignore[method-assign]
-    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+    diffuse_call = {}
+
+    def _fake_diffuse(**kwargs):
+        diffuse_call.update(kwargs)
+        return kwargs["latents"]
+
+    pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
+    schedule_refreshes = []
+    pipeline._cache_dit_refresh_for_schedule = lambda pipeline, timesteps, boundary_timestep: schedule_refreshes.append(
+        (timesteps, boundary_timestep)
+    )
 
     gen_a = torch.Generator(device="cpu").manual_seed(1)
     gen_b = torch.Generator(device="cpu").manual_seed(2)
@@ -361,6 +371,10 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch, s
         reference.set_timesteps(50, device="cpu")
         torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
+    # Cache-DiT budgets are sized from the schedule this request actually denoises.
+    assert len(schedule_refreshes) == 1
+    assert schedule_refreshes[0][0] is diffuse_call["timesteps"]
+    assert schedule_refreshes[0][1] == diffuse_call["boundary_timestep"]
     assert prepare_call["batch_size"] == 4
     assert prepare_call["generator"] == [gen_a, gen_a, gen_b, gen_b]
     torch.testing.assert_close(prepare_call["latents"], torch.cat([latents_a, latents_b]))

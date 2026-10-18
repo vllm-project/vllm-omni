@@ -110,7 +110,16 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
-        return _build_cache_context_refresh(cache_config)
+        refresh_single = _build_cache_context_refresh(cache_config)
+
+        def refresh_single_for_schedule(
+            pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+        ) -> None:
+            # A single expert denoises every timestep forward() resolved.
+            refresh_single(pipeline, len(timesteps), verbose)
+
+        pipeline._cache_dit_refresh_for_schedule = refresh_single_for_schedule
+        return refresh_single
 
     cache_dit.enable_cache(
         BlockAdapter(
@@ -166,6 +175,30 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
         refresh_trans_one(pipeline, num_high_noise_steps, verbose)
         refresh_trans_two(pipeline, num_low_noise_steps, verbose)
 
+    def refresh_cache_context_for_schedule(
+        pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+    ) -> None:
+        """Size both experts' contexts to the timesteps forward() is about to denoise.
+
+        The runner refreshes before forward() resolves this request's solver, flow
+        shift and boundary, so its split can follow the previous request's
+        schedule. forward() calls this once they are resolved; the counts follow
+        diffuse(), which runs transformer for t >= boundary_timestep and
+        transformer_2 below it.
+        """
+        if boundary_timestep is None:
+            num_high_noise_steps = len(timesteps)
+        else:
+            num_high_noise_steps = int((timesteps >= boundary_timestep).sum())
+        num_low_noise_steps = len(timesteps) - num_high_noise_steps
+        # An expert that gets no step in this request never runs, so its context
+        # can keep the reset the runner already gave it.
+        if num_high_noise_steps > 0:
+            refresh_trans_one(pipeline, num_high_noise_steps, verbose)
+        if num_low_noise_steps > 0:
+            refresh_trans_two(pipeline, num_low_noise_steps, verbose)
+
+    pipeline._cache_dit_refresh_for_schedule = refresh_cache_context_for_schedule
     return refresh_cache_context
 
 

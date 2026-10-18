@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
+    refresh_cache_for_denoise_schedule,
     resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
@@ -717,6 +718,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                 boundary_ratio = 0.875
                 logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         latents = self.diffuse(
             latents=latents,
