@@ -294,6 +294,45 @@ def test_silence_between_turns_is_not_speech() -> None:
     assert not any(result.is_speech or result.speech_active or result.speech_started for result in results)
 
 
+@pytest.mark.parametrize("chunk_ms", [20, 100, 12000])
+@pytest.mark.parametrize(
+    ("answer", "decision", "reason"),
+    [
+        (0.9, "smart_turn_complete", "semantic_complete"),
+        (0.1, "smart_turn_incomplete", "silence_timeout"),
+        (RuntimeError("inference failed"), "smart_turn_error", "silence_timeout"),
+    ],
+)
+def test_commit_diagnostics_distinguish_incomplete_from_failed_inference(chunk_ms, answer, decision, reason) -> None:
+    detector = _detector(_ScriptedTurn(answer), eagerness="high")
+    results = _feed(detector, [(SPEECH, 600), (0.0, 2600)], chunk_ms=chunk_ms)
+    commits = [result for result in results if result.should_commit]
+    assert len(commits) == 1
+    assert commits[0].semantic_decision == decision
+    assert commits[0].commit_reason == reason
+    # Keep diagnostics at decisions/commits, not on every silent audio frame.
+    diagnostics = [result for result in results if result.semantic_decision is not None]
+    assert len(diagnostics) == (1 if reason == "semantic_complete" or chunk_ms == 12000 else 2)
+    assert all(result.semantic_decision == decision for result in diagnostics)
+    idle = _feed(detector, [(0.0, 500)])
+    assert all(result.semantic_decision is None and result.commit_reason is None for result in idle)
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_new_pause_does_not_inherit_previous_inference_error(reset: bool) -> None:
+    detector = _detector(_ScriptedTurn(RuntimeError("inference failed"), 0.1), eagerness="high")
+    first = _feed(detector, [(SPEECH, 600), (0.0, 600)])
+    assert any(result.semantic_decision == "smart_turn_error" for result in first)
+    if reset:
+        detector.reset()
+    resumed = _feed(detector, [(SPEECH, 600)])
+    assert all(result.semantic_decision is None for result in resumed)
+    final = _feed(detector, [(0.0, 2600)])
+    commit = next(result for result in final if result.should_commit)
+    assert commit.semantic_decision == "smart_turn_incomplete"
+    assert commit.commit_reason == "silence_timeout"
+
+
 def test_stopped_and_active_are_never_reported_together() -> None:
     turn = _ScriptedTurn(0.1, 0.1, 0.9)
     results = _feed(
@@ -467,6 +506,35 @@ def test_a_missing_backend_fails_the_first_chunk_explicitly(tmp_path) -> None:
     )
     with pytest.raises(SemanticVADUnavailableError):
         detector.process_segments(_b64(np.zeros(1600, dtype=np.float32)), fmt="pcm_f32le", sample_rate_hz=RATE)
+
+
+def test_first_audio_chunk_loads_backend_before_any_candidate_pause(monkeypatch, tmp_path) -> None:
+    import vllm_omni.engine.duplex.smart_turn as smart_turn
+
+    path = tmp_path / "smart-turn.onnx"
+    path.write_bytes(b"x")
+    calls: list[str] = []
+
+    class _Backend:
+        def __init__(self, model_path) -> None:
+            calls.append("load")
+
+        def predict(self, audio: np.ndarray) -> float:
+            calls.append("score")
+            return 0.9
+
+    monkeypatch.setattr(smart_turn, "SmartTurnBackend", _Backend)
+    monkeypatch.setattr(smart_turn, "SMART_TURN_SHA256", hashlib.sha256(b"x").hexdigest())
+    provider = SmartTurnBackendProvider(model_path=str(path))
+    config = TurnDetectionConfig.from_realtime({"type": "semantic_vad", "eagerness": "high"})
+    for _ in range(2):
+        detector = SemanticTurnDetector(config, smart_turn_provider=provider, frame_scorer=_loud_frames_are_speech)
+        before = calls.count("score")
+        _feed(detector, [(0.0, 100)])
+        assert calls.count("load") == 1
+        assert calls.count("score") == before
+        _feed(detector, [(SPEECH, 600), (0.0, 600)])
+        assert calls.count("score") == before + 1
 
 
 # --------------------------------------------------------------------------- #

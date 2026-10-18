@@ -154,10 +154,15 @@ class SessionControl:
         return detected
 
     def _log_turn_detection(self, result: TurnDetectionResult) -> None:
-        if result.speech_started or result.speech_stopped or result.turn_complete_probability is not None:
+        if (
+            result.speech_started
+            or result.speech_stopped
+            or result.turn_complete_probability is not None
+            or result.semantic_decision is not None
+        ):
             logger.info(
                 "Duplex VAD session=%s backend=%s started=%s stopped=%s active=%s probability=%.3f "
-                "turn_complete=%s start_ms=%s end_ms=%s commit=%s",
+                "turn_complete=%s start_ms=%s end_ms=%s commit=%s semantic_decision=%s commit_reason=%s",
                 self._ctx.session.session_id,
                 result.backend,
                 result.speech_started,
@@ -168,6 +173,8 @@ class SessionControl:
                 result.audio_start_ms,
                 result.audio_end_ms,
                 result.should_commit,
+                result.semantic_decision,
+                result.commit_reason,
             )
 
     # ------------------------------------------------------------------ #

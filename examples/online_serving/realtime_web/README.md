@@ -180,6 +180,14 @@ voices and tool calls are not supported by this plugin.
 
 ### Semantic VAD (Silero + Smart Turn)
 
+Server-side `Duplex VAD` logs include the session ID and `semantic_decision`
+(`smart_turn_complete`, `smart_turn_incomplete`, or `smart_turn_error`) at each
+candidate pause. The final commit also records `commit_reason=semantic_complete`
+or `commit_reason=silence_timeout`, with the last decision for that pause. This
+distinguishes a low completion score from an inference failure when both wait
+for the silence limit. Decisions are logged at candidate pauses and commits,
+not on every audio chunk.
+
 `turn_detection: {"type": "semantic_vad", "eagerness": "auto"}` keeps Silero
 for speech activity and asks the [Smart Turn v3.2](https://github.com/pipecat-ai/smart-turn)
 classifier whether the user has finished whenever Silero hears a pause. A

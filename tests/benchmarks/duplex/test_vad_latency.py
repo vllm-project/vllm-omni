@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""The CLI's explicit model paths must reach endpoint-reference scoring too."""
+
+import hashlib
+import json
+import runpy
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import soundfile
+
+from vllm_omni.engine.duplex import smart_turn, vad
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_local_model_paths_produce_endpoint_report_without_cache_or_torch_fallback(tmp_path, monkeypatch) -> None:
+    from vllm.transformers_utils import repo_utils
+
+    silero_path = tmp_path / "silero.onnx"
+    smart_path = tmp_path / "smart-turn.onnx"
+    silero_path.write_bytes(b"silero")
+    smart_path.write_bytes(b"smart")
+    loads: list[Path] = []
+
+    class _SileroBackend:
+        def __init__(self, path: Path) -> None:
+            loads.append(path)
+
+        def new_state(self) -> object:
+            return object()
+
+        def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
+            return (0.95 if np.max(np.abs(frame)) > 0.1 else 0.02), state
+
+    class _SmartTurnBackend:
+        def __init__(self, path: Path) -> None:
+            loads.append(path)
+
+        def features(self, audio: np.ndarray) -> np.ndarray:
+            return audio
+
+        def score(self, features: np.ndarray) -> float:
+            return 0.9
+
+        def predict(self, audio: np.ndarray) -> float:
+            return self.score(self.features(audio))
+
+    def unexpected_fallback(*args, **kwargs):
+        pytest.fail("Explicit CLI paths must not consult the HF cache or optional silero-vad package")
+
+    monkeypatch.setattr(repo_utils, "try_get_local_file", unexpected_fallback)
+    monkeypatch.setattr(vad, "TorchSileroBackend", unexpected_fallback)
+    monkeypatch.setattr(vad, "SileroVADBackend", _SileroBackend)
+    monkeypatch.setattr(vad, "SILERO_VAD_SHA256", hashlib.sha256(b"silero").hexdigest())
+    monkeypatch.setattr(smart_turn, "SmartTurnBackend", _SmartTurnBackend)
+    monkeypatch.setattr(smart_turn, "SMART_TURN_SHA256", hashlib.sha256(b"smart").hexdigest())
+
+    wav = tmp_path / "complete.wav"
+    soundfile.write(wav, np.full(16000, 0.2, dtype=np.float32), 16000)
+    report_path = tmp_path / "report.json"
+    script = Path(__file__).resolve().parents[3] / "benchmarks/duplex_vad/bench_vad_latency.py"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script),
+            "--silero-model",
+            str(silero_path),
+            "--smart-turn-model",
+            str(smart_path),
+            "--wav",
+            str(wav),
+            "--iterations",
+            "1",
+            "--json",
+            str(report_path),
+        ],
+    )
+    runpy.run_path(str(script), run_name="__main__")
+
+    report = json.loads(report_path.read_text())
+    assert loads == [silero_path, smart_path]
+    endpoints = {row["mode"]: row for row in report["endpoints"]}
+    assert set(endpoints) == {"server_vad", "semantic_vad"}
+    assert all(row["false_cutoffs"] == 0 for row in endpoints.values())
+    assert 500 <= endpoints["server_vad"]["endpoint_delay_ms"] <= 700
+    assert 1200 <= endpoints["semantic_vad"]["endpoint_delay_ms"] <= 1400
+    assert endpoints["semantic_vad"]["smart_turn_calls"] == 1

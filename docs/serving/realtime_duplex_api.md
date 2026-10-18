@@ -490,7 +490,7 @@ Semantic divergences hidden behind shared names:
 - `turn_detection.interrupt_response=false` is rejected; the VAD runs per
   session (Silero) and implies `overlap_policy=barge_in_on_speech`.
   `semantic_vad` (Silero + Smart Turn v3.2, `eagerness` low/medium/high/auto;
-  setup in the [realtime web guide](../../examples/online_serving/realtime_web/README.md#semantic-vad-silero--smart-turn))
+  setup in the [realtime web guide](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/realtime_web/README.md#semantic-vad-silero--smart-turn))
   is accepted for turn-based sessions only; auto-responding (native duplex)
   sessions refuse it with `unsupported_turn_detection`. On turn-based sessions
   the detector's commit honours `create_response`.

@@ -1814,7 +1814,7 @@ async def test_input_clear_resets_the_turn_detector() -> None:
         await close_harness(h)
 
 
-def _semantic_detector(*turn_probabilities: float):
+def _semantic_detector(*turn_probabilities: float | Exception):
     from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
 
     answers = list(turn_probabilities)
@@ -1822,13 +1822,45 @@ def _semantic_detector(*turn_probabilities: float):
     def turn_scorer(_audio: np.ndarray) -> float:
         if not answers:
             pytest.fail("Smart Turn was called more often than the test expects")
-        return answers.pop(0)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
     return SemanticTurnDetector(
         TurnDetectionConfig.from_realtime({"type": "semantic_vad", "eagerness": "high"}),
         turn_scorer=turn_scorer,
         frame_scorer=lambda frame: 0.95 if float(np.abs(frame).max()) >= 0.01 else 0.02,
     )
+
+
+@pytest.mark.parametrize(
+    ("answer", "decision"),
+    [(0.1, "smart_turn_incomplete"), (RuntimeError("inference failed"), "smart_turn_error")],
+)
+@pytest.mark.asyncio
+async def test_semantic_timeout_logs_session_and_last_decision(answer, decision, monkeypatch) -> None:
+    from vllm_omni.engine.duplex.session import control
+
+    messages: list[str] = []
+    monkeypatch.setattr(control.logger, "info", lambda fmt, *args: messages.append(fmt % args))
+    h = await open_harness(auto_response=False)
+    try:
+        h.runner.control._detector = _semantic_detector(answer)
+        await h.run(append_audio(samples=8000, is_speech=None))
+        pause = await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        assert "input_audio_buffer.committed" not in types(pause)
+        decisions = [message for message in messages if f"semantic_decision={decision}" in message]
+        assert len(decisions) == 1
+        assert f"session={SESSION_ID}" in decisions[0] and "commit=False" in decisions[0]
+        events = await h.run(append_audio(samples=32000, value=0.0, is_speech=None))
+        assert types(events).count("input_audio_buffer.committed") == 1
+        commits = [message for message in messages if "commit_reason=silence_timeout" in message]
+        assert len(commits) == 1
+        assert f"session={SESSION_ID}" in commits[0] and f"semantic_decision={decision}" in commits[0]
+        assert "commit=True" in commits[0]
+    finally:
+        await close_harness(h)
 
 
 @pytest.mark.parametrize("command", [commands.ClearInput, commands.CancelInput, commands.BargeIn])

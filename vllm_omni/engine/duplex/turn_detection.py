@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 import pybase64 as base64
@@ -245,6 +245,9 @@ def normalize_turn_detection_session_payload(
     return True, config
 
 
+SemanticDecision = Literal["smart_turn_complete", "smart_turn_incomplete", "smart_turn_error"]
+
+
 @dataclass(frozen=True, slots=True)
 class TurnDetectionResult:
     is_speech: bool
@@ -261,6 +264,9 @@ class TurnDetectionResult:
     backend: str = "silero"
     #: Smart Turn's P(turn complete) when this chunk ended a pause (``semantic_vad`` only).
     turn_complete_probability: float | None = None
+    #: Internal diagnostics, emitted on candidate evaluation and final commit only.
+    semantic_decision: SemanticDecision | None = None
+    commit_reason: Literal["semantic_complete", "silence_timeout"] | None = None
 
     def as_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -322,6 +328,8 @@ def _process_segments(
                     if result.turn_complete_probability is not None
                     else accumulated.turn_complete_probability
                 ),
+                semantic_decision=result.semantic_decision or accumulated.semantic_decision,
+                commit_reason=result.commit_reason,
             )
         accumulated = result
         if result.should_commit or offset == samples.size:
@@ -493,6 +501,7 @@ class SemanticTurnDetector:
         self._turn_start_ms = 0
         #: Session ms where the current candidate pause began; None while speaking.
         self._pause_start_ms: int | None = None
+        self._pause_decision: SemanticDecision | None = None
 
     @property
     def vad(self) -> SileroStreamingVAD:
@@ -537,11 +546,14 @@ class SemanticTurnDetector:
             self._turn_start_ms = start_ms or 0
 
         probability: float | None = None
+        decision: SemanticDecision | None = None
+        commit_reason: Literal["semantic_complete", "silence_timeout"] | None = None
         commit = False
         if self._turn_active:
             if inner.speech_active:
                 # Speaking, or speech resumed inside a pause: still the same turn.
                 self._pause_start_ms = None
+                self._pause_decision = None
             elif inner.speech_stopped:
                 # Silero saw the candidate silence. Decide on the whole turn so
                 # far; a resumed-then-paused turn is re-scored with more context.
@@ -556,6 +568,16 @@ class SemanticTurnDetector:
                     # or prematurely commit the turn.
                     logger.warning("Smart Turn inference failed; treating the pause as incomplete", exc_info=True)
                 commit = probability is not None and probability >= SEMANTIC_VAD_COMPLETION_THRESHOLD
+                decision = (
+                    "smart_turn_error"
+                    if probability is None
+                    else "smart_turn_complete"
+                    if commit
+                    else "smart_turn_incomplete"
+                )
+                self._pause_decision = decision
+                if commit:
+                    commit_reason = "semantic_complete"
             if (
                 not commit
                 and self._pause_start_ms is not None
@@ -566,6 +588,8 @@ class SemanticTurnDetector:
                 and self._vad.processed_ms - self._pause_start_ms >= self._max_silence_ms
             ):
                 commit = True
+                decision = self._pause_decision
+                commit_reason = "silence_timeout"
 
         end_ms = self._vad.processed_ms if commit else None
         result = TurnDetectionResult(
@@ -581,6 +605,8 @@ class SemanticTurnDetector:
             create_response=self.config.create_response,
             backend=self.backend_name,
             turn_complete_probability=probability,
+            semantic_decision=decision,
+            commit_reason=commit_reason,
         )
         if commit:
             self.reset()

@@ -359,6 +359,18 @@ for queue updates and the final validity check before delivery.
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
 
+### Semantic turn decisions
+
+`SessionControl` owns a detector per session and offloads its ordered audio
+processing to the manager's executor. `SemanticTurnDetector` loads the shared
+Smart Turn backend on the first audio chunk; the backend constructor warms the
+CPU ONNX session. Silero's candidate pauses trigger subsequent scoring. Each
+detector retains the current pause's semantic decision until speech resumes or
+the turn resets. At commit, session-correlated logs distinguish a complete
+semantic decision from the silence timeout, including whether the preceding
+score was incomplete or inference failed. These diagnostics do not change the
+wire protocol or the endpoint decision.
+
 ### Experimental output limits
 
 `max_pending_output_bytes_per_session` defaults to 2 MiB and
