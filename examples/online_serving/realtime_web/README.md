@@ -211,6 +211,10 @@ new speech or the silence limit; silence alone does not trigger repeated
 classification. The completion threshold is 0.5 for the pinned INT8 model.
 False completions and false incompletions remain possible, and audio beyond
 the most recent eight seconds is outside the classifier's context.
+The scored window includes the candidate silence: `auto` normally uses about
+1.2 seconds of that context for trailing silence. Changing eagerness therefore
+changes both latency and classifier input; scores measured with a shorter pause
+are not necessarily calibrated identically.
 
 It is available on turn-based sessions; auto-responding (native duplex) sessions
 refuse it.
@@ -239,9 +243,19 @@ session.
 
 ### Using the Qwen3 web UI
 
-The shared UI supports both explicit turns and Server VAD. Use the manual UI
-command above with the turn-based deployment, or start the VAD deployment above
-and launch the UI with `--vad`.
+The shared UI supports explicit turns, Server VAD and Semantic VAD. Use the
+manual UI command above with the turn-based deployment. On a duplex deployment,
+`--vad` retains Silero-only endpointing at 500 ms and requires no Smart Turn
+artifact. Select Semantic VAD explicitly after preparing both model artifacts:
+
+```bash
+python -m examples.online_serving.realtime_web --profile qwen3-turn \
+    --backend ws://127.0.0.1:8091 --semantic-vad --port 7863
+```
+
+Semantic mode uses INT8 Smart Turn on CPU with the `auto` 1200 ms candidate
+pause and 4 s silence limit. Missing Smart Turn artifacts stop the browser
+session with setup guidance; the UI does not silently switch detection modes.
 
 Stop the existing UI process before starting another on the same port, then
 refresh the browser and reconnect. To enable VAD on a default backend, restart

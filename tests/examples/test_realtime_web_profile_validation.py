@@ -21,6 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("joyai-turn", {"speechInput": True, "turnMode": "vad"}),
         ("aura-ptt", {}),
         ("qwen3-turn", {"turnMode": "vad"}),
+        ("qwen3-turn", {"turnMode": "semantic_vad"}),
     ],
 )
 def test_browser_profile_session_update_passes_public_validator(profile_name, config):

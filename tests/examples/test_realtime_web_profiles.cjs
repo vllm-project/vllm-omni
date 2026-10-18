@@ -95,6 +95,22 @@ test('VAD uses nested format and interruptible endpoint detection', () => {
   assert.match(vad.mapEvent({ type: 'error', code: 'server_vad_initialization_failed' }).message, /Silero/);
 });
 
+test('Qwen semantic VAD is explicit and reports its extra dependency and latency', () => {
+  const semantic = profiles['qwen3-turn']({ ...config, turnMode: 'semantic_vad' });
+  const [update] = plain(semantic.initialMessages(config, 'help'));
+  assert.deepEqual(update.session.audio.input.turn_detection, {
+    type: 'semantic_vad', eagerness: 'auto', create_response: true, interrupt_response: true,
+  });
+  assert.equal(new URL(semantic.url(config, 'https://localhost/')).searchParams.get('duplex'), '1');
+  assert.match(semantic.description, /Smart Turn/);
+  assert.match(semantic.description, /1\.2/);
+  const error = semantic.mapEvent({ type: 'error', error: { code: 'semantic_vad_unavailable', message: 'Missing model' } });
+  assert.equal(error.kind, 'error');
+  assert.equal(error.fatal, true);
+  assert.match(error.message, /Smart Turn/);
+  assert.match(error.message, /--vad/);
+});
+
 function shell(profileName, turnMode = 'manual', options = {}) {
   const elements = new Map();
   class Element {
@@ -557,6 +573,16 @@ test('VAD handshake errors remain visible after resource cleanup', async () => {
   assert.equal(app.elements.get('connectionState').textContent, 'Error');
   assert.match(app.elements.get('runtimeDetail').textContent, /session_mode: duplex/);
   assert.equal(app.sockets[0].readyState, 3);
+});
+
+test('missing Smart Turn stops the session and preserves actionable guidance', async () => {
+  const app = shell('qwen3-turn', 'semantic_vad');
+  await app.ui.startSession();
+  await app.ui.handleEvent({ type: 'error', error: { code: 'semantic_vad_unavailable', message: 'Missing model' } });
+  assert.equal(app.ui.state().running, false);
+  assert.equal(app.elements.get('connectionState').textContent, 'Error');
+  assert.match(app.elements.get('runtimeDetail').textContent, /Smart Turn/);
+  assert.match(app.elements.get('runtimeDetail').textContent, /--vad/);
 });
 
 test('missing session acknowledgement fails instead of leaving Start disabled forever', async () => {

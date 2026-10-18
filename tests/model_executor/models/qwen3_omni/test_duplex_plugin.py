@@ -22,6 +22,7 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
+    BargeIn,
     CancelResponse,
     ClearInput,
     ClearOutputAudio,
@@ -211,10 +212,10 @@ async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("cancel_command", [None, CancelResponse, ClearOutputAudio, BargeIn])
 @pytest.mark.parametrize("next_input", [False, True])
 @pytest.mark.parametrize("delete_before_ack", [False, True])
-async def test_audio_without_transcript_accepts_playback_ack(cancelled, next_input, delete_before_ack):
+async def test_audio_without_transcript_accepts_playback_ack(cancel_command, next_input, delete_before_ack):
     h = await open_qwen()
     try:
         await h.run(append_audio())
@@ -222,10 +223,12 @@ async def test_audio_without_transcript_accepts_playback_ack(cancelled, next_inp
         request_id = h.port.submissions[-1].context.request_id
         response_id = h.session.active_response_id
         await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True), stage_id=0)
-        audio = await h.deliver_and_settle(tts_output(request_id, text="", finished=not cancelled), stage_id=2)
+        audio = await h.deliver_and_settle(tts_output(request_id, text="", finished=cancel_command is None), stage_id=2)
         assert any(event.type == "response.output_audio.delta" for event in audio)
-        if cancelled:
-            await h.run(CancelResponse())
+        if cancel_command is not None:
+            await h.run(cancel_command())
+            assert h.session.playback.sent_ms == 0
+            assert h.session.playback_for_response(response_id).sent_ms == 1000
         assert h.session.active_response_id is None
         assert all(message["role"] == "user" for message in h.session.history)
         if next_input:
