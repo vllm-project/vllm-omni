@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2025 Ollin Boer Bohan
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Lightweight stateful TAEW2.2 decoder used by ABot-World."""
+"""Shared stateful TAEW2.2 codec components for causal Wan pipelines."""
 
 # Decoder architecture adapted from https://github.com/madebyollin/taehv.
 # The original portions carry the following MIT license:
@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
@@ -187,3 +188,66 @@ class TAEW2Decoder(nn.Module):
         state.frames_decoded += latents.shape[2]
         state.chunks_decoded += 1
         return video.permute(0, 2, 1, 3, 4).mul(2).sub(1)
+
+
+@dataclass
+class TAEW2EncodeState:
+    """Encoder history is separate from decoder history and each reference image."""
+
+    memory: dict[int, torch.Tensor] = field(default_factory=dict)
+    frames_encoded: int = 0
+
+
+class _TPool(nn.Module):
+    def __init__(self, channels: int, stride: int):
+        super().__init__()
+        self.stride = stride
+        self.conv = nn.Conv2d(channels * stride, channels, 1, bias=False)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        _, channels, height, width = value.shape
+        return self.conv(value.reshape(-1, channels * self.stride, height, width))
+
+
+class TAEW2Encoder(nn.Module):
+    """Encode low-poly RGB with the released tiny codec's causal 1+4k cadence."""
+
+    def __init__(self, checkpoint_path: str, dtype: torch.dtype):
+        super().__init__()
+        layers: list[nn.Module] = [_conv(12, 64), nn.ReLU(inplace=True)]
+        for temporal_stride in (2, 2, 1):
+            layers.extend([_TPool(64, temporal_stride), _conv(64, 64, stride=2, bias=False)])
+            layers.extend(_MemBlock(64, 64) for _ in range(3))
+        layers.append(_conv(64, 48))
+        self.encoder = nn.Sequential(*layers)
+        source = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        weights = {
+            name.removeprefix("encoder."): value for name, value in source.items() if name.startswith("encoder.")
+        }
+        self.encoder.load_state_dict(weights, strict=True)
+        self.to(dtype=dtype).eval().requires_grad_(False)
+
+    @torch.no_grad()
+    def encode_chunk(self, pixels: torch.Tensor, state: TAEW2EncodeState) -> torch.Tensor:
+        if pixels.ndim != 5 or pixels.shape[:2] != (1, 3):
+            raise ValueError("TAEW2.2 encoder requires batch-one NCTHW RGB pixels")
+        count = pixels.shape[2]
+        opening = state.frames_encoded == 0
+        if count < 1 or count % 4 != int(opening):
+            raise ValueError("TAEW2.2 encoder requires 1+4k opening frames and 4k continuation frames")
+        video = pixels.permute(0, 2, 1, 3, 4).add(1).mul(0.5)
+        if opening:
+            video = torch.cat((video[:, :1].expand(-1, 3, -1, -1, -1), video), dim=1)
+        hidden = F.pixel_unshuffle(video.flatten(0, 1), 2)
+        for index, layer in enumerate(self.encoder):
+            if isinstance(layer, _MemBlock):
+                history = state.memory.get(index)
+                if history is None:
+                    history = torch.zeros_like(hidden[:1])
+                previous = torch.cat((history, hidden[:-1]), dim=0)
+                state.memory[index] = hidden[-1:].clone()
+                hidden = layer(hidden, previous)
+            else:
+                hidden = layer(hidden)
+        state.frames_encoded += count
+        return hidden.transpose(0, 1).unsqueeze(0).contiguous()

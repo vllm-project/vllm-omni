@@ -73,6 +73,7 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 - [Nightly CUDA Docker images](https://hub.docker.com/r/vllm/vllm-omni/tags?name=nightly) built from the latest `main`
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
 - [Deployment Recipes](https://recipes.vllm.ai) for vLLM-Omni model serving
+- [Matrix-Game 4.0: single-GPU setup and quality qualification](recipes/Skywork/Matrix-Game-4.0.md) (experimental)
 
 ## Contributing
 

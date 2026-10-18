@@ -15,7 +15,7 @@ from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
 )
 from vllm_omni.diffusion.models.abot_world.actions import parse_abot_camera_action_script
 from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import ABotWorldCausalPipeline, _wan_decode_cache_bytes
-from vllm_omni.diffusion.models.abot_world.taew2_2 import TAEW2Decoder
+from vllm_omni.diffusion.models.wan2_2.taew2_2 import TAEW2Decoder
 from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState, WanStreamingDecoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
