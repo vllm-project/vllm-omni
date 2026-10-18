@@ -653,3 +653,26 @@ The Dev checkpoint is approximately 47.55 GiB on disk. In the verified AR-only
 run, loaded model weights used approximately 16.97 GiB of GPU memory before KV
 and encoder caches. Allow additional GPU memory for those caches and the input
 image.
+
+## Preview HSDP (2 GPUs)
+
+Use FSDP2-based HSDP to shard DiT weights across two GPUs. Keep tensor
+parallelism at size 1.
+
+Copy `vllm_omni/deploy/mammoth_moda2.yaml` to `/path/to/mammoth_hsdp.yaml`.
+Set the DiT stage (`stage_id: 1`) to `devices: "0,1"`, keeping the AR stage
+on `devices: "0"` and retaining the other settings.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python examples/offline_inference/text_to_image/text_to_image.py \
+  --model bytedance-research/MammothModa2-Preview \
+  --deploy-config /path/to/mammoth_hsdp.yaml \
+  --prompt "a cup of coffee on the table" \
+  --height 1024 --width 1024 --seed 42 \
+  --guidance-scale 4.0 --num-inference-steps 50 \
+  --use-hsdp \
+  --hsdp-shard-size 2 \
+  --hsdp-replicate-size 1 \
+  --tensor-parallel-size 1 \
+  --output coffee_hsdp.png
+```
