@@ -171,6 +171,7 @@ def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mock
     s, _ = scheduler(monkeypatch, [event])
     s._generation_max_wait_s = 0
     s.waiting = []
+    s.kv_holding_waiting = []
     s.input_coordinator._async_chunk = True
     s.input_coordinator.update_request_metadata = mocker.Mock()
     s.input_coordinator.process_pending_chunks = mocker.Mock()
@@ -178,7 +179,11 @@ def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mock
     s.input_coordinator.update_request_metadata.assert_called_once_with(
         s.requests, {"0": {"code_predictor_codes": [7]}}, model_mode="generation"
     )
-    s.input_coordinator.process_pending_chunks.assert_called_once_with(s.waiting, s.running, {"0"}, set())
+    s.input_coordinator.process_pending_chunks.assert_called_once()
+    waiting, running, ready, finished = s.input_coordinator.process_pending_chunks.call_args.args
+    assert list(waiting) == []
+    assert running is s.running
+    assert ready == {"0"} and finished == set()
 
 
 @pytest.mark.parametrize("target,wait", [(0, 1), (257, 1), (4, -1), (4, float("nan")), (4, float("inf"))])

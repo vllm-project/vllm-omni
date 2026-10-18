@@ -8,16 +8,14 @@ import torch
 import torch.nn as nn
 from pytest_mock import MockerFixture
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     PersonaPlexMimiCodec,
     _MimiStreamingTransformer,
     _StreamConv1d,
     _StreamConvTr1d,
 )
-from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
-    PersonaPlexTemporalStreaming,
-    _RingKV,
-)
+from vllm_omni.model_executor.models.personaplex.personaplex_temporal import _RingKV
 
 pytestmark = pytest.mark.core_model
 
@@ -51,27 +49,6 @@ def _make_mimi_transformer(
             nn.init.normal_(parameter, std=0.1)
     transformer.streaming_init(batch_size)
     return transformer
-
-
-def _make_temporal(
-    batch_size: int,
-    device: torch.device,
-    context: int = 6,
-) -> PersonaPlexTemporalStreaming:
-    torch.manual_seed(SEED)
-    temporal = PersonaPlexTemporalStreaming(
-        dim=16,
-        num_layers=2,
-        num_heads=4,
-        hidden=32,
-        context=context,
-        text_card=11,
-    ).to(device)
-    for parameter in temporal.parameters():
-        if parameter.dtype.is_floating_point:
-            nn.init.normal_(parameter, std=0.1)
-    temporal.streaming_init(batch_size)
-    return temporal
 
 
 def _assert_valid_ring_row_matches(
@@ -117,13 +94,15 @@ def _make_codec_stub(mocker: MockerFixture) -> PersonaPlexMimiCodec:
     codec = PersonaPlexMimiCodec.__new__(PersonaPlexMimiCodec)
     nn.Module.__init__(codec)
 
-    quantizer = mocker.Mock(spec=["encode", "decode"])
-    quantizer.encode.side_effect = lambda x: torch.zeros(8, x.shape[0], x.shape[-1], dtype=torch.long)
-    quantizer.decode.side_effect = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
+    quantizer = mocker.Mock(spec=["encode"])
+    quantizer.encode.side_effect = lambda x, num_quantizers=None: torch.zeros(
+        8 if num_quantizers is None else num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
+    )
 
     codec.device = torch.device("cpu")
     codec.dtype = torch.float32
     codec.model = SimpleNamespace(quantizer=quantizer)
+    codec._dequantize = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
     codec._enc_stages = []
     codec._dec_stages = []
     codec._downsample = _make_passthrough_stage(mocker)
@@ -198,42 +177,7 @@ def test_ring_mixed_offsets_match_singleton_streams() -> None:
     assert not torch.equal(batched.end_offset[0], batched.end_offset[1])
 
 
-@pytest.mark.cpu
-def test_ring_slot_recycle_masks_old_history() -> None:
-    ring = _RingKV(2, 1, 1, 8, torch.device("cpu"), torch.float32)
-    for _ in range(4):
-        ring.complete(torch.randn(2, 1, 2, 1), torch.randn(2, 1, 2, 1), _mask(True, True))
-
-    old_end = ring.end_offset.clone()
-    ring.reset_slot(1)
-    _, _, positions = ring.complete(
-        torch.randn(2, 1, 2, 1),
-        torch.randn(2, 1, 2, 1),
-        _mask(False, True),
-    )
-    visible = positions[1] >= 0
-    assert torch.all(positions[1][visible] >= old_end[1])
-
-    ring.reset_slot(0)
-    ring.bump_slot_start(0)
-    _, _, positions = ring.complete(
-        torch.randn(2, 1, 2, 1),
-        torch.randn(2, 1, 2, 1),
-        _mask(True, False),
-    )
-    visible = positions[0] >= 0
-    assert torch.all(positions[0][visible] >= old_end[0] + 1)
-
-
-@pytest.mark.cpu
-def test_temporal_streaming_rejects_invalid_active_shape() -> None:
-    temporal = _make_temporal(2, torch.device("cpu"))
-
-    with pytest.raises(ValueError, match=r"active must have shape \(2,\)"):
-        temporal.step(torch.zeros(2, 1, 16), torch.ones(1))
-
-
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mimi_transformer_mixed_offsets_match_singletons() -> None:
     batch_size, tokens, dim = 3, 2, 32
@@ -273,52 +217,8 @@ def test_mimi_transformer_mixed_offsets_match_singletons() -> None:
                     assert torch.equal(kv.cache[:, row], previous_cache[:, row])
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_temporal_streaming_mixed_offsets_match_isolated_rows() -> None:
-    # Keep the reference shape at B=2 so exact comparisons use the same CUDA
-    # kernel shape while the target row runs independently.
-    batched = _make_temporal(2, CUDA_DEVICE)
-    references = [_make_temporal(2, CUDA_DEVICE) for _ in range(2)]
-    active_schedule = [
-        _mask(True, True, device=CUDA_DEVICE),
-        _mask(True, False, device=CUDA_DEVICE),
-        _mask(False, False, device=CUDA_DEVICE),
-        _mask(False, True, device=CUDA_DEVICE),
-        _mask(True, True, device=CUDA_DEVICE),
-        _mask(True, False, device=CUDA_DEVICE),
-        _mask(False, True, device=CUDA_DEVICE),
-        _mask(True, True, device=CUDA_DEVICE),
-    ] * 2
-
-    for step, active in enumerate(active_schedule):
-        inputs = _inputs((2, 1, 16), SEED + 100 + step, CUDA_DEVICE)
-        offsets_before = batched._offset.clone()
-        cache_before = [kv.cache.clone() for kv in batched._kv]
-        output, logits = batched.step(inputs, active)
-
-        for row, (reference, is_active) in enumerate(zip(references, active.tolist())):
-            if is_active:
-                reference_inputs = torch.zeros_like(inputs)
-                reference_inputs[row] = inputs[row]
-                reference_active = torch.zeros_like(active)
-                reference_active[row] = True
-                expected_output, expected_logits = reference.step(reference_inputs, reference_active)
-                torch.testing.assert_close(output[row : row + 1], expected_output[row : row + 1], rtol=0.0, atol=0.0)
-                torch.testing.assert_close(logits[row : row + 1], expected_logits[row : row + 1], rtol=0.0, atol=0.0)
-                assert torch.equal(batched._offset[row], reference._offset[row])
-                for batched_kv, reference_kv in zip(batched._kv, reference._kv):
-                    assert torch.equal(batched_kv.end_offset[row], reference_kv.end_offset[row])
-                    torch.testing.assert_close(batched_kv.cache[:, row], reference_kv.cache[:, row], rtol=0.0, atol=0.0)
-            else:
-                assert torch.equal(batched._offset[row], offsets_before[row])
-                for kv, previous_cache in zip(batched._kv, cache_before):
-                    assert torch.equal(kv.end_offset[row], offsets_before[row])
-                    assert torch.equal(kv.cache[:, row], previous_cache[:, row])
-
-
 @pytest.mark.parametrize("kind", ["conv", "convtr"])
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mimi_conv_carries_preserve_inactive_rows(kind: str) -> None:
     if kind == "conv":

@@ -26,6 +26,11 @@ from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.registry import resolve_native_single_file
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER, is_frontend_only
+from vllm_omni.entrypoints.api_server_shared_dir import (
+    create_api_server_shared_dir,
+    remove_api_server_shared_dir,
+)
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
@@ -70,6 +75,20 @@ def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     if parsed is None:
         raise argparse.ArgumentTypeError("--stage-overrides requires a JSON object")
     return parsed
+
+
+def _parse_stage_id(value: str) -> int:
+    """Parse `--stage-id` as a non-negative int, or `none` (no local stage) as `FRONTEND_ONLY_ID_FILTER`."""
+    if value.lower() == "none":
+        return FRONTEND_ONLY_ID_FILTER
+    msg = f"Stage ID must be a non-negative integer or 'none', got {value!r}"
+    try:
+        stage_id = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(msg) from exc
+    if stage_id < 0:
+        raise argparse.ArgumentTypeError(msg)
+    return stage_id
 
 
 def _nonneg_finite_float(value: str) -> float:
@@ -160,8 +179,20 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        # Only the head owns stage-metric collection; API statistics default on.
+        if (
+            not bool(getattr(args, "headless", False))
+            and not bool(getattr(args, "disable_log_stats", False))
+            and not bool(getattr(args, "collect_stage_metrics", True))
+        ):
+            raise ValueError(
+                "--no-collect-stage-metrics requires --disable-log-stats when statistics logging is enabled"
+            )
+
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+        if args.headless and is_frontend_only(args.stage_id):
+            raise ValueError("--stage-id none cannot be used with --headless")
 
         # Require an explicit model under --omni. ``args.model`` always carries
         # vLLM's ModelConfig default (``Qwen/Qwen3-0.6B``), so an omit is silent:
@@ -252,8 +283,8 @@ class OmniServeCommand(CLISubcommand):
         if omni_dp_size_local is not None:
             if omni_dp_size_local < 1:
                 raise ValueError(f"--omni-dp-size-local must be >= 1, got {omni_dp_size_local}")
-            if omni_dp_size_local != 1 and args.stage_id is None:
-                raise ValueError("--omni-dp-size-local != 1 requires --stage-id to be set")
+            if omni_dp_size_local != 1 and (args.stage_id is None or is_frontend_only(args.stage_id)):
+                raise ValueError("--omni-dp-size-local != 1 requires a numeric --stage-id")
 
         # vLLM CLI args that omni does not honor: parallelism comes from the
         # per-stage YAML (parallel_config:, enable_expert_parallel:) and the
@@ -416,9 +447,12 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--stage-id",
-            type=int,
+            type=_parse_stage_id,
             default=None,
-            help="Select and launch a single stage by stage_id.",
+            help=(
+                "Select and launch a single stage by stage_id. Pass 'none' on the "
+                "head to launch no local stage (API server + orchestrator only)."
+            ),
         )
         omni_config_group.add_argument(
             "--replica-id",
@@ -452,6 +486,16 @@ class OmniServeCommand(CLISubcommand):
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
+        )
+        omni_config_group.add_argument(
+            "--collect-stage-metrics",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Collect per-request stage diagnostics. Enabled by default; "
+                "use --no-collect-stage-metrics with --disable-log-stats to skip diagnostics "
+                "while preserving completion and usage metadata."
+            ),
         )
         omni_config_group.add_argument(
             "--log-file",
@@ -612,6 +656,16 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Use dynamic shapes for the selected generic diffusion compile scope. "
                 "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--enable-cuda-graph-decode",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Capture fixed-shape KV-cache decode steps into CUDA graphs on models that implement them "
+                "(currently Qwen-Image-2.1). Independent of compilation_config.cudagraph_mode; "
+                "disable with --no-enable-cuda-graph-decode. --enforce-eager also disables it."
             ),
         )
         omni_config_group.add_argument(
@@ -848,6 +902,18 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
 
+        omni_config_group.add_argument(
+            "--vae-encode-fast-path",
+            choices=("off", "lossless", "channels_last"),
+            default="lossless",
+            help=(
+                "Cosmos3/Wan2.2 residual VAE encoder fast path, independent of --vae-fast-path. "
+                "'lossless' (default) preserves reference values; 'channels_last' also switches "
+                "encoder convolution layouts and fuses reductions (not bit-exact); 'off' uses "
+                "the reference encoder."
+            ),
+        )
+
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(
             "--disable-multithread-weight-load",
@@ -1003,8 +1069,8 @@ class OmniServeCommand(CLISubcommand):
             "--vae-patch-parallel-size",
             type=int,
             default=1,
-            help="VAE Patch Parallelism degree for diffusion models. "
-            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            help="VAE parallelism degree for diffusion models. "
+            "Distributes VAE decode across ranks using --vae-parallel-mode. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
         omni_config_group.add_argument(
@@ -1019,9 +1085,10 @@ class OmniServeCommand(CLISubcommand):
             "--vae-parallel-mode",
             type=str,
             default="tile",
-            choices=["tile", "spatial_shard_height", "spatial_shard_width"],
+            choices=["tile", "batch", "spatial_shard_height", "spatial_shard_width"],
             help="VAE parallel decode strategy for diffusion models. "
             "'tile' (default) uses patch/tile parallel decode; "
+            "'batch' distributes complete images for AutoencoderKL/Flux2 with DP/PP/CFG sizes of 1; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "
             "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size. "
@@ -1272,6 +1339,9 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=True)
+    # API processes share one server-scoped scratch directory.
+    shared_dir = create_api_server_shared_dir()
+    args._omni_api_server_shared_dir = shared_dir
     stage_runtime = None
     api_server_manager = None
     engine_launch = None
@@ -1308,6 +1378,7 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
         if stage_runtime is not None:
             stage_runtime.shutdown()
         sock.close()
+        remove_api_server_shared_dir(shared_dir)
         if shutdown_requested:
             logger.info("Shared API server shutdown completed")
 

@@ -16,35 +16,16 @@ steps:
           - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
-      - label: "Simple · CosyVoice3 Packed Flow Test"
-        timeout_in_minutes: 15
-        source_file_dependencies:
-          - tests/model_executor/models/cosyvoice3/test_cosyvoice3_full_batch.py
-          - vllm_omni/model_executor/models/cosyvoice3/
-        commands:
-          - "pytest -sv tests/model_executor/models/cosyvoice3/test_cosyvoice3_full_batch.py -k packed -m 'core_model and cuda' --run-level=core_model"
-        mirror_hardwares: h100_1
-
-      - label: "Simple · MRV2 FA3 Graph Bounds Test"
-        timeout_in_minutes: 15
-        source_file_dependencies:
-          - tests/worker_v2/test_capture_query_bound_gpu.py
-          - tests/worker_v2/test_decode_query_bound_gpu.py
-          - vllm_omni/worker_v2/model_states/omni_model_state.py
-        commands:
-          - "pytest -sv tests/worker_v2/test_capture_query_bound_gpu.py tests/worker_v2/test_decode_query_bound_gpu.py -m 'core_model and cuda and H100' --run-level=core_model"
-        mirror_hardwares: h100_1
-
-      - label: "Simple · Diffusion Test"
-        timeout_in_minutes: 30
-        commands:
-          - "pytest -sv tests/diffusion -m 'core_model and cpu'"
-        mirror_hardwares: l4_1
-
-      - label: "Simple · Engine&Entrypoints Test"
+      - label: "Simple · Diffusion Models Test"
         timeout_in_minutes: 20
         commands:
-          - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu'"
+          - "pytest -sv tests/diffusion/models -m 'core_model and cpu'"
+        mirror_hardwares: l4_1
+
+      - label: "Simple · Engine&Entrypoints&Diffusion Test"
+        timeout_in_minutes: 20
+        commands:
+          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
@@ -105,7 +86,7 @@ steps:
 
       - label: "Diffusion · Other Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion -m 'core_model and cuda' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion tests/diffusion/layers/test_adalayernorm_*.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
@@ -117,14 +98,21 @@ steps:
           - timeout 15m pytest -sv -n 4 tests/model_tests/diffusion -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
-  - label: "Engine&Model Executor Test"
+  - group: ":card_index_dividers: Engine&Model Executor&Work Test"
     depends_on: upload-ready-pipeline
-    commands:
-      - |
-        timeout 15m bash -c "
-                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py tests/worker_v2/ -m 'core_model and cuda' --run-level 'core_model'
-        "
-    mirror_hardwares: l4_1
+    steps:
+      - label: "Engine&Model Executor&Work Test · L4"
+        timeout_in_minutes: 30
+        commands:
+          - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and L4' --run-level 'core_model'"
+        mirror_hardwares: l4_1
+
+      - label: "Engine&Model Executor&Work Test · H100"
+        timeout_in_minutes: 20
+        source_file_dependencies: engine_model_executor_worker_function
+        commands:
+          - "pytest -sv tests/engine/ tests/model_executor/ tests/worker_v2/ tests/worker/ -m 'core_model and cuda and H100' --run-level 'core_model'"
+        mirror_hardwares: h100_1
 
   - label: "Distributed Test"
     depends_on: upload-ready-pipeline
@@ -176,7 +164,7 @@ steps:
         commands:
           - |
             timeout 20m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m 'core_model' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni_thinking.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_2
 
@@ -207,6 +195,13 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      - label: "Omni · MiniCPM-o 4.5 MRv2 Duplex Test"
+        source_file_dependencies: omni_minicpmo_4_5_duplex_mrv2_function
+        timeout_in_minutes: 40
+        commands:
+          - timeout 35m pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py -m 'advanced_model and cuda' --run-level advanced_model
+        mirror_hardwares: h100_1
+
       - label: "Omni · MiniCPM-o 4.5 Perf Test"
         timeout_in_minutes: 60
         source_file_dependencies: omni_minicpmo_4_5_perf
@@ -215,14 +210,13 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -m 'core_model and cuda'
         mirror_hardwares: h100_1
 
-      - label: "TTS · Higgs v3 Full Response Test"
-        source_file_dependencies:
-          - tests/e2e/online_serving/test_higgs_audio_v3.py
-          - vllm_omni/model_executor/models/higgs_audio_v3/
-          - vllm_omni/model_executor/stage_input_processors/higgs_audio_v3.py
-          - vllm_omni/deploy/higgs_multimodal_qwen3.yaml
+      - label: "TTS · Drama 3 Test"
+        source_file_dependencies: tts_drama_3_function
         commands:
-          - timeout 20m pytest -s -v tests/e2e/online_serving/test_higgs_audio_v3.py::test_full_response_v1_preserves_audio -m 'core_model and cuda' --run-level 'core_model'
+          - |
+            timeout 30m bash -c "
+              pytest -s -v tests/e2e/online_serving/test_drama_3.py -m 'core_model and cuda' --run-level 'core_model'
+            "
         mirror_hardwares: h100_1
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"

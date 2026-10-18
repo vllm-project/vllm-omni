@@ -1253,14 +1253,15 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         speculative_config=None,
     )
 
-    def select_backend(*, backend, attn_selector_config, num_heads):
-        # Exercise the real 0.29 selector, replacing only platform resolution.
+    def select_backend(*, backend, attn_selector_config, num_heads, _run_kv_cache_dtype):
+        # Exercise the real upstream selector, replacing only platform resolution.
         # Ulysses has already gathered tokens and sharded heads before the
         # native kernel; the MoE PCP mapping must not request PCP attention.
         assert not attn_selector_config.use_pcp
         assert not attn_selector_config.use_dcp
         assert attn_selector_config.use_non_causal
         assert num_heads == 4
+        assert _run_kv_cache_dtype == config.cache_config.cache_dtype
         selected_backends.append((backend, config.attention_config.backend_per_kind))
         if selection_fails:
             raise ValueError("test backend unavailable")
@@ -1354,6 +1355,7 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1400,6 +1402,7 @@ def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1424,6 +1427,7 @@ def test_omni_attention_rejects_paged_request_for_backend_without_paged_support(
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=False, get_name=lambda: "SDPA")
@@ -1455,6 +1459,7 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer.paged_kv_cache_role = "primary"
     layer.use_ring = False
     layer._no_parallel_strategy = object()
@@ -1478,6 +1483,7 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 def test_omni_attention_rejects_scheduler_paged_forward_without_active_adapter() -> None:
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
     layer._scheduler_paged_kv = True
     layer.paged_kv_cache_role = "primary"
     layer._get_active_parallel_strategy = lambda: object()

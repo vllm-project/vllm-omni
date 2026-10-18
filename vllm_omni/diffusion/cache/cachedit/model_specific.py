@@ -908,6 +908,35 @@ def enable_cache_for_mammothmoda2(pipeline: Any, cache_config: Any) -> CacheDiTE
     return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
 
 
+def enable_cache_for_kandinsky6(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
+    """Cache-DiT over K6 visual blocks only.
+
+    Text and audio block lists are not one residual chain with the visual
+    stack. If the block adapter rejects the fused ``(video, audio)`` return,
+    fall back to the same step-level velocity cache MagCache uses.
+    """
+    transformer = pipeline.transformer
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.visual_transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_0],
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
+    try:
+        return enable_cache_for_dit(pipeline, cache_config, block_adapter)
+    except Exception as exc:
+        logger.warning("Cache-DiT block adapter failed for Kandinsky 6 (%s); using step cache", exc)
+        from vllm_omni.diffusion.models.kandinsky6.cache_accel import attach_mag_cache
+
+        attach_mag_cache(transformer, threshold=0.24, max_skip_steps=3, retention_ratio=0.1)
+
+        def _refresh(*_args, **_kwargs):
+            return None
+
+        return _refresh
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -925,6 +954,7 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "Kandinsky6TI2VAPipeline": enable_cache_for_kandinsky6,
             "Magi2Pipeline": enable_cache_for_magi2,
             "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
         }

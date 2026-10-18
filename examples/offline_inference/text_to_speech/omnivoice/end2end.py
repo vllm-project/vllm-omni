@@ -23,6 +23,7 @@ import soundfile as sf
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.omnivoice.prompt_utils import prepare_instruct, validate_instruction
 
 
 def run_e2e():
@@ -118,7 +119,10 @@ def run_e2e():
     if args.lang:
         mm_processor_kwargs["lang"] = args.lang
     if args.instruct:
-        mm_processor_kwargs["instruct"] = args.instruct
+        instruction_validation_error = validate_instruction(args.instruct)
+        if instruction_validation_error is not None:
+            raise ValueError(instruction_validation_error)
+        mm_processor_kwargs["instruct"] = prepare_instruct(args.instruct)
 
     prompts = {"prompt": args.text}
     if multi_modal_data:

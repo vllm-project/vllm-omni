@@ -44,10 +44,11 @@ import asyncio
 import json
 import signal
 from argparse import Namespace
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -58,7 +59,7 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.entrypoints.openai import api_server, realtime_connection
+from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -657,12 +658,12 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
         ("1", "duplex"),
         ("true", "duplex"),
         ("on", "duplex"),
-        ("0", "legacy"),
-        ("false", "legacy"),
+        ("0", "turn_based"),
+        ("false", "turn_based"),
     ],
 )
 async def test_realtime_route_defaults_to_configured_duplex_handler(
-    monkeypatch, duplex_query: str | None, expected_handler: str
+    duplex_query: str | None, expected_handler: str
 ) -> None:
     calls: list[str] = []
 
@@ -670,21 +671,16 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_realtime_session(self, _websocket) -> None:
             calls.append("duplex")
 
-    class _LegacyConnection:
-        async def handle_connection(self) -> None:
-            calls.append("legacy")
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
 
-    monkeypatch.setattr(
-        realtime_connection,
-        "RealtimeConnection",
-        lambda _websocket, _serving: _LegacyConnection(),
-    )
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
                 openai_serving_duplex=_DuplexHandler(),
-                openai_serving_realtime=object(),
+                openai_realtime_handler=_TurnBasedHandler(),
             )
         ),
         query_params=query_params,
@@ -696,7 +692,18 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
 
 
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
-def test_multi_api_duplex_reconnect_rejected_on_each_worker(path: str) -> None:
+@pytest.mark.parametrize(
+    ("replica_policy", "resume_supported", "reason"),
+    [
+        ("legacy", False, "replica_policy=least_sessions"),
+        ("legacy", True, "replica_policy=least_sessions"),
+        ("least_sessions", True, "resume routing"),
+        ("least_sessions", None, "resume routing"),
+    ],
+)
+def test_multi_api_duplex_reconnect_rejected_on_each_worker(
+    path: str, replica_policy: str, resume_supported: bool | None, reason: str
+) -> None:
     class SessionHandler:
         async def handle_realtime_session(self, _websocket) -> None:
             pytest.fail("Multi-API requests must not access process-local sessions")
@@ -711,18 +718,96 @@ def test_multi_api_duplex_reconnect_rejected_on_each_worker(path: str) -> None:
         app = FastAPI()
         app.state.api_server_count = 2
         app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+        )
         app.state.openai_serving_duplex = SessionHandler()
         app.state.duplex_warmup_done = PendingWarmup()
         app.include_router(api_server.router)
         with TestClient(app) as client, client.websocket_connect(path) as websocket:
-            assert websocket.receive_json()["code"] == "multi_api_duplex_unsupported"
+            error = websocket.receive_json()
+            assert error["code"] == "multi_api_duplex_unsupported"
+            assert reason in error["error"]
             with pytest.raises(WebSocketDisconnect) as exc:
                 websocket.receive_text()
             assert exc.value.code == 1008
 
 
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
+def test_multi_api_duplex_nonresumable_least_sessions_reaches_each_worker(path: str) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, websocket) -> None:
+            await websocket.accept()
+            await websocket.send_json({"type": "session.created"})
+            await websocket.close()
+
+    for worker_index in (0, 1):
+        app = FastAPI()
+        app.state.api_server_count = 2
+        app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+        )
+        app.state.openai_serving_duplex = SessionHandler()
+        app.include_router(api_server.router)
+        with TestClient(app) as client, client.websocket_connect(path) as websocket:
+            assert websocket.receive_json() == {"type": "session.created"}
+
+
+@pytest.mark.parametrize("count", [0, -1, True, "2"])
+def test_multi_api_duplex_invalid_topology_rejected(count: object) -> None:
+    app = FastAPI()
+    app.state.api_server_count = count
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+    )
+    app.include_router(api_server.router)
+    with TestClient(app) as client, client.websocket_connect("/v1/duplex") as websocket:
+        error = websocket.receive_json()
+        assert error["code"] == "multi_api_duplex_unsupported"
+        assert "initialized API worker topology" in error["error"]
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+        assert exc.value.code == 1008
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplex_query", ["0", "false"])
+async def test_multi_api_nonduplex_realtime_bypasses_duplex_guard(monkeypatch, duplex_query: str) -> None:
+    calls: list[str] = []
+
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
+
+    async def unexpected_guard(_websocket) -> NoReturn:
+        fail: Callable[[str], NoReturn] = pytest.fail
+        fail("Non-duplex requests must not use the duplex topology guard")
+
+    monkeypatch.setattr(api_server, "_reject_multi_api_duplex", unexpected_guard)
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                api_server_count=2,
+                openai_serving_duplex=object(),
+                openai_realtime_handler=_TurnBasedHandler(),
+            )
+        ),
+        query_params={"duplex": duplex_query},
+    )
+    await api_server.realtime_websocket(websocket)
+    assert calls == ["turn_based"]
+
+
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
-def test_single_api_duplex_session_still_reaches_handler(path: str) -> None:
+@pytest.mark.parametrize("replica_policy", ["legacy", "least_sessions"])
+@pytest.mark.parametrize("resume_supported", [False, True])
+def test_single_api_duplex_session_still_reaches_handler(
+    path: str, replica_policy: str, resume_supported: bool
+) -> None:
     class SessionHandler:
         async def handle_realtime_session(self, websocket) -> None:
             await websocket.accept()
@@ -731,6 +816,10 @@ def test_single_api_duplex_session_still_reaches_handler(path: str) -> None:
 
     app = FastAPI()
     app.state.api_server_count = 1
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+    )
     app.state.openai_serving_duplex = SessionHandler()
     app.include_router(api_server.router)
     with TestClient(app) as client, client.websocket_connect(path) as websocket:
@@ -867,22 +956,23 @@ def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multi_api_rejects_runtime_voice_upload() -> None:
+async def test_multi_api_allows_runtime_voice_upload_and_deletion() -> None:
+    # The speaker directory is shared by every API process, so these routes
+    # are not process-local; without a speech handler they report 404.
     app = FastAPI()
     app.state.api_server_count = 2
-    raw_request = _request_for(app, method="POST", path="/v1/audio/voices")
+    app.state.openai_serving_speech = None
 
-    with pytest.raises(HTTPException) as exc_info:
-        await api_server.upload_voice(
-            raw_request,
-            audio_sample=None,
-            speaker_embedding=None,
-            consent="consent-id",
-            name="probe",
-        )
+    upload = await api_server.upload_voice(
+        _request_for(app, method="POST", path="/v1/audio/voices"),
+        audio_sample=None,
+        speaker_embedding=None,
+        consent="consent-id",
+        name="probe",
+    )
+    deletion = await api_server.delete_voice("probe", _request_for(app, method="DELETE", path="/v1/audio/voices/probe"))
 
-    assert exc_info.value.status_code == 409
-    assert "process-local frontend state" in exc_info.value.detail
+    assert upload.status_code == deletion.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -1059,7 +1149,8 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
+async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
@@ -1074,6 +1165,7 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
             parallel_config=SimpleNamespace(_api_process_rank=0),
         ),
     )
+    mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -1084,10 +1176,12 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
 
     class _FakeCtor:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.kwargs = kwargs
+            self.warmup_calls = 0
 
         def warmup(self):
-            return None
+            self.warmup_calls += 1
 
     deploy = tmp_path / "deploy.yaml"
     deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
@@ -1125,17 +1219,33 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
 
+    disabled = (
+        set()
+        if "generate" in supported_tasks
+        else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
+    )
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE,
+        must_be_wired=_MULTISTAGE_MUST_BE_WIRED - disabled,
+        must_be_none=_MULTISTAGE_MUST_BE_NONE | disabled,
     )
+    assert state.online_renderer.kwargs["log_error_stack"] is True
+    assert state.online_renderer.warmup_calls == 1
+    for service in (state.openai_serving_chat, state.openai_serving_chat_batch):
+        if "generate" in supported_tasks:
+            assert service.kwargs["online_renderer"] is state.online_renderer
+        else:
+            assert service is None
+    if "generate" in supported_tasks:
+        assert state.openai_serving_responses.args[2] is state.online_renderer
+    else:
+        assert state.openai_serving_responses is None
 
 
 @pytest.mark.parametrize("count", [None, 0, -1, "2", True])
@@ -1156,6 +1266,31 @@ def test_process_local_guard_rejects_unknown_topology(count):
 )
 def test_api_topology_resolved_from_launch(requested, config, expected):
     assert api_server._resolve_api_server_count(Namespace(api_server_count=requested), config) == expected
+
+
+@pytest.mark.parametrize(
+    "current,limit,expected", [(16, None, 4), (2, None, 2), (16, "8", 8), (2, "8", 2), (16, "0", 16)]
+)
+def test_api_server_torch_threads_are_capped(monkeypatch, current, limit, expected):
+    import torch
+
+    monkeypatch.delenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", limit)
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(current)
+        api_server._limit_api_server_torch_threads()
+        assert torch.get_num_threads() == expected
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.mark.parametrize("limit", ["-1", "invalid"])
+def test_api_server_rejects_invalid_torch_thread_limit(monkeypatch, limit):
+    monkeypatch.setenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", limit)
+    with pytest.raises(ValueError, match="VLLM_OMNI_API_SERVER_TORCH_THREADS must be a non-negative integer"):
+        api_server._limit_api_server_torch_threads()
 
 
 @pytest.mark.parametrize("requested,config", [(2, None), (2, {}), (2, {"client_count": 1}), (2, {"client_count": "2"})])

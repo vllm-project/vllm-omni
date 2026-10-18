@@ -19,17 +19,20 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # On CUDA
-uv pip install vllm==0.30.0 --torch-backend=auto
+uv pip install vllm==0.31.0 --torch-backend=auto \
+  --extra-index-url https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6
 
 # On ROCm
-uv pip install vllm==0.30.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.30.0/rocm723
+uv pip install vllm==0.31.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.31.0/rocm723
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 uv pip install -e .
 ```
 
-For additional installation methods — please see the [installation guide](installation/README.md).
+These commands install vLLM 0.31.0 for this source checkout. The CUDA index is
+pinned to the final release commit. For published vLLM-Omni wheels and additional
+installation methods, see the [installation guide](installation/README.md).
 
 !!! note
     It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.

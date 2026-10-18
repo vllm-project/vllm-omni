@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import torch
-from vllm.config import CompilationConfig, DeviceConfig, KVTransferConfig, VllmConfig
+from vllm.config import CompilationConfig, DeviceConfig, KernelConfig, KVTransferConfig, VllmConfig
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -200,6 +200,7 @@ def create_base_diffusion_vllm_config(
         compilation_config=CompilationConfig(),
         device_config=DeviceConfig(device=device),
         additional_config=od_config.additional_config,
+        kernel_config=KernelConfig(moe_backend=od_config.moe_backend, linear_backend=od_config.linear_backend),
     )
 
 
@@ -240,6 +241,16 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     kv_transfer_config = getattr(od_config, "kv_transfer_config", None)
     if kv_transfer_config is not None:
         vllm_config.kv_transfer_config = cast(KVTransferConfig, kv_transfer_config)
+
+    # Weight transfer (RL training). Accepts the raw deploy dict or a
+    # pre-built config, mirroring upstream EngineArgs' dict coercion.
+    weight_transfer_config = getattr(od_config, "weight_transfer_config", None)
+    if weight_transfer_config is not None:
+        from vllm.config.weight_transfer import WeightTransferConfig
+
+        if isinstance(weight_transfer_config, dict):
+            weight_transfer_config = WeightTransferConfig(**weight_transfer_config)
+        vllm_config.weight_transfer_config = weight_transfer_config
     return vllm_config
 
 

@@ -33,13 +33,42 @@ class _NativeRequestState:
     external_req_id: str
     prompt_token_ids: list[int]
     additional_information: Any = None
+    model_intermediate_buffer: Any = None
     sampling_params: Any = None
     num_computed_tokens: int = 0
     resumable: bool = False
     output_token_ids: list[int] = field(default_factory=list)
     finished: bool = False
+    output_stopped: bool = False
+    # Set by ``abort_requests``: the scheduler ended the request outside its
+    # own output (cancel, error or a parked close), so the runner has no
+    # finish reason. MiniCPM-o duplex Talkers only end this way.
+    aborted: bool = False
 
-    def snapshot(self, *, include_token_history: bool) -> SimpleNamespace:
+    def accept_tokens(self, token_ids: list[int]) -> None:
+        """Fence publications past the sampled stop, before scheduler ACK.
+
+        Async scheduling may already have executed another step when the
+        scheduler consumes EOS. Keep the terminating step's payload, but do
+        not publish the later steps while lifecycle reservations drain.
+        Resumable requests keep their segment boundaries owned by the scheduler.
+        """
+        params = self.sampling_params
+        stop_ids = set(getattr(params, "stop_token_ids", None) or ())
+        if not getattr(params, "ignore_eos", False):
+            stop_ids.update(getattr(params, "_all_stop_token_ids", ()) or ())
+        min_tokens = getattr(params, "min_tokens", 0) or 0
+        max_tokens = getattr(params, "max_tokens", None)
+        for token_id in token_ids:
+            self.output_token_ids.append(int(token_id))
+            if not self.resumable and (
+                (len(self.output_token_ids) >= min_tokens and token_id in stop_ids)
+                or (max_tokens is not None and len(self.output_token_ids) >= max_tokens)
+            ):
+                self.output_stopped = True
+                break
+
+    def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
         finished = self.finished
@@ -52,10 +81,15 @@ class _NativeRequestState:
             all_token_ids=prompt + output,
             output_token_count=len(self.output_token_ids),
             last_output_token_id=self.output_token_ids[-1] if self.output_token_ids else None,
+            # A ledger tail can belong to an earlier segment. Only these ids
+            # were accepted with the payload being published now.
+            sampled_token_ids=list(sampled_token_ids or ()),
             additional_information=self.additional_information,
+            model_intermediate_buffer=self.model_intermediate_buffer,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
             resumable=self.resumable,
+            aborted=self.aborted,
         )
         request.is_finished = lambda: finished
         return request
@@ -252,6 +286,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 external_req_id=external_req_id,
                 prompt_token_ids=list(getattr(request_data, "prompt_token_ids", None) or []),
                 additional_information=getattr(request_data, "additional_information", None),
+                model_intermediate_buffer=getattr(request_data, "model_intermediate_buffer", None),
                 sampling_params=getattr(request_data, "sampling_params", None),
                 num_computed_tokens=int(getattr(request_data, "num_computed_tokens", 0) or 0),
                 resumable=bool(getattr(request_data, "resumable", False)),
@@ -303,6 +338,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             if not active_req_ids:
                 return 0
             for req_id in active_req_ids:
+                self._native_requests[req_id].aborted = True
                 self._native_outputs_in_flight.pop(req_id, None)
                 self._native_terminal_pending.discard(req_id)
                 # Cancellation must not flush a partially accumulated utterance.
@@ -506,9 +542,15 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             state = self._native_requests.get(req_id)
             if state is None:
                 continue
-            state.output_token_ids.extend(int(token_id) for token_id in sampled_by_req.get(req_id, []))
             state.finished = req_id in terminal_req_ids
-            payload = payload_by_req.get(req_id)
+            # Native transport runs ahead of scheduler consumption. Its
+            # terminal notification fences resource cleanup, not the sampled
+            # token boundary: a later in-flight frame must not reach the codec.
+            if state.output_stopped:
+                payload = None
+            else:
+                state.accept_tokens(sampled_by_req.get(req_id, []))
+                payload = payload_by_req.get(req_id)
             if not self._async_chunk:
                 # Full-payload consumers execute once, after the producer has
                 # finished. Reuse V1's concat/replace contract for flat outputs
@@ -528,7 +570,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             )
             entries.append(
                 (
-                    state.snapshot(include_token_history=include_token_history),
+                    state.snapshot(
+                        include_token_history=include_token_history,
+                        sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                    ),
                     payload,
                 )
             )

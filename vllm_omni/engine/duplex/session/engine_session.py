@@ -99,7 +99,6 @@ class ResponseState:
     assistant_text_buffer: list[str] = field(default_factory=list)
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     pending_options: ResponseCreateOptions | None = None
-    active_options: ResponseCreateOptions | None = None
     active_config: DuplexSessionConfig | None = None
     stage_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
     stage_metric_tpot_weighted_ms: dict[str, float] = field(default_factory=dict)
@@ -163,6 +162,7 @@ class DuplexRequestResource:
     request_id: str
     fence: DuplexFence
     submitted: bool = False
+    input_audio_part: dict[str, object] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -590,10 +590,6 @@ class DuplexEngineSession:
     def pending_history_item_ids(self) -> Mapping[str, dict[str, object]]:
         return MappingProxyType({key: dict(value) for key, value in self._conversation.pending_item_ids.items()})
 
-    @property
-    def pending_history_truncations_ms(self) -> Mapping[str, int]:
-        return MappingProxyType(dict(self._conversation.pending_truncations_ms))
-
     def replace_config(self, config: DuplexSessionConfig) -> None:
         previous_seed = self.config.initial_user_text
         self.config = config
@@ -752,6 +748,44 @@ class DuplexEngineSession:
             input_commit_seq=self._input.commit_seq,
         )
 
+    def input_audio_part(self, item_id: str) -> dict[str, object] | None:
+        """Return the native audio part whose identity owns this item's ASR."""
+        message = self._conversation.item_ids.get(item_id)
+        if message is None or message.get("role") != "user":
+            return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "audio_url"
+                and part.get("audio_url") == {"url": "native-duplex:input-audio"}
+            ):
+                return part
+        return None
+
+    def update_input_transcript(
+        self,
+        item_id: str,
+        transcript: str,
+        *,
+        audio_part: dict[str, object] | None,
+    ) -> bool:
+        """Attach ASR text only to the audio part captured for this request.
+
+        Public item IDs can be deleted and reused. A fresh native placeholder
+        has the same value, but must not receive the old audio's transcript.
+        """
+        if audio_part is None or self.input_audio_part(item_id) is not audio_part:
+            return False
+        message = self._conversation.item_ids[item_id]
+        if "transcript" in message or "transcript" in audio_part:
+            return False
+        audio_part["transcript"] = transcript
+        message["transcript"] = transcript
+        return True
+
     def complete_model_turn(self, turn_id: int) -> None:
         """Advance the model-owned output identity after its terminal signal."""
         completed_turn_id = int(turn_id)
@@ -782,14 +816,12 @@ class DuplexEngineSession:
     def _activate_response_options(self) -> None:
         options = self._response.pending_options
         self._response.active_config = copy.deepcopy(self.config)
-        self._response.active_options = options
         self._response.pending_options = None
         if options is not None:
             options.apply_to(self._response.active_config)
 
     def _restore_response_config(self) -> None:
         self._response.active_config = None
-        self._response.active_options = None
         self._response.pending_options = None
 
     def snapshot_active_response_for_drain(self) -> None:
@@ -1101,23 +1133,6 @@ class DuplexEngineSession:
 
         return copy.deepcopy(self._response.stage_metrics)
 
-    def replace_response_stage_metric_snapshots(
-        self,
-        stage_metrics: Mapping[Any, Any] | None,
-    ) -> dict[str, dict[str, object]]:
-        """Merge cumulative chat snapshots by replacing each stage's latest value."""
-        if self.active_response_id is None or not isinstance(stage_metrics, Mapping):
-            return copy.deepcopy(self._response.stage_metrics)
-
-        for raw_stage_id, raw_values in stage_metrics.items():
-            if not isinstance(raw_values, Mapping):
-                continue
-            stage_id = str(raw_stage_id)
-            self._response.stage_metrics[stage_id] = copy.deepcopy(dict(raw_values))
-            self._response.stage_metric_tpot_weighted_ms.pop(stage_id, None)
-            self._response.stage_metric_tpot_weight.pop(stage_id, None)
-        return copy.deepcopy(self._response.stage_metrics)
-
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
         self._input.overlap_speech_ms += max(0, int(duration_ms))
         return self._input.overlap_speech_ms
@@ -1339,6 +1354,16 @@ class DuplexEngineSession:
         ):
             self.register_history_item(f"item_{response_id}", None)
         elif response_id is not None and not assistant_text:
+            # Sent audio has no transcript to store, but the client still has
+            # to ack it. Dropping the item makes that ack fail and leaves
+            # sent_ms ahead of committed_ms, so the next response cannot start.
+            playback = self.playback_for_response(response_id)
+            if max(playback.sent_ms, playback.generated_ms) > 0:
+                self._conversation.assistant_response_snapshots[response_id] = (
+                    _object_dict(role="assistant", content=""),
+                    tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
+                    response_input_commit_seq,
+                )
             self._discard_history_item_placeholder(f"item_{response_id}")
         self._response.assistant_text_buffer.clear()
         if not preserve_request:

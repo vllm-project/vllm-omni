@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock
 
 import janus
 import pytest
+from vllm.exceptions import VLLMValidationError
+from vllm.multimodal.cache import LruKeyReplicatedSenderCache
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -37,6 +39,7 @@ from vllm_omni.engine.orchestrator import (
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.preprocess import OmniRenderer
 from vllm_omni.model_executor.stage_input_processors import (
     joyai_vl_interaction as joyai_bridge,
 )
@@ -53,6 +56,7 @@ from .test_orchestrator import (
     _engine_core_outputs,
     _enqueue_add_request,
     _get_output_message,
+    _processed_request,
     _wait_for,
 )
 
@@ -103,12 +107,15 @@ async def _wait_for_error_message(
     raise AssertionError(f"No ErrorMessage for req={request_id} within {max_messages} messages")
 
 
-@pytest.fixture
-def orchestrator_factory():
+@pytest.fixture(params=["0", "1"], ids=["legacy", "event-driven"])
+def orchestrator_factory(request, monkeypatch):
+    # Every scenario runs on both orchestration loops, which must behave identically.
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", request.param)
     fixtures: list[OrchestratorFixture] = []
 
     def _factory(*args, **kwargs) -> OrchestratorFixture:
         fixture = _build_harness(*args, **kwargs)
+        assert fixture.orchestrator._event_driven_orch is (request.param == "1")
         fixtures.append(fixture)
         return fixture
 
@@ -978,16 +985,61 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("event_driven", [False, True], ids=["legacy", "event-driven"])
+async def test_joyai_asr_invalid_context_fails_only_its_request(orchestrator_factory, monkeypatch) -> None:
+    monkeypatch.setattr(joyai_bridge, "cached_processor_from_config", lambda _: None)
+
+    class JoyAIStage(FakeStageClient):
+        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+            self.bridge_inputs = joyai_bridge.asr_to_joyai(source_outputs, prompt)
+            return self.bridge_inputs
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = JoyAIStage(stage_type="llm", final_output=True)
+    proc0, proc1 = FakeOutputProcessor(), FakeOutputProcessor()
+    fixture = orchestrator_factory([stage0, stage1], output_processors=[proc0, proc1])
+    fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params),
+        renderer=SimpleNamespace(mm_processor_cache=None),
+    )
+    invalid_info: dict[str, object] = {"joyai_prompt_context": {}}
+    for index, (request_id, info) in enumerate((("invalid-context", invalid_info), ("valid", {})), start=1):
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            original_prompt={"additional_information": info},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == index)
+        proc0.request_outputs = [_build_request_output(request_id, text="language English<asr_text>Hello.")]
+        stage0.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-asr", float(index)))
+        if info:
+            error = await _wait_for_error_message(fixture, request_id=request_id)
+            assert error.status_code == 400 and not error.fatal
+            assert error.stage_id == 1 and "joyai_prompt_context" in error.error
+            assert not stage1.add_request_calls
+        else:
+            await _wait_for(lambda: bool(stage1.add_request_calls) or fixture.result_future.done())
+            assert not fixture.result_future.done()
+            assert "Hello." in stage1.bridge_inputs[0]["prompt"]
+            proc1.request_outputs = [_build_request_output(request_id, text="Completed.")]
+            stage1.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-joyai", float(index)))
+            output = await _get_output_message(fixture)
+            assert output.request_id == request_id and output.finished
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        assert all(pool.get_bound_replica_id(request_id) is None for pool in fixture.orchestrator.stage_pools)
+        assert fixture.thread.is_alive() and not fixture.result_future.done()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("first_speaker", ["Ryan", "not-a-real-speaker"])
 async def test_joyai_tts_request_validation_keeps_orchestrator_running(
     orchestrator_factory,
     monkeypatch: pytest.MonkeyPatch,
     first_speaker: str,
-    event_driven: bool,
 ) -> None:
     """Check that the same orchestrator can handle the next valid request."""
-    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", "1" if event_driven else "0")
 
     # Use a fixed token count so the test does not need tokenizer files.
     class FakeTokenizer:
@@ -1105,6 +1157,129 @@ async def test_streaming_input_processor_client_error_does_not_forward_terminal_
         assert queues[1].sync_q.empty()
         assert state.request_id not in orchestrator.request_states
         assert all(pool.get_bound_replica_id(state.request_id) is None for pool in orchestrator.stage_pools)
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("option", ["fps", "num_frames"])
+async def test_bad_video_sampling_options_keep_orchestrator_alive(orchestrator_factory, option):
+    from vllm.model_executor.models.qwen3_vl import Qwen3VLMultiModalProcessor
+
+    stage0 = FakeStageClient()
+    stage1 = FakeStageClient(final_output=True)
+    output_processor = FakeOutputProcessor(request_outputs=[_build_request_output("valid-video")])
+    fixture = orchestrator_factory([stage0, stage1], output_processors=[FakeOutputProcessor(), output_processor])
+    info = SimpleNamespace(
+        ctx=SimpleNamespace(
+            get_merged_mm_kwargs=lambda kw, **_: kw,
+            get_mm_config=lambda: SimpleNamespace(get_video_pruning_spec=lambda: None),
+        ),
+        get_hf_config=lambda: SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            vision_start_token_id=1,
+            vision_end_token_id=2,
+            video_token_id=3,
+        ),
+        get_tokenizer=lambda: None,
+    )
+    processor = SimpleNamespace(
+        info=info,
+        _get_hf_mm_inputs=lambda items, kwargs: ({"videos": [(None, {})]}, kwargs, {}),
+    )
+    renderer = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_vl")),
+        mm_processor_cache=None,
+        get_mm_processor=lambda: processor,
+    )
+
+    def process_inputs(*, request_id, prompt, params, **kwargs):
+        OmniRenderer._validate_video_processor_kwargs(renderer, prompt)
+        if request_id == "bad-video":
+            # Exercise the real upstream list indexing on the unpatched code.
+            Qwen3VLMultiModalProcessor._apply_hf_processor_main(processor, None, prompt["mm_processor_kwargs"])
+        return _processed_request(request_id, params)
+
+    fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs, renderer=renderer)
+    for request_id in ("bad-video", "valid-video"):
+        options: dict[str, list[float]] = {option: []} if request_id == "bad-video" else {}
+        prompt = {"prompt": "describe", "multi_modal_data": {"video": [None]}, "mm_processor_kwargs": options}
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=prompt,
+            original_prompt=prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            entry_stage_id=1,
+        )
+        if request_id == "bad-video":
+            error = await _wait_for_error_message(fixture, request_id=request_id)
+            assert error.status_code == 400 and not error.fatal
+            assert option in error.error
+            assert stage1.add_request_calls == []
+        else:
+            await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+            stage1.push_engine_core_outputs(_engine_core_outputs("valid-video", 1.0))
+            output = await _get_output_message(fixture)
+            assert output.request_id == request_id and output.finished
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        assert fixture.thread.is_alive() and not fixture.result_future.done()
+        assert stage0.shutdown_calls == stage1.shutdown_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_forwarded_input_rejected_by_next_stage_is_request_scoped(mocker) -> None:
+    """A forwarded prompt that fails the next stage's own validation (here more tokens
+    than it accepts) fails only that request instead of escaping the orchestrator loop.
+    One aborted while it is processed is not submitted, and the stage's sender cache
+    forgets its media."""
+
+    def process_inputs(*, request_id, **kwargs):
+        if request_id == "aborted":
+            sent.add("frame-0-hash")  # The sender cache records the image as sent,
+            orchestrator.request_states.pop(request_id)  # and the abort lands mid-processing.
+            return SimpleNamespace(mm_features=[SimpleNamespace(mm_hash="frame-0-hash", identifier="frame-0-hash")])
+        raise VLLMValidationError("The decoder prompt is longer than the maximum model length of 16384.")
+
+    stage1 = FakeStageClient(
+        final_output=True, next_inputs=[{"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}]
+    )
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([[FakeStageClient()], [stage1]]))
+    sent: set[str] = set()
+    orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=process_inputs,
+        renderer=SimpleNamespace(
+            mm_processor_cache=mocker.Mock(spec=LruKeyReplicatedSenderCache, clear_cache=sent.clear)
+        ),
+    )
+    state = OrchestratorRequestState(
+        request_id="too-long",
+        prompt={"prompt_token_ids": [1]},
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    orchestrator.request_states[state.request_id] = state
+    try:
+        await orchestrator._route_output(0, 0, _build_request_output(state.request_id), state, stage_metrics=None)
+
+        error = queues[1].sync_q.get_nowait()
+        assert isinstance(error, ErrorMessage)
+        assert (error.request_id, error.stage_id, error.status_code, error.fatal) == ("too-long", 1, 400, False)
+        assert stage1.add_request_calls == []
+        assert state.request_id not in orchestrator.request_states
+
+        aborted = OrchestratorRequestState(
+            request_id="aborted",
+            prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        orchestrator.request_states[aborted.request_id] = aborted
+        await orchestrator._route_output(0, 0, _build_request_output(aborted.request_id), aborted, stage_metrics=None)
+        assert stage1.add_request_calls == []
+        assert sent == set()
     finally:
         for q in queues:
             q.close()
@@ -1282,6 +1457,7 @@ async def test_cache_reset_rpc_failure_is_nonfatal_and_visits_all_replicas(metho
     [
         ("reset_mm_cache", {}, True),
         ("sleep", {}, True),
+        ("release_kv_cache_memory", {}, True),
         ("pause_scheduler", {"clear_cache": True}, True),
         ("pause_scheduler", {"clear_cache": False}, False),
         ("reset_prefix_cache", {}, False),

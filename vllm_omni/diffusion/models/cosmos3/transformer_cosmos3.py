@@ -37,7 +37,6 @@ from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
@@ -54,6 +53,7 @@ from .mixed_precision import (
     Cosmos3MixedPrecisionRuntime,
     resolve_mixed_precision_config,
 )
+from .norm import RMSNorm
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -106,19 +106,6 @@ def _resolve_cosmos3_quant_configs(
         _pathway_quant_config(components, "language_model", transformer_config),
         _pathway_quant_config(components, "gen_layers", transformer_config),
     )
-
-
-class RMSNorm(_VllmRMSNorm):
-    """Cosmos3-local RMSNorm that uses the FP32 native implementation."""
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
 
 
 def _get_ulysses_state() -> tuple[int, int, dist.ProcessGroup | None]:
@@ -991,12 +978,13 @@ class Cosmos3GenDecoderLayer(nn.Module):
         rms_norm_eps: float,
         quant_config: QuantizationConfig | None = None,
         mlp_cls: type[nn.Module] = Cosmos3GatedMLP,
+        cross_attention_cls: type[nn.Module] = Cosmos3CrossAttention,
         qk_norm: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.cross_attention = Cosmos3CrossAttention(
+        self.cross_attention = cross_attention_cls(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
@@ -1014,6 +1002,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
+
+    def _forward_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.post_attention_layernorm(hidden_states))
+
+    def _add_residual(self, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        return residual + output
 
     def forward(
         self,
@@ -1049,11 +1043,10 @@ class Cosmos3GenDecoderLayer(nn.Module):
             control_token_sizes=control_token_sizes,
             control_weights=control_weights,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self._add_residual(hidden_states, residual)
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
+        hidden_states = self._add_residual(self._forward_mlp(hidden_states), residual)
 
         return hidden_states
 
@@ -1182,6 +1175,9 @@ class _GenPrepared(NamedTuple):
     use_multi_control_attention: bool
     multi_control_token_sizes: tuple[int, ...] | None
     multi_control_weights: tuple[float, ...] | None
+    # Execution-layout state; set only by Cosmos3VFMTransformer._shard_gen_prep.
+    freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
+    defer_gen_gather: bool = False
 
 
 class Cosmos3VFMTransformer(nn.Module):
@@ -1223,6 +1219,8 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _language_model_cls = Cosmos3LanguageModel
     _gen_mlp_cls = Cosmos3GatedMLP
+    _gen_layer_cls = Cosmos3GenDecoderLayer
+    _cross_attention_cls = Cosmos3CrossAttention
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -1242,7 +1240,13 @@ class Cosmos3VFMTransformer(nn.Module):
 
     _sp_plan = {
         "gen_sp_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            0: SequenceParallelInput(
+                split_dim=1,
+                expected_dims=3,
+                split_output=True,
+                auto_pad=True,
+                clone_shard=True,
+            ),
             1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
             2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
         },
@@ -1412,7 +1416,7 @@ class Cosmos3VFMTransformer(nn.Module):
 
         self.gen_layers = nn.ModuleList()
         for i in range(self.num_hidden_layers):
-            layer = Cosmos3GenDecoderLayer(
+            layer = self._gen_layer_cls(
                 layer_idx=i,
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
@@ -1422,6 +1426,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 rms_norm_eps=self.rms_norm_eps,
                 quant_config=gen_layers_quant_config,
                 mlp_cls=self._gen_mlp_cls,
+                cross_attention_cls=self._cross_attention_cls,
                 qk_norm=self.qk_norm_for_diffusion,
                 prefix=f"gen_layers.{i}",
             )
@@ -1765,30 +1770,41 @@ class Cosmos3VFMTransformer(nn.Module):
         pad = (-(base + sound_frames)) % ulysses_size
         return sound_frames + pad
 
+    # -- Forward -------------------------------------------------------------
+
+    def _embed_timestep(self, timestep: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Compute the shared diffusion timestep in FP32 before the model-dtype cast."""
+        with torch.autocast(timestep.device.type, enabled=False):
+            embedding = self.time_embedder((timestep * self.timestep_scale).float())
+        return embedding.to(dtype)
+
     def _run_gen_layers(
         self,
         hidden_gen: torch.Tensor,
         *,
-        s_video: int,
-        s_control: int,
-        s_action: int,
-        s_sound: int,
-        has_action: bool,
-        has_sound: bool,
-        has_control: bool,
-        ulysses_size: int,
-        use_multi_control_attention: bool,
-        multi_control_token_sizes: tuple[int, ...] | None,
-        multi_control_weights: tuple[float, ...] | None,
+        freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        gather_output: bool = True,
+        control_token_sizes: tuple[int, ...] | None = None,
+        control_weights: tuple[float, ...] | None = None,
     ) -> torch.Tensor:
-        """Run the complete GEN decoder between full-layout boundaries."""
-        if self.cached_kv is None or self.cached_freqs_gen is None:
-            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-        freqs_cos, freqs_sin = self.cached_freqs_gen
-        if not use_multi_control_attention:
-            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-        freqs_gen = (freqs_cos, freqs_sin)
+        """Run the shared GEN stack, including sequence parallelism and cache-dit wrappers.
 
+        ``freqs_gen`` marks ``hidden_gen`` as already in the execution layout
+        (see ``_shard_gen_prep``). Without it, the full-layout input is sharded
+        here, so callers can pass a temporary that no frame retains during the
+        stack. ``gather_output`` applies the SP gather on exit.
+        """
+        # UND K/V stay replicated; Cosmos3CrossAttention supplies them as
+        # joint_key/value for Ulysses head-slicing in the attention backend.
+        if self.cached_kv is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        if freqs_gen is None:
+            hidden_gen, freqs_gen = self._shard_gen_inputs(hidden_gen)
+        freqs_cos, freqs_sin = freqs_gen
+        layer_kwargs = {
+            "control_token_sizes": control_token_sizes,
+            "control_weights": control_weights,
+        }
         if len(self.gen_layers) == len(self.cached_kv):
             for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
                 hidden_gen = layer(
@@ -1797,8 +1813,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     v_und=v_und,
                     freqs_cos=freqs_cos,
                     freqs_sin=freqs_sin,
-                    control_token_sizes=multi_control_token_sizes,
-                    control_weights=multi_control_weights,
+                    **layer_kwargs,
                 )
                 # Cache-dit's block wrapper may return a tuple; unwrap it.
                 if isinstance(hidden_gen, tuple):
@@ -1807,20 +1822,18 @@ class Cosmos3VFMTransformer(nn.Module):
             # Cache-dit patches gen_layers to a grouped wrapper.
             for layer in self.gen_layers:
                 hidden_gen = layer(
-                    hidden_gen,
-                    cached_kv=self.cached_kv,
-                    freqs_gen=freqs_gen,
-                    control_token_sizes=multi_control_token_sizes,
-                    control_weights=multi_control_weights,
+                    hidden_gen, cached_kv=self.cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs
                 )
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
+        return self.gen_sp_gather(hidden_gen) if gather_output else hidden_gen
 
-        if not use_multi_control_attention:
-            hidden_gen = self.gen_sp_gather(hidden_gen)
-        return hidden_gen
-
-    # -- Forward -------------------------------------------------------------
+    def _shard_gen_inputs(self, hidden_gen: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Shard a full-layout GEN sequence and its cached RoPE for SP execution."""
+        if self.cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, *self.cached_freqs_gen)
+        return hidden_gen, (freqs_cos, freqs_sin)
 
     def forward(
         self,
@@ -1863,7 +1876,28 @@ class Cosmos3VFMTransformer(nn.Module):
             control_weights=control_weights,
             transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
         )
+        prep = self._shard_gen_prep(prep)
         return self._gen_postprocess(self._run_gen_stack(prep), prep)
+
+    def _shard_gen_prep(self, prep: _GenPrepared, *, defer_gather: bool = False) -> _GenPrepared:
+        """Move prepared GEN inputs into the execution layout.
+
+        Callers must rebind their ``prep`` to the result before running the
+        stack: keeping the original would pin the full embedding even though
+        the sharded ``hidden_gen`` owns separate storage.
+
+        ``defer_gather`` keeps the stack output rank-local and moves the SP
+        gather into ``_gen_postprocess``, so cache residuals stay sharded.
+        """
+        if prep.freqs_gen is not None or prep.defer_gen_gather:
+            raise RuntimeError("Cosmos3 GEN inputs are already in the execution layout.")
+        if self.cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        if prep.use_multi_control_attention:
+            # Multi-control attention runs unsharded, so there is nothing to gather.
+            return prep._replace(freqs_gen=self.cached_freqs_gen)
+        hidden_gen, freqs_gen = self._shard_gen_inputs(prep.hidden_gen)
+        return prep._replace(hidden_gen=hidden_gen, freqs_gen=freqs_gen, defer_gen_gather=defer_gather)
 
     def _gen_preprocess(
         self,
@@ -2073,9 +2107,7 @@ class Cosmos3VFMTransformer(nn.Module):
             # For I2V: only add to noisy tokens, not conditioned ones.
             # Conditioned frames are clean context and should not receive
             # the diffusion timestep signal.
-            with torch.autocast(current_omni_platform.device_type, enabled=False):
-                time_embed = self.time_embedder((timestep * self.timestep_scale).float())
-            time_embed = time_embed.to(hidden_states.dtype)
+            time_embed = self._embed_timestep(timestep, hidden_states.dtype)
 
             if noisy_frame_mask is not None:
                 # Build per-token mask from per-frame mask.
@@ -2110,6 +2142,11 @@ class Cosmos3VFMTransformer(nn.Module):
             if hidden_sound is not None:
                 hidden_parts.append(hidden_sound)
             hidden_gen = torch.cat(hidden_parts, dim=1)
+            # Concatenation owns its storage. Release the original embeddings
+            # before the GEN layers to avoid retaining a second full sequence.
+            del hidden_parts, hidden_controls, hidden_video, hidden_action, hidden_sound
+            if has_control:
+                del hidden_control  # The loop variable also retains the last control.
 
             return _GenPrepared(
                 hidden_gen=hidden_gen,
@@ -2132,20 +2169,16 @@ class Cosmos3VFMTransformer(nn.Module):
             )
 
     def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
-        """Execute the cacheable full-layout GEN stack, including final norm."""
+        """Execute the cacheable GEN stack, including final norm."""
+        if prep.freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN inputs must go through _shard_gen_prep before the stack.")
         hidden_gen = self._run_gen_layers(
             prep.hidden_gen,
-            s_video=prep.s_video,
-            s_control=prep.s_control,
-            s_action=prep.s_action,
-            s_sound=prep.s_sound,
-            has_action=prep.has_action,
-            has_sound=prep.has_sound,
-            has_control=prep.has_control,
-            ulysses_size=prep.ulysses_size,
-            use_multi_control_attention=prep.use_multi_control_attention,
-            multi_control_token_sizes=prep.multi_control_token_sizes,
-            multi_control_weights=prep.multi_control_weights,
+            freqs_gen=prep.freqs_gen,
+            # Multi-control attention runs unsharded, so there is nothing to gather.
+            gather_output=not prep.use_multi_control_attention and not prep.defer_gen_gather,
+            control_token_sizes=prep.multi_control_token_sizes,
+            control_weights=prep.multi_control_weights,
         )
         return self.norm_moe_gen(hidden_gen)
 
@@ -2155,6 +2188,8 @@ class Cosmos3VFMTransformer(nn.Module):
         prep: _GenPrepared,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Project an already-normalized packed GEN state to model outputs."""
+        if prep.defer_gen_gather:
+            hidden_gen = self.gen_sp_gather(hidden_gen)
         if not prep.has_action and not prep.has_sound and not prep.has_control:
             return self.unpatchify(self.proj_out(hidden_gen), prep.t, prep.h, prep.w)
 

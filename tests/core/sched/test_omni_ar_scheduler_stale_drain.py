@@ -73,7 +73,8 @@ def _replace_streaming_session(session: Request) -> None:
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
-    sched.skipped_waiting = set()
+    sched.kv_holding_waiting = set()
+    sched.deferred_waiting = set()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     update = StreamingUpdate(
         mm_features=None,

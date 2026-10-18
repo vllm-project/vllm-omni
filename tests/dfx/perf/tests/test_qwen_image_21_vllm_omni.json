@@ -1,0 +1,326 @@
+[
+  {
+    "test_name": "test_qwen_image_21_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Single-device baseline (no parallelism)",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-2.1",
+      "serve_args": {
+        "vae-use-tiling": true,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      },
+      {
+        "name": "1536x1536_steps35",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1536,
+          "height": 1536,
+          "num_inference_steps": 35,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_21_single_device_a3",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Single-device baseline (no parallelism)",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-2.1",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_21_single_device_step_execution",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Single-device step execution: sequential 512/1536 plus 512 concurrency sweep. One server (max-num-seqs 8).",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-2.1",
+      "serve_args": {
+        "vae-use-tiling": true,
+        "enable-diffusion-pipeline-profiler": true,
+        "step-execution": true,
+        "max-num-seqs": 8
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      },
+      {
+        "name": "1536x1536_steps35",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1536,
+          "height": 1536,
+          "num_inference_steps": 35,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      },
+      {
+        "name": "512x512_steps20_high_concurrency",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": [20, 40, 80, 160],
+        "max_concurrency": [1, 2, 4, 8],
+        "num_warmups": 8,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_21_single_device_step_execution_a3",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Single-device step execution: sequential 512 plus 512 concurrency sweep. One server (max-num-seqs 8).",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-2.1",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true,
+        "step-execution": true,
+        "max-num-seqs": 8
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      },
+      {
+        "name": "512x512_steps20_high_concurrency",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": [20, 40, 80, 160],
+        "max_concurrency": [1, 2, 4, 8],
+        "num_warmups": 8,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_21_ulysses4",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Ulysses SP=4",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-2.1",
+      "serve_args": {
+        "ulysses-degree": 4,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen_image_21_ulysses4_a3",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Ulysses SP=4",
+    "server_params": {
+      "model": "Qwen/Qwen-Image-2.1",
+      "serve_args": {
+        "ulysses-degree": 4,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "512x512_steps20",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/images/generations",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 512,
+          "height": 512,
+          "num_inference_steps": 20,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  }
+]

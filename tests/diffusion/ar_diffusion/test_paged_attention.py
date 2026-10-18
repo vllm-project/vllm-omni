@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from importlib.util import find_spec
 from pathlib import Path
@@ -12,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ARDiffusionKVCache,
@@ -26,7 +28,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import KV_GATHER_ENV
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import ChunkWindowManager
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 BLOCK = 16
@@ -118,6 +120,17 @@ def _gpu_flash_attn_usable() -> bool:
     return driver_major >= 580
 
 
+def _require_gpu_flash_attn() -> None:
+    """Skip optional local runs, but never let a dedicated GPU lane pass vacuously."""
+    if _gpu_flash_attn_usable():
+        return
+
+    reason = "usable GPU FlashAttention is required"
+    if os.environ.get("VLLM_OMNI_AR_FA_REQUIRED"):
+        pytest.fail(f"{reason} when VLLM_OMNI_AR_FA_REQUIRED is set")
+    pytest.skip(reason)
+
+
 def _commit_video_span(
     kv: ARDiffusionKVCache,
     st: ARDiffusionKVState,
@@ -139,6 +152,7 @@ def _commit_video_span(
     return k, v
 
 
+@pytest.mark.cpu
 def test_paged_context_allocates_lazily_and_commits_after_forward():
     _, st = make_state()
 
@@ -157,6 +171,7 @@ def test_paged_context_allocates_lazily_and_commits_after_forward():
     assert st._committed[POS] == BLOCK
 
 
+@pytest.mark.cpu
 def test_scratch_video_and_action_blocks_do_not_commit():
     kv, st = make_state()
 
@@ -171,6 +186,7 @@ def test_scratch_video_and_action_blocks_do_not_commit():
     assert st._committed[POS] == 0
 
 
+@pytest.mark.cpu
 def test_pipeline_kv_get_paged_path_has_no_gather_backend():
     kv, st = make_state()
     assert not hasattr(kv, "gather_window_all_layers")
@@ -188,6 +204,7 @@ def test_pipeline_kv_get_paged_path_has_no_gather_backend():
 @pytest.mark.parametrize("history_chunks", [0, 1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 @pytest.mark.parametrize("commit_current", [False, True])
+@pytest.mark.cpu
 def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len, commit_current):
     torch.manual_seed(0)
     device = torch.device("cpu")
@@ -264,6 +281,7 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
 
 @pytest.mark.parametrize("history_chunks", [0, 1, 2, 3])
 @pytest.mark.parametrize("window_chunks", [2, 4])
+@pytest.mark.cpu
 def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypatch, history_chunks, window_chunks):
     """A second probe of the same AR block restages its current K/V where the table actually holds it.
 
@@ -330,6 +348,7 @@ def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypa
 
 
 @pytest.mark.parametrize("gather_enabled", [False, True])
+@pytest.mark.cpu
 def test_staging_is_only_allocated_for_the_gather_path(monkeypatch, gather_enabled):
     if gather_enabled:
         monkeypatch.setenv(KV_GATHER_ENV, "1")
@@ -351,6 +370,7 @@ def test_staging_is_only_allocated_for_the_gather_path(monkeypatch, gather_enabl
 
 
 @pytest.mark.parametrize("window_chunks", [2, 4])
+@pytest.mark.cpu
 def test_layer_inputs_preserve_static_staging_tensors(monkeypatch, window_chunks):
     """Compiled inputs must retain the manager's static-address annotations, including with spare capacity."""
     monkeypatch.setenv(KV_GATHER_ENV, "1")
@@ -368,11 +388,12 @@ def test_layer_inputs_preserve_static_staging_tensors(monkeypatch, window_chunks
         assert stage_key.shape[0] == (window_chunks + 1) * BLOCK
 
 
-@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 @pytest.mark.parametrize("commit_current", [False, True])
 def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len, commit_current):
+    _require_gpu_flash_attn()
     torch.manual_seed(0)
     device = torch.device("cuda")
     dtype = torch.float16
@@ -439,6 +460,7 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
     torch.testing.assert_close(paged, ref, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.cpu
 def test_block_table_padded_to_fixed_width():
     """Shapes must be constant across window growth: only values change."""
     device = torch.device("cpu")
@@ -462,6 +484,7 @@ def test_block_table_padded_to_fixed_width():
     assert int(ctx2.seq_lens[0]) == 2 * BLOCK
 
 
+@pytest.mark.cpu
 def test_prepare_is_idempotent_and_layers_share_metadata():
     device = torch.device("cpu")
     kv, st = make_state(num_layers=2)
@@ -487,6 +510,7 @@ def test_prepare_is_idempotent_and_layers_share_metadata():
     assert i1.value_pool is kv._v_pools[1]
 
 
+@pytest.mark.cpu
 def test_layer_inputs_before_prepare_raises():
     _, st = make_state()
     layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
@@ -494,6 +518,7 @@ def test_layer_inputs_before_prepare_raises():
         layer_ctx.to_layer_inputs()
 
 
+@pytest.mark.cpu
 def test_custom_op_registration_idempotent():
     import importlib
     import sys
@@ -508,6 +533,7 @@ def test_custom_op_registration_idempotent():
     assert hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn")
 
 
+@pytest.mark.cpu
 def test_custom_op_mutable_arguments_cannot_be_elided_as_defaults():
     # Older PyTorch ADInplaceOrView handlers index positional mutable inputs
     # directly. Default-valued trailing inputs can disappear before that handler.
@@ -518,6 +544,7 @@ def test_custom_op_mutable_arguments_cannot_be_elided_as_defaults():
 
 
 @pytest.mark.parametrize("reuse_history_staging", [False, True])
+@pytest.mark.cpu
 def test_custom_op_compiles_fullgraph_without_recompile_on_value_change(monkeypatch, reuse_history_staging):
     """The op must trace as one opaque node: fullgraph OK, and changed tensor
     VALUES (new slots / block ids) must not trigger recompilation."""
@@ -576,6 +603,7 @@ RAGGED_CHUNK = 24
 
 @pytest.mark.parametrize("commit_current", [False, True])
 @pytest.mark.parametrize("action_len", [0, 3])
+@pytest.mark.cpu
 def test_a_ragged_chunk_still_matches_the_dense_reference(commit_current, action_len):
     """Attention reads a sequence, not a set of blocks.
 
@@ -643,6 +671,7 @@ def test_a_ragged_chunk_still_matches_the_dense_reference(commit_current, action
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.cpu
 def test_a_ragged_scratch_chunk_is_physically_continuous_with_its_history():
     """The write targets themselves must leave no hole.
 
@@ -668,6 +697,7 @@ def test_a_ragged_scratch_chunk_is_physically_continuous_with_its_history():
     assert ctx.action_scratch_block_ids[0] not in ctx.current_video_block_ids
 
 
+@pytest.mark.cpu
 def test_a_ragged_window_keeps_the_block_table_a_fixed_shape():
     """The table's shape must not track how full the window is.
 
@@ -769,6 +799,7 @@ def _model_block_indices(kv, adapter) -> dict[int, int]:
     ("sink_chunks", "window_chunks", "reset_at_boundary"),
     [(1, 2, False), (0, 2, False), (1, 3, False), (2, 2, True), (0, 2, True)],
 )
+@pytest.mark.cpu
 def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
     sink_chunks, window_chunks, reset_at_boundary
 ):
@@ -859,6 +890,7 @@ def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
     ("sink_chunks", "window_chunks", "reset_at_boundary"),
     [(1, 2, False), (0, 2, False), (1, 3, False), (2, 2, True), (0, 2, True)],
 )
+@pytest.mark.cpu
 def test_compaction_does_not_change_which_tokens_stay_resident(
     monkeypatch, sink_chunks, window_chunks, reset_at_boundary
 ):
@@ -898,6 +930,7 @@ def test_compaction_does_not_change_which_tokens_stay_resident(
         assert got == want, f"tick {tick}: compaction kept blocks {sorted(got - want)} and dropped {sorted(want - got)}"
 
 
+@pytest.mark.cpu
 def test_history_staging_holds_a_ragged_window_and_restages_it_whole(monkeypatch):
     """The staging buffers must fit the table width this module pads to.
 
@@ -925,6 +958,7 @@ def test_history_staging_holds_a_ragged_window_and_restages_it_whole(monkeypatch
 
 
 @pytest.mark.parametrize("commit_current", [False, True])
+@pytest.mark.cpu
 def test_action_tokens_after_a_partly_written_video_block_are_refused(commit_current):
     """Action K/V follows the video blocks in the table, and the kernel reads it as one run.
 
@@ -939,6 +973,7 @@ def test_action_tokens_after_a_partly_written_video_block_are_refused(commit_cur
         ctx.build_block_table(action_len=3, query_len=RAGGED_CHUNK + 3, device=torch.device("cpu"))
 
 
+@pytest.mark.cpu
 def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
     """832x480 with the checkpoint's own sink and window, slot by slot.
 
@@ -988,7 +1023,7 @@ def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
         kv_len = int(seq_lens[0])
 
         position_of_block = {b: i * block for b, i in _model_block_indices(kv, st.adapter(POS)).items()}
-        read = []
+        read: list[tuple[int, int]] = []
         for b in table[0].tolist()[: -(-kv_len // block)]:
             assert b in position_of_block, f"tick {tick}: read block {b}, which holds no token of this session"
             read.extend((b * block + o, position_of_block[b] + o) for o in range(block))
@@ -1039,6 +1074,7 @@ class _CountedBlock:
         return self._block.block_id
 
 
+@pytest.mark.cpu
 def test_reading_the_window_touches_only_the_blocks_it_can_keep(monkeypatch):
     """However long the block table is, reading the window must not cost more.
 
@@ -1074,6 +1110,7 @@ def test_reading_the_window_touches_only_the_blocks_it_can_keep(monkeypatch):
     )
 
 
+@pytest.mark.cpu
 def test_the_checkpoints_own_default_resolution_can_build_a_cache():
     """832x480 is what LingBot World v2 ships as its default, and it could not run.
 
@@ -1111,6 +1148,7 @@ def test_the_checkpoints_own_default_resolution_can_build_a_cache():
     assert kv.blocks_per_frame == -(-tokens_per_frame // block_size) == 98
 
 
+@pytest.mark.cpu
 def test_the_shipped_resolution_geometry_matches_dense_attention():
     """The real number, not a scaled-down stand-in: 1560 tokens per frame.
 
@@ -1163,7 +1201,7 @@ def test_the_shipped_resolution_geometry_matches_dense_attention():
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("commit_current", [False, True])
 def test_the_shipped_resolution_geometry_on_the_real_kernel(commit_current):
     """The shipped 832x480 geometry through FlashAttention's paged kernel.
@@ -1173,6 +1211,7 @@ def test_the_shipped_resolution_geometry_on_the_real_kernel(commit_current):
     tokens per frame, through the production path -- host prep followed by
     the fused write+attend op, which is what a forward actually calls.
     """
+    _require_gpu_flash_attn()
     torch.manual_seed(0)
     device = torch.device("cuda")
     dtype = torch.float16
@@ -1204,7 +1243,7 @@ def test_the_shipped_resolution_geometry_on_the_real_kernel(commit_current):
     torch.testing.assert_close(paged, ref, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("history_chunks", [0, 1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
 def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_chunks, action_len):
@@ -1213,6 +1252,7 @@ def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_c
     Covers an empty, partial and full window plus a partially filled action block:
     the gather reads the tail-padding null block, so its (zeroed) rows must be masked.
     """
+    _require_gpu_flash_attn()
 
     torch.manual_seed(0)
     device = torch.device("cuda")

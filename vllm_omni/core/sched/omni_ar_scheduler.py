@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -22,13 +23,14 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.fast_allocate import install_decode_allocate_fast_path
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import (
     free_kv_blocks_in_physical_order,
-    omni_routed_experts_for_request,
 )
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
 logger = init_logger(__name__)
 
@@ -45,6 +47,26 @@ def _should_emit_engine_output(
         bool(getattr(model_config, "use_v2_model_runner", False))
         and bool(getattr(model_config, "async_chunk", False))
         and not bool(getattr(model_config, "final_output", False))
+    )
+
+
+def _num_generation_tokens(request: Request) -> int:
+    output_token_ids: Any = getattr(request, "output_token_ids", None)
+    if output_token_ids is None:
+        output_token_ids = getattr(request, "_output_token_ids", ())
+    return len(output_token_ids)
+
+
+def _holds_payloadless_outputs(model_config: object) -> bool:
+    """Whether a final audio stage may fold token-only steps into its next output.
+
+    Such a stage streams audio through ``multimodal_output``; its codec tokens
+    are not client-visible. Steps that sampled a token but produced no audio
+    then only cost serialization, IPC and per-output API work.
+    """
+    # OmniModelConfig fields; a plain vLLM ModelConfig has neither.
+    return bool(getattr(model_config, "final_output", False)) and (
+        getattr(model_config, "engine_output_type", None) == "audio"
     )
 
 
@@ -99,7 +121,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
-    max_num_running_reqs: int
+    max_num_active_reqs: int
 
     def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
         model_config = self.vllm_config.model_config
@@ -120,6 +142,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        install_decode_allocate_fast_path(self.kv_cache_manager)
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -161,6 +184,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        # Keep rejecting in-flight appends after the error output is drained,
+        # until the engine consumes the owner's abort from its ordered input queue.
+        self._overflowed_streaming_requests: set[str] = set()
+        self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
+        # External finishes release Request before their terminal output is assembled.
+        self._held_token_ids: dict[str, list[int]] = {}
+        self._init_prefill_admission_policy()
+
+    def add_request(self, request: Request) -> None:
+        if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
+            logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
+            return
+        super().add_request(request)
+
+    def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
+        """Release admission fences after an ordered abort, never an eager one."""
+        overflowed = getattr(self, "_overflowed_streaming_requests", None)
+        if overflowed is not None:
+            overflowed.difference_update(request_ids)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -302,8 +344,41 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         is_final, _ = self._omni_final_stage_flags(request)
         return is_final
 
+    def _init_prefill_admission_policy(self) -> None:
+        """Optional prefill batching under load (stage connector ``extra``).
+
+        While at least ``ar_prefill_admission_min_running`` requests run, a new
+        request waits until ``ar_prefill_admission_min_batch`` requests wait or
+        the oldest has waited ``ar_prefill_admission_max_wait_ms``: arrivals then
+        share one prefill / mixed step instead of each turning a decode step
+        into one. Off unless ``ar_prefill_admission_min_batch`` > 1.
+        """
+        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+        extra = (
+            connector_config.get("extra", connector_config)
+            if isinstance(connector_config, dict)
+            else getattr(connector_config, "extra", None)
+        ) or {}
+        self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
+        self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
+        self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
+        if self._prefill_admission_min_batch > 1 and self._prefill_admission_max_wait_s <= 0:
+            raise ValueError("ar_prefill_admission_min_batch > 1 needs ar_prefill_admission_max_wait_ms > 0")
+        if self._prefill_admission_min_running < 0:
+            raise ValueError("ar_prefill_admission_min_running must be >= 0")
+
     def _should_defer_waiting_admission(self) -> bool:
-        return False
+        min_batch = getattr(self, "_prefill_admission_min_batch", 0)
+        if (
+            min_batch <= 1
+            or not self.running
+            or not self.waiting
+            or len(self.running) < self._prefill_admission_min_running
+            or len(self.waiting) >= min_batch
+        ):
+            return False
+        oldest = min(request.arrival_time for request in self.waiting)
+        return time.time() - oldest < self._prefill_admission_max_wait_s
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -375,39 +450,342 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
+    def update_draft_token_ids(self, draft_token_ids) -> None:
+        """Align the per-request draft buffers before the next schedule().
+
+        Upstream writes each request's drafts independently, so a request
+        whose buffer survived from an earlier state -- a duplex takeover
+        snapshot restored with its old drafts in place, or a step whose
+        schedule clipped this request while the neighbours ran full -- sits
+        next to neighbours with a different buffer length. The next
+        ``schedule()`` then books per-request spans of different widths (a
+        duplex takeover repro booked 8 and 4), and a non-uniform span is the
+        one shape the multi-frame loop declines -- fatally, with the stage.
+
+        A decode buffer is safe in exactly two states: empty, or a full
+        ``num_spec_tokens`` of drafts. Anything else is residue; clearing
+        every buffer leaves the next step to schedule a uniform padded
+        single-frame span, from which the K-step resumes on its own.
+        """
+        super().update_draft_token_ids(draft_token_ids)
+        if not self._talker_kstep_armed():
+            return
+        num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
+        if num_spec <= 0:
+            return
+        running = getattr(self, "running", None)
+        if not running:
+            return
+        lens = sorted({len(getattr(req, "spec_token_ids", ()) or ()) for req in running})
+        # A 0 in the set is a prefill chunk's buffer (legitimately empty),
+        # but a {0, num_spec} *mix* is itself uneven: the next schedule()
+        # books a width-1 row for the empty buffer next to a 1+num_spec row
+        # for the full one, so any multi-value set goes.
+        if len(lens) <= 1:
+            return
+        logger.error(
+            "[kstep] uneven draft buffers %s across %d running requests; "
+            "clearing every buffer so the next step schedules a uniform "
+            "(padded) single-frame span instead of the non-uniform span "
+            "the multi-frame loop declines",
+            lens,
+            len(running),
+        )
+        for req in running:
+            if req.spec_token_ids:
+                req.spec_token_ids = []
+
+    def _talker_kstep_armed(self) -> bool:
+        """True when this scheduler drives the Talker multi-frame decode.
+
+        Both conditions come off the engine config: the stage must be the
+        Talker (``model_config.model_stage == "tts"``) and it must carry the
+        injected n-gram config whose ``num_speculative_tokens`` is exactly
+        ``K - 1``. Interpretation is delegated to the shared
+        ``talker_kstep_contract`` module -- the model-side gate resolves the
+        same config through it, so the scheduler and the model cannot drift
+        apart (a missing ``method`` is disabled on both sides, and the frame
+        ceiling is enforced once).
+        """
+        cache = getattr(self, "_omni_talker_kstep_cache", None)
+        if cache is None:
+            # vLLM's Scheduler does not expose speculative_config as an
+            # attribute and SchedulerConfig has no num_speculative_tokens
+            # either, so the canonical engine-side source is vllm_config.
+            # Reading anything else silently yields 0 drafts and this whole
+            # guard never arms.
+            vllm_cfg = getattr(self, "vllm_config", None)
+            spec = getattr(self, "speculative_config", None)
+            if spec is None:
+                spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
+            model_cfg = getattr(vllm_cfg, "model_config", None)
+            cache = self._omni_talker_kstep_cache = (
+                talker_kstep_frames(getattr(model_cfg, "model_stage", None), spec) > 0
+            )
+        return cache
+
+    def _talker_waiting_prefill_may_run(self) -> bool:
+        """Whether a waiting request can be admitted into the current step.
+
+        vLLM drains the waiting queue first and stops admitting as soon as
+        ``len(self.running) + self.num_waiting_for_streaming_input`` reaches
+        ``max_num_running_reqs`` (vllm v1/core/sched/scheduler.py:864) -- the
+        same guard covers the skipped-waiting queue, so a full running batch
+        means nothing new joins this step.
+
+        That distinction matters under sustained load: a busy stream keeps a
+        request queued almost every step, and clearing the Talker's
+        continuation drafts on all of them turns most decode steps into
+        single-frame steps, which is exactly the K-step speedup this path
+        exists to provide. When the waiting request cannot be admitted, the
+        step is a pure decode batch and its spans stay uniform, so the
+        drafts are kept.
+        """
+        if not self.waiting:
+            return False
+        max_running = getattr(self, "max_num_running_reqs", None)
+        if max_running is None:
+            # Unknown capacity: assume the waiting request joins (the
+            # pre-existing behaviour, which is the safe direction -- an
+            # uneven batch is dropped a step later instead of being fed to
+            # the runner as a mixed span).
+            return True
+        num_running = len(self.running) + int(getattr(self, "num_waiting_for_streaming_input", 0) or 0)
+        return num_running < int(max_running)
+
+    def _drop_talker_drafts_if_prefill_pending(self) -> None:
+        """Keep the Talker's K-frame decode out of steps with uneven spans.
+
+        The Talker multi-frame loop requires uniform decode spans, and the
+        runner refuses anything else (better a crash than a silently wrong
+        codec stream). What matters is the number of rows vLLM is about to
+        schedule per request -- not the request's spec_token_ids length:
+
+        * a plain decode is scheduled ``1 + num_spec_tokens`` rows (the
+          continuation placeholders, re-armed every step);
+        * a request carrying a streaming (or chunked) input chunk keeps its
+          own token count, e.g. 7 rows for a 7-token chunk;
+        * a decode that cannot fit the padded width (near max_model_len)
+          falls back to a single row.
+
+        Any mix of those in one step produces non-uniform spans, even in a
+        pure decode batch with no prefill in sight. Rather than dying at
+        the runner, drop the continuation drafts for this round: every
+        decode row schedules a single token next step, the step takes the
+        single-frame path, and the next propose re-arms the K frames.
+        Continuation drafts are stateless, so dropping them is free.
+        """
+        if not self._talker_kstep_armed():
+            return
+        num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
+        max_len = getattr(self, "max_model_len", None)
+        try:
+            max_len = int(max_len) if max_len is not None else None
+        except (TypeError, ValueError):
+            max_len = None
+        prefill_pending = self._talker_waiting_prefill_may_run()
+        widths: set[int] = set()
+        starved_req_ids: list[str] = []
+        for req in self.running:
+            computed = int(req.num_computed_tokens)
+            prompt_len = len(req.prompt_token_ids)
+            total = int(getattr(req, "num_tokens", prompt_len))
+            delta = total - computed
+            if computed < prompt_len:
+                prefill_pending = True
+                continue
+            if delta <= 0:
+                # Nothing scheduled for this request; it owns no rows.
+                continue
+            if delta == 1:
+                can_pad = max_len is None or computed + 1 + num_spec + 1 <= max_len
+                if num_spec > 0:
+                    if can_pad:
+                        widths.add(1 + num_spec)
+                    else:
+                        widths.add(1)
+                        starved_req_ids.append(req.request_id)
+            else:
+                widths.add(delta)
+        uneven = len(widths) > 1
+        if not prefill_pending and not uneven:
+            return
+        # A request too close to max_model_len to carry the padded width
+        # schedules a single row next to the neighbours' 1+num_spec. Do NOT
+        # finish it here: finishing bypasses the final output, so the
+        # downstream stage never sees a terminal chunk and its input-stall
+        # watchdog fails the request after 600s (seed-tts WER regression:
+        # 8/20 requests). Instead let it ride along -- dropping every draft
+        # books a uniform single-frame step, the engine's own
+        # FINISHED_LENGTH_CAPPED caps the request within num_spec+2 steps
+        # through the normal output path, and constant_drafts re-arms the
+        # K-step right after.
+        if not prefill_pending and starved_req_ids:
+            # Every one of these steps forfeits the batch's drafts, which
+            # visibly eats into the K-step RTF gain when several requests
+            # reach the context edge at different times. Log once per
+            # request so the drain is observable without flooding the log.
+            logged = getattr(self, "_kstep_starved_logged", None)
+            if logged is None:
+                logged = set()
+                self._kstep_starved_logged = logged
+            fresh = [rid for rid in starved_req_ids if rid not in logged]
+            if fresh:
+                logged.update(fresh)
+                logger.warning(
+                    "[kstep] %d request(s) starved of the padded width "
+                    "(near max_model_len); the batch drops its drafts "
+                    "until FINISHED_LENGTH_CAPPED closes them: %s",
+                    len(fresh),
+                    ", ".join(map(str, fresh)),
+                )
+        for req in self.running:
+            if req.spec_token_ids:
+                req.spec_token_ids = []
+
+    def _enforce_kstep_span_uniformity(self, scheduler_output: SchedulerOutput) -> None:
+        """Book uniform spans on the *scheduled* output before dispatch.
+
+        The pre-schedule guard above reasons about request state, but the
+        actual per-request frame count is only fixed inside upstream
+        ``schedule()``: vllm v1/core/sched/scheduler.py derives each
+        request's ``num_scheduled_spec_tokens`` from its own token budget
+        (streaming placeholders, remaining budget), so one step can leave
+        the scheduler with span widths like 4/5/5/6/6 -- which the talker
+        multi-frame loop refuses, fatally.
+
+        Exactly two booked shapes are executable on the static-shape decode
+        backend -- q_len=1 and q_len=1+num_spec rows (the captured FULL
+        graphs book exactly those two) -- so this pass rewrites the
+        schedule into the one that needs no drafts:
+
+        * single-frame: drop every draft so all decode rows book one row.
+          A narrower multi-frame step is NOT a fallback: trimming to the
+          batch minimum (10-09: a uniform 3-frame batch) leaves the runner
+          no graph to replay and it stalls silently -- stage 1 emitted no
+          chunks and stage 2 errored every request after a 600s wait. On a
+          draftless step ``constant_drafts`` re-arms the full K-step, so
+          one single-frame step is all the recovery the pipeline needs.
+
+        Rows wider than 1 without drafts are prefill/extend rows; they may
+        only coexist with single-frame decode rows, so any drafts go.
+        """
+        if not self._talker_kstep_armed():
+            return
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not num_scheduled_tokens:
+            return
+        changed = False
+        min_frames = None
+        if any(n > 1 and rid not in spec_tokens for rid, n in num_scheduled_tokens.items()):
+            # Mixed step: a prefill/extend row next to a drafted decode row
+            # is exactly the non-uniform shape the runner dies on.
+            if spec_tokens:
+                for rid in spec_tokens:
+                    num_scheduled_tokens[rid] = 1
+                spec_tokens.clear()
+                changed = True
+                min_frames = 0
+        elif spec_tokens:
+            num_spec_tokens = int(getattr(self, "num_spec_tokens", 0) or 0)
+            uniform_full = len(spec_tokens) == len(num_scheduled_tokens) and {len(v) for v in spec_tokens.values()} == {
+                num_spec_tokens
+            }
+            if not uniform_full:
+                # A narrower K-step is not executable: the static-shape decode
+                # backend has no graph for q_len in (1, 1+num_spec), so a
+                # trim-to-minimum rewrite stalls the runner silently. Drop
+                # every draft and let the single-frame step re-arm the K-step
+                # (constant_drafts re-drafts after a draftless step).
+                for rid, v in spec_tokens.items():
+                    if v:
+                        num_scheduled_tokens[rid] -= len(v)
+                spec_tokens.clear()
+                changed = True
+                min_frames = 0
+        if changed:
+            scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+            logger.error(
+                "[kstep] booked spans were non-uniform; rewrote the step to a "
+                "uniform %d-frame batch (%d rows, total=%d, per_req=%s) instead of "
+                "feeding the multi-frame loop spans it declines",
+                min_frames,
+                len(num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                dict(num_scheduled_tokens),
+            )
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Rewrite the K-step spans before upstream books the step.
+
+        ``_enforce_kstep_span_uniformity`` can shrink rows the static-shape
+        multi-frame loop refuses to execute. Upstream books the step here --
+        ``_update_after_schedule`` is the last thing its ``schedule()`` does
+        (vllm/v1/core/sched/scheduler.py:1516) -- advancing
+        ``num_computed_tokens`` *and* ``num_in_flight_tokens`` by the span each
+        request was scheduled for, while ``update_from_output`` drains only
+        what the dispatched output says (:2023). Rewriting after that point
+        left every shrunk row carrying ``booked - 1`` tokens in flight for
+        good and handed the next admission an inflated computed count: two
+        requests booked 8/4 with drafts and executed as 1/1 settled at 108/104
+        instead of 101/101 (review on #7929).
+
+        Running ahead of the upstream body makes it book exactly the spans
+        that are dispatched, so no request state has to be reconciled
+        afterwards. Every path that books reaches this method -- upstream's
+        ``schedule()`` and the generation fast path both call it -- and the
+        call site in ``schedule()`` below stays as a backstop for a step built
+        without booking, where there is no accounting to settle.
+        """
+        self._enforce_kstep_span_uniformity(scheduler_output)
+        super()._update_after_schedule(scheduler_output)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        waiting = getattr(self, "waiting")
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-        original_waiting = None
-        if self._should_defer_waiting_admission():
-            original_waiting = waiting
-            self.waiting = create_request_queue(self.policy)
+        # Talker K-frame guard: a step whose decode spans would be uneven
+        # (mixed prefill+decode rows, or a first-step decode joining a
+        # steady-state K-step request) must not carry the K-step drafts --
+        # the multi-frame loop requires uniform decode spans and the runner
+        # refuses the rest.
+        self._drop_talker_drafts_if_prefill_pending()
 
-        original_max_num_running_reqs = self.max_num_running_reqs
+        original_wait_queues = None
+        if self._should_defer_waiting_admission():
+            original_wait_queues = self.waiting, self.kv_holding_waiting
+            self.waiting = create_request_queue(self.policy)
+            self.kv_holding_waiting = create_request_queue(self.policy)
+
+        original_max_num_active_reqs = self.max_num_active_reqs
         async_chunk_transport = self._async_chunk_transport_enabled()
         reserved_running_slots = (
             self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
         )
         if reserved_running_slots:
-            self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
+            self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
-            self.max_num_running_reqs = original_max_num_running_reqs
-            if original_waiting is not None:
-                deferred_waiting = list(self.waiting)
-                if deferred_waiting:
-                    original_waiting.prepend_requests(deferred_waiting)
-                self.waiting = original_waiting
+            self.max_num_active_reqs = original_max_num_active_reqs
+            if original_wait_queues is not None:
+                original_waiting, original_kv_holding = original_wait_queues
+                original_waiting.prepend_requests(self.waiting)
+                original_kv_holding.prepend_requests(self.kv_holding_waiting)
+                self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
+        # Backstop: a step built without ``_update_after_schedule`` (nothing
+        # booked, so nothing to reconcile) still leaves here uniform. On the
+        # booking paths the rewrite already ran ahead of the booking and this
+        # call finds uniform spans and returns.
+        self._enforce_kstep_span_uniformity(scheduler_output)
         self._postprocess_omni_schedule_output(
             scheduler_output,
             include_cached_payloads=True,
@@ -428,10 +806,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        prompt_token_id_logprobs_dict = getattr(model_runner_output, "prompt_token_id_logprobs_dict", {})
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
+        # Token-only processors need sampled IDs even without a tensor payload.
+        processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
+        requires_token_updates = getattr(processor, "requires_token_updates", False) is True
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
@@ -509,7 +891,54 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # The per-request emit policy only varies with stop/control state: look the config up once.
+        emit_every_step: bool | None = None
+        spec_decode_tokens = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+        # Plain decode rows (one sampled token, nothing but the token and the
+        # step's audio to publish) take a short path below when this step
+        # carries none of the features the general path handles.
+        fast_decode = not (
+            failed_kv_load_req_ids
+            or spec_decode_tokens
+            or getattr(self, "kv_transfer_criteria", None)
+            or self.chunk_transfer_adapter is not None
+            or getattr(self, "is_mm_encoder_only", False)
+            or num_nans_in_logits is not None
+            or prompt_logprobs_dict
+            or prompt_token_id_logprobs_dict
+            or pooler_outputs
+        )
+        new_prompt_len_snapshot = self._new_prompt_len_snapshot
+        # One processor call per step when the next-stage processor has an
+        # opted-in batch form (``per_step_batch``; it needs per-request finish
+        # flags, not step tokens).
+        batch_saves: list[dict[str, Any]] | None = (
+            []
+            if inspect.isfunction(
+                getattr(self.chunk_transfer_adapter, "custom_process_next_stage_input_batch_func", None)
+            )
+            and not requires_token_updates
+            else None
+        )
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            if num_tokens_scheduled <= 0:
+                # A zero-token schedule entry used to die on the bare assert
+                # below with no context. Report which request and in what state
+                # first; the assert still fires.
+                _r = self.requests.get(req_id)
+                _spec = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+                logger.error(
+                    "SCHED0 zero-token schedule: req=%s n=%s spec_tokens=%s status=%s "
+                    "num_computed=%s num_output_placeholders=%s finished=%s all_entries=%s",
+                    req_id,
+                    num_tokens_scheduled,
+                    _spec,
+                    getattr(_r, "status", None),
+                    getattr(_r, "num_computed_tokens", None),
+                    getattr(_r, "num_output_placeholders", None),
+                    None if _r is None else _r.is_finished(),
+                    dict(list(num_scheduled_tokens.items())[:8]),
+                )
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
@@ -559,6 +988,43 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
 
             status_before_stop = request.status
+            pre_updated = None
+            if (
+                fast_decode
+                and generated_token_ids
+                and not output_is_stale
+                and not (self._hold_payloadless_outputs and not (mm_outputs and mm_outputs[req_index]))
+                and not request.has_encoder_inputs
+                and not request.use_structured_output
+                and request.sampling_params is not None
+                and request.sampling_params.num_logprobs is None
+                and not request.pooling_params
+            ):
+                new_token_ids, stopped = self._update_request_with_output(request, generated_token_ids)
+                if not stopped:
+                    prefill_stats = request.take_prefill_stats()
+                    if prefill_stats is not None:
+                        prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
+                    if emit_every_step is None:
+                        emit_every_step = _should_emit_engine_output(
+                            self.vllm_config.model_config, stopped=False, has_control=False
+                        )
+                    if emit_every_step:
+                        OmniSchedulerMixin._append_request_output(
+                            self,
+                            outputs,
+                            request,
+                            new_token_ids=new_token_ids,
+                            multimodal_output=mm_outputs[req_index] if mm_outputs else None,
+                            stop_reason=request.stop_reason,
+                            prefill_stats=prefill_stats,
+                            num_nans_in_logits=request.num_nans_in_logits,
+                            new_prompt_len_snapshot=new_prompt_len_snapshot.get(req_id),
+                            num_generation_tokens=_num_generation_tokens(request),
+                        )
+                    continue
+                # Stopped this step: the general path below finishes the request.
+                pre_updated = new_token_ids, stopped
             new_logprobs = None
             logprob_validation_failed = False
 
@@ -580,7 +1046,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     generated_token_ids = []
                     logprob_validation_failed = True
 
-            scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            scheduled_spec_token_ids = spec_decode_tokens.get(req_id) if spec_decode_tokens else None
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -604,6 +1070,57 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+            elif self._talker_kstep_armed() and scheduled_spec_token_ids and sampled_token_ids:
+                # This request had drafts scheduled but its row
+                # came back with no generated tokens while the step itself
+                # sampled (a logprob-contract failure emptied the row above,
+                # the rejection sampler dropped every token, ...). The draft
+                # tokens were counted as computed but none of them will ever
+                # produce output, so roll them back -- otherwise the next
+                # step schedules a negative count and the engine stalls.
+                # NOTE the guard on `scheduled_spec_token_ids`: upstream takes
+                # it from `.get(req_id)` and a request with no drafts this
+                # step gets None -- an empty row without drafts is normal
+                # (a non-final prefill chunk produces no tokens) and upstream
+                # skips it; the guard above keeps that path intact. The
+                # rollback semantics are verified for the Talker K-step loop
+                # only, hence the armed gate: a non-K-step spec-decode stage
+                # keeps upstream's own handling of the empty-row case.
+                # A prefill-chunk row is different: the chunk's prompt tokens
+                # did land in the KV cache, so only the D drafts roll back
+                # (the base token stays advanced).
+                # A pure-decode row that came back empty rolls the base token
+                # back too -- schedule() optimistically advanced all scheduled
+                # tokens and not one of them produced output. A *short* row is
+                # not this branch: a step the multi-frame loop declined emits
+                # one accepted token through the branch above, where the
+                # engine's own accounting (``num_accepted = len(generated) -
+                # 1``) keeps the base token and rolls back only the drafts.
+                _drafts = len(scheduled_spec_token_ids)
+                _scheduled = num_tokens_scheduled
+                _prev_computed = request.num_computed_tokens - _scheduled
+                _prompt_len = (
+                    len(request.prompt_token_ids) if getattr(request, "prompt_token_ids", None) is not None else 0
+                )
+                _is_prefill_row = _prev_computed < _prompt_len
+                _rollback = _drafts if _is_prefill_row else min(_scheduled, _drafts + 1)
+                logger.error(
+                    "K-step: request %s returned an empty row on a %s step "
+                    "(scheduled=%s drafts=%s computed=%s prompt_len=%s); "
+                    "rolling back %s. An empty decode row is never expected "
+                    "from the verify path -- this log is the stall signature.",
+                    req_id,
+                    "prefill" if _is_prefill_row else "decode",
+                    _scheduled,
+                    _drafts,
+                    request.num_computed_tokens,
+                    _prompt_len,
+                    _rollback,
+                )
+                if request.num_computed_tokens >= _rollback:
+                    request.num_computed_tokens -= _rollback
+                if request.num_output_placeholders >= _rollback:
+                    request.num_output_placeholders -= _rollback
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -633,7 +1150,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.resumable = False
 
             # Check for stop and update request status.
-            if new_token_ids:
+            if pre_updated is not None:
+                new_token_ids, stopped = pre_updated
+            elif new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
                 if output_is_stale:
                     new_token_ids, stopped = self._update_request_with_output(request, new_token_ids, is_stale=True)
@@ -689,18 +1208,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Only when this step might save. Read additional_information
             # before _free_request rewrites it.
             omits_chunk_transfer = False
-            if self.chunk_transfer_adapter is not None and (inter_stage_output is not None or stopped):
+            if self.chunk_transfer_adapter is not None and (
+                inter_stage_output is not None or (new_token_ids and requires_token_updates) or stopped
+            ):
                 omits_chunk_transfer = self._request_omits_chunk_transfer_to_next_stage(request)
             # Capture before resumable stop handling can clear token history.
-            output_token_ids: Any = getattr(request, "output_token_ids", None)
-            if output_token_ids is None:
-                output_token_ids = getattr(request, "_output_token_ids", ())
-            num_generation_tokens = len(output_token_ids)
+            num_generation_tokens = _num_generation_tokens(request)
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
-                if model_runner_output.routed_experts is not None:
-                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
+                if (
+                    self.aux_output_connector is not None
+                    and (aux_output := model_runner_output.aux_output_connector_output) is not None
+                ):
+                    routed_experts = self.aux_output_connector.take_output(request, aux_output)
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
@@ -773,6 +1294,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            prompt_token_id_logprobs = prompt_token_id_logprobs_dict.get(req_id)
             has_stage_output = (
                 bool(new_token_ids)
                 or mm_output is not None
@@ -780,11 +1302,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 or kv_transfer_params
                 or stopped
             )
-            if has_stage_output and _should_emit_engine_output(
-                self.vllm_config.model_config,
-                stopped=stopped,
-                has_control=kv_transfer_params is not None,
+            if (
+                has_stage_output
+                and not stopped
+                and not mm_output
+                and pooler_output is None
+                and prefill_stats is None
+                and new_logprobs is None
+                and prompt_logprobs_tensors is None
+                and prompt_token_id_logprobs is None
+                and kv_transfer_params is None
+                and request.num_nans_in_logits == 0
+                and self._hold_payloadless_outputs
+                and request.sampling_params is not None
+                and not request.sampling_params.detokenize
             ):
+                # Token-only step of a final audio stage: the client sees
+                # nothing new, so carry the tokens on the next emitted output
+                # instead of sending one output per decode step.
+                self._held_token_ids.setdefault(req_id, []).extend(new_token_ids)
+                has_stage_output = False
+            if has_stage_output and emit_every_step is None and not stopped and kv_transfer_params is None:
+                emit_every_step = _should_emit_engine_output(
+                    self.vllm_config.model_config, stopped=False, has_control=False
+                )
+            if has_stage_output and (stopped or kv_transfer_params is not None or emit_every_step):
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,
@@ -793,6 +1335,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     finish_reason=finish_reason,
                     new_logprobs=new_logprobs,
                     new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                    prompt_token_id_logprobs=prompt_token_id_logprobs,
                     pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
                     stop_reason=request.stop_reason,
@@ -808,6 +1351,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+                assert prompt_token_id_logprobs is None
 
             if omits_chunk_transfer and inter_stage_output is not None:
                 logger.warning(
@@ -818,7 +1362,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (
                 self.chunk_transfer_adapter is not None
                 and not omits_chunk_transfer
-                and (inter_stage_output is not None or is_segment_finished or finished)
+                and (
+                    inter_stage_output is not None
+                    or (new_token_ids and requires_token_updates)
+                    or is_segment_finished
+                    or finished
+                )
             ):
                 save_kwargs = {
                     "new_token_ids": new_token_ids,
@@ -826,12 +1375,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 }
                 if is_segment_finished:
                     save_kwargs["segment_generation"] = boundary_generation
-                self.chunk_transfer_adapter.save_async(
-                    inter_stage_output,
-                    request,
-                    is_segment_finished,
-                    **save_kwargs,
-                )
+                if batch_saves is not None:
+                    batch_saves.append(
+                        {
+                            "multimodal_output": inter_stage_output,
+                            "request": request,
+                            "is_segment_finished": is_segment_finished,
+                            **save_kwargs,
+                        }
+                    )
+                else:
+                    self.chunk_transfer_adapter.save_async(
+                        inter_stage_output,
+                        request,
+                        is_segment_finished,
+                        **save_kwargs,
+                    )
+
+        if batch_saves and self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter.save_async_batch(batch_saves)
 
         self._remove_stopped_requests_from_queues(
             stopped_running_reqs,
@@ -871,6 +1433,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             engine_core_outputs,
             synthesize_abort_outputs=True,
         )
+
+        # Include external errors, control messages and synthetic aborts in the
+        # same flush, after every output path has finished assembling its batch.
+        if self._hold_payloadless_outputs:
+            for client_output in engine_core_outputs.values():
+                for output in client_output.outputs:
+                    held = self._held_token_ids.pop(output.request_id, None)
+                    if held:
+                        output.new_token_ids = held + output.new_token_ids
+                        output.is_coalesced = True
 
         self._attach_scheduler_stats(
             engine_core_outputs,
@@ -945,7 +1517,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.async_tokens_to_discard = 1
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
-            session.spec_token_ids = []
+        # Clear stale drafts unconditionally, not only under
+        # async scheduling. With async off -- which the K-step vehicle
+        # requires -- a draft proposed before the segment boundary survived
+        # into the next segment's prefill; the runner discards prefill rows
+        # that are not the final chunk, so that row produced no token
+        # forever and the request either tripped a negative num_new_tokens
+        # or livelocked until it timed out.
+        session.spec_token_ids = []
         stage_id = self.vllm_config.model_config.stage_id
 
         update_infos = (
@@ -966,8 +1545,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
                     self.num_waiting_for_streaming_input -= 1
                 session.status = RequestStatus.WAITING
-                if session in self.skipped_waiting:
-                    self.skipped_waiting.remove_requests((session,))
+                self.deferred_waiting.discard(session)
+                if session in self.kv_holding_waiting:
+                    self.kv_holding_waiting.remove_requests((session,))
                     self._enqueue_waiting_request(session)
 
                 if self.log_stats:
@@ -1020,22 +1600,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             "update_streaming_prompt_for_condition",
             None,
         )
-        if stage_id != 0 and streaming_prompt_payload is not None and callable(update_streaming_prompt):
+        native_prompt = bool(getattr(self, "_native_data_plane", False))
+        if (
+            stage_id != 0
+            and streaming_prompt_payload is not None
+            and (callable(update_streaming_prompt) or native_prompt)
+        ):
             mm_feature_base = session.num_computed_tokens
             try:
-                replaced = update_streaming_prompt(
-                    streaming_prompt_payload,
-                    session,
-                    update_prompt=True,
-                )
+                if callable(update_streaming_prompt):
+                    replaced = update_streaming_prompt(streaming_prompt_payload, session, update_prompt=True)
+                else:
+                    replaced = self._update_native_streaming_prompt(session, streaming_prompt_payload)
             except ValueError as exc:
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
-                # callable(update_streaming_prompt) above implies a live
-                # adapter; the assert narrows it for the type checker.
-                assert chunk_transfer_adapter is not None
-                chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                if chunk_transfer_adapter is not None:
+                    chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                else:
+                    self._streaming_context_overflow[req_id] = (session.client_index, str(exc))
+                    if not session.is_finished():
+                        self.finish_requests((req_id,), RequestStatus.FINISHED_ERROR)
                 return
             if replaced is not None:
                 if replaced:
@@ -1074,6 +1660,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
+        """Delegate streaming prompt policy to the stage's payload processor."""
+        from vllm.utils.import_utils import resolve_obj_by_qualname
+
+        if not hasattr(self, "_native_prompt_hook"):
+            path = getattr(self.vllm_config.model_config, "custom_process_next_stage_input_func", None)
+            processor = resolve_obj_by_qualname(path) if path else None
+            self._native_prompt_hook = getattr(processor, "update_streaming_prompt_for_condition", None)
+        if self._native_prompt_hook is None:
+            return None
+        return self._native_prompt_hook(self.vllm_config.model_config, session, payload)
 
     def _maybe_reanchor_streaming_window(
         self,
@@ -1348,6 +1946,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if overflow is None:
             overflow = self._streaming_context_overflow = {}
         overflow[session.request_id] = (int(getattr(session, "client_index", 0) or 0), reason)
+        overflowed = getattr(self, "_overflowed_streaming_requests", None)
+        if overflowed is None:
+            overflowed = self._overflowed_streaming_requests = set()
+        overflowed.add(session.request_id)
         if session.is_finished():
             # Reached from ``_handle_stopped_request`` with a queued update.
             # ``update_from_output`` frees every request that call reports as
@@ -1391,7 +1993,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ``_free_blocks``) and skips the caller's input-coordinator cleanup.
         """
         self.waiting.remove_requests((request,))
-        self.skipped_waiting.remove_requests((request,))
+        self.kv_holding_waiting.remove_requests((request,))
+        self.deferred_waiting.discard(request)
         if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.FINISHED_ERROR
@@ -1482,6 +2085,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        elif status == RequestStatus.FINISHED_ABORTED:
+            # Without finished-request notifications no synthetic abort output
+            # will flush these tokens; the cancelled consumer no longer needs them.
+            getattr(self, "_held_token_ids", {}).pop(request_id, None)
 
         # Mirror the generation scheduler's try/finally pattern so the
         # input_coordinator entry is always pruned along every return path,

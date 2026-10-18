@@ -30,6 +30,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.cuda_mps import CudaMPSServer, physical_gpu_uuid
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -179,6 +180,8 @@ class StageRuntime:
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
+        # Set by shutdown()/cancel_initialization(): stop launching further replicas.
+        self._init_cancelled = threading.Event()
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         # When True, same-device stages initialize concurrently, coordinated by
@@ -398,7 +401,15 @@ class StageRuntime:
         lock_fds: list[int] = []
         locked_devices: set[int] = set()
         launch: StageEngineLaunch | None = None
-        exited_contexts = 0
+        exited_contexts: set[int] = set()
+        handshake_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        stop_handshakes = threading.Event()
+        # With several API servers every replica is spawned before the first
+        # handshake. Replicas sharing devices still initialize in launch
+        # order, so keep the conservative wait budget for the longest chain.
+        handshake_timeout_s = (
+            float(timeout) * sum(len(plan.replicas) for plan in stage_plans) if num_api_servers > 1 else None
+        )
 
         try:
             for plan in stage_plans:
@@ -441,6 +452,8 @@ class StageRuntime:
                         omni_parallel_stage_init=self._parallel_stage_init,
                         num_api_servers=num_api_servers,
                         watched_frontend_processes=watched_frontend_processes if num_api_servers > 1 else None,
+                        stage_init_timeout=timeout,
+                        handshake_timeout_s=handshake_timeout_s,
                     )
                     # Environment overlays are process-global. Serialize spawn;
                     # parallel initialization waits for READY outside this lock.
@@ -455,7 +468,7 @@ class StageRuntime:
                             raise RuntimeError(f"LLM stage {plan.stage_id} launcher returned no resources")
                         resources.append(stage_resources)
                     if num_api_servers == 1:
-                        exited_contexts += 1
+                        exited_contexts.add(len(entered_contexts) - 1)
                         launch_context.__exit__(None, None, None)
                     addresses = stage_resources.addresses
                     # The generic resource bundle allows no addresses (e.g.
@@ -503,21 +516,59 @@ class StageRuntime:
             )
             yield launch
 
-            while exited_contexts < len(entered_contexts):
-                entered_context = entered_contexts[exited_contexts]
-                exited_contexts += 1
-                entered_context.__exit__(None, None, None)
+            if num_api_servers > 1:
+                replicas = [replica for plan in stage_plans for replica in plan.replicas]
+                handshake_groups: dict[str, list[int]] = {}
+                for index, key in enumerate(self._init_group_keys(replicas)):
+                    handshake_groups.setdefault(key, []).append(index)
+                handshake_state_lock = threading.Lock()
+
+                def complete_group(indices: list[int]) -> None:
+                    for index in indices:
+                        with handshake_state_lock:
+                            if stop_handshakes.is_set():
+                                return
+                            # A failed __exit__ also consumes its context.
+                            exited_contexts.add(index)
+                        try:
+                            entered_contexts[index].__exit__(None, None, None)
+                        except BaseException:
+                            stop_handshakes.set()
+                            raise
+
+                # The HELLO reply starts model initialization, so waiting for
+                # READY in launch order would serialize even disjoint GPUs.
+                # Match the frontend attachment scheduler's device groups.
+                if len(handshake_groups) == 1:
+                    complete_group(next(iter(handshake_groups.values())))
+                elif handshake_groups:
+                    handshake_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=len(handshake_groups), thread_name_prefix="stage-handshake"
+                    )
+                    futures = [handshake_executor.submit(complete_group, group) for group in handshake_groups.values()]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
         except BaseException as exc:
+            stop_handshakes.set()
+            # Terminating engines wakes handshake pollers via their process
+            # sentinels. Do this before joining any still-running workers.
             if launch is not None:
                 launch.shutdown()
             else:
                 StageEngineLaunch(client_configs=client_configs, resources=resources).shutdown()
+            if handshake_executor is not None:
+                handshake_executor.shutdown(wait=True, cancel_futures=True)
+                handshake_executor = None
             exc_info = (type(exc), exc, exc.__traceback__)
-            for pending_context in reversed(entered_contexts[exited_contexts:]):
+            for index in reversed(range(len(entered_contexts))):
+                if index in exited_contexts:
+                    continue
                 with contextlib.suppress(BaseException):
-                    pending_context.__exit__(*exc_info)
+                    entered_contexts[index].__exit__(*exc_info)
             raise
         finally:
+            if handshake_executor is not None:
+                handshake_executor.shutdown(wait=True)
             if lock_fds:
                 release_device_locks(lock_fds)
 
@@ -570,7 +621,12 @@ class StageRuntime:
             else:
                 del self._mps_servers[uuid]
 
+    def cancel_initialization(self) -> None:
+        """Stop launching replicas that have not started yet (e.g. after an init timeout)."""
+        self._init_cancelled.set()
+
     def shutdown(self) -> None:
+        self._init_cancelled.set()
         for pool in self.stage_pools:
             for client in pool.clients:
                 if client is not None and hasattr(client, "shutdown"):
@@ -900,6 +956,21 @@ class StageRuntime:
             """Initialize replicas in one scheduling group sequentially."""
             nonlocal primary_exc
             for stage_idx, replica in group:
+                if self._init_cancelled.is_set():
+                    logger.warning(
+                        "[StageRuntime] Initialization cancelled; not launching stage-%s replica-%s",
+                        stage_idx,
+                        replica.replica_id,
+                    )
+                    # Fail initialization instead of returning a partial set of
+                    # replicas, so the caller's cleanup path runs.
+                    with init_state_lock:
+                        if primary_exc is None:
+                            primary_exc = RuntimeError(
+                                f"Stage initialization was cancelled before stage-{stage_idx} "
+                                f"replica-{replica.replica_id} was launched"
+                            )
+                    return
                 with init_state_lock:
                     if primary_exc is not None:
                         return
@@ -1404,12 +1475,15 @@ class DistStageRuntime(StageRuntime):
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
-        return super()._prepare_stage_plans()
+        stage_plans = super()._prepare_stage_plans()
+        if all(replica.launch_mode == "remote" for plan in stage_plans for replica in plan.replicas):
+            logger.info("All stage replicas are remote; running only the frontend (API server + orchestrator)")
+        return stage_plans
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
         """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
         target_stage_id = self._single_stage_id_filter
-        if target_stage_id is None:
+        if target_stage_id is None or is_frontend_only(target_stage_id):
             return
 
         for idx, stage_cfg in enumerate(self._stage_configs):
@@ -1459,7 +1533,8 @@ class DistStageRuntime(StageRuntime):
     # ---- Distributed overrides ----
 
     def _get_launch_mode(self, stage_id: int) -> str:
-        if self._single_stage_id_filter is not None and stage_id != self._single_stage_id_filter:
+        stage_id_filter = self._single_stage_id_filter
+        if is_frontend_only(stage_id_filter) or (stage_id_filter is not None and stage_id != stage_id_filter):
             return "remote"
         return "local"
 

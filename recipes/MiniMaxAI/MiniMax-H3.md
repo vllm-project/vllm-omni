@@ -271,8 +271,10 @@ For a combined service on four high-memory GPUs, use:
 - regional `torch.compile` for the repeated DiT blocks;
 - dense BF16 `TRTLLM_ATTN`, with Ring and TP left at 1.
 
-Both DiTs remain resident in this no-offload configuration. If they do not fit,
-use model-level CPU offload.
+Both DiTs remain resident, except that supported SM120 deployments offload
+AdaLN projection weights by default. Other GPU architectures keep those weights
+resident unless explicitly opted in. If the models do not fit, use model-level
+CPU offload.
 
 ```bash
 export MODEL=MiniMaxAI/MiniMax-H3
@@ -988,6 +990,42 @@ settings, and both videos with any comparison; the command alone is not quality
 evidence. A matching seed does not imply matching noise over differently sized
 full and windowed latents.
 
+## Request-scoped sampler
+
+H3 supports `euler` (the default) and `res_multistep`. Select the sampler per
+request; it applies to both video and audio, using their separate sigma schedules.
+For the HTTP examples above, set `num_inference_steps=20` and add
+`"sampler":"res_multistep"` to the existing `extra_params` object. For example,
+the T2VA fields become:
+
+```bash
+-F 'num_inference_steps=20' \
+-F 'extra_params={"task":"t2va","duration":8.7,"audio_flow_shift":3.0,"sampler":"res_multistep"}'
+```
+
+For the offline Python API, use `extra_args`:
+
+```python
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+sampling_params = OmniDiffusionSamplingParams(
+    num_inference_steps=20,
+    seed=42,
+    extra_args={"task": "t2va", "sampler": "res_multistep"},
+)
+```
+
+Both samplers use one DiT evaluation per step in request mode and step execution.
+`res_multistep` retains the previous denoised prediction independently for each
+request and each stream; its first and final updates use Euler. Omitting `sampler`
+or selecting `euler` preserves the existing Euler update. Reducing the step count
+reduces model evaluations, but quality depends on the prompt and configuration;
+20 RES steps are a candidate to compare against an Euler-50 reference.
+
+Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
+must keep `sampler="euler"`. RES sampling with those schedules has not been
+validated and is rejected with `ValueError`.
+
 ## Request-scoped quality
 
 Add one of these fields to any HTTP request above. No Cache-DiT startup option
@@ -1040,12 +1078,13 @@ normally, avoiding cyclic eviction on repeated original-H3 requests. All origina
 remain loaded so new schedules and adapters can compute normally. Adapter changes,
 weight reloads, and model device moves invalidate the cache; parameter versions
 also guard individual entries. TP ranks coordinate hits before skipping a
-projection collective. Gradient-enabled execution, compilation, custom linear
-hooks, and tensors without weight version counters use the original computation.
+projection collective. Gradient-enabled execution, custom linear hooks, and
+tensors without weight version counters use the original computation. Both
+eager and compiled execution support projection reuse.
 Offload paths that replace weight storage can therefore reduce the hit rate.
 
-The runtime cache uses the shared `ExactProjectionCache` implementation; H3 keeps
-only its optional sidecar adaptation. Other models can integrate the same
+The runtime cache uses the shared `ExactProjectionCache` implementation; H3 owns
+its sidecar adaptation and projection weight offload. Other models can use the same
 [projection cache interface](../../docs/design/module/diffusion/diffusion_model_integration.md#exact-conditioning-projection-reuse).
 This cache retains projection outputs, not offloaded weights, and does not skip
 block weight prefetch.
@@ -1056,15 +1095,46 @@ For an A/B comparison, disable only this reuse at server startup:
 --cache-config '{"minimax_h3_adaln_cache": false}'
 ```
 
+### Default AdaLN weight offload
+
+AdaLN weight offload is enabled automatically on **SM120** for unquantized BF16
+CUDA inference with the default exact result cache. The default uses each
+worker's device capability; other GPU architectures keep their existing weight
+placement. It reduces GPU memory usage by
+keeping projection weights in host memory and reusing exact cached results.
+Both compiled and eager execution are supported; no extra enable flag is needed.
+Allow additional host RAM for the offloaded weights and pinned staging copies.
+Cache misses, including a cold request or a new timestep schedule, transfer
+weights to the GPU and synchronize staging; warmed cache hits avoid that work.
+Measure both cold latency and warmed throughput for the intended workload.
+
+Other compatible CUDA deployments can opt in explicitly:
+
+```bash
+--cache-config '{"minimax_h3_adaln_offload": true}'
+```
+
+The automatic default is limited to the tested SM120 path and does not depend
+on the attention provider or require FlashInfer.
+
+To keep AdaLN weights on the GPU while retaining result caching:
+
+```bash
+--cache-config '{"minimax_h3_adaln_offload": false}'
+```
+
+Non-CUDA platforms, quantized models, DiT-wide offload and HSDP retain their
+existing weight placement. Disabling the result cache also disables automatic
+AdaLN offload. Explicitly enabling it in an incompatible configuration raises
+an error.
+
 ### Optional offline sidecar
 
 An offline sidecar can seed the first projection results; it is not required to
-enable the default cache. Sidecars require `--enforce-eager`, native BF16 TP1
-math, and the same numerical environment as the builder. With the default
-compiled execution, sidecars are rejected before reading their payloads: compiled
-H3 blocks bypass cached projections, so retaining those payloads would waste GPU
-memory. This applies to both the main and Ref2VA sidecars. Other serving
-configurations retain the default runtime-cache behavior described above.
+enable the default cache. Sidecars require native BF16 TP1 math and the same
+numerical environment as the builder. Both eager and compiled H3 execution
+consult sidecars through the host cache boundary. Uncovered or incompatible
+inputs use the original projection instead.
 From the repository root, for a fixed FastH3 adapter and its own four-step schedule:
 
 ```bash
@@ -1081,10 +1151,9 @@ The builder accepts a native transformer directory with `config.json` and indexe
 or single-file safetensors. It streams the required inputs and refuses to overwrite
 an existing output. It does not instantiate the full DiT.
 
-Pass the resulting local artifact at eager server startup:
+Pass the resulting local artifact at server startup:
 
 ```bash
---enforce-eager \
 --cache-config '{"minimax_h3_adaln_cache_path": "/path/to/h3-adaln.safetensors"}'
 ```
 
@@ -1097,8 +1166,8 @@ the runtime path. A request with different settings similarly falls back.
 Build sidecars from trusted local inputs: checksums verify identity and integrity,
 not the correctness of an untrusted generator.
 
-This implementation saves repeated projection work. It does not remove AdaLN
-weights or claim a GPU memory reduction. End-to-end gains depend on the workload,
+Caching and sidecars alone save repeated projection work; GPU residency changes
+with weight offload, which is enabled by default on supported SM120 configurations. Gains depend on the workload,
 offload behavior, embedding fingerprint cost, and TP coordination overhead.
 
 ## LoRA
@@ -1274,8 +1343,8 @@ hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
 export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 ```
 
-Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
-command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
+Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a server command without
+DiT-wide offload. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
 correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
 fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
 rejected rather than served without the adapter it asked for.
@@ -1296,18 +1365,29 @@ Only a release that identifies itself as FastH3 is fused; any other
 `fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
 is then held to its own metadata: one that misdeclares its tensor counts or
 leaves a transformer block unedited is refused at startup instead of serving
-mostly base H3 weights on a four-step schedule. Offload is refused for the same
+mostly base H3 weights on a four-step schedule. DiT-wide offload is refused for the same
 reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
 `--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
 
-The VSA variants are supported through FastVideo's external kernel. Install a
-`fastvideo-kernel` build that provides the `fastvideo_kernel` Python module,
-then add the following flags to the same command:
+For the VSA variants, add the following flags to the same command. H3 selects
+FlashInfer BF16 automatically on SM120/SM121 when the required tile64 API is
+installed; otherwise it uses FastVideo's external kernel, supplied by the
+`vllm-omni[vsa]` extra. The video request API is unchanged:
 
 ```bash
 --diffusion-attention-backend FASTVIDEO_VSA \
 --fastvideo-vsa-topk 64
 ```
+
+To use approximate Sage attention on SM120, replace those two flags with:
+
+```bash
+--diffusion-attention-config '{"default":{"backend":"FASTVIDEO_VSA","fastvideo_vsa_precision":"sage","fastvideo_vsa_topk":64},"per_role":{"minimax_h3.token_refiner":{"backend":"TORCH_SDPA"}}}'
+```
+
+Sage requires a compatible FlashInfer build; BF16 remains the default. See
+[provider selection](../../docs/user_guide/diffusion/attention_backends/fastvideo_vsa.md#automatic-provider-selection)
+for hardware requirements and provider overrides.
 
 FastH3 VSA applies its learned `.set_weight` compression gates to the complete
 packed `[text | cond | audio | video]` document using the official H3 geometry:
@@ -1398,6 +1478,87 @@ This release supports T2VA only, with local or pure Ulysses attention. Additiona
 LoRA adapters, Ref2VA and FL2VA conditioning are unsupported. The legacy
 four-step adapter keeps its original sampling and fixed-top-k behavior.
 
+### VDN-H3 checkpoint
+
+[VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) is an 8-step DMD student of
+the FL2VA partition. Each DiT block replaces dense self-attention with an exact
+softmax over a frame window plus a Video DeltaNet linear branch for the frames
+outside it. The `VDNH3_ATTN` backend runs the window; see
+[VDN-H3 Hybrid Attention](../../docs/user_guide/diffusion/attention_backends/vdnh3_attn.md)
+for the window layout. The release's two LoRA adapters are fused into the H3
+weights as they stream in, and the linear-branch weights are attached to the
+DiT blocks.
+
+Pass the release as `--lora-path`. Only its `stage-dmd-step-250/` directory
+(about 5 GB) is downloaded; a local copy of the release or of that directory
+also works:
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve MiniMaxAI/MiniMax-H3 --omni \
+  --trust-remote-code \
+  --task-type fl2va \
+  --lora-path OpenVDN/vdn-minimax-h3 \
+  --diffusion-attention-backend VDNH3_ATTN \
+  --tensor-parallel-size 2 \
+  --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2
+```
+
+Requests use 8 steps and task `t2va` or `fl2va`:
+
+```bash
+-F 'num_inference_steps=8' \
+-F 'extra_params={"task":"t2va","duration":5}'
+```
+
+FL2VA takes a first frame, a last frame, or both, with the same
+`frame_indices` forms as
+[FL2VA for base H3](#2-fl2va-first-frame-to-video-and-audio).
+
+The student was distilled at 8 steps with H3's default video/audio shifts of
+12/3 and the Euler sampler. A request with another step count, a shift
+override, `sampler=res_multistep`, or a `lora=` field is rejected. Add
+`--quantization fp8` to run the DiT and text-encoder linears in FP8, including
+the linear branch's output projection.
+
+`VDNH3_ATTN` and the checkpoint must be selected together, and the server must
+use `--task-type fl2va`. VDN-H3 scales with tensor parallelism only: `--usp`
+and `--ring` are rejected. Distributed layerwise offload is rejected because it
+installs the DiT without the load-time fusion. The startup log confirms the
+fusion:
+
+```text
+VDN-H3 stage-dmd-step-250: fused 259 LoRA targets, loaded 800 branch tensors
+```
+
+Tensor-parallel sizes 1 (with `--enable-cpu-offload`), 2, and 8 were run end to
+end on NVIDIA H200 (141 GB, NVLink), with T2VA and with all three FL2VA
+keyframe forms at TP2. Cache acceleration, step execution, and
+latent upscale/refine have not been run with VDN-H3.
+
+Measured on H200 at 1344x768 and 14.375 s (345 frames, about 104k tokens) for
+one T2VA prompt with seed 1000, using the offline API and
+`--vae-patch-parallel-size` equal to the TP size. Compilation is on, the first
+request is excluded as warm-up, and one request was recorded per row. DiT time
+per step is the mean of steps 2-8:
+
+| GPUs | Configuration | DiT time per step | End-to-end |
+| ---: | --- | ---: | ---: |
+| 2 | VDN-H3, BF16 | 8.2 s | 74.6 s |
+| 2 | VDN-H3, FP8 | 7.2 s | 67.9 s |
+| 2 | Base H3, `FLASH_ATTN`, 8 steps, BF16 | 15.4 s | 132.4 s |
+| 8 | VDN-H3, BF16 | 2.9 s | 28.8 s |
+| 8 | VDN-H3, FP8 | 2.8 s | 27.9 s |
+| 8 | Base H3, `FLASH_ATTN`, 8 steps, BF16 | 4.4 s | 41.0 s |
+
+The base H3 rows only isolate the attention cost; base H3 is not distilled for
+8 steps. For correctness, the first eager DiT forward was replayed through the
+OpenVDN reference implementation on identical inputs. The relative L2 error
+was 1.6e-2 for video and 1.0e-2 for audio, against 1.2e-2 and 1.4e-2 for base
+H3 replayed the same way. Software: Ubuntu 22.04, driver 580.178.04, Python
+3.12, PyTorch 2.13.0+cu130, vLLM 0.30.0.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
@@ -1408,6 +1569,7 @@ four-step adapter keeps its original sampling and fixed-top-k behavior.
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
+| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |

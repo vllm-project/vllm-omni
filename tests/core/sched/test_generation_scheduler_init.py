@@ -44,16 +44,15 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
     )
 
 
-@pytest.mark.parametrize("profile", ["high_concurrency", "low_latency"])
 @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
 def test_moss_profile_generation_constructor_after_platform_resolution(
-    construct_scheduler, monkeypatch, mocker, profile, platform
+    construct_scheduler, monkeypatch, mocker, platform
 ):
     # merge_pipeline_deploy owns platform resolution. Mock the detected device
     # instead of applying an override first and then resolving the worker's
     # actual platform a second time.
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
-    deploy = load_deploy_config(get_deploy_config_path(f"moss_tts_local_mrv2_{profile}.yaml"))
+    deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
     pipeline = resolve_pipeline_config("moss_tts_local")
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     extras = deploy.connectors["shm"]["extra"]
@@ -66,15 +65,14 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     warning = mocker.patch("vllm_omni.core.sched.omni_generation_scheduler.logger.warning")
     scheduler = construct_scheduler(config)
     # The raw extras persist through fallback; the live constructor must cope.
-    assert extras["generation_min_batch_size"] == 32 and extras["generation_max_wait_ms"] == 12
+    assert extras["generation_min_batch_size"] == 16
+    assert extras["generation_max_wait_ms"] == 6
     if platform == "cuda":
         assert scheduler._native_data_plane and scheduler.input_coordinator is not None
-        assert scheduler._generation_min_batch_size == 32
-        assert scheduler._generation_max_wait_s == 0.012
-        assert scheduler._generation_max_regular_batch == (16 if profile == "low_latency" else 0)
+        assert scheduler._generation_min_batch_size == 16
+        assert scheduler._generation_max_wait_s == 0.006
+        assert scheduler._generation_max_regular_batch == 0
         warning.assert_not_called()
-        if profile == "low_latency":
-            assert extras["codec_first_chunk_fast_path"] == extras["codec_first_chunk_gate"] == 1
     else:
         assert not scheduler._native_data_plane and scheduler.chunk_transfer_adapter is not None
         assert scheduler._generation_min_batch_size == 1

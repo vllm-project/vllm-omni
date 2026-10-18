@@ -52,6 +52,8 @@ def test_finish_requests_cleans_input_coordinator_for_finished_ids(
     scheduler.requests = {}
     scheduler.running = []
     scheduler.waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
 
     def fake_finish_requests(self, request_ids, finished_status):
         assert request_ids == ["req-a", "req-b"]

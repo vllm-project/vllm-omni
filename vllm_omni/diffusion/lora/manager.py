@@ -693,6 +693,11 @@ class DiffusionLoRAManager:
                         )
                     b_splits = list(torch.split(deinterleaved, list(output_sizes), dim=0))
                 else:
+                    base = getattr(lora_layer, "base_layer", None)
+                    if isinstance(base, MergedColumnParallelLinear):
+                        # Adapter B contains global rows. The LoRA layer
+                        # slices each packed segment for its TP rank below.
+                        output_slices = base.output_sizes
                     total = sum(output_slices)
                     if lora_weights.lora_b.shape[0] != total:
                         raise ValueError(
