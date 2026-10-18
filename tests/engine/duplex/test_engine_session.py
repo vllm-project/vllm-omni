@@ -353,6 +353,45 @@ def test_unaligned_response_only_materializes_an_existing_answer_slot(reserve_sl
     assert session.history == (first.message,)
 
 
+def test_sent_audio_without_text_can_still_be_acknowledged():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    user = session.commit_audio_input(transcript="What is the weather in Taipei?")
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+    session.mark_audio_sent(duration_ms=696, text_requires_complete_audio=True, audio_complete=True)
+
+    assert session.end_response(commit_text=True) is None
+    assert session.active_response_id is None
+    assert session.has_assistant_response_item(response_id, f"item_{response_id}")
+
+    ack = apply_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 696,
+            "committed_ms": 696,
+        },
+    )
+    assert "error" not in ack[0].to_realtime()
+    assert ack[0].to_realtime()["event"]["playback"]["committed_ms"] == 696
+    assert session.playback.sent_ms == session.playback.committed_ms == 696
+    # The reserved slot stays as an empty turn. There is no transcript to store.
+    assert session.history == (user.message, {"role": "assistant", "content": ""})
+
+
+def test_response_with_no_audio_and_no_text_is_not_ackable():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+
+    assert session.end_response(commit_text=True) is None
+    assert not session.has_assistant_response_item(response_id, f"item_{response_id}")
+    ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 0})
+    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+
+
 @pytest.mark.parametrize("operation", ["delete", "truncate"])
 def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operation):
     session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
@@ -929,7 +968,12 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _log(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _log)
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -1097,7 +1141,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     wall = {"t": 1_000.0}
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _log(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _log)
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -1117,7 +1166,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _log(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _log)
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))

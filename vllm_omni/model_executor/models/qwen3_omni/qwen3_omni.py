@@ -62,6 +62,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
@@ -1298,8 +1299,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 )
                 talker_input_embeds.append(talker_user_part)
                 talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])
-            # Take assistant output (for now)
+            # Take assistant output (for now). A tool call is not speech:
+            # keep the preface and stop at the <tool_call> token so its
+            # hidden state never becomes a Talker text step.
             elif role_token == self.config.assistant_token_id and i == len(im_start_indexes) - 2:
+                segment_end_index = spoken_span_end(result_ids.reshape(-1).tolist(), im_start_index, segment_end_index)
                 talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = self._get_talker_assistant_parts(
                     im_start_index,
                     segment_end_index,

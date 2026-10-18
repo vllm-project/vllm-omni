@@ -1430,6 +1430,28 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
     return ResolvedControl(payloads=[command.payload(), ack_payload], events=[])
 
 
+def prepared_function_call_output(
+    item: Mapping[str, object], conversation_items: Mapping[str, Mapping[str, object]]
+) -> dict[str, object]:
+    """Copy the exposed call's name and arguments onto a plugin preparation item.
+
+    The client item stays unchanged for the acknowledgement. A projected
+    ``function_call`` with the same ``call_id`` supplies the two fields.
+    """
+    prepared = dict(item)
+    call_id = item.get("call_id")
+    for known in conversation_items.values():
+        if known.get("type") != "function_call" or known.get("call_id") != call_id:
+            continue
+        name = known.get("name")
+        arguments = known.get("arguments", "")
+        if isinstance(name, str) and name:
+            prepared["name"] = name
+            prepared["arguments"] = arguments if isinstance(arguments, str) else ""
+        break
+    return prepared
+
+
 def _duplicate_function_call_output(state: RealtimeProjectionState, call_id: object) -> tuple[bool, bool]:
     matching_call = any(
         known.get("type") == "function_call" and known.get("call_id") == call_id

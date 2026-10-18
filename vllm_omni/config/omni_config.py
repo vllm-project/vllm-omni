@@ -1834,7 +1834,9 @@ def _build_common_stage_config_kwargs(
                 topology,
                 stage_deploy,
                 engine.model,
-                duplex_max_sessions=(deploy.duplex_session.max_sessions if deploy.session_mode == "duplex" else 1),
+                duplex_max_sessions=(
+                    deploy.duplex_session.worker_max_sessions if deploy.session_mode == "duplex" else 1
+                ),
                 model=model,
             ),
             "load_config": _build_load_config(topology, engine.load),

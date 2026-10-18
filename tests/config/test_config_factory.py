@@ -2789,6 +2789,25 @@ class TestMingFlashOmniPipeline:
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
+    @pytest.mark.parametrize(
+        ("platform", "expected_devices", "talker_memory"),
+        [
+            ("rocm", ["0", "1", "1"], 0.3),
+            ("cuda", ["0", "1", "2"], 0.4),
+            ("xpu", ["0", "1", "2"], 0.5),
+        ],
+    )
+    def test_qwen2_5_omni_ci_placement(self, monkeypatch, platform, expected_devices, talker_memory):
+        """The two-card ROCm examples must colocate Code2Wav without changing other platforms."""
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(get_deploy_config_path("ci/qwen2_5_omni.yaml"))
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen2_5_omni"), deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
+        assert stages[1].yaml_engine_args["gpu_memory_utilization"] == talker_memory
+
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
         for filename in (

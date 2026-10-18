@@ -65,6 +65,61 @@ steps:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
 
+  # The seven ROCm nodes in tests/examples/online_serving/test_qwen2_5_omni.py
+  # already select Qwen/Qwen2.5-Omni-7B on MI325 with two cards. Keep AITER off
+  # so this documentation lane does not pay for a cold JIT build.
+  - group: ":full_moon: Qwen2.5-Omni MI300 Nightly"
+    steps:
+      - label: "Qwen2.5-Omni Documentation Examples"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        artifact_paths:
+          - "artifacts/rocm-qwen2-5-omni-doc/**/*"
+        commands:
+          - export VLLM_ROCM_USE_AITER=0
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export QWEN25_OMNI_DOC_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen2-5-omni-doc"
+          - mkdir -p "$$QWEN25_OMNI_DOC_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q \
+              tests/examples/online_serving/test_qwen2_5_omni.py \
+              -m "full_model and rocm and MI325 and cards_2" \
+              --run-level "full_model" \
+              > "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt"
+            count=$$(awk 'index($$0, "test_qwen2_5_omni.py::") { n++ } END { print n + 0 }' \
+              "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 7 ]]; then
+              echo "Expected exactly 7 Qwen2.5-Omni ROCm documentation examples, found $$count." >&2
+              cat "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 105m
+            pytest -s -v -ra
+            tests/examples/online_serving/test_qwen2_5_omni.py
+            -m "full_model and rocm and MI325 and cards_2"
+            --run-level "full_model"
+            --durations=20
+            --junitxml="$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 100 "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log" >
+            "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest-summary.txt"
+          - |
+            python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            executed = tests - skipped
+            if executed < 1:
+                print(f"Expected Qwen2.5-Omni documentation examples to execute; ran {executed} of {tests}.", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml"
+
   - group: ":speaker: CosyVoice3 MI300 Nightly"
     steps:
       # Exercise all sync/async and Chinese/English cases with the platform's
