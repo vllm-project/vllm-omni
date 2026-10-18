@@ -11,6 +11,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 from vllm_omni.diffusion.models.minimax_h3.adaln_cache import (
     FORMAT_VERSION,
@@ -201,9 +202,11 @@ def test_native_constructor_enables_cache_by_default(monkeypatch, tp_size):
         _small_od_config,
     )
 
-    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
+    for name in ("ColumnParallelLinear", "RowParallelLinear"):
         monkeypatch.setattr(h3, name, _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
+        monkeypatch.setattr(blocks, name, _FakeLinear)
+    monkeypatch.setattr(blocks, "Attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: tp_size)
     config = _small_od_config()
     model = h3.MiniMaxH3DiTModel(config, diffusers_weights=False)
@@ -224,9 +227,11 @@ def offload_model_config(monkeypatch):
         _small_od_config,
     )
 
-    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
+    for name in ("ColumnParallelLinear", "RowParallelLinear"):
         monkeypatch.setattr(h3, name, _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
+        monkeypatch.setattr(blocks, name, _FakeLinear)
+    monkeypatch.setattr(blocks, "Attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
@@ -245,7 +250,7 @@ def test_compiled_h3_projection_keeps_cache_and_tensor_graphs(monkeypatch, mocke
         def forward(self, x):
             return super().forward(x), None
 
-    monkeypatch.setattr(h3, "ColumnParallelLinear", Linear)
+    monkeypatch.setattr(blocks, "ColumnParallelLinear", Linear)
     arch = h3.MiniMaxH3DiTArchConfig(hidden_size=8, time_embed_dim=4)
     cache = MiniMaxH3RuntimeAdalnCache()
     proj = h3.MiniMaxH3AdalnProj(
@@ -524,6 +529,7 @@ def test_runtime_projection_matches_sidecar_using_actual_h3_forwards(tmp_path, m
 
     monkeypatch.setattr(h3, "ColumnParallelLinear", Linear)
     monkeypatch.setattr(h3, "RowParallelLinear", Linear)
+    monkeypatch.setattr(blocks, "ColumnParallelLinear", Linear)
     arch, weights, payload, manifest, _ = _fixture(tmp_path, base_model=base_model)
     embedder = h3.MiniMaxH3TimeEmbedder(arch, prefix="time_embedder")
     runtime = MiniMaxH3RuntimeAdalnCache()
