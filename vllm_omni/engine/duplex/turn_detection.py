@@ -325,7 +325,7 @@ def _process_segments(
                 backend=result.backend,
                 turn_complete_probability=(
                     result.turn_complete_probability
-                    if result.turn_complete_probability is not None
+                    if result.turn_complete_probability is not None or result.semantic_decision == "smart_turn_error"
                     else accumulated.turn_complete_probability
                 ),
                 semantic_decision=result.semantic_decision or accumulated.semantic_decision,

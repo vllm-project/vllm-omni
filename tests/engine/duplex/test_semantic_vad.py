@@ -333,6 +333,15 @@ def test_new_pause_does_not_inherit_previous_inference_error(reset: bool) -> Non
     assert commit.commit_reason == "silence_timeout"
 
 
+def test_failed_score_does_not_report_an_earlier_pauses_probability_in_one_append() -> None:
+    detector = _detector(_ScriptedTurn(0.1, RuntimeError("inference failed")), eagerness="high")
+    results = _feed(detector, [(SPEECH, 600), (0.0, 600), (SPEECH, 600), (0.0, 2600)], chunk_ms=12000)
+    commit = next(result for result in results if result.should_commit)
+    assert commit.semantic_decision == "smart_turn_error"
+    assert commit.commit_reason == "silence_timeout"
+    assert commit.turn_complete_probability is None
+
+
 def test_stopped_and_active_are_never_reported_together() -> None:
     turn = _ScriptedTurn(0.1, 0.1, 0.9)
     results = _feed(
