@@ -399,6 +399,89 @@ not a cross-process delivery protocol. Direct handle iteration and WebSocket
 delivery share buffer validity, but end-to-end client behavior still needs
 independent real-model verification.
 
+## Session-aware replica placement
+
+The opt-in `duplex_session.replica_policy: least_sessions` policy places each
+session on a local replica group mapping every stage to a replica. The
+orchestrator owns a separate session reservation ledger; StagePool's request
+bindings continue to describe submitted requests only. Admission reserves a
+group synchronously after taking the global admission slot. The group must
+have space under `max_sessions_per_replica` on every member replica. Replicas
+shared by groups share their capacity counter. Eligible groups are ordered by
+maximum reserved-to-capacity ratio, total reserved count, and round-robin
+tie-breaking.
+
+The reservation covers opening, active and closing sessions. Failed opens
+roll it back; ordinary request completion, response cancellation and epoch
+changes do not release it. Session cleanup releases it only after the closing
+session is finalized. Every Stage0 submission, downstream forward, prewarm and
+derived request uses the session's pinned stage replica. Routing is fixed
+before multimodal preprocessing and connector sender information are built.
+A conflicting or unavailable pin fails instead of falling back to another
+replica.
+
+Replica failure marks the replica unavailable and closes every session in its
+reverse index, including idle sessions without an in-flight request. Other
+groups retain their reservations and can continue serving. This policy does
+not migrate model state or support coordinator/distributed deployments.
+Worker-local state capacity uses the per-replica cap, while `max_sessions`
+remains the global service cap. The default `legacy` policy preserves the
+existing routing, admission and worker capacity behavior. See the
+[configuration reference](../configuration/stage_configs.md#duplex-replica-placement)
+for group validation and model capability requirements.
+
+With metrics enabled, `vllm_omni:duplex_reserved_sessions` reports reservations
+by model, stage and replica, and `vllm_omni:duplex_admission_rejected_total`
+counts global and replica capacity rejections. These collectors are created
+on first use by this policy and carry no session ID labels.
+
+### Multiple frontends
+
+`--api-server-count K` reuses the existing local multi-API launcher. The parent
+launches all stage cores, each core exposes one IPC endpoint pair per frontend,
+and every frontend attaches to every replica. Each frontend has its own
+`DuplexOrchestrator`, `DuplexSessionManager` and Python interpreter. Request
+`client_index` routes engine output back to the submitting frontend; there is
+no central per-frame session dispatcher.
+
+Placement, rather than engine attachment, enforces exclusive ownership. Group
+`g` belongs to frontend `g % K`, and only that frontend may reserve its replicas
+or submit its session requests. Groups sharing a physical stage replica must
+have the same owner, and `K` must not exceed the group count. The global session
+budget is divided by floor/remainder across frontends and bounded by each
+frontend's owned replica capacity; budgets do not move between frontends.
+The reservation lifetime, strict stage pins and worker caps apply within each
+owner's groups. With `K=1`, routing and admission behavior are unchanged.
+
+The multi-frontend WebSocket guard allows only `least_sessions` and plugins
+without session resume. Credentials, attachment state and replay journals
+remain process-local. The shared public address does not provide resume
+affinity; supporting resume-capable models would require a separate design.
+INET listeners use the existing per-process `SO_REUSEPORT` path where available
+(with a shared-socket fallback). Kernel connection distribution is not capacity
+aware, so a locally full frontend can return `resource_exhausted` with
+`retryable: true` even when another has room. Clients reconnect with backoff;
+an established session never moves to another frontend.
+
+When enabled, warmup runs against the local engine and owned groups rather than
+connecting through the public listener. PersonaPlex keeps its opt-in behavior:
+`duplex_session.warmup_frames` must be positive. Each frontend keeps its own
+warmup completion gate; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
+before being admitted, as in single-frontend mode; there is no all-frontend
+warmup barrier. `/health`
+retains the engine health check, and a 200 response does not guarantee admission
+capacity on the frontend accepting a connection. Only the owner publishes its
+replicas' reservation gauges, using Prometheus `livesum` aggregation;
+admission rejection counters aggregate across
+frontends without changing their label schema.
+
+This mode keeps the current supervisor's whole-service fail-fast behavior on
+an engine failure or a frontend's abnormal exit. It does not add frontend
+restart, session migration or failure isolation. All-frontend engine attachment
+and SHM notification fan-out are unchanged; narrowing SHM wakeups is a separate
+optimization. See the [configuration reference](../configuration/stage_configs.md#multiple-duplex-frontends)
+and [serving guide](../serving/realtime_duplex_api.md#multiple-frontends).
+
 ## Orchestrator seams
 
 `OrchestratorBase` keeps the generic machinery (request handler skeleton,
@@ -440,7 +523,9 @@ policy that used to be two separately configured objects:
 | Half | Members |
 | --- | --- |
 | engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
-| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `parse_function_call` (recognize one call), `runtime_config_for_function_output` (feed an accepted result back into that model), `note_published_function_call` (plugin stores history length at publish), `has_pending_tool_followup` (plugin still has a tool result to answer), `extra_prompt_config`, `runtime_patch_for_submitted_prompt`, `runtime_config_after_response` (keep or drop a result after the response ends), `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+
+A duplex tool call uses one client sequence. The client supplies tools, receives one function call, runs the function, and sends `function_call_output`. The server does not execute the function. Each model plugin implements both hooks. A recognized call is published through `model_channel._expose_function_call`. Before the plugin sees a `function_call_output`, the session copies `name` and `arguments` from the `function_call` already stored in `conversation_items`. The client item stays `call_id` and `output`. Qwen3-Omni `parse_function_call` reads a Hermes `<tool_call>` and returns `{call_id, name, arguments}` without retaining them. One Thinker chunk can carry more than one completed call; each is emitted. `note_published_function_call` stores that call's history length in the Qwen runtime. `runtime_config_for_function_output` reads `name` and `arguments` from the preparation item, refuses when either is absent, and appends one `{history_len, messages}` entry there. The stored length wins over the length at result time. Tool pairs stay out of `session.history`. `has_pending_tool_followup` is how the runner learns that a bare `response.create` may open `{"type":"conversation"}`. `plan_append` splices each turn after the history it was accepted against, and `runtime_patch_for_submitted_prompt` holds those turns aside after the append is accepted. The pair stays owned by that response until playback stores its text. The next prompt puts a still-inflight pair back on the waiting list before the usual splice, and the pair keeps that response id so the playback ACK can drop it once the assistant text is stored. A cancel, a playback clear before any audio is committed, or `realtime_response_conversation: none` stores no text and puts the pair back with that response id. A failure before playback can store the answer puts the pair back without the id, so the retry can own it. `tool_choice: none` is rejected. A result whose published anchor has left the prompt window is refused instead of being attached to the latest question. `runtime_config_after_response` is that step. Nemotron VoiceChat `parse_function_call` reads the data-plane function-channel event, and `runtime_config_for_function_output` places the result on a later frame of the request that is still open. The session call book is #8758.
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
@@ -451,6 +536,28 @@ offloaded from the loop.
 Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
 for the shared request identity, sequencing and config snapshots. Token budgets,
 PCM framing and model-specific worker fields remain in the plugins.
+
+Turn plugins may bind their stage identities in `configure_pipeline` and select
+an append's entry with `input_stage_id(payload)` (default 0). The request context
+and orchestrator retain that entry stage. Session prompt preparation receives
+the request's complete `stage_sampling_params`, so a pipeline with an ASR prefix
+budgets the JoyAI prompt against JoyAI's generation settings. Session model config
+comes from the first tokenizer-owning stage, matching frontend comprehension
+ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
+enters ASR and carries the original observation context through the handoff.
+
+While idle, JoyAI retains the latest camera frame and one input chunk of audio
+pre-roll. Once speech starts, it keeps the utterance until commit. An idle
+camera commit enters JoyAI directly; reserved-byte accounting includes the
+pre-roll until the commit is consumed or rolled back.
+
+Completed input transcriptions travel with stage outputs through the runner
+mailbox. After checking the request fence, the runner updates the exact committed
+audio history item and emits its transcription event. The append captures the
+original native audio part before yielding and retains that identity on its
+request resource; a reused public item ID does not confer transcript ownership.
+Cancellation, item deletion or replacement cannot apply a late transcript to a
+newer turn.
 
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.

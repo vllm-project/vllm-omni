@@ -23,11 +23,12 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
-from vllm.config import KVTransferConfig
+from vllm.config import KernelConfig, KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
+from vllm.config import SpeculativeConfig as VllmSpeculativeConfig
 from vllm.config.utils import config
 from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.logger import init_logger
@@ -124,6 +125,8 @@ class _TrackExplicitConfigFields:
         kwargs = getattr(value, "kwargs", None)
         if kwargs is not None:
             explicit_fields = frozenset(kwargs)
+        elif isinstance(value, Mapping):
+            explicit_fields = frozenset(value)
         elif isinstance(value, cls):
             explicit_fields = getattr(value, "_omni_explicit_fields", frozenset())
         else:
@@ -172,6 +175,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     attention_backend: Any
     attention_config: Any
     moe_backend: str
+    linear_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
@@ -299,6 +303,7 @@ class _StageEngineValues:
     diffusion: _DiffusionEngineOverrides
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
+    speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
 
 
 @dataclass(frozen=True)
@@ -480,6 +485,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     attention_backend: Any = None
     attention_config: Any = None
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
@@ -526,6 +532,11 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     generation_config: str | None = None
     override_generation_config: dict[str, Any] | None = None
     enable_prompt_embeds: bool | None = None
+
+    def __post_init__(self) -> None:
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -785,7 +796,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
-class _DiffusionConfigProjection:
+class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     """Diffusion-specific per-stage settings.
 
     Shared AR/diffusion fields are projected into the other sub-configs.  This
@@ -872,6 +883,7 @@ class _DiffusionConfigProjection:
     diffusion_kv_cache_skip_step_indices: set[int] | None = None
     diffusion_kv_cache_skip_layer_indices: set[int] | None = None
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
@@ -894,6 +906,8 @@ class _DiffusionConfigProjection:
     kv_transfer_config: KVTransferConfig | None = None
     # Full stage-payload transport, independent of native paged KV transfer.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
+    stage_role: str | None = None
     stage_output_payload_keys: tuple[str, ...] = ()
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
@@ -940,6 +954,10 @@ class _DiffusionConfigProjection:
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
+
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
 
         if self.tf_model_config is None:
             self.tf_model_config = TransformerConfig()
@@ -1141,6 +1159,7 @@ _DIFFUSION_ONLY_CONFIG_FIELDS = (
 )
 _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
     {
+        "model_stage",
         "parallel_config",
         "num_gpus",
         "log_level",
@@ -1229,7 +1248,15 @@ _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config"})
+# The three fields below are vLLM config objects passed through verbatim
+# instead of being unpacked structurally. speculative_config was missing from
+# this list, so a stage-1 multi-frame setup failed to load: stage_config.py
+# injects a speculative_config into stage 1 (vLLM uses spec_token_ids to
+# advance K tokens per request) and the ownership check here rejected the whole
+# stage-1 override block with a startup ValueError ("Stage 1 (llm_ar) has
+# explicit engine argument(s) with no structured config owner"). It joins the
+# two pass-through fields already listed.
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config", "speculative_config"})
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
@@ -1592,6 +1619,11 @@ def _stage_engine_values(
         diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
         compilation_config=_copy_value(engine.get("compilation_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
+        # Same category as the two above: a vLLM config object passed through
+        # verbatim. Without it, a speculative_config in the deploy config
+        # silently disappears (no error) and speculative decoding loses effect
+        # (engine logs show speculative_config=None).
+        speculative_config=_copy_value(engine.get("speculative_config")),
     )
 
 
@@ -1655,6 +1687,12 @@ class BaseVllmOmniStageConfig:
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     compilation_config: VllmCompilationConfig | None = None
     profiler_config: VllmProfilerConfig | None = None
+    # Shape matters: vLLM's create_speculative_config consumes this value as a
+    # dict (it calls .items() / .update() before building SpeculativeConfig).
+    # Typing it as VllmSpeculativeConfig | None would make pydantic convert the
+    # dict early and break that step with "SpeculativeConfig object has no
+    # attribute 'items'". Keep the Mapping shape and let vLLM do the conversion.
+    speculative_config: Mapping[str, Any] | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1728,6 +1766,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.requires_multimodal_data
 
     @property
+    def bypass_without_modalities(self) -> tuple[str, ...]:
+        return tuple(self.stage_pipeline_config.bypass_without_modalities)
+
+    @property
     def prompt_expand_func(self) -> str | None:
         return self.stage_pipeline_config.prompt_expand_func
 
@@ -1792,7 +1834,9 @@ def _build_common_stage_config_kwargs(
                 topology,
                 stage_deploy,
                 engine.model,
-                duplex_max_sessions=(deploy.duplex_session.max_sessions if deploy.session_mode == "duplex" else 1),
+                duplex_max_sessions=(
+                    deploy.duplex_session.worker_max_sessions if deploy.session_mode == "duplex" else 1
+                ),
                 model=model,
             ),
             "load_config": _build_load_config(topology, engine.load),
@@ -1821,6 +1865,7 @@ def _build_common_stage_config_kwargs(
             "parallel_config": parallel_config,
             "compilation_config": _copy_value(engine.compilation_config),
             "profiler_config": _copy_value(engine.profiler_config),
+            "speculative_config": _copy_value(engine.speculative_config),
             "quantization_config": _copy_value(quantization_config),
         },
         input_proc,
@@ -2192,6 +2237,8 @@ def _build_diffusion_config_projection(
     # Match the legacy builder: topology supplies defaults, while explicit
     # deploy/CLI values (including empty tuples) retain precedence.
     diffusion_kwargs.setdefault("stage_input_payload_keys", tuple(topology.stage_input_payload_keys))
+    diffusion_kwargs.setdefault("stage_input_optional_payload_keys", tuple(topology.stage_input_optional_payload_keys))
+    diffusion_kwargs.setdefault("stage_role", topology.stage_role.value if topology.stage_role is not None else None)
     diffusion_kwargs.setdefault("stage_output_payload_keys", tuple(topology.stage_output_payload_keys))
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(

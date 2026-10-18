@@ -78,6 +78,47 @@ def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
     assert output.dtype == torch.bfloat16
 
 
+def test_ltx_bwe_resampler_restores_unrounded_fp32_hann_filter():
+    from diffusers.pipelines.ltx2.vocoder import UpSample1d
+
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _restore_ltx_bwe_resampler_filter
+
+    reference = UpSample1d(ratio=3, window_type="hann", persistent=False)
+    resampler = UpSample1d(ratio=3, window_type="hann", persistent=False).to(torch.bfloat16)
+    vocoder = SimpleNamespace(resampler=resampler)
+
+    assert resampler.filter.dtype == torch.bfloat16
+    assert not torch.equal(resampler.filter.float(), reference.filter)
+
+    _restore_ltx_bwe_resampler_filter(vocoder)
+
+    assert resampler.filter.dtype == torch.float32
+    assert torch.equal(resampler.filter, reference.filter)
+
+
+def test_ltx_bwe_resampler_filter_is_rebuilt_only_after_a_cast():
+    from diffusers.pipelines.ltx2.vocoder import UpSample1d
+
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _restore_ltx_bwe_resampler_filter
+
+    reference = UpSample1d(ratio=3, window_type="hann", persistent=False)
+    resampler = UpSample1d(ratio=3, window_type="hann", persistent=False).to(torch.bfloat16)
+    vocoder = SimpleNamespace(resampler=resampler)
+
+    _restore_ltx_bwe_resampler_filter(vocoder)
+    restored = resampler.filter
+    _restore_ltx_bwe_resampler_filter(vocoder)
+    assert resampler.filter is restored
+
+    # A BF16 round trip leaves an FP32 filter whose coefficients lost bits.
+    resampler.to(torch.bfloat16).float()
+    assert resampler.filter.dtype == torch.float32
+    assert not torch.equal(resampler.filter, reference.filter)
+
+    _restore_ltx_bwe_resampler_filter(vocoder)
+    assert torch.equal(resampler.filter, reference.filter)
+
+
 class TestLTXDiffusionDecoder:
     def test_diffusion_decoder_reuses_diffusers_with_scoped_overrides(self, monkeypatch):
         from diffusers.models.autoencoders.ltx2_diffusion_decoder import (

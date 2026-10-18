@@ -49,6 +49,39 @@ class OmniGPUWorkerBase(GPUWorker):
         if callable(capture):
             capture()
 
+    def _profile_auxiliary_graph_memory(self) -> int:
+        """Measure the model's ``capture_auxiliary_graphs`` pools for the KV budget.
+
+        Only models that can also ``release_auxiliary_graphs`` are measured: the
+        graphs are captured here, measured, and released, and warmup captures
+        them for real as before. The model owns these graphs, so the runner's
+        throwaway-pool profiling does not apply to them.
+        """
+        model = getattr(self.model_runner, "model", None)
+        capture = getattr(model, "capture_auxiliary_graphs", None)
+        release = getattr(model, "release_auxiliary_graphs", None)
+        if not callable(capture) or not callable(release):
+            return 0
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        free_before = torch.accelerator.get_memory_info()[0]
+        try:
+            capture()
+            torch.accelerator.synchronize()
+            # Drop the capture's cached temporaries; the graphs keep their pools.
+            torch.accelerator.empty_cache()
+            auxiliary_graph_memory = max(free_before - torch.accelerator.get_memory_info()[0], 0)
+        finally:
+            release()
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+        logger.info(
+            "Estimated auxiliary CUDA graph memory: %s GiB (%s GiB still held after release)",
+            format_gib(auxiliary_graph_memory),
+            format_gib(max(free_before - torch.accelerator.get_memory_info()[0], 0)),
+        )
+        return auxiliary_graph_memory
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         result = super().compile_or_warm_up_model()
         self._capture_auxiliary_graphs()
@@ -126,7 +159,8 @@ class OmniGPUWorkerBase(GPUWorker):
                else is resident on the GPU at profiling time.
 
             3. Profile the CUDA graphs the runner captures through
-               ``cudagraph_dispatcher`` and the encoder graph manager. This has
+               ``cudagraph_dispatcher``, the encoder graph manager and the
+               talker MTP wrapper. This has
                to stay outside the ``memory_profiling`` window above, because it
                allocates a minimal KV cache and captures graphs of its own,
                which would otherwise land in ``non_torch_increase`` and be
@@ -137,17 +171,16 @@ class OmniGPUWorkerBase(GPUWorker):
                during capture must not raise the budget above the request.
                Under ``parallel_stage_init`` this runs inside the profiling
                ``LOCK_EX`` (``engine/stage_phase_lock``), so co-located stages
-               cannot allocate or capture meanwhile. Graphs captured outside
-               that dispatcher are not in it:
-               ``GPUARModelRunner.capture_model`` captures the talker MTP graphs
-               after ``super().capture_model()``, and model
-               ``capture_auxiliary_graphs`` hooks run after warmup. Under
-               ``parallel_stage_init`` those remain covered by the reserve in
-               ``engine/stage_admission``; on the default path nothing accounts
-               for them.
+               cannot allocate or capture meanwhile. On CUDA-alike platforms
+               while VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS is on, a model that
+               implements both ``capture_auxiliary_graphs`` and
+               ``release_auxiliary_graphs`` captures its graphs here, whatever
+               the cudagraph mode, and releases them once measured as
+               auxiliary_graph_memory; warmup captures them for real. Stages
+               without a KV cache never reach this method.
 
             4. profiled_usage = the step 2 measurements +
-               cudagraph_memory_estimate
+               cudagraph_memory_estimate + auxiliary_graph_memory
 
             5. available_kv_cache = requested_memory - profiled_usage
 
@@ -180,6 +213,12 @@ class OmniGPUWorkerBase(GPUWorker):
         ):
             cudagraph_memory_estimate = max(0, self.model_runner.profile_cudagraph_memory())
 
+        auxiliary_graph_memory = 0
+        if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS and current_omni_platform.is_cuda_alike():
+            auxiliary_graph_memory = self._profile_auxiliary_graph_memory()
+
+        # Compared with what capture_model() reports, so it leaves out the
+        # auxiliary graphs, which warmup captures after it.
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
         self.non_torch_memory = profile_result.non_torch_increase
         # Upstream adds the applied estimate here as well, then adds the actual
@@ -191,13 +230,16 @@ class OmniGPUWorkerBase(GPUWorker):
         # and reads it in GPUWorker.compile_or_warm_up_model() (when
         # kv_cache_memory_bytes is None and peak_activation_memory is set, both
         # true here). Mirror upstream so the omni override keeps it populated.
-        self.total_consumed = profile_result.total_consumed
+        # The auxiliary pools persist once warmup captures them, so the
+        # --kv-cache-memory suggestion counts them here.
+        self.total_consumed = profile_result.total_consumed + auxiliary_graph_memory
 
         profiled_usage = (
             int(self.model_runner.model_memory_usage)
             + profile_result.torch_peak_increase
             + profile_result.non_torch_increase
             + cudagraph_memory_estimate
+            + auxiliary_graph_memory
         )
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(
@@ -213,7 +255,7 @@ class OmniGPUWorkerBase(GPUWorker):
             format_gib(self.available_kv_cache_memory_bytes),
             scope="local",
         )
-        self._log_cudagraph_reserve(cudagraph_memory_estimate)
+        self._log_cudagraph_reserve(cudagraph_memory_estimate + auxiliary_graph_memory)
 
         return int(self.available_kv_cache_memory_bytes)
 

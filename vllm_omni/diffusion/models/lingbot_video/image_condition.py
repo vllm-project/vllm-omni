@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -133,9 +133,9 @@ def encode_clean_image_latent(
     vae_device = _module_device(vae)
     normalized = (pixel.to(device=vae_device, dtype=torch.float32) - 0.5) / 0.5
     with torch.autocast(
-        "cuda",
+        device_type=vae_device.type,
         dtype=torch.bfloat16,
-        enabled=vae_device.type == "cuda",
+        enabled=vae_device.type != "cpu",
     ):
         encoded = vae.encode(normalized)
         # Match the official LingBot TI2V path exactly: sample the posterior

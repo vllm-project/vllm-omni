@@ -32,6 +32,8 @@ from vllm_omni.engine.duplex.contracts import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+
 
 class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
@@ -303,6 +305,22 @@ class DuplexModelPlugin(ABC):
         # Constructor-only: concrete plugins hand the encoder to their data plane.
         del encode_audio
 
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        """Bind model policy to the resolved deployment topology before admission."""
+
+    def input_stage_id(self, payload: object) -> int:
+        """Select the entry stage for one append before reserving its request."""
+        return 0
+
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        """Separate the next ASR-only input from a batched response input.
+
+        The remaining committed payload resumes after this item's transcript
+        has reached conversation history. Models without an ASR entry stage
+        consume their input normally.
+        """
+        return payload, None
+
     def silence_unit_payload(self) -> dict[str, object]:
         """One silence unit as an append payload (``pcm_f32le`` zeros).
 
@@ -336,6 +354,9 @@ class DuplexModelPlugin(ABC):
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
         return self.plan_append(**kwargs)
+
+    def commit_append_plan(self, request_id: str) -> None:
+        """Commit model-owned context after the stage accepts a fenced append."""
 
     @abstractmethod
     def plan_append(
@@ -510,15 +531,107 @@ class DuplexModelPlugin(ABC):
             modalities=modalities,
         )
 
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        """Recognize one function call in this model's output, or None.
+
+        The plugin owns recognition. A plugin that does not emit tool calls
+        keeps this default. A recognized call is ``{"call_id", "name",
+        "arguments"}``. Feeding an accepted result back is
+        ``runtime_config_for_function_output``.
+        """
+        del model_result
+        return None
+
     # Optional hook: build the runtime config patch for a function-call output
-    # item. Plugins without tools keep the default (no change).
+    # item. ``name`` and ``arguments`` on that item are the call context for
+    # this preparation. A plugin that needs them reads those fields and refuses
+    # when they are absent. Parsing and this method do not consume a
+    # plugin-local call cache. Plugins without tools keep the default (no change).
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object] | None:
-        del config, current, item
+        del config, current, item, history_len
+        return None
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        """Record where this call sat in session history when it was published.
+
+        The session calls this from ``function_call.done``, before a later user
+        turn can grow the history. A plugin that splices the result back into
+        that history stores the length in its own runtime. The default keeps
+        nothing.
+        """
+        del runtime_config, call_id, history_len
+        return None
+
+    def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
+        """Whether a bare ``response.create`` should answer an accepted tool result.
+
+        The runner still decides that a text-only turn is legal. This only
+        reports that the plugin still has a result it has not yet prompted.
+        """
+        del runtime_config
+        return False
+
+    def extra_prompt_config(self, runtime_config: Mapping[str, object]) -> Mapping[str, object]:
+        """Runtime entries this model's prompt preparation reads. Default: none."""
+        del runtime_config
+        return {}
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        """Pop plugin-private prompt keys and return the runtime patch to store.
+
+        The session applies the patch only after the stage accepts the append.
+        A failed submit leaves the runtime unchanged. The default prompt has
+        no private keys.
+        """
+        del prompt
+        return None
+
+    def bind_inflight_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        response_id: str | None,
+    ) -> dict[str, object] | None:
+        """Remember which response owns a just-submitted tool follow-up.
+
+        The default has no inflight tool state. A plugin that does returns a
+        runtime patch naming ``response_id``; ``None`` leaves the runtime as it
+        is.
+        """
+        del runtime_config, response_id
+        return None
+
+    def runtime_config_after_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        committed: bool,
+        awaiting_playback: bool = False,
+        response_id: str | None = None,
+        release_owner: bool = False,
+    ) -> dict[str, object] | None:
+        """Adjust runtime after a response ends.
+
+        ``committed`` is false when the response was cancelled or failed before
+        its text was stored. ``awaiting_playback`` means audio was produced and
+        a later playback ACK may still store that text. ``release_owner`` means
+        that response failed before any playback ACK can store the answer, so a
+        retry may take the tool pair. The default keeps the runtime unchanged.
+        """
+        del runtime_config, committed, awaiting_playback, response_id, release_owner
         return None
 
     def runtime_config_after_model_output(
@@ -534,6 +647,37 @@ class DuplexModelPlugin(ABC):
         """
         del current, output_metadata
         return None
+
+
+def settle_response_runtime(
+    plugin: object,
+    session: object,
+    *,
+    committed: bool,
+    awaiting_playback: bool = False,
+    response_id: str | None = None,
+    release_owner: bool = False,
+) -> None:
+    """Let the plugin keep or drop response-scoped runtime after ``end_response``.
+
+    ``runtime_config_after_response`` is optional. A plugin object that does
+    not implement it, or implements something that is not callable, is left
+    unchanged.
+    """
+    runtime = getattr(session, "runtime_config", None)
+    replace = getattr(session, "replace_runtime_config", None)
+    hook = getattr(plugin, "runtime_config_after_response", None)
+    if not isinstance(runtime, Mapping) or not callable(replace) or not callable(hook):
+        return
+    updated = hook(
+        runtime,
+        committed=committed,
+        awaiting_playback=awaiting_playback,
+        response_id=response_id,
+        release_owner=release_owner,
+    )
+    if updated is not None:
+        replace(updated)
 
 
 def load_duplex_plugin(path: str, encode_audio: EncodeAudio) -> DuplexModelPlugin:
@@ -564,6 +708,25 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
                 "Duplex plugin sampling parameter type mismatch "
                 f"for stage {stage_id}: expected {type(default).__name__}, got {type(value).__name__}"
             )
+
+
+def validate_duplex_replica_policy(
+    plugin: DuplexModelPlugin,
+    runtime_config: DuplexSessionRuntimeConfig,
+    *,
+    distributed: bool,
+) -> None:
+    """Validate replica policy before workers start and against the actual stage pools."""
+    if runtime_config.replica_policy == "legacy":
+        return
+    if distributed:
+        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
+    cap = runtime_config.max_sessions_per_replica
+    assert cap is not None
+    # This capability depends on the requested capacity for some plugins; the
+    # global admission limit does not describe sharing within a single replica.
+    if cap > 1 and not plugin.capabilities(max_sessions=cap).supports_multi_session_same_replica:
+        raise ValueError("This duplex plugin does not support sharing a replica; set max_sessions_per_replica to 1")
 
 
 @lru_cache(maxsize=8)
@@ -604,5 +767,7 @@ __all__ = [
     "load_duplex_plugin",
     "payload_turn_id",
     "reject_changed_runtime_value",
+    "settle_response_runtime",
     "validate_duplex_plugin_sampling",
+    "validate_duplex_replica_policy",
 ]

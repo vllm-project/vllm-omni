@@ -81,3 +81,16 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 }
 
 WEB_DIRECTORY = "./web"
+
+# The `model` dropdown is fed by a same-origin proxy route on the ComfyUI
+# server (see comfyui_vllm_omni/routes.py): a browser-side fetch would resolve
+# `localhost` to the user's own machine for remote deployments.
+try:
+    from server import PromptServer
+
+    from .comfyui_vllm_omni.routes import register_routes
+
+    register_routes(PromptServer.instance)
+except ImportError:
+    # Outside a ComfyUI runtime (e.g. unit tests) there is no server module.
+    pass

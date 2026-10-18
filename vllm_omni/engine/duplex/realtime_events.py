@@ -582,7 +582,9 @@ def _realtime_response_done_event(
             "status": status,
             "status_details": status_details,
             "output": [_response_done_output_item(state, response_id, status=status)],
-            "metadata": dict(event),
+            # Audio was delivered by output_audio.delta. Copying the waveform
+            # into the terminal doubles queue usage and defeats its reserve.
+            "metadata": {key: value for key, value in event.items() if key != "audio"},
         },
     )
 
@@ -930,6 +932,8 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         item_id = (
             event_item_id if isinstance(event_item_id, str) and event_item_id else _pop_pending_commit_item_id(state)
         )
+        if isinstance(event_item_id, str) and event_item_id in state.pending_commit_item_ids:
+            state.pending_commit_item_ids.remove(event_item_id)
         committed_item = state.conversation_items.get(item_id)
         commit_events: list[DuplexEvent] = []
         if committed_item is None:
@@ -1424,6 +1428,28 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
         "truncate": True,
     }
     return ResolvedControl(payloads=[command.payload(), ack_payload], events=[])
+
+
+def prepared_function_call_output(
+    item: Mapping[str, object], conversation_items: Mapping[str, Mapping[str, object]]
+) -> dict[str, object]:
+    """Copy the exposed call's name and arguments onto a plugin preparation item.
+
+    The client item stays unchanged for the acknowledgement. A projected
+    ``function_call`` with the same ``call_id`` supplies the two fields.
+    """
+    prepared = dict(item)
+    call_id = item.get("call_id")
+    for known in conversation_items.values():
+        if known.get("type") != "function_call" or known.get("call_id") != call_id:
+            continue
+        name = known.get("name")
+        arguments = known.get("arguments", "")
+        if isinstance(name, str) and name:
+            prepared["name"] = name
+            prepared["arguments"] = arguments if isinstance(arguments, str) else ""
+        break
+    return prepared
 
 
 def _duplicate_function_call_output(state: RealtimeProjectionState, call_id: object) -> tuple[bool, bool]:

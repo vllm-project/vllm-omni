@@ -36,6 +36,7 @@ from typing import Any, Literal, cast
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from PIL import Image
+from pydantic import TypeAdapter, ValidationError
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
@@ -47,6 +48,7 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
+    TimelineGuide,
     VideoAction,
     VideoError,
     VideoGenerationRequest,
@@ -59,6 +61,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
+    TimelineGuideInput,
     _stage_diffusion_model_class_name,
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
@@ -93,6 +96,11 @@ MINIMAX_H3_REFERENCE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3"})
 CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
 CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
+
+TIMELINE_GUIDE_MAX_ENTRIES = 8
+TIMELINE_GUIDE_MAX_FILES = 16
+TIMELINE_GUIDE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3", ".flac"})
+_TIMELINE_GUIDES_ADAPTER = TypeAdapter(list[TimelineGuide])
 
 LATENT_EDIT_SOURCE_MAX_BYTES = 512 * 1024 * 1024
 LATENT_EDIT_MASK_FILE_MAX_BYTES = 8 * 1024 * 1024
@@ -376,6 +384,15 @@ def _cleanup_video_references(
                 os.unlink(path)
 
 
+def _cleanup_timeline_guides(request: VideoGenerationRequest) -> None:
+    guide_input = request._timeline_guide_input
+    if guide_input is None:
+        return
+    for path in guide_input.cleanup_paths:
+        with suppress(OSError):
+            os.unlink(path)
+
+
 def _unpack_video_generation_result(
     result: Sequence[object],
 ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
@@ -410,6 +427,7 @@ async def _run_video_generation_job(
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
         return
 
     started_at = time.perf_counter()
@@ -487,6 +505,7 @@ async def _run_video_generation_job(
         raise
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
 
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
@@ -851,6 +870,132 @@ async def _persist_uploaded_media_references(
     return images, videos, audios
 
 
+def _parse_timeline_guides(
+    handler: OmniOpenAIServingVideo,
+    timeline_guides: str | None,
+    guide_files: list[UploadFile],
+) -> tuple[list[TimelineGuide], dict[int, str]] | None:
+    """Validate the guide manifest and map each upload index to one modality."""
+    if not timeline_guides and not guide_files:
+        return None
+    if not handler.supports_timeline_guides:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Timeline guides are not supported by this model.",
+        )
+    if not timeline_guides:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="guide_files requires a timeline_guides manifest.",
+        )
+    try:
+        guides = _TIMELINE_GUIDES_ADAPTER.validate_json(timeline_guides)
+    except ValidationError as exc:
+        error = exc.errors()[0]
+        location = ".".join(str(item) for item in error["loc"])
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid timeline_guides{f' at {location}' if location else ''}: {error['msg']}",
+        ) from exc
+    if not guides:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="timeline_guides must not be empty.")
+    if len(guides) > TIMELINE_GUIDE_MAX_ENTRIES:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"timeline_guides accepts at most {TIMELINE_GUIDE_MAX_ENTRIES} entries.",
+        )
+    if len(guide_files) > TIMELINE_GUIDE_MAX_FILES:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"guide_files accepts at most {TIMELINE_GUIDE_MAX_FILES} uploads.",
+        )
+    kinds: dict[int, str] = {}
+    for guide in guides:
+        for kind in ("image", "video", "audio"):
+            source = getattr(guide, kind)
+            if source is None:
+                continue
+            index = source.upload_index
+            if index >= len(guide_files):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=(
+                        f"timeline_guides references guide_files[{index}], but only {len(guide_files)} were uploaded."
+                    ),
+                )
+            if kinds.setdefault(index, kind) != kind:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"guide_files[{index}] cannot be used as both {kinds[index]} and {kind}.",
+                )
+    if len(kinds) != len(guide_files):
+        unused = sorted(set(range(len(guide_files))) - set(kinds))
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"guide_files{unused} are not referenced by timeline_guides.",
+        )
+    return guides, kinds
+
+
+async def _persist_timeline_guides(
+    guides: list[TimelineGuide],
+    kinds: dict[int, str],
+    guide_files: list[UploadFile],
+) -> TimelineGuideInput:
+    """Decode guide images in memory and persist clips and audio as files."""
+    sources: dict[int, Any] = {}
+    paths: list[str] = []
+    try:
+        for index, kind in sorted(kinds.items()):
+            upload = guide_files[index]
+            field_name = f"guide_files[{index}]"
+            suffix = Path(upload.filename or "").suffix.lower()
+            if kind == "image":
+                payload = await _read_upload_limited(upload, max_bytes=MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES)
+                _validate_minimax_h3_image_payload(payload, filename=upload.filename)
+                try:
+                    sources[index] = _decode_image_bytes(payload, source=f"uploaded {field_name}")
+                except InvalidInputReferenceError as exc:
+                    raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+                continue
+            if kind == "video":
+                allowed, max_bytes, expected = (
+                    MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES,
+                    MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES,
+                    "an MP4 or MOV file",
+                )
+            else:
+                allowed, max_bytes, expected = (
+                    TIMELINE_GUIDE_AUDIO_SUFFIXES,
+                    MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES,
+                    "a WAV, MP3, or FLAC file",
+                )
+            if suffix not in allowed:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"{field_name} used as a {kind} guide must be {expected}.",
+                )
+            path = await _persist_uploaded_reference(
+                upload, field_name="guide_file", suffix=suffix, max_bytes=max_bytes
+            )
+            paths.append(path)
+            sources[index] = path
+    except (asyncio.CancelledError, Exception):
+        for path in paths:
+            with suppress(OSError):
+                os.unlink(path)
+        raise
+    resolved = []
+    for guide in guides:
+        entry: dict[str, Any] = {"frame_index": guide.frame_index}
+        for kind in ("image", "video", "audio"):
+            source = getattr(guide, kind)
+            if source is not None:
+                entry[kind] = sources[source.upload_index]
+        resolved.append(entry)
+    return TimelineGuideInput(guides=resolved, cleanup_paths=tuple(paths))
+
+
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
@@ -895,6 +1040,8 @@ async def _parse_video_form(
     source_audio: UploadFile | None = File(default=None),
     video_noise_mask: UploadFile | None = File(default=None),
     audio_noise_mask: UploadFile | None = File(default=None),
+    timeline_guides: str | None = Form(default=None),
+    guide_files: list[UploadFile] | None = File(default=None),
 ) -> tuple[
     VideoGenerationRequest,
     "OmniOpenAIServingVideo",
@@ -1006,6 +1153,8 @@ async def _parse_video_form(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
             detail=f"Video generation setup failed: {str(e)}",
         )
+
+    parsed_timeline_guides = _parse_timeline_guides(handler, timeline_guides, guide_files or [])
 
     has_latent_edit = _validate_latent_edit_inputs(
         handler,
@@ -1186,6 +1335,14 @@ async def _parse_video_form(
                 with suppress(OSError):
                     os.unlink(path)
             _cleanup_video_references(reference_video, reference_audio, control_path)
+            raise
+
+    if parsed_timeline_guides is not None:
+        guides, kinds = parsed_timeline_guides
+        try:
+            request._timeline_guide_input = await _persist_timeline_guides(guides, kinds, guide_files or [])
+        except (asyncio.CancelledError, Exception):
+            _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
             raise
 
     return (

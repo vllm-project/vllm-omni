@@ -29,7 +29,95 @@ framework internals and how to add another full-duplex model, see
   and/or load the weights in fp8 (see "Smaller GPU: fp8 weights" below — ~9.9 GiB vs 16.8 GiB)
 - vLLM / vLLM-Omni: versions from your current checkout
 
-## Start server
+## Unified Realtime Session (text/video)
+
+An opt-in profile connects JoyAI to the shared Session runtime and Realtime
+client. It uses the existing JoyAI → Qwen3-TTS CustomVoice → Code2Wav pipeline:
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction_duplex.yaml \
+  --port 8099
+```
+
+Connect to `ws://localhost:8099/v1/realtime?duplex=1`. Set the task with
+`session.update.instructions` or a user `conversation.item.create` text item.
+For each camera observation, send these events:
+
+```json
+{"type":"input_audio_buffer.append","video_frames":["<base64 JPEG or PNG>"]}
+{"type":"input_audio_buffer.commit","final":true,"create_response":true}
+```
+
+The shared Python `DuplexClient` supports the same flow with
+`SessionConfig(auto_response=False, instructions="Tell me when the pot starts smoking.")`,
+`append_audio(b"", video_frames=[frame])`, and `commit(create_response=True)`.
+The client controls observation cadence; each commit submits the latest pending
+camera frame. A silent decision completes the response with empty output. A spoken
+decision produces text and audio, followed by `response.done`. Playback acknowledgements,
+`response.cancel`, `session.close`, and reconnect use the shared Session lifecycle.
+
+This first profile runs observations sequentially through the all-sync pipeline.
+Incoming frames can be buffered while an answer is being generated; speech audio
+is delivered after synthesis finishes. Prompts retain up to four recent camera
+frames (thumbnail size at most 448×448) and eight recent text messages. Older
+history/frames are evicted when the expanded visual-token count plus the generation
+budget would exceed the configured JoyAI-stage context limit. The active instruction
+and newest frame are retained; an oversized instruction is reported as an error.
+These bounds provide a small working context, with summary memory planned in
+[RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
+
+The current profile accepts
+text, images, and camera frames, and uses the existing CustomVoice
+`tts_speaker`, `tts_language`, and `tts_instruct` fields in `session.extra_body`.
+The default `joyai_vl_interaction.yaml` remains turn-based.
+
+### Speech input
+
+Select the ASR duplex overlay to accept microphone input on the same Session:
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction_asr_duplex.yaml \
+  --port 8099
+```
+
+Send PCM audio through `input_audio_buffer.append`, then
+`input_audio_buffer.commit` with `create_response: true`; alternatively configure
+`session.audio.input.turn_detection` with `type: "server_vad"`. Session owns
+buffering, cancellation, VAD and playback acknowledgements. Qwen3-ASR transcribes
+each committed utterance; JoyAI receives that transcript together with the original
+visual inputs, standing instructions and committed conversation. Transcripts are
+added to the matching user history item, so later camera observations retain the
+spoken task. Text/video-only turns bypass ASR on this deployment. The final
+expanded prompt is checked against JoyAI's context budget after transcription.
+
+Speech output remains all-sync. Summary memory and tool delegation are separate
+follow-ups tracked by [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
+
+### Browser client
+
+The shared [Realtime Web UI](../../examples/online_serving/realtime_web/README.md#joyai-camera-observations-and-spoken-replies)
+provides text instructions, camera observations, transcript display, and speech
+playback for this profile:
+
+```bash
+python -m examples.online_serving.realtime_web --profile joyai-turn \
+  --ws-backend ws://127.0.0.1:8099 --port 7862
+```
+
+Set the instruction, start the session, and enable Camera. Observations are
+committed once per second while idle; **Send observation** submits the current
+frame manually. The client waits for response completion and playback before
+submitting the latest pending frame. With the ASR duplex deployment, add
+`--speech-input` for **Hold to talk**, releasing to commit a spoken instruction.
+Add `--speech-input --vad` for automatic speech commits with server VAD; camera
+frames accompany utterances, while automatic camera-only observations are paused
+in VAD mode. Starting speech clears queued reply audio immediately, including
+after reply generation has completed. Use push-to-talk for continuous camera
+observations between utterances.
+
+## Standalone interaction server
 
 From repository root:
 
@@ -243,7 +331,7 @@ vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
 With `modalities: ["text", "audio"]`, its behavior is:
 
 | JoyAI action | Native output |
-|---|---|
+| --- | --- |
 | `</response> <text>` | action text + speech for `<text>` |
 | `</silence>` | action text + empty audio output (zero samples) |
 | `</response> <note> </delegation> <question>` | action text + speech for `<note>` only |
@@ -257,7 +345,7 @@ This experimental native multi-stage pipeline is request-scoped, stateless, and
 all-sync. It currently does not include:
 
 - continuous frame sessions, persistent standing instructions, or session memory;
-- audio input / ASR, full-duplex interaction, or barge-in;
+- full-duplex interaction or barge-in;
 - background Agent execution for delegated questions;
 - async-chunk support from Talker to Code2Wav;
 - integration with the existing WebUI.
@@ -267,3 +355,44 @@ available, and Code2Wav starts only after the Talker completes. Silence actions 
 TTS stages and return an empty audio output with zero samples. All three stages are placed
 on GPU 0 by the provided
 [`deploy config`](../../vllm_omni/deploy/joyai_vl_interaction.yaml).
+
+### Audio input: opt-in native ASR profile
+
+A second deploy profile takes spoken input natively, without the external ASR bridge, and
+still serves the text/video requests above from the same deployment:
+
+```text
+with audio:    Qwen3-ASR transcript -> JoyAI action -> Qwen3-TTS Talker -> Code2Wav
+without audio: JoyAI action -> Qwen3-TTS Talker -> Code2Wav   (the ASR stage is skipped)
+```
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction_asr.yaml \
+  --port 8092
+```
+
+Send the spoken query as an `input_audio` / `audio_url` part next to the frames or video:
+
+```bash
+curl -s http://127.0.0.1:8092/v1/chat/completions -H 'content-type: application/json' -d '{
+    "model": "jdopensource/JoyAI-VL-Interaction-Preview",
+    "modalities": ["text", "audio"],
+    "messages": [{"role": "user", "content": [
+      {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+    ]}]
+  }'
+```
+
+- With audio, JoyAI sees the transcript under the Day-0 `[User Query ...]` header, followed
+  by the images/video, so `silence` / `response` / `delegate` behave as above. A `system`
+  message and text parts go to Qwen3-ASR as transcription context; set
+  `additional_information.joyai_system_prompt` to replace JoyAI's default system prompt.
+- Without audio, the request never reaches the ASR stage and is rendered for JoyAI exactly
+  as in the text/video profile.
+- In both cases, sampling parameters and the `voice` / `language` fields apply as in the
+  text/video profile.
+
+The first request that reaches JoyAI pays a one-off setup of about 22 s, because its input
+processor is built lazily; send a warm-up request after startup.

@@ -191,6 +191,11 @@ stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`
 Streaming input pumps take an admission slot immediately before each EngineCore
 ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
+Video output sessions shield final task cleanup and unfinished-request abort
+from ASGI cancellation, including disconnects immediately after `session.done`.
+Abort cleanup bounds both its coroutine and the engine acknowledgement wait
+with `ABORT_TIMEOUT_S`; an unresponsive orchestrator must not hold the shield
+indefinitely.
 Multi-API serving must preserve one client rank and one channel set per
 frontend, include every frontend in readiness/failure observation, and keep
 stage lifecycle ownership in the parent composition root.

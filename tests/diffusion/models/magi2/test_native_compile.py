@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch.fx.experimental.symbolic_shapes import is_concrete_int
 
 from tests.diffusion.models.magi2.test_native_packing import (
     _longer_text_tensors,
@@ -12,6 +13,7 @@ from tests.diffusion.models.magi2.test_native_packing import (
     _tiny_model,
     _tiny_sampler,
 )
+from vllm_omni.diffusion.models.magi2.layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.sampler_magi2 import CFGConfig
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -135,3 +137,32 @@ def test_compiled_regions_survive_new_requests_without_recompiling() -> None:
         assert torch.equal(video, video_ref)
         assert torch.equal(audio, audio_ref)
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] - graphs_before == 7
+
+
+def test_dynamic_compile_of_attention_output_keeps_only_the_token_count_symbolic() -> None:
+    attention = _tiny_model().block.layers[1].attention
+    graphs: list[torch.fx.GraphModule] = []
+
+    def backend(gm: torch.fx.GraphModule, example_inputs: list[object]):
+        graphs.append(gm)
+        return gm.forward
+
+    output = torch.compile(attention.output, backend=backend, fullgraph=True, dynamic=True)
+    for tokens in (13, 11):
+        generator = torch.Generator().manual_seed(tokens)
+        dispatcher = ModalityDispatcher(torch.randint(0, 3, (tokens,), generator=generator), 3)
+        attended = torch.randn(tokens, attention.num_heads_q, attention.head_dim, generator=generator)
+        gates = torch.randn(tokens, attention.num_heads_q, 1, generator=generator)
+        with torch.inference_mode():
+            assert torch.equal(output(attended, gates, dispatcher), attention.output(attended, gates, dispatcher))
+
+    # One graph serves every token count, with the head layout as constants.
+    assert len(graphs) == 1
+    (attended,) = (
+        node.meta["example_value"]
+        for node in graphs[0].graph.find_nodes(op="placeholder")
+        if node.name.lower() == "l_attention_"
+    )
+    assert not is_concrete_int(attended.shape[0])
+    assert all(is_concrete_int(size) for size in attended.shape[1:])
+    assert tuple(int(size) for size in attended.shape[1:]) == (attention.num_heads_q, attention.head_dim)

@@ -372,11 +372,12 @@ class LingBotSelfAttention(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
             )
-            if query.is_cuda and query.shape[0] == 1:
-                # Use the same block-table FlashAttention entry point as the
-                # realtime path so direct replay is a numerical oracle for
-                # paged execution, rather than a comparison between two
-                # different attention kernels.
+            if (query.is_cuda or query.device.type == "npu") and query.shape[0] == 1:
+                # Package the visible window as a block table and call the
+                # same block-table entry point as the realtime path
+                # (FlashAttention on CUDA, the fused kernel on NPU) so direct
+                # replay is a numerical oracle for paged execution, rather
+                # than a comparison between two different attention kernels.
                 block_size = key.shape[1]
                 key_cache = visible_key[0].unflatten(0, (-1, block_size))
                 value_cache = visible_value[0].unflatten(0, (-1, block_size))
@@ -490,6 +491,8 @@ class LingBotCrossAttention(nn.Module):
             softmax_scale=self.head_dim**-0.5,
             causal=False,
             role="cross",
+            computation="cross",
+            cross_parallel_layout="local_q_replicated_kv",
             qkv_layout="BSND",
             prefix=prefix,
             skip_sequence_parallel=True,

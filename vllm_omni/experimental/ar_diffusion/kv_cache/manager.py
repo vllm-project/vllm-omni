@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import inspect
 import os
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -318,6 +319,8 @@ class ARDiffusionKVCache:
             for name, length in self.cross_attention_lengths.items()
         )
 
+        resident_frames = config.sink_chunks + config.window_chunks
+
         def _required_managed_blocks(capacity: int) -> int:
             """Managed blocks needed to hold ``capacity`` resident sessions.
 
@@ -331,7 +334,6 @@ class ARDiffusionKVCache:
             the requirement -- it only stops the final block of each term from
             rounding up a whole frame's worth of memory.
             """
-            resident_frames = config.sink_chunks + config.window_chunks
             per_session_blocks = resident_frames * self.blocks_per_frame
             in_flight_blocks = self.frames_per_block * self.blocks_per_frame
             headroom_blocks = 2 * self.blocks_per_frame
@@ -527,6 +529,8 @@ class ARDiffusionKVCache:
         cache_name: str,
         kv_branch: str,
         layer_kv: Iterable[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        publish_guard: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Atomically populate one logical branch of a named cross-attention cache.
 
@@ -583,10 +587,11 @@ class ARDiffusionKVCache:
                 f"got {populated_layers}"
             )
 
-        if session is None:
-            session = {}
-            self._cross_sessions[session_id] = session
-        session.setdefault(cache_name, {})[kv_branch] = (k_pool, v_pool)
+        with publish_guard() if publish_guard is not None else nullcontext():
+            if session is None:
+                session = {}
+                self._cross_sessions[session_id] = session
+            session.setdefault(cache_name, {})[kv_branch] = (k_pool, v_pool)
 
     def read_cross_attention_kv(
         self,
@@ -619,9 +624,29 @@ class ARDiffusionKVCache:
         """Release every named cross-attention allocation for one session."""
         self._cross_sessions.pop(session_id, None)
 
+    def release_cross_attention_branch(self, session_id: str, cache_name: str, kv_branch: str) -> None:
+        """Release one conditioning branch without touching the other branches."""
+        session = self._cross_sessions.get(session_id)
+        if session is None:
+            return
+        branches = session.get(cache_name)
+        if branches is None:
+            return
+        branches.pop(kv_branch, None)
+        if not branches:
+            session.pop(cache_name, None)
+        if not session:
+            self._cross_sessions.pop(session_id, None)
+
     # -- request lifecycle ---------------------------------------------------
 
+    def _require_current_adapter(self, adapter: ARDiffusionRequestAdapter) -> None:
+        if self._adapters.get(adapter.request_id) is not adapter:
+            raise RuntimeError(f"AR-Diffusion request {adapter.request_id!r} has no matching active adapter")
+
     def begin_request(self, request_id: str, *, prefill_prefix_tokens: int = 0) -> ARDiffusionRequestAdapter:
+        if request_id in self._adapters:
+            raise ValueError(f"AR-Diffusion request ID {request_id!r} is already active")
         adapter = ARDiffusionRequestAdapter(
             request_id,
             chunk_size=self.spec.chunk_size,
@@ -632,6 +657,7 @@ class ARDiffusionKVCache:
         return adapter
 
     def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+        self._require_current_adapter(adapter)
         _log.debug(
             "AR-Diffusion end_request: req=%s chunks=%d free=%d",
             adapter.request_id,
@@ -662,6 +688,7 @@ class ARDiffusionKVCache:
 
     def allocate_token_slots(self, adapter: ARDiffusionRequestAdapter, num_tokens: int) -> list[int]:
         """Allocate managed blocks for an in-flight video span without committing it."""
+        self._require_current_adapter(adapter)
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
         # vLLM clips slot allocation at max_model_len. Admit the entire
@@ -674,6 +701,7 @@ class ARDiffusionKVCache:
         return self.block_table(adapter)
 
     def block_table(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
+        self._require_current_adapter(adapter)
         return list(self.manager.get_block_ids(adapter.request_id)[0])
 
     def block_ids_at(self, adapter: ARDiffusionRequestAdapter, indices: Sequence[int]) -> list[int]:
@@ -683,6 +711,7 @@ class ARDiffusionKVCache:
         the session. :meth:`block_table` reads every entry; this reads only the
         ones asked for, straight from the manager's own block list.
         """
+        self._require_current_adapter(adapter)
         blocks = self.manager.get_blocks(adapter.request_id).blocks[0]
         return [blocks[index].block_id for index in indices]
 
@@ -728,6 +757,7 @@ class ARDiffusionKVCache:
         advances the adapter only after the forward succeeds. Call once per
         committed chunk, not per denoise step.
         """
+        self._require_current_adapter(adapter)
         _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
         self.manager.remove_skipped_blocks(

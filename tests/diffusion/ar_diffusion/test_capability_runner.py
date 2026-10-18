@@ -191,7 +191,9 @@ def make_runner(
         gpu_memory_fraction=gpu_memory_fraction,
     )
     runner.kv_cache = None
+    runner.noisy_kv_cache = None
     runner._ar_diffusion_capability = None
+    runner._ar_diffusion_cell_capability = None
     runner._ar_diffusion_kv_cache_spec = None
     runner._sessions = OrderedDict()
     runner._session_capacity = 0
@@ -430,7 +432,7 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert kv is not None
     free_total = kv.manager.block_pool.get_num_free_blocks()
 
-    def boom(self, req, kv_prefetch_job=None):
+    def boom(self, req, kv_prefetch_job=None, diffusion_kv_metadata=None):
         state = pipeline.bound_state
         assert state is not None
         ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
@@ -460,7 +462,7 @@ def test_decode_failure_after_kv_commit_releases_session(monkeypatch):
     assert kv is not None
     free_total = kv.manager.block_pool.get_num_free_blocks()
 
-    def decode_failure(self, req, kv_prefetch_job=None):
+    def decode_failure(self, req, kv_prefetch_job=None, diffusion_kv_metadata=None):
         state = commit_one_block(runner, "broken", "main")
         assert state is pipeline.bound_state
         assert state._committed["main"] > 0
@@ -488,7 +490,7 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
     assert kv is not None
     free_total = kv.manager.block_pool.get_num_free_blocks()
 
-    def return_after_allocation(self, req, kv_prefetch_job=None):
+    def return_after_allocation(self, req, kv_prefetch_job=None, diffusion_kv_metadata=None):
         state = pipeline.bound_state
         assert state is not None
         ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=True)[0].forward_ctx
@@ -534,7 +536,7 @@ def test_ar_runner_allows_step_execution_when_pipeline_implements_the_contract()
 
 
 def test_ar_runner_defensively_rejects_inherited_batch_and_step_entrypoints():
-    runner = object.__new__(ARDiffusionModelRunner)
+    runner = make_runner(CapablePipeline(lingbot_like_spec()))
     with pytest.raises(RuntimeError, match="request-batch execution"):
         runner.execute_model_batch(None, None)
     with pytest.raises(RuntimeError, match="step execution"):
