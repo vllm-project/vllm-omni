@@ -935,6 +935,16 @@ class DiffusionWorker:
                 raise
             logger.warning("LoRA activation skipped: %s", exc)
 
+    def start_warmup_batch_profile(self) -> None:
+        """Start per-step warmup profile recording on the model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.start_warmup_batch_profile()
+
+    def collect_warmup_batch_profile(self) -> list[tuple[int, int, float]]:
+        """Stop recording and return warmup profile records from the runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.collect_warmup_batch_profile()
+
     def remove_lora(self, adapter_id: int) -> bool:
         if self.lora_manager is None:
             return False

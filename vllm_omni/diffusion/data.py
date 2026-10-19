@@ -817,6 +817,126 @@ class VideoOutputTransportConfig:
 
 
 @dataclass
+class DiffusionBatchingConfig:
+    """Configuration for diffusion batching policy plugins.
+
+    The built-in reference budget is profiled from Qwen-Image on one 910B2
+    NPU, where 512x512 requests have batch-size sweet spot 10:
+    ``(512 / 16) * (512 / 16) * 10 = 10240``.
+
+    For other models, hardware, or backend setups, run the profiler policy and
+    set ``compute_unit_budget`` from the generated config.
+    """
+
+    policy: str = "fixed"
+    compute_unit_budget: int = 10240
+
+    # Qwen-Image packs VAE latents into 2x2 patches. The effective sequence
+    # length is (height / (vae_scale_factor * latent_patch_size)) *
+    # (width / (vae_scale_factor * latent_patch_size)).
+    vae_scale_factor: int = 8
+    latent_patch_size: int = 2
+
+    # Cost multiplier for true CFG / negative-branch execution.
+    cfg_compute_multiplier: float = 2.0
+
+    default_height: int = 1024
+    default_width: int = 1024
+
+    profiler_interval: int = 20
+    log_stats: bool = False
+
+    # CNA (cost-normalized aging) waiting-queue ordering and admission.
+    # Waiting requests are ordered by score = age_s**alpha / (cost/1024)**beta,
+    # where cost is the request's compute units and 1024 is one 512x512 image.
+    cna_alpha: float = 1.0
+    cna_beta: float = 1.0
+    # A request waiting longer than this becomes an aged head: it reserves the
+    # remaining budget for itself instead of being skipped over.
+    cna_reserve_time_s: float = 60.0
+
+    # Warmup-time automatic budget calibration. Opt-in via warmup_auto_calibrate.
+    # The ladder sweep runs at startup (step_execution + max_num_seqs > 1) and
+    # rewrites compute_unit_budget based on a sparse ladder of batch sizes.
+    warmup_auto_calibrate: bool = False
+    warmup_profile_max_batch: int = 128
+    warmup_profile_num_steps: int = 3
+    warmup_profile_discard_steps: int = 1
+    warmup_reference_height: int = 512
+    warmup_reference_width: int = 512
+    warmup_profile_max_step_ms: float | None = None
+    warmup_profile_min_marginal_gain: float = 0.05
+    warmup_profile_timeout_s: float = 600.0
+    # Persist the calibrated profile so only the first startup pays the sweep
+    # cost; later startups reuse it. warmup_profile_refresh forces a re-sweep.
+    warmup_profile_cache: bool = True
+    warmup_profile_refresh: bool = False
+    warmup_profile_cache_ttl_s: float = 0.0
+    warmup_profile_cache_dir: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DiffusionBatchingConfig":
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected batching config dict, got {type(data)!r}")
+        field_names = {f.name for f in fields(cls)}
+        known_params = {k: v for k, v in data.items() if k in field_names}
+        return cls(**known_params)
+
+    @property
+    def uses_compute_budget(self) -> bool:
+        return self.policy == "compute_budget"
+
+    @property
+    def uses_profiler(self) -> bool:
+        return self.policy in {"profile", "profiler"}
+
+    @property
+    def latent_divisor(self) -> int:
+        return max(1, int(self.vae_scale_factor) * int(self.latent_patch_size))
+
+    def spatial_compute_units(
+        self,
+        height: int | None,
+        width: int | None,
+        num_frames: int | None = None,
+    ) -> int:
+        h = int(height or self.default_height)
+        w = int(width or self.default_width)
+        frames = max(1, int(num_frames or 1))
+        divisor = self.latent_divisor
+        latent_h = max(1, h // divisor)
+        latent_w = max(1, w // divisor)
+        return latent_h * latent_w * frames
+
+    def request_compute_units(self, sampling_params: Any, prompts: list[Any]) -> int:
+        units = self.spatial_compute_units(
+            getattr(sampling_params, "height", None),
+            getattr(sampling_params, "width", None),
+            getattr(sampling_params, "num_frames", 1),
+        )
+        if self._uses_true_cfg(sampling_params, prompts):
+            units = int(units * float(self.cfg_compute_multiplier))
+        return max(1, units)
+
+    def effective_compute_unit_budget(self) -> int:
+        return max(1, int(self.compute_unit_budget))
+
+    @staticmethod
+    def _uses_true_cfg(sampling_params: Any, prompts: list[Any]) -> bool:
+        if bool(getattr(sampling_params, "do_classifier_free_guidance", False)):
+            return True
+
+        true_cfg_scale = getattr(sampling_params, "true_cfg_scale", None)
+        if true_cfg_scale is None or true_cfg_scale <= 1:
+            return False
+
+        for prompt in prompts:
+            if isinstance(prompt, dict) and prompt.get("negative_prompt"):
+                return True
+        return False
+
+
+@dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     stage_id: int = 0
@@ -1158,6 +1278,9 @@ class OmniDiffusionConfig:
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
+    diffusion_batching_config: DiffusionBatchingConfig | dict[str, Any] = field(
+        default_factory=DiffusionBatchingConfig
+    )
 
     # Native vLLM KV-cache sizing inputs used only by paged_scheduler mode.
     # These mirror the structured stage cache/scheduler config until all
@@ -1433,6 +1556,11 @@ class OmniDiffusionConfig:
             self.video_output_transport = VideoOutputTransportConfig(**dict(self.video_output_transport))
         elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
             raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+
+        if isinstance(self.diffusion_batching_config, dict):
+            self.diffusion_batching_config = DiffusionBatchingConfig.from_dict(self.diffusion_batching_config)
+        elif not isinstance(self.diffusion_batching_config, DiffusionBatchingConfig):
+            self.diffusion_batching_config = DiffusionBatchingConfig()
 
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction

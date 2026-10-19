@@ -892,6 +892,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     enable_mixfusion: bool = False
     mixfusion_min_chunk_tokens: int = 256
     mixfusion_max_chunks: int = 128
+    diffusion_batching_config: Any = None
     step_execution: bool = False
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None

@@ -4,6 +4,7 @@
 import asyncio
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1208,9 +1209,10 @@ class TestRequestScheduler:
         assert third.num_waiting_reqs == 0
 
     def test_records_initial_scheduler_queue_wait(self, mocker: MockerFixture) -> None:
+        # Clock reads: enqueue, CNA ordering pass, then the queue-wait record.
         perf_counter = mocker.patch(
             "vllm_omni.diffusion.sched.base_scheduler.time.perf_counter",
-            side_effect=[10.0, 10.125],
+            side_effect=[10.0, 10.125, 10.125],
         )
         request = _make_step_request("queue-wait", num_inference_steps=2)
 
@@ -1218,7 +1220,7 @@ class TestRequestScheduler:
         self.scheduler.schedule()
 
         assert request.scheduler_queue_wait_ms == pytest.approx(125.0)
-        assert perf_counter.call_count == 2
+        assert perf_counter.call_count == 3
 
     def test_batches_compatible_requests_up_to_max_num_seqs(self) -> None:
         scheduler = RequestScheduler()
@@ -1417,9 +1419,16 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
-    def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
+    def test_cna_respects_homogeneous_batch_gate_by_compute_budget(self) -> None:
         scheduler = RequestScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=3,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
 
         req_id_a = scheduler.add_request(_make_request("a"))
         req_id_b = scheduler.add_request(
@@ -1429,20 +1438,32 @@ class TestRequestScheduler:
                 request_id="b",
             )
         )
-        scheduler.add_request(_make_request("c"))
+        req_id_c = scheduler.add_request(_make_request("c"))
+
+        # Age b so its CNA score dominates the microsecond-scale ages of the
+        # fresh requests; otherwise the ordering would be timing-dependent.
+        state_b = scheduler.get_request_state(req_id_b)
+        assert state_b is not None
+        state_b.queued_at = time.perf_counter() - 1.0
 
         first = scheduler.schedule()
 
-        assert _new_ids(first) == [req_id_a]
+        # The homogeneous-batching admission gate keeps request-mode batches
+        # single-key: the worker resolves height/width from the first
+        # request's sampling params, so b (1024x768 -> 3072) must be scheduled
+        # alone even though b + a (1024x1024 -> 4096) would fit the budget.
+        assert _new_ids(first) == [req_id_b]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 2
 
-        scheduler.update_from_output(first, _make_request_output(req_id_a))
+        scheduler.update_from_output(first, _make_request_output(req_id_b))
         second = scheduler.schedule()
 
-        assert _new_ids(second) == [req_id_b]
-        assert second.num_running_reqs == 1
-        assert second.num_waiting_reqs == 1
+        # With b finished, CNA fills the budget with same-key requests:
+        # a (4096) + c (4096) = 8192 <= 10240.
+        assert _new_ids(second) == [req_id_a, req_id_c]
+        assert second.num_running_reqs == 2
+        assert second.num_waiting_reqs == 0
 
     def test_abort_request_for_waiting_and_running(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
@@ -2081,37 +2102,289 @@ class TestStepScheduler:
         assert _new_ids(second) == []
         assert _cached_ids(second) == [req_good]
 
-    def test_step_batch_rejects_different_sampling_key(self) -> None:
-        scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+    @staticmethod
+    def _age_request(scheduler: StepScheduler, sched_req_id: str, age_s: float) -> None:
+        state = scheduler.get_request_state(sched_req_id)
+        assert state is not None
+        state.queued_at = time.perf_counter() - age_s
 
-        req_a = scheduler.add_request(_make_step_request("a"))
-        req_b = scheduler.add_request(
+    def test_cna_aged_head_reserves_remaining_budget_gap(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=8,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 8192,
+                },
+            )
+        )
+
+        small_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"small-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(6)
+        ]
+        first = scheduler.schedule()
+        assert _new_ids(first) == small_ids
+
+        req_big = scheduler.add_request(
             _make_step_request(
-                "b",
+                "big",
                 sampling_params=OmniDiffusionSamplingParams(
-                    height=768,
+                    height=1024,
+                    width=1024,
                     num_inference_steps=4,
                 ),
             )
         )
-        scheduler.add_request(_make_step_request("c"))
+        self._age_request(scheduler, req_big, 120.0)
+        scheduler.add_request(
+            _make_step_request(
+                "late-small",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
 
-        sched_output = scheduler.schedule()
+        # Running units = 6 * 1024 = 6144, budget 8192 -> remaining 2048. The
+        # aged big (4096) cannot fit; reservation mode must not spend the gap
+        # on the late small (1024), otherwise the gap never accumulates.
+        second = scheduler.schedule()
 
-        assert _new_ids(sched_output) == [req_a]
-        assert sched_output.num_running_reqs == 1
-        assert sched_output.num_waiting_reqs == 2
+        assert _new_ids(second) == []
+        assert second.num_running_reqs == 6
+        assert second.num_waiting_reqs == 2
+
+    def test_cna_young_head_is_skipped_to_fill_budget(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=8,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                    "compute_unit_budget": 8192,
+                },
+            )
+        )
+
+        small_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"small-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(6)
+        ]
+        first = scheduler.schedule()
+        assert _new_ids(first) == small_ids
+
+        req_big = scheduler.add_request(
+            _make_step_request(
+                "big",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        # Young aged head: only 10s < cna_reserve_time_s, so it does not get
+        # reservation treatment.
+        self._age_request(scheduler, req_big, 10.0)
+        req_small = scheduler.add_request(
+            _make_step_request(
+                "late-small",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+
+        # Remaining budget = 2048. Big (4096) does not fit but is young, so it
+        # is skipped and the small (1024) fills the budget.
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_small]
+        assert second.num_running_reqs == 7
+        assert second.num_waiting_reqs == 1
+
+    def test_cna_aging_promotes_waiting_request_over_new_arrivals(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+
+        req_first = scheduler.add_request(_make_step_request("first"))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_first]
+
+        scheduler.add_request(
+            _make_step_request(
+                "cheap",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        req_expensive = scheduler.add_request(
+            _make_step_request(
+                "expensive",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        self._age_request(scheduler, req_expensive, 120.0)
 
         scheduler.update_from_output(
-            sched_output,
-            _make_step_output(req_a, step_index=4, finished=True),
+            first,
+            _make_step_output(req_first, step_index=4, finished=True),
         )
         second = scheduler.schedule()
 
-        assert _new_ids(second) == [req_b]
-        assert second.num_running_reqs == 1
+        # The aged expensive request must overtake the younger cheap one even
+        # though the cheap one arrived (and was enqueued) first.
+        assert _new_ids(second) == [req_expensive]
         assert second.num_waiting_reqs == 1
+
+    def test_compute_budget_batching_caps_1024_requests_from_512_profile(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=128,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=1024,
+                        width=1024,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(8)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        # Qwen-Image packed latent units:
+        # 512x512 -> (512 / 16)^2 = 1024, profiled budget = 1024 * 10.
+        # 1024x1024 -> (1024 / 16)^2 = 4096. CNA admits by compute-unit sum,
+        # not by ceil(budget / cost) count: 2 * 4096 = 8192 <= 10240, a third
+        # would exceed it.
+        assert _new_ids(sched_output) == req_ids[:2]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 6
+
+    def test_compute_budget_batching_keeps_profiled_512_batch_size(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=128,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(12)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:10]
+        assert sched_output.num_running_reqs == 10
+        assert sched_output.num_waiting_reqs == 2
+
+    def test_compute_budget_batching_respects_max_num_seqs_hard_cap(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=4,
+                diffusion_batching_config={
+                    "policy": "compute_budget",
+                },
+            )
+        )
+
+        req_ids = [
+            scheduler.add_request(
+                _make_step_request(
+                    f"req-{i}",
+                    sampling_params=OmniDiffusionSamplingParams(
+                        height=512,
+                        width=512,
+                        num_inference_steps=4,
+                    ),
+                )
+            )
+            for i in range(8)
+        ]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:4]
+        assert sched_output.num_running_reqs == 4
+        assert sched_output.num_waiting_reqs == 4
+
+    def test_profile_batching_policy_ramps_batch_size(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=4,
+                diffusion_batching_config={
+                    "policy": "profile",
+                    "profiler_interval": 1,
+                },
+            )
+        )
+
+        req_ids = [scheduler.add_request(_make_step_request(f"req-{i}")) for i in range(4)]
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == req_ids[:2]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 2
 
     def test_step_batch_rejects_different_quality_levels(self) -> None:
         scheduler = StepScheduler()

@@ -204,6 +204,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
 
+        # Warmup batch profile records: [(batch, step_index, ms)] while active,
+        # None when not profiling (kept aligned with the profiler policy hook).
+        self._warmup_profile_records: list[tuple[int, int, float]] | None = None
+
         # Initialize KV cache manager for connector management.
         payload_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
         self.kv_transfer_manager = (
@@ -1328,6 +1332,41 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             ]
         )
 
+    def start_warmup_batch_profile(self) -> None:
+        """Reset and activate per-step warmup profile recording."""
+        self._warmup_profile_records = []
+
+    def collect_warmup_batch_profile(self) -> list[tuple[int, int, float]]:
+        """Return recorded (batch, step_index, ms) tuples and stop recording."""
+        records = self._warmup_profile_records or []
+        self._warmup_profile_records = None
+        return records
+
+    def _log_batch_profile(
+        self,
+        states: list[StepRequestState],
+        elapsed: float,
+    ) -> None:
+        batching_config = getattr(self.od_config, "diffusion_batching_config", None)
+        if batching_config is None or not getattr(batching_config, "uses_profiler", False):
+            return
+        if not states:
+            return
+
+        prompt = states[0].prompt
+        request_units = batching_config.request_compute_units(
+            states[0].sampling,
+            [prompt] if prompt is not None else [],
+        )
+        logger.info(
+            "[DiffusionBatchProfiler] batch_size=%s request_compute_units=%s "
+            "total_compute_units=%s denoise_step_time=%.6f",
+            len(states),
+            request_units,
+            request_units * len(states),
+            elapsed,
+        )
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         return self._execute_stepwise(
@@ -1477,14 +1516,26 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 paged_kv_runtime=paged_kv_runtime,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
+                record_warmup = self._warmup_profile_records is not None
+                if record_warmup:
+                    # Clear any async tail before measuring the step.
+                    current_omni_platform.synchronize()
                 clear_pipeline_stage_durations(pipeline)
                 driver = getattr(pipeline, "mixfusion_driver", None)
+                denoise_start = time.perf_counter()
                 if driver is not None:
                     # The driver forwards dense batches to the same
                     # ``denoise_step`` and owns the packed/ragged paths.
                     noise_pred = driver.run(input_batch, states, pipeline.denoise_step)
                 else:
                     noise_pred = pipeline.denoise_step(input_batch, states=states)
+                if record_warmup:
+                    current_omni_platform.synchronize()
+                    self._warmup_profile_records.append(
+                        (len(states), int(states[0].step_index), (time.perf_counter() - denoise_start) * 1000.0)
+                    )
+                else:
+                    self._log_batch_profile(states, time.perf_counter() - denoise_start)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(
