@@ -103,6 +103,7 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.memory_runtime import SessionMemoryRuntime
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import (
     LoopTimerScheduler,
@@ -254,6 +255,7 @@ class DuplexSessionRunner:
             tool_calls=self.tool_calls,
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
+        self.memory = SessionMemoryRuntime(self.ctx, self.out, post=self._post_memory_event, wake=self._wake_memory)
         calibration = plugin.history_calibrator(manager.runtime_config)
         if calibration is not None:
             self.ctx.history_calibration = HistoryCalibration(
@@ -318,6 +320,8 @@ class DuplexSessionRunner:
         input_item_id: str | None = None,
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
+        if self.memory.on_output(request_id, output, finished=context.segment_finished):
+            return True
         if self.model.is_input_transcription(request_id):
             self._mailbox.put_nowait(
                 StageOutput(
@@ -400,6 +404,8 @@ class DuplexSessionRunner:
         ``session.expired``. Emitting here keeps the order
         ``error`` -> failed ``response.done`` -> ``session.expired``.
         """
+        if self.memory.on_error(request_id, exc):
+            return
         session = self.session
         if session.state == DuplexSessionState.CLOSED:
             return
@@ -552,6 +558,8 @@ class DuplexSessionRunner:
             item = await self._mailbox.get()
             try:
                 await self._handle_item(item)
+                if isinstance(item, (DuplexCommand, StageOutput)):
+                    self.memory.maybe_start()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -564,6 +572,7 @@ class DuplexSessionRunner:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
 
     async def _stop_worker(self) -> None:
+        self.memory.cancel_retry()
         if self.ctx.history_calibration is not None:
             self.ctx.history_calibration.close()
         worker = self._worker
@@ -621,6 +630,8 @@ class DuplexSessionRunner:
         await self._on_command(item)
 
     async def _on_internal(self, item: _Internal) -> None:
+        if self.memory.handle_event(item.kind, item.payload):
+            return
         if item.kind == "stage_metrics":
             stage_metrics = item.payload.get("stage_metrics")
             if isinstance(stage_metrics, Mapping):
@@ -802,15 +813,20 @@ class DuplexSessionRunner:
         elif isinstance(command, Heartbeat):
             self._on_heartbeat(command)
         elif isinstance(command, CreateItem):
+            previous_user_items = session.unanswered_user_items()
             control = resolve_create_item(projector, command)
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self._run_internal_payload(payload)
+            if session.unanswered_user_items() > previous_user_items:
+                self.memory.note_user_item(command.payload(), str(command.item["id"]))
         elif isinstance(command, DeleteItem):
             control = resolve_delete_item(projector, command)
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
+            if control.payloads:
+                self.memory.forget_user_item(command.item_id)
         elif isinstance(command, TruncateItem):
             control = resolve_truncate_item(projector, command)
             self._emit_events(control.events)
@@ -859,6 +875,7 @@ class DuplexSessionRunner:
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
+        self.memory.forget_committed_input()
         session.cancel_pending_input()
         projector = self.out.projector
         if projector is not None:
@@ -1070,6 +1087,7 @@ class DuplexSessionRunner:
         self.run.closing = True
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
+        self.memory.close()
         # Every terminal path funnels through here: the control-RPC close, the
         # lease expiry, a runtime close raised by the model channel, and the
         # output-backpressure close. Releasing the call ledger here (rather than
@@ -1084,6 +1102,14 @@ class DuplexSessionRunner:
         self.tool_calls.close()
         self._finalized_tool_calls.clear()
         self._applied_tool_call_settlements.clear()
+
+    def _post_memory_event(self, kind: str, payload: dict[str, object]) -> None:
+        self._mailbox.put_nowait(_Internal(kind, payload))
+
+    def _wake_memory(self, _completed: object = None) -> None:
+        """Wake memory policy on the mailbox after accepted input or owned work finishes."""
+        if self.plugin.supports_auxiliary_requests and not self.closing and not self._worker_stopped:
+            self._post_memory_event("auxiliary_ready", {})
 
     def _session_auto_responds(self) -> bool:
         return self.out.auto_responds()
@@ -1452,6 +1478,7 @@ class DuplexSessionRunner:
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
+        interactive = self.memory.begin_append(payload, silence_continuation=silence_continuation)
         if not silence_continuation:
             # This append is being admitted. Do not also replay a continuation
             # that was waiting to see whether the same audio would be dropped.
@@ -1466,9 +1493,19 @@ class DuplexSessionRunner:
                     model_state.silence_deadline_monotonic = None
 
                 on_append_accepted = _reanchor_chain
+        accepted_callback = on_append_accepted
+
+        def _accepted(submit_time: float) -> None:
+            if accepted_callback is not None:
+                accepted_callback(submit_time)
+            self._wake_memory()
+
+        on_append_accepted = _accepted
         append_epoch = session.epoch
         append_fence = helpers.append_fence(session, payload, epoch=append_epoch)
         append_turn_id = append_fence.turn_id
+        if interactive:
+            self.memory.bind_interaction_turn(append_turn_id)
         request_id = self.ctx.manager.stage_request_id(
             append_fence,
             stage_id=0,
@@ -1514,6 +1551,7 @@ class DuplexSessionRunner:
             input_audio_part=session.input_audio_part(input_item_id) if isinstance(input_item_id, str) else None,
             input_audio_parts=input_audio_parts,
             on_append_accepted=on_append_accepted,
+            on_append_prepared=self.memory.preempt_for_submission if interactive else None,
             before_append=before_append,
         )
 
@@ -1527,6 +1565,7 @@ class DuplexSessionRunner:
             final=final,
             response_bound=final or precreate_response,
         )
+        task.add_done_callback(self._wake_memory)
         if silence_continuation:
             model_state.pending_silence_task = task
             task.add_done_callback(attempt.clear_pending_silence)
@@ -1837,6 +1876,7 @@ class DuplexSessionRunner:
                 )
                 return
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
+        self.memory.cancel_interaction()
         playback_was_active = helpers.assistant_playback_active(self.session)
         if event_type in {"input.cancel", "barge_in"}:
             model_state.audio_buffer.clear()
@@ -2175,6 +2215,7 @@ class DuplexSessionRunner:
                     session.release_input_bytes(pending_bytes)
                 model_state.input_since_commit = False
             return False
+        self.memory.note_committed_input(flushed)
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)
             flushed["force_listen"] = True
@@ -2353,6 +2394,7 @@ class DuplexSessionRunner:
             return False
         if isinstance(realtime_item_id, str) and realtime_item_id:
             deferred_payload = {**deferred_payload, "realtime_item_id": realtime_item_id}
+        self.memory.note_committed_input(deferred_payload)
         retained_payload: dict[str, object]
         if model_state.committed_audio_payload is not None:
             retained_payload = overlap_policy.merge_audio_payloads(
@@ -2571,6 +2613,8 @@ class DuplexSessionRunner:
                 await self._commit_and_start_auto_response(event, realtime_item_id=realtime_item_id)
                 return
         if event_type == "response.create":
+            if session.unanswered_user_items() or model_state.committed_audio_payload is not None:
+                self.memory.note_committed_input(event, has_new_user_input=True)
             await self._start_response_from_committed_audio()
             return
         next_commit_allowed = helpers.next_commit_allowed(
