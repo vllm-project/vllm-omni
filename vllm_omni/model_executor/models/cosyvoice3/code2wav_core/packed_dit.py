@@ -55,50 +55,83 @@ def page_metadata(
     return page_table, slot_frames
 
 
+@dataclass(frozen=True)
 class RaggedRowAttention:
-    """Paged FlashAttention metadata isolating each request and each causal query chunk."""
+    """Paged attention metadata shared by ordinary solves and CUDA graphs.
 
-    def __init__(
-        self,
-        rows: PackedRows,
-        *,
-        heads: int,
-        head_dim: int,
-        fa_version: int,
-        chunk_size: int | None = None,
-    ) -> None:
-        self.heads, self.head_dim = heads, head_dim
-        self.fa_version = fa_version
-        self.page_size = PAGE_SIZE[fa_version]
-        device = rows.row_ids.device
-        segment_rows, segment_ends, offsets = [], [], [0]
-        for row, length in enumerate(rows.lengths):
-            if length == 0:
-                # Bucketed layouts keep one (empty) segment per row slot so
-                # metadata shapes are identical across batches in a bucket.
-                segment_rows.append(row)
-                segment_ends.append(0)
-                offsets.append(offsets[-1])
-                continue
-            span = chunk_size or length
-            for start in range(0, length, span):
-                end = min(start + span, length)
-                segment_rows.append(row)
-                segment_ends.append(end)
-                offsets.append(offsets[-1] + end - start)
-        self.cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
-        self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
-        self.max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
-        self.page_table, self.slot_frames = page_metadata(
-            torch.tensor(rows.lengths, device=device),
-            torch.tensor(segment_rows, device=device),
-            self.cache_seqlens,
-            rows.row_ids,
-            rows.positions,
-            page_size=self.page_size,
-            columns=-(-rows.width // self.page_size),
-            slots=sum(-(-length // self.page_size) for length in rows.lengths) * self.page_size,
-        )
+    Tensor references are retained without copying. Fields cannot be rebound,
+    but graph-owned buffers may be updated in place before replay.
+    """
+
+    heads: int
+    head_dim: int
+    fa_version: int
+    max_seqlen_q: int
+    cache_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    page_table: torch.Tensor
+    slot_frames: torch.Tensor
+
+    @property
+    def page_size(self) -> int:
+        """Number of KV frames per page for the selected backend."""
+        return PAGE_SIZE[self.fa_version]
+
+
+def build_row_attention(
+    rows: PackedRows,
+    *,
+    heads: int,
+    head_dim: int,
+    fa_version: int,
+    chunk_size: int | None = None,
+) -> RaggedRowAttention:
+    """Build metadata isolating packed rows and optional causal query chunks.
+
+    With no chunk size, each query row sees its full KV row. Otherwise each
+    chunk sees the prefix ending at that chunk. Empty rows retain an empty
+    segment so bucketed layouts have stable metadata shapes.
+    """
+    page_size = PAGE_SIZE[fa_version]
+    device = rows.row_ids.device
+    segment_rows, segment_ends, offsets = [], [], [0]
+    for row, length in enumerate(rows.lengths):
+        if length == 0:
+            # Bucketed layouts keep one (empty) segment per row slot so
+            # metadata shapes are identical across batches in a bucket.
+            segment_rows.append(row)
+            segment_ends.append(0)
+            offsets.append(offsets[-1])
+            continue
+        span = chunk_size or length
+        for start in range(0, length, span):
+            end = min(start + span, length)
+            segment_rows.append(row)
+            segment_ends.append(end)
+            offsets.append(offsets[-1] + end - start)
+    cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
+    max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
+    page_table, slot_frames = page_metadata(
+        torch.tensor(rows.lengths, device=device),
+        torch.tensor(segment_rows, device=device),
+        cache_seqlens,
+        rows.row_ids,
+        rows.positions,
+        page_size=page_size,
+        columns=-(-rows.width // page_size),
+        slots=sum(-(-length // page_size) for length in rows.lengths) * page_size,
+    )
+    return RaggedRowAttention(
+        heads=heads,
+        head_dim=head_dim,
+        fa_version=fa_version,
+        max_seqlen_q=max_seqlen_q,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        page_table=page_table,
+        slot_frames=slot_frames,
+    )
 
 
 class PackedDiT:
@@ -183,7 +216,7 @@ class PackedDiT:
 
     def row_attention(self, rows: PackedRows, *, streaming: bool) -> RaggedRowAttention:
         attn = self.dit.transformer_blocks[0].attn
-        result = RaggedRowAttention(
+        result = build_row_attention(
             rows,
             heads=attn.heads,
             head_dim=attn.inner_dim // attn.heads,
@@ -899,15 +932,19 @@ class FlowGraphRunner:
         rows = PackedRows(
             lengths=(), starts_host=state.table, row_ids=state.row_ids, positions=state.positions, frames=state.frames
         )
-        attention = object.__new__(RaggedRowAttention)
-        attention.heads, attention.head_dim = self.heads, self.head_dim
-        attention.fa_version = estimator.fa_version
-        attention.page_size = PAGE_SIZE[estimator.fa_version]
-        attention.cache_seqlens, attention.cu_seqlens_q = state.cache_seqlens, state.cu_seqlens_q
-        attention.page_table, attention.slot_frames = state.page_table, state.slot_frames
-        # Streaming queries cover one training chunk, even when their KV
-        # prefix and the packed graph allocation contain thousands of frames.
-        attention.max_seqlen_q = estimator.dit.static_chunk_size if key[0] else rows.width
+        # Streaming queries cover one training chunk even when the KV prefix
+        # and packed graph allocation contain thousands of frames.
+        max_seqlen_q = estimator.dit.static_chunk_size if key[0] else rows.width
+        attention = RaggedRowAttention(
+            heads=self.heads,
+            head_dim=self.head_dim,
+            fa_version=estimator.fa_version,
+            max_seqlen_q=max_seqlen_q,
+            cache_seqlens=state.cache_seqlens,
+            cu_seqlens_q=state.cu_seqlens_q,
+            page_table=state.page_table,
+            slot_frames=state.slot_frames,
+        )
         mark_packed_compile_metadata(rows, attention)
         mu_cfg = torch.cat((state.mu, torch.zeros_like(state.mu)), dim=1)
         cond_cfg = torch.cat((state.cond, torch.zeros_like(state.cond)), dim=1)

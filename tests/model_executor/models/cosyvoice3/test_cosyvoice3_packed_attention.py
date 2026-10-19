@@ -18,13 +18,32 @@ CHUNK = 50
 
 def _attention(lengths, fa_version, chunk_size=None, width=None):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
-        RaggedRowAttention,
+        build_row_attention,
         pack_rows,
     )
 
     rows = pack_rows(lengths, torch.device("cpu"), width=width)
-    attention = RaggedRowAttention(rows, heads=2, head_dim=8, fa_version=fa_version, chunk_size=chunk_size)
+    attention = build_row_attention(rows, heads=2, head_dim=8, fa_version=fa_version, chunk_size=chunk_size)
     return rows, attention
+
+
+@pytest.mark.parametrize("fa_version", [2, 3])
+def test_attention_metadata_retains_live_graph_buffers(fa_version):
+    from dataclasses import replace
+
+    _, source = _attention([17, 0, 33], fa_version, chunk_size=CHUNK)
+    graph_attention = replace(source)
+
+    # Constructing metadata must retain the graph buffers, not snapshot them.
+    for name in ("cache_seqlens", "cu_seqlens_q", "page_table", "slot_frames"):
+        buffer = getattr(source, name)
+        assert getattr(graph_attention, name) is buffer
+        address = buffer.data_ptr()
+        updated = torch.zeros_like(buffer)
+        buffer.copy_(updated)
+        assert getattr(graph_attention, name).data_ptr() == address
+        assert torch.equal(getattr(graph_attention, name), updated)
+    assert graph_attention.page_size == (16 if fa_version == 2 else 1)
 
 
 def _paged_kv(x, attention):

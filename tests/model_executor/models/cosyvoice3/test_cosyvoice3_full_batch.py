@@ -123,7 +123,7 @@ def test_packed_stream_noise_growth_preserves_prefix_and_global_rng():
 def test_packed_stream_attention_matches_chunk_causal_reference(monkeypatch, fa_version):
     require_packed_fa(monkeypatch, fa_version)
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
-        RaggedRowAttention,
+        build_row_attention,
         pack_rows,
         ragged_attention_tensor_geometry,
     )
@@ -131,7 +131,7 @@ def test_packed_stream_attention_matches_chunk_causal_reference(monkeypatch, fa_
     # Row starts that are not multiples of 16 exercise FA2's page alignment.
     lengths = [67, 103]
     rows = pack_rows(lengths, torch.device("cuda"))
-    attention = RaggedRowAttention(rows, heads=2, head_dim=64, fa_version=fa_version, chunk_size=50)
+    attention = build_row_attention(rows, heads=2, head_dim=64, fa_version=fa_version, chunk_size=50)
     generator = torch.Generator(device="cuda").manual_seed(7)
     q, k, v = [
         torch.randn(sum(lengths), 2, 64, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
