@@ -38,6 +38,21 @@ def _cpu_ring(depth: int, *, max_pending_bytes: int | None = None) -> PinnedChun
 
 
 @pytest.mark.cpu
+def test_host_slot_can_be_reused_outside_the_vae_inference_context():
+    """The final flush can reuse a buffer allocated by an inference-mode callback."""
+    ring = _cpu_ring(1)
+    with torch.no_grad():
+        with torch.inference_mode():
+            first = ring.transfer(_frames(7), readers=1)
+            assert np.all(first.wait() == 7)
+            first.release()
+        final = ring.transfer(_frames(19), readers=1)
+        assert np.all(final.wait() == 19)
+        final.release()
+    assert ring.slots_in_use == 0
+
+
+@pytest.mark.cpu
 def test_slot_returns_only_after_its_last_reader():
     """Each batch entry reads the same buffer, so one release must not free it."""
     ring = _cpu_ring(2)
@@ -223,6 +238,19 @@ def test_session_feeds_chunks_in_producer_order(recording_encoders):
 
     assert session.finish() == [b"mp4"]
     assert recording_encoders[0].pushes == [10, 20, 30, 40]
+
+
+@pytest.mark.cpu
+def test_session_flushes_partial_batch_after_the_vae_inference_context(recording_encoders):
+    """A partial final batch must preserve pixels across the no-grad boundary."""
+    session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, batch_frames=2, transfer_slots=1)
+    with torch.no_grad():
+        with torch.inference_mode():
+            _push_ramp(session, [10, 10, 20])
+        assert session.finish() == [b"mp4"]
+    assert recording_encoders[0].pushes == [10, 20]
+    assert session.ring is not None
+    assert session.ring.slots_in_use == 0
 
 
 @pytest.mark.cpu
