@@ -64,8 +64,8 @@ Keep this separate from "add a watch case", which only records results.
 
 ## Nightly report chain
 
-Results under `BENCHMARK_DIR` (`tests/dfx/perf/results/*.json`) feed the nightly
-reporting tools:
+A directory of results (`tests/dfx/perf/results/*.json`, i.e. `BENCHMARK_DIR`)
+is the input to the nightly reporting tools:
 
 - `tools/nightly/generate_nightly_perf_excel.py` (sheets: `omni_summary`,
   `diffusion_summary`, `omni_raw`, `diffusion_raw`)
@@ -73,8 +73,11 @@ reporting tools:
 - `tools/nightly/send_nightly_email.py`
 
 The `:email: Nightly Collection & Email` step (`key: nightly-perf-distribution`)
-in `test-nightly.yml` aggregates these, but it is **deprecated** — do not add it
-to your step's `depends_on`. See [ci-wiring.md](ci-wiring.md#do-not-extend-the-deprecated-report-step).
+in `test-nightly.yml` runs them, but it is **deprecated** and collects by hand:
+it downloads results only from the step keys hard-coded in its own `depends_on`.
+A row added to a new step therefore stays **artifact-only** — uploaded to the
+build, absent from these reports. See
+[ci-wiring.md](ci-wiring.md#new-steps-are-artifact-only).
 
 ## Reporting a row
 

@@ -30,9 +30,10 @@ concurrency, input/output lengths, `tokenizer_id`, `model_id`, `Hardware`,
 `endpoint_type`, and the resolved `baseline`. It does **not** record `extra_body`
 (resolution, steps, guidance), `serve_args`, `num_warmups`, or
 `percentile_metrics`, so the artifact alone cannot reconstruct the workload.
-When a number is meant to be reused, keep the config row, the resolved server
-command, and the environment pins with the result (in the PR/issue or a sidecar
-file).
+When a number is meant to be reused, keep the config row, the commit SHA and
+model revision it was read at, the resolved server command, and the environment
+pins with the result (in the PR/issue or a sidecar file). The checked-in config
+can change under a row, so a row reference alone does not identify the workload.
 
 ## Warmup and sample count
 
@@ -138,11 +139,8 @@ Record the device and the parallelism actually used (cards, `ulysses-degree`,
 CFG/HSDP) because the comparison bucket is the runtime hardware, not the
 declared `mark`. Result filenames use the runtime label from
 `get_runtime_resource_label()`; on the default H100 pool the filename omits it,
-while the result's `Hardware` field still records `H100`.
-The unified result has a `backend` field, but it holds the endpoint path, not
-the attention backend, so an env-pinned backend leaves no trace in JSON — the
-only evidence is the selector log line
-(`Resolved diffusion attention backend ... via ...`).
+while the result's `Hardware` field still records `H100`. Record the attention
+backend with the same care — see [Attention backend](#attention-backend).
 
 ## Run-to-run variance
 
@@ -160,19 +158,15 @@ batch forces a memory trade-off, keep the trade-off explicit (for example
 alongside the latency. A memory-rescuing flag that changes the number must be
 part of the pinned contract for that row.
 
-## Attention backend and known numerical drift
+## Attention backend
 
-On Qwen-Image-2.1, an SDPA fallback is required for 4D attention masks in
-batches with varying prompt lengths, and FlashAttention-3 Hub is required for
-bit-exact parity with the reference. For a performance row, pin the backend with
-an env var in the CI step, e.g. `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA`.
+Different kernels give different numbers. The result's `backend` field holds the
+endpoint path, not the attention backend, so an env-pinned backend leaves no
+trace in the artifact: the selector log line
+(`Resolved diffusion attention backend ... via ...`) is the only evidence. Record
+it with the number, and reuse the backend the row's CI step pins instead of
+relying on auto-selection.
 
-Never commit a source patch for this (`vllm_omni/diffusion/attention/layer.py`
-must match `origin/main`; verify with
-`git diff origin/main -- vllm_omni/diffusion/attention/layer.py`). The env pin
-works by itself; with a clean tree the log shows
-`Parsed attention config from DIFFUSION_ATTENTION_BACKEND 'TORCH_SDPA'` followed
-by `Resolved diffusion attention backend 'SDPA' ... via attention_config.default`.
 
 ## What not to claim
 

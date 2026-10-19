@@ -217,9 +217,9 @@ therefore does **not** by itself prove the benchmark ran; check its contents.
    declares both SKUs, but would match nothing if the case declares only one;
    `-m "cuda and cards_1"` / `-m "npu and A3 and cards_1"` are the safe
    single-platform selectors.
-6. **Committing a source workaround.** A 4D-attention-mask workaround must stay
-   an env pin, never a source patch; see
-   [measurement-contract.md](measurement-contract.md#attention-backend-and-known-numerical-drift).
+6. **Committing a source workaround.** A workaround that makes a row run must
+   stay an env pin, never a source patch; see
+   [measurement-contract.md](measurement-contract.md#attention-backend).
 7. **Template fallback masks a failed run.** A sweep that produces no result file
    is replaced by `result_omni_template.json`, so a result JSON can exist without
    any benchmark having run. Check the contents and the console log, not the file

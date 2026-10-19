@@ -71,9 +71,13 @@ diffusion_<slug>_perf:
 ```
 
 Without this, changing the model, runner, or config will not trigger the step.
-The uploader routes a diff that touches shared perf infrastructure
-(`tests/helpers/`, `tests/dfx/`) to every perf step via the fallback prefixes,
-so keep shared helper changes out of the alias and let the fallback handle them.
+`source_filter_fallback` lists only
+`.buildkite/common/ci_mirror_hardwares.yml` and `tests/helpers/`; a diff limited
+to those paths keeps every job in the upload, so leave them out of the alias.
+`tests/dfx/` is **not** a fallback prefix: a shared DFX change such as
+`tests/dfx/conftest.py` or `tests/dfx/perf/tests/test_runner_metadata.py` matches
+no alias and does not select these steps — add such a path to the alias (or
+trigger the step explicitly) when the change depends on it.
 
 ## CUDA nightly step template
 
@@ -82,8 +86,8 @@ so keep shared helper changes out of the alias and let the fallback handle them.
   source_file_dependencies: diffusion_<slug>_perf
   key: nightly-diffusion-x2iat-performance-<slug>-single
   timeout_in_minutes: 180
-  # Pin the backend only when the model needs it (e.g. Qwen-Image-2.1 4D mask
-  # needs SDPA). Otherwise let the runner auto-select.
+  # Pin the backend only when auto-selection cannot run the row (for example a
+  # mask the selected kernel rejects); otherwise let the runner auto-select.
   env:
     DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
   artifact_paths:
@@ -97,12 +101,21 @@ Add a parallel `-4gpu` step for the multi-card row, using `-m "H100 and B200 and
 cards_4"` and the same alias. Reference: the real Qwen-Image-2.1 steps in
 [test-nightly.yml](../../../../.buildkite/cuda/test-nightly.yml).
 
-## Do not extend the deprecated report step
+## New steps are artifact-only
 
 `:email: Nightly Collection & Email` (`key: nightly-perf-distribution`) in
-`test-nightly.yml` is deprecated. Do **not** add it to your step's
-`depends_on` or otherwise extend it. Results still flow to the nightly
-Excel/HTML/email chain through the existing aggregation; see
+`test-nightly.yml` is deprecated. Do **not** add it to your step's `depends_on`
+or otherwise extend it.
+
+Aggregation is a hand-written enumeration, not a glob: that step lists every
+producing key in its own `depends_on` and repeats each one as a
+`buildkite-agent artifact download ... --step <key>` command, and it runs only
+when the build sets `EMAIL_DISTRIBUTION=1`. A new step therefore uploads
+`tests/dfx/perf/results/*.json` to the build and stops there. Treat every row
+you add as **artifact-only**: its numbers do not reach the nightly
+Excel/HTML/email chain, so do not claim they do. Including a row in those
+reports means adding its step key to that deprecated step's `depends_on` and
+download list, which is a CI-owner decision, not part of adding a row. See
 [baseline-and-report.md](baseline-and-report.md).
 
 ## Validate collection, routing, and execution
