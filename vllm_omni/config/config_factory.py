@@ -654,13 +654,6 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
-        # Preserve the default builder's explicit top-level override of model
-        # extras before the strict same-source alias validator runs.
-        if kwargs.get("auxiliary_text_encoder") is not None:
-            kwargs = dict(kwargs)
-            extras = dict(kwargs.get("extras") or {})
-            extras.pop("auxiliary_text_encoder", None)
-            kwargs["extras"] = extras
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
@@ -685,18 +678,6 @@ class StageConfigFactory:
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(
             {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
         )
-
-        extras = dict(engine_args.get("extras") or {})
-        for key, default in (
-            ("auxiliary_text_encoder", None),
-            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-        ):
-            value = kwargs.get(key)
-            if value is not None:
-                extras[key] = value
-            else:
-                extras.setdefault(key, default)
-        engine_args["extras"] = extras
 
         model_class_name = engine_args.get("model_class_name")
         final_output_type = get_diffusion_output_type(model_class_name)

@@ -71,37 +71,6 @@ def test_default_stage_config_preserves_model_extras():
     assert stage_cfg["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
 
 
-def test_default_stage_config_preserves_and_overrides_promoted_extras():
-    stage_cfg = StageConfigFactory.create_default_diffusion(
-        {
-            "extras": {
-                "auxiliary_text_encoder": "/models/extras-llama",
-                "default_llama_model_id": "extras/default-llama",
-            },
-            "auxiliary_text_encoder": None,
-        }
-    )[0]
-
-    extras = stage_cfg["engine_args"]["extras"]
-    assert extras["auxiliary_text_encoder"] == "/models/extras-llama"
-    assert extras["default_llama_model_id"] == "extras/default-llama"
-
-    stage_cfg = StageConfigFactory.create_default_diffusion(
-        {
-            "extras": {
-                "auxiliary_text_encoder": "/models/extras-llama",
-                "default_llama_model_id": "extras/default-llama",
-            },
-            "auxiliary_text_encoder": "/models/top-level-llama",
-            "default_llama_model_id": "top-level/default-llama",
-        }
-    )[0]
-
-    extras = stage_cfg["engine_args"]["extras"]
-    assert extras["auxiliary_text_encoder"] == "/models/top-level-llama"
-    assert extras["default_llama_model_id"] == "top-level/default-llama"
-
-
 @pytest.mark.parametrize(
     "stage_overrides",
     [

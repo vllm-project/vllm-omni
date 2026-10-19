@@ -96,7 +96,6 @@ EXCLUDED_MODELS = [
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",
-    "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
     # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
@@ -105,7 +104,6 @@ EXCLUDED_MODELS = [
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
-    "Pi05Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and

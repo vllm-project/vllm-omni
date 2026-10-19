@@ -532,7 +532,6 @@ source_file_dependencies:
     - vllm_omni/diffusion/models/flux/
     - vllm_omni/diffusion/models/flux2/
     - vllm_omni/diffusion/models/flux2_klein/
-    - vllm_omni/diffusion/models/hidream_image/
     - vllm_omni/diffusion/models/krea2/
     - vllm_omni/diffusion/models/lingbot_video/
 

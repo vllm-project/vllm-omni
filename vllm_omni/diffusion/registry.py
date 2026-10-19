@@ -256,11 +256,6 @@ _DIFFUSION_MODELS = {
         "pipeline_pi0",
         "Pi0Pipeline",
     ),
-    "Pi05Pipeline": (
-        "pi05",
-        "pipeline_pi05",
-        "Pi05Pipeline",
-    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -391,11 +386,6 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
-    "HiDreamImagePipeline": (
-        "hidream_image",
-        "pipeline_hidream_image",
-        "HiDreamImagePipeline",
-    ),
     "HiDreamO1ImagePipeline": (
         "hidream_o1_image",
         "pipeline_hidream_o1_image",
@@ -455,7 +445,6 @@ _NO_CACHE_ACCELERATION = {
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
-    "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
     "CausVidWanPipeline",
     "ABotWorldCausalPipeline",
@@ -731,7 +720,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MingImageDiffusionPipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
-    "Pi05Pipeline": "get_pi05_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
@@ -757,7 +745,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
-    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
