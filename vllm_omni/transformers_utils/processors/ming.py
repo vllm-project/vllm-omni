@@ -137,8 +137,8 @@ class MingWhisperFeatureExtractor(FeatureExtractionMixin):
             if isinstance(waveform, np.ndarray):
                 waveform = torch.from_numpy(waveform)
             waveform = _normalize_audio_tensor(waveform, sr, target_sample_rate=self.sampling_rate)
-            mel = whisper.log_mel_spectrogram(waveform.cuda(non_blocking=True), n_mels=self.n_mels)
-            audio_feat_list.append(mel.transpose(0, 1).contiguous().cpu())  # [T, n_mels]
+            mel = whisper.log_mel_spectrogram(waveform, n_mels=self.n_mels)
+            audio_feat_list.append(mel.transpose(0, 1))  # [T, n_mels]
 
         audio_feats_lengths = torch.tensor([[feat.shape[0] for feat in audio_feat_list]], dtype=torch.long)
         # Two stride-2 convolutions in series:
@@ -177,6 +177,7 @@ class MingFlashOmniProcessor(ProcessorMixin):
         video_processor_class = "AutoVideoProcessor"
     audio_processor_class = "AutoFeatureExtractor"
     tokenizer_class = "AutoTokenizer"
+    chat_template: str | dict[str, str] | None
 
     def __init__(
         self,

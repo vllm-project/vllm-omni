@@ -12,9 +12,9 @@ enable_prefix_caching: false
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.4
+    gpu_memory_utilization: 0.8
     enforce_eager: true
-    max_num_batched_tokens: 2304
+    max_num_batched_tokens: 100000
     devices: "0"
     default_sampling_params:
       temperature: 0.0
