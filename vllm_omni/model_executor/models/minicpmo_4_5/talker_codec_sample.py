@@ -36,8 +36,9 @@ HISTORY_WINDOW = 16
 
 # Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
 # 200-case bit-exact verification). Two independent controls:
-#   - ``codec_sampling_params.fused_prelude: false`` in the stage config forces
-#     the eager chain (accuracy triage, e.g. after a CANN/torch_npu upgrade).
+#   - ``talker_codec_fused_prelude: false`` in the stage connector's ``extra``
+#     block forces the eager chain (accuracy triage, e.g. after a CANN/torch_npu
+#     upgrade). The key is a no-op off NPU or without Triton.
 #   - ``_FUSED_PRELUDE_OK`` is a process-wide, permanent latch: one failed
 #     compile or launch turns it off and every later step takes the eager chain.
 _FUSED_PRELUDE_OK = True
@@ -298,16 +299,19 @@ def _rep_pen_temp_fused(
     return out.reshape(logits.shape)
 
 
-def warmup_fused_prelude(device: torch.device) -> None:
+def warmup_fused_prelude(device: torch.device, enabled: bool = True) -> None:
     """Compile the fused kernel once, before any graph capture.
 
     The first launch pays the Triton compile; running it here settles
     ``_FUSED_PRELUDE_OK`` outside capture, so a compile failure downgrades the
     process instead of poisoning a capture that just saw a failed launch.
-    Idempotent, and a no-op off NPU or without Triton.
+    Idempotent, and a no-op off NPU, without Triton, or when disabled -- an
+    eager-only configuration must never touch the kernel, because after a
+    CANN/torch_npu upgrade a broken kernel can fault the device instead of
+    raising.
     """
     global _FUSED_PRELUDE_WARMED
-    if _FUSED_PRELUDE_WARMED or not _HAS_TRITON or device.type != "npu":
+    if not enabled or _FUSED_PRELUDE_WARMED or not _HAS_TRITON or device.type != "npu":
         return
     _FUSED_PRELUDE_WARMED = True
     state = TalkerCodecDeviceState(
@@ -349,9 +353,9 @@ def prepare_codec_logits(
     which runs after temperature and before top-k/top-p (``builtin.py:102-113``).
     ``min_tokens_stop_ids`` widens the censored stop set beyond the codec EOS;
     ``frequency_penalty``/``presence_penalty`` subtract the whole-stream counts.
-    ``fused_prelude=False`` (stage config ``codec_sampling_params.fused_prelude``)
-    forces the eager chain for accuracy triage. Every one of them is a no-op at
-    its default value.
+    ``fused_prelude=False`` (stage connector ``extra`` key
+    ``talker_codec_fused_prelude``) forces the eager chain for accuracy triage.
+    Every one of them is a no-op at its default value.
     """
     stop_ids = _stop_id_tuple(eos_token_id, min_tokens_stop_ids)
     logits = raw_logits.float()

@@ -88,7 +88,6 @@ _CODEC_SAMPLING_SOURCES: tuple[tuple[str, str, Any, Any], ...] = (
     ("repetition_penalty", "repetition_penalty", _CODEC_REPETITION_PENALTY, float),
     ("min_tokens", "min_new_tokens", _CODEC_MIN_TOKENS, int),
     ("max_tokens", "max_new_tokens", _CODEC_MAX_TOKENS, int),
-    ("fused_prelude", "fused_prelude", True, bool),
 )
 
 
@@ -248,6 +247,26 @@ def _apply_batched_repetition_penalty(
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
     return penalized
+
+
+def _bool_flag(value: Any, key: str) -> bool:
+    """Parse a boolean knob strictly, so a typo fails at startup.
+
+    ``bool("false")`` is ``True``, which would silently keep the fused path on
+    for a quoted YAML value or a JSON/CLI stage override -- exactly the case
+    the switch exists to triage.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in ("true", "1"):
+            return True
+        if token in ("false", "0"):
+            return False
+    raise ValueError(f"{key} must be a boolean (true/false/1/0), got {value!r}")
 
 
 def resolve_codec_sampling_params(
@@ -659,11 +678,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_repetition_penalty = resolved["repetition_penalty"]
             self._codec_min_tokens = resolved["min_tokens"]
             self._codec_max_tokens = resolved["max_tokens"]
-            self._codec_fused_prelude = resolved["fused_prelude"]
         else:
             self._tts_config = None
             self._codec_eos_id = 0
-            self._codec_fused_prelude = True
+        # The fused prelude is a stage-connector knob rather than a sampler
+        # value: the connector's ``extra`` block is the YAML surface that
+        # actually reaches ``OmniModelConfig`` for this stage. Default true; a
+        # deployment sets ``talker_codec_fused_prelude: false`` to force the
+        # eager chain, and the runtime latch still covers kernel failures.
+        self._codec_fused_prelude = _bool_flag(
+            self._extra_config().get("talker_codec_fused_prelude", True),
+            "talker_codec_fused_prelude",
+        )
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
         # >= 2 engages the loop -- the scheduler hands each request K query
@@ -1882,6 +1908,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _extra_config(self) -> dict[str, Any]:
+        """Stage-connector ``extra``: the per-stage knobs a deploy YAML can set."""
+        model_config = getattr(self.vllm_config, "model_config", None)
+        connector = getattr(model_config, "stage_connector_config", None)
+        if isinstance(connector, Mapping):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        return dict(extra) if isinstance(extra, Mapping) else {}
+
     def _codec_sample_setup(
         self,
         request_id: str,
@@ -1943,7 +1979,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_inputs_by_request[request_id] = device_inputs
         # Compile the codec prelude kernel before this request decodes, so a
         # compile failure latches the eager chain outside any graph capture.
-        warmup_fused_prelude(hidden_state.device)
+        # An eager-only configuration never touches the kernel: after a
+        # CANN/torch_npu upgrade a broken kernel may fault the device instead
+        # of raising, which would defeat the switch.
+        warmup_fused_prelude(hidden_state.device, enabled=self._codec_fused_prelude)
         return device_state, device_inputs, device_states
 
     def _sample_audio_code(

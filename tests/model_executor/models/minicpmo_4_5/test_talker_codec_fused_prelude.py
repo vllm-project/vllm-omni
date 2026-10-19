@@ -3,8 +3,9 @@
 """Bit-exactness tests for the fused rep-penalty/temperature prelude.
 
 The fused Triton kernel is the default stage-1 codec sampling prologue on NPU
-(``MINICPMO_TALKER_CODEC_FUSED_PRELUDE=1``). These tests compare it against the eager
-chain it replaces (``_repetition_penalty_scaling`` + ``logits / temperature``)
+(disable it with ``talker_codec_fused_prelude: false`` in the stage connector
+extra). These tests compare it against the eager chain it replaces
+(``_repetition_penalty_scaling`` + ``logits / temperature``)
 through the public ``prepare_codec_logits`` entry point with the fused switch
 forced on and off, and additionally capture and replay the fused path under an
 NPU graph (``torch.npu.NPUGraph``) -- a Triton launch under graph capture is a
@@ -246,3 +247,31 @@ def test_warmup_fused_prelude_is_idempotent(monkeypatch):
     tcs.warmup_fused_prelude(_device())
     assert tcs._FUSED_PRELUDE_WARMED is True
     tcs.warmup_fused_prelude(_device())
+
+
+def test_warmup_disabled_never_touches_the_device():
+    """An eager-only configuration must not compile or launch the kernel."""
+
+    class _Bomb:
+        @property
+        def type(self):
+            raise AssertionError("disabled warmup touched the device")
+
+    tcs.warmup_fused_prelude(_Bomb(), enabled=False)
+
+
+def test_bool_flag_parses_strings_strictly():
+    """Quoted YAML/CLI values must not silently fall back to truthiness."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import _bool_flag
+
+    assert _bool_flag(True, "k") is True
+    assert _bool_flag(False, "k") is False
+    assert _bool_flag(1, "k") is True
+    assert _bool_flag(0, "k") is False
+    assert _bool_flag("true", "k") is True
+    assert _bool_flag(" FALSE ", "k") is False
+    assert _bool_flag("1", "k") is True
+    assert _bool_flag("0", "k") is False
+    for bogus in ("yes", "", "fa1se", None, 2):
+        with pytest.raises(ValueError):
+            _bool_flag(bogus, "k")
