@@ -11,7 +11,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize(
-    ("candidate", "latency_change", "throughput_change"),
+    ("candidate", "latency_improvement", "throughput_improvement"),
     [
         (20, "-100.0%", "+100.0%"),
         (5, "+50.0%", "-50.0%"),
@@ -22,8 +22,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_improvement_respects_metric_direction(
     capsys: pytest.CaptureFixture[str],
     candidate: int,
-    latency_change: str,
-    throughput_change: str,
+    latency_improvement: str,
+    throughput_improvement: str,
 ) -> None:
     all_runs = [
         [
@@ -42,7 +42,7 @@ def test_improvement_respects_metric_direction(
     print_comparison_table(all_runs, ["candidate", "baseline"])
 
     improvement = capsys.readouterr().out.split("### Improvement (candidate vs baseline)", 1)[1]
-    assert f"| TTFP (ms) | 1 | {latency_change} |" in improvement
-    assert f"| E2E (ms) | 1 | {latency_change} |" in improvement
-    assert f"| RTF | 1 | {latency_change} |" in improvement
-    assert f"| Throughput (a-s/s) | 1 | {throughput_change} |" in improvement
+    assert f"| TTFP (ms) | 1 | {latency_improvement} |" in improvement
+    assert f"| E2E (ms) | 1 | {latency_improvement} |" in improvement
+    assert f"| RTF | 1 | {latency_improvement} |" in improvement
+    assert f"| Throughput (a-s/s) | 1 | {throughput_improvement} |" in improvement
