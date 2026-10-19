@@ -36,6 +36,8 @@ def _run_bootstrap(
     labels: tuple[str, ...] = (),
     pull_request: bool = True,
     branch: str | None = None,
+    git_verify_status: int = 0,
+    git_fetch_status: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     for relative_path in (
         ".buildkite/common/scripts/ci_conditions.py",
@@ -58,6 +60,8 @@ def _run_bootstrap(
         "TEST_JQ_STATUS": str(jq_status),
         "TEST_PR_LABELS": "\n".join(labels),
         "TEST_GIT_LOG": str(tmp_path / "git-calls.txt"),
+        "TEST_GIT_VERIFY_STATUS": str(git_verify_status),
+        "TEST_GIT_FETCH_STATUS": str(git_fetch_status),
     }
     if debug_test_yaml is not None:
         env["DEBUG_TEST_YAML"] = debug_test_yaml
@@ -75,6 +79,19 @@ jq() {
 }
 git() {
     printf '%s\n' "$*" >> "$TEST_GIT_LOG"
+    case "$1" in
+        rev-parse)
+            if [[ "$2" == "--verify" ]]; then
+                return "${TEST_GIT_VERIFY_STATUS:-0}"
+            fi
+            ;;
+        fetch)
+            if [[ "$2" == "--deepen=1" ]]; then
+                return "${TEST_GIT_FETCH_STATUS:-0}"
+            fi
+            ;;
+    esac
+    return 0
 }
 python3() { "$TEST_PYTHON" "$@"; }
 source "$1"
@@ -183,6 +200,24 @@ def test_release_line_diff_does_not_query_main_merge_base(tmp_path):
     calls = _git_calls(tmp_path)
     assert not any("merge-base" in call for call in calls)
     assert any("rev-parse" in call and "HEAD^" in call for call in calls)
+
+
+def test_release_line_missing_parent_runs_all_instead_of_exiting(tmp_path):
+    result = _run_bootstrap(
+        tmp_path,
+        pull_request=False,
+        branch="release/v0.30.0",
+        git_verify_status=1,
+        git_fetch_status=1,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "running all AMD tests" in result.stderr
+    assert "building wheels from source" in result.stderr
+    calls = _git_calls(tmp_path)
+    assert "fetch --deepen=1" in calls
+    assert any("rev-parse" in call and "--verify" in call for call in calls)
+    assert not any("merge-base" in call for call in calls)
 
 
 def test_feature_branch_diff_uses_main_merge_base_once(tmp_path):

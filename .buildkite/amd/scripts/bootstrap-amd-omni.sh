@@ -215,7 +215,8 @@ upload_pipeline() {
 
 # First parent for a release-line push. A depth-one checkout has the commit
 # but not its parent object, so deepen once before diffing. Failure falls
-# back to running every suite instead of aborting under set -e.
+# back to RUN_ALL=1 instead of aborting under set -e. That flag uploads every
+# suite and, below, sets VLLM_USE_PRECOMPILED=0 so wheels build from source.
 release_line_parent_base() {
     if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
         git rev-parse 'HEAD^'
@@ -235,10 +236,14 @@ release_line_parent_base() {
 # Choose the diff base before any git command that can fail the bootstrap.
 # A release-line push must not call merge-base origin/main: that ref is often
 # absent on a fresh shallow checkout, and set -e would skip the upload.
+# An unresolvable parent sets RUN_ALL=1 because the diff is unknown. The
+# precompiled decision further down treats RUN_ALL=1 as a critical change and
+# sets VLLM_USE_PRECOMPILED=0, so this path builds wheels from source. That is
+# slower than uploading every suite on the existing wheel.
 DIFF_BASE=""
 if is_release_line_push; then
     if ! DIFF_BASE=$(release_line_parent_base); then
-        echo "release-line parent is unavailable; running all AMD tests." >&2
+        echo "release-line parent is unavailable; running all AMD tests and building wheels from source." >&2
         RUN_ALL=1
         DIFF_BASE=""
     fi
