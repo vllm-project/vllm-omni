@@ -615,18 +615,6 @@ def test_audio_history_rejects_invalid_feature_lengths(lengths):
         BailingMoeV3AudioForConditionalGeneration._normalize_audio_inputs(torch.zeros(1, 10, 80), lengths)
 
 
-def test_audio_history_profile_is_explicit_and_preserves_base_settings():
-    from vllm_omni.config.stage_config import resolve_deploy_yaml
-
-    deploy_dir = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
-    base = resolve_deploy_yaml(deploy_dir / "ming3_audio_flash.yaml")
-    history = resolve_deploy_yaml(deploy_dir / "ming3_audio_flash_history.yaml")
-    assert base["stages"][0]["limit_mm_per_prompt"] == {"audio": 1}
-    assert history["stages"][0]["limit_mm_per_prompt"] == {"audio": 16}
-    assert history["stages"][0]["max_model_len"] == base["stages"][0]["max_model_len"]
-    assert history["stages"][1] == base["stages"][1]
-
-
 def test_audio_history_encoder_matches_individual_clips(tiny_model):
     features = [torch.zeros(17, 80), torch.ones(33, 80)]
     lengths = torch.tensor([[17], [33]])

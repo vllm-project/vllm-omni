@@ -1,9 +1,0 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# Opt-in support for retaining multiple original audio clips in chat history.
-base_config: ming3_audio_flash.yaml
-
-stages:
-  - stage_id: 0
-    limit_mm_per_prompt:
-      audio: 16

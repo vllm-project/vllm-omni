@@ -77,18 +77,13 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 
 ### Original audio in multi-turn history
 
-To retain original audio clips across turns, explicitly select the history profile:
+The default profile `ming3_audio_flash.yaml` supports retaining original audio clips
+across turns.
 
-```bash
-vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
-    --deploy-config ming3_audio_flash_history.yaml \
-    --served-model-name ming3-audio-flash --port 8091
-```
-
-This overlay permits up to 16 audio items per request, counted across all
-messages, while inheriting the normal Flash profile. Other profiles keep their
-existing item limits. Each clip retains its own feature length and placeholder;
-clips may have different durations or repeat an earlier recording.
+The profile permits up to 20 audio items per request, counted across all
+messages. Other profiles keep their existing item limits. Each clip retains its own
+feature length and placeholder; clips may have different durations or repeat an earlier
+recording.
 
 Send the full Chat Completions `messages` history, including earlier user
 `audio_url` content and assistant text, followed by the new user audio. For example:
@@ -119,8 +114,8 @@ KV-cache reuse. This profile keeps the base profile's prefix-cache setting.
 
 ### Reusing an unchanged conversation prefix
 
-Select `ming3_audio_flash_history_cache.yaml` to enable native Thinker prefix
-caching while retaining up to 16 original audio clips. This profile enables
+The default profile `ming3_audio_flash.yaml` supports native Thinker prefix
+caching while retaining up to 20 original audio clips. The profile enables
 chunked prefill and aligned KDA-state checkpoints; Talker prefix caching remains
 disabled. It requires the CUDA Bailing/KDA kernels supported by this recipe.
 
@@ -139,68 +134,44 @@ cached prompt tokens; start the server with `--enable-prompt-tokens-details`
 to expose them in `usage.prompt_tokens_details.cached_tokens`. A faster response
 alone does not establish a cache hit.
 
-### Optional Talker decode graphs and low-latency collection
+### Talker decode graphs and low-latency collection
 
-`ming3_audio_flash_llm_graph.yaml` enables a CUDA Graph for the Talker's
-single-token Qwen2 decode. Prefill remains eager; the outer Talker stage keeps
-`cudagraph_mode: NONE`. This is independent of the existing CFM graphs.
-The decode graph is disabled by default and when `enforce_eager` is selected.
-Unsupported inputs or capture failures fall back to eager execution.
+The full Flash and Tiny profiles enable the Talker's single-token Qwen2 decode
+graph. Prefill remains eager, the outer Talker stage keeps `cudagraph_mode: NONE`,
+and unsupported inputs or capture failures fall back to eager execution.
+Graph buffers reset per request and do not provide Talker conversation reuse.
 
-To combine 128K context, up to 16 original audio clips, native Thinker KV/KDA
-prefix reuse and Talker decode graphs, select the packaged profile:
+`low_latency_streaming` remains `false`. Enabling it collects the first available
+audio latent promptly, then resumes normal VAE batching. BF16 VAE results can
+vary with chunk boundaries; do not assume bitwise-identical waveforms across
+chunk partitions. Cache checkpoints and graph buffers also consume GPU memory.
 
-```bash
-vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
-    --deploy-config ming3_audio_flash_multiturn_graph.yaml \
-    --served-model-name ming3-audio-flash --port 8091 \
-    --enable-prompt-tokens-details
-```
+### Deployment profiles
 
-This profile explicitly sets the context limit to 131072 and the prefill batch
-limit to 32768. It keeps `low_latency_streaming: false` and the outer Talker
-`cudagraph_mode: NONE`. All audio and text share the context limit. Select the
-history-cache profile instead when Talker decode graphs are not required.
+Select a profile with `--deploy-config`. ASR profiles run only the Thinker for
+text transcription; full profiles also include the Talker for speech output.
 
-Cache checkpoints and graph buffers consume GPU memory; choose cache capacity
-and context limits for the available devices. CUDA Graphs reset the Talker's
-static KV state for each request and do not provide Talker conversation reuse.
+| Profile | GPUs / Thinker TP | Thinker context | Prefill token budget | Default output limit | no-repeat-ngram size |
+| --- | --- | --- | --- | --- | --- |
+| `ming3_audio_flash.yaml` | 4 / 4 | 131072 | 32768 | 65536 | - |
+| `ming3_audio_flash_asr.yaml` | 4 / 4 | 131072 | 32768 | 32768 | 10 |
+| `ming3_audio_flash_thinker_only.yaml` | 4 / 4 | 131072 | 32768 | 65536 | - |
+| `ming3_audio_tiny.yaml` | 1 / 1 | 131072 | 32768 | 65536 | - |
+| `ming3_audio_tiny_asr.yaml` | 1 / 1 | 131072 | 32768 | 32768 | 10 |
+| `ming3_audio_tiny_thinker_only.yaml` | 1 / 1 | 131072 | 32768 | 65536 | - |
 
-`low_latency_streaming` defaults to `false` in all shipped profiles. Setting it
-to `true` in the Talker's `hf_overrides` collects the first available audio
-latent promptly, then resumes normal VAE batching. It is independent of prefix
-caching and decode graphs. BF16 VAE results can vary with chunk boundaries;
-even faster execution with this option disabled can change queue grouping.
-Do not assume bitwise-identical waveforms across different chunk partitions.
-
-### Optional 128K and Tiny profiles
-
-Select these profiles explicitly with `--deploy-config`; adding the files does
-not change automatic profile selection. The Flash overlays inherit the matching
-base profile's execution mode, sampling controls and Talker configuration.
-
-| Profile | GPUs / Thinker TP | Thinker context | Prefill token budget | Default output limit |
-| --- | --- | --- | --- | --- |
-| `ming3_audio_flash_128k.yaml` | 4 / 4 | 131072 | 32768 | 65536 |
-| `ming3_audio_flash_asr_128k.yaml` | 4 / 4 | 131072 | 32768 | 32768 |
-| `ming3_audio_flash_thinker_only_128k.yaml` | 4 / 4 | 131072 | 32768 | 65536 |
-| `ming3_audio_tiny.yaml` | 1 / 1 | 131072 | 32768 | 65536 |
-| `ming3_audio_tiny_asr.yaml` | 1 / 1 | 131072 | 32768 | 65536 |
-| `ming3_audio_tiny_thinker_only.yaml` | 1 / 1 | 131072 | 32768 | 65536 |
-
-For example, select the full Flash 128K profile:
+For example, select the Flash thinker-only profile:
 
 ```bash
 vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
-    --deploy-config ming3_audio_flash_128k.yaml \
+    --deploy-config ming3_audio_flash_thinker_only.yaml \
     --served-model-name ming3-audio-flash --port 8091
 ```
 
-The context limit includes input and generated positions. The output limit is a
-ceiling, not a target; set request `max_tokens` to the intended answer length.
-Long inputs and a larger prefill budget can increase compute and working memory.
-Validate memory capacity, warmup time and latency on the target GPUs; configuring
-128K does not establish full-length performance or quality.
+The earlier Flash `*_128k`, `*_history`, `*_history_cache`, `*_llm_graph` and
+`*_multiturn_graph` overlays have been consolidated into the base profiles.
+Use `ming3_audio_flash.yaml` for speech output or the ASR/thinker-only profiles
+for text output. Limit answer length with request `max_tokens` as needed.
 
 Tiny profiles require a compatible Tiny checkpoint, selected explicitly:
 
@@ -210,13 +181,11 @@ vllm serve /path/to/Ming-3.0-audio-tiny --omni \
     --served-model-name ming3-audio-tiny --port 8091
 ```
 
-They use the existing Ming3 pipeline and place both stages on GPU 0; the
-thinker-only variant omits the Talker. The Tiny
-ASR profile enables 10-gram repetition blocking and retains its own asynchronous
-execution settings, rather than copying the Flash ASR execution mode.
-These templates have configuration-resolution coverage, but have not been GPU
-validated with a Tiny checkpoint. Check the checkpoint's context support and
-single-GPU memory requirements before deployment.
+The full Tiny profile places both stages on GPU 0. The ASR and thinker-only
+variants run only the Thinker. Both Flash and Tiny ASR profiles enable 10-gram
+repetition blocking for text-only transcription; use a full profile for speech output.
+Tiny templates have configuration-resolution coverage; validate their checkpoint
+compatibility, memory requirements and output quality on the target GPU.
 
 ## Transcribe with Chat Completions
 
@@ -268,7 +237,7 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
     }
   ],
   modalities: ["text"],
-  temperature: 0,
+  temperature: 0.6,
   max_tokens: 1024
 }' | curl http://localhost:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
@@ -297,7 +266,7 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
   ],
   modalities: ["text", "audio"],
   additional_information: {voice_mode: "ip", ip_name: "灵小柔"},
-  temperature: 0,
+  temperature: 0.6,
   max_tokens: 128
 }' | curl --fail-with-body http://localhost:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
@@ -311,13 +280,13 @@ jq -r '.choices[0].message.audio.data' response.json \
 
 - The ASR prompt requests `language<TAB>transcription`, but raw Chat Completions output can contain a literal `\t` separator instead. Clients that need only the transcript should accept either separator when removing the leading language field.
 - Speech QA returns a direct answer rather than a transcript. It uses Chat Completions and is not passed through the ASR language-prefix postprocessor.
-- Ming3 IP voices use `additional_information: {"voice_mode": "ip", "ip_name": "灵小柔"}`. IP captions and Ming2 registered presets such as `DB30` are different controls.
-- Ming3 reference mode accepts per-request `ref_audio` (a URL, data URL, or base64 audio) and optional `prompt_text`. Choose either reference audio or IP controls. Omitting the controls retains the configured reference fallback; `voice_name: null` does not disable it.
+- Ming3 IP voices use `additional_information: {"voice_mode": "ip", "ip_name": "灵小柔"}`. IP captions and Ming2 registered presets such as `DB30`/`lingguang` are different controls.
+- Ming3-audio accepts voice registration request following the OpenAI Realtime protocol. Choose either registered voice or IP controls. Omitting the controls retains the configured reference fallback.
 - `normalize_text` controls linguistic text normalization. `scrub_markup` independently removes HTML, code fences and math markup before synthesis and defaults to `true`. Set both fields to `false` to disable markup scrubbing and linguistic normalization. Streaming segmentation and language-prefix handling still apply. Keep these controls fixed for the duration of a streaming request.
 - The talker emits mono 44.1 kHz audio.
 - Use Chat Completions for transcription; the `/v1/audio/transcriptions` endpoint is not currently available with `--omni`.
 - The model handles audio chunking internally, so the deployment configuration does not set `max_audio_clip_s` or `min_energy_split_window_size`.
-- The default Flash profiles retain an 8192-token context limit. Select an explicit `*_128k.yaml` overlay for the larger limits documented above.
+- Flash and Tiny profiles configure a 131072-token context. This includes input and output positions; a configured limit does not establish full-length quality or memory capacity. Validate the selected checkpoint and target GPUs before deployment.
 
 ## Standalone text to speech
 
