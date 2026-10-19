@@ -1892,6 +1892,7 @@ class DiffusionOutput:
     started_event_ids: list[str] = field(default_factory=list)
     active_event_ids: list[str] = field(default_factory=list)
     completed_event_ids: list[str] = field(default_factory=list)
+    coalesced_event_ids: list[str] = field(default_factory=list)
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)

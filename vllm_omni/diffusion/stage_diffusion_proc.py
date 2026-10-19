@@ -263,7 +263,7 @@ class StageDiffusionProc:
         """
         # Feedback only changes condition-protected host state and must not
         # wait behind an executor RPC for the current GPU chunk.
-        if method in ("update_streaming_playback", "release_streaming_output"):
+        if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
             assert self._engine is not None
             return getattr(self._engine, method)(*args, **(kwargs or {}))
 
@@ -561,6 +561,7 @@ class StageDiffusionProc:
                 elif msg_type == "collective_rpc":
                     if msg["method"] in (
                         "update_streaming_playback",
+                        "track_streaming_interaction",
                         "release_streaming_output",
                     ):
                         await _dispatch_rpc(msg)
