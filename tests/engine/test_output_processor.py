@@ -543,6 +543,85 @@ def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
     assert torch.equal(result.outputs[0].multimodal_output[AUDIO], torch.ones(5))
 
 
+def _nemotron_snapshot(rows: int, *, cols: int = 4, step: int) -> dict:
+    """One Nemotron talker wake: cumulative code stack + its meta marker."""
+    prefix = torch.arange(rows * cols, dtype=torch.long).reshape(rows, cols)
+    return {
+        "codes.audio": prefix,
+        "meta.nvc_logical_prompt_len": 3,
+        "meta.nvc_tts_step": torch.tensor([step], dtype=torch.long),
+    }
+
+
+def test_nemotron_cumulative_codes_snapshot_keeps_latest_prefix():
+    """A re-shipped cumulative prefix replaces, never concatenates, its predecessor."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(_nemotron_snapshot(2, step=1), mm_type=LATENT)
+    first = s.make_request_output([1], None, None, None)
+    assert first is not None and not isinstance(first, PoolingRequestOutput)
+    assert first.outputs[0].multimodal_output["codes"]["audio"].shape[0] == 2
+
+    s.add_multimodal_tensor(_nemotron_snapshot(5, step=2), mm_type=LATENT)
+    # Storage holds only the latest full prefix (single tensor), never a list
+    # of every prefix seen; total size tracks the current prefix, not the sum.
+    stored = s.mm_accumulated["codes.audio"]
+    assert isinstance(stored, torch.Tensor)
+    assert stored.shape[0] == 5
+
+    second = s.make_request_output([2], None, None, None)
+    assert second is not None and not isinstance(second, PoolingRequestOutput)
+    out = second.outputs[0].multimodal_output["codes"]["audio"]
+    assert out.shape == (5, 4)
+    assert torch.equal(out, _nemotron_snapshot(5, step=2)["codes.audio"])
+    meta = second.outputs[0].multimodal_output["meta"]
+    assert meta["nvc_tts_step"].tolist() == [2]
+    assert meta["nvc_logical_prompt_len"] == 3
+
+
+def test_nemotron_delta_codes_snapshot_retains_only_latest_prefix():
+    s = _make_state(RequestOutputKind.DELTA)
+    for step, rows in enumerate((2, 4, 5), start=1):
+        s.add_multimodal_tensor(_nemotron_snapshot(rows, step=step), mm_type=LATENT)
+        result = s.make_request_output([step], None, None, None)
+        assert result is not None and not isinstance(result, PoolingRequestOutput)
+        out = result.outputs[0].multimodal_output
+        assert out["codes"]["audio"].shape == (rows, 4)
+        assert torch.equal(out["codes"]["audio"], _nemotron_snapshot(rows, step=step)["codes.audio"])
+        # Per-wake tensor metadata is a snapshot, not an accumulated list.
+        assert out["meta"]["nvc_tts_step"].tolist() == [step]
+
+    stored = s.mm_accumulated["codes.audio"]
+    assert isinstance(stored, torch.Tensor)
+    assert stored.shape[0] == 5
+
+
+def test_nemotron_marker_without_codes_key_preserves_prior_prefix():
+    """A marker-only update must not erase content from an earlier wake."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(_nemotron_snapshot(4, step=1), mm_type=LATENT)
+    s.add_multimodal_tensor(
+        {"meta.nvc_logical_prompt_len": 3, "meta.nvc_tts_step": torch.tensor([2], dtype=torch.long)},
+        mm_type=LATENT,
+    )
+    result = s.make_request_output([1], None, None, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    out = result.outputs[0].multimodal_output["codes"]["audio"]
+    assert isinstance(out, torch.Tensor) and out.shape[0] == 4
+    assert result.outputs[0].multimodal_output["meta"]["nvc_tts_step"].tolist() == [2]
+
+
+def test_codes_audio_without_nemotron_marker_still_accumulates():
+    """Other models keep CONCAT semantics for the same key when unmarked."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor({"codes.audio": torch.ones(2, 4, dtype=torch.long)}, mm_type=LATENT)
+    s.add_multimodal_tensor({"codes.audio": torch.full((3, 4), 2, dtype=torch.long)}, mm_type=LATENT)
+    result = s.make_request_output([1], None, None, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    out = result.outputs[0].multimodal_output["codes"]["audio"]
+    assert out.shape == (5, 4)
+    assert out[:2].eq(1).all() and out[2:].eq(2).all()
+
+
 def test_delta_audio_final_tts_chunk_keeps_finish():
     s = _make_state(RequestOutputKind.DELTA)
     s.add_multimodal_tensor(

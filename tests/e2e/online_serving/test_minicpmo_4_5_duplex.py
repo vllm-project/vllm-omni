@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 import websockets
@@ -174,6 +175,13 @@ async def _run_text_only_response_create(
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
 
 
+class _SeededAudioResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
 async def _run_seeded_text_to_audio(
     *,
     url: str,
@@ -183,7 +191,7 @@ async def _run_seeded_text_to_audio(
     modalities: tuple[str, ...] = ("audio", "text"),
     silence_seconds: float = 12.0,
     timeout_s: float = 180.0,
-) -> dict[str, object]:
+) -> _SeededAudioResult:
     """Speak a seeded text: the duplex route's text-to-speech shape.
 
     A model-native session takes its text once, in the session context
@@ -307,10 +315,9 @@ def test_duplex_single_session_response_required(omni_server, tmp_path: Path) ->
         output_dir=tmp_path / "single_session",
     )
     args.turns = 2
-    # Every turn replays the same active-speech window as the first one. The default
-    # shorter follow-up window is a different mid-utterance slice, which the native
-    # duplex model may legitimately answer with "listen" instead of a response.
-    args.turn_duration_ms = [args.first_turn_ms] * args.turns
+    # Require a response to a complete utterance. Cropping this 5.47 s fixture
+    # at 1.4 s can legitimately leave the native model listening on a later turn.
+    args.turn_duration_ms = [0] * args.turns
     result = asyncio.run(run_demo(args))
     assert result["ok"] is True
     _assert_positive_int(result["audio_delta_count"])

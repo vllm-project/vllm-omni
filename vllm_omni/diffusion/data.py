@@ -900,6 +900,12 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str | None = None
     nccl_port: int | None = None
 
+    # Weight transfer configuration for RL training (pipeline-wide deploy
+    # field). A dict matching upstream vLLM ``WeightTransferConfig`` fields
+    # (e.g. ``{"backend": "ipc"}``); converted to the typed config when the
+    # diffusion VllmConfig is built. ``None`` disables weight transfer.
+    weight_transfer_config: dict[str, Any] | None = None
+
     # Engine backend selection, resolved by ``DiffusionEngine.resolve_engine_class``
     # (mirrors ``DiffusionExecutor.get_class``). Config files use a string:
     # "default" -> DiffusionEngine, or an import path (set e.g. by a deploy
@@ -1451,6 +1457,7 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1888,6 +1895,9 @@ class DiffusionOutput:
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # Engine-side async materialization wait (seconds), separate from model stages.
+    output_ready_wait_time: float = 0.0
 
     # memory usage info
     peak_memory_mb: float = 0.0
@@ -2445,6 +2455,31 @@ def build_attention_config(
         {k: v.backend for k, v in normalized.per_role.items()},
     )
     return normalized
+
+
+def validate_kv_cache_dtype_vs_attention_specs(
+    kv_cache_dtype: str | None,
+    attention_config: "AttentionConfig | None",
+) -> None:
+    """Reject a global attention-quant knob combined with per-backend quant specs.
+
+    ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
+    an explicit ``quant`` spec is the advanced per-backend override. Setting both
+    is contradictory intent — fail fast instead of picking one silently. A pure
+    ``flashinfer_backend`` variant pin without dtypes is not a conflict.
+    """
+    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+        return
+    specs = [attention_config.default, *attention_config.per_role.values()]
+    for spec in specs:
+        if spec is None or spec.quant is None:
+            continue
+        if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
+            raise ValueError(
+                "diffusion_kv_cache_dtype conflicts with a diffusion_attention_config quant spec: "
+                "the unified knob already requests quantized attention. Remove the explicit "
+                "quant spec, or set diffusion_kv_cache_dtype to 'auto' and keep the spec."
+            )
 
 
 @dataclass

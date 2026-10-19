@@ -60,6 +60,8 @@ def is_flash_attn_4_available() -> bool:
 # Bind via aliases so mypy does not treat each candidate import as a redefinition.
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
+# FP8 descales are supported by vLLM's FA3 dispatcher and standalone FA3.
+FLASH_ATTN_SUPPORTS_FP8 = False
 IS_FLASH_ATTN_4 = False
 IS_AITER = False
 
@@ -119,6 +121,7 @@ else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
 
             flash_attn_varlen_func = _fa_varlen
+            FLASH_ATTN_SUPPORTS_FP8 = True
         except (ImportError, ModuleNotFoundError):
             pass
 
@@ -131,6 +134,7 @@ else:
 
                 flash_attn_func = _fa_func
                 flash_attn_varlen_func = _fa_varlen
+                FLASH_ATTN_SUPPORTS_FP8 = True
             except (ImportError, ModuleNotFoundError):
                 pass
 

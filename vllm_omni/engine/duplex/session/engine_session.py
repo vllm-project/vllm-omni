@@ -125,8 +125,6 @@ RESPONSE_REQUEST_MEASUREMENT_ORIGIN: dict[str, str] = {
 class PlaybackLedger:
     current: DuplexPlaybackCursor = field(default_factory=DuplexPlaybackCursor)
     by_response: dict[str, DuplexPlaybackCursor] = field(default_factory=dict)
-    # Finished/cancelled audio can still need an ACK without any text history.
-    audio_only_responses: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -506,12 +504,13 @@ class DuplexEngineSession:
         return tuple(self._conversation.last_assistant_audio_text_marks)
 
     def has_audio_only_response(self, response_id: str) -> bool:
-        return response_id in self._playback.audio_only_responses
+        snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+        return snapshot is not None and snapshot[0].get("content") == ""
 
     def has_assistant_response_item(self, response_id: str, item_id: str) -> bool:
         if item_id != f"item_{response_id}":
             return False
-        if self.active_response_id == response_id or self.has_audio_only_response(response_id):
+        if self.active_response_id == response_id:
             return True
         message = self._conversation.item_ids.get(item_id) or self._conversation.pending_item_ids.get(item_id)
         if isinstance(message, dict) and message.get("role") == "assistant":
@@ -581,7 +580,14 @@ class DuplexEngineSession:
         if response_id is None or response_id == self.active_response_id:
             return
         self._conversation.assistant_response_snapshots.pop(response_id, None)
-        self._conversation.hard_truncations_ms.pop(f"item_{response_id}", None)
+        item_id = f"item_{response_id}"
+        # An audio-only response may have registered an empty pending item.
+        # Its full ACK has no text to materialize, but still releases that state.
+        self._conversation.pending_item_ids.pop(item_id, None)
+        self._conversation.pending_item_audio_text_marks.pop(item_id, None)
+        self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
+        self._conversation.pending_truncations_ms.pop(item_id, None)
+        self._conversation.hard_truncations_ms.pop(item_id, None)
 
     @property
     def playback(self) -> DuplexPlaybackView:
@@ -1285,7 +1291,6 @@ class DuplexEngineSession:
         if response_id is None or response_id == self.active_response_id:
             return
         self._playback.by_response.pop(response_id, None)
-        self._playback.audio_only_responses.discard(response_id)
 
     def release_finished_drain_response(self, response_id: str | None) -> None:
         """Drop unused books for a response whose TTS just finished.
@@ -1360,9 +1365,17 @@ class DuplexEngineSession:
         ):
             self.register_history_item(f"item_{response_id}", None)
         elif response_id is not None and not assistant_text:
+            # Sent audio has no transcript to store, but the client still has
+            # to ack it. Dropping the item makes that ack fail and leaves
+            # sent_ms ahead of committed_ms, so the next response cannot start.
+            playback = self.playback_for_response(response_id)
+            if max(playback.sent_ms, playback.generated_ms) > 0:
+                self._conversation.assistant_response_snapshots[response_id] = (
+                    _object_dict(role="assistant", content=""),
+                    tuple(copy.deepcopy(self._response.assistant_audio_text_marks)),
+                    response_input_commit_seq,
+                )
             self._discard_history_item_placeholder(f"item_{response_id}")
-            if self._playback.current.sent_ms > 0:
-                self._playback.audio_only_responses.add(response_id)
         self._response.assistant_text_buffer.clear()
         if not preserve_request:
             self._response.active_request_id = None

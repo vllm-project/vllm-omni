@@ -8,7 +8,7 @@ import functools
 import math
 import os
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -78,6 +78,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+)
+from vllm_omni.experimental.ar_diffusion.kv_cache.conditioning import (
+    ConditioningKVIdentity,
+    ConditioningKVRepresentation,
 )
 from vllm_omni.experimental.ar_diffusion.streaming_decode import (
     StreamingDecodeState,
@@ -611,6 +615,15 @@ class LingBotWorldCausalDMDPipeline(
         if not isinstance(reuse_last_step_kv, bool):
             raise ValueError("model_config.lingbot_reuse_last_step_kv must be a bool.")
         self._reuse_last_step_kv = reuse_last_step_kv
+        share_first_block = model_config.get("lingbot_share_first_block_kv", False)
+        if not isinstance(share_first_block, bool):
+            raise ValueError("model_config.lingbot_share_first_block_kv must be a bool.")
+        if share_first_block and (reuse_last_step_kv or not od_config.enforce_eager):
+            raise ValueError("First-block K/V sharing currently requires eager execution and clean-x0 K/V commits.")
+        first_block_limit = model_config.get("lingbot_first_block_kv_cpu_limit_bytes", 4 << 30)
+        if isinstance(first_block_limit, bool) or not isinstance(first_block_limit, int) or first_block_limit <= 0:
+            raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
+        self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
@@ -700,6 +713,9 @@ class LingBotWorldCausalDMDPipeline(
         self._ar_height = int(model_config.get("ar_diffusion_height", 480))
         self._ar_width = int(model_config.get("ar_diffusion_width", 832))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
+        # The loaded text encoder and transformer projections are immutable in
+        # normal inference. Weight or adapter mutation must advance this token.
+        self._conditioning_projection_revision = 0
         self._ar_sessions: dict[str, _LingBotARSessionState] = {}
         # Text encodes keyed by what they depend on; see encode_prompt.
         self._prompt_embeds_cache: OrderedDict[tuple[str, int, torch.dtype], torch.Tensor] = OrderedDict()
@@ -1336,21 +1352,53 @@ class LingBotWorldCausalDMDPipeline(
         )
         return _fold_camera_embedding(camera_embedding), tail
 
+    def advance_conditioning_projection_revision(self) -> None:
+        """Call after changing text-encoder or cross-K/V projection dependencies."""
+        self._conditioning_projection_revision += 1
+        self._prompt_embeds_cache.clear()
+        self.advance_first_block_projection_revision()
+        if self._ar_diffusion_kv_state is not None:
+            self._ar_diffusion_kv_state.conditioning_kv.invalidate(cache_name=self._AR_TEXT_CACHE)
+
+    def advance_first_block_projection_revision(self) -> None:
+        """Retire cross-request self K/V after changing any DiT projection dependency."""
+        runner = getattr(self, "_dmd_block_runner", None)
+        if runner is not None:
+            runner.invalidate_first_block_kv()
+
     def _ar_text_caches(
         self,
         prompt_embeds: torch.Tensor,
         *,
         invalidate: bool,
+        condition_revision: Hashable,
     ) -> list[LingBotAttentionCache]:
         state = self._ar_diffusion_kv_state
         if state is None:
             raise RuntimeError("LingBot AR text cache requested without a bound state.")
+        cross_attention = self.transformer.blocks[0].cross_attn
+        identity = ConditioningKVIdentity(
+            cache_name=self._AR_TEXT_CACHE,
+            kv_branch=self._AR_BRANCH,
+            condition_revision=(condition_revision, str(prompt_embeds.device)),
+            projection_revision=self._conditioning_projection_revision,
+            projection_owner=id(self.transformer),
+            representation=ConditioningKVRepresentation(
+                dtype=state.kv_cache.dtype,
+                device=state.kv_cache.device,
+                layout="BSND",
+                kv_length=prompt_embeds.shape[1],
+                local_heads=cross_attention.num_local_heads,
+                head_size=cross_attention.head_dim,
+                batch_size=prompt_embeds.shape[0],
+            ),
+        )
+        scope = state.conditioning_kv
         if invalidate:
-            state.clear_cross_attention()
-        if not state.is_cross_attention_populated(
-            self._AR_BRANCH,
-            self._AR_TEXT_CACHE,
-        ):
+            scope.invalidate(cache_name=self._AR_TEXT_CACHE, kv_branch=self._AR_BRANCH)
+        layers = scope.lookup(identity)
+        if layers is None:
+            ticket = scope.begin_build(identity)
             projected_text = self.transformer.text_embedding(prompt_embeds)
 
             def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
@@ -1361,11 +1409,9 @@ class LingBotWorldCausalDMDPipeline(
                     value = cross_attention.v(projected_text).unflatten(2, shape)
                     yield key, value
 
-            state.populate_cross_attention(
-                self._AR_BRANCH,
-                self._AR_TEXT_CACHE,
-                layer_kv(),
-            )
+            scope.publish(ticket, layer_kv())
+            layers = scope.lookup(identity)
+            assert layers is not None
         return [
             LingBotAttentionCache(
                 key=layer["k"],
@@ -1374,10 +1420,7 @@ class LingBotWorldCausalDMDPipeline(
                 absolute_end=prompt_embeds.shape[1],
                 last_start=0,
             )
-            for layer in state.get_cross_attention_kv(
-                self._AR_BRANCH,
-                self._AR_TEXT_CACHE,
-            )
+            for layer in layers
         ]
 
     # ── DMD block helpers ─────────────────────────────────────────────────
@@ -1397,6 +1440,7 @@ class LingBotWorldCausalDMDPipeline(
                 device=self.device,
                 enforce_eager=bool(self.od_config.enforce_eager),
                 reuse_last_step_kv=self._reuse_last_step_kv,
+                first_block_kv_cpu_limit_bytes=self._first_block_kv_cpu_limit_bytes,
             )
             self._dmd_block_runner = runner
         return runner
@@ -1462,7 +1506,7 @@ class LingBotWorldCausalDMDPipeline(
         invalidate = session_state.text_cache_dirty or (previous is not None and previous != text_key)
         session_state.text_cache_dirty = True
         session_state.text_cache_key = None
-        caches = self._ar_text_caches(prompt_embeds, invalidate=invalidate)
+        caches = self._ar_text_caches(prompt_embeds, invalidate=invalidate, condition_revision=text_key)
         session_state.text_cache_key = text_key
         session_state.text_cache_dirty = False
         return caches
@@ -1937,7 +1981,11 @@ class LingBotWorldCausalDMDPipeline(
             "camera_trajectory_cache": camera_trajectory_cache,
             "camera_embedding_cache": camera_embedding_cache,
         }
-        self._ar_text_caches(prompt_embeds, invalidate=False)
+        self._ar_text_caches(
+            prompt_embeds,
+            invalidate=False,
+            condition_revision=(inputs.prompt, int(inputs.max_sequence_length), str(prompt_embeds.dtype)),
+        )
         self._ar_sessions[state.request_id] = _LingBotARSessionState()
         return state
 
@@ -2058,6 +2106,7 @@ class LingBotWorldCausalDMDPipeline(
         extra["ar_cross_attention"] = self._ar_text_caches(
             cast(torch.Tensor, state.prompt_embeds),
             invalidate=False,
+            condition_revision=(inputs.prompt, int(inputs.max_sequence_length), str(state.prompt_embeds.dtype)),
         )
         state.latents = randn_tensor(
             (
@@ -2224,4 +2273,6 @@ class LingBotWorldCausalDMDPipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return cast(set[str], loader.load_weights(weights))
+        loaded = cast(set[str], loader.load_weights(weights))
+        self.advance_conditioning_projection_revision()
+        return loaded

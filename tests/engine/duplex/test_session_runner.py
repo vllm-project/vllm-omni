@@ -513,6 +513,70 @@ async def test_close_emits_session_closed_and_releases_stage_requests() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_an_inflight_response_and_aborts_its_request() -> None:
+    saw_cancel = asyncio.Event()
+
+    async def inflight() -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            saw_cancel.set()
+            raise
+
+    h = await open_harness()
+    task = asyncio.create_task(inflight())
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        h.runner.tasks.active_response_task = task
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close-inflight", session_id=SESSION_ID, reason="client_close")
+        )
+        await asyncio.wait_for(h.results.get(), timeout=2.0)
+        await h.settle()
+        assert saw_cancel.is_set()
+        assert any(request_id in batch for batch in h.port.aborts)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_close_skips_retirement_after_the_ledger_is_closed() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        asked: list[str] = []
+
+        def explode(config, current):
+            del config, current
+            asked.append("retire")
+            raise RuntimeError("the plugin cannot prove its queue is clean")
+
+        h.runner.plugin.retire_pending_function_output = explode
+        epoch_before = h.runner.session.epoch
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close-retire", session_id=SESSION_ID, reason="client_close")
+        )
+        result = await asyncio.wait_for(h.results.get(), timeout=2.0)
+        events = await h.settle()
+
+        assert result.ok and result.operation == "close"
+        assert h.runner.session.epoch > epoch_before
+        assert asked == []
+        assert "tool_result_retirement_failed" not in [getattr(event, "code", None) for event in events]
+        assert "session.closed" in types(events)
+        assert any(request_id in batch for batch in h.port.aborts)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_idle_expiry_emits_session_expired() -> None:
     clock = {"now": 100.0}
     h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=1.0), clock=lambda: clock["now"])
@@ -687,6 +751,45 @@ async def test_commit_projects_the_user_item_and_does_not_resubmit_consumed_audi
         assert len(h.port.submissions) == 1
         assert h.session.input_commit_seq == 1
         assert h.session.history[-1]["role"] == "user"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_response_commit_releases_residual_audio_before_the_next_turn() -> None:
+    h = await open_harness(extra_body={"force_listen_count": 0})
+    try:
+        for turn in range(2):
+            # Match streaming input with a partial final model unit. Give the
+            # turns different PCM so replaying the first tail cannot go unnoticed.
+            value = 0.05 + turn * 0.05
+            for _ in range(7):
+                await h.run(append_audio(3200, value=value))
+            await h.run(commands.Commit())
+
+            assert h.runner.model_state.committed_audio_payload is None
+            assert h.session.pending_input_bytes == 0
+            assert len(h.port.submissions) == (turn + 1) * 2
+            streaming_append = h.port.submissions[-2].prompt["model_intermediate_buffer"]["duplex"]
+            assert streaming_append["final"] is False
+            assert base64.b64decode(streaming_append["payload"]["audio"]) == pcm_f32(16000, value=value)
+            final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+            assert final_append["final"] is True
+            assert base64.b64decode(final_append["payload"]["audio"]) == (
+                pcm_f32(6400, value=value) + pcm_f32(9600, value=0.0)
+            )
+
+            samples = (turn + 1) * 24000
+            await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=samples, turn_id=turn))
+            events = await h.deliver_and_settle(
+                tts_output(h.stage0_request_id(), samples=samples, turn_end=True, turn_id=turn)
+            )
+            done = find(events, "response.done")
+            assert done.status == "completed"
+            ack = await h.run(commands.AckPlayback(played_ms=1000, response_id=done.response_id))
+            assert types(ack) == ["playback.acknowledged"]
+            assert ack[0].details["history_committed"] is True
+            assert ack[0].details["playback"]["committed_ms"] == 1000
     finally:
         await close_harness(h)
 
@@ -975,6 +1078,163 @@ async def test_cancel_response_absorbs_a_response_task_that_outlives_the_wait() 
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+async def _open_active_response(h: Harness) -> str:
+    """Drive the harness until a stage1 response is streaming, as the docs assume."""
+    await h.run(append_audio())
+    request_id = h.stage0_request_id()
+    await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+    return request_id
+
+
+@pytest.mark.asyncio
+async def test_input_cancel_with_an_active_response_acknowledges_cleared_input_once() -> None:
+    """An input.cancel that also tears down a response still acks the clear.
+
+    Regression: ``input_audio_buffer.cleared`` only existed on the queued-input
+    path, so cancelling an active response emitted no acknowledgement even
+    though ``input.cancel`` promises one. The epoch still advances exactly once.
+    """
+    h = await open_harness()
+    try:
+        request_id = await _open_active_response(h)
+        assert h.session.epoch == 0
+        assert h.session.active_response_id is not None
+
+        events = await h.run(commands.CancelInput())
+
+        assert types(events).count("input_audio_buffer.cleared") == 1
+        assert find(events, "response.done").status == "cancelled"
+        assert h.port.aborts == [[request_id]]
+        assert h.session.epoch == 1, "one cancellation advances the epoch exactly once"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_input_cancel_with_a_data_plane_stream_acknowledges_cleared_input_once() -> None:
+    """The stream-only fallback path acks the clear too, without a second epoch.
+
+    With no active response but a resumable data-plane stream, the cancel is
+    owned by the stream fallback (a different branch from the queued-input
+    path); it must still emit exactly one ``input_audio_buffer.cleared``.
+    """
+    h = await open_harness()
+    try:
+        h.runner.run.stream_request_id = h.stage0_request_id()
+        assert h.session.active_response_id is None
+
+        events = await h.run(commands.CancelInput())
+
+        assert types(events).count("input_audio_buffer.cleared") == 1
+        assert h.runner.run.stream_request_id is None
+        assert h.session.epoch == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_input_cancel_with_only_queued_input_acknowledges_cleared_input_once() -> None:
+    """The queued-input path emits one clear, one epoch bump, and the client reason.
+
+    The internal acknowledgement carries the client's cancel reason, not the
+    acoustic ``barge_in`` reason it used to inherit by falling through the
+    barge-in branch.
+    """
+    h = await open_harness()
+    try:
+        await h.run(append_audio(samples=8000))
+        assert h.runner.model_state.audio_buffer.has_pending()
+
+        emitted: list[dict[str, object]] = []
+        original_emit = h.runner.emit
+
+        def capture(payload: dict[str, object]) -> None:
+            emitted.append(dict(payload))
+            original_emit(payload)
+
+        h.runner.emit = capture  # type: ignore[method-assign]
+        events = await h.run(commands.CancelInput())
+
+        assert types(events).count("input_audio_buffer.cleared") == 1
+        assert h.session.epoch == 1
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        acked = [payload for payload in emitted if payload.get("type") == "input.cancelled"]
+        assert len(acked) == 1
+        assert acked[0]["reason"] == "client_cancelled"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_barge_in_with_only_queued_input_keeps_its_input_cleared_event() -> None:
+    """Preserve the established pending-only barge-in acknowledgement.
+
+    This fix corrects the explicit ``input.cancel`` acknowledgement; it must not
+    remove the input-clear a barge-in has always emitted for queued input. That
+    acknowledgement carries the acoustic ``barge_in`` reason and still advances
+    the epoch exactly once.
+    """
+    h = await open_harness()
+    try:
+        await h.run(append_audio(samples=8000))
+        assert h.runner.model_state.audio_buffer.has_pending()
+        assert h.session.active_response_id is None
+
+        emitted: list[dict[str, object]] = []
+        original_emit = h.runner.emit
+
+        def capture(payload: dict[str, object]) -> None:
+            emitted.append(dict(payload))
+            original_emit(payload)
+
+        h.runner.emit = capture  # type: ignore[method-assign]
+        events = await h.run(commands.BargeIn())
+
+        assert types(events).count("input_audio_buffer.cleared") == 1
+        assert h.session.epoch == 1
+        acked = [payload for payload in emitted if payload.get("type") == "input.cancelled"]
+        assert len(acked) == 1
+        assert acked[0]["reason"] == "barge_in"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_barge_in_that_cancels_a_response_gains_no_input_clear() -> None:
+    """Input-clear must not grow onto the active barge-in path.
+
+    Only explicit ``input.cancel`` gains a new acknowledgement; a barge-in that
+    tears down an active response keeps emitting output-cancel events alone.
+    """
+    h = await open_harness()
+    try:
+        await _open_active_response(h)
+
+        events = await h.run(commands.BargeIn())
+
+        assert "input_audio_buffer.cleared" not in types(events)
+        assert find(events, "response.done").status == "cancelled"
+        assert h.session.epoch == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_response_cancel_never_acknowledges_cleared_input() -> None:
+    """``response.cancel`` tears down output only; it must not clear input."""
+    h = await open_harness()
+    try:
+        await _open_active_response(h)
+
+        events = await h.run(commands.CancelResponse())
+
+        assert "input_audio_buffer.cleared" not in types(events)
+        assert find(events, "response.done").status == "cancelled"
+        assert h.session.epoch == 1
+    finally:
         await close_harness(h)
 
 

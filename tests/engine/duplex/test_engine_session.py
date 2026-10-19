@@ -19,6 +19,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexTurnEventType,
     DuplexTurnState,
     ResponseCreateOptions,
+    resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
@@ -351,6 +352,77 @@ def test_unaligned_response_only_materializes_an_existing_answer_slot(reserve_sl
 
     assert session.end_response(commit_text=reserve_slot) is None
     assert session.history == (first.message,)
+
+
+def test_sent_audio_without_text_can_still_be_acknowledged():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    user = session.commit_audio_input(transcript="What is the weather in Taipei?")
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+    session.mark_audio_sent(duration_ms=696, text_requires_complete_audio=True, audio_complete=True)
+
+    assert session.end_response(commit_text=True) is None
+    assert session.active_response_id is None
+    assert session.has_assistant_response_item(response_id, f"item_{response_id}")
+
+    ack = apply_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 696,
+            "committed_ms": 696,
+        },
+    )
+    assert "error" not in ack[0].to_realtime()
+    assert ack[0].to_realtime()["event"]["playback"]["committed_ms"] == 696
+    assert session.playback.sent_ms == session.playback.committed_ms == 696
+    # The reserved slot stays as an empty turn. There is no transcript to store.
+    assert session.history == (user.message, {"role": "assistant", "content": ""})
+    assert not session.has_audio_only_response(response_id)
+    assert response_id not in session._playback.by_response
+    assert f"item_{response_id}" not in session.pending_history_item_ids
+
+
+@pytest.mark.parametrize("ack_before_next_input", [False, True])
+def test_audio_only_ack_after_next_input_preserves_history(ack_before_next_input):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = session.commit_audio_input(transcript="first question")
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+    session.mark_audio_sent(duration_ms=696, text_requires_complete_audio=True, audio_complete=True)
+    session.end_response()
+    if ack_before_next_input:
+        ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 300})
+        assert ack[0].type == "playback.acknowledged"
+        assert session.history == (first.message, {"role": "assistant", "content": ""})
+
+    session.commit_audio_input(transcript="next question")
+    next_response = session.begin_response()
+    history = session.history
+    ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 696})
+
+    assert ack[0].type == "playback.acknowledged"
+    assert ack[0].details["playback"]["committed_ms"] == 696
+    assert ack[0].details["history_committed"] is False
+    assert session.history == history
+    assert session.active_response_id == next_response
+    assert session.playback.sent_ms == session.playback.committed_ms == 0
+    assert not session.has_audio_only_response(response_id)
+    assert response_id not in session._playback.by_response
+    assert f"item_{response_id}" not in session.pending_history_item_ids
+
+
+def test_response_with_no_audio_and_no_text_is_not_ackable():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+
+    assert session.end_response(commit_text=True) is None
+    assert not session.has_assistant_response_item(response_id, f"item_{response_id}")
+    ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 0})
+    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
 
 
 @pytest.mark.parametrize("operation", ["delete", "truncate"])
@@ -701,6 +773,31 @@ def test_from_realtime_ignores_client_chosen_session_ids():
     assert session.as_public_dict()["id"] == "duplex-engine-allocated"
 
 
+def test_from_realtime_reads_and_validates_the_tool_result_timeout():
+    config = DuplexSessionConfig.from_realtime({"tool_result_timeout_s": 2.5})
+    assert resolve_tool_result_timeout_s(config.extra_body) == 2.5
+    assert config.extra_body["tool_result_timeout_s"] == 2.5
+
+    nested = DuplexSessionConfig.from_realtime({"extra_body": {"tool_result_timeout_s": 4}})
+    assert resolve_tool_result_timeout_s(nested.extra_body) == 4.0
+
+    # The deadline only ever makes a pending call unanswerable, so a typo must
+    # be rejected rather than silently reinterpreted (``True`` is an ``int``).
+    for bad in (True, 0, -1.0, float("nan"), float("inf"), 10**400, "5"):
+        with pytest.raises(DuplexConfigError) as excinfo:
+            DuplexSessionConfig.from_realtime({"tool_result_timeout_s": bad})
+        assert excinfo.value.code == "invalid_tool_result_timeout"
+        assert excinfo.value.param == "tool_result_timeout_s"
+
+    with pytest.raises(DuplexConfigError) as excinfo:
+        DuplexSessionConfig(extra_body={"tool_result_timeout_s": False})
+    assert excinfo.value.code == "invalid_tool_result_timeout"
+
+    # Absent (or null) disables the deadline: the default is unchanged.
+    assert resolve_tool_result_timeout_s(DuplexSessionConfig.from_realtime({}).extra_body) is None
+    assert resolve_tool_result_timeout_s({"tool_result_timeout_s": None}) is None
+
+
 # ---- DuplexSessionConfig.apply_realtime_update ----
 
 
@@ -733,6 +830,56 @@ def test_apply_realtime_update_rejects_ref_audio_change():
 
     assert excinfo.value.code == "ref_audio_update_unsupported"
     assert config.ref_audio is None
+
+
+def test_apply_realtime_update_rejects_tool_result_timeout_change():
+    config = DuplexSessionConfig(model="served-model", extra_body={"tool_result_timeout_s": 5.0})
+
+    for patch in ({"tool_result_timeout_s": 1.0}, {"extra_body": {"tool_result_timeout_s": 1.0}}):
+        with pytest.raises(DuplexConfigError) as excinfo:
+            config.apply_realtime_update(patch, session_id="sid")
+        assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+        assert excinfo.value.param == "tool_result_timeout_s"
+
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+
+def test_apply_realtime_update_keeps_an_unchanged_tool_result_timeout():
+    config = DuplexSessionConfig(model="served-model", extra_body={"tool_result_timeout_s": 5.0})
+
+    config.apply_realtime_update({"instructions": "still here", "tool_result_timeout_s": 5}, session_id="sid")
+    config.apply_realtime_update({"extra_body": {"tool_result_timeout_s": 5.0}}, session_id="sid")
+
+    assert config.instructions == "still here"
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+    unset = DuplexSessionConfig(model="served-model")
+    unset.apply_realtime_update({"tool_result_timeout_s": None}, session_id="sid")
+    assert resolve_tool_result_timeout_s(unset.extra_body) is None
+    with pytest.raises(DuplexConfigError) as excinfo:
+        unset.apply_realtime_update({"extra_body": {"tool_result_timeout_s": 1.0}}, session_id="sid")
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    with pytest.raises(DuplexConfigError) as excinfo:
+        config.apply_realtime_update({"tool_result_timeout_s": None}, session_id="sid")
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+    opened = DuplexSessionConfig.from_realtime(
+        {"model": "served-model", "tool_result_timeout_s": 5, "extra_body": {"tool_result_timeout_s": 10}}
+    )
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
+    opened.apply_realtime_update(
+        {"tool_result_timeout_s": 5, "extra_body": {"tool_result_timeout_s": 10}},
+        session_id="sid",
+    )
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
+    with pytest.raises(DuplexConfigError) as excinfo:
+        opened.apply_realtime_update(
+            {"tool_result_timeout_s": 1, "extra_body": {"tool_result_timeout_s": 5}},
+            session_id="sid",
+        )
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
 
 
 def test_apply_realtime_update_patches_fields_and_realtime_keys():
@@ -929,7 +1076,12 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -1097,7 +1249,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     wall = {"t": 1_000.0}
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -1117,7 +1274,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))

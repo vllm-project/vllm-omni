@@ -45,12 +45,7 @@ requires_distributed = pytest.mark.skipif(
 )
 
 # Module-level markers: these tests are diffusion + parallel related
-pytestmark = [
-    pytest.mark.diffusion,
-    pytest.mark.parallel,
-    pytest.mark.core_model,
-    pytest.mark.cpu,
-]
+pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model]
 
 # =============================================================================
 # Tests for sp_plan.py

@@ -1,6 +1,6 @@
 # LTX-2 Family
 
-> LTX-2 and LTX-2.3 text-to-video and image-to-video generation with synchronized audio
+> LTX-2 and LTX-2.3 text-to-video, image-to-video, and text-to-audio generation
 
 ## Pipelines
 
@@ -10,10 +10,12 @@
 | `LTX2TwoStagePipeline` | LTX-2 ordinary two-stage T2V/I2V | `Lightricks/LTX-2` |
 | `LTX2DistilledOneStagePipeline` | LTX-2 merged-distilled one-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
 | `LTX2DistilledTwoStagePipeline` | LTX-2 merged-distilled two-stage T2V/I2V | `rootonchair/LTX-2-19b-distilled` |
+| `LTX2TextToAudioPipeline` | LTX-2 T2A | `Lightricks/LTX-2` |
 | `LTX2Pipeline` | LTX-2.3 one-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers` |
 | `LTX2TwoStagePipeline` | LTX-2.3 ordinary two-stage T2V/I2V | `diffusers/LTX-2.3-Diffusers`<br>`Lightricks/LTX-2.3` |
 | `LTX2DistilledOneStagePipeline` | LTX-2.3 merged-distilled one-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers` |
 | `LTX2DistilledTwoStagePipeline` | LTX-2.3 merged-distilled two-stage T2V/I2V | `diffusers/LTX-2.3-Distilled-Diffusers`<br>`Lightricks/LTX-2.3` |
+| `LTX2TextToAudioPipeline` | LTX-2.3 T2A | `diffusers/LTX-2.3-Diffusers` |
 
 Repositories in the table are download units. A full pipeline repository
 contains the Transformer, text encoder, connectors, VAEs, vocoder, scheduler,
@@ -34,6 +36,47 @@ merged distilled Transformer without upsampling, while
 T2V and I2V; select their class explicitly. The deprecated
 `LTX2DistilledPipeline` name remains an alias for
 `LTX2DistilledTwoStagePipeline`.
+
+## Text-to-Audio
+
+Select `LTX2TextToAudioPipeline` explicitly. LTX-2 defaults to 40 denoise
+steps, while LTX-2.3 defaults to 30. The output sample rate is read from the
+checkpoint vocoder rather than supplied by the request.
+
+```bash
+# LTX-2
+python examples/offline_inference/text_to_audio/text_to_audio.py \
+  --model Lightricks/LTX-2 \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A fingerpicked acoustic guitar in a quiet studio" \
+  --audio-length 5 \
+  --num-inference-steps 40 \
+  --output ltx2_audio.wav
+
+# LTX-2.3
+python examples/offline_inference/text_to_audio/text_to_audio.py \
+  --model diffusers/LTX-2.3-Diffusers \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A fingerpicked acoustic guitar in a quiet studio" \
+  --audio-length 5 \
+  --num-inference-steps 30 \
+  --output ltx23_audio.wav
+```
+
+For serving, launch either checkpoint with the same explicit pipeline class:
+
+```bash
+vllm serve Lightricks/LTX-2 --omni \
+  --model-class-name LTX2TextToAudioPipeline \
+  --stage-init-timeout 600
+
+# Or use: diffusers/LTX-2.3-Diffusers
+```
+
+Send requests to `/v1/audio/generate`; see the
+[audio generation API](../../docs/serving/audio_generate_api.md) for the
+request and response format. The audio-only pipeline currently requires
+tensor parallel size 1, sequence parallel size 1, and no Cache-DiT backend.
 
 ## API Migration
 

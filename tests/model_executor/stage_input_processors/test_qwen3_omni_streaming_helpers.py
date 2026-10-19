@@ -78,7 +78,7 @@ def test_get_streaming_codec_delta_len_increments_and_finishes(_streaming_contex
 
 
 def test_streaming_input_prefill_chunk_is_cached() -> None:
-    transfer_manager = SimpleNamespace(_pending_streaming_prefills={})
+    transfer_manager = SimpleNamespace(_pending_streaming_prefills={}, request_payload={})
     request = SimpleNamespace(
         external_req_id="rt-1",
         output_token_ids=[100],
@@ -108,13 +108,14 @@ def test_streaming_input_prefill_chunk_is_cached() -> None:
 
 def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
     transfer_manager = SimpleNamespace(
+        request_payload={},
         _pending_streaming_prefills={
             "rt-2": {
                 "embed": {"prefill": torch.ones(2, 3)},
                 "hidden_states": {"output": torch.full((2, 3), 2.0)},
                 "ids": {"all": [151644, 872, 100], "prompt": [151644, 872]},
             }
-        }
+        },
     )
     request = SimpleNamespace(
         external_req_id="rt-2",

@@ -45,6 +45,7 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
         response_id = session.active_response_id
         item_id = f"item_{response_id}"
     audio_only = response_id is not None and session.has_audio_only_response(response_id)
+    history_is_late = False
     if response_id is not None:
         expected_item_id = f"item_{response_id}"
         if item_id is None:
@@ -55,11 +56,12 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             return [
                 error_event("playback_item_not_found", f"No assistant response item is registered for {response_id}.")
             ]
-        if not audio_only and session.playback_ack_is_too_late(response_id, item_id):
+        history_is_late = session.playback_ack_is_too_late(response_id, item_id)
+        if history_is_late and not audio_only:
             return [
                 error_event("playback_ack_too_late", "playback.ack arrived after a later user input was committed.")
             ]
-        if not audio_only:
+        if not history_is_late:
             session.reserve_history_item(item_id)
     elif item_id is not None:
         return [error_event("playback_item_not_found", "playback.ack requires a response-owned assistant item.")]
@@ -71,7 +73,12 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
         playback = session.acknowledge_playback(int(played_ms), committed_cursor, response_id=response_id)
     committed_history = False
     if isinstance(item_id, str) and item_id:
-        if not audio_only:
+        if audio_only:
+            # Keep an acknowledged turn boundary, but never append an older
+            # answer after a later input. Empty text does not settle tool output.
+            if not history_is_late:
+                session.register_history_item(item_id, {"role": "assistant", "content": ""})
+        else:
             if (
                 item_id == f"item_{response_id}"
                 and item_id not in session.history_item_ids

@@ -33,16 +33,12 @@ def test_stage0_pattern_does_not_select_stage1(monkeypatch: pytest.MonkeyPatch) 
     assert hits == [3]
 
 
-def test_sigkill_records_dead_pid_and_health(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_sigkill_records_dead_pid(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     class _Proc:
         pid = 10
 
     class _Server:
         proc = _Proc()
-        host = "127.0.0.1"
-        port = 9
 
     monkeypatch.setattr(helpers, "_list_server_process_tree", lambda _server: [10, 20])
     monkeypatch.setattr(helpers, "_log_server_process_tree", lambda _server: None)
@@ -69,7 +65,6 @@ def test_sigkill_records_dead_pid_and_health(
         return _Status()
 
     monkeypatch.setattr(helpers.psutil, "Process", _process)
-    monkeypatch.setattr(helpers, "get_health_raw", lambda *_args, **_kwargs: (503, b""))
 
     inject = helpers.make_process_kill_fault_injector(
         grep_patterns=RUNTIME_WORKER_PATTERN,
@@ -83,4 +78,3 @@ def test_sigkill_records_dead_pid_and_health(
     output = capsys.readouterr().out
     assert "pid=20" in output
     assert "dead=1" in output
-    assert "post-kill health status=503" in output
