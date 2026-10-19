@@ -152,12 +152,12 @@ def test_invalid_reuse_prefix_is_rejected(monkeypatch):
         impl.forward_npu(q, k[:, :-1], v[:, :-1], metadata)
 
 
-def test_unmarked_rectangular_attention_stays_dense(monkeypatch):
+def test_unmarked_rectangular_attention_keeps_existing_geometry_check(monkeypatch):
     impl, metadata, q, k, v = _make_reuse(monkeypatch)
     metadata.extra.pop("minimax_h3_compact_reference_rows")
-    impl.dense_fallback.forward_npu = mock.Mock(return_value=q)
-    assert impl.forward_npu(q, k, v, metadata) is q
-    impl.dense_fallback.forward_npu.assert_called_once_with(q, k, v, metadata)
+    monkeypatch.setattr(impl, "_resolve_plan", lambda metadata: types.SimpleNamespace(used_len=q.shape[1]))
+    with pytest.raises(ValueError, match="identical full-sequence"):
+        impl.forward_npu(q, k, v, metadata)
 
 
 def test_non_reference_rainfusion_never_enters_new_hybrid_path(monkeypatch):

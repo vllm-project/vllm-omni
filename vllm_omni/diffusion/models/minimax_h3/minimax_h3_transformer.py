@@ -13,7 +13,7 @@ import math
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -1339,7 +1339,6 @@ class MiniMaxH3DiTModel(nn.Module):
         block_forward_patterns={"blocks": ForwardPattern.Pattern_3},
         # H3 is CFG-distilled and performs one transformer forward per step.
         has_separate_cfg=False,
-        cached_adapter_cls=MiniMaxH3CachedAdapter,
         check_forward_pattern=False,
     )
     _repeated_blocks = ["MiniMaxH3DiTBlock"]
@@ -1521,6 +1520,11 @@ class MiniMaxH3DiTModel(nn.Module):
             max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
         )
         self.od_config = od_config
+        if getattr(od_config, "kv_offload_config", None) is not None:
+            self._cache_dit_adapter_config = replace(
+                self._cache_dit_adapter_config,
+                cached_adapter_cls=MiniMaxH3CachedAdapter,
+            )
         self.parallel_config = od_config.parallel_config
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads

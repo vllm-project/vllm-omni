@@ -321,9 +321,6 @@ class RainFusionAttentionImpl(AttentionImpl):
                 )
             return self.dense_fallback.forward_npu(query, key, value, attn_metadata)
 
-        if query.shape[1] != key.shape[1]:
-            # An unmarked rectangular call cannot use rf_v2's self-attention ABI.
-            return self.dense_fallback.forward_npu(query, key, value, attn_metadata)
         plan = self._resolve_plan(attn_metadata)
         if plan is None:
             return self.dense_fallback.forward_npu(query, key, value, attn_metadata)

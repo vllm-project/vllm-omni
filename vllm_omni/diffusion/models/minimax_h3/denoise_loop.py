@@ -474,8 +474,8 @@ def minimax_h3_denoise_loop(
 
     finally:
         minimax_h3_publish_denoise_progress(None, None, None)
-        positive.static_kwargs.pop("reference_kv_tier1_state", None)
         if reference_kv_state is not None:
+            positive.static_kwargs.pop("reference_kv_tier1_state", None)
             reference_kv_state.close()
     return video_rows, audio_rows
 
