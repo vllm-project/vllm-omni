@@ -625,7 +625,6 @@ class StageDeployConfig:
     diffusion_kv_cache_dtype: str | None = None
     diffusion_kv_cache_skip_steps: str | None = None
     diffusion_kv_cache_skip_layers: str | None = None
-    auxiliary_text_encoder: str | None = None
 
     # Runtime optimizations used by diffusion loading/execution.
     hsdp_weight_load_strategy: str | None = None

@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import zmq
 from vllm.utils import network_utils
-from vllm.v1.engine.utils import EngineZmqAddresses
+from vllm.v1.engine.utils import EngineZmqBindAddresses
 
 from vllm_omni.engine import stage_engine_core_proc_manager, stage_engine_startup, stage_init_deadline
 
@@ -33,8 +33,8 @@ def fake_startup(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(network_utils, "get_open_zmq_ipc_path", lambda: f"ipc://unused-{next(paths)}")
     monkeypatch.setattr(
         stage_engine_startup,
-        "get_engine_zmq_addresses",
-        lambda _config: EngineZmqAddresses(inputs=["ipc://single-in"], outputs=["ipc://single-out"]),
+        "get_engine_zmq_bind_addresses",
+        lambda _config: EngineZmqBindAddresses(inputs=["ipc://single-in"], outputs=["ipc://single-out"]),
     )
     monkeypatch.setattr(
         stage_engine_startup, "scoped_spawn_device_env", lambda *_args, **_kwargs: contextlib.nullcontext()
