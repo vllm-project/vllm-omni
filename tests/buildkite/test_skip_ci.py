@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 
 from ci_conditions import (  # noqa: E402
     MERGE_MAIN_IF,
+    RELEASE_LINE_BUILDKITE_PATTERN,
     RELEASE_LINE_VERSION_PATTERN,
     is_release_line_branch,
     is_release_line_push,
@@ -421,7 +422,9 @@ def test_version_branch_push_requires_a_non_pr_build() -> None:
     assert not is_release_line_push("release/v0.30.0", "99")
     assert not is_release_line_push("feature", "false")
     assert "build.pull_request.id == null" in MERGE_MAIN_IF
-    assert MERGE_MAIN_IF.startswith('(build.branch == "main" || (build.branch =~ %r{')
+    assert RELEASE_LINE_BUILDKITE_PATTERN == r"/^release\/v[0-9]+\.[0-9]+\.[0-9]+$$/"
+    assert RELEASE_LINE_BUILDKITE_PATTERN in MERGE_MAIN_IF
+    assert "%r{" not in MERGE_MAIN_IF
 
 
 def test_release_line_version_pattern_is_shared() -> None:

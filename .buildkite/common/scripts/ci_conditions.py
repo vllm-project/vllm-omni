@@ -67,19 +67,35 @@ CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF
 RELEASE_LINE_VERSION_PATTERN = r"^release/v[0-9]+\.[0-9]+\.[0-9]+$"
 _RELEASE_LINE_VERSION_RE = re.compile(RELEASE_LINE_VERSION_PATTERN)
 
+
+def _buildkite_regex_literal(pattern: str) -> str:
+    """Turn an anchored pattern into a Buildkite ``/.../`` conditional regex.
+
+    The conditional lexer only starts a regex on ``/``. ``%r{}`` is illegal.
+    ``pipeline upload`` interpolates ``$``, so the end anchor is written ``$$``.
+    Slashes inside the pattern are escaped so they do not end the literal.
+    """
+    if len(pattern) < 2 or not pattern.startswith("^") or not pattern.endswith("$"):
+        raise ValueError(f"Buildkite regex must be anchored, got {pattern!r}")
+    body = pattern[1:-1].replace("/", r"\/")
+    return f"/^{body}$$/"
+
+
+# Buildkite-flavoured copy of RELEASE_LINE_VERSION_PATTERN. Do not embed the
+# Python pattern verbatim: its slash would end a ``/.../`` literal, and its
+# single ``$`` would be interpolated away at upload.
+RELEASE_LINE_BUILDKITE_PATTERN = _buildkite_regex_literal(RELEASE_LINE_VERSION_PATTERN)
+
 # Bootstrap Buildkite ``if`` expressions.
 # ``*_MAIN_IF``: release-line push + env schedule.
 # ``*_LABEL_IF``: PR label (and/or composed with MAIN).
 # ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
-# Ruby regex; built from RELEASE_LINE_VERSION_PATTERN. ``%r{}`` keeps the
-# slash in ``release/v`` from ending a ``/.../`` literal.
 #
 # ``build.branch`` on a pull request is the source branch. A PR opened from
 # ``release/vX.Y.Z`` (for example, merging the release line back to main) must
 # not take the direct-push gates. ``main`` stays name-only.
 _RELEASE_LINE_BRANCH_IF = (
-    f'(build.branch == "main" || (build.branch =~ %r{{{RELEASE_LINE_VERSION_PATTERN}}} '
-    "&& build.pull_request.id == null))"
+    f'(build.branch == "main" || (build.branch =~ {RELEASE_LINE_BUILDKITE_PATTERN} && build.pull_request.id == null))'
 )
 NIGHTLY_MAIN_IF = f'{_RELEASE_LINE_BRANCH_IF} && build.env("NIGHTLY") == "1"'
 NIGHTLY_LABEL_IF = (
