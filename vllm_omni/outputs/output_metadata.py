@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -124,6 +124,7 @@ def _validate_video_metadata(metadata: DiffusionMetadataMapping | None) -> None:
     _check_optional_positive_number(metadata, "fps", group="video")
     _check_optional_int(metadata, "video_fps_multiplier", group="video", min_value=1)
     _check_optional_shape(metadata, "shape", group="video")
+    _check_optional_shape(metadata, "frame_counts", group="video")
 
 
 def _validate_audio_metadata(metadata: DiffusionMetadataMapping | None) -> None:
