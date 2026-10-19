@@ -10,10 +10,10 @@ from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.linear import LinearBase
 
 import vllm_omni.quantization.int8_config as int8_config
-from vllm_omni.diffusion.layers.mot.mot_qkv_parallel_linear import (
+from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import (
     MoTQKVParallelLinear,
 )
-from vllm_omni.diffusion.layers.mot.mot_row_parallel_linear import (
+from vllm_omni.diffusion.models.bagel.mot.mot_row_parallel_linear import (
     MoTRowParallelLinear,
 )
 
