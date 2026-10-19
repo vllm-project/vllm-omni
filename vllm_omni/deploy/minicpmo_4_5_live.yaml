@@ -1,0 +1,13 @@
+# MiniCPM-o 4.5 on OpenAI Live (/v1/live/sessions). One resumable request per
+# session gets one streaming update per official 1 s audio unit; the model's
+# duplex grammar is enforced by the Live logits processor declared in the
+# pipeline. `session_mode: turn` keeps the /v1/realtime full-duplex stack off.
+base_config: minicpmo_4_5.yaml
+session_mode: turn
+
+live_session_config:
+  session_lifetime_s: 1800
+  # Each session keeps a streaming audio-encoder cache of up to ~150 MB on the
+  # Stage 0 GPU that vLLM's memory profiling does not count. Set a bound when
+  # the Stage 0 headroom is tight.
+  max_sessions: null

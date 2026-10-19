@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
+from vllm_omni.config.live_session import LiveSessionConfig, LiveSessionDeployConfig
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
@@ -457,6 +458,9 @@ class PipelineConfig:
     duplex_runtime_extension: str | None = None
     duplex_serving_adapter: str | None = None
     duplex_control_enabled: bool = False
+    # OpenAI Live (``/v1/live/sessions``) capabilities. Served only when the
+    # deploy config also carries a ``live_session_config`` object.
+    live_session_config: LiveSessionConfig | None = None
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
@@ -504,6 +508,11 @@ class PipelineConfig:
         # pipeline without one can never emit a result, so every request hangs.
         if not any(s.final_output for s in self.stages):
             errors.append("No terminal stage (stage with final_output=True)")
+        if self.live_session_config is not None:
+            errors.extend(self.live_session_config.get_validation_errors())
+            for stage_id in self.live_session_config.logits_processor:
+                if stage_id not in stage_id_set:
+                    errors.append(f"live_session_config.logits_processor references non-existent stage {stage_id}")
         return errors
 
 
@@ -825,6 +834,8 @@ class DeployConfig:
     cuda_mps: bool = False
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
     speech_cache: SpeechCacheConfig = field(default_factory=SpeechCacheConfig)
+    # Enables /v1/live/sessions when present.
+    live_session_config: LiveSessionDeployConfig | None = None
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -1088,6 +1099,11 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
+        "live_session_config": (
+            LiveSessionDeployConfig.from_dict(raw_dict["live_session_config"])
+            if raw_dict.get("live_session_config") is not None
+            else None
+        ),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -1274,6 +1290,42 @@ def _select_processor_funcs(
     return input_proc, next_stage_proc
 
 
+def live_session_capacity(deploy: DeployConfig) -> int | None:
+    """Concurrent Live sessions a Live deployment bounds, if it does."""
+    live = deploy.live_session_config
+    return live.max_sessions if live is not None else None
+
+
+def streaming_session_capacity(deploy: DeployConfig) -> int:
+    """Capacity of model-owned per-session streaming state (codec rows)."""
+    if deploy.session_mode == "duplex":
+        return deploy.duplex_session.worker_max_sessions
+    return live_session_capacity(deploy) or 1
+
+
+def add_live_session_logits_processor(
+    engine_args: dict[str, Any],
+    stage_id: int,
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+) -> None:
+    """Fold the model's Live logits processor into the stage's engine args.
+
+    Only on Live deployments, so chat deployments of the same model keep their
+    sampling untouched.
+    """
+    live = pipeline.live_session_config
+    if deploy.live_session_config is None or live is None:
+        return
+    fqcn = live.logits_processor.get(stage_id)
+    if not fqcn:
+        return
+    processors = list(engine_args.get("logits_processors") or [])
+    if fqcn not in processors:
+        processors.append(fqcn)
+    engine_args["logits_processors"] = processors
+
+
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -1325,12 +1377,14 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
+    add_live_session_logits_processor(engine_args, ps.stage_id, pipeline, deploy)
     engine_args["async_chunk"] = resolve_stage_async_chunk(deploy, ds)
     engine_args["session_mode"] = deploy.session_mode
-    if deploy.session_mode == "duplex":
-        # Session placement caps model-owned state per replica. Legacy deploys
-        # retain the global admission limit as their worker capacity.
-        engine_args["duplex_max_sessions"] = deploy.duplex_session.worker_max_sessions
+    if deploy.session_mode == "duplex" or live_session_capacity(deploy) is not None:
+        # The engine admission limit is also the authoritative capacity for
+        # model-owned streaming state. Propagate it to every stage instead of
+        # making individual models duplicate the value in connector extras.
+        engine_args["duplex_max_sessions"] = streaming_session_capacity(deploy)
     # The runner selection is a deploy-topology decision owned by the
     # ``model_runner`` field; do not let an opaque ``engine_extras`` entry
     # silently veto or force it per stage.

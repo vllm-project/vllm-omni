@@ -49,6 +49,7 @@ from vllm_omni.model_executor.models.personaplex.configuration_personaplex impor
     PersonaPlexConfig,
     PersonaPlexDepformerConfig,
 )
+from vllm_omni.model_executor.models.personaplex.live.stage0 import LIVE_KEY, PersonaPlexLiveStage0
 from vllm_omni.model_executor.models.personaplex.modeling_helium import HeliumModel
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
     PersonaPlexDepformer,
@@ -210,6 +211,16 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             return model_outputs
         hidden = model_outputs
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
+        live = getattr(self, "_personaplex_live_stage0", None)
+        if live is not None and any(isinstance(info, dict) and LIVE_KEY in info for info in info_dicts):
+            # /v1/live/sessions: one entry per request in batch order, holding
+            # the codes of the frame this step's preprocess finished, if any.
+            empty = torch.empty((0, self.dep_q), dtype=torch.long, device=hidden.device)
+            per_request = []
+            for info in info_dicts:
+                codes = live.take_codes(info.get("request_id")) if isinstance(info, dict) else None
+                per_request.append(codes if codes is not None else empty)
+            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": per_request}})
         audio_codes_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
@@ -388,6 +399,10 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         else:
             is_prefill = span > 1
 
+        live = info_dict.get(LIVE_KEY)
+        if isinstance(live, dict) and is_prefill:
+            return self._live_stage0().preprocess(input_ids, live, info_dict)
+
         duplex = info_dict.get("duplex")
         if isinstance(duplex, dict) and duplex.get("data_plane") is True and is_prefill:
             prompt_len_raw = info_dict.get("duplex_prompt_len", span)
@@ -509,6 +524,17 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self._personaplex_duplex_stage0_runtime = runtime
         return runtime
 
+    def _live_stage0(self) -> PersonaPlexLiveStage0:
+        runtime = getattr(self, "_personaplex_live_stage0", None)
+        if runtime is None:
+            runtime = PersonaPlexLiveStage0(
+                self,
+                model_path=str(getattr(self.vllm_config.model_config, "model", "")),
+                max_sessions=int(getattr(self.vllm_config.model_config, "duplex_max_sessions", 1)),
+            )
+            self._personaplex_live_stage0 = runtime
+        return runtime
+
     def _stale_append_passthrough(
         self, input_ids: torch.Tensor, span: int
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
@@ -545,9 +571,14 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         del device
         appends: list[dict[str, Any]] = []
         live: list[tuple[int, str, dict[str, Any]]] = []
+        live_session_appends: list[tuple[str, dict[str, Any]]] = []
         for index, req_id in enumerate(req_ids):
             info = model_intermediate_buffer.get(req_id)
             if not isinstance(info, dict):
+                continue
+            live_session = info.get(LIVE_KEY)
+            if isinstance(live_session, dict):
+                live_session_appends.append((req_id, live_session))
                 continue
             duplex = info.get("duplex")
             if not isinstance(duplex, dict):
@@ -556,6 +587,8 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             if isinstance(duplex, dict) and duplex.get("data_plane") is True:
                 appends.append(duplex)
                 live.append((index, req_id, duplex))
+        if live_session_appends:
+            self._live_stage0().encode(live_session_appends)
         if not appends:
             return set()
         runtime = self._duplex_stage0_runtime()
@@ -593,6 +626,10 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         return {candidates[position][1] for position in handled}
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        live = getattr(self, "_personaplex_live_stage0", None)
+        if live is not None:
+            for request_id in finished_req_ids:
+                live.close(request_id)
         runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
         if runtime is None:
             return

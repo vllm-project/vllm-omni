@@ -183,6 +183,13 @@ REALTIME_VAD_INFERENCE_LATENCY_S = METRIC_PREFIX + "realtime_vad_inference_laten
 REALTIME_VAD_ENDPOINT_DELAY_S = METRIC_PREFIX + "realtime_vad_endpoint_delay_s"
 REALTIME_VAD_ERRORS = METRIC_PREFIX + "realtime_vad_errors"
 
+# OpenAI Live (/v1/live/sessions) serving metrics.
+LIVE_ACTIVE_SESSIONS = METRIC_PREFIX + "live_active_sessions"
+LIVE_REJECTED_SESSIONS = METRIC_PREFIX + "live_rejected_sessions"
+LIVE_AUDIO_SECONDS = METRIC_PREFIX + "live_audio_seconds"
+LIVE_CONTEXT_TRIMS = METRIC_PREFIX + "live_context_trims"
+LIVE_ERRORS = METRIC_PREFIX + "live_errors"
+
 
 # ============================================================================
 # Diffusion family (per-stage + per-replica diffusion timing breakdowns)

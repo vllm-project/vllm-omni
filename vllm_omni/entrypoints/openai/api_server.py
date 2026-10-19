@@ -146,6 +146,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _load_input_images,
     _update_if_not_none,
 )
+from vllm_omni.entrypoints.openai.live.serving import init_live_app_state, serve_live_session
 from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -917,6 +918,8 @@ async def omni_init_app_state(
     state.log_stats = not args.disable_log_stats
     state.args = args
     state.sleeping_stages = set()
+    state.live_session_config = None
+    state.live_session_deploy_config = None
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -1078,6 +1081,7 @@ async def omni_init_app_state(
         lora_modules=lora_modules,
     )
     await state.openai_serving_models.init_static_loras()
+    init_live_app_state(engine_client, state)
 
     _init_chat_services(
         engine_client,
@@ -1837,6 +1841,12 @@ async def realtime_websocket(websocket: WebSocket):
         return
 
     await realtime_handler.handle_websocket(websocket)
+
+
+@router.websocket("/v1/live/sessions")
+async def live_sessions_websocket(websocket: WebSocket):
+    """WebSocket endpoint for the OpenAI Live API (native full-duplex models)."""
+    await serve_live_session(websocket)
 
 
 @router.websocket("/v1/duplex")

@@ -3775,6 +3775,11 @@ class MiniCPMOMultiModalDataParser(MultiModalDataParser):
         return super()._parse_audio_data(data)
 
 
+# Request-level mm_processor_kwargs consumed by this processor, never
+# forwarded to the HF processor.
+_REQUEST_ONLY_MM_KWARGS = frozenset({"use_tts", "live_duplex_unit"})
+
+
 class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45OmniLLMProcessingInfo]):
     """Multimodal processor for MiniCPM-o thinker stage."""
 
@@ -3983,7 +3988,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             self,
             prompts,
             mm_data,
-            {key: value for key, value in mm_kwargs.items() if key != "use_tts"},
+            {key: value for key, value in mm_kwargs.items() if key not in _REQUEST_ONLY_MM_KWARGS},
             out_keys=out_keys,
         )
 
@@ -4057,6 +4062,9 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         ]
 
         audio_placeholder = self.info.audio_pattern
+        # OpenAI Live duplex units carry bare audio embeddings after <unit>,
+        # without the chat format's <|audio_start|>/<|audio_end|> markers.
+        live_duplex_unit = bool(hf_processor_mm_kwargs.get("live_duplex_unit", False))
 
         def get_audio_replacement(item_idx: int):
             audios = mm_items.get_items("audio", (MiniCPMOAudioEmbeddingItems, AudioProcessorItems))
@@ -4068,7 +4076,10 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             else:
                 audio_len = audios.get_audio_length(item_idx)
 
-            return _select_unk_positions(self.get_audio_prompt_texts(audio_len))
+            text = self.get_audio_prompt_texts(audio_len)
+            if live_duplex_unit:
+                text = text.replace("<|audio_start|>", "").replace("<|audio_end|>", "")
+            return _select_unk_positions(text)
 
         return [
             *base_updates,

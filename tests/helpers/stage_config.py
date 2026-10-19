@@ -250,6 +250,23 @@ def modify_stage_config(
     return str(output_path)
 
 
+def write_deploy_overlay(base_path: str, overlay: dict[str, Any]) -> str:
+    """Write a deploy overlay inheriting ``base_path`` and return its path.
+
+    For deploy YAMLs that are themselves overlays (``modify_stage_config`` only
+    updates stages the file already lists, and its temp copy would break a
+    relative ``base_config``). Stage entries merge by ``stage_id``.
+    """
+    path = Path(base_path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"yaml does not exist: {path}")
+    output_fd, output_path = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+    atexit.register(Path(output_path).unlink, missing_ok=True)
+    with os.fdopen(output_fd, "w", encoding="utf-8") as f:
+        yaml.dump({"base_config": str(path), **overlay}, f, default_flow_style=None, sort_keys=False)
+    return str(output_path)
+
+
 # ``stage_config.py`` lives under ``tests/helpers/``; repo root is three parents up.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEPLOY_DIR = _REPO_ROOT / "vllm_omni" / "deploy"

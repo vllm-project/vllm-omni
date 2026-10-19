@@ -51,6 +51,7 @@ from vllm_omni.config.stage_config import (
     _resolve_scheduler,
     _scheduler_path,
     _select_processor_funcs,
+    add_live_session_logits_processor,
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -59,6 +60,7 @@ from vllm_omni.config.stage_config import (
     reconcile_diffusion_attention_overrides,
     resolve_stage_async_chunk,
     resolve_stage_model_runner,
+    streaming_session_capacity,
     update_deploy_config_async_chunk_enabled,
     validate_native_mrv2_session,
 )
@@ -1570,8 +1572,13 @@ def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
     topology: StagePipelineConfig,
     stage_cli_overrides: Mapping[str, Any] | None = None,
+    *,
+    pipeline: PipelineConfig | None = None,
+    deploy: DeployConfig | None = None,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
+    if pipeline is not None and deploy is not None:
+        add_live_session_logits_processor(engine, topology.stage_id, pipeline, deploy)
     # Preserve legacy ordering: topology-owned KV roles override deploy
     # extras, while an explicit CLI override remains highest priority.
     if topology.omni_kv_config:
@@ -1854,9 +1861,7 @@ def _build_common_stage_config_kwargs(
                 topology,
                 stage_deploy,
                 engine.model,
-                duplex_max_sessions=(
-                    deploy.duplex_session.worker_max_sessions if deploy.session_mode == "duplex" else 1
-                ),
+                duplex_max_sessions=streaming_session_capacity(deploy),
                 model=model,
             ),
             "load_config": _build_load_config(topology, engine.load),
@@ -2408,6 +2413,8 @@ class VllmOmniConfig:
                         cli_overrides,
                         execution_type=topology.execution_type,
                     ),
+                    pipeline=pipeline_cfg,
+                    deploy=deploy,
                 ),
                 model=model,
             )
