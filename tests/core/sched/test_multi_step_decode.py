@@ -493,3 +493,53 @@ def test_reconcile_handles_empty_report():
     # (prompt + L - 1 = 104); the reserved slots stay allocated as
     # look-ahead and the next schedule re-plans a normal single step.
     assert request.num_computed_tokens == 104
+
+def test_plan_window_fences_the_request_until_reconciled():
+    """A second window must not stack on a window that is still in flight."""
+    requests = [make_request("r0")]
+    scheduler = make_scheduler(requests)
+    assert plan_multi_step_window(scheduler, make_scheduler_output(requests), 8) is True
+    assert msd.multi_step_outstanding_windows(scheduler) == {"r0": 8}
+    # Unreconciled: the follow-up schedule must stay a plain single-token step.
+    assert plan_multi_step_window(scheduler, make_scheduler_output(requests), 8) is False
+    # Settling the window (full report or shortfall rollback) releases the fence.
+    reconcile_window_shortfall(requests[0], 8, 8)
+    msd.clear_outstanding_window(scheduler, "r0")
+    assert msd.multi_step_outstanding_windows(scheduler) == {}
+    assert plan_multi_step_window(scheduler, make_scheduler_output(requests), 8) is True
+
+
+def test_deferral_holds_fenced_requests_out_of_the_next_schedule():
+    """A fenced request must not be placed K tokens ahead of its window.
+
+    This is what makes a runner refusal recoverable: with the request held out
+    of the pass, no follow-up schedule exists that could start at the window's
+    optimistic position while only one token is actually written.
+    """
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    scheduler = SimpleNamespace(policy=SchedulingPolicy.FCFS)
+    scheduler.running = create_request_queue(scheduler.policy)
+    for rid in ("r0", "r1"):
+        scheduler.running.add_request(make_request(rid))
+    msd.mark_window_outstanding(scheduler, "r0", 8)
+
+    original_running = OmniARScheduler._defer_outstanding_window_requests(scheduler)
+    assert original_running is not None
+    # Only the fenced request is held back; the plain decode still runs.
+    assert [r.request_id for r in scheduler.running] == ["r1"]
+    # The caller restores the queue once the pass is done.
+    scheduler.running = original_running
+    assert [r.request_id for r in scheduler.running] == ["r0", "r1"]
+
+
+def test_deferral_is_a_noop_without_outstanding_windows():
+    from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    scheduler = SimpleNamespace(policy=SchedulingPolicy.FCFS)
+    scheduler.running = create_request_queue(scheduler.policy)
+    scheduler.running.add_request(make_request("r0"))
+    assert OmniARScheduler._defer_outstanding_window_requests(scheduler) is None
+    assert [r.request_id for r in scheduler.running] == ["r0"]

@@ -144,13 +144,48 @@ def model_supports_multi_step(model_config: Any) -> bool:
     return False
 
 
+# Windows that have been planned but not yet reconciled against the runner's
+# report, keyed by request id (value: the planned K).  Async scheduling runs a
+# batch queue (``max_concurrent_batches == 2`` whenever ``async_scheduling`` is
+# on with PP == 1), so the next scheduler pass is built before this window's
+# output lands.  A request left schedulable in that state would get a follow-up
+# step positioned K tokens ahead of what the window may actually confirm, and on
+# a runner refusal (only one token written) the un-written slots behind it would
+# stay holes: ``reconcile_window_shortfall`` repairs the counters, not an
+# already-emitted schedule.  ``OmniARScheduler`` therefore holds such requests
+# out of the next schedule until their window is reconciled.
+_OUTSTANDING_WINDOWS_ATTR = "_multi_step_outstanding_windows"
+
+
+def multi_step_outstanding_windows(scheduler: Any) -> dict[str, int]:
+    """Planned-but-unreconciled windows on ``scheduler``: req_id -> planned K."""
+    outstanding = getattr(scheduler, _OUTSTANDING_WINDOWS_ATTR, None)
+    if outstanding is None:
+        outstanding = {}
+        setattr(scheduler, _OUTSTANDING_WINDOWS_ATTR, outstanding)
+    return outstanding
+
+
+def mark_window_outstanding(scheduler: Any, req_id: str, window_k: int) -> None:
+    """Fence ``req_id`` until its window has been reconciled."""
+    multi_step_outstanding_windows(scheduler)[req_id] = window_k
+
+
+def clear_outstanding_window(scheduler: Any, req_id: str) -> None:
+    """Release the fence once the window's tokens have been accounted for."""
+    outstanding = getattr(scheduler, _OUTSTANDING_WINDOWS_ATTR, None)
+    if outstanding is not None:
+        outstanding.pop(req_id, None)
+
+
 def scheduler_allows_multi_step(scheduler: Any) -> bool:
     """Static configuration gate evaluated once per ``schedule()`` call.
 
     Only single-rank (TP/PP/DP/PCP/DCP == 1), spec-decode-free, LoRA-free
-    AR stages on async scheduling are eligible.  Anything the runner cannot
-    reproduce bit-identically (KV-transfer criteria, routed experts,
-    encoder-decoder, mamba-aligned caches) is refused here.
+    AR stages are eligible.  Anything the runner cannot reproduce
+    bit-identically (KV-transfer criteria, routed experts, encoder-decoder,
+    mamba-aligned caches) is refused here.  Both async and sync scheduling
+    qualify: sync keeps a single window in flight and measures the larger gain.
     """
     vllm_config = getattr(scheduler, "vllm_config", None)
     if vllm_config is None:
@@ -303,6 +338,16 @@ def plan_multi_step_window(scheduler: Any, scheduler_output: Any, steps: int) ->
     if not windowed:
         return False
 
+    # One window in flight per request.  A request whose previous window has not
+    # been reconciled is fenced (see ``_OUTSTANDING_WINDOWS_ATTR``); planning a
+    # second window on top of it would also let the two reservations walk past
+    # the context limit the base scheduler just clamped, because the budget only
+    # sees the confirmed tokens.
+    outstanding = multi_step_outstanding_windows(scheduler)
+    if any(req_id in outstanding for req_id, _ in windowed):
+        logger.debug("Multi-step window refused: a window is already in flight")
+        return False
+
     max_model_len = scheduler.max_model_len
     window_k = steps
     for _, request in windowed:
@@ -368,6 +413,7 @@ def plan_multi_step_window(scheduler: Any, scheduler_output: Any, steps: int) ->
         request.num_in_flight_tokens += extra
         scheduler_output.num_scheduled_tokens[req_id] = window_k
         scheduler_output.multi_step_plan[req_id] = window_k
+        mark_window_outstanding(scheduler, req_id, window_k)
     scheduler_output.total_num_scheduled_tokens += extra * len(windowed)
     logger.debug(
         "Multi-step window scheduled: K=%d requests=%d", window_k, len(windowed)

@@ -510,6 +510,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # shrink_refused_multi_step_window); the scheduler-side reconcile
         # absorbs the reservation shortfall.
         shrink_refused_multi_step_window(scheduler_output)
+        # A pass that ends up scheduling nothing (every request fenced behind an
+        # unreconciled window) needs no special case here: the existing
+        # `num_scheduled_tokens <= 0` guard further down already returns an empty
+        # output before the input-prep path's `assert total_num_scheduled_tokens >
+        # 0` (#5196) is reached -- and it still runs _update_states and
+        # on_requests_finished first, which an early return here would skip.
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens

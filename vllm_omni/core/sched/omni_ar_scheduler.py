@@ -20,6 +20,8 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.multi_step_decode import (
+    clear_outstanding_window,
+    multi_step_outstanding_windows,
     plan_multi_step_window,
     reconcile_window_shortfall,
     resolve_multi_step_steps,
@@ -129,6 +131,34 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _should_defer_waiting_admission(self) -> bool:
         return False
 
+    def _defer_outstanding_window_requests(self):
+        """Hold back requests whose multi-step window is not yet reconciled.
+
+        Async scheduling runs a batch queue (``max_concurrent_batches == 2``
+        when ``async_scheduling`` is on with PP == 1), so this pass is built
+        before the previous window's output lands.  Scheduling such a request
+        again would place its follow-up step K tokens ahead of what the window
+        may actually confirm; on a runner refusal (one token written) the slots
+        in between would stay unwritten, and ``reconcile_window_shortfall``
+        repairs the counters, not an already-emitted schedule.  Holding the
+        request out of the schedule until its window is accounted for makes a
+        refusal fully recoverable.
+
+        Returns the original running queue when something was held back, so the
+        caller can restore it; ``None`` when nothing changed.
+        """
+        outstanding = multi_step_outstanding_windows(self)
+        if not outstanding:
+            return None
+        if not any(r.request_id in outstanding for r in self.running):
+            return None
+        original_running = self.running
+        self.running = create_request_queue(self.policy)
+        for request in original_running:
+            if request.request_id not in outstanding:
+                self.running.add_request(request)
+        return original_running
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -223,9 +253,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             original_waiting = self.waiting
             self.waiting = create_request_queue(self.policy)
 
+        deferred_running = self._defer_outstanding_window_requests()
+
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            if deferred_running is not None:
+                self.running = deferred_running
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:
@@ -436,6 +470,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             planned_steps = multi_step_plan.get(req_id)
             if planned_steps is not None:
                 reconcile_window_shortfall(request, planned_steps, len(new_token_ids))
+                # The window is settled (fully reported or rolled back), so the
+                # request no longer needs to be held out of scheduling.
+                clear_outstanding_window(self, req_id)
 
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
