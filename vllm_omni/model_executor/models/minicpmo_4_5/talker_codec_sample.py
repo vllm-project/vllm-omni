@@ -35,10 +35,13 @@ VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
 
 # Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
-# 200-case bit-exact verification). If the kernel fails to compile or launch at
-# runtime, _FUSED_PRELUDE_OK latches to False and the eager chain takes over for
-# the rest of the process; there is no environment switch to manage.
+# 200-case bit-exact verification). Two independent controls:
+#   - ``codec_sampling_params.fused_prelude: false`` in the stage config forces
+#     the eager chain (accuracy triage, e.g. after a CANN/torch_npu upgrade).
+#   - ``_FUSED_PRELUDE_OK`` is a process-wide, permanent latch: one failed
+#     compile or launch turns it off and every later step takes the eager chain.
 _FUSED_PRELUDE_OK = True
+_FUSED_PRELUDE_WARMED = False
 _PRELUDE_BLOCK = 1024
 
 try:  # Triton is NPU-only; other backends keep the eager prologue.
@@ -285,11 +288,42 @@ def _rep_pen_temp_fused(
             block_size=_PRELUDE_BLOCK,
             num_warps=4,
         )
-    except Exception as exc:  # compile/launch failure: latch to the eager chain
+    except Exception as exc:
+        # Compile or launch failure. The latch is process-wide and permanent: every
+        # later step in this process takes the eager chain. Failures inside an
+        # already captured graph replay never reach this handler.
         _FUSED_PRELUDE_OK = False
         logger.warning("fused talker codec prelude disabled after a kernel failure: %s", exc)
         return None
     return out.reshape(logits.shape)
+
+
+def warmup_fused_prelude(device: torch.device) -> None:
+    """Compile the fused kernel once, before any graph capture.
+
+    The first launch pays the Triton compile; running it here settles
+    ``_FUSED_PRELUDE_OK`` outside capture, so a compile failure downgrades the
+    process instead of poisoning a capture that just saw a failed launch.
+    Idempotent, and a no-op off NPU or without Triton.
+    """
+    global _FUSED_PRELUDE_WARMED
+    if _FUSED_PRELUDE_WARMED or not _HAS_TRITON or device.type != "npu":
+        return
+    _FUSED_PRELUDE_WARMED = True
+    state = TalkerCodecDeviceState(
+        history=torch.zeros(HISTORY_WINDOW, dtype=torch.long, device=device),
+        history_len=torch.zeros(1, dtype=torch.int32, device=device),
+        step=torch.zeros(1, dtype=torch.int32, device=device),
+        max_tokens=torch.ones(1, dtype=torch.int32, device=device),
+        finished=torch.zeros(1, dtype=torch.bool, device=device),
+    )
+    logits = torch.zeros(1, VOCAB_SIZE, device=device)
+    _rep_pen_temp_fused(
+        logits,
+        state,
+        torch.ones(1, device=device),
+        torch.ones(1, device=device),
+    )
 
 
 def prepare_codec_logits(
@@ -307,6 +341,7 @@ def prepare_codec_logits(
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
     eos_window_masked: bool = False,
+    fused_prelude: bool = True,
 ) -> torch.Tensor:
     """Prepare and filter logits without changing native NPU RNG semantics.
 
@@ -314,7 +349,9 @@ def prepare_codec_logits(
     which runs after temperature and before top-k/top-p (``builtin.py:102-113``).
     ``min_tokens_stop_ids`` widens the censored stop set beyond the codec EOS;
     ``frequency_penalty``/``presence_penalty`` subtract the whole-stream counts.
-    Every one of them is a no-op at its default value.
+    ``fused_prelude=False`` (stage config ``codec_sampling_params.fused_prelude``)
+    forces the eager chain for accuracy triage. Every one of them is a no-op at
+    its default value.
     """
     stop_ids = _stop_id_tuple(eos_token_id, min_tokens_stop_ids)
     logits = raw_logits.float()
@@ -332,7 +369,7 @@ def prepare_codec_logits(
     # penalty requests fall back to the eager chain below).
     fused = (
         _rep_pen_temp_fused(logits, state, repetition_penalty, temperature)
-        if (_FUSED_PRELUDE_OK and not frequency_penalty and not presence_penalty)
+        if (fused_prelude and _FUSED_PRELUDE_OK and not frequency_penalty and not presence_penalty)
         else None
     )
     if fused is not None:

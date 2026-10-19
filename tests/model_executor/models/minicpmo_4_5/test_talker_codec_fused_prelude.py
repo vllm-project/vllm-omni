@@ -167,3 +167,82 @@ def test_fused_prelude_bit_exact_under_graph_capture_and_replay():
     graph.replay()
     torch.npu.synchronize()
     assert torch.equal(static_out, _eager(raw_b))
+
+
+class _BoomKernel:
+    """Stand-in for the jitted kernel whose compile/launch always fails."""
+
+    def __getitem__(self, grid):
+        def _launch(*args, **kwargs):
+            raise RuntimeError("simulated Triton compile failure")
+
+        return _launch
+
+
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_prelude_config_switch_forces_eager():
+    """``fused_prelude=False`` must produce exactly the eager chain output."""
+    device = _device()
+    state = _make_state([11, 22, 33, 44])
+    raw = torch.randn(1, tcs.VOCAB_SIZE, device=device)
+    raw[:, 0] = 0.0
+    common = dict(
+        state=state,
+        min_tokens=torch.tensor([0], dtype=torch.int32, device=device),
+        temperature=torch.tensor([0.9], dtype=torch.float32, device=device),
+        repetition_penalty=torch.tensor([1.2], dtype=torch.float32, device=device),
+        eos_token_id=0,
+        top_k=0,
+        top_p=1.0,
+        min_p=0.0,
+    )
+    original = tcs._FUSED_PRELUDE_OK
+    try:
+        tcs._FUSED_PRELUDE_OK = False
+        eager = tcs.prepare_codec_logits(raw.clone(), **common)
+        tcs._FUSED_PRELUDE_OK = True
+        switched = tcs.prepare_codec_logits(raw.clone(), fused_prelude=False, **common)
+        fused = tcs.prepare_codec_logits(raw.clone(), **common)
+    finally:
+        tcs._FUSED_PRELUDE_OK = original
+    assert torch.equal(switched, eager)
+    assert torch.equal(fused, eager)
+
+
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_prelude_latches_off_after_kernel_failure(monkeypatch):
+    """A failing kernel returns None, latches off and leaves the eager path intact."""
+    device = _device()
+    state = _make_state([5, 6, 7])
+    raw = torch.randn(1, tcs.VOCAB_SIZE, device=device)
+    raw[:, 0] = 0.0
+    rep = torch.tensor([1.1], dtype=torch.float32, device=device)
+    temp = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+    monkeypatch.setattr(tcs, "_FUSED_PRELUDE_OK", True)
+    monkeypatch.setattr(tcs, "_rep_pen_temp_kernel", _BoomKernel())
+    assert tcs._rep_pen_temp_fused(raw.clone(), state, rep, temp) is None
+    assert tcs._FUSED_PRELUDE_OK is False
+
+    out = tcs.prepare_codec_logits(
+        raw.clone(),
+        state=state,
+        min_tokens=torch.tensor([0], dtype=torch.int32, device=device),
+        temperature=temp,
+        repetition_penalty=rep,
+        eos_token_id=0,
+        top_k=0,
+        top_p=1.0,
+        min_p=0.0,
+    )
+    assert out.shape == raw.shape
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_warmup_fused_prelude_is_idempotent(monkeypatch):
+    """Warmup compiles once; a second call is a no-op."""
+    monkeypatch.setattr(tcs, "_FUSED_PRELUDE_WARMED", False)
+    tcs.warmup_fused_prelude(_device())
+    assert tcs._FUSED_PRELUDE_WARMED is True
+    tcs.warmup_fused_prelude(_device())

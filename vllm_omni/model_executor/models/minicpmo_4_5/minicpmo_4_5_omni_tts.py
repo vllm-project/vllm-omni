@@ -46,6 +46,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     greedy_codec_sample,
     make_device_state,
     prepare_codec_logits,
+    warmup_fused_prelude,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     VOCAB_SIZE as _CODEC_VOCAB_SIZE,
@@ -87,6 +88,7 @@ _CODEC_SAMPLING_SOURCES: tuple[tuple[str, str, Any, Any], ...] = (
     ("repetition_penalty", "repetition_penalty", _CODEC_REPETITION_PENALTY, float),
     ("min_tokens", "min_new_tokens", _CODEC_MIN_TOKENS, int),
     ("max_tokens", "max_new_tokens", _CODEC_MAX_TOKENS, int),
+    ("fused_prelude", "fused_prelude", True, bool),
 )
 
 
@@ -657,9 +659,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._codec_repetition_penalty = resolved["repetition_penalty"]
             self._codec_min_tokens = resolved["min_tokens"]
             self._codec_max_tokens = resolved["max_tokens"]
+            self._codec_fused_prelude = resolved["fused_prelude"]
         else:
             self._tts_config = None
             self._codec_eos_id = 0
+            self._codec_fused_prelude = True
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
         # >= 2 engages the loop -- the scheduler hands each request K query
@@ -1937,6 +1941,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 ),
             )
             device_inputs_by_request[request_id] = device_inputs
+        # Compile the codec prelude kernel before this request decodes, so a
+        # compile failure latches the eager chain outside any graph capture.
+        warmup_fused_prelude(hidden_state.device)
         return device_state, device_inputs, device_states
 
     def _sample_audio_code(
@@ -1977,6 +1984,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             frequency_penalty=_codec_float_param(request_state, "codec_frequency_penalty", 0.0),
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             eos_window_masked=eos_window_masked,
+            fused_prelude=self._codec_fused_prelude,
         )
         probabilities = torch.softmax(logits, dim=-1)
         sampled = torch.multinomial(
