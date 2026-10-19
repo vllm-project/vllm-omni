@@ -38,6 +38,7 @@ def _run_bootstrap(
     branch: str | None = None,
     git_verify_status: int = 0,
     git_fetch_status: int = 0,
+    git_merge_base: str = "",
     keep_suites: bool = False,
     vllm_use_precompiled: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -74,6 +75,7 @@ def _run_bootstrap(
         "TEST_GIT_LOG": str(tmp_path / "git-calls.txt"),
         "TEST_GIT_VERIFY_STATUS": str(git_verify_status),
         "TEST_GIT_FETCH_STATUS": str(git_fetch_status),
+        "TEST_GIT_MERGE_BASE": git_merge_base,
         "TEST_SKIP_CI_STATUS": "1" if keep_suites else "0",
     }
     if debug_test_yaml is not None:
@@ -111,11 +113,17 @@ git() {
                 return "${TEST_GIT_FETCH_STATUS:-0}"
             fi
             ;;
+        merge-base)
+            printf '%s\n' "${TEST_GIT_MERGE_BASE:-}"
+            ;;
     esac
     return 0
 }
 python3() { "$TEST_PYTHON" "$@"; }
-minijinja-cli() { printf 'steps: []\n'; }
+minijinja-cli() {
+    printf 'minijinja-cli %s\n' "$*" >&2
+    printf 'steps: []\n'
+}
 buildkite-agent() {
     printf 'buildkite-agent %s\n' "$*" >&2
     return 0
@@ -305,10 +313,21 @@ def test_version_branch_reads_parent_from_commit_header(tmp_path):
 
 
 def test_feature_branch_trusted_commit_uses_merge_base(tmp_path):
-    result = _run_bootstrap(tmp_path, pull_request=True, branch="feature")
+    merge_base = "7" * 40
+    result = _run_bootstrap(
+        tmp_path,
+        pull_request=True,
+        branch="feature",
+        git_merge_base=merge_base,
+        keep_suites=True,
+    )
 
     assert result.returncode == 0, result.stderr
-    assert "cat-file -p HEAD" not in _git_calls(tmp_path)
+    calls = _git_calls(tmp_path)
+    assert calls.count("merge-base origin/main HEAD") == 1
+    assert "cat-file -p HEAD" not in calls
+    assert f"vllm_aiter_mha_trusted_commit={merge_base}" in result.stderr
+    assert "buildkite-agent pipeline upload pipeline.yaml" in result.stderr
 
 
 def test_version_branch_does_not_lookup_labels(tmp_path):
