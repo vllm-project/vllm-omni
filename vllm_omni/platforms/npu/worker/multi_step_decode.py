@@ -305,18 +305,37 @@ def _build_window_meta_copies(
         return None
 
 
+def window_cos_sin_positions(
+    base_positions: Any, num_reqs: int, window_k: int
+) -> list[int]:
+    """Rotary positions for one window, in the order the replay loop consumes them.
+
+    Step-major, not request-major: the loop copies the prebuilt block for step
+    ``j`` (slots ``j*num_reqs .. (j+1)*num_reqs-1``) into the rows ``0..num_reqs-1``
+    that the captured graph reads, so slot ``j*num_reqs + i`` must hold request
+    ``i``'s position at step ``j``.  A request-major flatten would hand request
+    ``i > 0`` the wrong positions from step 0 on and corrupt the rotary phase of
+    every batched window (``num_reqs > 1``); the two orders coincide only in the
+    single-request case.
+    """
+    return [
+        int(base_positions[i]) + j for j in range(window_k) for i in range(num_reqs)
+    ]
+
+
 def _prebuild_window_cos_sin(
     runner: Any, comp_cpu: Any, num_reqs: int, window_k: int
 ) -> bool:
     """Fill the rotary cos/sin rows for all K window steps in one call.
 
-    The per-step positions are ``comp_cpu[i] + j`` (request i, step j), so the
+    The per-step positions are ``comp_cpu[i] + j`` (request i, step j); the
     whole window's rotary rows are a single ``update_cos_sin`` over
     ``K * num_reqs`` positions instead of K per-step calls (each an
     index_select + repeat + chunk over the cos/sin cache).  The captured decode
     graph reads rows ``0..num_reqs-1``; per step the loop copies the prebuilt
-    block ``j*num_reqs..(j+1)*num_reqs`` into those rows (a plain device
-    copy).  Returns False on any failure -- the caller keeps calling
+    block ``j*num_reqs..(j+1)*num_reqs`` into those rows (a plain device copy),
+    so the flatten must be step-major (see ``window_cos_sin_positions``).
+    Returns False on any failure -- the caller keeps calling
     ``update_cos_sin`` per step, so this is a pure optimization (never a
     correctness dependency).
     """
@@ -330,7 +349,7 @@ def _prebuild_window_cos_sin(
         if window_k * num_reqs > int(cos.shape[1]):
             return False
         all_pos = torch.tensor(
-            [int(comp_cpu[i]) + j for i in range(num_reqs) for j in range(window_k)],
+            window_cos_sin_positions(comp_cpu, num_reqs, window_k),
             dtype=torch.long,
             device=runner.device,
         )

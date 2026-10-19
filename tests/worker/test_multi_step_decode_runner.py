@@ -278,3 +278,22 @@ def test_validate_returns_none_on_internal_error():
 
     runner = ExplodingRunner()
     assert validate_multi_step_plan(runner, make_scheduler_output(["r0"])) is None
+
+def test_window_cos_sin_positions_are_step_major():
+    """Slot ``j*num_reqs + i`` must be request i's position at step j.
+
+    The replay loop copies the prebuilt block for step j into the rows the
+    captured graph reads, so a request-major flatten would give every request
+    but the first another request's rotary phase from step 0 onwards.
+    """
+    positions = msd_module.window_cos_sin_positions([100, 200], 2, 3)
+    assert positions == [100, 200, 101, 201, 102, 202]
+    num_reqs = 2
+    for step in range(3):  # each per-step slice is one step across requests
+        block = positions[step * num_reqs : (step + 1) * num_reqs]
+        assert block == [100 + step, 200 + step]
+
+
+def test_window_cos_sin_positions_single_request_matches_per_step_updates():
+    """``num_reqs == 1`` collapses both orders, which is why c1 was unaffected."""
+    assert msd_module.window_cos_sin_positions([7], 1, 4) == [7, 8, 9, 10]
