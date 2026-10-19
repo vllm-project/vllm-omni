@@ -287,9 +287,7 @@ def _rep_pen_temp_fused(
         )
     except Exception as exc:  # compile/launch failure: latch to the eager chain
         _FUSED_PRELUDE_OK = False
-        logger.warning(
-            "fused talker codec prelude disabled after a kernel failure: %s", exc
-        )
+        logger.warning("fused talker codec prelude disabled after a kernel failure: %s", exc)
         return None
     return out.reshape(logits.shape)
 
