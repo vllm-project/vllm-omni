@@ -55,6 +55,7 @@ from vllm_omni.diffusion.offloader.offload_plan import (
 )
 from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent, resolve_offload_plan
 from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.host_weight_runtime import MappedHostRegion
 from vllm_omni.platforms import current_omni_platform
 
@@ -2865,6 +2866,34 @@ class TestDistributedComponentSelection:
 
         with pytest.raises(RuntimeError, match="recreate the backend and reload the pipeline"):
             backend.enable(nn.Module())
+
+    def test_worker_shutdown_skips_allgather_restore(self, patched_offload_runtime, mocker):
+        # Restoring AllGather blocks rebuilds the full DiT on every rank's host,
+        # which outlived the executor's shutdown grace period (issue 8081).
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"dit", "text_encoder"}),
+                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+            ),
+            torch.device("cpu"),
+        )
+        allgather_hook = Mock(dp_size=2, next_block=nn.Linear(1, 1))
+        rank_local_hook = Mock(dp_size=1, next_block=nn.Linear(1, 1))
+        backend._all_hook_groups = [[allgather_hook], [rank_local_hook]]
+        backend.enabled = True
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        worker.model_runner = SimpleNamespace(offload_backend=backend, kv_transfer_manager=None)
+
+        worker.shutdown()
+
+        allgather_hook.restore_next_block_to_cpu.assert_not_called()
+        rank_local_hook.restore_next_block_to_cpu.assert_called_once_with()
+        assert not backend.enabled
+        assert not backend._all_hook_groups
 
     def test_disable_runs_collectives_before_best_effort_local_cleanup(
         self,

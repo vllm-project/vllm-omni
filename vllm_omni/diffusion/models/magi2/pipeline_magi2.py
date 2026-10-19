@@ -44,6 +44,12 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan, PinnedModuleStager
+from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
+    OffloadStrategy,
+    offload_streams_blocks,
+    resolve_offload,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -298,18 +304,17 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         raise ValueError(f"MAGI-2 tensor_parallel_size={tp_size} does not divide: " + ", ".join(invalid_tp_dimensions))
 
     configured_world_size = dp_size * cfg_size * tp_size * sp_size
-    cpu_offload = bool(od_config.enable_cpu_offload)
-    layerwise_offload = bool(od_config.enable_layerwise_offload)
-    distributed_offload = bool(od_config.enable_distributed_layerwise_offload)
-    if cpu_offload and not layerwise_offload:
+    resolved_offload = resolve_offload(od_config)
+    strategy = resolved_offload.strategy
+    layerwise_offload = strategy is OffloadStrategy.LAYER_WISE
+    distributed_offload = strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+    if strategy is OffloadStrategy.MODEL_LEVEL:
         raise ValueError(
             "MAGI-2 already stages its auxiliary components from CPU, while "
             "the complete Preview transformer cannot fit on one qualified GPU. "
-            "Combine --enable-cpu-offload with --enable-layerwise-offload, or "
-            "use --enable-layerwise-offload alone."
+            "Use layer offload instead: diffusion_offload_config={'mode': 'layer', "
+            "'components': ['dit']}, or the legacy --enable-layerwise-offload."
         )
-    if layerwise_offload and distributed_offload:
-        raise ValueError("MAGI-2 ordinary and distributed layerwise offload are mutually exclusive")
     if layerwise_offload and configured_world_size != 1:
         raise ValueError(
             "MAGI-2 ordinary layerwise offload is a single-worker path; "
@@ -330,7 +335,6 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
             f"expected vae_patch_parallel_size=1 or {configured_world_size}, got {vae_pp_size}."
         )
 
-    dlo_allgather = bool(getattr(od_config, "dlo_use_allgather", True))
     if cfg_size > 1 and dp_size > 1:
         raise ValueError("MAGI-2 CFG parallelism is not yet combined with DLO data parallelism")
     if distributed_offload and getattr(parallel, "use_hsdp", False):
@@ -339,7 +343,7 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         raise ValueError("MAGI-2 data parallelism currently requires distributed layerwise offload")
     if dp_size > 1 and tp_size > 1:
         raise ValueError("MAGI-2 DLO data-parallel replicas currently require tensor_parallel_size=1")
-    if distributed_offload and dlo_allgather:
+    if distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT):
         if dp_size <= 1:
             raise ValueError(
                 "MAGI-2 DLO AllGather requires data_parallel_size > 1. SP ranks "
@@ -546,12 +550,13 @@ class Magi2Pipeline(
         if not od_config.model:
             raise ValueError("MAGI-2 requires od_config.model")
         _validate_native_topology(od_config)
-        if not current_omni_platform.is_cuda() or not current_omni_platform.is_available():
-            raise RuntimeError("MAGI-2 Preview requires CUDA GPUs")
+        supported_gpu = current_omni_platform.is_cuda() or current_omni_platform.is_musa()
+        if not supported_gpu or not current_omni_platform.is_available():
+            raise RuntimeError("MAGI-2 Preview requires available CUDA or MUSA GPUs")
 
         self.od_config = od_config
         self.dtype = od_config.dtype or torch.bfloat16
-        self.device_str = f"cuda:{torch.accelerator.current_device_index()}"
+        self.device_str = f"{current_omni_platform.device_type}:{torch.accelerator.current_device_index()}"
         self.checkpoint_root = _resolve_checkpoint_root(
             str(od_config.model),
             od_config.revision,
@@ -574,9 +579,7 @@ class Magi2Pipeline(
         )
         self._is_output_rank = self._parallel_group.rank == 0
         self._offload_aux_after_use = True
-        self._transformer_is_layerwise_offloaded = bool(
-            od_config.enable_layerwise_offload or od_config.enable_distributed_layerwise_offload
-        )
+        self._transformer_is_layerwise_offloaded = offload_streams_blocks(od_config)
         self._transformer_is_hsdp = bool(getattr(od_config.parallel_config, "use_hsdp", False))
         self._distributed_video_decode = int(od_config.parallel_config.vae_patch_parallel_size) > 1
 
@@ -585,8 +588,10 @@ class Magi2Pipeline(
         from .modeling_magi2 import Magi2PreviewTransformer
 
         MAGI2_PREVIEW_CONFIG.validate()
-        mmap_dlo = bool(
-            od_config.enable_distributed_layerwise_offload and getattr(od_config, "dlo_use_allgather", True)
+        resolved_offload = resolve_offload(od_config)
+        mmap_dlo = (
+            resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            and resolved_offload.uses_allgather(DIT_COMPONENT)
         )
         if mmap_dlo:
             # AllGather DLO binds checkpoint tensors as mmap views and copies
@@ -1080,11 +1085,13 @@ class Magi2Pipeline(
         seed = _resolve_request_seed(sampling)
         _seed_request(seed)
 
-        has_cuda = current_omni_platform.is_cuda() and current_omni_platform.is_available()
-        device_index = torch.accelerator.current_device_index() if has_cuda else None
+        has_accelerator = (
+            current_omni_platform.is_cuda() or current_omni_platform.is_musa()
+        ) and current_omni_platform.is_available()
+        device_index = torch.accelerator.current_device_index() if has_accelerator else None
         # Sampling reserved memory is qualification instrumentation, not part
         # of ordinary serving. It starts only when the pipeline profiler is
-        # explicitly enabled, so every CUDA request avoids a 20 Hz thread.
+        # explicitly enabled, so ordinary GPU requests avoid a 20 Hz thread.
         monitor = (
             _PeakReservedMonitor(device_index)
             if device_index is not None and getattr(self, "enable_diffusion_pipeline_profiler", False)
@@ -1105,7 +1112,7 @@ class Magi2Pipeline(
                 height=height,
                 num_inference_steps=steps,
             )
-            if has_cuda:
+            if has_accelerator:
                 torch.accelerator.synchronize()
         finally:
             if monitor_started:
@@ -1116,7 +1123,7 @@ class Magi2Pipeline(
             video = _resize_video(video, output_width, output_height)
 
         peak_memory_mb = monitor.peak_bytes / 1024**2 if monitor is not None else 0.0
-        if has_cuda and dist.is_available() and dist.is_initialized() and self._parallel_group.world_size > 1:
+        if has_accelerator and dist.is_available() and dist.is_initialized() and self._parallel_group.world_size > 1:
             peak = torch.tensor(peak_memory_mb, device=self.device_str)
             dist.all_reduce(
                 peak,

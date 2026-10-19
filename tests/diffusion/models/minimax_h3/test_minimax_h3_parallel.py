@@ -297,6 +297,25 @@ def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest
     assert model.forward_calls == 2
 
 
+def test_reference_kv_config_rejects_vdn_hybrid_attention():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+
+    model = SimpleNamespace(
+        od_config=SimpleNamespace(kv_offload_config=None),
+        vdn_config=object(),
+    )
+    assert (
+        MiniMaxH3DiTModel.create_reference_kv_tier1_state(model, global_reference_rows=1, device=torch.device("cpu"))
+        is None
+    )
+
+    model.od_config.kv_offload_config = {"mode": "tier2"}
+    with pytest.raises(ValueError, match="does not support VDN-H3"):
+        MiniMaxH3DiTModel.create_reference_kv_tier1_state(model, global_reference_rows=1, device=torch.device("cpu"))
+
+
 def test_reference_kv_compact_prepends_cached_keys_without_sp():
     from types import SimpleNamespace
 

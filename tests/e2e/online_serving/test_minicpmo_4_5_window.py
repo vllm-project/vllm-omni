@@ -16,7 +16,7 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
 from tests.e2e.online_serving.helpers.minicpmo_window_e2e import run_window_turn
 from tests.helpers.mark import hardware_test
 
-pytestmark = [pytest.mark.omni, pytest.mark.advanced_model]
+pytestmark = [pytest.mark.omni]
 
 
 def _assert_complete(result, *, require_audio=False):
@@ -30,6 +30,7 @@ def _assert_complete(result, *, require_audio=False):
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode,reference", [("basic", False), ("context", False), ("context", True)])
 def test_window_rebuild_and_next_session(omni_server, mode, reference):
@@ -47,7 +48,8 @@ def test_window_rebuild_and_next_session(omni_server, mode, reference):
         _assert_complete(result, require_audio=reference)
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
+@pytest.mark.full_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode,camera", [("basic", False), ("context", False), ("context", True)])
 def test_window_continuous_input(omni_server, tmp_path, mode, camera):
@@ -71,6 +73,7 @@ def test_window_continuous_input(omni_server, tmp_path, mode, camera):
 
 
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 @pytest.mark.parametrize("mode", ["off", "basic", "context"])
 def test_window_buffered_flush(omni_server, mode):

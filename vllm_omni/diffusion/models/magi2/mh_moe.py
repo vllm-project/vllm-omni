@@ -25,21 +25,26 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from vllm_omni.platforms import current_omni_platform
 
+from .fused_moe_kernels import (
+    global_sort_routes,
+    invoke_fused_moe_bf16,
+    torch_mh_moe_forward,
+    triton_mh_moe_forward,
+)
 from .parallel import Magi2ParallelGroup, ep_dispatch, ep_undispatch, get_magi2_ep_group
 
+try:  # Triton's precise exp; ``tl.exp`` lowers to the 29-ULP ex2 approximation.
+    from triton.language.extra import libdevice as _tl_libdevice
+except ImportError:  # pragma: no cover - non-CUDA Triton builds
+    _tl_libdevice = None
+
+_HAS_PRECISE_EXP = _tl_libdevice is not None and hasattr(_tl_libdevice, "exp")
+
 RoutingScore = Literal["softmax", "sigmoid"]
+_BF16_MOE_CUDA_MIN_TOKENS = 4096
 
 
-def swiglu7_pair(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """Released clamped SwiGLU7 expert activation, evaluated in fp32."""
-
-    dtype = gate.dtype
-    gate = gate.float().clamp(max=7.0)
-    up = up.float().clamp(min=-7.0, max=7.0)
-    return (gate * torch.sigmoid(1.702 * gate) * (up + 1.0)).to(dtype)
-
-
-def compute_topk_probs_and_indices(
+def _reference_topk_probs_and_indices(
     router_logits: torch.Tensor,
     top_k: int,
     *,
@@ -48,16 +53,8 @@ def compute_topk_probs_and_indices(
     route_norm: bool = True,
     norm_eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route independently for every ``[head, token]`` pair.
+    """Unfused reference routing.  Also the oracle the fused path is tested against."""
 
-    The auxiliary-free bias affects expert selection but deliberately does not
-    affect the returned routing probability, matching the training recipe.
-    """
-
-    if router_logits.ndim != 3:
-        raise ValueError("router_logits must be [heads,tokens,experts]")
-    if not 0 < top_k <= router_logits.shape[-1]:
-        raise ValueError("top_k must be in [1, num_experts]")
     if score_func == "sigmoid":
         router_scores = torch.sigmoid(router_logits)
     elif score_func == "softmax":
@@ -77,302 +74,387 @@ def compute_topk_probs_and_indices(
     return topk_probs, topk_indices
 
 
-def global_sort_routes(
-    topk_probs: torch.Tensor,
-    topk_indices: torch.Tensor,
-    num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert per-head routes into a stable flattened-expert CSR layout."""
-
-    if topk_probs.shape != topk_indices.shape or topk_indices.ndim != 3:
-        raise ValueError("top-k probabilities and indices must have the same [H,S,K] shape")
-    heads, sequence, top_k = topk_indices.shape
-    device = topk_indices.device
-    head_offset = torch.arange(heads, device=device).view(heads, 1, 1) * num_experts
-    flattened_experts = (topk_indices + head_offset).reshape(-1)
-    flat_probs = topk_probs.reshape(-1)
-    flat_tokens = torch.arange(sequence, device=device).view(1, sequence, 1).expand(heads, sequence, top_k).reshape(-1)
-    order = flattened_experts.argsort(stable=True)
-    gather_ids = flat_tokens[order].to(torch.int32)
-    sorted_probs = flat_probs[order].float()
-    counts = torch.bincount(flattened_experts, minlength=heads * num_experts)
-    offsets = torch.zeros(heads * num_experts + 1, device=device, dtype=torch.long)
-    offsets[1:] = counts.cumsum(0)
-    return gather_ids, sorted_probs, offsets
-
-
-def torch_mh_moe_forward(
-    x: torch.Tensor,
-    gather_ids: torch.Tensor,
-    probs: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down: torch.Tensor,
-) -> torch.Tensor:
-    """Small-shape correctness oracle for the fused expert kernel."""
-
-    if x.ndim != 3:
-        raise ValueError("multi-head MoE input must be [tokens,heads,head_dim]")
-    output = torch.zeros_like(x)
-    experts_per_head = (expert_offsets.numel() - 1) // x.shape[1]
-    for flat_expert in range(expert_offsets.numel() - 1):
-        begin = int(expert_offsets[flat_expert].item())
-        end = int(expert_offsets[flat_expert + 1].item())
-        if begin == end:
-            continue
-        head = flat_expert // experts_per_head
-        token_ids = gather_ids[begin:end].long()
-        expert_input = x.index_select(0, token_ids)[:, head]
-        gate = expert_input @ w_gate[flat_expert]
-        up = expert_input @ w_up[flat_expert]
-        hidden = swiglu7_pair(gate, up)
-        expert_output = hidden @ w_down[flat_expert]
-        expert_output = expert_output * probs[begin:end, None].to(expert_output.dtype)
-        output[:, head].index_add_(0, token_ids, expert_output)
-    return output
-
-
-# vLLM's no-Triton placeholder exposes ``tl.constexpr`` as ``None``.
-_SWIGLU7_ALPHA = tl.constexpr(1.702) if HAS_TRITON else 1.702
-_SWIGLU7_LIMIT = tl.constexpr(7.0) if HAS_TRITON else 7.0
-_SWIGLU7_BIAS = tl.constexpr(1.0) if HAS_TRITON else 1.0
+# Selection-score bounds: the finite fp32 range, so that -inf is reserved for
+# lanes the top-k loop has already consumed and +inf for NaN lanes, which
+# torch.topk ranks above everything.  Guarded like the SwiGLU7 constants in
+# ``fused_moe_kernels``, since the placeholder's ``tl.constexpr`` is ``None``.
+_MIN_FINITE_FP32 = tl.constexpr(-3.4028234663852886e38) if HAS_TRITON else -3.4028234663852886e38
+_MAX_FINITE_FP32 = tl.constexpr(3.4028234663852886e38) if HAS_TRITON else 3.4028234663852886e38
 
 
 @triton.jit
-def _swiglu7_kernel(gate, up, out_dtype: tl.constexpr):
-    gate_clamped = tl.minimum(gate, _SWIGLU7_LIMIT)
-    up_clamped = tl.maximum(tl.minimum(up, _SWIGLU7_LIMIT), -_SWIGLU7_LIMIT)
-    sigmoid = tl.sigmoid(_SWIGLU7_ALPHA * gate_clamped)
-    swish = gate_clamped * sigmoid
-    return (swish * (up_clamped + _SWIGLU7_BIAS)).to(out_dtype)
-
-
-@triton.jit
-def _binary_search_expert(
-    cumulative_tiles,
-    tile_id,
-    num_experts: tl.constexpr,
-    log2_num_experts: tl.constexpr,
-):
-    lo = 0
-    hi = num_experts
-    for _ in tl.static_range(0, log2_num_experts + 1):
-        mid = (lo + hi + 1) // 2
-        below = tl.load(cumulative_tiles + mid) <= tile_id
-        lo = tl.where(below, mid, lo)
-        hi = tl.where(below, hi, mid - 1)
-    return lo
-
-
-@triton.jit
-def _mh_moe_kernel(
-    x_ptr,
-    wg_ptr,
-    wu_ptr,
-    wd_ptr,
-    y_ptr,
-    gather_ids_ptr,
+def _routing_topk_kernel(
+    logits_ptr,
+    bias_ptr,
     probs_ptr,
-    expert_offsets_ptr,
-    cumulative_tiles_ptr,
-    stride_x_s,
-    stride_x_h,
-    stride_x_dh,
-    stride_wg_e,
-    stride_wg_dh,
-    stride_wg_de,
-    stride_wu_e,
-    stride_wu_dh,
-    stride_wu_de,
-    stride_wd_e,
-    stride_wd_de,
-    stride_wd_dh,
-    stride_y_s,
-    stride_y_h,
-    stride_y_dh,
-    d_head: tl.constexpr,
-    d_expert: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_flat_experts: tl.constexpr,
-    log2_num_experts: tl.constexpr,
+    indices_ptr,
+    num_tokens,
+    stride_logits_h,
+    stride_logits_s,
+    tiles_per_head,
+    top_k: tl.constexpr,
+    top_k_pad: tl.constexpr,
+    num_experts: tl.constexpr,
+    experts_pad: tl.constexpr,
     block_t: tl.constexpr,
-    block_dh: tl.constexpr,
-    block_de: tl.constexpr,
-    acc_dtype: tl.constexpr,
-    deterministic: tl.constexpr = False,
+    has_bias: tl.constexpr,
+    route_norm: tl.constexpr,
+    norm_eps: tl.constexpr,
+    precise_exp: tl.constexpr,
 ):
-    tile_id = tl.program_id(0)
-    total_tiles = tl.load(cumulative_tiles_ptr + num_flat_experts)
-    if tile_id >= total_tiles:
-        return
+    """Sigmoid, selection bias, top-k, probability gather and L1 norm in one pass.
 
-    expert = _binary_search_expert(cumulative_tiles_ptr, tile_id, num_flat_experts, log2_num_experts)
-    expert_i64 = expert.to(tl.int64)
-    head = expert // (num_flat_experts // num_heads)
-    tile_in_expert = tile_id - tl.load(cumulative_tiles_ptr + expert)
-    token_start = tl.load(expert_offsets_ptr + expert) + tile_in_expert * block_t
-    expert_end = tl.load(expert_offsets_ptr + expert + 1)
-    count = tl.minimum(token_start + block_t, expert_end) - token_start
+    One program owns ``block_t`` ``[head, token]`` rows and keeps the whole
+    expert bank in registers, so the ``[heads,tokens,experts]`` logits are read
+    exactly once instead of once per routing stage.
+    """
 
-    dh_block_offsets = tl.arange(0, block_dh)
-    de_block_offsets = tl.arange(0, block_de)
-    token_offsets = tl.arange(0, block_t)
-    dh_offsets = tl.arange(0, d_head)
+    tile = tl.program_id(0)
+    head = tile // tiles_per_head
+    token_tile = tile % tiles_per_head
+    token_offsets = token_tile * block_t + tl.arange(0, block_t)
+    expert_offsets = tl.arange(0, experts_pad)
+    token_mask = token_offsets < num_tokens
+    expert_mask = expert_offsets < num_experts
+    live = token_mask[:, None] & expert_mask[None, :]
 
-    token_positions = token_start + token_offsets
-    token_mask = token_offsets < count
-    # Token indices fit in int32, but multiplying a large packed-batch index by
-    # the hidden-width stride does not. Promote before computing element offsets.
-    gather_ids = tl.load(gather_ids_ptr + token_positions, mask=token_mask, other=0).to(tl.int64)
-    probabilities = tl.load(probs_ptr + token_positions, mask=token_mask, other=0.0)
-    x_base = gather_ids * stride_x_s + head * stride_x_h
-    output_acc = tl.zeros([block_t, d_head], dtype=acc_dtype)
-
-    for de_start in tl.range(0, d_expert, block_de):
-        de_offsets = de_start + de_block_offsets
-        gate_acc = tl.zeros([block_t, block_de], dtype=acc_dtype)
-        up_acc = tl.zeros([block_t, block_de], dtype=acc_dtype)
-        for dh_start in tl.static_range(0, d_head, block_dh):
-            local_dh = dh_start + dh_block_offsets
-            x_block = tl.load(
-                x_ptr + x_base[:, None] + local_dh[None, :] * stride_x_dh,
-                mask=token_mask[:, None],
-                other=0.0,
-            )
-            wg = tl.load(
-                wg_ptr
-                + expert_i64 * stride_wg_e
-                + local_dh[:, None] * stride_wg_dh
-                + de_offsets[None, :] * stride_wg_de
-            )
-            wu = tl.load(
-                wu_ptr
-                + expert_i64 * stride_wu_e
-                + local_dh[:, None] * stride_wu_dh
-                + de_offsets[None, :] * stride_wu_de
-            )
-            gate_acc += tl.dot(x_block, wg)
-            up_acc += tl.dot(x_block, wu)
-        hidden = _swiglu7_kernel(gate_acc, up_acc, wd_ptr.dtype.element_ty)
-        down = tl.load(
-            wd_ptr + expert_i64 * stride_wd_e + de_offsets[:, None] * stride_wd_de + dh_offsets[None, :] * stride_wd_dh
-        )
-        output_acc += tl.dot(hidden, down)
-    output_acc = output_acc * probabilities[:, None]
-
-    if deterministic:
-        output_ptrs = y_ptr + token_positions[:, None] * stride_y_s + dh_offsets[None, :] * stride_y_dh
-        tl.store(output_ptrs, output_acc.to(y_ptr.dtype.element_ty), mask=token_mask[:, None])
+    # Head and token indices fit in int32, but scaling them by the per-head
+    # logit stride does not once the packed sequence gets long.  Promote before
+    # computing element offsets, as the expert kernel does.
+    logits_base = head.to(tl.int64) * stride_logits_h + token_offsets.to(tl.int64) * stride_logits_s
+    logits = tl.load(
+        logits_ptr + logits_base[:, None] + expert_offsets[None, :],
+        mask=live,
+        other=0.0,
+    )
+    # tl.sigmoid and tl.exp lower to the ex2 approximation, which drifts up to
+    # 29 ULP from torch.sigmoid and can reorder near-equal selection scores.
+    # libdevice's exp keeps the fused route within one ULP of the reference.
+    if precise_exp:
+        router_scores = 1.0 / (1.0 + _tl_libdevice.exp(-logits))
     else:
-        output_base = gather_ids * stride_y_s + head * stride_y_h
-        output_ptrs = y_ptr + output_base[:, None] + dh_offsets[None, :] * stride_y_dh
-        tl.atomic_add(output_ptrs, output_acc.to(y_ptr.dtype.element_ty), mask=token_mask[:, None])
+        router_scores = 1.0 / (1.0 + tl.exp(-logits))
+    if has_bias:
+        bias = tl.load(bias_ptr + head * num_experts + expert_offsets, mask=expert_mask, other=0.0)
+        # The loop below retires a winner by marking it -inf, and NaN lanes are
+        # folded to +inf, so both infinities must stay out of reach for a
+        # finite score.  A sigmoid is inside [0, 1], so the bias is the only way
+        # in: clamp it to the finite range, over the [experts] bank rather than
+        # the whole score tile.  The clamp would swallow a NaN bias, which the
+        # reference ranks first, so that passes through untouched.
+        clamped_bias = tl.minimum(tl.maximum(bias, _MIN_FINITE_FP32), _MAX_FINITE_FP32)
+        selection_scores = router_scores + tl.where(bias == bias, clamped_bias, bias)[None, :]
+    else:
+        selection_scores = router_scores
+    # tl.max does not propagate NaN, so a NaN row would match no live lane and
+    # hand the padded sentinel id out of the kernel.  torch.topk ranks NaN above
+    # every number; +inf is otherwise unreachable, so folding NaN onto it keeps
+    # that order and the ids in range.  The route weight is still read from
+    # ``router_scores``, so a NaN logit reaches the output as NaN, as it does in
+    # the reference.  Dead and padded lanes keep -inf and stay unreachable for
+    # good, which is sound because ``top_k <= num_experts`` leaves an unretired
+    # live lane in every round.
+    selection_scores = tl.where(selection_scores == selection_scores, selection_scores, float("inf"))
+    selection_scores = tl.where(live, selection_scores, float("-inf"))
+
+    route_offsets = tl.arange(0, top_k_pad)
+    topk_probs = tl.zeros([block_t, top_k_pad], dtype=tl.float32)
+    topk_indices = tl.zeros([block_t, top_k_pad], dtype=tl.int32)
+    l1_norm = tl.zeros([block_t], dtype=tl.float32)
+    for route in tl.static_range(top_k):
+        best_score = tl.max(selection_scores, axis=1)
+        # tl.argmax is several times more expensive than a plain max on this
+        # shape, so recover the winner with a second reduction.  Ties resolve to
+        # the lowest expert id, which torch.topk leaves unspecified.  A retired
+        # expert sits at -inf, strictly below the clamp above, so it can never
+        # match ``best_score`` and be routed to twice.  Scores are NaN-free here,
+        # so ``best_score`` always matches a live lane.
+        best_expert = tl.min(tl.where(selection_scores == best_score[:, None], expert_offsets, experts_pad), axis=1)
+        selected = expert_offsets[None, :] == best_expert[:, None]
+        # The bias steers selection only; the route weight is the unbiased score.
+        probability = tl.sum(tl.where(selected, router_scores, 0.0), axis=1)
+        is_route = route_offsets == route
+        topk_probs += tl.where(is_route[None, :], probability[:, None], 0.0)
+        topk_indices += tl.where(is_route[None, :], best_expert[:, None].to(tl.int32), 0)
+        selection_scores = tl.where(selected, float("-inf"), selection_scores)
+        l1_norm += tl.abs(probability)
+    if route_norm:
+        # F.normalize clamps with clamp_min, which propagates a NaN norm; the
+        # default tl.maximum would replace it with eps and blow the finite
+        # weights of a partly NaN row up to ~1e12 instead.
+        topk_probs = topk_probs / tl.maximum(l1_norm, norm_eps, propagate_nan=tl.PropagateNan.ALL)[:, None]
+
+    store_mask = token_mask[:, None] & (route_offsets[None, :] < top_k)
+    store_base = (head.to(tl.int64) * num_tokens + token_offsets.to(tl.int64)) * top_k
+    store_offsets = store_base[:, None] + route_offsets[None, :]
+    tl.store(probs_ptr + store_offsets, topk_probs, mask=store_mask)
+    tl.store(indices_ptr + store_offsets, topk_indices.to(tl.int64), mask=store_mask)
 
 
-def _deterministic_scatter(
-    sorted_output: torch.Tensor,
-    reference: torch.Tensor,
-    gather_ids: torch.Tensor,
-    expert_offsets: torch.Tensor,
-) -> torch.Tensor:
-    num_flat_experts = expert_offsets.numel() - 1
-    experts_per_head = num_flat_experts // reference.shape[1]
-    expert_lengths = torch.diff(expert_offsets)
-    head_values = torch.arange(num_flat_experts, device=gather_ids.device) // experts_per_head
-    head_ids = torch.repeat_interleave(head_values, expert_lengths)
-    scatter_ids = gather_ids.long() * reference.shape[1] + head_ids.long()
-    output = torch.zeros_like(reference).view(-1, reference.shape[-1])
-    output.scatter_add_(0, scatter_ids[:, None].expand_as(sorted_output), sorted_output.to(output.dtype))
-    return output.view_as(reference)
+# Above this the [block_t, experts_pad] score tiles no longer fit in registers
+# and the fused kernel loses to the unfused reference.
+_MAX_FUSED_EXPERTS_PAD = 1024
 
 
-def _select_block_config() -> tuple[int, int, int, int, int]:
-    """Return the reference kernel config, capped for pre-Blackwell GPUs."""
+def _fused_routing_config(experts_pad: int) -> tuple[int, int]:
+    """Return ``(block_t, num_warps)`` for a padded expert-bank width."""
 
-    capability = current_omni_platform.get_device_capability()
-    if capability is not None and capability.major >= 10:  # Blackwell
-        return (128, 64, 32, 2, 8)
-    # BLOCK_T=128 needs 122,880 bytes of shared memory and is not safe on the
-    # qualified L20X path.  This is the reference kernel's portable config.
-    return (64, 64, 32, 2, 4)
+    # Two fp32 [block_t, experts_pad] tiles per program; one warp per 256-wide
+    # slice keeps the six top-k reductions inside warp shuffles.
+    num_warps = max(1, min(8, experts_pad // 256))
+    block_t = max(1, 256 // experts_pad)
+    return block_t, num_warps
 
 
-def triton_mh_moe_forward(
-    x: torch.Tensor,
-    gather_ids: torch.Tensor,
-    probs: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down: torch.Tensor,
+def _fused_routing_supported(
+    router_logits: torch.Tensor,
+    score_func: RoutingScore,
+    expert_bias: torch.Tensor | None,
+) -> bool:
+    if not (router_logits.is_cuda and current_omni_platform.is_cuda()) or score_func != "sigmoid":
+        return False
+    # fp32 only: the reference evaluates sigmoid and the L1 norm in the logit
+    # dtype, and reproducing narrow-dtype rounding is not worth a second kernel.
+    if router_logits.dtype != torch.float32:
+        return False
+    if router_logits.stride(-1) != 1 or router_logits.shape[1] == 0:
+        return False
+    if triton.next_power_of_2(router_logits.shape[-1]) > _MAX_FUSED_EXPERTS_PAD:
+        return False
+    # Only contiguity is load bearing: the reference reshapes the bias with
+    # ``view``, and so does :func:`_dense_expert_bias`.  Narrow dtypes and the
+    # broadcast shapes the reference accepts are normalized there instead of
+    # costing the whole fused path.
+    if expert_bias is not None and not expert_bias.is_contiguous():
+        return False
+    return True
+
+
+def _dense_expert_bias(expert_bias: torch.Tensor, heads: int, num_experts: int) -> torch.Tensor:
+    """Return the dense fp32 ``[heads, num_experts]`` bank the kernel indexes.
+
+    The reference broadcasts the bias with ``expert_bias.view(heads, 1, -1)``, so
+    a per-head scalar is legal input, while the kernel reads ``heads *
+    num_experts`` elements.  Materialize that broadcast rather than drop to the
+    reference for a bank this small, and upcast narrow dtypes, which is exactly
+    the promotion the reference gets from adding the bias to fp32 scores.
+
+    ``view`` and ``expand`` reject the shapes the reference's own broadcast
+    rejects, ``contiguous`` is what actually retires the zero stride ``expand``
+    leaves behind, and every step is a no-op for a dense fp32 bias.
+    """
+
+    dense = expert_bias.view(heads, -1).expand(heads, num_experts)
+    return dense.to(torch.float32).contiguous()
+
+
+def compute_topk_probs_and_indices(
+    router_logits: torch.Tensor,
+    top_k: int,
     *,
-    deterministic: bool = False,
-) -> torch.Tensor:
-    """Fused gather/expert/scatter kernel for released MAGI dimensions."""
+    score_func: RoutingScore = "sigmoid",
+    expert_bias: torch.Tensor | None = None,
+    route_norm: bool = True,
+    norm_eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route independently for every ``[head, token]`` pair.
 
-    routed_tokens = gather_ids.numel()
-    if routed_tokens == 0:
-        return torch.zeros_like(x)
-    d_head, d_expert = x.shape[-1], w_down.shape[1]
-    block_t, block_dh, block_de, num_stages, num_warps = _select_block_config()
-    if d_head % block_dh or d_expert % block_de:
-        return torch_mh_moe_forward(x, gather_ids, probs, expert_offsets, w_gate, w_up, w_down)
+    The auxiliary-free bias affects expert selection but deliberately does not
+    affect the returned routing probability, matching the training recipe.
 
-    if deterministic:
-        output = torch.empty((routed_tokens, 1, d_head), device=x.device, dtype=x.dtype)
-    else:
-        output = torch.zeros_like(x)
-    num_flat_experts = expert_offsets.numel() - 1
-    expert_tiles = (torch.diff(expert_offsets) + block_t - 1) // block_t
-    cumulative_tiles = torch.cat(
-        (torch.zeros(1, dtype=torch.int32, device=x.device), expert_tiles.cumsum(0, dtype=torch.int32))
-    )
-    # Match the reference launch bound.  Empty/excess programs return after
-    # comparing against ``cumulative_tiles[-1]`` inside the kernel.
-    grid = ((routed_tokens + block_t - 1) // block_t + num_flat_experts,)
-    log2_experts = max(1, math.ceil(math.log2(max(num_flat_experts, 1) + 1)))
-    _mh_moe_kernel[grid](
-        x,
-        w_gate,
-        w_up,
-        w_down,
-        output,
-        gather_ids,
-        probs,
-        expert_offsets,
-        cumulative_tiles,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        w_gate.stride(0),
-        w_gate.stride(1),
-        w_gate.stride(2),
-        w_up.stride(0),
-        w_up.stride(1),
-        w_up.stride(2),
-        w_down.stride(0),
-        w_down.stride(1),
-        w_down.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        d_head,
-        d_expert,
-        x.shape[1],
-        num_flat_experts,
-        log2_experts,
+    Supported CUDA inputs run as a single fused kernel; other devices, logit
+    dtypes, score functions and shapes fall back to
+    :func:`_reference_topk_probs_and_indices`.  The two pick the same experts in
+    the same order whenever the top ``top_k + 1`` selection scores of a row are
+    separated by more than a few ULP, and the returned weights then agree to
+    about 1e-6 relative: the fused sigmoid is within one ULP of
+    ``torch.sigmoid`` and the folded L1 normalization sums in a different order.
+    Under an exact tie the fused kernel selects the lowest expert id, an order
+    ``torch.topk`` leaves unspecified.  NaN selection scores rank first, as in
+    ``torch.topk``, and a NaN logit makes its row's weights NaN in both paths.
+    """
+
+    if router_logits.ndim != 3:
+        raise ValueError("router_logits must be [heads,tokens,experts]")
+    if not 0 < top_k <= router_logits.shape[-1]:
+        raise ValueError("top_k must be in [1, num_experts]")
+    if not _fused_routing_supported(router_logits, score_func, expert_bias):
+        return _reference_topk_probs_and_indices(
+            router_logits,
+            top_k,
+            score_func=score_func,
+            expert_bias=expert_bias,
+            route_norm=route_norm,
+            norm_eps=norm_eps,
+        )
+
+    heads, num_tokens, num_experts = router_logits.shape
+    if expert_bias is not None:
+        expert_bias = _dense_expert_bias(expert_bias, heads, num_experts)
+    experts_pad = triton.next_power_of_2(num_experts)
+    block_t, num_warps = _fused_routing_config(experts_pad)
+    tiles_per_head = triton.cdiv(num_tokens, block_t)
+    topk_probs = torch.empty((heads, num_tokens, top_k), device=router_logits.device, dtype=torch.float32)
+    topk_indices = torch.empty((heads, num_tokens, top_k), device=router_logits.device, dtype=torch.int64)
+    _routing_topk_kernel[(heads * tiles_per_head,)](
+        router_logits,
+        expert_bias,
+        topk_probs,
+        topk_indices,
+        num_tokens,
+        router_logits.stride(0),
+        router_logits.stride(1),
+        tiles_per_head,
+        top_k,
+        triton.next_power_of_2(top_k),
+        num_experts,
+        experts_pad,
         block_t,
-        block_dh,
-        block_de,
-        tl.float32,
-        deterministic,
-        num_stages=num_stages,
+        expert_bias is not None,
+        route_norm,
+        norm_eps,
+        _HAS_PRECISE_EXP,
         num_warps=num_warps,
+        num_stages=1,
     )
-    if deterministic:
-        return _deterministic_scatter(output.view(routed_tokens, d_head), x, gather_ids, expert_offsets)
-    return output
+    return topk_probs, topk_indices
+
+
+def _align_bf16_routes(
+    route_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build route metadata without reading the padded count back to the CPU."""
+
+    flat_ids = route_ids.reshape(-1).to(torch.int32)
+    route_count = flat_ids.numel()
+    # One sort yields both the route order and the sorted expert ids.
+    sorted_experts, order = torch.sort(flat_ids)
+    sorted_experts = sorted_experts.long()
+    # Expert e owns sorted positions [begins[e], begins[e + 1]), found without atomics.
+    expert_bounds = torch.arange(num_experts + 1, device=flat_ids.device, dtype=torch.int64)
+    begins = torch.searchsorted(sorted_experts, expert_bounds)
+    counts = begins[1:] - begins[:-1]
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size
+    padded_ends = torch.cumsum(padded_counts, 0)
+    positions = torch.arange(route_count, device=flat_ids.device, dtype=torch.int64)
+    destinations = (padded_ends - padded_counts - begins[:-1])[sorted_experts] + positions
+    if buffers is None:
+        buffers = _allocate_bf16_route_buffers(route_count, num_experts, block_size, flat_ids.device)
+    sorted_ids, expert_ids, num_padded = buffers
+    sorted_ids.fill_(route_count)
+    sorted_ids[destinations] = order.to(torch.int32)
+    block_starts = torch.arange(0, expert_ids.numel() * block_size, block_size, device=flat_ids.device)
+    expert_ids.copy_(torch.searchsorted(padded_ends, block_starts, right=True))
+    num_padded.copy_(padded_ends[-1:])
+    return sorted_ids, expert_ids, num_padded
+
+
+def _allocate_bf16_route_buffers(
+    route_count: int, num_experts: int, block_size: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Each expert adds at most block_size - 1 padding rows. The kernel uses
+    # the device-side padded count to skip programs beyond the live prefix.
+    capacity = math.ceil((route_count + num_experts * (block_size - 1)) / block_size) * block_size
+    return (
+        torch.empty(capacity, device=device, dtype=torch.int32),
+        torch.empty(capacity // block_size, device=device, dtype=torch.int32),
+        torch.empty(1, device=device, dtype=torch.int32),
+    )
+
+
+def _pack_bf16_w13(w_gate: torch.Tensor, w_up: torch.Tensor) -> torch.Tensor:
+    """Pack gate/up weights into adjacent rows for the grouped W13 GEMM."""
+
+    num_experts, hidden_size, intermediate_size = w_gate.shape
+    return torch.stack((w_gate.transpose(1, 2), w_up.transpose(1, 2)), dim=2).reshape(
+        num_experts, 2 * intermediate_size, hidden_size
+    )
+
+
+def _can_own_fused_w13(weight: torch.Tensor) -> bool:
+    """Whether this residency can hold the owned fused weight layout.
+
+    Only BF16 accelerator weights pay for it.  Host and meta parameters never
+    reach the fused grouped GEMM, and owning a bank there would spend host
+    memory on a layout nothing reads.
+    """
+
+    return weight.dtype == torch.bfloat16 and weight.device.type not in ("cpu", "meta")
+
+
+def _bf16_fused_moe_forward(
+    x_heads: torch.Tensor,
+    probabilities: torch.Tensor,
+    indices: torch.Tensor,
+    packed_w13: torch.Tensor,
+    w_down: torch.Tensor,
+    route_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Run the BF16 grouped GEMM path with head-local routing."""
+
+    num_tokens, num_heads, hidden_size = x_heads.shape
+    top_k = probabilities.shape[-1]
+    num_experts = packed_w13.shape[0]
+    if num_experts % num_heads:
+        raise ValueError("expert bank must be divisible by local MoE heads")
+    experts_per_head = num_experts // num_heads
+    if num_tokens == 0:
+        return torch.zeros_like(x_heads)
+    # Routes are token-major (token * heads + head), so the GEMMs read x_heads
+    # and write the output in its [tokens, heads] layout without permute copies.
+    head_offsets = torch.arange(0, num_experts, experts_per_head, device=x_heads.device, dtype=torch.int32)
+    token_major_ids = indices.transpose(0, 1).to(torch.int32, memory_format=torch.contiguous_format)
+    route_ids = (token_major_ids + head_offsets.view(1, num_heads, 1)).view(num_tokens * num_heads, top_k)
+    route_weights = probabilities.transpose(0, 1).reshape(num_tokens * num_heads, top_k).contiguous()
+    sorted_ids, expert_ids, num_padded = _align_bf16_routes(route_ids, num_experts, 128, route_buffers)
+
+    hidden = x_heads.reshape(num_tokens * num_heads, hidden_size)
+    intermediate_size = packed_w13.shape[1] // 2
+    intermediate = torch.empty(
+        (num_tokens * num_heads * top_k, intermediate_size), device=x_heads.device, dtype=x_heads.dtype
+    )
+    # CUDA/H20 benefits from the pre-Blackwell tile found by the MAGI-2 BF16
+    # sweep (smaller K/warp count and deeper pipelining reduce register
+    # pressure).  On MUSA both GEMMs are faster with a 64-wide K tile.  The
+    # launch contract remains the same; only legal, device-specific values
+    # are selected.
+    config = {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32 if not current_omni_platform.is_musa() else 64,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 4 if not current_omni_platform.is_musa() else 16,
+        "num_stages": 3 if not current_omni_platform.is_musa() else 1,
+    }
+    invoke_fused_moe_bf16(
+        hidden,
+        packed_w13,
+        intermediate,
+        route_weights,
+        sorted_ids,
+        expert_ids,
+        num_padded,
+        top_k=top_k,
+        config=config,
+        fuse_swiglu=True,
+    )
+    route_output = torch.empty((num_tokens * num_heads, top_k, hidden_size), device=x_heads.device, dtype=x_heads.dtype)
+    invoke_fused_moe_bf16(
+        intermediate,
+        w_down.transpose(1, 2),
+        route_output,
+        route_weights,
+        sorted_ids,
+        expert_ids,
+        num_padded,
+        top_k=1,
+        config=config,
+        fuse_swiglu=False,
+    )
+    return route_output.sum(dim=1).view(num_tokens, num_heads, hidden_size)
 
 
 @dataclass(frozen=True)
@@ -450,6 +532,153 @@ class Magi2MultiHeadMoE(nn.Module):
             parameter = getattr(target, parts[-1])
             parameter.mmap_weight_transform = self.ep_slice
 
+        # Copy-packed W13 fallback, used only when the owned bank below is
+        # absent (direct layer construction, host-loaded weights, foreign
+        # ``.data`` rebinding).  Non-persistent; built lazily on first use.
+        self.register_buffer("_bf16_packed_w13", None, persistent=False)
+        self._bf16_packed_w13_key: tuple | None = None
+        self._bf16_route_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        # Owned fused W13 bank.  It stays a plain attribute rather than a
+        # buffer: gate/up are views into it, and a buffer would be migrated on
+        # its own by ``.to()`` and pin a second full-size bank.
+        # ``_owns_fused_layout`` is the sticky request; it outlives the drop
+        # ``_apply`` performs, so a device move can rebuild the bank.
+        self._owned_w13: torch.Tensor | None = None
+        self._owns_fused_layout = False
+
+    def _apply(self, fn, recurse: bool = True):
+        # Do not migrate an extra full-size derived weight bank on .to().
+        self._bf16_packed_w13 = None
+        self._bf16_packed_w13_key = None
+        self._bf16_route_buffers = None
+        # Detach the bank while the parameters move, then re-attach it and let
+        # ``_get_owned_w13`` decide: it survives a move that leaves the aliases
+        # alone, and is rebuilt below for modules that own the layout.
+        owned_w13 = self._owned_w13
+        self._owned_w13 = None
+        applied = super()._apply(fn, recurse=recurse)
+        self._owned_w13 = owned_w13
+        if self._owns_fused_layout and self._get_owned_w13() is None:
+            # Giving the layout up here would put a second full-size W13 copy
+            # back beside gate/up for every later forward.  The resident
+            # pipeline stages the transformer to the host and back around
+            # prompt encoding, so this is the routine path, not an edge case.
+            self.prepare_owned_layout()
+        return applied
+
+    def _get_bf16_packed_w13(self) -> torch.Tensor:
+        # When gate/up already live inside one packed bank, that bank *is* the
+        # fused layout: return it and never allocate a derived copy beside it.
+        owned = self._get_owned_w13()
+        if owned is not None:
+            return owned
+        # In-place loading increments _version; mmap/.data replacement may
+        # not. Include object/storage identity and handle inference tensors,
+        # which intentionally do not expose a version counter.
+        key = tuple(
+            (id(weight), weight.data_ptr(), None if weight.is_inference() else weight._version)
+            for weight in (self.W_gate, self.W_up)
+        )
+        packed = self._bf16_packed_w13
+        if (
+            packed is None
+            or self._bf16_packed_w13_key != key
+            or packed.device != self.W_gate.device
+            or packed.dtype != self.W_gate.dtype
+        ):
+            # [E, I, 2, D] -> [E, 2I, D]: adjacent rows are gate/up pairs.
+            with torch.no_grad():
+                packed = _pack_bf16_w13(self.W_gate, self.W_up)
+            self._bf16_packed_w13 = packed
+            self._bf16_packed_w13_key = key
+        return packed
+
+    def _rebind_w13_to_owned_bank(self) -> None:
+        """Rebind gate/up into one interleaved packed bank.
+
+        ``_pack_bf16_w13`` produces the fused layout by copying, so a module
+        that only uses the packed form still carries the original two banks as
+        well.  Allocating one ``[E, 2I, D]`` bank and pointing gate/up at strided
+        views inside it makes the fused layout the *only* copy, which is what
+        the grouped GEMM wants.  Values, dtypes and state_dict keys are
+        unchanged; only the storages differ.
+        """
+
+        if self.W_gate.dtype != torch.bfloat16 or self.W_up.dtype != torch.bfloat16:
+            raise ValueError("Owned W13 requires BF16 gate and up weights")
+        if self._get_owned_w13() is not None:
+            return
+        packed = torch.empty(
+            (self.local_flatten_num_experts, 2 * self.d_expert, self.d_head),
+            dtype=self.W_gate.dtype,
+            device=self.W_gate.device,
+        )
+        views = packed.view(self.local_flatten_num_experts, self.d_expert, 2, self.d_head)
+        gate = views[:, :, 0, :].transpose(1, 2)
+        up = views[:, :, 1, :].transpose(1, 2)
+        # Storage surgery on parameters that require grad: copy under no_grad so
+        # autograd does not try to track a write into a fresh plain tensor.
+        with torch.no_grad():
+            gate.copy_(self.W_gate)
+            up.copy_(self.W_up)
+        self.W_gate.data = gate
+        self.W_up.data = up
+        self._owned_w13 = packed
+
+    def _get_owned_w13(self) -> torch.Tensor | None:
+        """Return the owned W13 bank, or ``None`` once it stops matching."""
+
+        packed = self._owned_w13
+        if packed is None:
+            return None
+        # ``.data = ...`` replacement and dtype or device moves rebind the
+        # parameters without touching ``_owned_w13``, so verify device, dtype,
+        # pointers and strides.
+        expected_stride = (2 * self.d_expert * self.d_head, 1, 2 * self.d_head)
+        if (
+            packed.device != self.W_gate.device
+            or packed.dtype != self.W_gate.dtype
+            or self.W_up.device != packed.device
+            or self.W_up.dtype != packed.dtype
+            or self.W_gate.data_ptr() != packed.data_ptr()
+            or self.W_up.data_ptr() != packed.data_ptr() + self.d_head * packed.element_size()
+            or self.W_gate.stride() != expected_stride
+            or self.W_up.stride() != expected_stride
+        ):
+            self._owned_w13 = None
+            return None
+        return packed
+
+    def prepare_owned_layout(self) -> None:
+        """Own the fused W13 bank and keep owning it across device moves.
+
+        A no-op on host and meta weights, where the fused path never runs.
+        """
+
+        if not _can_own_fused_w13(self.W_gate):
+            return
+        self._rebind_w13_to_owned_bank()
+        self._owns_fused_layout = True
+
+    def prepare_bf16_weights(self) -> None:
+        """Materialize derived BF16 weights outside the inference hot path."""
+
+        # Reload may mutate inference tensors without a version counter.
+        self._bf16_packed_w13 = None
+        self._bf16_packed_w13_key = None
+        # Owning the bank *is* the materialization: it already holds the fused
+        # layout the grouped GEMM reads, so it replaces the copying pack as well
+        # as the separate gate and up banks.
+        self.prepare_owned_layout()
+
+    def _get_bf16_route_buffers(self, route_count: int, device: torch.device):
+        buffers = self._bf16_route_buffers
+        capacity = math.ceil((route_count + self.local_flatten_num_experts * 127) / 128) * 128
+        if buffers is None or buffers[0].numel() != capacity or buffers[0].device != device:
+            buffers = _allocate_bf16_route_buffers(route_count, self.local_flatten_num_experts, 128, device)
+            self._bf16_route_buffers = buffers
+        return buffers
+
     def ep_slice(self, checkpoint_tensor: torch.Tensor) -> torch.Tensor:
         """Slice flattened ``(head,expert)`` checkpoint rows for this rank."""
 
@@ -477,7 +706,9 @@ class Magi2MultiHeadMoE(nn.Module):
 
     def _route(self, x_heads: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         gate = self.gate.view(self.local_num_heads, self.num_experts, self.d_head).float()
-        logits = torch.einsum("shd,hed->hse", x_heads.float(), gate)
+        # The router bmm reads a contiguous head-major operand; cast and permute in one copy.
+        x_route = x_heads.transpose(0, 1).to(torch.float32, memory_format=torch.contiguous_format)
+        logits = torch.einsum("hsd,hed->hse", x_route, gate)
         bias_source = (os.environ.get("MAGI2_ROUTER_BIAS_SOURCE") or "ema").strip().lower()
         bias_tensor = self.router.expert_bias if bias_source == "main" else self.router.expert_bias_ema
         bias = bias_tensor.view(self.local_num_heads, self.num_experts)
@@ -492,6 +723,21 @@ class Magi2MultiHeadMoE(nn.Module):
 
     def _local_forward(self, x_heads: torch.Tensor) -> torch.Tensor:
         probabilities, indices = self._route(x_heads)
+        if (
+            x_heads.device.type in ("cuda", "musa")
+            and x_heads.dtype == torch.bfloat16
+            and os.environ.get("MAGI2_DETERMINISTIC", "0") != "1"
+            and (current_omni_platform.is_musa() or x_heads.shape[0] >= _BF16_MOE_CUDA_MIN_TOKENS)
+            and not torch.compiler.is_compiling()
+        ):
+            return _bf16_fused_moe_forward(
+                x_heads,
+                probabilities,
+                indices,
+                self._get_bf16_packed_w13(),
+                self.W_down,
+                self._get_bf16_route_buffers(x_heads.shape[0] * self.local_num_heads * self.top_k, x_heads.device),
+            )
         gather_ids, sorted_probs, offsets = global_sort_routes(probabilities, indices, self.num_experts)
         if x_heads.is_cuda:
             return triton_mh_moe_forward(

@@ -1,0 +1,23 @@
+# Opt-in CUDA Model Runner V2 profile for MiniCPM-o 4.5 full-duplex serving:
+# Thinker, Talker and Code2Wav all run on MRv2.
+# Enables MRv2 execution for duplex sessions, retaining native
+# Stage-0 streaming audio preprocessing, KV sliding window reanchor,
+# device duplex sampling hooks, and streaming Code2Wav waveform synthesis.
+base_config: minicpmo_4_5.yaml
+
+session_mode: duplex
+model_runner: v2
+
+stages:
+  - stage_id: 0
+    async_chunk: false
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

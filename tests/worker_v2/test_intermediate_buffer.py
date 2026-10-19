@@ -94,3 +94,25 @@ def test_update_merge_semantics(monkeypatch):
     assert stored is not tensor
     assert torch.equal(stored, tensor)
     assert "kv" in buf.buffers[0]
+
+
+def test_add_request_merges_orchestrator_model_intermediate_buffer():
+    """Stage bridges such as MiniCPM-o's llm2tts hand over ``model_intermediate_buffer``."""
+    buf = OmniIntermediateBuffer(max_num_reqs=2)
+    hidden = torch.randn(3, 4)
+    data = _make_new_req_data(
+        "talker-1",
+        additional_information={"meta": {"a": 1}},
+        model_intermediate_buffer={
+            "ids": {"tts": [1, 2, 3]},
+            "hidden_states": {"tts": hidden},
+            "meta": {"next_stage_prompt_len": 5},
+            "request_id": "thinker-1",
+        },
+    )
+    buf.add_request(0, data)
+    info = buf.buffers[0]
+    assert info["ids"]["tts"] == [1, 2, 3]
+    assert torch.equal(info["hidden_states"]["tts"], hidden)
+    assert info["meta"] == {"a": 1, "next_stage_prompt_len": 5}
+    assert info["request_id"] == "thinker-1" and info["req_id"] == "talker-1"

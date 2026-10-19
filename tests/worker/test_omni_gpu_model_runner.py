@@ -7,10 +7,12 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.utils.torch_utils import weak_ref_tensors
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
     OmniGPUModelRunner,
@@ -19,6 +21,44 @@ from vllm_omni.worker.gpu_model_runner import (
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    payload = {
+        "latent": hidden,
+        "latent_input_ids": torch.tensor([[21], [22]]),
+        "latent_positions": torch.tensor([[10], [11]]),
+    }
+    original = OmniOutput(text_hidden_states=hidden, multimodal_outputs=payload)
+    # CUDAGraphWrapper weak-references its outputs both at capture and replay.
+    # vLLM converts NamedTuple outputs into plain tuples along this path.
+    # Only the CUDA storage-alias primitive is replaced for this CPU test;
+    # the upstream container conversion is exercised unchanged.
+    monkeypatch.setattr("vllm.utils.torch_utils.weak_ref_tensor", lambda value: value)
+    replay = weak_ref_tensors(original)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: replay)
+
+    output = runner._model_forward()
+    output_hidden, output_payload = runner.extract_multimodal_outputs(output)
+
+    assert isinstance(output, OmniOutput)
+    torch.testing.assert_close(output_hidden, hidden)
+    assert output_payload is payload
+
+
+def test_model_forward_keeps_auxiliary_hidden_tuple(monkeypatch):
+    hidden = torch.ones(2, 4)
+    auxiliary = (hidden, hidden.clone(), None, None)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: auxiliary)
+
+    assert runner._model_forward() is auxiliary
 
 
 def _runner_for_talker_graph_init(
@@ -565,6 +605,39 @@ def test_update_additional_information_deserializes_new_request_payload():
         runner.model_intermediate_buffer["r1"]["tts_hidden_states"],
         conditioning["tts_hidden_states"],
     )
+
+
+@pytest.mark.parametrize("replace_payload", [False, True])
+def test_resumed_streaming_payload_converts_to_typed_model_input(replace_payload):
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.data_entry_keys import to_struct
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = replace_payload
+    payload = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"req_id": ["r1"], "stream_finished": torch.tensor(False)},
+    }
+    new_req = OmniNewRequestData(
+        req_id="r1",
+        prompt_token_ids=[1, 2],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+        model_intermediate_buffer=payload,
+    )
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
+    # CosyVoice and other typed-payload consumers perform this conversion
+    # after the runner adds its resume metadata.
+    result = to_struct(runner.model_intermediate_buffer["r1"])
+    assert result.meta.resumable is True
+    assert result.meta.num_processed_tokens == 0
+    assert result.meta.req_id == ["r1"]
+    torch.testing.assert_close(result.codes.audio, payload["codes"]["audio"])
 
 
 def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
@@ -1182,3 +1255,81 @@ def test_decode_batch_without_mtp_rejects_incomplete_outputs(monkeypatch, invali
     with pytest.raises(ValueError, match="decode preprocessing"):
         runner._preprocess(scheduled, 2)
     assert torch.equal(runner.inputs_embeds.gpu, before)
+
+
+@pytest.mark.parametrize("supports_boundaries", [False, True])
+def test_multimodal_embeddings_receive_opt_in_host_request_boundaries(supports_boundaries):
+    runner = object.__new__(OmniGPUModelRunner)
+    received = {}
+
+    def embed(ids, **kwargs):
+        received.update(kwargs)
+        return ids
+
+    runner.model = SimpleNamespace(supports_embed_input_ids_query_start_loc=supports_boundaries, embed_input_ids=embed)
+    runner.input_batch = SimpleNamespace(num_reqs=3)
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 6, 7, 11, 999]))
+    runner.input_ids = SimpleNamespace(gpu=torch.arange(16))
+    mm = [torch.ones(2, 4), torch.ones(1, 4)]
+    mask = torch.tensor([True] * 4 + [False] * 3 + [True] * 3 + [False])
+
+    result = runner._embed_multimodal_input_ids(11, mm, mask)
+
+    torch.testing.assert_close(result, torch.arange(11))
+    assert received["multimodal_embeddings"] is mm
+    assert received["is_multimodal"] is mask
+    if supports_boundaries:
+        assert received["query_start_loc"] == [0, 6, 7, 11]
+    else:
+        assert "query_start_loc" not in received
+
+
+class BatchFilledRowsModel:
+    has_preprocess = True
+
+    def __init__(self, filled, *, fills_rows=True):
+        self.filled = set(filled)
+        self.preprocess_batch_fills_rows = fills_rows
+        self.batch_kwargs: dict = {}
+        self.calls = []
+
+    def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device, **layout):
+        self.batch_kwargs = {"req_ids": list(req_ids), **layout}
+        if not layout:
+            return None
+        for i, req_id in enumerate(req_ids):
+            if req_id in self.filled:
+                s = layout["token_offsets"][i]
+                layout["inputs_embeds"][s] = 100.0 + i
+                layout["input_ids"][s] = -i
+        return set(self.filled)
+
+    def preprocess(self, input_ids, input_embeds, **info):
+        self.calls.append(info["request_id"])
+        return input_ids, input_ids.float().view(-1, 1).expand(-1, 4).clone(), {"marker": info["request_id"]}
+
+
+def test_batch_filled_rows_skip_the_per_request_preprocess(monkeypatch):
+    rows = [("live-a", 5, 4, 1), ("prefill", 8, 0, 3), ("live-b", 6, 5, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a", "live-b"})
+    runner.model = model
+
+    ids, embeds, *_ = runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    assert model.calls == ["prefill"]
+    assert model.batch_kwargs["req_ids"] == ["live-a", "prefill", "live-b"]
+    torch.testing.assert_close(embeds[0], torch.full((4,), 100.0))
+    torch.testing.assert_close(embeds[4], torch.full((4,), 102.0))
+    assert ids.tolist() == [0, 1, 2, 3, -2]
+
+
+def test_batch_preprocess_without_fill_opt_in_keeps_the_legacy_hook(monkeypatch):
+    runner, scheduled, _, _ = _make_phase_runner(
+        monkeypatch, [("live-a", 5, 4, 1), ("live-b", 6, 5, 1)], batched_decode=False
+    )
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a"}, fills_rows=False)
+    runner.model = model
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    assert model.batch_kwargs == {"req_ids": ["live-a", "live-b"]} and model.calls == ["live-a", "live-b"]

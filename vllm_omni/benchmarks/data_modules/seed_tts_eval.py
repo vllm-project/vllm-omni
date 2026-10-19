@@ -42,8 +42,10 @@ Env: ``SEED_TTS_EVAL_DEVICE`` (e.g. ``cuda:0``, ``cpu``); ``SEED_TTS_HF_WHISPER_
 defaults to ``openai/whisper-large-v3`` (override for debugging only). Set
 ``SEED_TTS_WER_SAVE_AUDIO_DIR`` to save the captured 24 kHz mono WAV used by
 WER evaluation for each synthesized utterance.
-Streaming PCM is decoded using ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
-``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` (default: 24 kHz mono).
+Streaming PCM is decoded using the server's ``X-Audio-Sample-Rate`` /
+``X-Audio-Channels`` response headers; ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
+``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` (default: 24 kHz mono) apply when a server
+does not send them.
 """
 
 from __future__ import annotations
@@ -493,12 +495,16 @@ def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:
                 forced = _en_processor.get_decoder_prompt_ids(language="english", task="transcribe", **prompt_kwargs)
                 predicted_ids = _en_model.generate(input_features, forced_decoder_ids=forced, **generate_kwargs)
             except Exception:
-                predicted_ids = _en_model.generate(
-                    input_features,
-                    language="english",
-                    task="transcribe",
-                    **generate_kwargs,
-                )
+                # English-only checkpoints (e.g. openai/whisper-tiny.en) reject the
+                # ``language``/``task`` kwargs with ValueError. Only multilingual
+                # checkpoints accept them, so retry without first.
+                gen_kwargs = dict(generate_kwargs)
+                gen_kwargs["language"] = "english"
+                gen_kwargs["task"] = "transcribe"
+                try:
+                    predicted_ids = _en_model.generate(input_features, **gen_kwargs)
+                except (ValueError, TypeError):
+                    predicted_ids = _en_model.generate(input_features, **generate_kwargs)
         text = _en_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
     return (text or "").strip()
 

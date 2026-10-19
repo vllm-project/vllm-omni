@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# mypy: disable-error-code="attr-defined"
 
 import importlib
 import logging
@@ -10,6 +11,7 @@ from functools import cached_property
 import torch
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
+from vllm.config import VllmConfig as _OriginalVllmConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -28,6 +30,23 @@ from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbeddin
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
+
+# Omni's deploy config selects a runner per stage. vLLM 0.31's config property
+# otherwise defaults to v2 independently of the runner selected by our workers,
+# making shared consumers such as InputProcessor choose the wrong API.
+_runner_property = _OriginalVllmConfig.use_v2_model_runner
+if not getattr(_runner_property.fget, "_omni_stage_runner", False):
+
+    def _patched_use_v2_model_runner(self, _upstream=_runner_property.fget):
+        # Lazy import keeps the package's patch/config initialization acyclic.
+        from vllm_omni.config.model import OmniModelConfig
+
+        if isinstance(self.model_config, OmniModelConfig):
+            return self.model_config.use_v2_model_runner
+        return _upstream(self)
+
+    _patched_use_v2_model_runner._omni_stage_runner = True
+    _OriginalVllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -390,8 +409,8 @@ def _patch_chat_template_registry():
         )
 
         if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
-            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = (
-                lambda _: CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = lambda _: (
+                CHAT_TEMPLATES_DIR / "template_chatml.jinja"
             )
     except ImportError:
         pass
@@ -569,67 +588,193 @@ _patch_inductor_factorable_divisibility()
 
 
 # =============================================================================
-# Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
+# Patch CuMemAllocator free path so releasing a MemPool frees all its memory
 # =============================================================================
-# WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free
-# skip with ``if data.is_asleep and current_platform.is_rocm():`` — only ROCm
-# gets the safe empty-handle return.  On CUDA, the callback falls through and
-# returns the original handle, causing cuMemRelease on already-freed memory
-# (CUDA_ERROR_INVALID_VALUE) during EngineCore subprocess atexit cleanup.
+# WHY: Inline diffusion engines release their CuMem ``MemPool`` in-process at
+# shutdown, and torch then raw-frees every cached block through the C
+# extension's ``my_free``, which calls ``_python_free_callback`` for a handle
+# to unmap. Two kinds of block have no usable handle there (#8016):
 #
-# This happens because ``sleep()`` calls ``unmap_and_release()`` on ALL
-# platforms, then sets ``is_asleep = True``.  When the atexit handler
-# (``_shutdown_singleton`` -> ``release_pools()`` -> GC) triggers the free
-# callback, the asleep entries must return an empty chunk list so the C
-# extension skips ``cuMemRelease`` — exactly the same logic already used by
-# the ROCm guard.
+# * Blocks swept by ``use_memory_pool()`` on exit: it pops idle segments from
+#   ``pointer_to_data`` and unmaps them, but torch's MemPool still caches them
+#   and frees them again later, so the upstream callback raises ``KeyError``.
+# * Asleep blocks: ``sleep()`` already unmapped them. Upstream only guards
+#   ROCm, whose ``my_free`` accepts an empty chunk list; on CUDA ``my_free``
+#   parses the handle as ``KKKK`` and always unmaps.
 #
-# The fix removes the ``current_platform.is_rocm()`` condition so the guard
-# applies to CUDA (and any future platform that implements cumem).
+# On CUDA any failure in ``my_free`` returns without unmapping and leaves a
+# Python exception and a sticky CUDA error behind, so every later free in the
+# same ``emptyCache`` pops its entry but never releases the physical memory.
+# One stale block thus leaked the whole transformer (~4 GiB) on shutdown.
 #
-# FRAGILITY: Relies on ``_python_free_callback`` being a regular method
-# (not a slot or C extension).  If CuMemAllocator is rewritten in C/Cython,
-# this monkey-patch will silently become a no-op.
+# FIX: remember handles swept by ``use_memory_pool()``; when torch frees a
+# swept or asleep block, re-back it with fresh physical memory on CUDA so
+# ``my_free`` can unmap, release, and free the address normally (ROCm keeps
+# its empty-chunk-list path).
+#
+# FRAGILITY: Relies on ``_python_free_callback`` being a regular method and on
+# ``use_memory_pool()`` resolving ``unmap_and_release`` from the module globals.
+def _cumem_platform_is_rocm() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_rocm()
+
+
+def release_cumem_allocations_for_shutdown(allocator) -> int:
+    """Retire every allocation still tracked by an inline worker.
+
+    ``CuMemAllocator.release_pools()`` only drops the Python MemPool and
+    pluggable-allocator wrappers. Tensors retained outside the model runner
+    can therefore keep entries in ``pointer_to_data`` after an inline engine
+    shuts down, which prevents the next sleep-enabled engine from starting in
+    the same process.
+
+    The caller must first stop worker activity and synchronize the device.
+    Mapped allocations are unmapped here; already-asleep allocations were
+    unmapped by ``sleep()``. Both are removed from the live-usage registry and
+    retained as swept handles so the later MemPool/tensor free callback can
+    finish releasing their virtual addresses safely.
+    """
+    from vllm.device_allocator import cumem as cumem_module
+
+    swept_handles = allocator.__dict__.setdefault("_omni_swept_handles", {})
+    retired_bytes = 0
+    for ptr, data in list(allocator.pointer_to_data.items()):
+        if not data.is_asleep:
+            # Keep the entry visible until the physical unmap succeeds. If it
+            # fails, get_current_usage() must continue to report the leak.
+            cumem_module.unmap_and_release(data.handle)
+        data.cpu_backup_tensor = None
+        removed = allocator.pointer_to_data.pop(ptr, None)
+        if removed is not data:
+            raise RuntimeError(f"CuMem allocation {ptr} changed during shutdown")
+        swept_handles[ptr] = data.handle
+        retired_bytes += data.handle[1]
+    return retired_bytes
+
+
 def _patch_cumem_free_callback_cuda() -> None:
     try:
+        from vllm.device_allocator import cumem as cumem_module
         from vllm.device_allocator.cumem import CuMemAllocator
     except ImportError:
         _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
         return
 
-    _original_free_callback = CuMemAllocator._python_free_callback
-
-    if getattr(_original_free_callback, "_omni_cumem_cuda_patched", False):
+    if getattr(CuMemAllocator._python_free_callback, "_omni_cumem_cuda_patched", False):
         return
 
-    # The upstream bug: `_python_free_callback` only skips the double-free
-    # for ROCm (line ~206).  We wrap the method to extend the guard to all
-    # platforms.
+    original_unmap_and_release = cumem_module.unmap_and_release
+
+    def _tracking_unmap_and_release(allocation_handle) -> None:
+        original_unmap_and_release(allocation_handle)
+        allocator = CuMemAllocator.instance
+        # sleep()/discard() keep their entries; only the use_memory_pool()
+        # sweep unmaps a block that is no longer tracked.
+        if allocator is not None and allocation_handle[2] not in allocator.pointer_to_data:
+            allocator.__dict__.setdefault("_omni_swept_handles", {})[allocation_handle[2]] = allocation_handle
+
+    def _releasable_handle(allocation_handle) -> tuple:
+        """Return a handle for a block whose physical memory is already released."""
+        if _cumem_platform_is_rocm():
+            device, size, d_mem, _ = allocation_handle
+            return (device, size, d_mem, [])
+        cumem_module.create_and_map(allocation_handle)
+        return allocation_handle
+
     def _patched_free_callback(self, ptr: int) -> tuple:
-        data = self.pointer_to_data.pop(ptr)
+        data = self.pointer_to_data.pop(ptr, None)
+        if data is None:
+            swept = self.__dict__.get("_omni_swept_handles", {}).pop(ptr, None)
+            if swept is None:
+                raise KeyError(ptr)
+            return _releasable_handle(swept)
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
         if data.is_asleep:
-            # sleep() already called unmap_and_release() on this allocation.
-            # Return an empty chunk list so the C extension skips
-            # cuMemRelease, avoiding a double-free.  Same logic as the
-            # existing ROCm guard, but applied to all platforms.
-            device, size, d_mem, _ = data.handle
-            result = (device, size, d_mem, [])
-            _PATCH_LOGGER.debug(
-                "[cumem-cuda] Free callback: asleep entry %s -> empty handle",
-                ptr,
-            )
-            return result
+            return _releasable_handle(data.handle)
         # Drain pending kernels before the C extension's cuMemUnmap.
         torch.accelerator.synchronize(data.handle[0])
         return data.handle
 
     _patched_free_callback._omni_cumem_cuda_patched = True
     CuMemAllocator._python_free_callback = _patched_free_callback
-    _PATCH_LOGGER.info(
-        "[cumem-cuda] CuMemAllocator._python_free_callback patched: asleep guard extended to all platforms."
-    )
+    cumem_module.unmap_and_release = _tracking_unmap_and_release
+    _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
 
 
 _patch_cumem_free_callback_cuda()
+
+
+def _patch_batched_seeded_random_sample() -> None:
+    """Draw per-request seeded sampling noise in one launch.
+
+    vLLM's ``random_sample`` calls ``exponential_(generator=...)`` once per
+    seeded request and step. The replacement reproduces those draws bit for
+    bit (values and generator states) with one kernel; unsupported cases keep
+    the original loop.
+    """
+    try:
+        import inspect
+
+        from vllm.v1.sample.ops import topk_topp_sampler as sampler_ops
+    except ImportError:
+        return
+    original = getattr(sampler_ops, "random_sample", None)
+    if original is None or getattr(original, "_omni_batched_seeded", False):
+        return
+    if list(inspect.signature(original).parameters) != ["probs", "generators", "use_fp64_gumbel"] or not all(
+        hasattr(sampler_ops, name) for name in ("empty_exponential_noise_like", "sample_with_exponential_noise")
+    ):
+        _PATCH_LOGGER.debug("[seeded-sampling] random_sample signature changed; batching disabled")
+        return
+
+    def random_sample(
+        probs: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        use_fp64_gumbel: bool = False,
+    ) -> torch.Tensor:
+        q = sampler_ops.empty_exponential_noise_like(probs, use_fp64_gumbel)
+        if len(generators) != probs.shape[0]:
+            q.exponential_()
+        if generators:
+            from vllm_omni.utils.seeded_exponential import (
+                batched_seeded_exponential_supported,
+                fill_exponential_rows,
+            )
+
+            if batched_seeded_exponential_supported(q, generators):
+                fill_exponential_rows(q, list(generators.values()), list(generators))
+            else:
+                for i, generator in generators.items():
+                    q[i].exponential_(generator=generator)
+        return sampler_ops.sample_with_exponential_noise(probs, q)
+
+    random_sample._omni_batched_seeded = True  # type: ignore[attr-defined]
+    random_sample.__wrapped__ = original  # type: ignore[attr-defined]
+    sampler_ops.random_sample = random_sample
+
+
+_patch_batched_seeded_random_sample()
+
+
+def _patch_mrv2_stop_token_capacity() -> None:
+    """Let Model Runner V2 enforce ``min_tokens`` over large stop sets.
+
+    MRV2 keeps each request's stop token ids for ``min_tokens`` masking in a
+    fixed-width GPU table capped at 128 ids and rejects larger sets. Speech
+    LMs stop on every special id past the codebook (CosyVoice3: 200). The
+    masking kernel sizes its block from the table widths, which other tables
+    already raise to 1024, so widening this one only grows a small buffer.
+    """
+    try:
+        from vllm.v1.worker.gpu.sample import logit_bias
+    except ImportError:
+        return
+    logit_bias.MAX_NUM_STOP_TOKEN_IDS = max(
+        logit_bias.MAX_NUM_STOP_TOKEN_IDS,
+        logit_bias.MAX_NUM_ALLOWED_TOKEN_IDS,
+    )
+
+
+_patch_mrv2_stop_token_capacity()

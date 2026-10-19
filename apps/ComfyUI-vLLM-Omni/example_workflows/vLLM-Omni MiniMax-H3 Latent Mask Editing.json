@@ -2293,10 +2293,10 @@
       "title": "Usage Guide",
       "properties": {},
       "widgets_values": [
-        "Use a compatible MiniMax-H3 latent-edit server. Select a source video and set the server URL/model in each Generate Video node.\n\nSelect one Save Preview or Save Video output, then use Execute to selected output nodes. Running the whole workflow submits all four cases.\n\nMask: 0 preserves source latents; 1 regenerates. Audio mask applies to the whole clip, not individual sounds. Preview overlays are silent and do not run inference."
+        "Use a compatible MiniMax-H3 latent-edit server. Select a source video and set the server URL/model in each Generate Video node.\n\nSelect one Save Preview or Save Video output, then use Execute to selected output nodes. Running the whole workflow submits all four cases.\n\nMask: 0 preserves source latents; 1 regenerates. For an arbitrary-shape spatial mask, replace a case's Mask Rectangle chain with Load Image (as Mask). Audio mask applies to the whole clip, not individual sounds. Preview overlays are silent and do not run inference."
       ],
       "widgets_values_named": {
-        "text": "Use a compatible MiniMax-H3 latent-edit server. Select a source video and set the server URL/model in each Generate Video node.\n\nSelect one Save Preview or Save Video output, then use Execute to selected output nodes. Running the whole workflow submits all four cases.\n\nMask: 0 preserves source latents; 1 regenerates. Audio mask applies to the whole clip, not individual sounds. Preview overlays are silent and do not run inference."
+        "text": "Use a compatible MiniMax-H3 latent-edit server. Select a source video and set the server URL/model in each Generate Video node.\n\nSelect one Save Preview or Save Video output, then use Execute to selected output nodes. Running the whole workflow submits all four cases.\n\nMask: 0 preserves source latents; 1 regenerates. For an arbitrary-shape spatial mask, replace a case's Mask Rectangle chain with Load Image (as Mask). Audio mask applies to the whole clip, not individual sounds. Preview overlays are silent and do not run inference."
       },
       "color": "#432",
       "bgcolor": "#000"
@@ -2823,7 +2823,7 @@
         "Node name for S&R": "VLLMOmniGenerateVideo"
       },
       "widgets_values": [
-        "http://127.0.0.1:8001/v1",
+        "http://127.0.0.1:8000/v1",
         "MiniMaxAI/MiniMax-H3",
         "integrated_multimodal_description: The masked area is a flat, seamless continuation of the surrounding wall, matching its color, texture, and lighting. The wall surface remains consistent throughout the video.\n\noverall_soundscape: \n\nnon_diegetic_music: ",
         "",
@@ -2833,7 +2833,7 @@
         5
       ],
       "widgets_values_named": {
-        "url": "http://127.0.0.1:8001/v1",
+        "url": "http://127.0.0.1:8000/v1",
         "model": "MiniMaxAI/MiniMax-H3",
         "prompt": "integrated_multimodal_description: The masked area is a flat, seamless continuation of the surrounding wall, matching its color, texture, and lighting. The wall surface remains consistent throughout the video.\n\noverall_soundscape: \n\nnon_diegetic_music: ",
         "negative_prompt": "",
@@ -3677,7 +3677,7 @@
         "Node name for S&R": "VLLMOmniGenerateVideo"
       },
       "widgets_values": [
-        "http://127.0.0.1:8001/v1",
+        "http://127.0.0.1:8000/v1",
         "MiniMaxAI/MiniMax-H3",
         "integrated_multimodal_description: A small orange cat rests curled up in the masked area, gently swaying its tail from side to side. Its appearance matches the surrounding anime style, lighting, and shadows.\n\noverall_soundscape:\n\nnon_diegetic_music: ",
         "",
@@ -3687,7 +3687,7 @@
         5
       ],
       "widgets_values_named": {
-        "url": "http://127.0.0.1:8001/v1",
+        "url": "http://127.0.0.1:8000/v1",
         "model": "MiniMaxAI/MiniMax-H3",
         "prompt": "integrated_multimodal_description: A small orange cat rests curled up in the masked area, gently swaying its tail from side to side. Its appearance matches the surrounding anime style, lighting, and shadows.\n\noverall_soundscape:\n\nnon_diegetic_music: ",
         "negative_prompt": "",
@@ -3916,7 +3916,7 @@
         "Node name for S&R": "VLLMOmniGenerateVideo"
       },
       "widgets_values": [
-        "http://127.0.0.1:8001/v1",
+        "http://127.0.0.1:8000/v1",
         "MiniMaxAI/MiniMax-H3",
         "integrated_multimodal_description: The sky turns completely overcast, with the sun hidden and no direct sunlight, as torrential rain pours over the school entrance in dense visible streaks and splashes on the wet pavement. Distant lightning flashes in the sky behind the school buildings.\n\noverall_soundscape: Loud, steady rainfall, splashing water, and gusts of wind.\n\nnon_diegetic_music: None.",
         "",
@@ -3926,7 +3926,7 @@
         5
       ],
       "widgets_values_named": {
-        "url": "http://127.0.0.1:8001/v1",
+        "url": "http://127.0.0.1:8000/v1",
         "model": "MiniMaxAI/MiniMax-H3",
         "prompt": "integrated_multimodal_description: The sky turns completely overcast, with the sun hidden and no direct sunlight, as torrential rain pours over the school entrance in dense visible streaks and splashes on the wet pavement. Distant lightning flashes in the sky behind the school buildings.\n\noverall_soundscape: Loud, steady rainfall, splashing water, and gusts of wind.\n\nnon_diegetic_music: None.",
         "negative_prompt": "",
@@ -4363,7 +4363,7 @@
         "Node name for S&R": "VLLMOmniGenerateVideo"
       },
       "widgets_values": [
-        "http://127.0.0.1:8001/v1",
+        "http://127.0.0.1:8000/v1",
         "MiniMaxAI/MiniMax-H3",
         "integrated_multimodal_description: Cut to the same school on a summer night beneath a deep blue sky dotted with stars. A firework rises from behind the school buildings, leaving a glowing trail; the camera slowly tilts upward to follow it into the sky, ending as it bursts into a large bloom of colorful sparks.\n\noverall_soundscape: Soft summer insect sounds, followed by the firework rising with a whistle and bursting with a distant boom and crackling sparks.\n\nnon_diegetic_music: N/A",
         "",
@@ -4373,7 +4373,7 @@
         10
       ],
       "widgets_values_named": {
-        "url": "http://127.0.0.1:8001/v1",
+        "url": "http://127.0.0.1:8000/v1",
         "model": "MiniMaxAI/MiniMax-H3",
         "prompt": "integrated_multimodal_description: Cut to the same school on a summer night beneath a deep blue sky dotted with stars. A firework rises from behind the school buildings, leaving a glowing trail; the camera slowly tilts upward to follow it into the sky, ending as it bursts into a large bloom of colorful sparks.\n\noverall_soundscape: Soft summer insect sounds, followed by the firework rising with a whistle and bursting with a distant boom and crackling sparks.\n\nnon_diegetic_music: N/A",
         "negative_prompt": "",

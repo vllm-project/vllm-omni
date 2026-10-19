@@ -15,7 +15,7 @@ nav:
         - Image Edit: serving/image_edit_api.md
         - Videos: serving/videos_api.md
       - Streaming and Realtime:
-        - Realtime Audio: serving/realtime_api.md
+        - Full Duplex OpenAI: serving/realtime_openai_duplex_api.md
         - Full Duplex: serving/full_duplex_api.md
         - Realtime Duplex Reference: serving/realtime_duplex_api.md
         - Streaming Video Input: serving/video_stream_api.md
@@ -47,6 +47,7 @@ nav:
     - configuration/*
   - Models:
     - models/supported_models.md
+    - SeedVR2: models/seedvr2.md
   - Features:
     - Overview: features/README.md
     - Runtime and Stage Execution:
@@ -95,8 +96,10 @@ nav:
         - Dense Backends: user_guide/diffusion/attention_backends/dense_backends.md
         - TRTLLM: user_guide/diffusion/attention_backends/trtllm.md
         - SageAttention: user_guide/diffusion/attention_backends/sage.md
+        - FastVideo VSA: user_guide/diffusion/attention_backends/fastvideo_vsa.md
         - Hugging Face Hub: user_guide/diffusion/attention_backends/huggingface_hub.md
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
+        - VDN-H3 Hybrid Attention: user_guide/diffusion/attention_backends/vdnh3_attn.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
@@ -151,6 +154,7 @@ nav:
           - Hybrid Sharded Data Parallel (HSDP): design/feature/hsdp.md
           - Pipeline Parallel: design/feature/pipeline_parallel.md
           - Sequence Parallel: design/feature/sequence_parallel.md
+          - Window Sequence Parallel: design/feature/window_sequence_parallel.md
           - Tensor Parallel: design/feature/tensor_parallel.md
           - VAE Patch Parallelism: design/feature/vae_parallel.md
         - Attention Optimization:

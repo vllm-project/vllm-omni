@@ -16,8 +16,11 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
+
+import pybase64 as base64
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import (
@@ -29,6 +32,10 @@ from vllm_omni.engine.duplex.contracts import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig
+    from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
+
 
 class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
@@ -36,6 +43,21 @@ class DuplexRuntimeConfigError(ValueError):
     def __init__(self, message: str, *, code: str = "invalid_duplex_runtime_config") -> None:
         super().__init__(message)
         self.code = code
+
+
+def reject_private_runtime_keys(
+    extra_body: object,
+    private_runtime_config_keys: frozenset[str],
+    *,
+    message: str,
+    error_cls: type[DuplexRuntimeConfigError] = DuplexRuntimeConfigError,
+) -> None:
+    """Reject client overrides while preserving each plugin's error contract."""
+    if not isinstance(extra_body, dict):
+        return
+    private_keys = sorted(private_runtime_config_keys.intersection(extra_body))
+    if private_keys:
+        raise error_cls(message + ", ".join(private_keys))
 
 
 def reject_changed_runtime_value(
@@ -146,6 +168,78 @@ class DuplexModelSessionState(ABC):
     def clear_continuation(self) -> None: ...
 
 
+@dataclass(slots=True)
+class DefaultDuplexModelSessionState(DuplexModelSessionState):
+    """Framework-owned flag anatomy, implemented once.
+
+    The flag set above is the session runner's contract with the model (commit
+    retention, deferred response/creates, silence-continuation bookkeeping); it
+    is identical for every lockstep or frame-locked model, so a plugin only
+    supplies its input packetizer as ``audio_buffer``.
+    """
+
+    audio_buffer: PcmAppendBuffer
+    input_since_commit: bool = False
+    speech_since_commit: bool = False
+    context_locked: bool = False
+    committed_audio_payload: dict[str, object] | None = None
+    committed_audio_operation_id: str | None = None
+    committed_audio_reserved_bytes: int = 0
+    deferred_response_create: bool = False
+    deferred_precreate_response: bool = False
+    continuation_owner_id: str | None = None
+    continuation_units: int = 0
+    pending_silence_task: asyncio.Task[bool] | None = None
+    pending_silence_owner_id: str | None = None
+    # Deadline-aligned silence continuation state: the monotonic submission
+    # time of the most recent native input unit and the next silence
+    # continuation deadline. A real (non-silence) input resets the chain.
+    last_native_submit_monotonic: float | None = None
+    silence_deadline_monotonic: float | None = None
+
+    def retain_committed_audio(
+        self,
+        payload: dict[str, object],
+        *,
+        operation_id: str | None,
+        reserved_bytes: int = 0,
+    ) -> None:
+        self.committed_audio_payload = payload
+        self.committed_audio_operation_id = operation_id
+        self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+
+    def clear_committed_audio(self) -> int:
+        reserved_bytes = self.committed_audio_reserved_bytes
+        self.committed_audio_payload = None
+        self.committed_audio_operation_id = None
+        self.committed_audio_reserved_bytes = 0
+        self.deferred_response_create = False
+        self.deferred_precreate_response = False
+        return reserved_bytes
+
+    def clear_continuation(self) -> None:
+        self.continuation_owner_id = None
+        self.continuation_units = 0
+        self.pending_silence_task = None
+        self.pending_silence_owner_id = None
+        self.last_native_submit_monotonic = None
+        self.silence_deadline_monotonic = None
+
+
+@dataclass(frozen=True, slots=True)
+class DuplexDataPlaneContext:
+    """Session state the runner hands a data plane to project one stage output."""
+
+    epoch: int = 0
+    turn_id: int = 0
+    active_response_turn_id: int | None = None
+    active_response_id: str | None = None
+    auto_responds: bool = False
+    response_format: str = "wav"
+    speed: float | None = None
+    modalities: tuple[str, ...] = ()
+
+
 class DuplexDataPlane(ABC):
     """Projects raw stage outputs of one model into internal duplex events."""
 
@@ -199,16 +293,57 @@ class DuplexModelPlugin(ABC):
     two halves is impossible by construction.
     """
 
+    def history_calibrator(self, runtime_config: DuplexSessionRuntimeConfig) -> HistoryCalibrationPolicy | None:
+        """Optional original-text offset policy, shared per plugin.
+
+        The framework retains requested audio, enforces deadlines and owns history writes.
+        The default preserves existing playback marks for all other models.
+        """
+        return None
+
     projects_intermediate_outputs: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
     silence_continuation_samples: int = 16000
+    #: Sample rate of that unit: the runner submits it through ``plan_append``
+    #: exactly like client audio, so it must be a unit the model accepts.
+    silence_continuation_sample_rate_hz: int = 16000
     data_plane: DuplexDataPlane
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         # Constructor-only: concrete plugins hand the encoder to their data plane.
         del encode_audio
+
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        """Bind model policy to the resolved deployment topology before admission."""
+
+    def input_stage_id(self, payload: object) -> int:
+        """Select the entry stage for one append before reserving its request."""
+        return 0
+
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        """Separate the next ASR-only input from a batched response input.
+
+        The remaining committed payload resumes after this item's transcript
+        has reached conversation history. Models without an ASR entry stage
+        consume their input normally.
+        """
+        return payload, None
+
+    def silence_unit_payload(self) -> dict[str, object]:
+        """One silence unit as an append payload (``pcm_f32le`` zeros).
+
+        Used by the runner's turn continuation and by the startup warmup; a
+        model whose unit is not plain zero PCM overrides it.
+        """
+        samples = int(self.silence_continuation_samples)
+        return {
+            "type": "audio",
+            "audio": _silence_pcm_f32le_base64(samples),
+            "format": "pcm_f32le",
+            "sample_rate_hz": int(self.silence_continuation_sample_rate_hz),
+        }
 
     # ---- engine policy (was DuplexRuntimeExtension) ----
 
@@ -229,6 +364,9 @@ class DuplexModelPlugin(ABC):
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
         return self.plan_append(**kwargs)
+
+    def commit_append_plan(self, request_id: str) -> None:
+        """Commit model-owned context after the stage accepts a fenced append."""
 
     @abstractmethod
     def plan_append(
@@ -357,8 +495,15 @@ class DuplexModelPlugin(ABC):
     @abstractmethod
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities: ...
 
-    @abstractmethod
-    def validate_client_extra_body(self, extra_body: object) -> None: ...
+    def validate_client_extra_body(self, extra_body: object) -> None:
+        """Refuse client ``extra_body`` keys the server owns (``private_runtime_config_keys``)."""
+        if not isinstance(extra_body, Mapping):
+            return
+        private_keys = sorted(self.private_runtime_config_keys.intersection(extra_body))
+        if private_keys:
+            raise DuplexRuntimeConfigError(
+                f"{self.plugin_id} runtime configuration is server-owned: " + ", ".join(private_keys)
+            )
 
     @abstractmethod
     async def prepare_runtime_config(
@@ -372,7 +517,6 @@ class DuplexModelPlugin(ABC):
         current: Mapping[str, object],
     ) -> dict[str, object]: ...
 
-    @abstractmethod
     def data_plane_context(
         self,
         *,
@@ -384,18 +528,246 @@ class DuplexModelPlugin(ABC):
         response_format: str,
         speed: float | None,
         modalities: tuple[str, ...],
-    ) -> object: ...
+    ) -> object:
+        """The context handed to ``data_plane.project``; the default is the generic dataclass."""
+        return DuplexDataPlaneContext(
+            epoch=epoch,
+            turn_id=turn_id,
+            active_response_turn_id=active_response_turn_id,
+            active_response_id=active_response_id,
+            auto_responds=auto_responds,
+            response_format=response_format,
+            speed=speed,
+            modalities=modalities,
+        )
 
-    # Optional hook: build the runtime config patch for a function-call output
-    # item. Plugins without tools keep the default (no change).
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        """Recognize one function call in this model's output, or None.
+
+        The plugin owns recognition. A plugin that does not emit tool calls
+        keeps this default. A recognized call is ``{"call_id", "name",
+        "arguments"}``. Feeding an accepted result back is
+        ``runtime_config_for_function_output``.
+        """
+        del model_result
+        return None
+
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object] | None:
-        del config, current, item
+        """Prepare a result candidate without committing plugin bookkeeping.
+
+        The session revalidates epoch and deadline after conversion. Do not
+        consume a call's cached metadata here: a candidate can still be refused.
+        Terminal bookkeeping belongs in ``on_tool_call_settled``.
+        ``item`` is an isolated preparation copy. Its ``name`` and ``arguments``
+        come only from the session's immutable call origin, when available;
+        client-supplied hints are ignored. Plugins requiring that context must
+        refuse missing metadata instead of guessing an association. The public
+        acknowledgement still carries the original submitted item.
+        Plugins without tools keep the default (no change).
+        """
+        del config, current, item, history_len
         return None
+
+    def note_published_function_call(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        call_id: str,
+        history_len: int,
+    ) -> dict[str, object] | None:
+        """Record where this call sat in session history when it was published.
+
+        The session calls this from ``function_call.done``, before a later user
+        turn can grow the history. A plugin that splices the result back into
+        that history stores the length in its own runtime. The default keeps
+        nothing.
+        """
+        del runtime_config, call_id, history_len
+        return None
+
+    def has_pending_tool_followup(self, runtime_config: Mapping[str, object]) -> bool:
+        """Whether a bare ``response.create`` should answer an accepted tool result.
+
+        The runner still decides that a text-only turn is legal. This only
+        reports that the plugin still has a result it has not yet prompted.
+        """
+        del runtime_config
+        return False
+
+    def extra_prompt_config(self, runtime_config: Mapping[str, object]) -> Mapping[str, object]:
+        """Runtime entries this model's prompt preparation reads. Default: none."""
+        del runtime_config
+        return {}
+
+    def runtime_patch_for_submitted_prompt(self, prompt: dict[str, object]) -> Mapping[str, object] | None:
+        """Pop plugin-private prompt keys and return the runtime patch to store.
+
+        The session applies the patch only after the stage accepts the append.
+        A failed submit leaves the runtime unchanged. The default prompt has
+        no private keys.
+        """
+        del prompt
+        return None
+
+    def bind_inflight_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        response_id: str | None,
+    ) -> dict[str, object] | None:
+        """Remember which response owns a just-submitted tool follow-up.
+
+        The default has no inflight tool state. A plugin that does returns a
+        runtime patch naming ``response_id``; ``None`` leaves the runtime as it
+        is.
+        """
+        del runtime_config, response_id
+        return None
+
+    def runtime_config_after_response(
+        self,
+        runtime_config: Mapping[str, object],
+        *,
+        committed: bool,
+        awaiting_playback: bool = False,
+        response_id: str | None = None,
+        release_owner: bool = False,
+    ) -> dict[str, object] | None:
+        """Adjust runtime after a response ends.
+
+        ``committed`` is false when the response was cancelled or failed before
+        its text was stored. ``awaiting_playback`` means audio was produced and
+        a later playback ACK may still store that text. ``release_owner`` means
+        that response failed before any playback ACK can store the answer, so a
+        retry may take the tool pair. The default keeps the runtime unchanged.
+        """
+        del runtime_config, committed, awaiting_playback, response_id, release_owner
+        return None
+
+    def on_tool_call_settled(self, settlement: ToolCallSettlement) -> None:
+        """Finalize only the named call's cached metadata after its decision.
+
+        A terminal notification may outlive its origin epoch. This cleanup must
+        not change model input, runtime config or continuation state. The
+        separate recovery hook is fenced against superseded epochs.
+        """
+        del settlement
+
+    def on_tool_calls_closed(self, origins: tuple[ToolCallOrigin, ...]) -> None:
+        """Dispose cached metadata for this session's calls, including pending.
+
+        Close can overtake queued terminal notifications. Cleanup must be
+        idempotent because some calls have already been finalized individually.
+        This does not perform model recovery or change another session's state.
+        """
+        del origins
+
+    def runtime_config_for_tool_call_timeout(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        settlement: ToolCallSettlement,
+    ) -> dict[str, object] | None:
+        """Prepare model recovery for one newly timed-out call on the mailbox.
+
+        This is called only for a timeout still in the current epoch,
+        never during speculative result conversion. Cached metadata cleanup
+        belongs in ``on_tool_call_settled`` and runs even if an epoch changed.
+        Plugins may prepare call-scoped model recovery here. Returning ``None``
+        requests no runtime-config change; it is
+        not an acknowledgement that the worker consumed anything. A timeout
+        must not reset the session or retire another call's queued result.
+
+        Raising closes the session: the owner cannot safely retry partial
+        model/bookkeeping effects. Closed or superseded decisions are skipped.
+        Accepted and cancelled calls never enter this hook. Their prepared
+        delivery or epoch-wide cancellation path remains the only model effect.
+        """
+        del config, current, settlement
+        return None
+
+    def runtime_config_after_model_output(
+        self,
+        current: Mapping[str, object],
+        output_metadata: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Return a runtime-config patch after a model output is observed.
+
+        Plugins may use model-owned output metadata to retire server-side
+        runtime state that has been consumed by the worker. The default keeps
+        the framework unaware of model-specific metadata.
+        """
+        del current, output_metadata
+        return None
+
+    def retire_pending_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Answer what a cancelled epoch does to an accepted-but-unconsumed result.
+
+        A ``function_call_output`` is accepted into the runtime config, and a
+        frame-locked model may only pick it up on a later frame. When the epoch
+        advances (a cancel or barge-in), that queued frame belongs to the
+        generation that was just cancelled and must not be spoken in the next
+        one. Plugins with a queued function channel override this; the default
+        keeps nothing queued and returns ``None`` (no change).
+
+        A history-spliced pair is a different owner. Qwen puts that pair back
+        through ``runtime_config_after_response`` when the response is cancelled
+        or cleared before its text is stored, and a later ``response.create``
+        may answer it in the new epoch. This hook does not drop that pair.
+        The epoch bump still cancels pending ledger calls.
+
+        Returning a config must not reset a monotonic cursor the worker keys
+        its "already consumed" watermark on -- only the queue itself is retired.
+
+        Raising is a fail-closed answer, not a soft error: the framework cannot
+        verify a runtime is clean on its own, so a plugin that cannot retire its
+        queue ends the session rather than let the cancelled generation's result
+        be spoken in the new epoch.
+        """
+        del config, current
+        return None
+
+
+def settle_response_runtime(
+    plugin: object,
+    session: object,
+    *,
+    committed: bool,
+    awaiting_playback: bool = False,
+    response_id: str | None = None,
+    release_owner: bool = False,
+) -> None:
+    """Let the plugin keep or drop response-scoped runtime after ``end_response``.
+
+    ``runtime_config_after_response`` is optional. A plugin object that does
+    not implement it, or implements something that is not callable, is left
+    unchanged.
+    """
+    runtime = getattr(session, "runtime_config", None)
+    replace = getattr(session, "replace_runtime_config", None)
+    hook = getattr(plugin, "runtime_config_after_response", None)
+    if not isinstance(runtime, Mapping) or not callable(replace) or not callable(hook):
+        return
+    updated = hook(
+        runtime,
+        committed=committed,
+        awaiting_playback=awaiting_playback,
+        response_id=response_id,
+        release_owner=release_owner,
+    )
+    if updated is not None:
+        replace(updated)
 
 
 def load_duplex_plugin(path: str, encode_audio: EncodeAudio) -> DuplexModelPlugin:
@@ -428,6 +800,30 @@ def validate_duplex_plugin_sampling(plugin: DuplexModelPlugin, *, sampling_defau
             )
 
 
+def validate_duplex_replica_policy(
+    plugin: DuplexModelPlugin,
+    runtime_config: DuplexSessionRuntimeConfig,
+    *,
+    distributed: bool,
+) -> None:
+    """Validate replica policy before workers start and against the actual stage pools."""
+    if runtime_config.replica_policy == "legacy":
+        return
+    if distributed:
+        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
+    cap = runtime_config.max_sessions_per_replica
+    assert cap is not None
+    # This capability depends on the requested capacity for some plugins; the
+    # global admission limit does not describe sharing within a single replica.
+    if cap > 1 and not plugin.capabilities(max_sessions=cap).supports_multi_session_same_replica:
+        raise ValueError("This duplex plugin does not support sharing a replica; set max_sessions_per_replica to 1")
+
+
+@lru_cache(maxsize=8)
+def _silence_pcm_f32le_base64(samples: int) -> str:
+    return base64.b64encode(bytes(max(0, samples) * 4)).decode("ascii")
+
+
 def payload_turn_id(payload: object) -> int | None:
     if not isinstance(payload, Mapping):
         return None
@@ -448,7 +844,9 @@ def coerce_int(value: object) -> int | None:
 
 
 __all__ = [
+    "DefaultDuplexModelSessionState",
     "DuplexDataPlane",
+    "DuplexDataPlaneContext",
     "DuplexModelPlugin",
     "DuplexModelSessionState",
     "DuplexRuntimeConfigError",
@@ -459,5 +857,7 @@ __all__ = [
     "load_duplex_plugin",
     "payload_turn_id",
     "reject_changed_runtime_value",
+    "settle_response_runtime",
     "validate_duplex_plugin_sampling",
+    "validate_duplex_replica_policy",
 ]

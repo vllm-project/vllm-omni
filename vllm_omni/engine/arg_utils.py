@@ -20,6 +20,16 @@ from vllm_omni.worker.omni_connector_validation import validate_worker_omni_conn
 
 logger = init_logger(__name__)
 
+# Stage ids are non-negative, so this filter never matches a stage id; it must never be used as an index.
+# We use this as a sentinel value for --stage-id none to indicate all stages should be launched remotely.
+FRONTEND_ONLY_ID_FILTER = -1
+
+
+def is_frontend_only(single_stage_id_filter: int | None) -> bool:
+    """Return whether the stage filter asks the head to launch no local stage."""
+    return single_stage_id_filter == FRONTEND_ONLY_ID_FILTER
+
+
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
@@ -156,7 +166,7 @@ class OmniEngineArgs(EngineArgs):
             (default: "Qwen2_5OmniForConditionalGeneration")
         engine_output_type: Optional output type specification for the engine.
             Used to route outputs to appropriate processors (e.g., "image",
-            "audio", "latents"). If None, output type is inferred.
+            "audio", "latent", "token_ids"). If None, output type is inferred.
         hf_config_name: Optional key for HF config subkey to be extracted
             for this stage, e.g., talker_config; If None, the default
             HF config will be used.
@@ -198,6 +208,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_running_prefix_cache_reset: bool = True
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
@@ -269,6 +280,10 @@ class OmniEngineArgs(EngineArgs):
         )
         validate_worker_omni_connector(self.worker_cls, needs_connector)
         super().__post_init__()
+        # The NPU runner implements the auxiliary connector on its legacy
+        # execution path; CUDA/ROCm Omni stages use the V2 implementation.
+        if self.aux_output_config.enabled and not self.use_v2_model_runner and not current_omni_platform.is_npu():
+            raise ValueError("Auxiliary outputs require use_v2_model_runner=True for this Omni stage.")
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
@@ -430,6 +445,7 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
             use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,
@@ -547,6 +563,7 @@ class OrchestratorArgs:
 
     # === Observability ===
     log_stats: bool = False
+    collect_stage_metrics: bool = True
     enable_orch_monitor: bool = False
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===
@@ -558,6 +575,7 @@ class OrchestratorArgs:
     # === Diffusion model config ===
     num_gpus: int | None = None
     model_class_name: str | None = None
+    hsdp_weight_load_strategy: str | None = None
     diffusion_load_format: str | None = None
     lora_path: list[str] | None = None
     lora_backend: str | None = None
@@ -578,6 +596,10 @@ class OrchestratorArgs:
     diffusion_attention_config: str | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
+    # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
+    # today). None defers to the OmniDiffusionConfig default (enabled);
+    # --enforce-eager also disables it.
+    enable_cuda_graph_decode: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
     video_output_transport: dict[str, object] | None = None
@@ -586,6 +608,7 @@ class OrchestratorArgs:
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: str = "lossless"
+    vae_encode_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
@@ -613,7 +636,6 @@ class OrchestratorArgs:
     tts_max_instructions_length: int | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
-    auxiliary_text_encoder: str | None = None
     log_file: str | None = None
     replica_id: int | None = None
     omni_replica_address: str | None = None

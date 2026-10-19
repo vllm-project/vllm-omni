@@ -15,6 +15,7 @@ platforms:
 connectors:
   connector_of_shared_memory:
     extra:
+      talker_first_audio: true
       # Keep unqualified prefix-graph optimizations disabled in this profile.
       code_predictor_prefix_graphs: false
       ref_audio_artifact_cache_max_entries: 1024

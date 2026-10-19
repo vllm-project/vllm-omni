@@ -14,6 +14,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
 | `BestWishYsh/Helios-Base` / `Helios-Mid` / `Helios-Distilled` | 384x640 | 99 | 50 | 5.0 / 5.0 / 1.0 | — |
+| `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers` | 480x864 | 125 | 50 | 5.0 | ~75 GiB reserved (H100, CPU offload, SDPA) |
 | `sand-ai/MAGI-2-preview` | 512x896 | 125 | 100 | Model-fixed | Native four-GPU TP/SP; resident SP4 default; DLO available |
 | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480x832 | 81 | 50 | 6.0 | BF16 DiT + FP32 Wan VAE wrapper |
 | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704x1280 | 81 | 50 | 6.0 | BF16 DiT + LTX-2 Video VAE wrapper |
@@ -248,6 +249,24 @@ python text_to_video.py \
 > Helios image-to-video (I2V) and video-to-video (V2V) require image/video
 > conditioning tensors that cannot be passed through the JSON `--extra-body`
 > flag; they are out of scope for this text-to-video example.
+
+### Kandinsky 6 (TI2VA)
+
+The checkpoint is the public Hub repo `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`.
+`--enable-cpu-offload` is required on an 80 GB H100. Audio is on by default.
+
+```bash
+python text_to_video.py \
+  --model kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers \
+  --prompt "A golden retriever runs along a sunny beach, waves crashing, cinematic footage" \
+  --enable-cpu-offload \
+  --output kandinsky6_t2va.mp4
+```
+
+Video only: add `--extra-body '{"sample_audio": false}'`. Image-to-video uses
+the shared [`image_to_video.py`](../image_to_video/README.md) example with
+`--image`. Serving numbers and flags are in the
+[`Kandinsky 6 TI2VA recipe`](../../../recipes/Kandinsky/Kandinsky6-TI2VA.md).
 
 ## Key Arguments
 

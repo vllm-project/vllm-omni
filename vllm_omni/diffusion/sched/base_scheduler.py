@@ -38,7 +38,7 @@ from vllm_omni.diffusion.sched.interface import (
     StepBatchSamplingParamsKey,
     _AdmissionWaitDecision,
 )
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -120,6 +120,12 @@ class BaseScheduler(ABC):
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 max_in_flight_tokens=kv_vllm_config.max_in_flight_tokens,
+                enable_prefix_caching=bool(getattr(kv_vllm_config.cache_config, "enable_prefix_caching", False)),
+                prefix_caching_hash_algo=getattr(
+                    kv_vllm_config.cache_config,
+                    "prefix_caching_hash_algo",
+                    "sha256",
+                ),
             )
         else:
             if any(
@@ -164,7 +170,7 @@ class BaseScheduler(ABC):
         # First, schedule the RUNNING request(s)
         for request_id in self._running:
             state = self._request_states.get(request_id)
-            if state is not None:
+            if state is not None and self._can_schedule_running(state):
                 scheduled_cached_request_ids.append(request_id)
 
         # Second, schedule WAITING requests while capacity remains.
@@ -182,7 +188,8 @@ class BaseScheduler(ABC):
 
             diffusion_kv_metadata: DiffusionKVMetadata | None = None
             if self._diffusion_kv_manager is not None:
-                if self._diffusion_kv_manager.has_request(request_id):
+                already_reserved = self._diffusion_kv_manager.has_request(request_id)
+                if already_reserved:
                     diffusion_kv_metadata = self._diffusion_kv_manager.get_metadata(request_id)
                 else:
                     matched_tokens: list[int] = []
@@ -209,6 +216,11 @@ class BaseScheduler(ABC):
                         )
                         continue
                     if allocation is None:
+                        break
+                    # Check the lookup result before registering destination
+                    # pages with the connector: deferred pages can be freed.
+                    if not self._can_schedule_waiting(state):
+                        self._diffusion_kv_manager.free_request(request_id)
                         break
                     diffusion_kv_metadata = allocation
                     self._kv_request_generations[request_id] = allocation.allocation_generation
@@ -397,7 +409,7 @@ class BaseScheduler(ABC):
         )
 
     @abstractmethod
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         pass
 
     def has_requests(self) -> bool:
@@ -408,6 +420,16 @@ class BaseScheduler(ABC):
             or self._kv_finished_request_ids
             or self._kv_draining_requests
         )
+
+    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
+        return True
+
+    def get_execution_wait_timeout(self, now: float) -> float | None:
+        """Seconds until runnable work: zero runs now, None waits for an event."""
+        return 0.0
+
+    def notify_interaction(self, request_id: str) -> None:
+        """Observe an interaction only after all Workers accepted its RPC."""
 
     def update_kv_connector_output(self, output: KVConnectorOutput | None) -> None:
         if output is None:
@@ -457,7 +479,11 @@ class BaseScheduler(ABC):
 
     def pending_finished_request_ids(self) -> set[str]:
         """Finished requests whose state the engine has not consumed yet."""
-        return {request_id for request_id in self._finished_req_ids if request_id in self._request_states}
+        return {
+            request_id
+            for request_id in self._finished_req_ids
+            if (state := self._request_states.get(request_id)) is not None and state.is_finished()
+        }
 
     def get_admission_wait_decision(
         self,
@@ -632,12 +658,24 @@ class BaseScheduler(ABC):
         # in this update so the engine can observe the terminal state.
         # Also surface admission failures recorded while schedule() built this
         # output. Older finished ids retained only for Worker cleanup have
-        # already been popped by the Engine and are deliberately ignored.
+        # already been popped by the Engine and are deliberately ignored, even
+        # if a new, non-terminal request has since reused the same ID.
+        if self._diffusion_kv_manager is not None:
+            for request_id, status in statuses.items():
+                if status == DiffusionRequestStatus.FINISHED_COMPLETED:
+                    self._diffusion_kv_manager.publish_request(request_id)
+
         finished_req_ids = {
-            request_id for request_id in sched_output.finished_req_ids if request_id in self._request_states
+            request_id
+            for request_id in sched_output.finished_req_ids
+            if (state := self._request_states.get(request_id)) is not None and state.is_finished()
         }
         finished_req_ids |= {
-            request_id for request_id in sched_output.scheduled_request_ids if request_id in self._finished_req_ids
+            request_id
+            for request_id in sched_output.scheduled_request_ids
+            if request_id in self._finished_req_ids
+            and (state := self._request_states.get(request_id)) is not None
+            and state.is_finished()
         }
         finished_req_ids |= self._finish_requests(statuses, errors)
         return finished_req_ids

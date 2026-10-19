@@ -97,6 +97,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="moss_tts_local",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
@@ -114,6 +115,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="moss_tts_local_codec",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
@@ -133,4 +135,9 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
 # they have different talker architectures from the delay variant
 # (MossTTSRealtime / MossTTSLocalModel vs MossTTSDelayModel).
 
-__all__ = ["MOSS_TTS_PIPELINE", "MOSS_TTS_REALTIME_PIPELINE", "MOSS_TTS_LOCAL_PIPELINE"]
+
+__all__ = [
+    "MOSS_TTS_PIPELINE",
+    "MOSS_TTS_REALTIME_PIPELINE",
+    "MOSS_TTS_LOCAL_PIPELINE",
+]

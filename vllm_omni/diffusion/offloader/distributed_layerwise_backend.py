@@ -22,6 +22,7 @@ import threading
 import time
 import weakref
 from collections.abc import Sequence
+from functools import partial
 from itertools import chain
 from typing import Any
 
@@ -211,6 +212,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # (tail hook's async prefetch) — if so, skip the sync-prefetch.
         self._group_id: int = -1
         self._shared_slot_group: list[int] | None = None  # [-1, -1], shared
+        # A skipped block can retain a tensor view after its physical slot
+        # was reused. Track the hook owning the actual weights in each slot.
+        self._shared_slot_owner: list[int] | None = None
 
         # Parameters/buffers of the current and next blocks
         self.block_parameters: dict[str, nn.Parameter] = {}
@@ -596,6 +600,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # hooks can detect whether another group has overwritten the slot.
         if self._shared_slot_group is not None:
             self._shared_slot_group[slot] = self._group_id
+        if self._shared_slot_owner is not None:
+            self._shared_slot_owner[slot] = id(self)
 
         # Re-point using cached metadata (avoids per-layer dict lookups).
         for target, dtype, offset, numel, shape, stride in self._cached_repoint:
@@ -692,6 +698,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # collide with the head's read slot.
         if self._prev_hook is not None and self._prev_hook._prefetched_slot is not None:
             self.current_slot = self._prev_hook._prefetched_slot
+        weights_overwritten = (
+            self._shared_slot_owner is not None
+            and self._prev_hook is not None
+            and self._shared_slot_owner[self.current_slot] != id(self._prev_hook)
+        )
 
         # Group-first hook: check whether the shared buffer slot was
         # overwritten by another group since our last forward.  If the
@@ -700,14 +711,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         if self._is_group_first and self._prev_hook is not None:
             slot_contaminated = True
             if self._shared_slot_group is not None:
-                slot_contaminated = self._shared_slot_group[self.current_slot] != self._group_id
+                slot_contaminated = weights_overwritten or self._shared_slot_group[self.current_slot] != self._group_id
             if slot_contaminated:
                 # Another group (or no group) wrote to our slot — re-fetch
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             # Always wait for data to be ready (handles both sync and async paths)
             self._prev_hook._wait_for_weights(self.current_slot)
-        elif not self.is_materialized and self._prev_hook is not None:
-            # Previous hook was skipped (e.g. by cache-dit), sync-prefetch
+        elif (not self.is_materialized or weights_overwritten) and self._prev_hook is not None:
+            # A predecessor was skipped, or this block's retained view points
+            # at a slot overwritten since its previous prefetch.
             self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             self._prev_hook._wait_for_weights(self.current_slot)
 
@@ -823,7 +835,7 @@ class PinnedResidentLayerGroup:
                     bufs,
                     tensor_transforms,
                 )
-                cpu_shards = {}
+                cpu_shards: dict[torch.dtype, torch.Tensor] = {}
             else:
                 cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
                     params,
@@ -1544,6 +1556,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         dit_module = component.module
         nested = {child.path.rsplit(".", 1)[-1]: child for child in component.children}
+        block_ids = {id(block) for block in stack.blocks}
         for name, module in dit_module.named_children():
             if name in stack.attrs:
                 logger.debug("Skipped blocks module %s", name)
@@ -1567,7 +1580,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 continue
 
             try:
-                module.to(self.device)
+                # Place only this child's non-block tensors. A wrapper can
+                # share the streamed layers through another attribute; moving
+                # it wholesale would materialize the entire DiT on device.
+                if any(id(child) in block_ids for child in module.modules()):
+                    move_non_block_state_to_device(module, (stack.blocks,), self.device)
+                else:
+                    module.to(self.device)
             except (NotImplementedError, RuntimeError):
                 # Non-persistent buffers such as RoPE frequencies do not
                 # exist in the checkpoint and must be reconstructed.
@@ -1770,6 +1789,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # that last wrote to that slot.  Group-first hooks use this to
         # skip sync-prefetch when the slot still contains their own data.
         shared_slot_group = [-1, -1]
+        shared_slot_owner = [-1, -1]
 
         for group_idx, group in enumerate(self._all_hook_groups):
             for hook in group:
@@ -1782,6 +1802,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     hook.cpu_staging_events = cpu_staging_events
                 hook._group_id = group_idx
                 hook._shared_slot_group = shared_slot_group
+                hook._shared_slot_owner = shared_slot_owner
 
         # Defer every group's first prefetch until its first forward. DP ranks
         # may intentionally own different rank-local groups (for example only
@@ -1889,10 +1910,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         skipped_allgather = bool(allgather_hooks) and not restore_allgather_weights
         if skipped_allgather:
             # Startup rollback cannot safely enter a collective that a failed
-            # peer may never reach. Those blocks cannot be reconstructed, so
-            # make accidental reuse explicit instead of accepting zero weights.
+            # peer may never reach, and shutdown has no later user. Those blocks
+            # cannot be reconstructed, so make accidental reuse explicit
+            # instead of accepting zero weights.
             self._poisoned_reason = (
-                "Distributed layerwise offload startup skipped AllGather weight restoration; "
+                "Distributed layerwise offload skipped AllGather weight restoration; "
                 "recreate the backend and reload the pipeline before retrying"
             )
 
@@ -1909,7 +1931,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         removal_error = run_cleanup_steps(
             (
                 "removing a distributed block hook",
-                lambda block=block: remove_distributed_block_hook(block),
+                partial(remove_distributed_block_hook, block),
             )
             for blocks in self._blocks
             for block in blocks
@@ -1917,7 +1939,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         encoder_error = run_cleanup_steps(
             (
                 "clearing distributed encoder state",
-                lambda module=module: clear_encoder_layerwise_state(module),
+                partial(clear_encoder_layerwise_state, module),
             )
             for module in self._encoder_modules
         )
@@ -1980,6 +2002,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         self._disable(restore_allgather_weights=True)
+
+    def shutdown(self) -> None:
+        # Restoring AllGather blocks rebuilds the full DiT in every rank's host
+        # memory, which can outlast the executor's shutdown grace period.
+        self._disable(restore_allgather_weights=False)
 
     @staticmethod
     def _allocate_shared_buffers(
