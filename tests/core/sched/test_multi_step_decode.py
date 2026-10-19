@@ -257,6 +257,14 @@ def test_scheduler_allows_multi_step_refusals():
                 make_model_config(enable_return_routed_experts=True)
             )
         },
+        {
+            # Prefix caching on: the runner's omni prefix cache refuses windows.
+            "vllm_config": make_vllm_config(
+                cache_config=SimpleNamespace(
+                    mamba_cache_mode="off", enable_prefix_caching=True
+                )
+            )
+        },
     ]
     for overrides in refusals:
         assert scheduler_allows_multi_step(make_configured_scheduler(**overrides)) is False, overrides

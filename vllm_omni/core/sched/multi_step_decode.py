@@ -231,6 +231,13 @@ def scheduler_allows_multi_step(scheduler: Any) -> bool:
     if getattr(model_config, "enable_return_routed_experts", False):
         return False
     cache_config = getattr(vllm_config, "cache_config", None)
+    if getattr(cache_config, "enable_prefix_caching", False):
+        # The NPU window executor refuses to run with the omni tensor prefix
+        # cache active (the omni prefix cache object exists exactly when prefix
+        # caching is on), so gate it here as well: the fence makes a refusal
+        # recoverable, but not planning a doomed window avoids the whole
+        # plan/allocate/reconcile churn on every step.
+        return False
     if getattr(cache_config, "mamba_cache_mode", "off") == "align":
         return False
     return True
