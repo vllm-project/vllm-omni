@@ -1379,11 +1379,29 @@ class DuplexEngineSession:
                     committed_history = self.truncate_history_item(
                         item_id, audio_end_ms=playback.committed_ms, playback=playback
                     )
-        if hard_truncated:
-            # Keep only the immutable stored prefix/cutoff, sharing the history
-            # string. Duplicate ACKs cannot expand it or recreate full evidence.
+        retain_alignment = (
+            bool(self._conversation.item_audio_text_marks.get(item_id))
+            and (playback is None or not playback.text_requires_complete_audio)
+            and item_id not in self._conversation.heard_prefixes
+        )
+        if hard_truncated and (require_audio_complete or not retain_alignment):
+            # Without usable alignment, retain the conservative prefix/cutoff.
             self.retire_history_calibration(response_id)
         else:
+            # Ordinary aligned history keeps its cheap timing marks, just as
+            # after a full ACK. A later explicit stop can shorten it accurately;
+            # releasing the full snapshot prevents ACKs from expanding it.
+            if retain_alignment and snapshot is not None and playback is not None:
+                marks = self._conversation.item_audio_text_marks[item_id]
+                total_ms = max(playback.sent_ms, playback.generated_ms)
+                if max(mark.audio_end_ms for mark in marks) < total_ms:
+                    # Preserve the interpolation tail before its total duration
+                    # and original text length disappear with the snapshot.
+                    marks.append(
+                        DuplexAssistantAudioTextMark(
+                            text_chars=self._message_text_len(snapshot[0]), audio_end_ms=total_ms
+                        )
+                    )
             self.release_response_playback(response_id)
             self.release_response_history_snapshot(response_id)
         return committed_history
@@ -1609,6 +1627,10 @@ class DuplexEngineSession:
             self._store_history_item_message(item_id, _object_dict(role="assistant", content=text[:char_end]))
             return True
         playback = playback or self._playback_cursor_for_item_id(item_id)
+        if playback is None and response_id is not None and response_id != self.active_response_id:
+            # Retired items must not borrow the current response's playback
+            # policy or duration. Their retained marks use absolute offsets.
+            playback = DuplexPlaybackCursor()
         if hard:
             previous_cap_ms = self._conversation.hard_truncations_ms.get(item_id)
             self._conversation.hard_truncations_ms[item_id] = (
@@ -1697,6 +1719,11 @@ class DuplexEngineSession:
             if item_id.startswith("item_"):
                 self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
             return True
+        if not hard and playback is not None and max(playback.sent_ms, playback.generated_ms) == 0:
+            # No response snapshot or output cursor remains: this is finalized
+            # history. Delayed progress ACKs cannot shorten it; only a new
+            # explicit truncate may change the stored prefix.
+            return self._message_text_len(stored_message) > 0
         message = stored_message
         changed = self._truncate_message_to_audio_ms(
             message,
@@ -1845,16 +1872,18 @@ class DuplexEngineSession:
         previous_chars = 0
         for mark in marks:
             mark_ms = max(previous_ms, mark.audio_end_ms)
-            mark_chars = min(text_len, max(previous_chars, mark.text_chars))
+            # Marks refer to the original transcript, even after the stored
+            # text was shortened. Clamp the result, not the interpolation scale.
+            mark_chars = max(previous_chars, mark.text_chars)
             if audio_end_ms <= mark_ms:
                 if mark_ms <= previous_ms:
-                    return mark_chars
+                    return min(text_len, mark_chars)
                 ratio = (audio_end_ms - previous_ms) / max(1, mark_ms - previous_ms)
-                return int(previous_chars + (mark_chars - previous_chars) * max(0.0, min(1.0, ratio)))
+                return min(text_len, int(previous_chars + (mark_chars - previous_chars) * max(0.0, min(1.0, ratio))))
             previous_ms = mark_ms
             previous_chars = mark_chars
         final_ms = max(playback.sent_ms, playback.generated_ms, previous_ms)
-        if audio_end_ms >= final_ms:
+        if audio_end_ms >= final_ms or previous_chars >= text_len:
             return text_len
         ratio = (audio_end_ms - previous_ms) / max(1, final_ms - previous_ms)
         return int(previous_chars + (text_len - previous_chars) * max(0.0, min(1.0, ratio)))

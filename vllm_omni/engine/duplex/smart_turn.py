@@ -138,9 +138,19 @@ class SmartTurnBackendProvider:
             return self._backend
         with self._lock:
             if self._backend is None:
-                path = self._resolve_local_artifact()
-                self._verify_checksum(path)
-                self._backend = SmartTurnBackend(path)
+                try:
+                    path = self._resolve_local_artifact()
+                    self._verify_checksum(path)
+                    self._backend = SmartTurnBackend(path)
+                except SemanticVADUnavailableError:
+                    raise
+                except Exception as exc:
+                    # Filesystem, ORT initialization and warm-up failures all
+                    # disable this detector through the same serving contract.
+                    raise SemanticVADUnavailableError(
+                        "Could not initialize Smart Turn semantic VAD; check artifact access and "
+                        "duplex_session.semantic_vad_model_path, ONNX Runtime and transformers"
+                    ) from exc
                 logger.info("Loaded Smart Turn semantic VAD model from %s", path)
         return self._backend
 
@@ -150,16 +160,13 @@ class SmartTurnBackendProvider:
             if path.is_file():
                 return path
             raise SemanticVADUnavailableError(f"Configured Smart Turn model does not exist: {path}")
-        try:
-            from vllm.transformers_utils.repo_utils import try_get_local_file
+        from vllm.transformers_utils.repo_utils import try_get_local_file
 
-            cached = try_get_local_file(
-                model=SMART_TURN_REPO_ID,
-                file_name=SMART_TURN_FILENAME,
-                revision=SMART_TURN_REVISION,
-            )
-        except Exception:
-            cached = None
+        cached = try_get_local_file(
+            model=SMART_TURN_REPO_ID,
+            file_name=SMART_TURN_FILENAME,
+            revision=SMART_TURN_REVISION,
+        )
         if isinstance(cached, Path) and cached.is_file():
             return cached
         raise SemanticVADUnavailableError(

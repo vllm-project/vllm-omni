@@ -126,3 +126,66 @@ def test_endpoint_report_counts_commit_before_continuation_in_same_append(monkey
     assert row["append_endpoint_delay_ms"] >= row["endpoint_delay_ms"]
     if chunk_ms == 10_000:
         assert row["append_endpoint_delay_ms"] == 5500
+
+
+@pytest.mark.parametrize("chunk_ms", [100, 10_000])
+def test_chunk_cost_counts_failed_evaluations(monkeypatch, chunk_ms):
+    from tests.engine.duplex.test_semantic_vad import _loud_frames_are_speech, _ScriptedTurn
+
+    class _SileroBackend:
+        def new_state(self):
+            return object()
+
+        def infer(self, frame, state):
+            return _loud_frames_are_speech(frame), state
+
+    # bench_chunk_cost replays each clip three times. Both pauses invoke the
+    # scorer even when the final invocation produces no probability.
+    scorer = _ScriptedTurn(*(value for _ in range(3) for value in (0.1, RuntimeError("scoring failed"))))
+
+    class _SmartBackend:
+        predict = staticmethod(scorer)
+
+    silero_provider = vad.SileroVADBackendProvider()
+    smart_provider = smart_turn.SmartTurnBackendProvider()
+    monkeypatch.setattr(silero_provider, "get", _SileroBackend)
+    monkeypatch.setattr(smart_provider, "get", _SmartBackend)
+    audio = np.concatenate([np.full(16000, 0.2), np.zeros(32000), np.full(16000, 0.2)]).astype(np.float32)
+    script = Path(__file__).resolve().parents[3] / "benchmarks/duplex_vad/bench_vad_latency.py"
+    result = runpy.run_path(str(script))["bench_chunk_cost"](
+        silero_provider, smart_provider, {"resume": audio}, chunk_ms
+    )
+    assert len(scorer.windows) == 6
+    assert result["semantic_vad"]["smart_turn_chunk"]["n"] == (6 if chunk_ms == 100 else 3)
+    assert "smart_turn_chunk" not in result["server_vad"]
+
+
+@pytest.mark.parametrize("chunk_ms", [100, 127, 20_000])
+@pytest.mark.parametrize("last_score", [0.9, RuntimeError("scoring failed")], ids=["complete", "error"])
+def test_endpoint_report_counts_every_scorer_call(monkeypatch, chunk_ms, last_score):
+    from tests.engine.duplex.test_semantic_vad import _loud_frames_are_speech, _ScriptedTurn
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    class _SileroBackend:
+        def new_state(self):
+            return object()
+
+        def infer(self, frame, state):
+            return _loud_frames_are_speech(frame), state
+
+    provider = vad.SileroVADBackendProvider()
+    monkeypatch.setattr(provider, "get", _SileroBackend)
+    scorer = _ScriptedTurn(0.1, last_score)
+    detector = SemanticTurnDetector(
+        TurnDetectionConfig.from_realtime({"type": "semantic_vad"}),
+        backend_provider=provider,
+        turn_scorer=scorer,
+    )
+    audio = np.concatenate([np.full(16000, 0.2), np.zeros(32000), np.full(16000, 0.2)]).astype(np.float32)
+    script = Path(__file__).resolve().parents[3] / "benchmarks/duplex_vad/bench_vad_latency.py"
+    row = runpy.run_path(str(script))["_endpoint_row"](detector, audio, chunk_ms, provider)
+    assert len(scorer.windows) == 2
+    assert row["smart_turn_calls"] == 2
+    assert row["false_cutoffs"] == 0
+    expected = 4000 if isinstance(last_score, Exception) else 1200
+    assert expected <= row["endpoint_delay_ms"] <= expected + 100

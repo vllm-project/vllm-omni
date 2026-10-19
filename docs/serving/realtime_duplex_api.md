@@ -487,8 +487,10 @@ and either a full playback ACK or an explicit hard truncate, in either order: if
 output applies that saved progress to the final transcript and releases the
 response without requiring another ACK. Ordinary partial playback retains the
 response for a later ACK. An explicit truncate stops playback at its cutoff and
-does not require acknowledging the discarded audio. Only the stored history
-prefix and cutoff survive cleanup; subsequent ACKs cannot restore unheard text.
+does not require acknowledging the discarded audio. Without calibration, text
+timing marks remain available for later, stricter item truncation. When usable
+alignment is unavailable, only the stored history prefix and cutoff survive.
+Subsequent progress ACKs cannot change finalized history or restore unheard text.
 When history calibration is enabled, its bounded cache retains the evidence
 needed for prefix correction until retirement, including hard-capped replies.
 Cancellation does not mark unfinished audio as fully generated;

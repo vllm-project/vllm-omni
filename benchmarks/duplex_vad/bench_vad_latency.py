@@ -214,9 +214,7 @@ def bench_chunk_cost(silero_provider, smart_turn_provider, clips: dict[str, np.n
             for _ in range(3):
                 detector = _detector(kind, silero_provider, smart_turn_provider)
                 for _, decisions, seconds in stream(detector, audio, chunk_ms):
-                    target = (
-                        evaluating if any(r.turn_complete_probability is not None for _, r in decisions) else ordinary
-                    )
+                    target = evaluating if any(r.turn_evaluations for _, r in decisions) else ordinary
                     target.append(seconds)
         results[kind] = {"ordinary_chunk": stats_ms(ordinary)}
         if evaluating:
@@ -245,9 +243,7 @@ def _endpoint_row(detector, audio: np.ndarray, chunk_ms: int, silero_provider: S
         "false_cutoffs": sum(1 for segment_ms, _ in commits if segment_ms < end_ms),
         "endpoint_delay_ms": (final[0][0] - end_ms) if final else None,
         "append_endpoint_delay_ms": (final[0][1] - end_ms) if final else None,
-        "smart_turn_calls": sum(
-            1 for _, decisions, _ in chunks for _, result in decisions if result.turn_complete_probability is not None
-        ),
+        "smart_turn_calls": sum(result.turn_evaluations for _, decisions, _ in chunks for _, result in decisions),
     }
 
 

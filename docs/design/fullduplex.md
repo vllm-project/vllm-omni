@@ -47,8 +47,12 @@ can add transcript or completion metadata after the ACK, so history is reconcile
 against the retained cursor before releasing the snapshot and pending item state.
 Deleted history is never reconstructed. Natural drain completion establishes
 `audio_complete`; cancellation does not. A later response's cursor and history
-position remain independent. A hard stop retains only the stored history prefix
-and its cutoff, so a duplicate ACK cannot restore unheard text. Plugin runtime
+position remain independent. Without calibration, aligned history keeps its
+timing marks after a hard stop so a later explicit truncate can shorten the
+stored prefix. Marks retain their original character offsets; repeated truncation
+does not rescale them to the remaining text. Unaligned stops and retired
+calibration evidence keep only the stored prefix and cutoff. Delayed progress
+ACKs cannot change finalized history or restore unheard text. Plugin runtime
 settlement follows all history writes, including cancellation writeback into a
 reserved older turn; it must observe the final committed result.
 

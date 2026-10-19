@@ -190,3 +190,53 @@ def test_hard_stop_retires_registered_item_without_snapshot():
     apply_playback_ack(session, {"response_id": "old", "played_ms": 400})
     assert session.history == ({"role": "assistant", "content": "he"},)
     _assert_released(session, "old")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_hard,initial_ms", [(False, 400), (True, 400), (True, 300), (True, 200)])
+@pytest.mark.parametrize("next_response", [False, True])
+@pytest.mark.parametrize("partial_marks", [False, True])
+async def test_repeated_item_truncation_keeps_original_alignment(
+    initial_hard, initial_ms, next_response, partial_marks
+):
+    h = await open_qwen()
+    try:
+        session = h.session
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        response = session.begin_response()
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("hello")
+        if partial_marks:
+            session.mark_audio_sent(200, text_chars=2)
+            session.mark_audio_sent(400, audio_complete=True)
+        else:
+            session.mark_audio_sent(400, text_chars=5, audio_complete=True)
+        session.register_history_item(f"item_{response}", session.end_response())
+        await h.runner._run_internal_payload(
+            {"type": "playback.ack", "response_id": response, "played_ms": initial_ms, "truncate": initial_hard}
+        )
+        await h.settle()
+        assert session.history[-1]["content"] == "hello"[: 5 * initial_ms // 400]
+        _assert_released(session, response)
+        assert f"item_{response}" not in session._conversation.heard_prefixes
+        assert session._conversation.item_audio_text_marks[f"item_{response}"]
+        if next_response:
+            newer = session.begin_response()
+            h.runner.emit(h.runner.model.response_created_payload(newer, epoch=session.epoch))
+            # This response has no alignment; its cursor must not affect the old item.
+            session.mark_audio_sent(1000, text_requires_complete_audio=True)
+        playback = session.playback
+        expected = session.history[-1]["content"]
+        for cutoff, keep_chars in [(300, 3), (200, 2), (160, 1 if partial_marks else 2)]:
+            expected = expected[:keep_chars]
+            events = await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=cutoff))
+            assert not any(event.type == "error" for event in events)
+            assert session.history[-1]["content"] == expected
+            for ack_ms in (400, 100, 0, 400):
+                events = await h.run(commands.AckPlayback(response_id=response, played_ms=ack_ms))
+                assert not any(event.type == "error" for event in events)
+                assert session.history[-1]["content"] == expected
+                _assert_released(session, response)
+                assert session.playback == playback
+    finally:
+        await close_harness(h)

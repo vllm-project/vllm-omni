@@ -264,6 +264,8 @@ class TurnDetectionResult:
     backend: str = "silero"
     #: Smart Turn's P(turn complete) when this chunk ended a pause (``semantic_vad`` only).
     turn_complete_probability: float | None = None
+    #: Actual Smart Turn scoring attempts, including failures, summed across frames.
+    turn_evaluations: int = 0
     #: Internal diagnostics, emitted on candidate evaluation and final commit only.
     semantic_decision: SemanticDecision | None = None
     commit_reason: Literal["semantic_complete", "silence_timeout"] | None = None
@@ -328,6 +330,7 @@ def _process_segments(
                     if result.turn_complete_probability is not None or result.semantic_decision == "smart_turn_error"
                     else accumulated.turn_complete_probability
                 ),
+                turn_evaluations=accumulated.turn_evaluations + result.turn_evaluations,
                 semantic_decision=result.semantic_decision or accumulated.semantic_decision,
                 commit_reason=result.commit_reason,
             )
@@ -546,6 +549,7 @@ class SemanticTurnDetector:
             self._turn_start_ms = start_ms or 0
 
         probability: float | None = None
+        evaluations = 0
         decision: SemanticDecision | None = None
         commit_reason: Literal["semantic_complete", "silence_timeout"] | None = None
         commit = False
@@ -562,7 +566,9 @@ class SemanticTurnDetector:
                 # subtracting that minimum would move the timeout deadline.
                 self._pause_start_ms = inner.silence_start_ms
                 try:
-                    probability = float(scorer(self._turn_window()))
+                    window = self._turn_window()
+                    evaluations = 1
+                    probability = float(scorer(window))
                 except Exception:
                     # Degrade to the eagerness silence limit rather than drop
                     # or prematurely commit the turn.
@@ -605,6 +611,7 @@ class SemanticTurnDetector:
             create_response=self.config.create_response,
             backend=self.backend_name,
             turn_complete_probability=probability,
+            turn_evaluations=evaluations,
             semantic_decision=decision,
             commit_reason=commit_reason,
         )

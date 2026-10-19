@@ -29,6 +29,11 @@ append's end, including the wait to collect that chunk. Both are audio-time
 measurements and exclude model compute and network latency. Detector wall time
 is reported separately under chunk cost.
 
+`smart_turn_calls` counts scoring attempts, including failed calls. Multiple
+candidate pauses within one append each count, even if their decisions are
+merged into a single output segment. Chunk cost classifies an append as a
+Smart Turn chunk whenever it attempted scoring, including inference failures.
+
 ## Labeled clips
 
 The endpoint scenarios need clips labeled complete/incomplete, for example a
