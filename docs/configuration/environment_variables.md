@@ -130,9 +130,21 @@ settings.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
-| `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS` | Non-negative integer; unset or empty means each consumer's own default (Boogu-Image: `2048`; MammothModa2: `0`) | Token gate of the shared `fused_qk_norm_rope` op: a rotary table is packed for the fused kernel only when it spans at least this many positions (`B*S`); read at forward time | Environment-only. `0` = always fuse; a very large value disables the fused path. Any other value raises `ValueError` on the first forward. The crossover is host-dependent; re-benchmark before overriding. | Experimental performance control |
+| `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS` | Non-negative integer; unset or empty means each consumer's own default (Boogu-Image: `2048`; MammothModa2: `0`) | Token gate for consumers that read this setting; read at forward time. Excludes Qwen-Image's `QwenImageTransformer2DModel` (see below). | Environment-only for those consumers. `0` removes the token threshold; a very large value disables the fused path. Invalid values raise `ValueError` on the first forward. The crossover is host-dependent; re-benchmark before overriding. | Experimental performance control |
 | `VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | ModelOpt NVFP4 compatibility patch; read when `vllm_omni.patch` imports | Environment-only escape hatch. Any other value means false. Set only to diagnose the upstream NaN-scale issue. | Diagnostic and temporary |
 | `VLLM_OMNI_USE_QUACK_FP8` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; unset means hardware auto-detection | FP8 scaled matrix multiplication; evaluated when quack capability is selected | A set value overrides auto-detection. Any non-truthy value forces quack off. If quack cannot load, vLLM-Omni warns and falls back to FlashInfer. | Experimental performance control |
+
+!!! note "Qwen-Image compatibility change"
+    `QwenImageTransformer2DModel` no longer reads
+    `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS`. Its fused QK RMSNorm + RoPE paths
+    use a fixed threshold of `2048` positions (`B*S`): the combined text/image
+    sequence for joint fusion, or each stream for per-stream fusion.
+    An existing large value no longer disables fusion for this transformer,
+    and `0` does not force fusion below that threshold. Deployments that used
+    this variable to disable Qwen-Image fusion can therefore run fused kernels
+    after upgrading. Fusion still requires supported BF16 CUDA inputs and
+    Triton; unsupported devices, dtypes, or geometry use the existing norm/RoPE
+    path.
 
 `QUACK_CACHE_DIR` is owned by the external quack library and is not an
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
