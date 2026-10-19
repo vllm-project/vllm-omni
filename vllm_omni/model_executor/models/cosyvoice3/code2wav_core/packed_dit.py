@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from ..runtime import cosyvoice3_packed_fa_version
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
@@ -24,6 +25,7 @@ from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 # FA3 pages the packed KV in place. vLLM's FA2 requires pages of a multiple of
 # 16 frames, so every row is gathered onto a page-aligned start.
 PAGE_SIZE = {3: 1, 2: 16}
+logger = init_logger(__name__)
 
 
 def page_metadata(
@@ -142,6 +144,7 @@ class PackedDiT:
         if fa_version is None:
             raise ValueError("Packed Flow requires FlashAttention 2 or 3")
         self.fa_version = fa_version
+        logger.info_once("CosyVoice3 packed Flow selected FlashAttention %d", fa_version)
         self.dit = dit
         self.compiled_full_forward = None
         self.graph_buckets = False

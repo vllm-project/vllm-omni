@@ -7,6 +7,9 @@ from contextlib import nullcontext
 from functools import cache
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _FALSE_ENV_VALUES = ("0", "false", "False", "")
 
@@ -62,12 +65,38 @@ def cosyvoice3_packed_fa_version() -> int | None:
 
 def cosyvoice3_full_response_enabled() -> bool:
     """Opt-in packed full-response path; devices without FA2/FA3 retain the standard path."""
-    return _env_flag("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0") and cosyvoice3_packed_fa_version() is not None
+    return _packed_profile_enabled("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS")
 
 
 def cosyvoice3_packed_streaming_enabled() -> bool:
     """Opt-in packed, chunk-causal Flow with request-owned GPU HiFT state."""
-    return _env_flag("COSYVOICE3_PACKED_STREAMING", "0") and cosyvoice3_packed_fa_version() is not None
+    return _packed_profile_enabled("COSYVOICE3_PACKED_STREAMING")
+
+
+def _packed_profile_enabled(environment_variable: str) -> bool:
+    """Resolve an opted-in packed profile and explain unsupported fallbacks."""
+    if not _env_flag(environment_variable, "0"):
+        return False
+
+    fa_version = cosyvoice3_packed_fa_version()
+    if fa_version is not None:
+        return True
+
+    pinned = os.environ.get("COSYVOICE3_PACKED_FA_VERSION", "")
+    if pinned:
+        logger.warning_once(
+            "%s=1 but pinned FlashAttention %s is unavailable on this GPU/build; "
+            "CosyVoice3 will use the stock Flow path",
+            environment_variable,
+            pinned,
+        )
+    else:
+        logger.warning_once(
+            "%s=1 but no supported CUDA FlashAttention backend is available; "
+            "CosyVoice3 will use the stock Flow path",
+            environment_variable,
+        )
+    return False
 
 
 def cosyvoice3_packed_inference_enabled() -> bool:
