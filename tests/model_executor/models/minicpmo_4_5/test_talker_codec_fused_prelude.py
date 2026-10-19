@@ -275,3 +275,24 @@ def test_bool_flag_parses_strings_strictly():
     for bogus in ("yes", "", "fa1se", None, 2):
         with pytest.raises(ValueError):
             _bool_flag(bogus, "k")
+
+
+def test_extra_config_reaches_the_switch_from_the_connector_dict():
+    """The dict shape ``arg_utils`` builds must resolve to the switch value."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_tts as tts_mod
+
+    holder = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                stage_connector_config={
+                    "name": "SharedMemoryConnector",
+                    "extra": {"talker_codec_fused_prelude": "false"},
+                }
+            )
+        )
+    )
+    extra = tts_mod.MiniCPMO45OmniTTSForConditionalGeneration._extra_config(holder)
+    assert extra["talker_codec_fused_prelude"] == "false"
+    assert tts_mod._bool_flag(extra["talker_codec_fused_prelude"], "talker_codec_fused_prelude") is False

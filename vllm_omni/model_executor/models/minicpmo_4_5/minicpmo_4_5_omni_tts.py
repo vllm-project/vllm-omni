@@ -1909,7 +1909,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return generator
 
     def _extra_config(self) -> dict[str, Any]:
-        """Stage-connector ``extra``: the per-stage knobs a deploy YAML can set."""
+        """Stage-connector ``extra``: the per-stage knobs a deploy YAML can set.
+
+        The talker has no incoming connector edge, so ``get_stage_connector_spec``
+        takes the producer fallback and hands it the extra of its outgoing
+        ``1->2`` edge. If a deploy ever gives stage 1 an explicit
+        ``input_connectors`` entry, the dict comes from that edge instead and
+        ``talker_codec_fused_prelude`` silently reverts to the default.
+        """
         model_config = getattr(self.vllm_config, "model_config", None)
         connector = getattr(model_config, "stage_connector_config", None)
         if isinstance(connector, Mapping):
