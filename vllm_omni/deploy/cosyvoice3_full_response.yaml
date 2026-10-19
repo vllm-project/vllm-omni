@@ -1,6 +1,9 @@
 # Opt-in single-GPU full-response throughput profile (not streaming TTFP).
 # Stage 1 selects the packed backend through its environment below:
 # FlashAttention 3 on Hopper, FlashAttention 2 on other CUDA GPUs.
+# On non-Hopper FA2 GPUs this now enables packed Flow, batched HiFT, and GPU F0
+# instead of falling back to stock Flow. Memory use and numerics can change;
+# use cosyvoice3.yaml if the profile causes memory pressure on smaller GPUs.
 # The 4096-frame internal boundary exceeds this profile's 2048-token output cap.
 async_chunk: true
 connectors:

@@ -85,14 +85,14 @@ def _packed_profile_enabled(environment_variable: str) -> bool:
     pinned = os.environ.get("COSYVOICE3_PACKED_FA_VERSION", "")
     if pinned:
         logger.warning_once(
-            "%s=1 but pinned FlashAttention %s is unavailable on this GPU/build; "
+            "%s is enabled but pinned FlashAttention %s is unavailable on this GPU/build; "
             "CosyVoice3 will use the stock Flow path",
             environment_variable,
             pinned,
         )
     else:
         logger.warning_once(
-            "%s=1 but no supported CUDA FlashAttention backend is available; "
+            "%s is enabled but no supported CUDA FlashAttention backend is available; "
             "CosyVoice3 will use the stock Flow path",
             environment_variable,
         )
