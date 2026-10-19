@@ -1679,9 +1679,10 @@ truncating ack after an interruption (what was actually heard)
 
 Send `response_id` or `item_id` to identify the playback being acknowledged.
 For compatibility, an omitted ID can select the active response. For a finished
-response, the server can infer a sole pending item, or a sole stored assistant
-item when no items are pending; either must belong to the most recently started
-response associated with current playback. A stored item must also have produced
+response, the server can infer its pending or stored assistant item if it belongs
+to the most recently started response associated with current playback. Older
+pending replies and imported history do not change that target, including after
+a partial ACK moves it into stored history. A stored item must also have produced
 audio. The session retains that fact after releasing the full playback records,
 including for replies without text. An imported item's `item_`
 prefix alone does not make it a playback target. An older reply is not selected

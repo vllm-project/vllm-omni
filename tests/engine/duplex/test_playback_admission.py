@@ -17,15 +17,29 @@ from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.mark.parametrize("target", ["none", "text", "ambiguous"])
-def test_idless_hard_ack_rejects_missing_audio_or_ambiguous_target_without_mutation(target):
+@pytest.mark.parametrize("target", ["none", "text", "deleted_current", "pending_text", "replaced_current"])
+def test_idless_hard_ack_rejects_missing_current_audio_without_mutation(target):
     session = _session()
-    for _ in range(2 if target == "ambiguous" else int(target == "text")):
+    if target == "pending_text":
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+    count = 3 if target == "deleted_current" else int(target != "none")
+    for _ in range(count):
         response = session.begin_response()
         session.append_assistant_text("hello")
-        if target == "ambiguous":
+        if target in {"deleted_current", "pending_text", "replaced_current"}:
             session.mark_audio_sent(400, text_chars=5, audio_complete=True)
         session.register_history_item(f"item_{response}", session.end_response())
+    if target == "deleted_current":
+        assert session.delete_history_item(f"item_{response}")
+    elif target == "pending_text":
+        response = session.begin_response()
+        session.append_assistant_text("text without audio")
+        session.end_response(commit_text=False)
+        assert len(session.pending_history_item_ids) == 2
+    elif target == "replaced_current":
+        apply_playback_ack(session, {"response_id": response, "played_ms": 400})
+        session.register_history_item(f"item_{response}", {"role": "assistant", "content": "imported replacement"})
+        assert not session.history_item_has_audio(f"item_{response}")
     session.acknowledge_playback(200)
     before = copy.deepcopy((session._conversation, session._playback))
     events = apply_playback_ack(session, {"played_ms": 0, "truncate": True})
@@ -73,7 +87,12 @@ async def test_idless_ack_does_not_adopt_imported_history(reply_history, hard, i
             commands.command_from_realtime({"type": "playback.ack", "played_ms": 200, "truncate": hard})
         )
         assert len(events) == 1, events
-        if hard:
+        if reply_history == "stored":
+            assert events[0].type == "playback.acknowledged"
+            assert events[0].details["item_id"] == f"item_{response}"
+            assert events[0].details["playback"]["committed_ms"] == 200
+            assert session.history_item_ids[f"item_{response}"]["content"] == "he"
+        elif hard:
             assert events[0].type == "error" and events[0].code == "bad_event"
             assert (session._conversation, session._playback) == before
         else:
@@ -122,15 +141,23 @@ def test_idless_ack_resolves_one_audio_target_before_mutation(target, hard):
 
 
 @pytest.mark.parametrize("hard", [False, True])
-def test_idless_ack_resolves_retired_audio_only_item(hard):
+@pytest.mark.parametrize("older_pending", [False, True])
+def test_idless_ack_resolves_retired_audio_only_item(hard, older_pending):
     session = _session()
+    if older_pending:
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        session.begin_response()
+        session.append_assistant_text("older answer")
+        session.mark_audio_sent(600, text_chars=12, audio_complete=True)
+        session.end_response()
+    pending_before = dict(session.pending_history_item_ids)
     response = session.begin_response()
     session.mark_audio_sent(400, audio_complete=True)
     session.end_response()
     apply_playback_ack(session, {"response_id": response, "played_ms": 400})
     item_id = f"item_{response}"
     assert response not in session._playback.by_response
-    assert not session.pending_history_item_ids
+    assert dict(session.pending_history_item_ids) == pending_before
     assert session.last_assistant_full_message is None
     assert session.history_item_has_audio(item_id)
     events = apply_playback_ack(session, {"played_ms": 200 if hard else 400, "truncate": hard})
@@ -234,23 +261,148 @@ async def test_idless_ack_does_not_select_older_reply_after_current_item_deleted
 
 
 @pytest.mark.parametrize("hard", [False, True])
-def test_idless_ack_selects_active_reply_instead_of_older_pending_reply(hard):
+@pytest.mark.parametrize("finished", [False, True])
+def test_idless_ack_selects_current_reply_instead_of_older_pending_reply(hard, finished):
     session = _session()
     session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
     older = session.begin_response()
     session.append_assistant_text("older answer")
     session.mark_audio_sent(600, text_chars=12, audio_complete=True)
     session.end_response()
+    pending_before = dict(session.pending_history_item_ids)
     response = session.begin_response()
     session.append_assistant_text("hello")
     session.mark_audio_sent(400, text_chars=5, audio_complete=True)
-    pending_before = dict(session.pending_history_item_ids)
+    if finished:
+        session.end_response()
+        assert len(session.pending_history_item_ids) == 2
     events = apply_playback_ack(session, {"played_ms": 200 if hard else 400, "truncate": hard})
     assert len(events) == 1 and events[0].type == "playback.acknowledged"
     assert events[0].details["item_id"] == f"item_{response}"
-    assert session.playback.committed_ms == (200 if hard else 400)
+    assert events[0].details["playback"]["committed_ms"] == (200 if hard else 400)
     assert session.playback_for_response(older).committed_ms == 0
     assert dict(session.pending_history_item_ids) == pending_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("older_acknowledged", [False, True])
+@pytest.mark.parametrize("end_before_ack", [False, True])
+@pytest.mark.parametrize("aligned", [False, True])
+@pytest.mark.parametrize("hard", [False, True])
+async def test_idless_ack_follows_current_reply_through_history_transitions(
+    older_acknowledged, end_before_ack, aligned, hard
+):
+    h = await open_qwen(requires_audio=False)
+    try:
+        await h.run(commands.UpdateSession(patch={"turn_detection": None}))
+        session = h.session
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        older = session.begin_response()
+        session.append_assistant_text("older answer")
+        session.mark_audio_sent(600, text_chars=12, audio_complete=True)
+        session.end_response()
+        if older_acknowledged:
+            await h.run(commands.AckPlayback(response_id=older, played_ms=600))
+        older_cursor = session.playback_for_response(older)
+        older_item = copy.deepcopy(
+            session.history_item_ids.get(f"item_{older}") or session.pending_history_item_ids[f"item_{older}"]
+        )
+        for imported in ("imported-context", "item_imported"):
+            events = await h.run(
+                commands.CreateItem(
+                    item={
+                        "id": imported,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "keep this context"}],
+                    }
+                )
+            )
+            assert not any(event.type == "error" for event in events), events
+        response = session.begin_response()
+        item_id = f"item_{response}"
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        await h.settle()
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(
+            400,
+            text_chars=5 if aligned else None,
+            text_requires_complete_audio=not aligned,
+            audio_complete=True,
+        )
+        if end_before_ack:
+            session.end_response()
+            assert item_id in session.pending_history_item_ids
+        events = await h.run(commands.command_from_realtime({"type": "playback.ack", "played_ms": 200}))
+        assert len(events) == 1 and events[0].type == "playback.acknowledged", events
+        assert events[0].details["item_id"] == item_id
+        assert session.playback.committed_ms == 200
+        if not end_before_ack:
+            session.register_history_item(item_id, session.end_response())
+        if aligned:
+            assert item_id not in session.pending_history_item_ids
+            assert session.history_item_ids[item_id]["content"] == "he"
+        # A partial ACK must still block the next response, without committing
+        # another user input (which would correctly make an unreserved ACK late).
+        events = await h.run(commands.CreateResponse())
+        assert any(getattr(event, "code", None) == "response_already_active" for event in events)
+        assert not h.port.submissions
+        events = await h.run(
+            commands.command_from_realtime(
+                {"type": "playback.ack", "played_ms": 200 if hard else 400, "truncate": hard}
+            )
+        )
+        assert len(events) == 1 and events[0].type == "playback.acknowledged", events
+        assert events[0].details["item_id"] == item_id
+        expected = ("he" if aligned else "") if hard else "hello"
+        assert session.history_item_ids[item_id]["content"] == expected
+        assert item_id not in session.pending_history_item_ids
+        assert response not in session._playback.by_response
+        # A repeated progress ACK after retirement must not expand a hard cap
+        # or settle an old response just because it remains pending.
+        events = await h.run(commands.command_from_realtime({"type": "playback.ack", "played_ms": 400}))
+        assert len(events) == 1 and events[0].type == "playback.acknowledged", events
+        assert events[0].details["item_id"] == item_id
+        assert events[0].details["history_committed"] is False
+        assert session.history_item_ids[item_id]["content"] == expected
+        assert session.playback_for_response(older) == older_cursor
+        assert (
+            session.history_item_ids.get(f"item_{older}") or session.pending_history_item_ids[f"item_{older}"]
+        ) == older_item
+        for imported in ("imported-context", "item_imported"):
+            assert session.history_item_ids[imported]["content"] == "keep this context"
+        await h.run(append_audio())
+        await h.run(commands.Commit(final=True, create_response=False))
+        events = await h.run(commands.CreateResponse())
+        assert not any(event.type == "error" for event in events), events
+        assert len(h.port.submissions) == 1
+        newer = session.active_response_id
+        assert newer is not None and newer != response
+        session.mark_audio_sent(800)
+        current = session.playback
+        await h.run(commands.AckPlayback(response_id=response, played_ms=400))
+        assert session.active_response_id == newer and session.playback == current
+        assert session.history_item_ids[item_id]["content"] == expected
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("older_pending", [False, True])
+@pytest.mark.parametrize("hard", [False, True])
+def test_idless_ack_for_current_pending_reply_preserves_late_history_guard(older_pending, hard):
+    session = _session()
+    session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+    for _ in range(2 if older_pending else 1):
+        session.begin_response()
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(400, text_chars=5, audio_complete=True)
+        session.end_response()
+    session.commit_audio_input(transcript="a later user turn")
+    before = copy.deepcopy((session._conversation, session._playback))
+    events = apply_playback_ack(session, {"played_ms": 200, "truncate": hard})
+    assert len(events) == 1 and events[0].type == "error"
+    assert events[0].code == "playback_ack_too_late"
+    assert (session._conversation, session._playback) == before
 
 
 @pytest.mark.asyncio

@@ -70,10 +70,14 @@ An ACK's implicit target is resolved before validation or mutation. Pending and
 stored-item fallbacks must match `last_response_id`, which `begin_response`
 updates together with the current playback cursor. A retained older reply cannot
 consume the current reply's ACK, even when it is the only remaining history item.
-The sole stored-item fallback also requires the item's live or retained audio
+Resolution looks up that current item directly in pending or stored history;
+unrelated older or imported items do not make its identity ambiguous. This must
+continue working when a partial ACK moves it from pending to stored history.
+The stored-item fallback also requires the item's live or retained audio
 provenance, including for audio-only replies, then passes the same ownership
-validation as an explicit target. Imported context without audio provenance is
-not selected, even if its ID starts with `item_`. Without an identifiable target, ordinary ACKs
+and late-ACK validation as an explicit target. Imported context without audio
+provenance is not selected, even if its ID starts with `item_`. Without an
+identifiable target, ordinary ACKs
 update only the current playback cursor and hard ACKs fail before any history or
 cursor mutation.
 The typed `AckPlayback` command preserves the wire `truncate` flag through

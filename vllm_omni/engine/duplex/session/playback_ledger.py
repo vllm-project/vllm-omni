@@ -43,32 +43,20 @@ def apply_playback_ack(
         item_id = f"item_{response_id}" if response_id is not None else None
     elif response_id is None and item_id.startswith("item_"):
         response_id = item_id.removeprefix("item_")
-    if response_id is None and item_id is None and len(session.pending_history_item_ids) == 1:
-        pending_item_id = next(iter(session.pending_history_item_ids))
-        # An older pending reply must not consume the current playback's ACK.
-        if pending_item_id == f"item_{session.last_response_id}":
-            item_id = pending_item_id
-            response_id = session.last_response_id
     if response_id is None and item_id is None and session.active_response_id is not None:
         response_id = session.active_response_id
         item_id = f"item_{response_id}"
-    if response_id is None and item_id is None and not session.pending_history_item_ids:
-        # Resolve the legacy single-history-item target before any validation
-        # or cursor mutation, just like explicit, pending, and active targets.
-        assistant_item_ids = [
-            known_item_id
-            for known_item_id, message in session.history_item_ids.items()
-            if message.get("role") == "assistant"
-        ]
-        # Imported IDs can look like response IDs, and a genuine older reply
-        # can outlive the current item. Require the current response's identity
-        # and audio provenance, including for retired audio-only replies.
-        if (
-            len(assistant_item_ids) == 1
-            and assistant_item_ids[0] == f"item_{session.last_response_id}"
-            and session.history_item_has_audio(assistant_item_ids[0])
+    if response_id is None and item_id is None and session.last_response_id is not None:
+        # A partial ACK can move the current reply from pending to stored.
+        # Its identity stays the same regardless of unrelated history items.
+        current_item_id = f"item_{session.last_response_id}"
+        stored_message = session.history_item_ids.get(current_item_id)
+        if current_item_id in session.pending_history_item_ids or (
+            stored_message is not None
+            and stored_message.get("role") == "assistant"
+            and session.history_item_has_audio(current_item_id)
         ):
-            item_id = assistant_item_ids[0]
+            item_id = current_item_id
             response_id = session.last_response_id
     audio_only = response_id is not None and session.has_audio_only_response(response_id)
     history_is_late = False
