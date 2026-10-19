@@ -259,6 +259,21 @@ def test_playback_ack_is_scoped_per_response():
     assert session.playback.played_ms == 0
 
 
+def test_playback_ack_after_followup_user_commit_is_noop():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = session.commit_audio_input(transcript="user A")
+    response_id = session.begin_response()
+    session.append_assistant_text("an answer in flight when the user barged back in")
+    session.end_response(commit_text=False)
+    second = session.commit_audio_input(transcript="user B")
+
+    # The ack lost the race against the follow-up user commit. It is a
+    # pipelining artifact, not a client bug, so the server must not fail the
+    # session: no error event, no history mutation.
+    assert apply_playback_ack(session, {"response_id": response_id, "played_ms": 1_000}) == []
+    assert session.history == (first.message, second.message)
+
+
 def test_history_commit_uses_audio_text_alignment_marks():
     session = _session()
     session.begin_response()

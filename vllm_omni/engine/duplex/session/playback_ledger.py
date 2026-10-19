@@ -14,9 +14,13 @@ so the rules can be exercised without a runner.
 
 from __future__ import annotations
 
+import logging
+
 from vllm_omni.engine.duplex.events import DuplexEvent, PlaybackAcknowledged, error_event
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+
+logger = logging.getLogger(__name__)
 
 
 def apply_playback_ack(
@@ -61,9 +65,18 @@ def apply_playback_ack(
                 error_event("playback_item_not_found", f"No assistant response item is registered for {response_id}.")
             ]
         if session.playback_ack_is_too_late(response_id, item_id):
-            return [
-                error_event("playback_ack_too_late", "playback.ack arrived after a later user input was committed.")
-            ]
+            # A pipelining client computes this ack before it observes the
+            # user-input commit that supersedes the acked response, so the
+            # race is benign and unavoidable: the superseded response never
+            # entered history and the ack has nothing to update. Ignore it
+            # instead of failing the session with a protocol error.
+            logger.warning(
+                "Ignoring superseded playback.ack for response %s in session %s "
+                "(a later user input was committed first).",
+                response_id,
+                session.session_id,
+            )
+            return []
         session.reserve_history_item(item_id)
     elif item_id is not None:
         return [error_event("playback_item_not_found", "playback.ack requires a response-owned assistant item.")]
