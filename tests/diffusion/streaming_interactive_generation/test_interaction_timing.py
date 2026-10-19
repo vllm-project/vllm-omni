@@ -11,6 +11,7 @@ from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession, SE3DeltaCameraHandler
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptInteractionHandler, prompt_update_versions
+from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import TaoMateH3PromptInteractionHandler
 from vllm_omni.diffusion.interaction.types import (
     ChunkMediaSpec,
     InteractionBoundaryContext,
@@ -269,11 +270,12 @@ def test_target_transition_completes_once_on_media_grid(state):
     assert apply(handler, state).completed_event_ids == []
 
 
-def test_prompt_last_write_uses_ingress_order_and_keeps_revision_updates(state):
+@pytest.mark.parametrize("handler_cls", [PromptInteractionHandler, TaoMateH3PromptInteractionHandler])
+def test_prompt_last_write_uses_ingress_order_and_keeps_revision_updates(state, handler_cls):
     def encode_prompt(*, prompt, **kwargs):
         return torch.full((1, 2, 3), float(prompt)), None
 
-    handler = PromptInteractionHandler(encode_prompt=encode_prompt, device="cpu", dtype=torch.float32)
+    handler = handler_cls(encode_prompt=encode_prompt, device="cpu", dtype=torch.float32)
     state.prompt_embeds = torch.zeros(1, 2, 3)
     for event_id, stamp, prompt in (("first", 0.1, "1"), ("latest", 0.3, "3"), ("reordered", 0.2, "2")):
         handler.enqueue(state, event_id=event_id, received_at=stamp, payload={"prompt": prompt}, transition_chunks=0)
@@ -306,9 +308,10 @@ def test_camera_pending_controls_are_bounded_until_boundary(state, mode):
     assert [event.event_id for event in session.pending_events] == ["after-boundary"]
 
 
-def test_prompt_pending_metadata_is_bounded_before_encoding(state, mocker):
+@pytest.mark.parametrize("handler_cls", [PromptInteractionHandler, TaoMateH3PromptInteractionHandler])
+def test_prompt_pending_metadata_is_bounded_before_encoding(state, mocker, handler_cls):
     encode_prompt = mocker.MagicMock(return_value=(torch.ones(1, 2, 3), None))
-    handler = PromptInteractionHandler(encode_prompt=encode_prompt, device="cpu", dtype=torch.float32)
+    handler = handler_cls(encode_prompt=encode_prompt, device="cpu", dtype=torch.float32)
     state.prompt_embeds = torch.zeros(1, 2, 3)
     for index in range(256):
         handler.enqueue(

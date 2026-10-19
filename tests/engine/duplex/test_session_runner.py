@@ -930,6 +930,9 @@ async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> N
     release_abort = asyncio.Event()
     h.port.abort_gate = release_abort
     try:
+        # Admit the older response just as the model channel does before its
+        # first output; it remains live while the newer response is generated.
+        h.runner.emit({"type": "response.created", "response_id": "resp-old"})
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
@@ -1043,6 +1046,73 @@ async def test_cancel_response_aborts_the_stage_request_and_reports_playback() -
         # Only the played prefix of the cancelled answer is kept in history.
         assert h.session.history == ({"role": "assistant", "content": "he"},)
     finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aligned", [True, False])
+@pytest.mark.parametrize("hard_cutoff_ms", [None, 500])
+async def test_full_ack_releases_cancelled_replies_without_history_calibration(aligned, hard_cutoff_ms) -> None:
+    h = await open_harness()
+    try:
+        assert h.runner.ctx.history_calibration is None
+        for _ in range(8):
+            await h.run(append_audio())
+            await h.deliver_and_settle(
+                tts_output(h.stage0_request_id(), samples=24000, text="hello", epoch=h.session.epoch)
+            )
+            response = h.session.active_response_id
+            assert response is not None
+            if not aligned:
+                # Exercise the proportional fallback for outputs without alignment.
+                h.session._response.assistant_audio_text_marks.clear()
+            await h.run(commands.CancelResponse())
+            assert not h.session.playback_for_response(response).audio_complete
+            if hard_cutoff_ms is not None:
+                await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=hard_cutoff_ms))
+            events = await h.run(commands.AckPlayback(response_id=response, played_ms=1000))
+            assert find(events, "playback.acknowledged").details["history_committed"]
+            assert not h.session._conversation.assistant_response_snapshots
+            assert not h.session._playback.by_response
+            assert not h.session._conversation.hard_truncations_ms
+        expected_text = "hello" if hard_cutoff_ms is None else "he"
+        assert [message["content"] for message in h.session.history] == [expected_text] * 8
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_full_ack_preserves_cancelled_reply_while_history_calibration_is_pending() -> None:
+    from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def calibrate(snapshot):
+        entered.set()
+        await release.wait()
+        return 2
+
+    h = await open_harness()
+    controller = HistoryCalibration(h.session, calibrate, requires_audio=False)
+    h.runner.ctx.history_calibration = controller
+    try:
+        await h.run(append_audio())
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, text="hello"))
+        response = h.session.active_response_id
+        assert response is not None
+        await h.run(commands.AckPlayback(response_id=response, played_ms=1000))
+        await h.run(commands.CancelResponse())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert not h.session._conversation.heard_prefixes
+        await h.run(commands.AckPlayback(response_id=response, played_ms=1000))
+        assert response in h.session._conversation.assistant_response_snapshots
+        assert response in h.session._playback.by_response
+        assert response in controller.tasks
+        release.set()
+        await controller.before_prompt()
+        assert h.session.history[-1]["content"] == "he"
+    finally:
+        release.set()
         await close_harness(h)
 
 
@@ -1459,6 +1529,102 @@ async def test_stage_failure_on_draining_request_fails_that_response_only() -> N
         assert done.status == "failed"
         assert h.session.active_response_id == r2
         assert not h.session.is_draining_request(draining_req)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["barge_in", "stage_failure"])
+@pytest.mark.parametrize("deleted", [False, True])
+async def test_interrupted_drain_releases_only_deleted_item_playback(termination: str, deleted: bool) -> None:
+    from dataclasses import replace
+
+    h = await open_harness()
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_concurrent_turn_requests=True)
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        old_response = h.session.active_response_id
+        assert old_response is not None
+        item_id = f"item_{old_response}"
+        h.session.snapshot_active_response_for_drain()
+        # Multiple stage requests can drain for the same older response.
+        for draining_request in ("old-talker", "old-vocoder"):
+            h.session.bind_draining_request(draining_request, old_response)
+        active_response = h.session.begin_response(turn_id=h.session.turn_id + 1)
+        h.runner.emit({"type": "response.created", "response_id": active_response})
+        h.session.append_assistant_text("newer reply")
+        h.session.mark_audio_sent(duration_ms=250)
+        await h.settle()
+        if deleted:
+            events = await h.run(commands.DeleteItem(item_id=item_id))
+            assert types(events) == ["conversation.item.deleted"]
+        assert h.session.playback_for_response(old_response).sent_ms == 1000
+
+        if termination == "barge_in":
+            events = await h.run(commands.BargeIn())
+            assert h.port.aborts == [[request_id, "old-talker", "old-vocoder"]]
+            assert h.session.active_response_id is None
+        else:
+            h.runner.on_stage_failure(1, RuntimeError("drain failed"), request_id="old-talker")
+            events = await h.settle()
+            assert h.session.active_response_id == active_response
+        done = next(event for event in events if event.type == "response.done" and event.response_id == old_response)
+        assert done.status == ("cancelled" if termination == "barge_in" else "failed")
+        assert done.response["metadata"]["playback"]["sent_ms"] == 1000
+        assert not h.session.response_has_draining_request(old_response)
+        assert h.session.playback_for_response(active_response).sent_ms == 250
+        assert (old_response in h.session._playback.by_response) is not deleted
+
+        ack = await h.run(commands.AckPlayback(response_id=old_response, played_ms=500))
+        if deleted:
+            assert types(ack) == ["error"]
+            assert ack[0].code == "playback_item_not_found"
+            assert old_response not in h.session._playback.by_response
+        else:
+            assert types(ack) == ["playback.acknowledged"]
+            assert h.session.playback_for_response(old_response).committed_ms == 500
+            events = await h.run(commands.TruncateItem(item_id=item_id, audio_end_ms=250))
+            assert types(events) == ["conversation.item.truncated", "playback.acknowledged"]
+            assert h.session.playback_for_response(old_response).committed_ms == 250
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["barge_in", "stage_failure"])
+async def test_interrupted_silent_drain_releases_snapshot_cursor_and_placeholder(termination: str) -> None:
+    from dataclasses import replace
+
+    h = await open_harness()
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_concurrent_turn_requests=True)
+        await h.run(append_audio())
+        old_response = h.session.begin_response(turn_id=h.session.turn_id)
+        h.runner.emit({"type": "response.created", "response_id": old_response})
+        h.session.append_assistant_text("not yet spoken")
+        h.session.snapshot_active_response_for_drain()
+        h.session.bind_draining_request("silent-talker", old_response)
+        active_response = h.session.begin_response(turn_id=h.session.turn_id + 1)
+        h.runner.emit({"type": "response.created", "response_id": active_response})
+        h.session.append_assistant_text("newer reply")
+        h.session.mark_audio_sent(duration_ms=250)
+        await h.settle()
+
+        if termination == "barge_in":
+            events = await h.run(commands.BargeIn())
+        else:
+            h.runner.on_stage_failure(1, RuntimeError("silent drain failed"), request_id="silent-talker")
+            events = await h.settle()
+            assert h.session.active_response_id == active_response
+        done = next(event for event in events if event.type == "response.done" and event.response_id == old_response)
+        assert done.response["metadata"]["playback"]["sent_ms"] == 0
+        assert not h.session.response_has_draining_request(old_response)
+        assert old_response not in h.session._conversation.assistant_response_snapshots
+        assert old_response not in h.session._playback.by_response
+        assert f"item_{old_response}" not in h.session._conversation.history_item_placeholders
+        assert h.session.playback_for_response(active_response).sent_ms == 250
     finally:
         await close_harness(h)
 

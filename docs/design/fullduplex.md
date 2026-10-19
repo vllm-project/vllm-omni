@@ -623,6 +623,98 @@ newer turn.
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.
 
+## Heard-text history calibration
+
+With `ack_only`, the client reports how much output audio it played. Some
+models have no text-to-audio alignment for an interrupted reply, so the
+existing history policy may retain an empty assistant turn. Optional
+calibration estimates a prefix of that reply's original text before the next
+prompt is built. It remains experimental and disabled by default; configuration
+and strategy limitations are described in the
+[serving guide](../serving/realtime_duplex_api.md#optional-history-calibration-for-interrupted-qwen3-omni-replies).
+
+### Ownership and callback contract
+
+`DuplexModelPlugin.history_calibrator(runtime_config)` returns either `None`
+or a `HistoryCalibrationPolicy`. The plugin selects the strategy and declares
+whether it needs retained audio through `requires_audio`. The runner creates
+one `HistoryCalibration` controller per session on its own asyncio loop. The
+controller owns recordings, task deadlines and result versions;
+`DuplexEngineSession` owns the authoritative conversation and validates every
+writeback. The callback must yield during slow work and must not mutate session
+history.
+
+The async callback receives an immutable `HeardTextSnapshot`: response ID,
+original text, client-confirmed playback cutoff in milliseconds, and mono
+float32 PCM from the reply's start with its sample rate. A text-only policy
+receives empty PCM and a zero sample rate. `complete_audio_duration_ms` is
+present only after the final audio stage finishes; an interrupted generation's
+partial audio duration cannot estimate the rate of its complete text. The
+callback returns an exclusive character offset into the original text (`0`
+means an accepted empty prefix), or `None` to keep the existing policy. It
+never supplies replacement history text or an ASR transcript to insert.
+
+### Runtime sequence and guarded writeback
+
+1. `ModelChannel` records projected output in the controller. Under `ack_only`,
+   cancellation of a response or input, output-audio clearing, barge-in,
+   truncation and a final playback acknowledgement can trigger `request_ready()`.
+   Each prompt build also calls it through `before_prompt()`, re-evaluating
+   eligibility on every append. Only ended replies with a positive, partially
+   played cutoff are eligible; active replies and replies whose TTS still drains
+   wait.
+2. The controller captures the original text and cutoff, starts the callback
+   with `asyncio.wait_for`, and identifies the task's evidence by
+   `(text, cutoff, retained_audio_bytes)`. Changed evidence replaces the task;
+   unchanged evidence is not retried after failure. Callback failure, refusal
+   or timeout preserves the existing conservative history policy.
+3. Before freezing the stage request's runtime and preparing its conversation,
+   `ModelChannel._append_via_data_plane` awaits `before_prompt()`. This has one
+   `history_calibration_timeout_ms` budget (default 1000 ms) for all eligible
+   tasks, including replacements; replacement work does not extend it. At the
+   deadline, the controller revokes task ownership and cancels pending work.
+   The append then checks the session epoch and open state before continuing,
+   so cancellation or close during the wait cannot submit a stale prompt.
+   History and tool runtime are captured after the wait, so a calibration that
+   consumes a tool pair cannot leave that pair beside its stored answer in
+   the submitted prompt.
+4. A result may write back only while its controller is open, its task still
+   owns that response and its evidence version still matches. The session
+   additionally checks that the original response snapshot and conversation
+   item exist, the original text is unchanged, the offset is in range, and
+   the result's audio cutoff does not exceed the current permanent cutoff.
+   Accepted results replace text at the original assistant item's position in
+   history.
+   Deletion, replacement, stricter truncation and close therefore reject stale
+   results even if cancellation of an async callback arrives late.
+5. After an accepted writeback, the controller notifies the runner. If the
+   stored assistant item has nonempty text, the runner settles that response's
+   runtime as committed, just as a playback ACK does. Qwen then consumes its
+   tool pair without requiring another ACK. An empty prefix keeps the pair
+   available for a retry, including late ACKs after its evidence is retired.
+   Settlement runs outside the calibration-failure handler. A plugin failure
+   while settling a stored answer emits `tool_call_settlement_failed` and closes
+   that session; it cannot continue with history and tool runtime out of sync.
+
+### Evidence lifetime and limits
+
+The controller retains at most four replies and bounds retained PCM by
+`history_audio_max_bytes_per_session` (default 8 MiB). It drops whole replies
+rather than retaining a suffix that could be mistaken for audio starting at
+zero. Text-only calibration retains no PCM. The byte limit excludes temporary
+callback copies and does not bound the conversation's stored text.
+
+Eviction and item deletion discard recordings and revoke pending tasks. For an
+ended reply, `retire_history_calibration` also releases its original response
+snapshot, playback cursor and pending reconciliation state. A still-generating
+or draining reply defers retirement until its output no longer needs that
+state. The stored prefix and compact cutoff metadata remain with an undeleted
+conversation item. Late ACKs cannot expand a retired prefix; a later, stricter
+explicit truncation clears it conservatively because its alignment evidence
+has expired. Finishing calibration alone does not retire evidence that a
+stricter truncation may still need. Session close closes the controller,
+cancels its tasks and releases its recordings.
+
 ## Serving
 
 `OmniDuplexSessionHandler.handle_realtime_session(websocket)`:
@@ -663,6 +755,12 @@ for the current plugin integrations and deployment configurations.
   `tests/clients/**`, `tests/engine/test_duplex_import_boundary.py`,
   `tests/model_executor/models/minicpmo_4_5/duplex/**`,
   `tests/worker/test_native_duplex_hooks.py`.
+- Calibration CPU suites: `tests/engine/duplex/test_history_calibration.py`
+  covers cache eviction, live-suffix rejection and deferred retirement.
+  `tests/model_executor/models/qwen3_omni/test_history_integration.py` covers
+  task ownership, cancellation, prompt deadlines, failed-snapshot deduplication
+  and the calibrated history in the next submitted prompt. The remaining Qwen
+  `test_history_*.py` files cover prefix matching and token-rate estimates.
 - GPU: `examples/online_serving/minicpmo/realtime_duplex_demo.py` (one turn
   over the websocket), `examples/online_serving/barge_in_client.py` (cancel
   during playback; `--inline` drives the same scenario through
