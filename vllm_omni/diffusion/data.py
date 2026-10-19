@@ -1795,6 +1795,11 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi0Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif cfg.get("type") == "pi05":
+                    if self.model_class_name is None:
+                        self.model_class_name = "Pi05Pipeline"
+                    self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
                 elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":
                     # The official ABot checkpoint uses its native single-directory
                     # layout and intentionally has no Diffusers pipeline index.

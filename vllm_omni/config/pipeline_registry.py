@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
+from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -211,6 +212,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "omnivoice": OMNIVOICE_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,
     "pi0": PI0_PIPELINE,
+    "pi05": PI05_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,

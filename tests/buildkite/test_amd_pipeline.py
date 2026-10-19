@@ -695,6 +695,7 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     assert argv[:3] == ["pytest", "-sv", "tests/diffusion"]
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
     assert "--ignore=tests/diffusion/cache/test_teacache_extractors.py" in argv
+    assert "--ignore=tests/diffusion/models/pi05/test_pi05_units.py" in argv
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         DIFFUSION_SLOW_CPU_NODES
     )
