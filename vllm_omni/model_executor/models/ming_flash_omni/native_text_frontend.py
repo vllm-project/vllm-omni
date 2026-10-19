@@ -6,6 +6,8 @@ Only punctuation/newline boundaries (with 12/8 sentence and 12-element comma thr
 or end of input, flush the buffer. There is no hard character-count flush.
 """
 
+from collections.abc import Callable
+
 import regex as re
 
 from .front_toolkit import (
@@ -164,10 +166,15 @@ class NativeMingTextFrontend:
         return output
 
 
-def normalize_native_fragment(fragment: str, prompt: str = "", tn_mode: str = "upstream") -> str:
+def normalize_native_fragment(
+    fragment: str,
+    prompt: str = "",
+    tn_mode: str = "upstream",
+    normalizer: Callable[[str], str] | None = None,
+) -> str:
     """Apply the requested TN once without resegmenting native fragments."""
     from .front_toolkit import normalize_text_kit
-    from .text_processing import _get_upstream_tn, is_chinese, normalize_numbers
+    from .text_processing import is_chinese, normalize_numbers
 
     text = fragment
     language = re.search(r"Target language:\s*([^\n.]+)", prompt)
@@ -185,11 +192,9 @@ def normalize_native_fragment(fragment: str, prompt: str = "", tn_mode: str = "u
         if not is_chinese(text):
             text = normalize_numbers(text)
         if tn_mode == "upstream":
-            # _get_upstream_tn logs dependency failures once; preserve the
-            # existing legacy fallback instead of making optional TN mandatory.
-            normalizer = _get_upstream_tn()
-            if normalizer is not None:
-                text = normalizer(text)
+            if normalizer is None:
+                raise ValueError("tn_mode='upstream' requires a normalizer loaded from the Talker checkpoint")
+            text = normalizer(text)
             text = normalize_text_kit(text)
         text = text.lstrip("，").strip()
     return text

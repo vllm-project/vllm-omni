@@ -13,7 +13,8 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -42,6 +43,9 @@ from .text_processing import segment_and_normalize
 from .tts_request import GenerationParams as _GenerationParams
 from .tts_request import resolve_conditioning_modes, resolve_generation_params
 from .voice_presets import VoicePresetRegistry
+
+if TYPE_CHECKING:
+    from .talker_tn.talker_tn import TalkerTN
 
 logger = init_logger(__name__)
 
@@ -92,6 +96,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             else self._resolve_talker_config(root_config, self.talker_dir, model_path)
         )
         self.config = config
+        if config.normalize_text and config.tn_mode == "upstream":
+            # Validate resources/dependencies before constructing GPU modules.
+            _ = self._upstream_tn
 
         self._standalone = prefix in ("", "talker")
         if self._standalone:
@@ -164,6 +171,19 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             spk_head=self.spk_head,
             patch_size=self.patch_size,
         )
+
+    @cached_property
+    def _upstream_tn(self) -> TalkerTN:
+        """Own the normalizer for this checkpoint, without executing Hub code."""
+        from .talker_tn.talker_tn import TalkerTN
+        from .text_processing import _get_inflect
+
+        normalizer = TalkerTN(Path(self.talker_dir) / "talker_tn")
+        if _get_inflect() is None:
+            raise ModuleNotFoundError(
+                "Ming upstream text normalization requires pip install 'vllm-omni[ming-tn]' (missing inflect)"
+            )
+        return normalizer
 
     def model_local_kv_specs(self):
         """Forward to the generator, which owns the talker's StaticCache.
@@ -709,12 +729,13 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             return [TalkerSegment(inputs_embeds, params.max_steps)]
 
         spk_emb = self._project_spk_emb(voice.spk_emb, voice.already_projected, params.use_zero_spk_emb)
+        normalizer = self._upstream_tn if params.normalize_text and params.tn_mode == "upstream" else None
         if native_fragments is not None:
             # Producer-side fragments were already scrubbed and segmented.
             # Linguistic normalization must run exactly once, without splitting
             # the same fragment again at receiver-dependent boundaries.
             text_segments = [
-                normalize_native_fragment(segment, params.prompt, tn_mode=params.tn_mode)
+                normalize_native_fragment(segment, params.prompt, tn_mode=params.tn_mode, normalizer=normalizer)
                 if params.normalize_text
                 else segment
                 for segment in native_fragments
@@ -730,7 +751,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 if not any(char.isalnum() for char in text):
                     raise ValueError("Ming frontend emitted no speakable text after markup removal")
             text_segments = (
-                segment_and_normalize(text, max_length=params.max_text_length, tn_mode=params.tn_mode)
+                segment_and_normalize(
+                    text, max_length=params.max_text_length, tn_mode=params.tn_mode, normalizer=normalizer
+                )
                 if text and params.normalize_text
                 else [text]
                 if text

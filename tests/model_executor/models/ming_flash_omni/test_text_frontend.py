@@ -71,8 +71,14 @@ def test_legacy_normalization_does_not_run_upstream_rules(monkeypatch):
     from vllm_omni.model_executor.models.ming_flash_omni import text_processing
 
     monkeypatch.setattr(text_processing, "normalize_numbers", lambda text: text.replace("12", "twelve"))
-    monkeypatch.setattr(text_processing, "_get_upstream_tn", lambda: pytest.fail("Unexpected upstream TN"))
-    assert normalize_native_fragment("There are 12 apples.", tn_mode="legacy") == "There are twelve apples."
+
+    def unexpected_tn(text):
+        pytest.fail("Unexpected upstream TN")
+
+    assert (
+        normalize_native_fragment("There are 12 apples.", tn_mode="legacy", normalizer=unexpected_tn)
+        == "There are twelve apples."
+    )
 
 
 def test_long_fragment_keeps_url_and_abbreviation_lexemes_intact():

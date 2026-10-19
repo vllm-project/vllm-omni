@@ -48,8 +48,8 @@ def prepare_talker_checkpoint(source: str, cache_dir: str | None = None) -> str:
         trim_trailing_silence=None,
     )
     config_json = json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    # A new view must not reuse an older cache entry that linked deploy/data.
-    digest = hashlib.sha256(("no-preset-data-v1\0" + str(deployment) + config_json).encode()).hexdigest()[:20]
+    # Rebuild older views that did not link the checkpoint's TN resource directory.
+    digest = hashlib.sha256(("model-tn-assets-v2\0" + str(deployment) + config_json).encode()).hexdigest()[:20]
     cache = Path(cache_dir or os.environ.get("MING_TTS_CONFIG_CACHE", "~/.cache/vllm-omni/ming_talker")).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
     target = cache / digest

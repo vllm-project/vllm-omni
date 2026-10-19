@@ -93,19 +93,13 @@ def test_sync_language_only_text_does_not_leak_the_language_name():
     assert prompts[0]["additional_information"]["text"] == ""
 
 
-def test_upstream_resources_and_bilingual_number_normalization():
-    pytest.importorskip("pynini")
-    pytest.importorskip("inflect")
-    tn = text_processing._get_upstream_tn()
-    assert tn is not None, text_processing._UPSTREAM_TN_ERROR
-    result = "".join(
-        text_processing.segment_and_normalize("日期2026年10月16日，金额12.5元，进度50%。", tn_mode="upstream")
-    )
-    assert "百分之五十" in result
-    assert "12.5" not in result
-    assert "2026" not in result
-    result = " ".join(text_processing.segment_and_normalize("I have 12 apples.", tn_mode="upstream"))
-    assert "twelve" in result.lower()
+def test_upstream_mode_does_not_silently_fall_back_without_checkpoint_normalizer():
+    from vllm_omni.model_executor.models.ming_flash_omni.native_text_frontend import normalize_native_fragment
+
+    with pytest.raises(ValueError, match="requires a normalizer loaded from the Talker checkpoint"):
+        text_processing.segment_and_normalize("日期2026年10月16日。", tn_mode="upstream")
+    with pytest.raises(ValueError, match="requires a normalizer loaded from the Talker checkpoint"):
+        normalize_native_fragment("日期2026年10月16日。", tn_mode="upstream")
 
 
 def test_markup_control_is_independent_and_preserves_legacy_defaults():

@@ -4,27 +4,42 @@
 # Author: wanren
 # Date: 2025/10/16
 import logging
-import os
+from pathlib import Path
 
 import regex as re
 
-from .normalizer import Normalizer
 from .talker_pre_processor import TalkerPreProcessor
 from .talker_re import TalkerRE
 
 
 class TalkerTN:
-    def __init__(self):
+    def __init__(self, resource_dir: str | Path):
+        resource_dir = Path(resource_dir)
+        required = [f"{lang}_tn_{kind}.fst" for lang in ("zh", "en") for kind in ("tagger", "verbalizer")]
+        missing = [name for name in required if not (resource_dir / name).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing Ming text normalization resources in {resource_dir}: {', '.join(missing)}. "
+                "Download the complete talker/talker_tn directory from the selected model revision."
+            )
+        try:
+            from .normalizer import Normalizer
+        except ModuleNotFoundError as exc:
+            if exc.name != "pynini":
+                raise
+            raise ModuleNotFoundError(
+                "Ming upstream text normalization requires pip install 'vllm-omni[ming-tn]'"
+            ) from exc
+
         self.talker_pre_processor = TalkerPreProcessor()
         self.talker_re = TalkerRE()
-        file_dir = os.path.dirname(os.path.realpath(__file__))
-        default_re_cfg = f"{file_dir}/talker_re.json"
-        if os.path.exists(default_re_cfg):
+        default_re_cfg = Path(__file__).with_name("talker_re.json")
+        if default_re_cfg.is_file():
             self.talker_re.update(default_re_cfg)
         self.re_contains_chinese = re.compile(r"[一-鿿]")
         self.re_digit_hyphen = re.compile(r"(?<=\d)-(?=\d)")
-        self.tn_zh = Normalizer(f"{file_dir}/zh_tn", ordertype="tn")
-        self.tn_en = Normalizer(f"{file_dir}/en_tn", ordertype="en_tn")
+        self.tn_zh = Normalizer(str(resource_dir / "zh_tn"), ordertype="tn")
+        self.tn_en = Normalizer(str(resource_dir / "en_tn"), ordertype="en_tn")
 
     def __call__(self, text):
         logging.debug(f"[TalkerTN] input: {text!r}")

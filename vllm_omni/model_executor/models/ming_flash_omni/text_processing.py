@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import string
-from typing import Any
+from collections.abc import Callable
 
 import regex as re
 from vllm.logger import init_logger
@@ -22,35 +22,6 @@ logger = init_logger(__name__)
 # https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/front/text_segment_cut.py
 def is_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
-
-
-# Upstream Ming talker TN (pynini fst zh/en normalizer + regex rules),
-# ported from origin_master/ming_flash talker_tn/ and front/toolkit.py.
-# Loaded lazily because pynini/fst assets may be absent on some platforms;
-# tn_mode="upstream" degrades to the English-only path with a warning.
-_UPSTREAM_TN: Any | None = None
-_UPSTREAM_TN_READY = False
-_UPSTREAM_TN_TRIED = False
-_UPSTREAM_TN_ERROR: str | None = None
-
-
-def _get_upstream_tn() -> Any | None:
-    """Return the singleton TalkerTN, or None when unavailable."""
-    global _UPSTREAM_TN, _UPSTREAM_TN_READY, _UPSTREAM_TN_TRIED, _UPSTREAM_TN_ERROR
-    if not _UPSTREAM_TN_TRIED:
-        _UPSTREAM_TN_TRIED = True
-        try:
-            from .talker_tn.talker_tn import TalkerTN
-
-            _UPSTREAM_TN = TalkerTN()
-            _UPSTREAM_TN_READY = True
-        except Exception as exc:  # pragma: no cover - environment-dependent
-            _UPSTREAM_TN_ERROR = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "Upstream TalkerTN unavailable (%s); tn_mode='upstream' degrades to English-only normalize_numbers",
-                _UPSTREAM_TN_ERROR,
-            )
-    return _UPSTREAM_TN if _UPSTREAM_TN_READY else None
 
 
 def get_semantic_length(text: str) -> int:
@@ -450,6 +421,7 @@ def segment_and_normalize(
     text: str,
     max_length: int = _DEFAULT_MAX_SEMANTIC_LENGTH,
     tn_mode: str = "legacy",
+    normalizer: Callable[[str], str] | None = None,
 ) -> list[str]:
     """Segment text into fragments and normalize numbers for Ming TTS.
 
@@ -467,8 +439,8 @@ def segment_and_normalize(
       ported from ``origin_master/ming_flash`` — ``TalkerTN`` (pynini fst
       zh/en TN followed by regex rules) and ``normalize_text_kit`` (front/
       toolkit.py), matching ``instruct_audio_generation_ming3p0``'s per-
-      fragment order. Degrades to the legacy English path with a warning
-      when pynini/fst assets are unavailable.
+      fragment order. The caller supplies the normalizer loaded from its
+      model snapshot; missing resources must not change the selected mode.
     """
     if not text or not text.strip():
         return []
@@ -476,13 +448,8 @@ def segment_and_normalize(
     segments = cut_text_by_semantic_length(text.strip(), max_length)
 
     use_upstream = tn_mode == "upstream"
-    upstream_tn = _get_upstream_tn() if use_upstream else None
-    if use_upstream and upstream_tn is None:
-        logger.warning(
-            "tn_mode='upstream' requested but TalkerTN is unavailable (%s); "
-            "falling back to the legacy English-only normalization",
-            _UPSTREAM_TN_ERROR,
-        )
+    if use_upstream and normalizer is None:
+        raise ValueError("tn_mode='upstream' requires a normalizer loaded from the Talker checkpoint")
     if use_upstream:
         from .front_toolkit import normalize_text_kit
 
@@ -493,8 +460,8 @@ def segment_and_normalize(
             # English pre-expansion -> TalkerTN (zh+en fst) -> text kit.
             if not is_chinese(seg):
                 seg = normalize_numbers(seg)
-            if upstream_tn is not None:
-                seg = upstream_tn(seg)
+            if normalizer is not None:
+                seg = normalizer(seg)
             seg = normalize_text_kit(seg)
         elif not is_chinese(seg):
             seg = normalize_numbers(seg)

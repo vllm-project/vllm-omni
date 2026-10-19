@@ -15,7 +15,8 @@ from vllm_omni.model_executor.models.ming_flash_omni.checkpoint import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path):
+@pytest.mark.parametrize("with_tn", [False, True])
+def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path, with_tn):
     root = tmp_path / "deployment"
     talker = root / "talker"
     (talker / "llm").mkdir(parents=True)
@@ -27,11 +28,19 @@ def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path)
     for name in ("model.safetensors", "vae/model.safetensors", "campplus.onnx"):
         (talker / name).touch()
     (root / "data/voice_name.json").write_text("{}")
+    if with_tn:
+        (talker / "talker_tn").mkdir()
+        for lang in ("zh", "en"):
+            for kind in ("tagger", "verbalizer"):
+                (talker / "talker_tn" / f"{lang}_tn_{kind}.fst").touch()
 
     view = Path(prepare_talker_checkpoint(str(root), cache_dir=str(tmp_path / "cache")))
 
     assert not (view / "data").exists()
     assert (view / "model.safetensors").resolve() == talker / "model.safetensors"
+    if with_tn:
+        assert (view / "talker_tn").resolve() == talker / "talker_tn"
+        assert len(list((view / "talker_tn").glob("*.fst"))) == 4
 
     (root / "data/voice_name.json").unlink()
     assert prepare_talker_checkpoint(str(root), cache_dir=str(tmp_path / "cache")) == str(view)
