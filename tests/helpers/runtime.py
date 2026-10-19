@@ -144,7 +144,10 @@ class OmniServerParams(NamedTuple):
 
 
 class AsyncOmniParams(NamedTuple):
-    """Indirect parameter for the ``async_omni_runner`` / ``async_omni_runner_function`` fixtures.
+    """Parameters for the ``async_omni_runner`` / ``async_omni_runner_function`` fixtures.
+
+    Normally supplied via indirect parametrization. The function-scoped fixture
+    also accepts pre-resolved paths from ``async_omni_resolved_params``.
 
     ``extra_omni_kwargs`` are forwarded to :class:`AsyncOmniRunner` and from
     there to ``AsyncOmni`` (``enforce_eager``, ``enable_sleep_mode``,
@@ -1295,28 +1298,37 @@ def iter_async_omni(
     request: Any,
     run_level: str,
     omni_fixture_lock: threading.Lock,
+    *,
+    resolved_params: AsyncOmniParams | None = None,
 ) -> Generator[Any, None, None]:
     """Yield an :class:`AsyncOmniRunner`; used by ``async_omni_runner`` / ``async_omni_runner_function`` fixtures.
 
     Applies the same model prefix, run-level deploy YAML patching and
     ``core_model`` tiny-model rewrite (``diffusion``-marked tests) as
-    :func:`iter_omni_runner`.
+    :func:`iter_omni_runner`. The function-scoped fixture may instead supply
+    ``resolved_params`` with already prepared model and deploy YAML paths;
+    those paths bypass all rewrites while retaining the shared lifecycle.
     """
     from tests.helpers.stage_config import stage_config_path_for_run_level
 
-    params = getattr(request, "param", None)
+    params = resolved_params if resolved_params is not None else getattr(request, "param", None)
     if not isinstance(params, AsyncOmniParams):
         fixture_name = getattr(request, "fixturename", "async_omni_runner_function")
-        raise ValueError(
-            f"{fixture_name} must be parametrized (indirect=True) with "
-            f"AsyncOmniParams(model, deploy_config=..., extra_omni_kwargs=...), got {params!r}"
+        source = (
+            f"{fixture_name} must be parametrized (indirect=True) with"
+            if resolved_params is None
+            else "async_omni_resolved_params must return"
         )
-    model_prefix = get_model_prefix()
+        raise ValueError(f"{source} AsyncOmniParams(model, deploy_config=..., extra_omni_kwargs=...), got {params!r}")
     with omni_fixture_lock, _whisper_device_free_around():
-        model = model_prefix + params.model
-        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
-            model = resolve_tiny_model_path(model)
-        deploy_config = stage_config_path_for_run_level(params.deploy_config, run_level)
+        if resolved_params is None:
+            model = get_model_prefix() + params.model
+            if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+                model = resolve_tiny_model_path(model)
+            deploy_config = stage_config_path_for_run_level(params.deploy_config, run_level)
+        else:
+            model = params.model
+            deploy_config = params.deploy_config
         extra_omni_kwargs = dict(params.extra_omni_kwargs or {})
         with AsyncOmniRunner(model, deploy_config=deploy_config, **extra_omni_kwargs) as runner:
             print("AsyncOmniRunner started successfully")

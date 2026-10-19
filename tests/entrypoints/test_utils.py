@@ -345,6 +345,10 @@ class TestResolveOmniConfig:
         checkpoint = tmp_path / "model.safetensors"
         if checkpoint_exists:
             checkpoint.write_text("dummy")
+        if deploy_config_path is not None:
+            deploy = tmp_path / deploy_config_path
+            deploy.write_text("stages: []\n")
+            deploy_config_path = str(deploy)
         create_from_model = mocker.patch(
             "vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None
         )

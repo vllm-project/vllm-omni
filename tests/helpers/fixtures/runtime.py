@@ -20,7 +20,7 @@ import pytest
 import pytest_asyncio
 
 if TYPE_CHECKING:
-    from tests.helpers.runtime import AsyncOmniRunner, OmniRunner, OmniServer
+    from tests.helpers.runtime import AsyncOmniParams, AsyncOmniRunner, OmniRunner, OmniServer
 
 omni_fixture_lock = threading.Lock()
 
@@ -128,10 +128,23 @@ def omni_runner(request: pytest.FixtureRequest, run_level: str) -> Generator[Omn
     yield from iter_omni_runner(request, run_level, omni_fixture_lock)
 
 
+@pytest.fixture
+def async_omni_resolved_params() -> AsyncOmniParams | None:
+    """Optional pre-resolved paths for ``async_omni_runner_function`` only.
+
+    Override this fixture when model and deploy YAML paths are prepared by
+    other fixtures. They are used exactly as supplied, without a model prefix,
+    tiny-model rebuilding, or run-level deploy YAML patching. Returning ``None``
+    keeps the normal indirect ``AsyncOmniParams`` behavior.
+    """
+    return None
+
+
 @pytest_asyncio.fixture(scope="function", loop_scope="function")
 async def async_omni_runner_function(
     request: pytest.FixtureRequest,
     run_level: str,
+    async_omni_resolved_params: AsyncOmniParams | None,
 ) -> AsyncGenerator[AsyncOmniRunner, None]:
     """Function-scoped in-process :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner_function`).
 
@@ -141,13 +154,16 @@ async def async_omni_runner_function(
     defaults to a function-scoped loop, and an engine reused across loops hangs
     on its second ``generate()``.
 
+    Override :func:`async_omni_resolved_params` instead of parametrizing this
+    fixture when other fixtures prepare the model and deploy YAML paths.
+
     An async fixture, so the engine is built and shut down on the test's running
     loop: ``AsyncOmni.shutdown()`` cancels the output-handler task, which
     belongs to that loop. A sync fixture is torn down after the loop has stopped.
     """
     from tests.helpers.runtime import iter_async_omni
 
-    runners = iter_async_omni(request, run_level, omni_fixture_lock)
+    runners = iter_async_omni(request, run_level, omni_fixture_lock, resolved_params=async_omni_resolved_params)
     try:
         yield next(runners)
         next(runners, None)

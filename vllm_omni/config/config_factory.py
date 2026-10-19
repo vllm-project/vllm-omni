@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,8 @@ from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.omni_config import (
     VllmOmniConfig,
+    VllmOmniDiffusionStageConfig,
+    _orchestrator_cli_overrides,
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
@@ -741,8 +743,15 @@ class StageConfigFactory:
         cls,
         model: str,
         kwargs: dict[str, Any],
+        *,
+        deploy_config_path: str | None = None,
+        default_model_class_name: str | None = None,
     ) -> VllmOmniConfig:
         """Build generic diffusion directly into the structured runtime config."""
+        if deploy_config_path is not None:
+            return cls._create_typed_diffusion_from_deploy(model, kwargs, deploy_config_path, default_model_class_name)
+        if default_model_class_name is not None:
+            kwargs = {"model_class_name": default_model_class_name, **kwargs}
         engine_overrides, parallel_config, default_sampling_params, final_output_type = (
             cls._normalize_default_diffusion(kwargs)
         )
@@ -779,6 +788,128 @@ class StageConfigFactory:
         return VllmOmniConfig.from_pipeline_config(
             pipeline, user_deploy_config=deploy, cli_overrides={"model": model, **stage_overrides}
         )
+
+    @classmethod
+    def _create_typed_diffusion_from_deploy(
+        cls,
+        model: str,
+        kwargs: dict[str, Any],
+        deploy_config_path: str,
+        default_model_class_name: str | None,
+    ) -> VllmOmniConfig:
+        """Merge deployment sources before deriving generic diffusion defaults."""
+        deploy = cls._load_user_deploy_config(deploy_config_path)
+        assert deploy is not None
+        stage_deploy = next((stage for stage in deploy.stages if stage.stage_id == 0), None)
+        if stage_deploy is None:
+            stage_deploy = StageDeployConfig(stage_id=0)
+            deploy.stages.append(stage_deploy)
+        # Diffusion ingress supplies its terminal dtype default before the
+        # structured projection reads pipeline-wide deployment settings.
+        # Materialize the declared deploy dtype as a stage input first;
+        # platform and explicit caller inputs still overlay it normally.
+        if deploy.dtype is not None:
+            stage_deploy.engine_extras.setdefault("dtype", deploy.dtype)
+
+        # Ingress normalization preserves omission. The compatibility builder's
+        # terminal defaults (dtype, cache, and parallel degrees) are not CLI
+        # overrides and must not replace deploy or platform values.
+        inputs = dict(kwargs)
+        if inputs.get("auxiliary_text_encoder") is not None:
+            extras = dict(inputs.get("extras") or {})
+            extras.pop("auxiliary_text_encoder", None)
+            inputs["extras"] = extras
+        explicit = normalize_and_validate_diffusion_engine_ingress_kwargs(inputs, stage_id=0)
+        quantization = explicit.pop("quantization", None)
+        if quantization is not None:
+            explicit["quantization_config"] = quantization
+        default_llama_model_id = explicit.pop("default_llama_model_id", None)
+        if default_llama_model_id is not None:
+            explicit["extras"] = {
+                **dict(explicit.get("extras") or {}),
+                "default_llama_model_id": default_llama_model_id,
+            }
+
+        sampling = explicit.pop("default_sampling_params", None)
+        if isinstance(sampling, str):
+            try:
+                sampling = json.loads(sampling)
+            except json.JSONDecodeError:
+                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
+                sampling = None
+        sampling_defaults = dict(sampling.get("0", {})) if isinstance(sampling, Mapping) else {}
+
+        devices = explicit.pop("stage_0_devices", None)
+        if devices is not None:
+            explicit["devices"] = devices
+        stage_overrides = {
+            f"stage_0_{key}": value
+            for key, value in explicit.items()
+            if key not in {"model", "stage_id"} and value is not None
+        }
+        # Engine aliases have already been normalized into stage overrides.
+        # Only keep global inputs consumed outside that stage projection.
+        global_overrides = _orchestrator_cli_overrides(inputs)
+        if inputs.get("async_chunk") is not None:
+            global_overrides["async_chunk"] = inputs["async_chunk"]
+        model_class_name = explicit.get("model_class_name") or default_model_class_name
+        pipeline = PipelineConfig(
+            model_type="generic_diffusion",
+            model_arch=str(model_class_name or ""),
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="diffusion",
+                    model_arch=model_class_name,
+                    execution_type=StageExecutionType.DIFFUSION,
+                    final_output=True,
+                    final_output_type=get_diffusion_output_type(model_class_name),
+                ),
+            ),
+        )
+        config = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=deploy,
+            deploy_config_path=deploy_config_path,
+            cli_overrides={**global_overrides, "model": model, **stage_overrides},
+        )
+        stage = config.stage_configs[0]
+        assert isinstance(stage, VllmOmniDiffusionStageConfig)
+        if sampling_defaults:
+            stage.model_config.default_sampling_params = {
+                **dict(stage.model_config.default_sampling_params or {}),
+                **sampling_defaults,
+            }
+            stage.model_config.has_sampling_extra_args = bool(
+                stage.model_config.default_sampling_params.get("extra_args")
+            )
+        if explicit.get("num_gpus") is not None:
+            parallel_inputs = {
+                item.name: getattr(stage.parallel_config, item.name)
+                for item in fields(DiffusionParallelConfig)
+                if item.init
+            }
+            if "data_parallel_size" not in getattr(stage.parallel_config, "_omni_explicit_fields", ()):
+                parallel_inputs["data_parallel_size"] = None
+            parallel = DiffusionParallelConfig(**parallel_inputs)
+            parallel.resolve_data_parallel_size(int(explicit["num_gpus"]))
+            stage.parallel_config = replace(stage.parallel_config, data_parallel_size=parallel.data_parallel_size)
+            stage.runtime_config.num_gpus = parallel.world_size
+        if stage.runtime_config.devices is None:
+            stage.runtime_config.devices = ",".join(str(i) for i in range(stage.parallel_config.world_size))
+        stage.diffusion_config.extras.setdefault("auxiliary_text_encoder", None)
+        stage.diffusion_config.extras.setdefault("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+        resolved_model_class = stage.diffusion_config.model_class_name
+        output_type = get_diffusion_output_type(resolved_model_class)
+        if resolved_model_class != model_class_name or output_type != stage.final_output_type:
+            topology = replace(
+                stage.stage_pipeline_config, model_arch=resolved_model_class, final_output_type=output_type
+            )
+            stage.stage_pipeline_config = topology
+            stage.model_config.model_arch = resolved_model_class
+            stage.diffusion_config.model_arch = resolved_model_class
+            config.pipeline_config = replace(pipeline, model_arch=str(resolved_model_class or ""), stages=(topology,))
+        return config
 
     @classmethod
     def _merge_cli_overrides(

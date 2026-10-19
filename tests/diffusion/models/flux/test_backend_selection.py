@@ -50,7 +50,7 @@ def test_tiny_flux_runs_requested_backends(tmp_path, mocker):
             "diffusion_attention_config": {"default": "TORCH_SDPA"},
         },
     )
-    args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+    args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
     od_config = OmniDiffusionConfig.from_kwargs(
         **extract_diffusion_stage_config_kwargs(
             args,

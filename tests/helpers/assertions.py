@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
     from tests.helpers.client import DiffusionResponse
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.outputs import OmniRequestOutput
 
 import av
 import numpy as np
@@ -203,6 +205,26 @@ def _transcript_has_bounded_tail(transcript: str, expected: str) -> bool:
     tail_words = len(transcript_words) - len(expected_words)
     max_tail_words = max(_MAX_TAIL_WORDS_FLOOR, math.ceil(_TAIL_WORD_RATIO * len(expected_words)))
     return tail_words <= max_tail_words
+
+
+def assert_image_diffusion_output(
+    output: "OmniRequestOutput | None",
+    *,
+    sampling_params: "OmniDiffusionSamplingParams",
+    request_id: str,
+) -> "OmniRequestOutput":
+    """Validate a completed native image output, including requested dimensions."""
+    assert output is not None, "Image generation returned no output"
+    assert output.error is None, f"Image generation failed: {output.error}"
+    assert output.finished, "Image generation did not finish"
+    assert output.request_id == request_id, f"Expected request_id={request_id!r}, got {output.request_id!r}"
+    assert output.final_output_type == "image", f"Expected image output, got {output.final_output_type!r}"
+    assert output.images, "No images in response"
+    expected_count = sampling_params.num_outputs_per_prompt
+    assert len(output.images) == expected_count, f"Expected {expected_count} images, got {len(output.images)}"
+    for image in output.images:
+        assert_image_valid(image, width=sampling_params.width, height=sampling_params.height)
+    return output
 
 
 def assert_image_diffusion_response(
@@ -1278,6 +1300,7 @@ __all__ = [
     "assert_diffusion_response",
     "assert_err_message_in_text",
     "assert_http_error",
+    "assert_image_diffusion_output",
     "assert_image_diffusion_response",
     "assert_image_valid",
     "assert_omni_response",

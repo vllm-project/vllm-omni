@@ -32,6 +32,7 @@ from tests.helpers.assertions import (
     assert_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
+    assert_image_diffusion_output,
     assert_images_generations_response,
     assert_omni_response,
     collect_at_success_rate,
@@ -44,8 +45,28 @@ from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import OmniRunner
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 logger = init_logger(__name__)
+
+
+async def send_async_image_diffusion_request(
+    engine: AsyncOmni,
+    *,
+    prompt: str,
+    sampling_params: OmniDiffusionSamplingParams,
+    request_id: str,
+) -> OmniRequestOutput:
+    """Consume one async image request and validate its final output."""
+    final_output = None
+    async for output in engine.generate(
+        prompt={"prompt": prompt},
+        request_id=request_id,
+        sampling_params_list=[sampling_params],
+        output_modalities=["image"],
+    ):
+        final_output = output
+    return assert_image_diffusion_output(final_output, sampling_params=sampling_params, request_id=request_id)
 
 
 def _parse_response_json(r: requests.Response) -> dict[str, Any] | list[Any] | None:
@@ -2346,4 +2367,5 @@ __all__ = [
     "OnlineOmniClient",
     "OpenAIClientHandler",
     "OmniRunnerHandler",
+    "send_async_image_diffusion_request",
 ]

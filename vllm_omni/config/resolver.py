@@ -232,15 +232,14 @@ def resolve_omni_config(
         raise ValueError(
             f"Model {model!r} did not resolve to a registered Omni pipeline or a supported diffusion model."
         )
-    if model_class_name is not None:
-        normalized_overrides.setdefault("model_class_name", model_class_name)
-    default_config = StageConfigFactory.create_typed_default_diffusion(model, normalized_overrides)
-
-    return OmniConfigResolution(
-        config_path=deploy_config_path,
-        stage_configs=tuple(default_config.stage_configs),
-        pipeline_config=default_config.pipeline_config,
+    default_config = StageConfigFactory.create_typed_default_diffusion(
+        model,
+        normalized_overrides,
+        deploy_config_path=deploy_config_path,
+        default_model_class_name=model_class_name,
     )
+
+    return _build_registered_resolution(default_config)
 
 
 __all__ = [
