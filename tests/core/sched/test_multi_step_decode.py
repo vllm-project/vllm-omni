@@ -121,14 +121,14 @@ def make_scheduler_output(requests, *, scheduled=1):
     )
 
 
-def make_scheduler(requests, *, max_model_len=4096, fail_ids=()):
+def make_scheduler(requests, *, max_model_len=4096, fail_ids=(), async_scheduling=True):
     return SimpleNamespace(
         requests={r.request_id: r for r in requests},
         kv_cache_manager=make_kv_manager(fail_ids=fail_ids),
         max_model_len=max_model_len,
         # async and sync scheduling both host windows; the planner reads the
         # mode only to choose the accounting path (placeholder fence vs direct).
-        scheduler_config=SimpleNamespace(async_scheduling=True),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
     )
 
 
@@ -543,3 +543,26 @@ def test_deferral_is_a_noop_without_outstanding_windows():
     scheduler.running.add_request(make_request("r0"))
     assert OmniARScheduler._defer_outstanding_window_requests(scheduler) is None
     assert [r.request_id for r in scheduler.running] == ["r0"]
+
+def test_plan_window_sync_mode_inflates_only_computed_tokens():
+    """Sync scheduling has no placeholder fence: one window in flight max.
+
+    The plan inflates ``num_computed_tokens`` (the K optimistic slots the window
+    will write) and nothing else; the shortfall reconcile rolls that back
+    directly, because a sync step is strictly serial and never has an in-flight
+    placeholder to consume.
+    """
+    requests = [make_request("r0", output_len=5)]
+    # Sync scheduling never adds output placeholders.
+    requests[0].num_output_placeholders = 0
+    scheduler = make_scheduler(requests, async_scheduling=False)
+    output = make_scheduler_output(requests)
+    assert plan_multi_step_window(scheduler, output, 8) is True
+    request = requests[0]
+    assert output.multi_step_plan["r0"] == 8
+    assert request.num_output_placeholders == 0
+    assert request.num_computed_tokens == 105 + 7
+    # A window that produced a single token rolls the 7 optimistic slots back.
+    reconcile_window_shortfall(request, 8, 1)
+    assert request.num_computed_tokens == 105
+    assert request.num_output_placeholders == 0

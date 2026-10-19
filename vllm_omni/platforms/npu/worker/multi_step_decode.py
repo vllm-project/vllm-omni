@@ -32,12 +32,11 @@ Fail-closed contract: ``validate_multi_step_plan`` re-checks every static
 invariant (platform, parallelism, model contract, sampling features)
 before a window runs.  Per-step mutable state is deliberately NOT
 re-checked here: under async scheduling the runner's input_batch view
-lags the scheduler, so such checks would produce false refusals -- and a
-refusal after the scheduler planned follow-up windows on top of this one
-cannot be recovered by shrinking (the follow-up plans' KV positions
-would skip this window's reserved slots, leaving holes of uninitialized
-cache).  Phase and batch composition are gated scheduler-side with
-authoritative state instead.  The residual static refusals shrink the
+lags the scheduler, so such checks would produce false refusals.  A
+refusal is recoverable: the scheduler fences a request whose window is
+still unreconciled, so no follow-up schedule is ever emitted against the
+window's optimistic positions.  Phase and batch composition are gated
+scheduler-side with authoritative state instead.  The residual static refusals shrink the
 K-token schedule back to a plain single-token step
 (``shrink_refused_multi_step_window``); the scheduler side reconciles the
 reservation shortfall, so a refused window costs nothing but a skipped
@@ -119,7 +118,11 @@ def validate_multi_step_plan(
     try:
         plan = getattr(scheduler_output, "multi_step_plan", None)
         if not plan:
-            return _refuse("no_plan")
+            # An empty plan is the default -- windows disabled, or a step the
+            # planner left alone.  Return without counting a refusal so a
+            # default-configured stage neither logs a warning on its first step
+            # nor floods the planned-vs-executed diagnostic with baseline noise.
+            return None
         window_sizes = {int(k) for k in plan.values()}
         if len(window_sizes) != 1:
             return _refuse("mixed_window_sizes")
@@ -221,13 +224,13 @@ def validate_multi_step_plan(
         # batch composition).  Under async scheduling the runner's
         # input_batch view lags the scheduler -- the plan is validated
         # before _update_states syncs it -- so those checks would produce
-        # false refusals.  A refusal after the scheduler planned follow-up
-        # windows on top of this one is NOT recoverable by shrinking: the
-        # follow-up plan's KV positions would skip this window's reserved
-        # slots, leaving holes of uninitialized cache that corrupt every
-        # later step.  The scheduler side already gates phase/batch with
-        # authoritative state (_request_admits_multi_step), so the runner
-        # only re-checks static configuration above.
+        # false refusals.  Shrinking back to a single-token step is safe
+        # because the scheduler fences the request while its window is
+        # unreconciled, so no follow-up schedule has been emitted against the
+        # window's optimistic positions.  Phase and batch composition are
+        # gated scheduler-side with authoritative state
+        # (_request_admits_multi_step); the runner only re-checks static
+        # configuration above.
         global _executed_windows
         _executed_windows += 1
         return plan

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Multi-step decode window planning for AR stages on async scheduling.
+"""Multi-step decode window planning for AR stages.
 
 Small autoregressive stages (e.g. the MiniCPM-o 4.5 Talker) spend more host
 time per decode step (scheduling, input preparation, attention metadata,
@@ -20,10 +20,12 @@ whole batch, amortizing the per-step host cost over ``K`` tokens:
    fewer tokens than planned (early stop or single-step fallback), so the
    engine's confirmed ``num_computed_tokens`` always matches the KV slots
    actually written.
-3. The inflated placeholder count doubles as the fence: while a window is
-   in flight, ``num_tokens_with_spec + placeholders - computed == 0`` keeps
-   the request out of subsequent schedules until its K tokens are
-   reconciled.
+3. Fence: a planned-but-unreconciled window is tracked per request, and the
+   request is held out of subsequent scheduling until its K tokens are
+   reconciled.  Inflating placeholders and computed tokens by the same amount
+   leaves ``num_new_tokens`` at its normal value, so the counters alone do NOT
+   fence; the explicit fence is what makes a runner refusal recoverable, since
+   reconcile repairs counters but not an already-emitted schedule.
 
 Concurrency safety: the window freezes the batch composition for K steps,
 so a request waiting in the scheduler's waiting queue would be blocked from
@@ -46,7 +48,8 @@ model class.  The contract behind the flag:
   end.
 
 Every refusal path is fail-closed: the patch is skipped entirely and the
-normal single-step engine loop runs.  Rollback: leave
+normal single-step engine loop runs.  Both async and sync scheduling are
+supported (sync keeps one window in flight and has no placeholder fence).  Rollback: leave
 ``multi_step_decode_steps`` at 0 (the default) in the deploy config.
 """
 

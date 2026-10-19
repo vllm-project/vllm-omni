@@ -322,3 +322,42 @@ def test_notify_finished_requests_is_a_noop_without_finished_or_hook():
         SimpleNamespace(model=object()), SimpleNamespace(finished_req_ids={"r0"})
     )
     assert calls == []
+
+def test_shrink_refused_window_restores_a_single_token_step():
+    """A runner refusal must shrink the whole K-token schedule to one token.
+
+    Otherwise the fallback would run the K-token schedule as a plain multi-token
+    decode: rows 1..K-1 would carry stale embeddings and KV would be written on
+    slots the window never produced.
+    """
+    output = SimpleNamespace(
+        num_scheduled_tokens={"r0": 8, "r1": 8},
+        total_num_scheduled_tokens=16,
+        multi_step_plan={"r0": 8, "r1": 8},
+    )
+    msd_module.shrink_refused_multi_step_window(output)
+    assert output.num_scheduled_tokens == {"r0": 1, "r1": 1}
+    assert output.total_num_scheduled_tokens == 2
+
+
+def test_shrink_refused_window_leaves_unplanned_requests_alone():
+    output = SimpleNamespace(
+        num_scheduled_tokens={"r0": 8, "r1": 3},
+        total_num_scheduled_tokens=11,
+        multi_step_plan={"r0": 8},
+    )
+    msd_module.shrink_refused_multi_step_window(output)
+    assert output.num_scheduled_tokens == {"r0": 1, "r1": 3}
+    assert output.total_num_scheduled_tokens == 4
+
+
+def test_shrink_refused_window_is_a_noop_without_a_plan():
+    for plan in ({}, None):
+        output = SimpleNamespace(
+            num_scheduled_tokens={"r0": 1},
+            total_num_scheduled_tokens=1,
+            multi_step_plan=plan,
+        )
+        msd_module.shrink_refused_multi_step_window(output)
+        assert output.num_scheduled_tokens == {"r0": 1}
+        assert output.total_num_scheduled_tokens == 1
