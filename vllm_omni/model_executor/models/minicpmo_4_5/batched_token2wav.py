@@ -443,10 +443,9 @@ class BatchedToken2Wav(nn.Module):
         )
         self._timeline_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, list[float]]] = {}
         self.hift_graph_wrapper: HiFTGraphWrapper | None = None
-        # Row-order index tensors for the batched per-request cache split,
+        # CFG-interleaved row order for the batched per-request cache split,
         # cached per (batch_size, device); see ``_split_flow_cache``.
         self._split_order_2n: dict[int, torch.Tensor] = {}
-        self._split_order_row: dict[int, torch.Tensor] = {}
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
             if hift_parameter is None:
@@ -1599,12 +1598,22 @@ class BatchedToken2Wav(nn.Module):
         whole batch is built first: at 16 requests that copy alone was ~7 GiB.
 
         The conformer caches and ``estimator_cnn_cache`` are split with one
-        batched ``index_select`` per key instead of two ``clone`` calls and
-        one ``cat`` per row (3B small launches -> 3). The CFG-interleaved
-        order ``[cond0, uncond0, cond1, ...]`` reproduces the previous
-        per-row ``cat([row, batch + row], dim=2)`` row selection exactly, and
-        ``index_select`` allocates a fresh buffer, which preserves the
-        graph-output isolation the per-row ``clone`` provided.
+        batched allocation per key instead of two ``clone`` calls and one
+        ``cat`` per row (3B small launches -> 3). The CFG-interleaved order
+        ``[cond0, uncond0, cond1, ...]`` reproduces the previous per-row
+        ``cat([row, batch + row], dim=2)`` row selection exactly, and the
+        fresh buffers keep the graph-output isolation the per-row ``clone``
+        provided.
+
+        Lifetime: each row's cache is a view into that chunk's B-row buffer,
+        so the buffer stays alive until every sibling row has been replaced by
+        a later chunk. Serving steps the live rows of a chunk together, so at
+        most one extra chunk's buffers are pinned per generation; the
+        conformer_cnn rows are contiguous (whole-tensor clone) and the
+        conformer_att/estimator_cnn rows stay strided views. Both consumers
+        accept the strided views without an extra copy: ``_stack_flow_cache``
+        concatenates them, and ``FlowEncoderGraphs.run`` copies rows into its
+        static views with ``torch.cat(..., out=...)``.
         ``estimator_att_cache`` keeps its existing per-request copy/direct
         path: it is coupled to ``keep_ranges``/``_copy_frame_segments`` and is
         unchanged here.
@@ -1626,12 +1635,8 @@ class BatchedToken2Wav(nn.Module):
                 dtype=torch.long,
             )
             self._split_order_2n[batch_size] = order_2n
-        order_row = self._split_order_row.get(batch_size)
-        if order_row is None or order_row.device != dev:
-            order_row = torch.arange(batch_size, device=dev, dtype=torch.long)
-            self._split_order_row[batch_size] = order_row
-        cnn_split = cache["conformer_cnn_cache"].index_select(0, order_row).detach()
-        catt_split = cache["conformer_att_cache"].index_select(1, order_row).detach()
+        cnn_split = cache["conformer_cnn_cache"].detach().clone()
+        catt_split = cache["conformer_att_cache"].detach().clone()
         ecnn_split = cache["estimator_cnn_cache"].index_select(2, order_2n).detach()
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
