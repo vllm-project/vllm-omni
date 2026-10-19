@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from collections.abc import Callable
@@ -37,21 +37,32 @@ if current_omni_platform.is_xpu():
     try:
         import inspect
 
-        from auto_round_kernel import ARK
+        try:
+            # auto-round-lib <= 0.14: singleton class
+            from auto_round_kernel import ARK
 
-        _ark = ARK()
-        xpu_sageattn = _ark.sagev1
+            xpu_sageattn = ARK().sagev1
+        except ImportError:
+            # auto-round-lib >= 0.15: ARK removed, kernels are module-level
+            import auto_round_kernel as _ark_mod
+
+            if getattr(_ark_mod, "xpu_lib", None) is None:
+                raise ImportError("auto_round_kernel XPU extension failed to load")
+            xpu_sageattn = _ark_mod.sagev1
         _sagev1_params = inspect.signature(xpu_sageattn).parameters
         _sagev1_has_tensor_layout = "tensor_layout" in _sagev1_params
         _sagev1_scale_param = "sm_scale" if "sm_scale" in _sagev1_params else "scale"
+        # >= 0.15 (auto-round PR #1882) accepts bf16 natively; skip the fp16 round-trip.
+        _sagev1_native_bf16 = "smooth_k" in _sagev1_params
     except ImportError:
         logger.warning(
-            "XPU SageAttention (auto_round_kernel.ARK.sagev1) is not available. "
+            "XPU SageAttention (auto_round_kernel sagev1) is not available. "
             "Install auto-round-lib for XPU sage attention support."
         )
         xpu_sageattn = None
         _sagev1_has_tensor_layout = False
         _sagev1_scale_param = "scale"
+        _sagev1_native_bf16 = False
 else:
     try:
         from sageattention import sageattn as _sageattn
@@ -281,9 +292,11 @@ class SageAttentionImpl(AttentionImpl):
         if xpu_sageattn is None:
             raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
         orig_dtype = query.dtype
-        q = query.to(torch.float16) if orig_dtype != torch.float16 else query
-        k = key.to(torch.float16) if orig_dtype != torch.float16 else key
-        v = value.to(torch.float16) if orig_dtype != torch.float16 else value
+        kernel_dtype = orig_dtype if (_sagev1_native_bf16 and orig_dtype == torch.bfloat16) else torch.float16
+        # ARK validates canonical strides; .contiguous() is a no-op for Cosmos3 (post-RoPE q, torch.cat k/v).
+        q = query.to(kernel_dtype).contiguous()
+        k = key.to(kernel_dtype).contiguous()
+        v = value.to(kernel_dtype).contiguous()
 
         if _sagev1_has_tensor_layout:
             if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
@@ -314,6 +327,6 @@ class SageAttentionImpl(AttentionImpl):
             )
             output = output.transpose(1, 2).contiguous()
 
-        if orig_dtype != torch.float16:
+        if output.dtype != orig_dtype:
             output = output.to(orig_dtype)
         return output
