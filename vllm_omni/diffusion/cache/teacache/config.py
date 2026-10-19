@@ -54,6 +54,14 @@ _MODEL_COEFFICIENTS = {
         -6.30339273e01,
         7.61309272e-01,
     ],
+    # OmniGen2 transformer coefficients
+    "OmniGen2Transformer2DModel": [
+        -1.13169970e01,
+        1.28097796e01,
+        -2.35170830e00,
+        1.51188493e00,
+        4.86397212e-04,
+    ],
     # Z-Image transformer coefficients
     # Calibrated on Z-Image-Turbo with ZImageAdapter + the TeaCacheCoefficientEstimator
     # hook path (per-step rel-L1 computed on the GPU instead of storing full CPU
