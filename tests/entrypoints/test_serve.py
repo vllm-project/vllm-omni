@@ -522,7 +522,6 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
 
     manager = mocker.Mock()
     manager.processes = [mocker.Mock()]
-    manager.gather_actual_addresses.return_value = (primary_addresses.inputs, primary_addresses.outputs)
 
     mocker.patch.object(serve_module, "_build_multi_api_stage_runtime", return_value=runtime)
     mocker.patch.object(serve_module, "_wait_for_multi_api_server_completion")
@@ -536,9 +535,9 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
     assert args._omni_stage_client_configs is engine_launch.client_configs
     start_manager.assert_called_once()
     manager_kwargs = start_manager.call_args.kwargs
-    assert manager_kwargs["cleanup_timeout"] == 1
     assert manager_kwargs["num_servers"] == 2
-    assert manager_kwargs["input_addresses"] == ["ipc://input-0", "ipc://input-1"]
+    assert [listener.address for listener in manager_kwargs["input_listeners"]] == ["ipc://input-0", "ipc://input-1"]
+    assert [listener.address for listener in manager_kwargs["output_listeners"]] == ["ipc://output-0", "ipc://output-1"]
     assert manager_kwargs["target_server_fn"] is serve_module.run_omni_api_server_worker_proc
     assert engine_launch.watched_frontend_processes == manager.processes
     runtime.shutdown.assert_called_once_with()
@@ -550,34 +549,36 @@ def test_start_api_server_process_manager_cleans_up_partial_start(mocker: Mocker
 
     first_process = mocker.Mock(name="first_process")
     second_process = mocker.Mock(name="second_process")
-    first_process.pid = 1234
-    second_process.pid = None
     second_process.start.side_effect = RuntimeError("spawn failed")
-    parent_pipes = [mocker.Mock(name="parent_pipe_0"), mocker.Mock(name="parent_pipe_1")]
-    child_pipes = [mocker.Mock(name="child_pipe_0"), mocker.Mock(name="child_pipe_1")]
     spawn_context = mocker.Mock()
     spawn_context.Process.side_effect = [first_process, second_process]
-    spawn_context.Pipe.side_effect = list(zip(parent_pipes, child_pipes))
     mocker.patch("vllm.v1.utils.multiprocessing.get_context", return_value=spawn_context)
     shutdown = mocker.patch("vllm.v1.utils.shutdown")
 
+    def _listener(address: str):
+        return mocker.Mock(address=address, socket=None)
+
+    input_listeners = [_listener("ipc://input-0"), _listener("ipc://input-1")]
+    output_listeners = [_listener("ipc://output-0"), _listener("ipc://output-1")]
+
     with pytest.raises(RuntimeError, match="spawn failed"):
         serve_module._start_api_server_process_manager(
-            cleanup_timeout=1.5,
             listen_address="127.0.0.1:8000",
             sock=mocker.Mock(),
             args=argparse.Namespace(),
             num_servers=2,
-            input_addresses=["ipc://input-0", "ipc://input-1"],
-            output_addresses=["ipc://output-0", "ipc://output-1"],
+            input_listeners=input_listeners,
+            output_listeners=output_listeners,
             target_server_fn=mocker.Mock(),
         )
 
     first_process.start.assert_called_once_with()
     second_process.start.assert_called_once_with()
-    for pipe in parent_pipes:
-        pipe.close.assert_called_once_with()
-    shutdown.assert_called_once_with([first_process], timeout=1.5)
+    # Since upstream f226af0e11 the manager owns the rollback: it shuts down
+    # the processes it recorded and cleans every listener up.
+    shutdown.assert_called_once_with([first_process, second_process], timeout=None)
+    for listener in [*input_listeners, *output_listeners]:
+        listener.cleanup.assert_called_once_with()
 
 
 def test_wait_for_multi_api_server_completion_rejects_engine_failure(

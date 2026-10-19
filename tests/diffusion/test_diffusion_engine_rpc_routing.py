@@ -178,6 +178,8 @@ def _make_engine_with_loop(
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
+    engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
     engine._closed = False
     engine.abort_queue = queue.Queue()
     engine._rpc_queue = queue.Queue()
@@ -252,10 +254,13 @@ async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_clean
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     calls = []
+    boundaries = []
 
     def execute(output):
         request_id = output.scheduled_request_ids[0]
         calls.append(request_id)
+        if request_id == "paced":
+            boundaries.append(output.interaction_boundaries[request_id])
         chunk = calls.count(request_id)
         return RunnerOutput(
             request_id=request_id,
@@ -284,11 +289,19 @@ async def test_playback_backpressure_bounds_generation_keeps_rpcs_live_and_clean
         await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.1))
         await asyncio.sleep(0.02)
         assert calls == ["paced"]
+        stamp = await engine.async_collective_rpc("track_streaming_interaction", args=("paced", "release"))
         await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.3))
+        await asyncio.sleep(0.02)
+        assert calls == ["paced"]
+        assert stamp < engine._streaming_playback["paced"].next_ready_at
         await engine.async_collective_rpc("submit_interaction", args=("paced", {"event_id": "release", "event": {}}))
         second = await asyncio.wait_for(queue.get(), 2)
         assert second.chunk_index == 1
         assert calls == ["paced", "paced"]
+        assert boundaries[0].window_end_at is None
+        assert boundaries[1].window_opened_at == boundaries[0].boundary_at
+        assert boundaries[1].window_end_at == pytest.approx(boundaries[0].boundary_at + 1.0)
+        assert boundaries[1].boundary_at >= boundaries[1].window_end_at
         assert engine._playback_blocked()
         # Delayed/reordered progress cannot move the playhead backwards.
         await engine.async_collective_rpc("update_streaming_playback", args=("paced", 0.2))
@@ -377,8 +390,10 @@ async def test_streaming_credit_covers_downstream_consumer_and_final_chunk(expli
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("over_limit", [False, True])
-async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit):
+@pytest.mark.parametrize("interaction_wait", [False, True])
+async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit, interaction_wait):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.utils import StepWait
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     calls = []
@@ -392,6 +407,7 @@ async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit)
             step_index=1,
             finished=finished,
             result=DiffusionOutput(output=b"four", finished=finished),
+            wait_for_interaction=StepWait() if interaction_wait and not finished else None,
             streaming_media_duration=0.01,
             streaming_next_media_duration=0.01,
         )
@@ -436,6 +452,22 @@ async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit)
         assert calls == ["paced", "next"]
     finally:
         _stop_engine(engine)
+
+
+def test_pending_streaming_controls_are_bounded_and_keep_original_ingress_time():
+    from vllm_omni.diffusion.diffusion_engine import _StreamingPlayback
+    from vllm_omni.diffusion.interaction.types import MAX_PENDING_INTERACTION_EVENTS
+
+    engine = _make_engine_with_loop(None, start_loop=False)
+    engine._streaming_playback = {"paced": _StreamingPlayback(1.0)}
+    first = engine.track_streaming_interaction("paced", "first")
+    assert engine.track_streaming_interaction("paced", "first") == first
+    for index in range(MAX_PENDING_INTERACTION_EVENTS - 1):
+        engine.track_streaming_interaction("paced", str(index))
+    with pytest.raises(ValueError, match="Too many pending interactions"):
+        engine.track_streaming_interaction("paced", "overflow")
+    engine.track_streaming_interaction("paced", "first", pending=False)
+    assert engine.track_streaming_interaction("paced", "accepted-after-release") is not None
 
 
 def test_internal_pacing_deadline_does_not_start_client_idle_timeout():
@@ -769,14 +801,8 @@ async def test_native_kv_reservation_error_wakes_stream_without_killing_busy_loo
     request.diffusion_kv_requests = (object(),)
     try:
         response_stream = engine.async_add_req_and_stream_response(request)
-        output_queue = engine._out_streams[request.request_id]
-        for _ in range(300):
-            if not output_queue.empty():
-                break
-            await asyncio.sleep(0.01)
-        assert not output_queue.empty(), "terminal KV allocation error was not delivered to the request stream"
-
-        output = await anext(response_stream)
+        assert request.request_id in engine._out_streams
+        output = await asyncio.wait_for(anext(response_stream), timeout=3.0)
         assert output.error == "native allocation bug"
         assert output.finished
         assert engine.worker_thread.is_alive()

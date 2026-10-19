@@ -99,6 +99,7 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
     error: str
     status_code: int | None = None
     error_type: str | None = None
+    mm_cache_miss_hashes: list[str] | None = None
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None
