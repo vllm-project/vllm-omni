@@ -73,6 +73,55 @@ profile. This selects `AsyncOmni` and the ordinary API initialization instead
 of the duplex handler. See [Full Duplex](full_duplex_api.md#enable-full-duplex)
 for the command and configuration requirements.
 
+### Multiple Frontends
+
+For a local multi-replica deployment, `--api-server-count K` distributes duplex
+processing across separate Python processes on one public port. This requires
+`duplex_session.replica_policy: least_sessions`, a per-replica session cap, and
+a model plugin that does **not** support session resume, such as PersonaPlex.
+The default stays at one frontend; resume-capable plugins and `legacy` routing
+are rejected when `K > 1`.
+
+Create a PersonaPlex deploy configuration with eight replica groups as described
+in [Multiple duplex frontends](../configuration/stage_configs.md#multiple-duplex-frontends),
+then start four frontends:
+
+```bash
+vllm serve nvidia/personaplex-7b-v1 --omni \
+    --deploy-config /path/to/personaplex-eight-replicas.yaml \
+    --api-server-count 4 --host 0.0.0.0 --port 8099
+```
+
+With eight groups, `max_sessions: 64` and `max_sessions_per_replica: 8`, each
+frontend owns two groups and admits at most 16 sessions. Ownership is
+`group_index % K`; global capacity is split evenly, including any remainder.
+`K` must not exceed the number of groups. A group cannot share a stage replica
+with a group owned by a different frontend. Prefer `max_sessions >= K` so every
+frontend receives a nonzero admission budget.
+
+The operating system assigns new connections without consulting session
+capacity. An admission error with `error.retryable: true` means the client may
+close its current WebSocket, back off and reconnect to try another frontend;
+repeated rejection is possible even
+while another frontend has capacity. Reconnect opens a **new** session, not a
+resume, and does not preserve model state. Clients should bound retries and
+record rejection and retry counts when measuring service capacity.
+
+PersonaPlex startup warmup is opt-in: set `duplex_session.warmup_frames` to a
+positive frame count to enable it. Frontends with nonzero admission budgets
+then warm their owned groups locally and gate their own duplex connections
+until warmup completes; clients wait at most `DUPLEX_WARMUP_CLIENT_WAIT_S` (180 s)
+before being admitted, as in single-frontend mode.
+`/health` retains the engine-health check; it is not an
+all-frontend warmup barrier, and a 200 response does not mean that the accepting
+frontend has free admission slots.
+Prometheus multiprocess collection aggregates the owner-only
+`vllm_omni:duplex_reserved_sessions` gauge and admission
+rejection counters. The supervisor still shuts down the service on an engine
+failure or abnormal frontend exit; this mode does not isolate failures or
+migrate sessions. See the [architecture](../design/fullduplex.md#multiple-frontends)
+for the shared-engine attachment model and its limits.
+
 ### Run the Example Client
 
 `examples/online_serving/barge_in_client.py` asks a question, interrupts the
@@ -283,6 +332,84 @@ independent slot. A closure notification exceeding 4 KiB is compacted to
 `reason: "close_details_exceed_output_limit"` with empty details, preserving
 the event type and identity. One event held by the consumer is outside the
 queued budget; audio already sent still requires the client to stop playback.
+
+### Tool calls: results, deadlines and cancellation
+
+A native-duplex model may emit a function call at any point in its token
+stream. The runtime never executes it: it projects the call to the client as
+`response.function_call_arguments.done` with a `call_id` (plus the projected
+`item_id` / `response_id`) and waits for the client to send the result back as
+a `conversation.item.create` item of type `function_call_output`. Between those
+two events the call is *pending*, and it settles exactly once:
+
+| Terminal state | When |
+| --- | --- |
+| `accepted` | the result was admitted and the item was created |
+| `timed_out` | the deadline passed (only when `tool_result_timeout_s` is set) |
+| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`) |
+
+Admission is authoritative per session, and it is about the *call*, not about
+conversation history: only a call this session exposed can be answered, and only
+while it is still pending. A result for an unknown `call_id`, for a call the
+client imported into history itself, for a call that already settled, or for a
+call left behind by a cancelled epoch is refused with
+`invalid_function_call_output`, carrying the client `event_id` as
+`error.event_id` and `param` `item.call_id` (unusable identity) or
+`item.output` (duplicate or cancelled). Refusals never mutate the call: a plugin
+that rejects a result (for example an over-full tool-result queue) leaves the
+call pending so a corrected or repeated result for the same `call_id` is still
+admissible. A `call_id` is never rebound to a newer call, so a late result
+cannot answer a later one.
+
+Cancelling an epoch (a supported barge-in, or `input.cancel`) refuses any
+pending result and also retires a result the model had already accepted but not
+yet consumed on a frame; the next epoch cannot speak it. Retiring keeps the
+model's monotonic consumption cursor, so a result taken into model state once is
+never applied twice. If a plugin cannot retire its queue, the session closes
+(`tool_result_retirement_failed`) rather than risk speaking a cancelled result.
+
+`tool_result_timeout_s` is optional, per session, and disabled by default. Set it
+in `extra_body` at session open (a top-level session key is accepted too, like
+`idle_timeout_s`); it must be a positive, finite number. It cannot be changed by
+a later `session.update`, because calls may already be pending under the old
+deadline (`tool_result_timeout_update_unsupported`):
+
+```json
+{
+  "type": "session.update",
+  "session": {"extra_body": {"auto_response": true, "tool_result_timeout_s": 30}}
+}
+```
+
+The deadline is measured on the session's monotonic clock from the moment the
+call is exposed. A result that arrives strictly before it is accepted; one that
+arrives at or after it is refused (`invalid_function_call_output`,
+`param: "item.call_id"`). The expiry timer and result admission each settle
+the call as timed out at most once, and that settlement emits one `error`
+with `code: "tool_result_timeout"` naming the expired `call_id`. When
+admission settles it, the correlated `invalid_function_call_output` is also
+present. The notices have no promised order. No business result is fabricated,
+and input keeps flowing. If the model emits another call in the same session,
+including the same turn, that call can be answered normally. Closing the
+session disarms every pending deadline.
+
+This deadline settles the session ledger and rejects late results; it does not
+by itself make the model abandon a call or guarantee that it emits another one.
+Model recovery requires an adapter implementation of
+`runtime_config_for_tool_call_timeout`. The native Nemotron adapter currently
+inherits the no-op hook, so enabling its deadline does not guarantee native
+timeout recovery. The session admission and settlement support here is also
+separate from Qwen tool-result delivery in
+[#8493](https://github.com/vllm-project/vllm-omni/pull/8493); this runtime change
+alone does not establish Qwen tool-call end-to-end support.
+
+Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
+bounds the records one session may track, pending calls and settled tombstones
+together, until it closes; it must be a positive integer. At the limit, a new
+call is refused with `resource_exhausted` without being exposed to the client.
+The session stays open: already pending calls can still receive results, and
+audio processing continues. Records are not evicted and the budget is not
+replenished until the session closes, preserving protection against call-id reuse.
 
 ### Measure latency
 

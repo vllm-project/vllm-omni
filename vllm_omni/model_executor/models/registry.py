@@ -323,6 +323,12 @@ _OMNI_MODELS = {
         "audio8_tts_codec_decoder",
         "Audio8TTSCodecDecoder",
     ),
+    ## VibeVoice
+    "VibeVoiceForConditionalGeneration": (
+        "vibevoice",
+        "vibevoice",
+        "VibeVoiceForConditionalGeneration",
+    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",

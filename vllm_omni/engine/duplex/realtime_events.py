@@ -582,7 +582,9 @@ def _realtime_response_done_event(
             "status": status,
             "status_details": status_details,
             "output": [_response_done_output_item(state, response_id, status=status)],
-            "metadata": dict(event),
+            # Audio was delivered by output_audio.delta. Copying the waveform
+            # into the terminal doubles queue usage and defeats its reserve.
+            "metadata": {key: value for key, value in event.items() if key != "audio"},
         },
     )
 
@@ -930,6 +932,8 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         item_id = (
             event_item_id if isinstance(event_item_id, str) and event_item_id else _pop_pending_commit_item_id(state)
         )
+        if isinstance(event_item_id, str) and event_item_id in state.pending_commit_item_ids:
+            state.pending_commit_item_ids.remove(event_item_id)
         committed_item = state.conversation_items.get(item_id)
         commit_events: list[DuplexEvent] = []
         if committed_item is None:
@@ -1084,8 +1088,17 @@ def _function_call_done_events(state: RealtimeProjectionState, event: dict[str, 
         return [DuplexRawEvent(internal_type="function_call.done", details=event)]
     if not isinstance(arguments, str):
         arguments = str(arguments)
-    response_id = f"resp_{uuid4().hex}"
-    item_id = f"item_{uuid4().hex}"
+    # The emitter mints these so the item it projects and the record the
+    # tool-call ledger keeps are the same call; a caller that projects the
+    # internal event directly still gets fresh ids.
+    supplied_response_id = event.get("response_id")
+    supplied_item_id = event.get("item_id")
+    response_id = (
+        supplied_response_id
+        if isinstance(supplied_response_id, str) and supplied_response_id
+        else f"resp_{uuid4().hex}"
+    )
+    item_id = supplied_item_id if isinstance(supplied_item_id, str) and supplied_item_id else f"item_{uuid4().hex}"
     item: dict[str, object] = {
         "id": item_id,
         "object": "realtime.item",
@@ -1426,18 +1439,6 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
     return ResolvedControl(payloads=[command.payload(), ack_payload], events=[])
 
 
-def _duplicate_function_call_output(state: RealtimeProjectionState, call_id: object) -> tuple[bool, bool]:
-    matching_call = any(
-        known.get("type") == "function_call" and known.get("call_id") == call_id
-        for known in state.conversation_items.values()
-    )
-    duplicate_output = any(
-        known.get("type") == "function_call_output" and known.get("call_id") == call_id
-        for known in state.conversation_items.values()
-    )
-    return matching_call, duplicate_output
-
-
 def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> ResolvedControl:
     """Expand ``conversation.item.create`` the way the old translator did.
 
@@ -1446,6 +1447,14 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     become one ``input_audio_buffer.append`` per audio part followed by an
     ``input_audio_buffer.commit`` (no response). The user-item ack events are
     returned in ``events`` and must be emitted *before* running the payloads.
+
+    ``function_call_output`` is validated *structurally* here (shape and types)
+    and for nothing else: whether that call may still be answered is a property
+    of the session, not of the conversation history, and is decided by the
+    session's tool-call ledger in ``SessionControl`` when the payload runs. The
+    projection used to answer it from ``state.conversation_items``, which is
+    history-wide and epoch-blind, so a result arriving after a barge-in was
+    admitted against a call the session had already moved past.
     """
     item = dict(command.item)
     if isinstance(command.previous_item_id, str):
@@ -1456,8 +1465,7 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     if item_type == "function_call_output":
         call_id = item.get("call_id")
         output = item.get("output")
-        matching_call, duplicate_output = _duplicate_function_call_output(state, call_id)
-        if not isinstance(call_id, str) or not call_id or not matching_call:
+        if not isinstance(call_id, str) or not call_id:
             return ResolvedControl(
                 payloads=[],
                 events=[
@@ -1469,17 +1477,13 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
                     )
                 ],
             )
-        if not isinstance(output, str) or duplicate_output:
+        if not isinstance(output, str):
             return ResolvedControl(
                 payloads=[],
                 events=[
                     error_event(
                         "invalid_function_call_output",
-                        (
-                            "function_call_output requires a string output"
-                            if not isinstance(output, str)
-                            else f"function_call_output already exists for call_id {call_id}"
-                        ),
+                        "function_call_output requires a string output",
                         event_id=command.event_id,
                         param="item.output",
                     )

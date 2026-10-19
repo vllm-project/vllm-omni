@@ -82,6 +82,11 @@ def model_output_dir(parent_dir: Path, model: str) -> Path:
     return path
 
 
+def write_json_artifact(path: Path, value: Any) -> None:
+    """Write a UTF-8 accuracy artifact, rejecting non-finite JSON numbers."""
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
 DEFAULT_DEVICE_PROFILE = "default"
 
 
@@ -458,6 +463,24 @@ def assert_similarity(
         reference=diffusers_image,
         compare_mode=compare_mode,
     )
+    assert_similarity_metrics(
+        model_name=model_name,
+        ssim_score=ssim_score,
+        psnr_score=psnr_score,
+        ssim_threshold=ssim_threshold,
+        psnr_threshold=psnr_threshold,
+    )
+
+
+def assert_similarity_metrics(
+    *,
+    model_name: str,
+    ssim_score: float,
+    psnr_score: float,
+    ssim_threshold: float,
+    psnr_threshold: float,
+) -> None:
+    """Check computed image metrics, allowing callers to save all evidence first."""
     print(f"{model_name} similarity metrics:")
     print(f"  SSIM: value={ssim_score:.6f}, threshold>={ssim_threshold:.6f}, range=[-1, 1], higher_is_better=True")
     print(

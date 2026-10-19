@@ -50,6 +50,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_THINK_PIPELINE,
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
+from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
@@ -124,6 +125,7 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
 )
+from vllm_omni.model_executor.models.vibevoice.pipeline import VIBEVOICE_PIPELINE
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
 from vllm_omni.model_executor.models.wan2_2.pipeline import (
@@ -151,6 +153,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
+    "causvid_wan": CAUSVID_WAN_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
@@ -217,6 +220,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
+    "vibevoice": VIBEVOICE_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "wan2_2": WAN2_2_PIPELINE,

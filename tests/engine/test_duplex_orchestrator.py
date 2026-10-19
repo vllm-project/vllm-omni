@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -39,8 +40,9 @@ from vllm_omni.engine.duplex.messages import (
     OpenDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
-from vllm_omni.engine.messages import AbortRequestMessage, ShutdownRequestMessage
-from vllm_omni.engine.orchestrator import Orchestrator, build_engine_core_request_from_tokens
+from vllm_omni.engine.messages import AbortRequestMessage, AddCompanionRequestMessage, ShutdownRequestMessage
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
+from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
@@ -62,13 +64,19 @@ def _stage_configs(count: int) -> list[object]:
 def _build(
     *,
     stages: int = 1,
+    replicas: int = 1,
     running_counter: FakeRunningCounter | None = None,
     runtime_config: DuplexSessionRuntimeConfig | None = None,
     plugin=None,
+    frontend_count: int = 1,
+    frontend_index: int = 0,
 ) -> tuple[DuplexOrchestrator, list[FakeStageClient], asyncio.Queue, asyncio.Queue]:
     clients = [FakeStageClient(stage_type="llm", final_output=index == stages - 1) for index in range(stages)]
     pools = _build_stage_pools(
-        [[client] for client in clients],
+        [
+            [client, *[FakeStageClient(final_output=index == stages - 1) for _ in range(replicas - 1)]]
+            for index, client in enumerate(clients)
+        ],
         output_processors=[FakeOutputProcessor() for _ in clients],
         stage_vllm_configs=_stage_configs(stages),
     )
@@ -83,6 +91,8 @@ def _build(
         plugin=plugin or MiniCPMO45DuplexPlugin(_encode_audio),
         duplex_session_config=runtime_config or DuplexSessionRuntimeConfig(reaper_interval_s=0.01),
         model_config=None,
+        frontend_count=frontend_count,
+        frontend_index=frontend_index,
     )
     return orchestrator, clients, rpc_q, output_q
 
@@ -91,10 +101,11 @@ def _open_message(
     extra_body: dict[str, object] | None = None,
     *,
     output_buffer: DuplexOutputBuffer | None = None,
+    session_id: str = SESSION_ID,
 ) -> OpenDuplexSessionMessage:
     return OpenDuplexSessionMessage(
-        control_id=f"open-{SESSION_ID}",
-        session_id=SESSION_ID,
+        control_id=f"open-{session_id}",
+        session_id=session_id,
         output_buffer=output_buffer or DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         session_config=DuplexSessionConfig(
             model="openbmb/MiniCPM-o-4_5",
@@ -347,6 +358,35 @@ def ephemeral_submissions(mocker):
 
     builder = mocker.patch.object(orchestrator, "_build_next_stage_request", side_effect=build_request)
     return orchestrator, clients, submissions, builder
+
+
+@pytest.mark.asyncio
+async def test_nonzero_entry_stage_retains_direct_entry_routing(mocker):
+    orchestrator, clients, _, _ = _build(stages=4)
+    context = DuplexStageRequestContext(
+        request_id="camera-only",
+        session_id="camera",
+        fence=DuplexFence("camera"),
+        stage_id=1,
+        final_stage_id=3,
+        config_generation=0,
+        sampling_params=orchestrator.sampling_defaults(),
+    )
+    orchestrator.ensure_request(context)
+    assert orchestrator.request_states[context.request_id].entry_stage_id == 1
+
+    async def build_request(request_id, stage_id, prompt, params, *, resumable):
+        return build_engine_core_request_from_tokens(request_id, prompt, params, resumable=resumable)
+
+    mocker.patch.object(orchestrator, "_build_next_stage_request", side_effect=build_request)
+    result = await orchestrator.submit(
+        DuplexStageSubmission(
+            context=context, prompt={"prompt_token_ids": [1]}, already_submitted=False, resumable=False
+        )
+    )
+    assert result.stage_id == 1
+    assert not clients[0].add_request_calls and len(clients[1].add_request_calls) == 1
+    await orchestrator.cleanup([context.request_id])
 
 
 @pytest.mark.asyncio
@@ -952,3 +992,584 @@ async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() 
 def test_default_plugin_declares_no_draining_stages() -> None:
     plugin = MiniCPMO45DuplexPlugin(_encode_audio)
     assert plugin.draining_stage_ids(stage_count=4) == frozenset()
+
+
+def _placement_config(**kwargs) -> DuplexSessionRuntimeConfig:
+    return DuplexSessionRuntimeConfig(
+        replica_policy="least_sessions", max_sessions=8, max_sessions_per_replica=2, **kwargs
+    )
+
+
+@pytest.mark.asyncio
+async def test_payload_sender_info_binds_from_explicit_session_state(monkeypatch) -> None:
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config(replica_groups=[{0: 1}, {0: 0}]))
+    pool = orchestrator.stage_pools[0]
+    for replica, client in enumerate(pool.clients):
+        client.get_payload_sender_info = lambda r=replica: {"replica": r}
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        request_id = _stage0_request_id()
+        state = orchestrator.request_states[request_id]
+        assert pool.get_bound_replica_id(request_id) is None
+        with monkeypatch.context() as patch:
+            patch.delattr(orchestrator, "request_states")
+            assert orchestrator._build_payload_sender_info(0, request_id=request_id) == {"replica": 0}
+            assert pool.get_bound_replica_id(request_id) is None
+            sender_info = orchestrator._build_payload_sender_info(0, request_id=request_id, req_state=state)
+        assert sender_info == {"replica": 1}
+        assert pool.get_bound_replica_id(request_id) == 1
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_group_pins_initial_update_forward_prewarm_and_new_epoch(monkeypatch) -> None:
+    config = _placement_config(replica_groups=[{0: 1, 1: 0, 2: 1}, {0: 0, 1: 1, 2: 0}])
+    orchestrator, _, rpc_q, _ = _build(stages=3, replicas=2, runtime_config=config)
+    pools = orchestrator.stage_pools
+    orchestrator.async_chunk = True
+    monkeypatch.setattr(orchestrator, "_stage_receives_async_chunks", lambda stage: stage == 2)
+    for stage, pool in enumerate(pools):
+        for replica, client in enumerate(pool.clients):
+            client.next_inputs = [{"prompt_token_ids": [1, 2]}]
+            client.get_payload_sender_info = lambda s=stage, r=replica: {"stage": s, "replica": r}
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        placement = orchestrator.replica_placement
+        before = placement.snapshot()["reserved"]
+        # Opening reserves capacity without adding session placeholders to a pool.
+        assert all(not pool._request_bindings for pool in pools)
+        await _submit(orchestrator, _append_audio())
+        request_id = _stage0_request_id()
+        state = orchestrator.request_states[request_id]
+        codec_request = pools[2].clients[1].add_request_calls[0][0]
+        # Stage 1 has not submitted yet, but its sender endpoint is already pinned.
+        assert not pools[1].clients[0].add_request_calls
+        assert codec_request.payload_sender_info == {"stage": 1, "replica": 0}
+        await orchestrator._forward_to_next_stage(
+            request_id, 0, SimpleNamespace(request_id=request_id), state, is_streaming_session=True
+        )
+        await _submit(orchestrator, _append_audio())
+        assert len(pools[0].clients[1].add_request_calls) == 2
+        assert pools[1].clients[0].add_request_calls
+        for stage, replica in {0: 1, 1: 0, 2: 1}.items():
+            assert pools[stage].get_bound_replica_id(request_id) == replica
+            assert not pools[stage].clients[1 - replica].add_request_calls
+        await _submit(orchestrator, commands.BargeIn())
+        assert request_id not in orchestrator.request_states
+        assert placement.snapshot()["reserved"] == before
+        await _submit(orchestrator, _append_audio())
+        new_id = _stage0_request_id(epoch=1)
+        assert pools[0].get_bound_replica_id(new_id) == 1
+        assert pools[2].get_bound_replica_id(new_id) == 1
+        await _close(orchestrator, rpc_q)
+        assert all(value == 0 for value in placement.snapshot()["reserved"].values())
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_turn_requests_keep_the_session_replica_before_prompt_processing(monkeypatch) -> None:
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda *args, **kwargs: "audio prompt")
+    orchestrator, _, rpc_q, _ = _build(
+        replicas=2,
+        runtime_config=_placement_config(replica_groups=[{0: 1}, {0: 0}]),
+        plugin=plugin,
+    )
+    pool = orchestrator.stage_pools[0]
+    processed_ids = []
+
+    def process_inputs(**kwargs):
+        request_id = kwargs["request_id"]
+        assert pool.get_bound_replica_id(request_id) == 1
+        assert orchestrator._stage_input_submission_locks[0].locked()
+        processed_ids.append(request_id)
+        return build_engine_core_request_from_tokens(
+            request_id=request_id,
+            prompt={"prompt_token_ids": [1, 2]},
+            params=kwargs["params"],
+            model_config=pool.stage_vllm_config.model_config,
+            resumable=False,
+        )
+
+    monkeypatch.setattr(
+        orchestrator, "_get_stage_input_processor", lambda stage: SimpleNamespace(process_inputs=process_inputs)
+    )
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        session = orchestrator.session_manager.get(SESSION_ID)
+        for _ in range(2):
+            await _submit(orchestrator, _append_audio())
+            await _submit(orchestrator, commands.Commit(final=True, create_response=True))
+            request_id = pool.clients[1].add_request_calls[-1][0].request_id
+            state = orchestrator.request_states[request_id]
+            output = SimpleNamespace(
+                request_id=request_id,
+                finished=True,
+                outputs=[SimpleNamespace(text="done", token_ids=[], multimodal_output={})],
+                multimodal_output={},
+            )
+            await orchestrator._intercept_stage_output(0, 1, output, state, None, None)
+            await _settle(orchestrator)
+            assert session.active_response_id is None
+        assert len(set(processed_ids)) == 2
+        assert not pool.clients[0].add_request_calls
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {SESSION_ID: 0}
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preselected", [False, True])
+async def test_session_replica_scopes_multimodal_cache_before_processing(monkeypatch, preselected) -> None:
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config())
+    processed = []
+    scope_calls = []
+    loop_thread_id = threading.get_ident()
+    scope_prompt = orchestrator._scope_stage_mm_cache_to_replica
+
+    def scope_inputs(stage_id, prompt, replica_id):
+        assert threading.get_ident() != loop_thread_id
+        scope_calls.append((stage_id, replica_id))
+        return scope_prompt(stage_id, prompt, replica_id)
+
+    def process_inputs(**kwargs):
+        assert threading.get_ident() != loop_thread_id
+        processed.append(kwargs["prompt"])
+        return build_engine_core_request_from_tokens(
+            request_id=kwargs["request_id"], prompt={"prompt_token_ids": [1]}, params=kwargs["params"]
+        )
+
+    monkeypatch.setattr(
+        orchestrator, "_get_stage_input_processor", lambda stage: SimpleNamespace(process_inputs=process_inputs)
+    )
+    monkeypatch.setattr(orchestrator, "_scope_stage_mm_cache_to_replica", scope_inputs)
+    prompt = {"prompt": "image", "multi_modal_data": {"image": object()}, "multi_modal_uuids": {"image": ["same"]}}
+    try:
+        for session_id in (SESSION_ID, "other"):
+            assert (await _open(orchestrator, rpc_q, session_id=session_id)).ok
+            request_id = duplex_resource_request_id(DuplexFence(session_id), "stage0")
+            state = orchestrator.request_states[request_id]
+            replica_id = orchestrator._session_route(0, state)
+            orchestrator.stage_pools[0].bind_request_to_replica(request_id, replica_id)
+            kwargs = {"replica_id": replica_id} if preselected else {}
+            await orchestrator._build_next_stage_request(request_id, 0, prompt, state.sampling_params_list[0], **kwargs)
+        assert scope_calls == [(0, 0), (0, 1)]
+        assert [item["multi_modal_uuids"]["image"] for item in processed] == [
+            ["stage0:rep0:same"],
+            ["stage0:rep1:same"],
+        ]
+        assert prompt["multi_modal_uuids"] == {"image": ["same"]}
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_derived_companion_uses_session_pin_even_without_parent_request_binding() -> None:
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config(replica_groups=[{0: 1}, {0: 0}]))
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        parent_id = _stage0_request_id()
+        state = orchestrator.request_states[parent_id]
+        prompt = build_engine_core_request_from_tokens(
+            request_id="companion", prompt={"prompt_token_ids": [1]}, params=state.sampling_params_list[0]
+        )
+        await orchestrator._handle_add_companion(
+            AddCompanionRequestMessage(
+                companion_id="companion",
+                parent_id=parent_id,
+                role="uncond",
+                prompt=prompt,
+                companion_prompt_text=None,
+                sampling_params_list=state.sampling_params_list,
+            )
+        )
+        pool = orchestrator.stage_pools[0]
+        assert pool.get_bound_replica_id("companion") == 1
+        assert not pool.clients[0].add_request_calls
+        assert pool.clients[1].add_request_calls[0][0] is prompt
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_stage", [0, 1])
+async def test_failed_initial_submit_evicts_session_replica_after_binding_rollback(monkeypatch, failing_stage) -> None:
+    orchestrator, _, rpc_q, _ = _build(stages=2, replicas=2, runtime_config=_placement_config())
+    orchestrator.async_chunk = True
+    monkeypatch.setattr(orchestrator, "_stage_receives_async_chunks", lambda stage: True)
+
+    async def fail_add(*args, **kwargs):
+        raise EngineDeadError("failed initial ADD")
+
+    monkeypatch.setattr(orchestrator.stage_pools[failing_stage].clients[0], "add_request_async", fail_add)
+    try:
+        for session_id in (SESSION_ID, "healthy", "idle"):
+            assert (await _open(orchestrator, rpc_q, session_id=session_id)).ok
+        await _submit(orchestrator, _append_audio())
+        manager = orchestrator.session_manager
+        await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
+        await asyncio.wait_for(manager.reap_expired(), timeout=1)
+        assert not manager._closing
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert set(orchestrator.session_manager.runners) == {"healthy"}
+        assert not orchestrator.stage_pools[failing_stage].is_replica_available(0)
+        assert (failing_stage, 0) in orchestrator.replica_placement.snapshot()["unavailable"]
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_replica_failure_closes_active_and_idle_owners_only() -> None:
+    orchestrator, _, rpc_q, output_q = _build(stages=2, replicas=2, runtime_config=_placement_config())
+    buffers = {}
+    try:
+        for session_id in (SESSION_ID, "healthy", "idle"):
+            buffers[session_id] = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+            assert (await _open(orchestrator, rpc_q, session_id=session_id, output_buffer=buffers[session_id])).ok
+        await _submit(orchestrator, _append_audio())
+        # No owner has submitted anything to stage 1; request-only failure scans miss them.
+        await orchestrator._handle_dead_replica(1, 0, EngineDeadError("test replica death"))
+        await _settle(orchestrator)
+        manager = orchestrator.session_manager
+        await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=1)
+        await asyncio.wait_for(manager.reap_expired(), timeout=1)
+        assert not manager._closing
+        assert orchestrator.replica_placement.snapshot()["sessions"] == {"healthy": 1}
+        assert set(orchestrator.session_manager.runners) == {"healthy"}
+        terminal_events = [output_q.get_nowait().event for _ in range(output_q.qsize())]
+        for session_id in (SESSION_ID, "idle"):
+            events = [await buffers[session_id].get() for _ in range(buffers[session_id].pending_events)]
+            events.extend(event for event in terminal_events if event.session_id == session_id)
+            errors = [event for event in events if event.type == "error"]
+            assert any(event.code == "replica_unavailable" for event in errors)
+            assert events[-1].type == "session.expired"
+        healthy_events = [await buffers["healthy"].get() for _ in range(buffers["healthy"].pending_events)]
+        assert not any(event.type in {"error", "session.expired"} for event in healthy_events)
+        assert (await _open(orchestrator, rpc_q, session_id="replacement")).ok
+        assert orchestrator.replica_placement.route("replacement", 1) == 1
+        result = await _open(orchestrator, rpc_q, session_id="overflow")
+        assert not result.ok and result.error_code == "resource_exhausted"
+        assert "replica_capacity_exhausted" in result.error_message
+        # Surviving sessions can still submit through their original group.
+        session = orchestrator.session_manager.get("healthy")
+        context = orchestrator.session_manager.ensure_stage_request(session, stage_id=0)
+        state = orchestrator.request_states[context.request_id]
+        assert orchestrator._session_route(0, state) == 1
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_session_open_keeps_request_round_robin_and_has_no_placement() -> None:
+    orchestrator, _, rpc_q, _ = _build(replicas=2)
+    try:
+        assert orchestrator.replica_placement is None
+        assert (await _open(orchestrator, rpc_q)).ok
+        pool = orchestrator.stage_pools[0]
+        assert not pool._request_bindings
+        assert pool.select_replica_id("ordinary-first") == 0
+        await _submit(orchestrator, _append_audio())
+        assert pool.get_bound_replica_id(_stage0_request_id()) == 1
+        assert pool.select_replica_id("ordinary-second") == 0
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.parametrize("distributed_hook", ["hub", "lb", "membership"])
+def test_least_sessions_rejects_distributed_startup(distributed_hook) -> None:
+    pools = _build_stage_pools([[FakeStageClient()]], stage_vllm_configs=_stage_configs(1))
+    kwargs = {}
+    if distributed_hook == "hub":
+        pools[0].attach_hub(SimpleNamespace())
+    elif distributed_hook == "lb":
+        pools[0].attach_load_balancer(SimpleNamespace())
+    else:
+        kwargs["membership_controller"] = SimpleNamespace()
+    with pytest.raises(ValueError, match="does not support distributed"):
+        DuplexOrchestrator(
+            request_async_queue=asyncio.Queue(),
+            output_async_queue=asyncio.Queue(),
+            rpc_async_queue=asyncio.Queue(),
+            stage_pools=pools,
+            plugin=MiniCPMO45DuplexPlugin(_encode_audio),
+            duplex_session_config=_placement_config(),
+            **kwargs,
+        )
+
+
+def test_orchestrator_validates_groups_against_actual_stage_pools() -> None:
+    with pytest.raises(ValueError, match="must cover every replica"):
+        _build(stages=2, replicas=2, runtime_config=_placement_config(replica_groups=[{0: 0, 1: 0}]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frontend_index", range(4))
+async def test_frontend_reserves_only_owned_groups_with_local_admission_budget(frontend_index) -> None:
+    config = DuplexSessionRuntimeConfig(replica_policy="least_sessions", max_sessions=11, max_sessions_per_replica=2)
+    orchestrator, _, rpc_q, _ = _build(
+        stages=2, replicas=8, runtime_config=config, frontend_count=4, frontend_index=frontend_index
+    )
+    owned = {frontend_index, frontend_index + 4}
+    limit = 3 if frontend_index < 3 else 2
+    try:
+        assert orchestrator.session_manager.admission_limit == limit
+        assert config.max_sessions == 11 and config.worker_max_sessions == 2
+        assert all(pool.num_replicas == 8 for pool in orchestrator.stage_pools), "all replicas remain attached"
+        for index in range(limit):
+            session_id = f"s{index}"
+            assert (await _open(orchestrator, rpc_q, session_id=session_id)).ok
+            for stage in range(2):
+                assert orchestrator.replica_placement.route(session_id, stage) in owned
+        rejected = await _open(orchestrator, rpc_q, session_id="full")
+        assert rejected.error_code == "resource_exhausted" and rejected.error_retryable
+        assert f"limit={limit}" in rejected.error_message
+        # Death notifications arrive on non-owner connections too.
+        await orchestrator._handle_dead_replica(1, (frontend_index + 1) % 4, EngineDeadError("non-owner"))
+        assert len(orchestrator.session_manager.runners) == limit
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_multi_frontend_initial_update_and_prewarm_use_owned_replica(monkeypatch) -> None:
+    orchestrator, _, rpc_q, _ = _build(
+        stages=2, replicas=4, runtime_config=_placement_config(), frontend_count=2, frontend_index=1
+    )
+    orchestrator.async_chunk = True
+    monkeypatch.setattr(orchestrator, "_stage_receives_async_chunks", lambda stage: True)
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        await _submit(orchestrator, _append_audio())
+        await _submit(orchestrator, _append_audio())
+        for pool in orchestrator.stage_pools:
+            assert pool.get_bound_replica_id(_stage0_request_id()) == 1
+            assert pool.clients[1].add_request_calls
+            assert all(not pool.clients[index].add_request_calls for index in (0, 2, 3))
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_frontends_emit_reserved_metrics_only_for_owned_replicas() -> None:
+    gauge = {}
+    writes = []
+
+    def set_reserved(stage, replica, count):
+        gauge[stage, replica] = count
+        writes.append((stage, replica))
+
+    frontends = [
+        _build(stages=2, replicas=2, runtime_config=_placement_config(), frontend_count=2, frontend_index=index)
+        for index in range(2)
+    ]
+    try:
+        for index, (orchestrator, _, rpc_q, _) in enumerate(frontends):
+            orchestrator._prom_metrics = SimpleNamespace(set_duplex_reserved_sessions=set_reserved)
+            assert (await _open(orchestrator, rpc_q, session_id=f"owner-{index}")).ok
+            assert writes[-2:] == [(0, index), (1, index)]
+        first, _, rpc_q, _ = frontends[0]
+        await first.session_manager.close(CloseDuplexSessionMessage(control_id="close", session_id="owner-0"))
+        assert (await rpc_q.get()).ok
+        assert gauge == {(0, 0): 0, (1, 0): 0, (0, 1): 1, (1, 1): 1}
+    finally:
+        for orchestrator, _, _, _ in frontends:
+            await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["legacy", "least_sessions"])
+async def test_single_frontend_keeps_global_admission_limit(policy) -> None:
+    config = DuplexSessionRuntimeConfig(replica_policy=policy, max_sessions=11, max_sessions_per_replica=2)
+    orchestrator, _, _, _ = _build(runtime_config=config)
+    try:
+        assert orchestrator.session_manager.admission_limit == 11
+        assert config.worker_max_sessions == (2 if policy == "least_sessions" else 11)
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_route_query_never_changes_request_bindings() -> None:
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config(replica_groups=[{0: 1}, {0: 0}]))
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        request_id = _stage0_request_id()
+        state = orchestrator.request_states[request_id]
+        pool = orchestrator.stage_pools[0]
+        for _ in range(2):
+            assert orchestrator._session_route(0, state) == 1
+            assert pool.get_bound_replica_id(request_id) is None
+        # Binding conflicts belong to the explicit bind, not the route query.
+        pool.bind_request_to_replica(request_id, 0)
+        assert orchestrator._session_route(0, state) == 1
+        assert pool.get_bound_replica_id(request_id) == 0
+        with pytest.raises(StageUnavailableError, match="conflicting"):
+            pool.bind_request_to_replica(request_id, 1)
+        pool.release_binding(request_id)
+        pool.evict_replica(1)
+        with pytest.raises(StageUnavailableError, match="unavailable"):
+            orchestrator._session_route(0, state)
+        assert not pool._request_bindings
+        assert orchestrator._session_route(0, OrchestratorRequestState(request_id="ordinary")) is None
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_request_id", [None, "req-x"])
+async def test_dead_replica_forwards_failed_request_id(monkeypatch, failed_request_id) -> None:
+    orchestrator, _, _, _ = _build(runtime_config=_placement_config())
+    error = EngineDeadError("replica died")
+    reported = []
+
+    async def record_dead(self, stage_id, replica_id, error, *, failed_request_id=None):
+        reported.append((self, stage_id, replica_id, error, failed_request_id))
+
+    monkeypatch.setattr(Orchestrator, "_handle_dead_replica", record_dead)
+    try:
+        kwargs = {} if failed_request_id is None else {"failed_request_id": failed_request_id}
+        await orchestrator._handle_dead_replica(0, 0, error, **kwargs)
+        assert reported == [(orchestrator, 0, 0, error, failed_request_id)]
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_forwards_failed_request_id_to_base(monkeypatch) -> None:
+    orchestrator, clients, _, _ = _build()
+    pool = orchestrator.stage_pools[0]
+    request_id = "req-x"
+    state = OrchestratorRequestState(request_id=request_id, sampling_params_list=list(orchestrator.sampling_defaults()))
+    orchestrator.request_states[request_id] = state
+    request = build_engine_core_request_from_tokens(
+        request_id=request_id, prompt={"prompt_token_ids": [1]}, params=state.sampling_params_list[0]
+    )
+    error = EngineDeadError("replica died during ADD")
+    reported = []
+
+    async def fail_send(*args, **kwargs):
+        raise error
+
+    async def record_dead(self, stage_id, replica_id, error, *, failed_request_id=None):
+        reported.append((self, stage_id, replica_id, error, failed_request_id))
+
+    monkeypatch.setattr(clients[0], "add_request_async", fail_send)
+    # A dead worker cannot acknowledge abort, so the failed submit retains its
+    # binding and the dispatch handler can attribute and evict the dead replica.
+    monkeypatch.setattr(clients[0], "abort_requests_async", fail_send)
+    monkeypatch.setattr(Orchestrator, "_handle_dead_replica", record_dead)
+    try:
+        submitted = await orchestrator._dispatch_or_fail_request(
+            lambda: pool.submit_initial(request_id, state, request),
+            req_id=request_id,
+            stage_id=0,
+            operation="test ADD",
+        )
+        assert not submitted
+        assert reported == [(orchestrator, 0, 0, error, request_id)]
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_queries_session_route_without_rebinding(monkeypatch) -> None:
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+
+    orchestrator, _, rpc_q, _ = _build(replicas=2, runtime_config=_placement_config())
+    pool = orchestrator.stage_pools[0]
+    reported = []
+
+    async def fail_add(*args, **kwargs):
+        raise EngineDeadError("initial ADD failed")
+
+    async def record_dead(stage_id, replica_id, error):
+        assert not pool._request_bindings, "the error path must not recreate the rolled-back binding"
+        reported.append((stage_id, replica_id))
+
+    monkeypatch.setattr(pool.clients[0], "add_request_async", fail_add)
+    monkeypatch.setattr(orchestrator, "_handle_dead_replica", record_dead)
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        request_id = _stage0_request_id()
+        state = orchestrator.request_states[request_id]
+        request = build_engine_core_request_from_tokens(
+            request_id=request_id, prompt={"prompt_token_ids": [1]}, params=state.sampling_params_list[0]
+        )
+        submitted = await orchestrator._dispatch_or_fail_request(
+            lambda: pool.submit_initial(request_id, state, request, pinned_replica_id=0),
+            req_id=request_id,
+            stage_id=0,
+            operation="test pinned ADD",
+        )
+        assert not submitted
+        assert reported == [(0, 0)]
+        assert not pool._request_bindings
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat_during_cleanup", [True, False])
+@pytest.mark.parametrize("failing_stage", [0, 1])
+async def test_repeated_replica_failure_reports_session_error_and_close_once(
+    monkeypatch, mocker, repeat_during_cleanup, failing_stage
+) -> None:
+    orchestrator, _, rpc_q, output_q = _build(stages=2, replicas=2, runtime_config=_placement_config())
+    manager = orchestrator.session_manager
+    placement = orchestrator.replica_placement
+    dead_client = orchestrator.stage_pools[failing_stage].clients[0]
+    cleanup_started = asyncio.Event()
+    cleanup_gate = asyncio.Event()
+    cleanup = orchestrator.cleanup
+    buffers = {}
+    expires = {}
+
+    async def blocked_cleanup(request_ids, *, abort=False):
+        cleanup_started.set()
+        await cleanup_gate.wait()
+        await cleanup(request_ids, abort=abort)
+
+    monkeypatch.setattr(orchestrator, "cleanup", blocked_cleanup)
+    try:
+        for session_id in (SESSION_ID, "healthy", "idle"):
+            buffers[session_id] = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+            assert (await _open(orchestrator, rpc_q, session_id=session_id, output_buffer=buffers[session_id])).ok
+            expires[session_id] = mocker.spy(manager.runners[session_id], "expire")
+        await _submit(orchestrator, _append_audio())
+        error = EngineDeadError("replica reported dead twice")
+        await orchestrator._handle_dead_replica(failing_stage, 0, error)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=3)
+        reserved = placement.snapshot()["reserved"]
+        if repeat_during_cleanup:
+            await orchestrator._handle_dead_replica(failing_stage, 0, error)
+            assert placement.snapshot()["reserved"] == reserved
+        cleanup_gate.set()
+        await asyncio.wait_for(asyncio.gather(*tuple(manager._dispatched_control_tasks)), timeout=3)
+        if not repeat_during_cleanup:
+            await orchestrator._handle_dead_replica(failing_stage, 0, error)
+        assert dead_client.shutdown_calls == 1
+        assert orchestrator.stage_pools[failing_stage].clients[0] is None
+        assert not manager._closing
+        assert placement.snapshot()["sessions"] == {"healthy": 1}
+        assert set(placement.snapshot()["reserved"].values()) == {0, 1}
+        messages = [output_q.get_nowait() for _ in range(output_q.qsize())]
+        terminal_events = [message.event for message in messages if hasattr(message, "event")]
+        for session_id in (SESSION_ID, "idle"):
+            events = [await buffers[session_id].get() for _ in range(buffers[session_id].pending_events)]
+            events.extend(event for event in terminal_events if event.session_id == session_id)
+            assert [event.code for event in events if event.type == "error"] == ["replica_unavailable"]
+            assert sum(event.type in {"session.closed", "session.expired"} for event in events) == 1
+            assert expires[session_id].await_count == 1
+        assert expires["healthy"].await_count == 0
+        assert manager.get("healthy") is not None
+    finally:
+        cleanup_gate.set()
+        await manager.shutdown()

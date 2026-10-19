@@ -1,0 +1,36 @@
+# Opt-in CUDA Model Runner V2 profile for PersonaPlex full-duplex serving.
+# Stage 0 (Talker) stays on Model Runner V1 to retain lockstep resumable append,
+# post_sample_talker_mtp device depformer scheduling, and pacing.
+# Stage 1 (Code2Wav) runs on MRv2 with shared Mimi decode, TF32 GEMMs,
+# and streaming chunk synthesis.
+base_config: personaplex.yaml
+
+session_mode: duplex
+model_runner: v2
+
+stages:
+  - stage_id: 0
+    # Stage 0 Talker stays on V1 for lockstep post-sample depformer execution
+    model_runner: v1
+    async_scheduling: false
+    hf_overrides:
+      mimi_cuda_graphs: true
+      depformer_cuda_graphs: true
+
+  - stage_id: 1
+    # Stage 1 Code2Wav runs on MRv2 with shared Mimi decode
+    model_runner: v2
+    async_scheduling: true
+    hf_overrides:
+      mimi_cuda_graphs: true
+      mimi_decode_tf32: true
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

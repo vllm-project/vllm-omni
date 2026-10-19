@@ -199,13 +199,26 @@ class QwenImage21CausalConv3d(nn.Conv2d):
         self.padding = (0, 0)
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
         assert cache_x is None
-        x = x.squeeze(2)  # Remove the temporal dimension
-        x = F.pad(x, padding)
-        x = super().forward(x)
-        x = x.unsqueeze(2)  # Add the temporal dimension back
-        return x
+        x = x.squeeze(2)  # Single-frame tensors have a unit time axis.
+        left, right, top, bottom = self._padding
+        if x.device.type == "npu" and left == right and top == bottom:
+            # Symmetric pad matches Conv2d padding, so skip the extra pad kernel.
+            # Other devices keep the explicit pad: built-in padding selects
+            # different cuDNN BF16 kernels and drifts from the Diffusers reference.
+            x = F.conv2d(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                padding=(top, left),
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        else:
+            x = F.pad(x, (left, right, top, bottom))
+            x = super().forward(x)
+        return x.unsqueeze(2)
 
 
 class QwenImage21RMS_norm(nn.Module):
@@ -240,9 +253,33 @@ class QwenImage21RMS_norm(nn.Module):
         needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
             t in str(x.dtype) for t in ("float4_", "float8_")
         )
-        normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=(1 if self.channel_first else -1)).to(
-            x.dtype
+        reuse_normalization = (
+            x.device.type == "npu"
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
         )
+        dim = 1 if self.channel_first else -1
+        if reuse_normalization:
+            # The dtype conversion owns this buffer; never overwrite the input.
+            normalized = x.float()
+            denominator = normalized.norm(p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
+            normalized = normalized.div_(denominator).to(x.dtype)
+        else:
+            normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=dim).to(x.dtype)
+        if (
+            x.device.type == "npu"
+            and normalized.dtype == self.gamma.dtype
+            and (not isinstance(self.bias, torch.Tensor) or self.bias.dtype == normalized.dtype)
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            # Reuse the fresh normalization output, preserving each rounding step.
+            normalized.mul_(self.scale).mul_(self.gamma)
+            # bias=False stores a Python zero, not a trainable tensor.
+            if not isinstance(self.bias, torch.Tensor) and self.bias == 0.0:
+                return normalized
+            return normalized.add_(self.bias)
         return normalized * self.scale * self.gamma + self.bias
 
 
@@ -1295,15 +1332,10 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
 
             iter_ = 1 + (num_frame - 1) // 4
             for i in range(iter_):
-                self._enc_conv_idx = [0]
                 if i == 0:
-                    out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                    out = self.encoder(x[:, :, :1, :, :])
                 else:
-                    out_ = self.encoder(
-                        x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :],
-                        feat_cache=self._enc_feat_map,
-                        feat_idx=self._enc_conv_idx,
-                    )
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
                     out = torch.cat([out, out_], 2)
 
             return self.quant_conv(out)
@@ -1350,14 +1382,12 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         self.clear_cache()
         try:
             x = self.post_quant_conv(z)
+            # No feature cache: the 2D causal convs never read it, it would only pin a clone of each conv input.
             for i in range(num_frame):
-                self._conv_idx = [0]
                 if i == 0:
-                    out = self.decoder(
-                        x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=True
-                    )
+                    out = self.decoder(x[:, :, i : i + 1, :, :], first_chunk=True)
                 else:
-                    out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    out_ = self.decoder(x[:, :, i : i + 1, :, :])
                     out = torch.cat([out, out_], 2)
 
             if self.config.patch_size is not None:
@@ -1452,7 +1482,6 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 time = []
                 frame_range = 1 + (num_frames - 1) // 4
                 for k in range(frame_range):
-                    self._enc_conv_idx = [0]
                     if k == 0:
                         tile = x[:, :, :1, i : i + self.tile_sample_min_height, j : j + self.tile_sample_min_width]
                     else:
@@ -1463,7 +1492,7 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                             i : i + self.tile_sample_min_height,
                             j : j + self.tile_sample_min_width,
                         ]
-                    tile = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                    tile = self.encoder(tile)
                     tile = self.quant_conv(tile)
                     time.append(tile)
                 row.append(torch.cat(time, dim=2))
@@ -1578,12 +1607,9 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 self.clear_cache()
                 time = []
                 for k in range(num_frames):
-                    self._conv_idx = [0]
                     tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
                     tile = self.post_quant_conv(tile)
-                    decoded = self.decoder(
-                        tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
-                    )
+                    decoded = self.decoder(tile, first_chunk=(k == 0))
                     time.append(decoded)
                 row.append(torch.cat(time, dim=2))
             rows.append(row)

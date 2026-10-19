@@ -27,6 +27,7 @@ list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
+| VibeVoice-1.5B | `vibevoice/VibeVoice-1.5B-hf` | 1 (LLM_AR, eager) | ✓ (optional) | — | offline only; no example script (use `vllm_omni.model_executor.models.vibevoice.prompt`) | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
@@ -671,7 +672,6 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
     --lang ja \
     --text "こんにちは、音声合成のテストです。" \
     --ref-audio /path/to/reference.wav
-
 ```
 
 ### Emotion control
@@ -788,3 +788,48 @@ python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
 - Output: 24 kHz mono WAV; `--max-new-tokens` caps generated frames (80 ms each).
 - Speaker tags `--voice S0`..`S9` (default `S0`) select the timbre in non-reference modes; with `--ref-audio` the timbre comes from the reference clip.
 - Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.
+
+## VibeVoice
+
+Single-stage eager offline TTS for the native Transformers checkpoint `vibevoice/VibeVoice-1.5B-hf` (single speaker, 24 kHz mono). There is no example script; build the prompt with the model's helper:
+
+```python
+import soundfile as sf
+import torch
+from vllm import SamplingParams
+
+from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.model_executor.models.vibevoice.prompt import render_vibevoice_prompt
+
+text = "Hello from VibeVoice."
+cloned = {
+    "prompt": render_vibevoice_prompt(text),
+    "multi_modal_data": {"audio": sf.read("reference.wav", dtype="float32")},  # (waveform, sample_rate)
+}
+no_reference = {"prompt": render_vibevoice_prompt(text, reference=False)}
+omni = Omni(model="vibevoice/VibeVoice-1.5B-hf")  # loads vllm_omni/deploy/vibevoice.yaml
+try:
+    for name, prompt in (("cloned", cloned), ("no_reference", no_reference)):
+        output = omni.generate([prompt], [SamplingParams(max_tokens=2048)])[0].outputs[0]
+        mm = output.multimodal_output
+        audio = mm.get("audio")
+        if audio is None:
+            audio = mm.get("model_outputs")
+        if audio is None:
+            raise RuntimeError("VibeVoice returned no audio.")
+        if isinstance(audio, list):
+            if not audio:
+                raise RuntimeError("VibeVoice returned empty audio.")
+            audio = torch.cat([torch.as_tensor(chunk).reshape(-1) for chunk in audio])
+        else:
+            audio = torch.as_tensor(audio).reshape(-1)
+        sf.write(f"{name}.wav", audio.detach().cpu().numpy(), 24000)
+finally:
+    omni.close()
+```
+
+### Notes
+
+- Reference audio: at most one clip, any channel layout and sample rate (mixed to mono, resampled to 24 kHz), up to 60 s. A reference prompt without audio is rejected.
+- Without a reference there is no default voice, as in Transformers: the voice is sampled per request from the diffusion noise, so it changes between requests. Pass a reference for a stable voice.
+- Limits: offline `Omni` only, eager, single speaker, no streaming and no `/v1/audio/speech`. See [`recipes/Microsoft/VibeVoice-1.5B-H100.md`](../../../recipes/Microsoft/VibeVoice-1.5B-H100.md).

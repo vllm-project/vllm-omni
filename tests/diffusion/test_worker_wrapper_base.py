@@ -130,6 +130,25 @@ class TestWorkerWrapperBaseInitialization:
             skip_load_model=False,
         )
 
+    def test_set_proc_title_false_is_forwarded(self, mocker: MockerFixture, mock_od_config):
+        """``set_proc_title=False`` (UniProc inline worker) must reach the worker."""
+        mock_worker_init = mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
+
+        WorkerWrapperBase(
+            gpu_id=0,
+            od_config=mock_od_config,
+            base_worker_class=DiffusionWorker,
+            set_proc_title=False,
+        )
+
+        mock_worker_init.assert_called_once_with(
+            local_rank=0,
+            rank=0,
+            od_config=mock_od_config,
+            skip_load_model=False,
+            set_proc_title=False,
+        )
+
     def test_custom_pipeline_args_without_pipeline_class_loads_normally(self, mocker: MockerFixture, mock_od_config):
         """Test native pipeline args do not trigger custom pipeline re-initialization."""
         custom_args = {"components_path": "/tmp/anima-components"}
@@ -383,6 +402,83 @@ class TestWorkerWrapperBaseDelegation:
         synchronize.assert_called_once_with()
         assert collect.call_count == 2
 
+    def test_sequential_worker_shutdown_releases_upstream_wte(self, mocker: MockerFixture):
+        """Retained inline workers must release WTE-owned models before pools."""
+        from vllm.config.weight_transfer import WeightTransferConfig
+        from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine
+
+        events: list[str] = []
+        original_shutdown = IPCWeightTransferEngine.shutdown
+
+        def shutdown_engine(engine):
+            original_shutdown(engine)
+            events.append("wte")
+
+        mocker.patch.object(IPCWeightTransferEngine, "shutdown", new=shutdown_engine)
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
+            side_effect=lambda: events.append("distributed"),
+        )
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.synchronize")
+
+        def release_pools():
+            assert model_ref() is None
+            assert engine_ref() is None
+            events.append("pools")
+
+        allocator = SimpleNamespace(
+            pointer_to_data={},
+            get_current_usage=lambda: 0,
+            release_pools=release_pools,
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class",
+            return_value=SimpleNamespace(get_instance=lambda: allocator),
+        )
+        workers = []
+        for _ in range(2):
+            worker = DiffusionWorker.__new__(DiffusionWorker)
+            model = torch.nn.Linear(2, 2)
+            worker.model_runner = SimpleNamespace(pipeline=model)
+            worker.weight_transfer_engine = IPCWeightTransferEngine(
+                WeightTransferConfig(backend="ipc"),
+                SimpleNamespace(parallel_config=None, model_config=None),
+                torch.device("cpu"),
+                model,
+            )
+            worker._owns_sleep_pool = True
+            model_ref = weakref.ref(model)
+            engine_ref = weakref.ref(worker.weight_transfer_engine)
+            del model
+            workers.append(worker)
+
+            worker.shutdown()
+            worker.shutdown()
+
+            assert worker.weight_transfer_engine is None
+            assert model_ref() is None
+            assert engine_ref() is None
+            assert not worker._owns_sleep_pool
+
+        assert events == ["wte", "distributed", "pools"] * 2
+
+    def test_worker_shutdown_continues_after_wte_cleanup_failure(self, mocker: MockerFixture):
+        destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+        connector = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        engine = mocker.Mock()
+        engine.shutdown.side_effect = RuntimeError("WTE cleanup failed")
+        worker.weight_transfer_engine = engine
+
+        worker.shutdown()
+        worker.shutdown()
+
+        assert worker.weight_transfer_engine is None
+        engine.shutdown.assert_called_once_with()
+        destroy.assert_called_once_with()
+        connector.assert_called_once_with()
+
     @pytest.mark.parametrize("cleanup_fails", [False, True])
     def test_worker_shutdown_releases_model_references(self, mocker: MockerFixture, cleanup_fails):
         mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
@@ -587,6 +683,10 @@ class TestCustomPipelineWorkerExtension:
         mock_pipeline = mocker.Mock()
         mock_model_runner.pipeline = mock_pipeline
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
@@ -620,6 +720,10 @@ class TestCustomPipelineWorkerExtension:
         mock_pipeline = mocker.Mock()
         mock_model_runner.pipeline = mock_pipeline
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
@@ -649,6 +753,10 @@ class TestCustomPipelineWorkerExtension:
         mock_model_runner = mocker.Mock()
         mock_model_runner.pipeline = None
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
@@ -753,6 +861,10 @@ class TestCustomPipelineWorkerExtension:
         mock_pipeline2 = mocker.Mock()
         mock_model_runner.pipeline = mock_pipeline1
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 

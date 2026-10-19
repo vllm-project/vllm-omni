@@ -96,7 +96,10 @@ from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
-from vllm_omni.entrypoints.duplex.openai import dispatch_realtime_websocket
+from vllm_omni.entrypoints.duplex.openai import (
+    OpenAIRealtimeHandler,
+    _reject_unavailable_realtime_websocket,
+)
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import (
     _warmup_duplex_realtime,
@@ -202,6 +205,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     video_response_from_request,
 )
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.entrypoints.serve import weight_transfer_api
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
 from vllm_omni.entrypoints.serve.profile.protocol import ProfileRequest
 from vllm_omni.entrypoints.serve.profile.utils import _should_enable_profiler_endpoints
@@ -408,6 +412,17 @@ async def omni_run_server_worker(
 
             register_routes(app, args.port)
 
+        # OMNI: Mount the weight-transfer admin routes only when the feature
+        # is enabled via weight_transfer_config (mirrors upstream vLLM, which
+        # keeps weight-mutation endpoints behind an explicit opt-in).
+        if getattr(engine_client, "weight_transfer_enabled", False):
+            logger.warning(
+                "SECURITY WARNING: weight transfer endpoints are enabled! "
+                "These mutate model weights and must not be exposed in "
+                "untrusted environments."
+            )
+            app.include_router(weight_transfer_api.router)
+
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
         _register_omni_exception_handlers(app)
@@ -491,9 +506,9 @@ async def omni_run_server_worker(
         app.state.duplex_warmup_done = asyncio.Event() if warmup_kind is not None else None
         warmup_task: asyncio.Task | None = None
         if warmup_kind is not None:
-            # Scheduled before serve_http (which may not return until
-            # shutdown); the coroutine retries its self-connect until the
-            # server socket is accepting.
+            # Scheduled before serve_http (which may not return until shutdown).
+            # One frontend retries a self-connect; multiple frontends warm
+            # their owned replica groups through the local engine.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
         shutdown_task = await serve_http(
@@ -890,6 +905,7 @@ async def omni_init_app_state(
         request_logger = None
 
     base_model_paths = [BaseModelPath(name=name, model_path=args.model) for name in served_model_names]
+    state.openai_realtime_handler = OpenAIRealtimeHandler.from_engine_client(engine_client)
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.args = args
@@ -1637,7 +1653,6 @@ async def upload_voice(
     Returns:
         JSON response with voice information
     """
-    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice upload")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -1697,7 +1712,6 @@ async def delete_voice(name: str, raw_request: Request):
     Returns:
         JSON response indicating success or failure
     """
-    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice deletion")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -1810,7 +1824,12 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    await dispatch_realtime_websocket(websocket)
+    realtime_handler = getattr(websocket.app.state, "openai_realtime_handler", None)
+    if realtime_handler is None:
+        await _reject_unavailable_realtime_websocket(websocket)
+        return
+
+    await realtime_handler.handle_websocket(websocket)
 
 
 @router.websocket("/v1/duplex")
@@ -1859,16 +1878,27 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
 
 async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
-    # Session credentials and replay state are local to each frontend; a shared
-    # listening socket cannot route reconnects back to the session owner.
     count = getattr(websocket.app.state, "api_server_count", None)
     if count is None or (type(count) is int and count == 1):
         return False
+    error = "Duplex sessions require initialized API worker topology."
+    if type(count) is int and count > 1:
+        engine_client = getattr(websocket.app.state, "engine_client", None)
+        config = getattr(engine_client, "duplex_session_config", None)
+        capabilities = getattr(engine_client, "duplex_capabilities", None)
+        if getattr(config, "replica_policy", None) != "least_sessions":
+            error = "Duplex sessions with multiple API workers require replica_policy=least_sessions."
+        elif getattr(capabilities, "supports_session_resume", None) is not False:
+            # Session credentials and replay state are local to each frontend;
+            # the shared socket cannot route reconnects back to their owner.
+            error = "Duplex session resume routing across API workers is not supported."
+        else:
+            return False
     await websocket.accept()
     await websocket.send_json(
         {
             "type": "error",
-            "error": "Duplex sessions require a single API worker with initialized topology.",
+            "error": error,
             "code": "multi_api_duplex_unsupported",
         }
     )
