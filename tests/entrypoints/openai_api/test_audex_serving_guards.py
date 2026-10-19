@@ -34,8 +34,6 @@ def _serving(model_type: str = "audex") -> OmniOpenAIServingSpeech:
     serving._tts_model_type = model_type
     adapter_cls = resolve_adapter(model_type)
     serving._adapter = adapter_cls(SpeechServingContext(server=serving)) if adapter_cls is not None else None
-    serving._mark_ref_audio_artifact_ready_for_request = lambda request_id: None
-    serving._discard_ref_audio_artifact_warmup = lambda request_id: None
     return serving
 
 

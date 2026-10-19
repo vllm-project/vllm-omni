@@ -14,6 +14,7 @@ import pytest
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_media import (
     _ffmpeg_q_to_pil_quality,
+    _video_thread_type,
     extract_jpeg,
     materialize_media,
     read_audio_pcm16,
@@ -84,6 +85,24 @@ def _make_synthetic_ogg(duration: float = 1.0, sample_rate: int = 16000) -> byte
         for pkt in stream.encode():
             container.mux(pkt)
     return buf.getvalue()
+
+
+class TestVideoThreadType:
+    @staticmethod
+    def test_hevc_uses_slice_and_other_codecs_keep_auto(tmp_path: Path) -> None:
+        """HEVC selects SLICE; a non-HEVC stream keeps AUTO."""
+        mpeg4_path = tmp_path / "mpeg4.mp4"
+        mpeg4_path.write_bytes(_make_synthetic_mp4())
+        hevc_path = Path(__file__).resolve().parent / "hevc_3frame.mp4"
+
+        with av.open(str(mpeg4_path)) as container:
+            mpeg4_stream = container.streams.video[0]
+            assert mpeg4_stream.codec_context.name != "hevc"
+            assert _video_thread_type(mpeg4_stream) == "AUTO"
+        with av.open(str(hevc_path)) as container:
+            hevc_stream = container.streams.video[0]
+            assert hevc_stream.codec_context.name == "hevc"
+            assert _video_thread_type(hevc_stream) == "SLICE"
 
 
 # ---------------------------------------------------------------------------

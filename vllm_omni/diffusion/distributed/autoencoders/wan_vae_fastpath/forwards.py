@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Replacement forwards for the diffusers Wan VAE decoder modules.
+"""Replacement forwards for the diffusers Wan VAE decoder and encoder modules.
 
 Each function below is bound per module instance (``types.MethodType``) by
 :mod:`.install`; the diffusers classes themselves are never modified. Every
@@ -8,12 +8,14 @@ function at the ``lossless`` level reproduces the diffusers 0.40 operation
 order exactly and only differs in how the bytes move:
 
 * ``WanRMS_norm``: fp32 ``vector_norm`` straight from the low-precision tensor
-  plus one fused Triton epilogue (see :mod:`.triton_rms_norm`), optionally with
+  plus one fused Triton epilogue (see :mod:`vllm_omni.diffusion.layers.vae_norm_epilogue`), optionally with
   the following SiLU folded in. At the ``channels_last`` level the single-pass
   kernel also absorbs the bias of the ``conv1`` that feeds ``norm2``.
 * ``WanCausalConv3d`` and every cached call site: the ``clone`` + ``cat`` +
   ``F.pad`` triple becomes one layout-preserving kernel that also writes the
   next cache frames; all-zero paddings skip ``F.pad`` entirely.
+  Eligible encoder norm/SiLU consumers write directly into that temporal input
+  and cache, avoiding a separate normalized activation (:mod:`.triton_norm_cache`).
 * ``WanResidualUpBlock``: ``x + DupUp3D(x)`` becomes one gather + add that
   also applies the bias of the upsampler's ``Conv2d`` (which feeds nothing else).
 * ``WanResample``: the ``upsample3d`` time interleave becomes one strided copy.
@@ -50,10 +52,14 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.layers.vae_rms_norm import kernels_allowed as _kernels_allowed
+from vllm_omni.diffusion.layers.vae_rms_norm import rms_norm_fastpath as shared_rms_norm_fastpath
+
 from . import triton_data_movement as dm
-from . import triton_rms_norm as rn
+from . import triton_norm_cache as nc
 from . import triton_rms_norm_cl as cl
 from . import triton_upsample as up
+from ._utils import suggests_channels_last
 
 logger = init_logger(__name__)
 
@@ -67,14 +73,18 @@ class FastPathConfig:
 
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
     channels_last: bool = False
+    clone_encoder_shortcuts: bool = False
+    fuse_norm_cache: bool = False
+    # Keep the reference BF16 roundings in the channels-last norm (encoder only).
+    exact_bf16_norm: bool = False
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
     """True for a diffusers ``WanRMS_norm`` instance.
 
-    Identified by name because ``vllm_omni.diffusion.models.wan2_2.patch_diffusers``
-    rebinds the name ``WanRMS_norm`` to ``RMSNormVAE`` in diffusers' own module
-    namespace; instances created before that patch keep the original class.
+    Identified by name because the Wan 2.2 NPU patch rebinds ``WanRMS_norm``
+    to ``RMSNormVAE`` in diffusers' module namespace; instances created before
+    that patch keep the original class.
     ``RMSNormVAE`` has different numerics (eps 1e-6, no fp32 upcast) and is
     deliberately not matched.
     """
@@ -88,46 +98,21 @@ def is_diffusers_rms_norm(module: Any) -> bool:
     )
 
 
-def _kernels_allowed(x: torch.Tensor) -> bool:
-    return x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+def _has_forward_hooks(*modules: nn.Module | None) -> bool:
+    """Whether calling any of ``modules`` would run forward hooks, so the call cannot be inlined.
+
+    Global module hooks count for every module. Checked on every call, so hooks
+    registered after installation are honored. Optimizations inside a module's
+    own forward stay active: its hooks still see the real arguments and output.
+    """
+    if nn.modules.module._global_forward_pre_hooks or nn.modules.module._global_forward_hooks:
+        return True
+    return any(m is not None and (m._forward_pre_hooks or m._forward_hooks) for m in modules)
 
 
 # --------------------------------------------------------------------------- #
 # WanRMS_norm
 # --------------------------------------------------------------------------- #
-
-
-def _as_rows(
-    x: torch.Tensor, denom: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]] | None:
-    """View ``x``/``denom`` as contiguous ``(N, C, S)`` / ``(N, 1, S)`` without copying.
-
-    Handles the dense layouts the decoder produces: plain contiguous 4D/5D
-    tensors and the frame-major 5D view ``WanResample`` emits
-    (``permute(0, 2, 1, 3, 4)`` of a contiguous ``(b, t, c, h, w)`` buffer).
-    Returns the two views and a function mapping a kernel output back to
-    ``x``'s shape and strides, or ``None`` for any other layout.
-    """
-    if x.dim() == 5:
-        b, c, t, h, w = x.shape
-        if x.is_contiguous():
-            spatial = t * h * w
-            return x.view(b, c, spatial), denom.view(b, 1, spatial), lambda out: out.view(b, c, t, h, w)
-        frame_major = x.permute(0, 2, 1, 3, 4)
-        denom_frame_major = denom.permute(0, 2, 1, 3, 4)
-        if frame_major.is_contiguous() and denom_frame_major.is_contiguous():
-            spatial = h * w
-            return (
-                frame_major.view(b * t, c, spatial),
-                denom_frame_major.view(b * t, 1, spatial),
-                lambda out: out.view(b, t, c, h, w).permute(0, 2, 1, 3, 4),
-            )
-        return None
-    if x.dim() == 4 and x.is_contiguous():
-        n, c, h, w = x.shape
-        spatial = h * w
-        return x.view(n, c, spatial), denom.view(n, 1, spatial), lambda out: out.view(n, c, h, w)
-    return None
 
 
 def _add_channel_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -162,31 +147,10 @@ def rms_norm_fastpath(
     cfg = getattr(norm, CFG_ATTR, None)
     if cfg is not None and cfg.channels_last and _kernels_allowed(x):
         # Tier 2: one read, one write; not bit-exact (different reduction order).
-        out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias)
+        out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias, exact_bf16=cfg.exact_bf16_norm)
         if out is not None:
             return out
-    if bias is not None:
-        x = _add_channel_bias(x, bias)
-
-    # Same reduction kernel as ``F.normalize(x.float(), dim=1)`` runs, reading
-    # the low-precision tensor once instead of materializing an fp32 copy.
-    denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
-
-    if _kernels_allowed(x):
-        rows = _as_rows(x, denom)
-        if rows is not None:
-            x_rows, denom_rows, restore = rows
-            out = rn.rms_norm_scale(x_rows, denom_rows, gamma.reshape(-1), norm.scale, silu=silu)
-            if out is not None:
-                return restore(out)
-
-    # Exact PyTorch restructuring: the divide computes in fp32 opmath and rounds
-    # once on store, exactly like ``(x.float() / denom).to(x.dtype)``; the
-    # epilogue is upstream's own expression.
-    normalized = torch.empty_like(x)
-    torch.div(x, denom, out=normalized)
-    out = normalized * norm.scale * gamma + norm_bias
-    return F.silu(out) if silu else out
+    return shared_rms_norm_fastpath(norm, x, silu=silu, bias=bias)
 
 
 def rms_norm_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -205,10 +169,15 @@ def _norm_act(
     un-added (see :func:`_run_cached_causal_conv` with ``return_bias=True``).
     """
     cfg = getattr(norm, CFG_ATTR, None)
-    if cfg is not None and is_diffusers_rms_norm(norm):
+    if cfg is not None and is_diffusers_rms_norm(norm) and not _has_forward_hooks(norm):
         # SiLU is folded into the norm kernel when the epilogue was proven exact
         # for this dtype, or always under the (tolerance-based) channels_last level.
-        fuse = type(act) is nn.SiLU and not act.inplace and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+        fuse = (
+            type(act) is nn.SiLU
+            and not act.inplace
+            and not _has_forward_hooks(act)
+            and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+        )
         out = rms_norm_fastpath(norm, x, silu=fuse, bias=pending_bias)
         if out is not None:
             return out if fuse else act(out)
@@ -229,7 +198,16 @@ def causal_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.T
         # fill + copy. Skipping it is the identity.
         return nn.Conv3d.forward(self, x)
     if _kernels_allowed(x) and (cache_x is None or (cache_x.device == x.device and cache_x.dtype == x.dtype)):
-        assembled = dm.cat_pad_5d(x, cache_x if padding[4] > 0 else None, padding)
+        history = cache_x if padding[4] > 0 else None
+        # Preferred: temporal concat only + cuDNN spatial padding, sharing the
+        # cached call sites' verdicts, so hooked convolutions keep it too.
+        verdicts = _SPATIAL_PAD_VERDICTS.setdefault(self, {})
+        key = _conv_verdict_key(self, x, 0 if history is None else history.shape[2])
+        if verdicts.get(key, True):
+            assembled = dm.cat_time_5d(x, history, padding[4])
+            if assembled is not None:
+                return _conv_with_spatial_padding(self, assembled, self.bias, verdicts, key)
+        assembled = dm.cat_pad_5d(x, history, padding)
         if assembled is not None:
             return nn.Conv3d.forward(self, assembled)
     return WanCausalConv3d.forward(self, x, cache_x)
@@ -271,7 +249,47 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     if a.shape != b.shape or a.dtype != b.dtype:
         return False
     int_dtype = torch.int16 if a.element_size() == 2 else torch.int32
-    return bool(torch.equal(a.contiguous().view(int_dtype), b.contiguous().view(int_dtype)))
+    # A same-size dtype view works for any strides, so no contiguous copies are made.
+    return bool(torch.equal(a.view(int_dtype), b.view(int_dtype)))
+
+
+_PROBE_SEED = 0
+
+
+def _random_like(t: torch.Tensor, generator: torch.Generator, std: float = 1.0) -> torch.Tensor:
+    """Gaussian tensor with ``t``'s shape, dtype, device and strides."""
+    return torch.empty_like(t).normal_(0.0, std, generator=generator)
+
+
+def _equal_on_random_operands(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    candidate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    reference: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    reference_input: Callable[[torch.Tensor], torch.Tensor],
+) -> bool:
+    """Compare two convolution formulations on seeded random stand-ins for ``x`` and ``weight``.
+
+    Agreement on the real operands proves little: all-zero activations or
+    weights give the same bytes under any kernel. Which kernel cuDNN runs
+    depends only on the verdict key's metadata, never on values, so a match on
+    random data is what makes a verdict reusable for every later input and
+    weight update; it is also the only comparison needed. A private generator
+    leaves the global RNG streams untouched.
+
+    ``reference`` convolves ``reference_input(x)`` (the pre-padded or
+    channels-first copy). The probe input is drawn twice from the same
+    generator state, so each formulation's input is freed before the other's
+    is created; callers probe before running the real convolution. The first
+    call for a shape then holds at most one probe input, the reference copy
+    and the two probe outputs, no more than comparing real operands did.
+    """
+    generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
+    probe_weight = _random_like(weight, generator, std=weight[0].numel() ** -0.5)
+    state = generator.get_state()
+    reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
+    generator.set_state(state)
+    return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
 
 
 def _conv_with_spatial_padding(
@@ -286,30 +304,60 @@ def _conv_with_spatial_padding(
     Upstream pads the input tensor explicitly and convolves with ``padding=0``.
     Handing the spatial padding to cuDNN avoids materializing the padded copy,
     but is only bit-identical if cuDNN selects the same kernel for both
-    formulations, so the first call for each (conv, shape) runs both and
-    compares bitwise; later calls reuse the verdict until it is evicted.
+    formulations, so the first call for each (conv, shape) compares both on
+    seeded random operands (see :func:`_equal_on_random_operands`) before
+    running the real convolution once with the selected formulation; later
+    calls reuse the verdict until it is evicted.
     """
     pad_height, pad_width = conv._padding[2], conv._padding[0]
-    fast = F.conv3d(assembled, conv.weight, bias, conv.stride, (0, pad_height, pad_width), conv.dilation, conv.groups)
-    if key in verdicts:
-        return fast
-    padded = F.pad(assembled, (pad_width, pad_width, pad_height, pad_height, 0, 0))
-    reference = F.conv3d(padded, conv.weight, bias, conv.stride, 0, conv.dilation, conv.groups)
-    verdict = _bitwise_equal(fast, reference)
-    _record_verdict(verdicts, key, verdict)
-    if not verdict:
-        logger.info(
-            "cuDNN spatial padding is not bitwise identical to pre-padded input for %s %s; "
-            "using the pre-padded path for this shape",
-            type(conv).__name__,
-            tuple(assembled.shape),
-        )
-        return reference
-    return fast
+    pads = (pad_width, pad_width, pad_height, pad_height, 0, 0)
+
+    def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(x, weight, bias, conv.stride, (0, pad_height, pad_width), conv.dilation, conv.groups)
+
+    def pad(x: torch.Tensor) -> torch.Tensor:
+        return F.pad(x, pads)
+
+    def padded(x_padded: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(x_padded, weight, bias, conv.stride, 0, conv.dilation, conv.groups)
+
+    verdict = verdicts.get(key)
+    if verdict is None:
+        verdict = _equal_on_random_operands(assembled, conv.weight, candidate, padded, pad)
+        _record_verdict(verdicts, key, verdict)
+        if not verdict:
+            logger.info(
+                "cuDNN spatial padding is not bitwise identical to pre-padded input for %s %s; "
+                "using the pre-padded path for this shape",
+                type(conv).__name__,
+                tuple(assembled.shape),
+            )
+    return candidate(assembled, conv.weight) if verdict else padded(pad(assembled), conv.weight)
 
 
 def _layout_tag(x: torch.Tensor) -> str:
-    return "channels_last" if x.shape[1] > 1 and x.stride(1) == 1 else "channels_first"
+    # The input assemblies choose their layout the way ATen would, so key on the same test.
+    return "channels_last" if suggests_channels_last(x) else "channels_first"
+
+
+def _conv_verdict_key(conv: nn.Module, x: torch.Tensor, cache_frames: int) -> tuple:
+    """Do not reuse numerical probes across devices, autocast or backend settings."""
+    autocast = torch.is_autocast_enabled(x.device.type)
+    return (
+        tuple(x.shape),
+        cache_frames,
+        x.dtype,
+        _layout_tag(x),
+        x.device,
+        conv.weight.dtype,
+        conv.weight.stride(),
+        torch.get_autocast_dtype(x.device.type) if autocast else None,
+        torch.backends.cudnn.allow_tf32,
+        torch.backends.cudnn.enabled,
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+        torch.are_deterministic_algorithms_enabled(),
+    )
 
 
 def _first_frame_conv2d(
@@ -380,6 +428,7 @@ def _run_cached_causal_conv(
     payload = cache if isinstance(cache, torch.Tensor) else None
     if (
         type(conv) is WanCausalConv3d
+        and not _has_forward_hooks(conv)
         and _kernels_allowed(x)
         and x.dim() == 5
         and (payload is None or (payload.device == x.device and payload.dtype == x.dtype))
@@ -396,7 +445,7 @@ def _run_cached_causal_conv(
         # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
         # padding, once verified bitwise for this (conv, shape).
         verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
-        key = (tuple(x.shape), 0 if payload is None else payload.shape[2], x.dtype, _layout_tag(x))
+        key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
         if verdicts.get(key, True):
             pair = dm.cat_time_5d(x, payload, conv._padding[4], keep_cache_frames=CACHE_T)
             if pair is not None:
@@ -421,6 +470,81 @@ def _run_cached_causal_conv(
     return (out, None) if return_bias else out
 
 
+def _can_bypass_dropout(module: nn.Module | None) -> bool:
+    """Only skip an unmodified, inactive Dropout, including its hook dispatch."""
+    return module is None or (
+        type(module) is nn.Dropout
+        and (not module.training or module.p == 0)
+        and getattr(module.forward, "__func__", None) is nn.Dropout.forward
+        and not _has_forward_hooks(module)
+    )
+
+
+def _run_norm_act_cached_conv(
+    norm: nn.Module,
+    act: nn.Module,
+    conv: nn.Module,
+    x: torch.Tensor,
+    cache_list: list[Any],
+    index: int,
+    *,
+    pending_bias: torch.Tensor | None = None,
+    return_bias: bool = False,
+    after_norm: nn.Module | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    """Encoder norm/SiLU -> temporal assembly, without a normalized temporary.
+
+    Keep the existing math and spatial-padding verifier. A rejected input or
+    non-identity dropout uses the previous norm -> assembly path unchanged.
+    """
+    cfg = getattr(norm, CFG_ATTR, None)
+    if (
+        cfg is not None
+        and cfg.fuse_norm_cache
+        and _kernels_allowed(x)
+        and x.ndim == 5
+        and is_diffusers_rms_norm(norm)
+        and norm.channel_first
+        and isinstance(norm.bias, float)
+        and norm.bias == 0.0
+        and norm.gamma.ndim == 4
+        and type(act) is nn.SiLU
+        and not act.inplace
+        and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+        and type(conv) is WanCausalConv3d
+        and not _has_forward_hooks(norm, act, conv)
+        and _can_bypass_dropout(after_norm)
+        and conv._padding[0] == conv._padding[1]
+        and conv._padding[2] == conv._padding[3]
+        and conv._padding[5] == 0
+    ):
+        cache = cache_list[index]
+        payload = cache if isinstance(cache, torch.Tensor) else None
+        if payload is None or payload.ndim == 5:
+            verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
+            key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
+            if verdicts.get(key, True):
+                pair = nc.norm_act_cat_time(
+                    x,
+                    norm.gamma,
+                    norm.scale,
+                    payload,
+                    conv._padding[4],
+                    channels_last=cfg.channels_last,
+                    silu=True,
+                    bias=pending_bias,
+                )
+                if pair is not None:
+                    assembled, cache_list[index] = pair
+                    out = _conv_with_spatial_padding(conv, assembled, None if return_bias else conv.bias, verdicts, key)
+                    return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+
+    x = _norm_act(norm, act, x, pending_bias=pending_bias)
+    if after_norm is not None:
+        x = after_norm(x)
+    return _run_cached_causal_conv(conv, x, cache_list, index, return_bias=return_bias)
+
+
 def _run_conv_out_channels_last(
     conv: nn.Module, x: torch.Tensor, cache_list: list[Any], index: int
 ) -> torch.Tensor | None:
@@ -432,43 +556,52 @@ def _run_conv_out_channels_last(
     input is assembled pre-padded anyway; assembling it channels-last directly
     (one fused transpose in the pixels kernel) saves the separate channels-first
     assembly and cuDNN's transpose. The output is made contiguous, so nothing
-    downstream sees a layout change. The first call per (conv, shape) also runs
-    the channels-first formulation and compares bitwise; a mismatch routes that
-    shape back to the standard path while its verdict is cached. Evicted shapes
-    are checked again on their next use.
+    downstream sees a layout change. The first call per (conv, shape) compares
+    it bitwise with the channels-first formulation on seeded random operands
+    (see :func:`_equal_on_random_operands`) before running the real
+    convolution once; a mismatch routes that shape back to the standard path
+    while its verdict is cached. Evicted shapes are checked again on their
+    next use.
     """
     cache = cache_list[index]
     payload = cache if isinstance(cache, torch.Tensor) else None
-    if type(conv) is not WanCausalConv3d or not _kernels_allowed(x) or x.dim() != 5 or x.stride(1) == 1:
+    if (
+        type(conv) is not WanCausalConv3d
+        or _has_forward_hooks(conv)
+        or not _kernels_allowed(x)
+        or x.dim() != 5
+        or x.stride(1) == 1
+    ):
         return None
     if payload is not None and (payload.device != x.device or payload.dtype != x.dtype):
         return None
     verdicts = _CONV_OUT_LAYOUT_VERDICTS.setdefault(conv, {})
-    key = (tuple(x.shape), 0 if payload is None else payload.shape[2], x.dtype)
+    key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
     if not verdicts.get(key, True):
         return None
     pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T, channels_last_output=True)
     if pair is None:
         return None
     assembled, cache_list[index] = pair
-    out = F.conv3d(assembled, conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
-    out = out.contiguous()
-    if key in verdicts:
-        return out
-    # The channels-first path convolves exactly this tensor in NCDHW layout.
-    reference = F.conv3d(
-        assembled.contiguous(), conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups
-    )
-    verdict = _bitwise_equal(out, reference)
-    _record_verdict(verdicts, key, verdict)
-    if not verdict:
-        logger.info(
-            "channels-last conv_out input is not bitwise identical to the channels-first one for %s; "
-            "using the channels-first path for this shape",
-            tuple(assembled.shape),
-        )
-        return reference
-    return out
+
+    def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(x, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups).contiguous()
+
+    def channels_first(x_contiguous: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # The channels-first path convolves exactly this tensor in NCDHW layout.
+        return F.conv3d(x_contiguous, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+    if key not in verdicts:
+        verdict = _equal_on_random_operands(assembled, conv.weight, candidate, channels_first, lambda t: t.contiguous())
+        _record_verdict(verdicts, key, verdict)
+        if not verdict:
+            logger.info(
+                "channels-last conv_out input is not bitwise identical to the channels-first one for %s; "
+                "using the channels-first path for this shape",
+                tuple(assembled.shape),
+            )
+            return channels_first(assembled.contiguous(), conv.weight)
+    return candidate(assembled, conv.weight)
 
 
 def _residual_add(
@@ -497,16 +630,30 @@ def _residual_add(
 # --------------------------------------------------------------------------- #
 
 
-def _interleave_time(x: torch.Tensor, batch: int, channels: int, frames: int, height: int, width: int) -> torch.Tensor:
+def _interleave_time(
+    x: torch.Tensor,
+    batch: int,
+    channels: int,
+    frames: int,
+    height: int,
+    width: int,
+    *,
+    channels_last: bool = False,
+) -> torch.Tensor:
     """Upstream ``reshape(b, 2, c, t, h, w)`` + ``stack(..., 3)`` + ``reshape`` as one strided copy.
 
     ``out[:, :, 2i] = x[:, :c, i]`` and ``out[:, :, 2i + 1] = x[:, c:, i]``; pure
-    data movement that also preserves a channels_last_3d layout (``torch.stack``
-    on the 6-D view always produced a contiguous tensor).
+    data movement. Upstream's ``torch.stack`` concatenates the two halves, so
+    its result is channels_last_3d exactly when ATen treats both halves as
+    channels-last; the ``reshape`` can prevent that for a size-1 batch. The
+    ``channels_last`` level keeps any channels_last_3d input's layout instead.
     """
-    memory_format = torch.contiguous_format
-    if channels > 1 and x.is_contiguous(memory_format=torch.channels_last_3d):
-        memory_format = torch.channels_last_3d
+    if channels_last:
+        keep_channels_last = channels > 1 and x.is_contiguous(memory_format=torch.channels_last_3d)
+    else:
+        halves = x.reshape(batch, 2, channels, frames, height, width)
+        keep_channels_last = suggests_channels_last(halves[:, 0]) and suggests_channels_last(halves[:, 1])
+    memory_format = torch.channels_last_3d if keep_channels_last else torch.contiguous_format
     out = torch.empty(
         (batch, channels, frames * 2, height, width),
         dtype=x.dtype,
@@ -518,26 +665,31 @@ def _interleave_time(x: torch.Tensor, batch: int, channels: int, frames: int, he
     return out
 
 
-def _merge_batch_and_frames(x: torch.Tensor) -> torch.Tensor:
-    """``(b, c, t, h, w)`` -> ``(b * t, c, h, w)`` view, keeping a channels-last layout recognizable.
+def _merge_batch_and_frames(x: torch.Tensor, *, channels_last: bool = False) -> torch.Tensor:
+    """``(b, c, t, h, w)`` -> ``(b * t, c, h, w)``: upstream's ``permute().reshape()``.
 
-    For a channels_last_3d tensor with ``b * t == 1``, ``permute().reshape()`` hands
-    the size-1 batch dimension an arbitrary stride that PyTorch's layout heuristic
-    (``suggest_memory_format``) does not accept as channels_last, so ops without a
-    weight to vote for the layout, such as the nearest upsample, would allocate
-    NCHW output and force the next convolution to transpose it. Building the same
-    view with canonical strides avoids that; the values are untouched.
+    At the ``channels_last`` level a channels-last layout is kept recognizable:
+    for a channels_last_3d tensor with ``b * t == 1``, ``permute().reshape()``
+    hands the size-1 batch dimension an arbitrary stride that PyTorch's layout
+    heuristic (``suggest_memory_format``) does not accept as channels_last, so ops
+    without a weight to vote for the layout, such as the nearest upsample, would
+    allocate NCHW output and force the next convolution to transpose it. Building
+    the same view with canonical strides avoids that; the values are untouched.
+
+    The lossless level keeps upstream's strides: the following convolution and
+    normalization pick their kernels from the layout, and a contiguous tensor
+    whose only non-unit dimension is ``c`` also looks channels-last.
     """
     b, c, t, h, w = x.shape
-    if c > 1 and x.is_contiguous(memory_format=torch.channels_last_3d):
+    if channels_last and c > 1 and x.is_contiguous(memory_format=torch.channels_last_3d):
         return x.as_strided((b * t, c, h, w), (h * w * c, 1, w * c, c))
     return x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
 
 
-def _split_batch_and_frames(x: torch.Tensor, batch: int, frames: int) -> torch.Tensor:
+def _split_batch_and_frames(x: torch.Tensor, batch: int, frames: int, *, channels_last: bool = False) -> torch.Tensor:
     """``(b * t, c, h, w)`` -> ``(b, c, t, h, w)`` view; see :func:`_merge_batch_and_frames`."""
     _, c, h, w = x.shape
-    if c > 1 and x.is_contiguous(memory_format=torch.channels_last):
+    if channels_last and c > 1 and x.is_contiguous(memory_format=torch.channels_last):
         return x.as_strided((batch, c, frames, h, w), (frames * h * w * c, 1, h * w * c, w * c, c))
     return x.view(batch, frames, c, h, w).permute(0, 2, 1, 3, 4)
 
@@ -570,6 +722,8 @@ def resample_forward(
     """
     if feat_idx is None:
         feat_idx = [0]
+    cfg = getattr(self, CFG_ATTR, None)
+    channels_last = cfg is not None and cfg.channels_last
     batch, channels, frames, height, width = x.size()
     if self.mode == "upsample3d" and feat_cache is not None:
         index = feat_idx[0]
@@ -579,18 +733,23 @@ def resample_forward(
         else:
             x = _run_cached_causal_conv(self.time_conv, x, feat_cache, index)
             feat_idx[0] += 1
-            x = _interleave_time(x, batch, channels, frames, height, width)
+            x = _interleave_time(x, batch, channels, frames, height, width, channels_last=channels_last)
 
     frames = x.shape[2]
-    x = _merge_batch_and_frames(x)
+    x = _merge_batch_and_frames(x, channels_last=channels_last)
     pending_bias = None
-    if return_bias and _is_upsample_conv_pair(self.resample) and _kernels_allowed(x):
+    if (
+        return_bias
+        and _is_upsample_conv_pair(self.resample)
+        and not _has_forward_hooks(self.resample, self.resample[1])
+        and _kernels_allowed(x)
+    ):
         upsample, conv = self.resample[0], self.resample[1]
         x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
         pending_bias = _deferred_conv_bias(conv, x)
     else:
         x = self.resample(x)
-    x = _split_batch_and_frames(x, batch, frames)
+    x = _split_batch_and_frames(x, batch, frames, channels_last=channels_last)
 
     if self.mode == "downsample3d" and feat_cache is not None:
         index = feat_idx[0]
@@ -646,18 +805,38 @@ def residual_block_forward(
         type(shortcut) is WanCausalConv3d
         and shortcut.bias is not None
         and not any(shortcut._padding)
+        and not _has_forward_hooks(shortcut)
         and _kernels_allowed(x)
     ):
         residual = _conv_without_bias(shortcut, x)
         residual_bias = _deferred_conv_bias(shortcut, residual)
     else:
         residual = shortcut(x)
+    cfg = getattr(self, CFG_ATTR, None)
+    if cfg is not None and cfg.fuse_norm_cache and feat_cache is not None:
+        conv1 = _run_norm_act_cached_conv(
+            self.norm1, self.nonlinearity, self.conv1, x, feat_cache, feat_idx[0], return_bias=cfg.channels_last
+        )
+        x, conv1_bias = conv1 if cfg.channels_last else (conv1, None)
+        feat_idx[0] += 1
+        x, conv2_bias = _run_norm_act_cached_conv(
+            self.norm2,
+            self.nonlinearity,
+            self.conv2,
+            x,
+            feat_cache,
+            feat_idx[0],
+            pending_bias=conv1_bias,
+            return_bias=True,
+            after_norm=self.dropout,
+        )
+        feat_idx[0] += 1
+        return _residual_add(x, conv2_bias, residual, residual_bias)
     x = _norm_act(self.norm1, self.nonlinearity, x)
     # conv1 feeds only norm2. At the channels_last level the single-pass norm
     # kernel adds the conv bias itself (rounded like ATen's ``add_``), so the
     # convolution runs without it; the lossless level keeps the separate add
     # because ``vector_norm`` must see the same bytes as upstream.
-    cfg = getattr(self, CFG_ATTR, None)
     conv1_bias = None
     if feat_cache is not None:
         index = feat_idx[0]
@@ -689,8 +868,9 @@ def residual_up_block_forward(
 ) -> torch.Tensor:
     if feat_idx is None:
         feat_idx = [0]
-    # Upstream clones ``x`` for the shortcut; nothing below mutates it in place.
-    shortcut_source = x
+    # Upstream clones ``x`` for the shortcut. Nothing below mutates it in place
+    # unless a hook does, so the copy is only needed while one is registered.
+    shortcut_source = x.clone() if _has_forward_hooks(*self.resnets.modules()) else x
     for resnet in self.resnets:
         if feat_cache is None:
             x = resnet(x)
@@ -700,12 +880,22 @@ def residual_up_block_forward(
     shortcut = self.avg_shortcut
     # The upsampler's Conv2d output feeds only ``x + DupUp3D(...)``, so its bias
     # is folded into that kernel (exact: rounded like ATen's ``add_`` first).
-    fuse_shortcut = type(shortcut) is DupUp3D and _kernels_allowed(x) and x.dtype == shortcut_source.dtype
+    fuse_shortcut = (
+        type(shortcut) is DupUp3D
+        and not _has_forward_hooks(shortcut)
+        and _kernels_allowed(x)
+        and x.dtype == shortcut_source.dtype
+    )
     conv_bias = None
     if self.upsampler is not None:
         if feat_cache is None:
             x = self.upsampler(x)
-        elif fuse_shortcut and type(self.upsampler) is WanResample and hasattr(self.upsampler, CFG_ATTR):
+        elif (
+            fuse_shortcut
+            and type(self.upsampler) is WanResample
+            and hasattr(self.upsampler, CFG_ATTR)
+            and not _has_forward_hooks(self.upsampler)
+        ):
             x, conv_bias = resample_forward(self.upsampler, x, feat_cache, feat_idx, return_bias=True)
         else:
             x = self.upsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)

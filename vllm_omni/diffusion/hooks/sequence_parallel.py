@@ -196,19 +196,17 @@ class SequenceParallelSplitHook(ModelHook):
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         """Shard inputs before forward."""
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
         args_list = list(args)
+        actually_sharded = False
+        equal_rank_seq_lens = True
         # Clear text length cache for this forward pass
         self._text_len_cache.clear()
-        if self._shard_groups:
-            from vllm_omni.diffusion.forward_context import (
-                get_forward_context,
-                is_forward_context_available,
-            )
-
-            if is_forward_context_available():
-                ctx = get_forward_context()
-                for shard_group in self._shard_groups:
-                    ctx.sp_shard_metadata.pop(shard_group, None)
+        if self._shard_groups and is_forward_context_available():
+            ctx = get_forward_context()
+            for shard_group in self._shard_groups:
+                ctx.sp_shard_metadata.pop(shard_group, None)
 
         for name, spm in self.metadata.items():
             # Skip if this is a split_output entry (handled in post_forward)
@@ -231,7 +229,11 @@ class SequenceParallelSplitHook(ModelHook):
                     raise ValueError(
                         f"Expected SequenceParallelInput for tensor parameter '{name}', got {type(spm).__name__}"
                     )
+                original = input_val
                 input_val = self._prepare_sp_input(input_val, spm, args_list, kwargs)
+                if input_val is not original:
+                    actually_sharded = True
+                    equal_rank_seq_lens &= isinstance(spm, SequenceParallelInput) and spm.auto_pad
             elif isinstance(input_val, (list, tuple)):
                 # Handle list/tuple of tensors with per-element config
                 if not isinstance(spm, (list, tuple)):
@@ -243,8 +245,13 @@ class SequenceParallelSplitHook(ModelHook):
                     raise ValueError(f"Expected {len(spm)} elements for parameter '{name}', got {len(input_val)}")
                 sharded_input_val = []
                 for i, x in enumerate(input_val):
-                    if torch.is_tensor(x) and not spm[i].split_output:
-                        x = self._prepare_sp_input(x, spm[i], args_list, kwargs)
+                    input_spec = spm[i]
+                    if torch.is_tensor(x) and not input_spec.split_output:
+                        original = x
+                        x = self._prepare_sp_input(x, input_spec, args_list, kwargs)
+                        if x is not original:
+                            actually_sharded = True
+                            equal_rank_seq_lens &= isinstance(input_spec, SequenceParallelInput) and input_spec.auto_pad
                     sharded_input_val.append(x)
                 input_val = type(input_val)(sharded_input_val)
             else:
@@ -260,9 +267,19 @@ class SequenceParallelSplitHook(ModelHook):
             else:
                 raise ValueError(f"Failed to update parameter '{name}' after sharding.")
 
-        # Store kwargs for post_forward to resolve text lengths
-        self._last_kwargs = kwargs
-        self._last_args = tuple(args_list)
+        # Output splitting only needs integer text lengths. Saving args/kwargs
+        # here would keep full hidden-state inputs alive after output sharding,
+        # including when the module raises before post_forward can run.
+        for spm in self.metadata.values():
+            if isinstance(spm, SequenceParallelPartialInput) and spm.split_output:
+                self._resolve_text_len(spm, args_list, kwargs)
+
+        # Attention inside this module already consumes sharded inputs.
+        # Enter one scope for the boundary, regardless of its tensor count.
+        if actually_sharded and is_forward_context_available():
+            ctx = get_forward_context()
+            ctx._sp_shard_depth += 1
+            ctx._sp_equal_pad_stack.append(equal_rank_seq_lens)
 
         return tuple(args_list), kwargs
 
@@ -291,7 +308,7 @@ class SequenceParallelSplitHook(ModelHook):
                 raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
 
             original = output_list[index]
-            output_list[index] = self._prepare_sp_input(original, spm, self._last_args, self._last_kwargs)
+            output_list[index] = self._prepare_sp_input(original, spm)
             if output_list[index] is not original:
                 actually_sharded = True
                 equal_rank_seq_lens &= isinstance(spm, SequenceParallelInput) and spm.auto_pad
@@ -392,13 +409,22 @@ class SequenceParallelSplitHook(ModelHook):
         if isinstance(sp_input, SequenceParallelInput):
             # Full split with optional auto-padding
             if sp_input.auto_pad:
-                return self._shard_with_auto_pad(
+                shard = self._shard_with_auto_pad(
                     x,
                     sp_input.split_dim,
                     sp_input.shard_group,
                 )
-            _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
-            return sp_shard(x, sp_input.split_dim, validate=False)
+            else:
+                _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
+                shard = sp_shard(x, sp_input.split_dim, validate=False)
+            # contiguous() may be a no-op for a single-batch sequence slice;
+            # clone explicitly to release its full (possibly padded) backing.
+            if sp_input.clone_shard:
+                from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
+
+                if get_sequence_parallel_world_size() > 1:
+                    return shard.clone(memory_format=torch.contiguous_format)
+            return shard
         elif isinstance(sp_input, SequenceParallelPartialInput):
             # Partial split: keep text portion, split image portion
             text_len = self._resolve_text_len(sp_input, args, kwargs)

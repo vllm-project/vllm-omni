@@ -64,6 +64,7 @@ class E2EOperator:
 @dataclass
 class FakeWorldGroup:
     device_group: object
+    cpu_group: object = None
 
 
 class DummyMixin(DistributedVaeMixin):

@@ -1310,6 +1310,8 @@ def extract_sensenova_u1_context(
     use_cache: bool | None = None,
     embed_only: bool = False,
     compute_logits: bool = True,
+    exist_und: bool | None = None,
+    exist_gen: bool | None = None,
     **kwargs: Any,
 ) -> CacheContext:
     """Extract cache context for SenseNovaU1ForCausalLM denoising forwards."""
@@ -1320,15 +1322,22 @@ def extract_sensenova_u1_context(
     layer_kwargs = dict(kwargs)
     layer_kwargs.pop("cache_dit_skip", None)
     image_gen_indicators = layer_kwargs.pop("image_gen_indicators", None)
-    exist_und = (~image_gen_indicators).any().item()
-    exist_gen = image_gen_indicators.any().item()
+    if exist_und is None or exist_gen is None:
+        exist_und = (~image_gen_indicators).any().item()
+        exist_gen = image_gen_indicators.any().item()
     causal_mask_mapping = attention_mask
 
     first_layer = module.model.layers[0]
     modulated_input = first_layer.input_layernorm_mot_gen(inputs_embeds)
 
     def run_transformer_blocks():
+        assert indexes is not None
         h = inputs_embeds
+        position_embeddings = (
+            module.model.rotary_emb(h, indexes[0].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[1].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[2].unsqueeze(0)),
+        )
         for layer in module.model.layers:
             h = layer(
                 h,
@@ -1336,6 +1345,7 @@ def extract_sensenova_u1_context(
                 exist_und=exist_und,
                 exist_gen=exist_gen,
                 indexes=indexes,
+                position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
                 **layer_kwargs,
@@ -1620,6 +1630,9 @@ def extract_cosmos3_context(
         control_weights=control_weights,
         transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
     )
+    # Cache residuals stay rank-local: shard before the context and its
+    # closures retain prep; postprocess gathers on both misses and hits.
+    prep = module._shard_gen_prep(prep, defer_gather=True)
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
         return (module._run_gen_stack(prep),)

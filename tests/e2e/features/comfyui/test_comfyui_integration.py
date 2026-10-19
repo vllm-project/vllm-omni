@@ -30,10 +30,12 @@ from comfyui_vllm_omni.nodes import (
     VLLMOmniGenerateImage,
     VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
+    VLLMOmniLatentMaskEditing,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
     VLLMOmniVideoReferences,
     VLLMOmniVoiceClone,
+    VLLMOmniYuE2Params,
 )
 from comfyui_vllm_omni.utils.types import (
     AutoregressionSamplingParams,
@@ -1308,6 +1310,31 @@ def _build_music_tokenizer():
     return SimpleNamespace(encode=encode, convert_tokens_to_ids=special_token_ids.get)
 
 
+@pytest.mark.parametrize("cot", ["off", "melody", "full"])
+def test_yue2_params(cot: str) -> None:
+    abc = "" if cot == "off" else "X:1\nK:C\nC D E F|"
+
+    (params,) = VLLMOmniYuE2Params().get_params(cot=cot, abc=abc)
+
+    expected = {"cot": cot}
+    if abc:
+        expected["abc"] = abc
+    assert params == expected
+
+
+@pytest.mark.parametrize(
+    ("cot", "abc", "message"),
+    [
+        ("off", "X:1\nK:C\nC D E F|", "ABC requires cot=melody or full"),
+        ("melody", "", "requires supplied ABC score text"),
+        ("full", " ", "requires supplied ABC score text"),
+    ],
+)
+def test_yue2_params_rejects_incompatible_abc(cot: str, abc: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        VLLMOmniYuE2Params().get_params(cot=cot, abc=abc)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "server_case",
@@ -1344,3 +1371,52 @@ async def test_music_generation_node_minimax_music3(api_server: str, sampling_ca
     assert len(result) == 1
     assert result[0]["sample_rate"] == 24000
     assert result[0]["waveform"].shape == (1, 1, 24000)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            id="minimax-h3",
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [pytest.param(SamplingCase(kind=SamplingKind.VIDEO_NONE, sampling_params=None), id="latent-mask")],
+    indirect=True,
+)
+async def test_video_generation_node_minimax_h3_latent_mask_editing(api_server: str, sampling_case: SamplingCase):
+    """Latent-mask editing: the raw video/audio masks must be accepted by the real /v1/videos form parser."""
+    mask_node = VLLMOmniLatentMaskEditing()
+    (latent_edit,) = mask_node.get_latent_edit(
+        source_video=VideoInput(b"mock-source-video"),
+        video_mask=torch.zeros((VIDEO_HEIGHT, VIDEO_WIDTH), dtype=torch.float32),
+        audio_mask=0.5,
+    )
+
+    node = VLLMOmniGenerateVideo()
+    result = await node.generate(
+        url=api_server,
+        model="MiniMaxAI/MiniMax-H3",
+        prompt="Restyle the clip.",
+        negative_prompt="",
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=VIDEO_FPS,
+        duration=VIDEO_DURATION,
+        model_params=H3_MODEL_PARAMS,
+        latent_edit=latent_edit,
+    )
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], VideoInput)

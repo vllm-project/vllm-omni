@@ -89,3 +89,28 @@ def test_non_opted_in_sampler_keeps_two_argument_contract(mocker):
 
     assert result == "sampled"
     model_sample.assert_called_once_with(logits, metadata)
+
+
+@pytest.mark.parametrize("with_extra_args", [False, True])
+def test_opted_in_sampler_receives_host_sampling_params_in_row_order(mocker, with_extra_args):
+    from vllm.sampling_params import SamplingParams
+
+    params = SamplingParams(repetition_penalty=1.05, extra_args={"ar_task_mode": "generation"})
+    model = SimpleNamespace(model_sampler_wants_sampling_params=True, model_sampler_wants_extra_args=with_extra_args)
+    model_sample = mocker.Mock(return_value="sampled")
+    logits = torch.zeros(3, 8)
+    metadata = SimpleNamespace()
+    requests = {"a": SimpleNamespace(sampling_params=params), "b": SimpleNamespace(sampling_params=None)}
+    result = call_model_sampler(
+        model,
+        model_sample,
+        logits,
+        metadata,
+        input_batch=SimpleNamespace(req_ids=["b", "missing", "a"]),
+        requests=requests,
+    )
+    kwargs: dict[str, object] = {"per_req_sampling_params": [None, None, params]}
+    if with_extra_args:
+        kwargs["per_req_extra_args"] = [None, None, params.extra_args]
+    model_sample.assert_called_once_with(logits, metadata, **kwargs)
+    assert result == "sampled"

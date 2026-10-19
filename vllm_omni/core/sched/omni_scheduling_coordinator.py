@@ -183,8 +183,8 @@ class OmniSchedulingCoordinator:
                 self.pending_input_registrations.append(
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
-                        payload_sender_info=getattr(request, "payload_sender_info", None),
+                        external_req_id=request.external_req_id,
+                        payload_sender_info=request.payload_sender_info,
                     )
                 )
             elif request.status == RequestStatus.WAITING_FOR_INPUT:
@@ -197,8 +197,8 @@ class OmniSchedulingCoordinator:
                     self.pending_input_registrations.append(
                         OmniChunkRecvHandle(
                             request_id=request.request_id,
-                            external_req_id=getattr(request, "external_req_id", None),
-                            payload_sender_info=getattr(request, "payload_sender_info", None),
+                            external_req_id=request.external_req_id,
+                            payload_sender_info=request.payload_sender_info,
                         )
                     )
         if to_remove:
@@ -443,36 +443,77 @@ class OmniSchedulingCoordinator:
         target_status: RequestStatus,
         chunk_ready_req_ids: set[str],
     ) -> None:
-        queue_snapshot = list(queue)
-        for request in queue_snapshot:
+        """Single-pass partition of the queue.
+
+        Walks the queue snapshot once, appending each request to either the
+        retained list or the waiting_for_chunk_list, then rebuilds the queue
+        from the retained list (or calls bulk remove for queue objects).
+        This avoids the O(N) per-request ``queue.remove()`` scan that made
+        the previous implementation O(N·K) on every scheduler cycle.
+        """
+        is_list_queue = isinstance(queue, list)
+        if is_list_queue:
+            retained: list[Any] = []
+        else:
+            to_remove: list[Any] = []
+
+        for request in queue:
             request_can_run = self._request_can_run(request, chunk_ready_req_ids)
+            move_to_waiting = False
+
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request_can_run:
                     if request.request_id in chunk_ready_req_ids:
                         self.requests_with_ready_chunks.add(request.request_id)
-                    continue
-                if request.status == RequestStatus.WAITING_FOR_INPUT:
-                    continue
-                self.pending_chunk_registrations.append(
-                    OmniChunkRecvHandle(
-                        request_id=request.request_id,
-                        external_req_id=getattr(request, "external_req_id", None),
+                    # stays in queue
+                elif request.status == RequestStatus.WAITING_FOR_INPUT:
+                    # stays in queue — input coordinator owns this transition
+                    pass
+                else:
+                    # needs to be parked for chunk recv
+                    self.pending_chunk_registrations.append(
+                        OmniChunkRecvHandle(
+                            request_id=request.request_id,
+                            external_req_id=request.external_req_id,
+                        )
                     )
-                )
-                request.status = RequestStatus.WAITING_FOR_CHUNK
-                self._waiting_since.setdefault(request.request_id, time.monotonic())
+                    request.status = RequestStatus.WAITING_FOR_CHUNK
+                    self._waiting_since.setdefault(request.request_id, time.monotonic())
+                    move_to_waiting = True
             else:
                 if request_can_run:
                     request.status = target_status
                     if request.request_id in chunk_ready_req_ids:
                         self.requests_with_ready_chunks.add(request.request_id)
                     self._waiting_since.pop(request.request_id, None)
-                    continue
-            if isinstance(queue, list):
-                queue.remove(request)
+                    # stays in queue
+                else:
+                    # already WAITING_FOR_CHUNK and still can't run — stays parked
+                    # (but we still need to move it out of this queue partition)
+                    move_to_waiting = True
+
+            if move_to_waiting:
+                waiting_for_chunk_list.append(request)
+                if is_list_queue:
+                    continue  # skip this request in retained
+                else:
+                    to_remove.append(request)
             else:
-                queue.remove_request(request)
-            waiting_for_chunk_list.append(request)
+                if is_list_queue:
+                    retained.append(request)
+                # else: the request stays, nothing to do
+
+        if is_list_queue:
+            # Single O(N) slice assignment instead of K individual O(N) removes.
+            queue[:] = retained
+        elif to_remove:
+            try:
+                queue.remove_requests(to_remove)
+            except AttributeError:
+                # Fallback for queue types lacking bulk remove — still better
+                # than remove-in-loop because we batch the O(N) scan once.
+                for request in to_remove:
+                    queue.remove_request(request)
 
     def _request_can_run(
         self,

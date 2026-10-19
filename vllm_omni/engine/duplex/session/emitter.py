@@ -28,6 +28,7 @@ from vllm_omni.engine.duplex.events import (
     ResponseDone,
     error_event,
 )
+from vllm_omni.engine.duplex.plugin import settle_response_runtime
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     discard_pending_input_audio,
@@ -94,7 +95,11 @@ class SessionEmitter:
         self._ctx.manager.invalidate_output(session.session_id, response_id, through_epoch=session.epoch)
         if session.active_response_id is not None:
             # Close still needs the request binding to abort the real engine work.
+            failed_response_id = session.active_response_id
             session.end_response(commit_text=False, preserve_request=True)
+            settle_response_runtime(
+                self._ctx.plugin, session, committed=False, response_id=failed_response_id, release_owner=True
+            )
         events: list[DuplexEvent] = [error_event("output_backpressure", message)]
         if response_id is None:
             return events
@@ -234,15 +239,6 @@ class SessionEmitter:
         )
         can_promote_overlap = response_terminal and terminal_status not in {"cancelled", "failed"}
         deferred_overlap_payload: dict[str, object] | None = None
-        continuous_input_crosses_terminal = (
-            can_promote_overlap
-            and self.auto_responds()
-            and model_state.input_since_commit
-            and not model_state.deferred_response_create
-        )
-        if continuous_input_crosses_terminal:
-            session.reset_overlap_speech()
-            return True, None
         realtime_input_still_open = (
             can_promote_overlap and model_state.input_since_commit and not model_state.deferred_response_create
         )
@@ -292,8 +288,6 @@ class SessionEmitter:
                 model_state.speech_since_commit = False
                 if had_pending_overlap_audio and self._projector is not None:
                     self.emit_events(discard_pending_input_audio(self._projector, session.overlap_speech_ms))
-                if payload_type in {"audio.cancelled", "input.cancelled", "session.closed"}:
-                    session.release_input_bytes(model_state.clear_committed_audio())
 
         session.reset_overlap_speech()
         if (

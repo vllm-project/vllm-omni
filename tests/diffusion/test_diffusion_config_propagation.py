@@ -46,6 +46,21 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
 
 
+def test_direct_config_extras_are_independent_dicts():
+    first = OmniDiffusionConfig(model="test-model")
+    second = OmniDiffusionConfig(model="test-model")
+
+    assert first.extras.get("prefix_kv_cache_dtype") is None
+    first.extras["prefix_kv_cache_dtype"] = "fp8"
+    assert second.extras == {}
+
+
+def test_direct_config_preserves_explicit_extras():
+    config = OmniDiffusionConfig(model="test-model", extras={"prefix_kv_cache_dtype": "fp8"})
+
+    assert config.extras["prefix_kv_cache_dtype"] == "fp8"
+
+
 class TestParallelConfigPropagation:
     """Core regression tests: parallel_config must survive serialization."""
 
@@ -224,6 +239,18 @@ def test_vae_fast_path_roundtrip():
 def test_invalid_vae_fast_path_is_rejected():
     with pytest.raises(ValueError, match="vae_fast_path"):
         OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
+def test_vae_encode_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_encode_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="off", vae_encode_fast_path="channels_last")
+    assert od.vae_fast_path == "off"
+    assert od.vae_encode_fast_path == "channels_last"
+
+
+def test_invalid_vae_encode_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_encode_fast_path"):
+        OmniDiffusionConfig(model="x", vae_encode_fast_path="fast")
 
 
 def test_flux2_klein_sets_generic_multimodal_limit():

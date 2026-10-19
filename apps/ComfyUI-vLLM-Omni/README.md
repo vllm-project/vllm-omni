@@ -72,6 +72,8 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 
 Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
 
+The `model` field of every node that talks to a server doubles as a dropdown of what the server actually serves: the list is fetched through the ComfyUI backend (so `localhost` resolves to the host running ComfyUI, not to the machine the browser is on), refetched when the `url` field changes or the **↻ refresh models** button is clicked, and falls back to plain free text whenever the list cannot be fetched -- a server that is down must never make the node unfillable. A value saved in a workflow is always kept, even when it is not in the fetched list.
+
 **Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
 
 To build a simple workflow yourself,
@@ -271,10 +273,10 @@ The [WF-05 template](example_workflows/vLLM-Omni%20MiniMax-H3%20Latent%20Mask%20
 Connect a **Latent Mask Editing** node to **Generate Video → latent_edit** to edit a source clip instead of generating from scratch. It uploads the source media and serializes the video/audio noise masks the MiniMax H3 API accepts:
 
 - `source_video` / `source_audio` — the media to edit.
-- `video_mask` — a ComfyUI mask image; `0` preserves a region, `1` regenerates it, fractional values blend. A 2D mask `[H, W]` is applied to every frame; a 3D mask `[T, H, W]` is treated as a temporal mask (one slice per frame) for continuation or extension. It is resized to the video latent grid.
+- `video_mask` — a ComfyUI mask image; `0` preserves a region, `1` regenerates it, fractional values blend. A 2D mask `[H, W]` is applied to every frame; a 3D mask `[T, H, W]` is treated as a temporal mask (one slice per frame) for continuation or extension. The client area-downsamples it by 16 to keep the upload small, and the server resizes it to the video latent grid.
 - `audio_mask` — a scalar in `[0, 1]`; `0` keeps the source audio, `1` regenerates it, fractional values blend.
 
-A non-trivial mask requires its matching source, and a source without a mask is rejected. This node only forwards inputs to the server; the served model must declare latent-mask editing support (MiniMax-H3).
+The node requires at least one mask; the server then enforces the cross-field rules (a source requires a matching mask, and a non-trivial mask requires its source). This node only forwards inputs to the server; the served model must declare latent-mask editing support (MiniMax-H3).
 
 ### TTS (e.g., Qwen TTS series)
 
@@ -290,14 +292,45 @@ A non-trivial mask requires its matching source, and a source without a mask is 
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
 
-### Music generation (e.g., MiniMax Music 3)
+### Text to Music (e.g., MiniMax Music 3/YuE2)
 
-(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Generation**)
+Open **ComfyUI sidebar->Template->vLLM-Omni** and select:
+
+- **vLLM-Omni Text to Music(MiniMax Music3)** — the existing MiniMax Music 3 template.
+- **vLLM-Omni Text to Music(YuE2)** — uses YuE2 Params with `cot=off` by default.
+
+Set Generate Music's URL and model to the running service. Caption and lyrics
+map to `instructions` and `input`. For YuE2, connect YuE2 Params to the optional
+`model_specific_params` input. Leave ABC empty for `off`; `melody/full` require
+ABC score text, pasted or connected as STRING, not a file path.
+
+See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md) for deployment details.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg">
-    <img alt="vLLM-Omni Music Generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg">
+    <img alt="vLLM-Omni Text to Music(MiniMax Music3)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg" width=55%>
+  </picture>
+</p>
+
+### Music Cover (e.g. YuE2)
+
+Open **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Cover(YuE2)**.
+
+The template uses native Load Audio, Audio Encoder Loader and SheetSage2 Audio
+to ABC nodes locally, followed by remote YuE2 generation. Download
+[sheetsage2_bf16.safetensors](https://huggingface.co/Comfy-Org/YuE2/resolve/main/audio_encoders/sheetsage2_bf16.safetensors)
+into `models/audio_encoders/`, select it and upload your source audio.
+
+Keep SheetSage2 mode and YuE2 Params cot matched; both default to `melody`.
+Provide lyrics separately. The remote service receives ABC text rather than the
+source recording, and returns audio without generated ABC or truncation metadata.
+Save Audio previews and saves the result.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg">
+    <img alt="vLLM-Omni Music Cover(YuE2)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg" width=55%>
   </picture>
 </p>
 

@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
     from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
-    from vllm_omni.engine.messages import EngineQueueMessage
+    from vllm_omni.engine.messages import EngineQueueMessage, OutputQueueWriter
 
 logger = init_logger(__name__)
 
@@ -77,6 +77,7 @@ class _PendingRequestCleanup:
     lease_generation: int
     request_ids: tuple[str, ...]
     abort: bool
+    closing: _PendingSessionCleanup | None = None
 
 
 @dataclass(frozen=True)
@@ -105,10 +106,11 @@ class DuplexSessionManager:
         *,
         plugin: DuplexModelPlugin,
         stage_port: DuplexStagePort,
-        output_sink: janus.AsyncQueue[EngineQueueMessage],
+        output_sink: OutputQueueWriter,
         result_sink: janus.AsyncQueue[EngineQueueMessage],
         runtime_config: DuplexSessionRuntimeConfig,
         model_config: ModelConfig | None,
+        admission_limit: int | None = None,
         log_stats: bool = False,
         clock: Callable[[], float] | None = None,
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
@@ -119,6 +121,9 @@ class DuplexSessionManager:
         self.model_config = model_config
         self.log_stats = bool(log_stats)
         self.runtime_config = runtime_config
+        if admission_limit is not None and (type(admission_limit) is not int or admission_limit < 0):
+            raise ValueError("admission_limit must be a non-negative integer")
+        self._admission_limit = admission_limit
         self._output_sink = output_sink
         self._result_sink = result_sink
         self._clock = clock or time.monotonic
@@ -415,12 +420,7 @@ class DuplexSessionManager:
             return
         # Only closure notifications and errors without a live session use the
         # engine-wide queue. Audio never accumulates there before the bounded buffer.
-        message = DuplexSessionEventMessage(session_id=session_id, event=event)
-        put_nowait = getattr(self._output_sink, "put_nowait", None)
-        if callable(put_nowait):
-            put_nowait(message)
-        else:  # pragma: no cover - sink without put_nowait
-            asyncio.ensure_future(self._output_sink.put(message))
+        self._output_sink.put_nowait(DuplexSessionEventMessage(session_id=session_id, event=event))
 
     async def _put_result(
         self,
@@ -505,6 +505,7 @@ class DuplexSessionManager:
         *,
         stage_id: int,
         fence: DuplexFence | None = None,
+        final_stage_id: int | None = None,
     ) -> DuplexStageRequestContext | None:
         """Reserve the session's stage request id and register it with the stage port."""
         if stage_id >= self.stage_port.stage_count:
@@ -518,7 +519,7 @@ class DuplexSessionManager:
             session_id=session.session_id,
             fence=effective_fence,
             stage_id=stage_id,
-            final_stage_id=self.stage_port.stage_count - 1,
+            final_stage_id=self.stage_port.stage_count - 1 if final_stage_id is None else final_stage_id,
             config_generation=session.config_generation,
             sampling_params=self.sampling_params_for(session),
             session_config=session.config.as_dict(),
@@ -532,6 +533,11 @@ class DuplexSessionManager:
     # Control operations                                                 #
     # ------------------------------------------------------------------ #
 
+    @property
+    def admission_limit(self) -> int:
+        """Local frontend budget, separate from the deployment's worker configuration."""
+        return int(self.runtime_config.max_sessions) if self._admission_limit is None else self._admission_limit
+
     def _admission_count(self) -> int:
         return len(set(self.runners) | set(self._closing) | self._admitting)
 
@@ -544,11 +550,13 @@ class DuplexSessionManager:
         # Only the open that put the id in ``_admitting`` may take it out again:
         # a duplicate open must not release the slot the first one is holding.
         holds_admission_slot = False
+        holds_replica_reservation = False
         try:
             if session_id in self.runners or session_id in self._closing or session_id in self._admitting:
                 raise DuplexSessionError(f"Duplex session already exists: {session_id}", code="session_exists")
-            max_sessions = int(self.runtime_config.max_sessions)
+            max_sessions = self.admission_limit
             if self._admission_count() >= max_sessions:
+                self.stage_port.reject_session("global_capacity_exhausted")
                 raise DuplexSessionError(
                     f"duplex_session_capacity_exhausted: limit={max_sessions}",
                     code="resource_exhausted",
@@ -558,6 +566,8 @@ class DuplexSessionManager:
             # sessions run concurrently and must not all pass the check above.
             self._admitting.add(session_id)
             holds_admission_slot = True
+            self.stage_port.reserve_session(session_id)
+            holds_replica_reservation = True
             config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
             try:
@@ -606,7 +616,9 @@ class DuplexSessionManager:
             # open burned one slot for good. Nobody is answered: the caller's
             # RPC waiter is being torn down with us or times out.
             logger.info("open_duplex_session cancelled for %s; rolling the admission back", session_id)
-            await self._rollback_open(session_id, session=session, runner=runner)
+            await self._rollback_open(
+                session_id, session=session, runner=runner, release_reservation=holds_replica_reservation
+            )
             raise
         except Exception as exc:
             error_code, _, _ = self._control_error(exc)
@@ -614,7 +626,9 @@ class DuplexSessionManager:
                 logger.info("open_duplex_session rejected: %s", exc)
             else:
                 logger.exception("open_duplex_session failed: %s", exc)
-            await self._rollback_open(session_id, session=session, runner=runner)
+            await self._rollback_open(
+                session_id, session=session, runner=runner, release_reservation=holds_replica_reservation
+            )
             await self._put_result(message, operation="open", ok=False, error=exc)
         finally:
             if holds_admission_slot:
@@ -627,6 +641,7 @@ class DuplexSessionManager:
         *,
         session: DuplexEngineSession | None,
         runner: DuplexSessionRunner | None,
+        release_reservation: bool = False,
     ) -> None:
         """Undo whatever an open that will not complete already did.
 
@@ -656,6 +671,8 @@ class DuplexSessionManager:
                     abort=False,
                 )
                 self._pending_request_cleanups[key] = pending
+        if release_reservation:
+            self.stage_port.release_session(session_id)
         if owned_runner and runner is not None:
             try:
                 await runner.shutdown()
@@ -695,6 +712,32 @@ class DuplexSessionManager:
             # outstanding and the reaper retries it while the slot stays held.
             logger.warning("close_duplex_session: stage cleanup for %s remains pending: %s", session_id, exc)
         await self._put_result(message, operation="close", ok=True, session=session)
+
+    async def fail_sessions(self, session_ids: Iterable[str], *, reason: str) -> None:
+        """Fail replica owners, including idle sessions with no submitted request."""
+        for session_id in session_ids:
+            runner = self.runners.get(session_id)
+            if runner is None or runner.closing:
+                continue
+            # Fence every affected owner before awaiting any stage cleanup.
+            runner.session.begin_close(reason=reason)
+            runner.run.closing = True
+            self.emit(runner.session, [error_event("replica_unavailable", reason)])
+            failed_runner = runner
+
+            async def close_failed(runner: DuplexSessionRunner = failed_runner) -> None:
+                if self.runners.get(runner.session.session_id) is not runner:
+                    return
+                try:
+                    await self._close_runner(runner, kind="expired", reason=reason)
+                except Exception:
+                    # As with explicit close, the reaper retries and holds capacity.
+                    logger.exception("Failed replica session cleanup pending for %s", runner.session.session_id)
+
+            # This can be called by an append whose prewarm discovered the dead
+            # replica. Its teardown cancels append tasks, so never make that
+            # append await the task that will cancel it.
+            self._run_control(session_id, f"duplex-replica-failed-{session_id}", close_failed)
 
     def close_from_runner(self, runner: DuplexSessionRunner, reason: str) -> None:
         """Finish a close the runner started from its command stream (``session.close``).
@@ -775,8 +818,11 @@ class DuplexSessionManager:
             await self.stage_port.cleanup(list(pending.reserved_request_ids))
         if session is not None:
             session.release_all_requests()
+        if self.runtime_config.replica_policy != "legacy" and self._closing.get(pending.session_id) is not pending:
+            return
         self._unregister_session_requests(pending.session_id)
         if self._closing.get(pending.session_id) is pending:
+            self.stage_port.release_session(pending.session_id)
             self._closing.pop(pending.session_id, None)
         self._session_snapshots.pop(pending.session_id, None)
 
@@ -925,17 +971,7 @@ class DuplexSessionManager:
             key = (session_id, session.lease_generation)
             existing = self._pending_request_cleanups.get(key)
             merged = tuple(dict.fromkeys([*(existing.request_ids if existing is not None else ()), *stale]))
-            self._pending_request_cleanups[key] = _PendingRequestCleanup(
-                session_id=session_id,
-                lease_generation=session.lease_generation,
-                request_ids=merged,
-                abort=abort or (existing.abort if existing is not None else False),
-            )
-            if cleanup_in_progress:
-                self._request_cleanups_in_progress.add(key)
-            # Tear the runner down in the background; the orchestrator owns the stage cleanup.
-            self._session_snapshots[session_id] = session
-            self._closing[session_id] = _PendingSessionCleanup(
+            closing = _PendingSessionCleanup(
                 kind="request_cleanup",
                 session_id=session_id,
                 lease_generation=session.lease_generation,
@@ -943,6 +979,18 @@ class DuplexSessionManager:
                 submitted_request_ids=(),
                 reserved_request_ids=(),
             )
+            self._pending_request_cleanups[key] = _PendingRequestCleanup(
+                session_id=session_id,
+                lease_generation=session.lease_generation,
+                request_ids=merged,
+                abort=abort or (existing.abort if existing is not None else False),
+                closing=closing,
+            )
+            if cleanup_in_progress:
+                self._request_cleanups_in_progress.add(key)
+            # Tear the runner down in the background; the orchestrator owns the stage cleanup.
+            self._session_snapshots[session_id] = session
+            self._closing[session_id] = closing
             self.runners.pop(session_id, None)
             task = asyncio.create_task(runner.expire("request_cleanup"), name=f"duplex-request-cleanup-{session_id}")
             self._track_task(task)
@@ -965,7 +1013,9 @@ class DuplexSessionManager:
             if session is not None and session.lease.terminal_reason is not None:
                 session.release_all_requests()
                 session.close()
-            self._closing.pop(session_id, None)
+            if session_id in self._closing:
+                self.stage_port.release_session(session_id)
+                self._closing.pop(session_id, None)
             self._unregister_session_requests(session_id)
 
     async def _complete_request_cleanup(
@@ -993,16 +1043,24 @@ class DuplexSessionManager:
 
     async def _run_request_cleanup(self, key: tuple[str, int], pending: _PendingRequestCleanup) -> None:
         await self.stage_port.cleanup(list(pending.request_ids), abort=pending.abort)
-        if self._pending_request_cleanups.get(key) is pending:
+        is_current = self._pending_request_cleanups.get(key) is pending
+        if is_current:
             self._pending_request_cleanups.pop(key, None)
             self._request_cleanups_in_progress.discard(key)
-        self.finalize_closed_sessions([pending.session_id])
+        # An open rollback has no closing owner. Its cleanup can finish after
+        # the same id is admitted again, even with the same lease generation.
+        # Preserve legacy finalization; only placement owners require this fence.
+        if self.runtime_config.replica_policy == "legacy" or (
+            is_current and pending.closing is not None and self._closing.get(pending.session_id) is pending.closing
+        ):
+            self.finalize_closed_sessions([pending.session_id])
 
     # ------------------------------------------------------------------ #
     # Shutdown                                                           #
     # ------------------------------------------------------------------ #
 
     async def shutdown(self) -> None:
+        session_ids = set(self.runners) | set(self._closing) | self._admitting
         runners = list(self.runners.values())
         self.runners.clear()
         for runner in runners:
@@ -1015,6 +1073,8 @@ class DuplexSessionManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for session_id in session_ids:
+            self.stage_port.release_session(session_id)
         self._session_control_tails.clear()
         self._closing.clear()
         self._session_snapshots.clear()

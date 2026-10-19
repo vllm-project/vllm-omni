@@ -267,7 +267,7 @@ def test_realtime_invalid_requests(
             "send_frames": send_frames_spec,
             "timeout": 120,
             "ws_max_size": None,
-            "ws_skip_types": ["session.created", "conversation.created"],
+            "ws_skip_types": ["session.created"],
             "ws_json_type": "error",
             "ws_error_code": ws_error_code,
             "err_message": err_message,

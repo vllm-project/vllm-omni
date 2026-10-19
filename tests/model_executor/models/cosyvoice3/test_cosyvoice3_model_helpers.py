@@ -1109,3 +1109,14 @@ def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
     assert call["prompt_token"].shape == (1, 2)
     assert call["prompt_feat"].shape == (1, 4, 80)
     assert output.multimodal_outputs
+
+
+@pytest.mark.parametrize("stage", ["cosyvoice3_talker", "cosyvoice3_code2wav"])
+@pytest.mark.parametrize("owned", [False, True])
+def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owned):
+    model = object.__new__(CosyVoice3Model)
+    nn.Module.__init__(model)
+    model.model_stage = stage
+    if stage == "cosyvoice3_code2wav":
+        model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
+    assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
