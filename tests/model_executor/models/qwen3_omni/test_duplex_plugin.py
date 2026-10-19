@@ -819,6 +819,89 @@ async def test_enabling_vad_requires_pending_manual_input_to_be_cleared(scripted
 
 
 @pytest.mark.parametrize("mode", ["server_vad", "semantic_vad"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("recovery", ["clear", "commit"])
+@pytest.mark.asyncio
+async def test_same_config_recovery_requires_finishing_buffered_input(monkeypatch, mode, nested, recovery):
+    from vllm_omni.engine.duplex.smart_turn import SemanticVADUnavailableError
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError
+
+    h = await open_qwen()
+    try:
+        windows = []
+
+        class Silero:
+            def new_state(self):
+                return object()
+
+            def infer(self, frame, state):
+                return (0.95 if np.abs(frame).max() > 0.1 else 0.02), state
+
+        class SmartTurn:
+            def predict(self, audio):
+                windows.append(audio.copy())
+                return 0.9
+
+        failed = False
+
+        def fail_once():
+            nonlocal failed
+            if not failed:
+                failed = True
+                error = SemanticVADUnavailableError if mode == "semantic_vad" else ServerVADUnavailableError
+                raise error("one-time initialization failure")
+            return SmartTurn() if mode == "semantic_vad" else Silero()
+
+        monkeypatch.setattr(h.manager.vad_backend_provider, "get", fail_once if mode == "server_vad" else Silero)
+        monkeypatch.setattr(
+            h.manager.semantic_vad_backend_provider, "get", fail_once if mode == "semantic_vad" else SmartTurn
+        )
+        await h.run(UpdateSession(patch={"turn_detection": {"type": mode}}))
+        events = await h.run(append_audio(value=0.2, is_speech=None))
+        assert any(getattr(event, "code", None) == f"{mode}_unavailable" for event in events)
+        assert h.runner.control._detector is None
+        pending_bytes = h.runner.model_state.audio_buffer.pending_byte_count
+        assert pending_bytes > 0
+        config, runtime = h.session.config, dict(h.session.runtime_config)
+        generation = h.session.config_generation
+        turn_detection = dict(h.session.as_public_dict()["turn_detection"])
+        patch = (
+            {"audio": {"input": {"turn_detection": turn_detection}}} if nested else {"turn_detection": turn_detection}
+        )
+        rejected = await h.run(UpdateSession(patch={**patch, "temperature": 0.3}, event_id="retry-vad"))
+        assert [event.type for event in rejected] == ["error"]
+        assert rejected[0].code == "unsupported_turn_detection"
+        assert rejected[0].related_event_id == "retry-vad"
+        assert h.runner.control._detector is None
+        assert h.session.config is config and h.session.runtime_config == runtime
+        assert h.session.config_generation == generation
+        assert h.runner.model_state.audio_buffer.pending_byte_count == pending_bytes
+
+        finished = await h.run(ClearInput() if recovery == "clear" else Commit(final=True, create_response=False))
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        if recovery == "commit":
+            assert sum(event.type == "input_audio_buffer.committed" for event in finished) == 1
+        accepted = await h.run(UpdateSession(patch=patch))
+        assert [event.type for event in accepted] == ["session.updated"]
+        events = await h.run(append_audio(value=0.4, is_speech=None))
+        for _ in range(6):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        assert len(h.port.submissions) == 1
+        audio, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert np.count_nonzero(audio == np.float32(0.4)) == 16000
+        # An explicit manual commit preserves A as earlier user context. Clear
+        # discards it. In either case the recovered detector's new turn is B.
+        assert np.count_nonzero(audio == np.float32(0.2)) == (16000 if recovery == "commit" else 0)
+        if mode == "semantic_vad":
+            assert len(windows) == 1
+            assert np.count_nonzero(windows[0] == np.float32(0.4)) == 16000
+            assert not np.any(windows[0] == np.float32(0.2))
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["server_vad", "semantic_vad"])
 @pytest.mark.parametrize("overlap_policy", ["listen_only", "barge_in_on_speech"])
 @pytest.mark.parametrize("queued_appends", [False, True])
 @pytest.mark.asyncio

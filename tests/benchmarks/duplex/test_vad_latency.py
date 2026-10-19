@@ -18,7 +18,10 @@ from vllm_omni.engine.duplex import smart_turn, vad
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_local_model_paths_produce_endpoint_report_without_cache_or_torch_fallback(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("chunk_ms", [100, 20_000])
+def test_local_model_paths_produce_endpoint_report_without_cache_or_torch_fallback(
+    tmp_path, monkeypatch, chunk_ms
+) -> None:
     from vllm.transformers_utils import repo_utils
 
     silero_path = tmp_path / "silero.onnx"
@@ -77,6 +80,9 @@ def test_local_model_paths_produce_endpoint_report_without_cache_or_torch_fallba
             str(wav),
             "--iterations",
             "1",
+            "--chunk-ms",
+            str(chunk_ms),
+            "--markdown",
             "--json",
             str(report_path),
         ],
@@ -91,6 +97,7 @@ def test_local_model_paths_produce_endpoint_report_without_cache_or_torch_fallba
     assert 500 <= endpoints["server_vad"]["endpoint_delay_ms"] <= 700
     assert 1200 <= endpoints["semantic_vad"]["endpoint_delay_ms"] <= 1400
     assert endpoints["semantic_vad"]["smart_turn_calls"] == 1
+    assert ("ordinary_chunk" in report["chunk_cost"]["semantic_vad"]) == (chunk_ms == 100)
 
 
 @pytest.mark.parametrize("kind", ["server_vad", "semantic_vad"])
@@ -128,7 +135,7 @@ def test_endpoint_report_counts_commit_before_continuation_in_same_append(monkey
         assert row["append_endpoint_delay_ms"] == 5500
 
 
-@pytest.mark.parametrize("chunk_ms", [100, 10_000])
+@pytest.mark.parametrize("chunk_ms", [100, 10_000, 20_000])
 def test_chunk_cost_counts_failed_evaluations(monkeypatch, chunk_ms):
     from tests.engine.duplex.test_semantic_vad import _loud_frames_are_speech, _ScriptedTurn
 
@@ -158,6 +165,7 @@ def test_chunk_cost_counts_failed_evaluations(monkeypatch, chunk_ms):
     assert len(scorer.windows) == 6
     assert result["semantic_vad"]["smart_turn_chunk"]["n"] == (6 if chunk_ms == 100 else 3)
     assert "smart_turn_chunk" not in result["server_vad"]
+    assert ("ordinary_chunk" in result["semantic_vad"]) == (chunk_ms != 20_000)
 
 
 @pytest.mark.parametrize("chunk_ms", [100, 127, 20_000])

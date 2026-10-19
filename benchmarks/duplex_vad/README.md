@@ -58,3 +58,6 @@ OMP_NUM_THREADS=1 python benchmarks/duplex_vad/bench_vad_latency.py \
 
 `--wav` adds unlabeled clips, which count as complete. `--chunk-ms` sets the
 append size (default 100 ms) and `--pause-ms` the thinking pause (default 1000 ms).
+Chunk-cost reports omit buckets with no samples. For example, a large append
+that contains the entire padded clip may always evaluate Smart Turn, leaving
+no `ordinary_chunk` measurements for `semantic_vad`.

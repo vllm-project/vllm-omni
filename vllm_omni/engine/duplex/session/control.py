@@ -282,7 +282,10 @@ class SessionControl:
             return
         if (
             pending_turn_detection is not None
-            and pending_turn_detection.config != self._config
+            and (
+                pending_turn_detection.config != self._config
+                or (pending_turn_detection.config is not None and self._detector is None)
+            )
             and (
                 model_state.input_since_commit
                 or model_state.audio_buffer.has_pending()
@@ -290,10 +293,12 @@ class SessionControl:
             )
         ):
             # A fresh detector cannot reconstruct the turn/pause represented by
-            # buffered audio. Refuse the whole update before adopting any config.
+            # buffered audio, including recovery with identical settings after
+            # backend failure. Refuse before adopting any config.
             self._out.emit_error(
                 "unsupported_turn_detection",
-                "session.update cannot change turn_detection while input is pending; commit or clear input first",
+                "session.update cannot replace or restart turn_detection while input is pending; "
+                "commit or clear input first",
                 event_id=realtime_event_id,
             )
             reject_update()

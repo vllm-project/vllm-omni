@@ -874,6 +874,10 @@ Semantic divergences hidden behind shared names:
   speech and pause state. Changing settings (including switching modes or
   disabling VAD) while input is pending rejects the entire `session.update`
   with `unsupported_turn_detection`; commit or clear input before retrying.
+  This also applies to identical settings after a backend failure disabled the
+  detector: its replacement cannot reconstruct the buffered turn. Identical
+  settings preserve pending input only when reusing the live detector (or when
+  VAD remains disabled).
 - `rate_limits.updated` is always an empty list (compatibility only).
 - Cancellation never reuses a `response_id`; truncation is driven by
   `playback.ack` as well as `conversation.item.truncate`.
@@ -1672,6 +1676,14 @@ truncating ack after an interruption (what was actually heard)
 ```json
 {"type": "playback.ack", "response_id": "resp_01", "played_ms": 1850, "committed_ms": 1850, "truncate": true}
 ```
+
+Send `response_id` or `item_id` to identify the playback being acknowledged.
+For compatibility, an omitted ID can select a sole pending item, the active
+response, or a sole stored assistant item. A hard ACK with no identifiable audio
+target returns `bad_event` before changing history or playback. Once a
+hard-stopped response finishes generating, it no longer blocks `response.create`,
+including while its history-calibration evidence is retained. An ordinary
+partial ACK still means playback is in progress.
 
 #### Overlap and barge-in
 

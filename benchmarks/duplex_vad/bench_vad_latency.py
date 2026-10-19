@@ -216,7 +216,9 @@ def bench_chunk_cost(silero_provider, smart_turn_provider, clips: dict[str, np.n
                 for _, decisions, seconds in stream(detector, audio, chunk_ms):
                     target = evaluating if any(r.turn_evaluations for _, r in decisions) else ordinary
                     target.append(seconds)
-        results[kind] = {"ordinary_chunk": stats_ms(ordinary)}
+        results[kind] = {}
+        if ordinary:
+            results[kind]["ordinary_chunk"] = stats_ms(ordinary)
         if evaluating:
             results[kind]["smart_turn_chunk"] = stats_ms(evaluating)
     return results

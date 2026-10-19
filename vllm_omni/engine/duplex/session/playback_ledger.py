@@ -50,6 +50,23 @@ def apply_playback_ack(
     if response_id is None and item_id is None and session.active_response_id is not None:
         response_id = session.active_response_id
         item_id = f"item_{response_id}"
+    if (
+        response_id is None
+        and item_id is None
+        and not session.pending_history_item_ids
+        and session.last_assistant_full_message is not None
+    ):
+        # Resolve the legacy single-history-item target before any validation
+        # or cursor mutation, just like explicit, pending, and active targets.
+        assistant_item_ids = [
+            known_item_id
+            for known_item_id, message in session.history_item_ids.items()
+            if message.get("role") == "assistant"
+        ]
+        if len(assistant_item_ids) == 1:
+            item_id = assistant_item_ids[0]
+            if item_id.startswith("item_"):
+                response_id = item_id.removeprefix("item_")
     audio_only = response_id is not None and session.has_audio_only_response(response_id)
     history_is_late = False
     if response_id is not None:
@@ -70,8 +87,8 @@ def apply_playback_ack(
     elif item_id is not None:
         return [error_event("playback_item_not_found", "playback.ack requires a response-owned assistant item.")]
     hard_truncate = event.get("truncate") is True
-    if hard_truncate and item_id is not None and not session.history_item_has_audio(item_id):
-        return [error_event("bad_event", "playback.ack truncate requires an item that produced audio")]
+    if hard_truncate and (item_id is None or not session.history_item_has_audio(item_id)):
+        return [error_event("bad_event", "playback.ack truncate requires one identifiable item that produced audio")]
     if item_id is not None and not history_is_late:
         session.reserve_history_item(item_id)
     if hard_truncate:
@@ -95,40 +112,6 @@ def apply_playback_ack(
                 and item_id not in session.pending_history_item_ids
             ):
                 session.register_history_item(item_id, None)
-            committed_history = session.truncate_history_item(
-                item_id,
-                audio_end_ms=committed_cursor,
-                playback=playback,
-                hard=hard_truncate,
-            )
-    elif session.pending_history_item_ids:
-        pending_ids = list(session.pending_history_item_ids)
-        if len(pending_ids) == 1:
-            item_id = pending_ids[0]
-            committed_history = session.truncate_history_item(
-                item_id,
-                audio_end_ms=committed_cursor,
-                playback=playback,
-                hard=hard_truncate,
-            )
-    elif session.active_response_id is not None:
-        item_id = f"item_{session.active_response_id}"
-        committed_history = session.truncate_history_item(
-            item_id,
-            audio_end_ms=committed_cursor,
-            playback=playback,
-            hard=hard_truncate,
-        )
-    elif session.last_assistant_full_message is not None:
-        if item_id is None and session.history_item_ids:
-            assistant_item_ids = [
-                known_item_id
-                for known_item_id, message in session.history_item_ids.items()
-                if message.get("role") == "assistant"
-            ]
-            if len(assistant_item_ids) == 1:
-                item_id = assistant_item_ids[0]
-        if isinstance(item_id, str) and item_id:
             committed_history = session.truncate_history_item(
                 item_id,
                 audio_end_ms=committed_cursor,

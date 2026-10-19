@@ -56,6 +56,8 @@ def test_hard_truncate_retires_output_without_another_ack(
     if draining:
         assert session.active_response_id == next_response
         assert session.playback.sent_ms == 100
+    else:
+        assert session.playback.sent_ms == session.playback.committed_ms
     # The stop is permanent even if the browser sends a duplicate/stale full ACK.
     apply_playback_ack(session, {"response_id": response, "played_ms": 400})
     assert session.history == ({"role": "assistant", "content": expected},)

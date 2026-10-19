@@ -1379,6 +1379,10 @@ class DuplexEngineSession:
         committed_history = False
         item_id = f"item_{response_id}"
         hard_truncated = item_id in self._conversation.hard_truncations_ms
+        if hard_truncated and playback is self._playback.current:
+            # Playback stopped even if calibration retains the response cursor.
+            # Detach only this reply's gate; a newer reply keeps its own cursor.
+            self._playback.current = DuplexPlaybackCursor()
         if playback is not None:
             total_ms = max(playback.sent_ms, playback.generated_ms)
             if self.has_assistant_response_item(response_id, item_id):

@@ -42,6 +42,9 @@ normal response completion, draining response completion, and cancellation.
 It retains state while that response is active, any of its requests are still
 draining, or playback is partial without an explicit hard truncate. A hard
 truncate means playback has stopped; once output ends, no further ACK is needed.
+At that point, detach the stopped response from the current playback gate even
+if calibration keeps its response-scoped cursor. Detach by cursor identity so
+an older stop or delayed ACK cannot unblock or overwrite a newer response.
 A final output
 can add transcript or completion metadata after the ACK, so history is reconciled
 against the retained cursor before releasing the snapshot and pending item state.
@@ -63,6 +66,9 @@ for stored history items; deleting or replacing finalized context removes it.
 This distinguishes a retired audio reply from imported context or a reply that never emitted audio
 without retaining its recording or full response snapshot. Realtime commands,
 native truncate signals, and hard playback ACKs reject a no-audio target.
+An ACK's implicit target is resolved before validation or mutation; a hard ACK
+without one identifiable audio item is rejected rather than editing the current
+cursor and choosing history afterward.
 
 History edits pass the item's own timing marks and playback cursor explicitly;
 the text-prefix calculation never reads the active response implicitly. If both
