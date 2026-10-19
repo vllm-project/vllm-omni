@@ -19,8 +19,13 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 
 
-def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -> list[DuplexEvent]:
-    """Apply one ``playback.ack`` and return the events it produces."""
+def apply_playback_ack(
+    session: DuplexEngineSession,
+    event: dict[str, object],
+    *,
+    require_audio_complete: bool = False,
+) -> list[DuplexEvent]:
+    """Apply an ACK, retaining incomplete replies when calibration is enabled."""
     played_ms = event.get("played_ms", event.get("audio_ms", 0))
     committed_ms = event.get("committed_ms")
     if not isinstance(played_ms, int | float):
@@ -30,10 +35,11 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
     except Exception:
         pass
     committed_cursor = int(committed_ms) if isinstance(committed_ms, int | float) else int(played_ms)
-    item_id = event.get("item_id")
+    raw_item_id = event.get("item_id")
+    item_id: str | None = raw_item_id if isinstance(raw_item_id, str) and raw_item_id else None
     response_id = event.get("response_id")
     response_id = response_id if isinstance(response_id, str) and response_id else None
-    if not isinstance(item_id, str) or not item_id:
+    if item_id is None:
         item_id = f"item_{response_id}" if response_id is not None else None
     elif response_id is None and item_id.startswith("item_"):
         response_id = item_id.removeprefix("item_")
@@ -47,10 +53,10 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
     audio_only = response_id is not None and session.has_audio_only_response(response_id)
     history_is_late = False
     if response_id is not None:
-        expected_item_id = f"item_{response_id}"
+        response_item_id = f"item_{response_id}"
         if item_id is None:
-            item_id = expected_item_id
-        elif item_id != expected_item_id:
+            item_id = response_item_id
+        elif item_id != response_item_id:
             return [error_event("playback_item_mismatch", "playback.ack item_id must match item_<response_id>.")]
         if not session.has_assistant_response_item(response_id, item_id):
             return [
@@ -78,6 +84,8 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             # answer after a later input. Empty text does not settle tool output.
             if not history_is_late:
                 session.register_history_item(item_id, {"role": "assistant", "content": ""})
+            if hard_truncate:
+                session.truncate_history_item(item_id, audio_end_ms=committed_cursor, playback=playback, hard=True)
         else:
             if (
                 item_id == f"item_{response_id}"
@@ -140,5 +148,5 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             }
         )
     ]
-    session.finalize_response_playback(response_id)
+    session.finalize_response_playback(response_id, require_audio_complete=require_audio_complete)
     return events

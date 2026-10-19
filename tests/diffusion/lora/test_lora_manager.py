@@ -1086,6 +1086,20 @@ def test_reactivating_same_adapter_resumes_without_rebinding(monkeypatch):
     assert manager._suspended_adapter_id is None
 
 
+def test_suspended_scope_restores_exact_scale_after_another_adapter(monkeypatch):
+    manager, layer = _suspend_harness(monkeypatch)
+    manager._registered_adapters[8] = manager._registered_adapters[7]
+    manager.set_active_adapter(_dummy_lora_request(7), lora_scale=0.123456)
+    original_b = layer.set_calls[-1][1].clone()
+    with manager.suspended():
+        manager.set_active_adapter(_dummy_lora_request(8), lora_scale=0.7)
+        with manager.suspended():
+            assert manager._active_adapter_id is None
+        assert manager._active_adapter_id == 8
+    assert manager._active_adapter_id == 7
+    torch.testing.assert_close(layer.set_calls[-1][1], original_b, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("second_scale", [0.5, 0.25])
 def test_scale_or_adapter_change_forces_rebind(monkeypatch, second_scale):
     """A different scale, or a different adapter, must take the full bind

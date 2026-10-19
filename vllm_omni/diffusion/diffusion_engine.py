@@ -687,13 +687,12 @@ class DiffusionEngine:
                 self._emit_finished_outputs(pending_finished, None)
 
             with self._cv:
-                while (
-                    (self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests())
-                    and self._rpc_queue.empty()
-                    and self.abort_queue.empty()
-                    and not self.stop_event.is_set()
-                ):
+                if self._rpc_queue.empty() and self.abort_queue.empty() and not self.stop_event.is_set():
                     now = time.monotonic()
+                    if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
+                        wait_timeout: float | None = 1.0
+                    else:
+                        wait_timeout = self.scheduler.get_execution_wait_timeout(now)
                     deadlines = [
                         state.next_ready_at - now
                         for state in (self._streaming_playback or {}).values()
@@ -704,13 +703,23 @@ class DiffusionEngine:
                         for state in (self._streaming_playback or {}).values()
                         if state.idle_since is not None
                     )
-                    self._cv.wait(timeout=min(1.0, *deadlines) if deadlines else 1.0)
-                    break  # Recheck idle expiry even when no client message arrives.
+                    if deadlines:
+                        wait_timeout = min(deadlines) if wait_timeout is None else min(wait_timeout, *deadlines)
+                    if wait_timeout != 0:
+                        self._cv.wait(timeout=wait_timeout)
+                        # Recheck idle expiry, interactions and aborts before scheduling.
+                        continue
 
                 if self.stop_event.is_set():
                     break
 
-                if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
+                if (
+                    self._scheduling_paused
+                    or self._playback_blocked()
+                    or not self.scheduler.has_requests()
+                    or not self._rpc_queue.empty()
+                    or not self.abort_queue.empty()
+                ):
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
@@ -1033,6 +1042,11 @@ class DiffusionEngine:
             if not fut.done():
                 fut.set_exception(exc)
         else:
+            if task.method == "submit_interaction":
+                request_id = task.args[0] if task.args else (task.kwargs or {})["request_id"]
+                with self._cv:
+                    self.scheduler.notify_interaction(request_id)
+                    self._cv.notify_all()
             if not fut.done():
                 fut.set_result(result)
 

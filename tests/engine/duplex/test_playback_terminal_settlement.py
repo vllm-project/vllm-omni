@@ -1,0 +1,192 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Stopped playback retires evidence; stored answers settle their tool owner."""
+
+from dataclasses import replace
+
+import pytest
+
+from tests.engine.duplex.test_engine_session import _session
+from tests.engine.duplex.test_playback_finalization import _CONTENT, _assert_released
+from tests.engine.duplex.test_session_runner import close_harness
+from tests.model_executor.models.qwen3_omni.test_duplex_plugin import open_qwen
+from vllm_omni.engine.duplex import commands
+from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("initial_text,terminal_text,unaligned", _CONTENT)
+@pytest.mark.parametrize("draining", [False, True])
+@pytest.mark.parametrize("truncate_before_end", [False, True])
+@pytest.mark.parametrize("cutoff", [0, 200, 400])
+def test_hard_truncate_retires_output_without_another_ack(
+    initial_text, terminal_text, unaligned, draining, truncate_before_end, cutoff
+):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response = session.begin_response()
+    session.append_assistant_text(initial_text)
+    session.mark_audio_sent(400, text_requires_complete_audio=unaligned)
+    if draining:
+        session.bind_draining_request("tts", response)
+        session.snapshot_active_response_for_drain()
+        next_response = session.begin_response()
+        session.mark_audio_sent(100)
+    ack = {"response_id": response, "played_ms": cutoff, "truncate": True}
+    if truncate_before_end:
+        assert apply_playback_ack(session, ack)[0].type == "playback.acknowledged"
+        assert response in session._playback.by_response
+    if draining:
+        session.append_draining_assistant_text(response, terminal_text)
+        session.pop_draining_request("tts")
+        session.release_finished_drain_response(response)
+    else:
+        session.append_assistant_text(terminal_text)
+        session.mark_audio_sent(400, audio_complete=True)
+        message = session.end_response()
+        session.register_history_item(f"item_{response}", message)
+        session.finalize_response_playback(response)
+    if not truncate_before_end:
+        assert apply_playback_ack(session, ack)[0].type == "playback.acknowledged"
+    expected = "" if unaligned and cutoff < 400 else (initial_text + terminal_text)[: 5 * cutoff // 400]
+    assert session.history == ({"role": "assistant", "content": expected},)
+    _assert_released(session, response)
+    if draining:
+        assert session.active_response_id == next_response
+        assert session.playback.sent_ms == 100
+    # The stop is permanent even if the browser sends a duplicate/stale full ACK.
+    apply_playback_ack(session, {"response_id": response, "played_ms": 400})
+    assert session.history == ({"role": "assistant", "content": expected},)
+    _assert_released(session, response)
+    # A stricter stop after full evidence was released cannot restore old text.
+    apply_playback_ack(session, {"response_id": response, "played_ms": 0, "truncate": True})
+    assert session.history == ({"role": "assistant", "content": ""},)
+    _assert_released(session, response)
+
+
+@pytest.mark.parametrize("command_type", [commands.CancelResponse, commands.ClearOutputAudio, commands.BargeIn])
+@pytest.mark.parametrize("ack_ms", [0, 200, 400])
+@pytest.mark.parametrize("new_input", [False, True])
+@pytest.mark.parametrize("unaligned", [False, True])
+@pytest.mark.asyncio
+async def test_cancel_settles_only_the_answer_actually_stored(command_type, ack_ms, new_input, unaligned):
+    h = await open_qwen()
+    try:
+        session = h.session
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        response = session.begin_response()
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        pair = {"response_id": response, "call_id": "call-a", "messages": []}
+        unrelated = {"response_id": "other-response", "call_id": "call-b", "messages": []}
+        session.replace_runtime_config(
+            {
+                **session.runtime_config,
+                "qwen_tool_turns_inflight": [pair],
+                "qwen_tool_turns": [unrelated],
+                "qwen_tool_response_id": response,
+            }
+        )
+        session.mark_audio_sent(400, text_requires_complete_audio=unaligned)
+        await h.run(commands.AckPlayback(played_ms=ack_ms, response_id=response))
+        session.append_assistant_text("hello")
+        user = session.commit_audio_input(transcript="next question") if new_input else None
+        events = await h.run(command_type())
+        assert not any(event.type == "error" for event in events)
+        expected = "" if unaligned else "hello"[: 5 * ack_ms // 400]
+        assistant = ({"role": "assistant", "content": expected},) if unaligned or ack_ms else ()
+        assert session.history == assistant + ((user.message,) if user else ())
+        assert session.runtime_config.get("qwen_tool_turns") == ([unrelated] if expected else [pair, unrelated])
+        assert not session.runtime_config.get("qwen_tool_turns_inflight")
+        if ack_ms == 400:
+            _assert_released(session, response)
+        else:
+            assert response in session._conversation.assistant_response_snapshots
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_truncate_item", [False, True])
+@pytest.mark.parametrize("calibration_enabled", [False, True])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_truncation_preserves_bounded_calibration_owner(use_truncate_item, calibration_enabled, cancelled):
+    from tests.engine.duplex.test_session_runner import append_audio, tts_output
+
+    async def calibrate(snapshot):
+        assert snapshot.played_ms == 200
+        return 2
+
+    h = await open_qwen(calibrate=calibrate if calibration_enabled else None)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(final=True, create_response=True))
+        session = h.session
+        request = h.port.submissions[-1].context.request_id
+        response = session.active_response_id
+        await h.deliver_and_settle(tts_output(request, samples=0, text="hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request, samples=9600, finished=not cancelled), stage_id=2)
+        if cancelled:
+            await h.run(commands.CancelResponse())
+        if use_truncate_item:
+            events = await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=200))
+        else:
+            await h.runner._run_internal_payload(
+                {
+                    "type": "playback.ack",
+                    "response_id": response,
+                    "played_ms": 200,
+                    "truncate": True,
+                }
+            )
+            events = await h.settle()
+        assert not any(event.type == "error" for event in events)
+        if calibration_enabled:
+            controller = h.runner.ctx.history_calibration
+            await controller.before_prompt()
+            assert session.history[-1]["content"] == "he"
+            assert response in session._conversation.assistant_response_snapshots
+            # Evidence belongs to the bounded calibration cache, not a future ACK.
+            controller.discard(response)
+        else:
+            assert session.history[-1]["content"] == ""
+        _assert_released(session, response)
+        before = session.history
+        await h.run(commands.AckPlayback(response_id=response, played_ms=400))
+        assert session.history == before
+        _assert_released(session, response)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("cutoff", [0, 200])
+def test_hard_stop_tightens_text_already_stored_during_drain(cutoff):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response = session.begin_response()
+    session.append_assistant_text("hello")
+    session.mark_audio_sent(400)
+    session.bind_draining_request("tts", response)
+    session.snapshot_active_response_for_drain()
+    session.begin_response()
+    apply_playback_ack(session, {"response_id": response, "played_ms": 400})
+    assert session.history == ({"role": "assistant", "content": "hello"},)
+    apply_playback_ack(session, {"response_id": response, "played_ms": cutoff, "truncate": True})
+    expected = "hello"[: 5 * cutoff // 400]
+    assert session.history == ({"role": "assistant", "content": expected},)
+    session.pop_draining_request("tts")
+    session.release_finished_drain_response(response)
+    assert session.history == ({"role": "assistant", "content": expected},)
+    _assert_released(session, response)
+
+
+def test_hard_stop_retires_registered_item_without_snapshot():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    session.register_history_item("item_old", {"role": "assistant", "content": "hello"})
+    session.mark_audio_sent(400, response_id="old")
+    apply_playback_ack(session, {"response_id": "old", "played_ms": 200, "truncate": True})
+    assert session.history == ({"role": "assistant", "content": "he"},)
+    _assert_released(session, "old")
+    apply_playback_ack(session, {"response_id": "old", "played_ms": 400})
+    assert session.history == ({"role": "assistant", "content": "he"},)
+    _assert_released(session, "old")

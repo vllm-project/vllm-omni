@@ -191,6 +191,11 @@ _DIFFUSION_MODELS = {
         "pipeline",
         "LingBotWorldCausalDMDPipeline",
     ),
+    "TaoMateH3Pipeline": (
+        "taomate_h3",
+        "pipeline",
+        "TaoMateH3Pipeline",
+    ),
     "ABotWorldCausalPipeline": (
         "abot_world",
         "pipeline_abot_world",
@@ -457,6 +462,7 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    "TaoMateH3Pipeline",
     "CausVidWanPipeline",
     "ABotWorldCausalPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
@@ -722,6 +728,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
+    "TaoMateH3Pipeline": "get_taomate_h3_post_process_func",
     "ABotWorldCausalPipeline": "get_abot_world_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",

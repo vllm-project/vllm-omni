@@ -296,6 +296,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
+        initialize_lora: Callable[[], None] | None = None,
     ) -> None:
         """
         Launch the diffusion pipeline, applying compilation, offloading, and caching.
@@ -360,6 +361,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+                if initialize_lora is not None and getattr(self.pipeline, "requires_early_lora_init", False) is True:
+                    initialize_lora()
         time_after_load = time.perf_counter()
 
         logger.info(

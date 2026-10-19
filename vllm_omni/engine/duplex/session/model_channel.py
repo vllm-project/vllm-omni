@@ -387,6 +387,12 @@ class ModelChannel:
         try:
             session.begin_lease_operation(fence, lease_operation_id)
             operation_started = True
+            if self._ctx.history_calibration is not None:
+                await self._ctx.history_calibration.before_prompt()
+                if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
+                    raise DuplexFenceMismatchError(session.fence, fence)
+            # Calibration can change history and response-owned runtime together.
+            # Freeze the request only after that wait and its close/epoch fence.
             reservation = session.prepare_append(fence)
             already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
             request_context = self._ctx.manager.ensure_stage_request(
@@ -1313,6 +1319,8 @@ class ModelChannel:
             audio_complete=model_result.get("audio_complete") is True,
             response_id=target_id,
         )
+        if self._ctx.history_calibration is not None and response_id is not None:
+            self._ctx.history_calibration.record(target_id or response_id, model_result)
         payload = {
             "type": "response.output_audio.delta",
             "session_id": session.session_id,
@@ -1381,7 +1389,9 @@ class ModelChannel:
                 await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
                 if drained_response_id is not None:
                     playback = session.playback_for_response(drained_response_id).as_dict()
-                    committed = session.release_finished_drain_response(drained_response_id)
+                    committed = session.release_finished_drain_response(
+                        drained_response_id, require_audio_complete=self._ctx.history_calibration is not None
+                    )
                     if committed:
                         settle_response_runtime(
                             self._ctx.plugin, session, committed=True, response_id=drained_response_id
@@ -1434,14 +1444,18 @@ class ModelChannel:
     def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> bool:
         """Store the final history before reconciling an ACK received earlier."""
         committed = committed_message is not None
-        # Inspect the cursor before finalization; playback_for_response creates
-        # a cursor when absent and must not resurrect one we just released.
+        # Inspect the cursor before finalization releases response-owned state.
         awaiting_playback = _response_awaits_playback_ack(
             session, response_id, should_commit=should_commit, committed_message=committed_message
         )
         if should_commit:
             session.register_history_item(f"item_{response_id}", committed_message)
-            committed = session.finalize_response_playback(response_id) or committed
+            committed = (
+                session.finalize_response_playback(
+                    response_id, require_audio_complete=self._ctx.history_calibration is not None
+                )
+                or committed
+            )
         settle_response_runtime(
             self._ctx.plugin,
             session,
