@@ -31,6 +31,10 @@ EXCLUDED_MODELS = [
     # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
     # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
     "QwenImage21Pipeline",
+    # Custom DiT/scheduler with a Qwen3.5 encoder; no tiny builder yet.
+    # Covered by tests/diffusion/test_mossimage_*.py and
+    # test_mossimage_registry.py.
+    "MOSSImagePipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
@@ -99,7 +103,6 @@ EXCLUDED_MODELS = [
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",
-    "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
     # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
@@ -108,7 +111,6 @@ EXCLUDED_MODELS = [
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
-    "Pi05Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and

@@ -81,7 +81,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
-from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolve_diffusion_moe_lora_token_capacity
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -645,6 +645,13 @@ class DiffusionWorker:
                 raise ValueError("Dynamic PEFT LoRA requires a single adapter path and scale")
             max_cpu_loras = self.od_config.max_cpu_loras
             assert max_cpu_loras is not None, "max_cpu_loras must be resolved before worker initialization"
+            max_num_batched_tokens = None
+            if getattr(self.od_config, "is_moe", False) is True:
+                assert self.vllm_config is not None
+                max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                    self.od_config,
+                    self.vllm_config,
+                )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=pipeline,
                 device=self.device,
@@ -652,6 +659,7 @@ class DiffusionWorker:
                 max_cached_adapters=max_cpu_loras,
                 lora_path=lora_path,
                 lora_scale=lora_scale,
+                max_num_batched_tokens=max_num_batched_tokens,
             )
         elif lora_backend == LoRABackend.DISTILL:
             if hasattr(pipeline, "load_lora_weights"):
