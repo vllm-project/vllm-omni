@@ -18,6 +18,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minimax_h3_partition
 
+from .lightvae import resolve_h3_lightvae_decoder_path
 from .pipeline_minimax_h3 import (
     MiniMaxH3Pipeline,
     _prepare_minimax_h3_video_output,
@@ -82,6 +83,7 @@ class MiniMaxH3DecoderPipeline(
             device=self.device,
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
+            lightvae_decoder_path=resolve_h3_lightvae_decoder_path(od_config.additional_config),
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             str(model_path / "audio_vae"),
