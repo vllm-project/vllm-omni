@@ -14,6 +14,7 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -256,9 +257,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 profile_prefix = f"stage_{self.stage_id}_rep_{self.replica_id}_diffusion_{int(time.time())}"
             return await loop.run_in_executor(
                 self._executor,
-                self._engine.profile,
-                is_start,
-                profile_prefix,
+                partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})),
             )
 
         kwargs = kwargs or {}

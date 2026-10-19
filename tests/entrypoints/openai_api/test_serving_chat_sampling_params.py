@@ -274,7 +274,9 @@ def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_cl
     ]
     mock_engine_client.output_modalities = ["image"]
     mock_engine_client.errored = False
-    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object())
+    # Upstream's OpenAIServingChat.__init__ reads renderer.tokenizer when
+    # composing the tool/reasoning parser; None is its skip-validation value.
+    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object(), tokenizer=None)
 
     captured: dict[str, object] = {}
 
@@ -342,7 +344,9 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engi
     ]
     mock_engine_client.output_modalities = ["text", "image"]
     mock_engine_client.errored = False
-    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object())
+    # Upstream's OpenAIServingChat.__init__ reads renderer.tokenizer when
+    # composing the tool/reasoning parser; None is its skip-validation value.
+    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object(), tokenizer=None)
     captured: dict[str, object] = {}
 
     async def results():
