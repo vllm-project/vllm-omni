@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request-local producer/consumer transport for native Ming audio decoding."""
 
+from collections import deque
 from queue import Empty, Full, Queue
 from threading import Event, Thread
 from time import monotonic
@@ -61,9 +62,13 @@ class MingStreamingJob:
         self.thread = Thread(target=run, name="ming-latent-producer", daemon=True)
         self.thread.start()
 
-    def _publish(self, latent, last):
+    def _publish(self, latent, last, ready=None):
         # As in ming_flash.llm_job, publish only completed latent tensors.
-        torch.cuda.current_stream().synchronize()
+        # A producer that already queued later work passes the latent's event.
+        if ready is None:
+            torch.cuda.current_stream().synchronize()
+        else:
+            ready.synchronize()
         while not self.cancelled.is_set():
             try:
                 self.queue.put((latent, last), timeout=0.01)
@@ -141,5 +146,94 @@ class MingStreamingJob:
         self.thread.join()
         while not self.queue.empty():
             self.queue.get_nowait()
+        self.past_key_values = None
+        self.stream_state = (None, None, None)
+
+
+class MingBatchedStreamJob:
+    """Consumer half of a request decoded by the shared talker batch engine.
+
+    The engine thread publishes completed latents; ``next_audio`` runs on the
+    model runner thread and VAE-decodes everything that has arrived. Waiting
+    happens once per runner step for all requests (see ``urgent``), not per
+    request. A request that is not streamed collects every latent and is
+    decoded by ``decode_full`` when its final latent arrives.
+    """
+
+    def __init__(self, vae, device, *, low_latency_streaming=False, decode_full=None):
+        self.vae = vae
+        self.device = device
+        self.low_latency_streaming = low_latency_streaming
+        self.decode_full = decode_full
+        self.request = None
+        self.latents = deque()
+        self.collected = []
+        self.error = None
+        self.final_published = False
+        self.past_key_values = None
+        self.stream_state = (None, None, None)
+        self.finished = False
+        self._has_audio_output = False
+
+    def publish(self, latent, last):
+        # Called from the engine thread after the producing step completed.
+        self.latents.append((latent, last))
+        if last:
+            self.final_published = True
+
+    def fail(self, exc):
+        self.error = exc
+        self.final_published = True
+
+    def urgent(self):
+        """Whether a waiting runner step should stop coalescing for this job."""
+        if self.error is not None:
+            return True
+        if not self.latents:
+            return False
+        if self.decode_full is not None:
+            return self.final_published
+        # First audio as early as possible, the final flush immediately.
+        return not self._has_audio_output or self.final_published
+
+    def next_audio(self):
+        if self.error is not None:
+            raise self.error
+        parts = []
+        last = False
+        while self.latents and not last:
+            latent, last = self.latents.popleft()
+            if latent.is_cuda:
+                # Produced on the engine stream; keep it alive for this stream's VAE.
+                latent.record_stream(torch.cuda.current_stream(latent.device))
+            parts.append(latent)
+        # A request with no speakable segment is final without any latent.
+        last = last or (self.final_published and not parts and not self.latents and not self.finished)
+        if self.decode_full is not None:
+            self.collected.extend(parts)
+            if not last:
+                return torch.empty(1, 1, 0, device=self.device), False
+            self.finished = True
+            return self.decode_full(self.collected), True
+        if not parts:
+            self.finished = last
+            return torch.empty(1, 1, 0, device=self.device), last
+        audio, self.stream_state, self.past_key_values = self.vae.decode(
+            torch.cat(parts, dim=1),
+            past_key_values=self.past_key_values,
+            stream_state=self.stream_state,
+            use_cache=True,
+            last_chunk=last,
+        )
+        self.finished = last
+        if audio.numel():
+            self._has_audio_output = True
+        return audio, last
+
+    def close(self, engine=None):
+        if engine is not None and self.request is not None and not self.finished:
+            engine.cancel(self.request)
+        self.latents.clear()
+        self.collected = []
         self.past_key_values = None
         self.stream_state = (None, None, None)

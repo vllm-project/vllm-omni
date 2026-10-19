@@ -122,6 +122,7 @@ def test_markup_control_is_independent_and_preserves_legacy_defaults():
 
 @pytest.mark.parametrize("normalize", [False, True])
 def test_native_fragments_are_normalized_once_without_receiver_resegmentation(mocker, normalize):
+    from functools import partial
     from types import SimpleNamespace
 
     import torch
@@ -129,6 +130,7 @@ def test_native_fragments_are_normalized_once_without_receiver_resegmentation(mo
     from vllm_omni.model_executor.models.ming_flash_omni import ming_flash_omni_talker as talker
 
     model = mocker.Mock()
+    model._tts_segments = partial(talker.MingFlashOmniTalkerForConditionalGeneration._tts_segments, model)
     model._project_spk_emb.return_value = None
     model.audio_generator.generate_latents.return_value = []
     model.audio_generator.duration_capped_steps.return_value = 4

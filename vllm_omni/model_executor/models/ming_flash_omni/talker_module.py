@@ -203,6 +203,7 @@ class CFMGraphExecutor:
         self.inputs_embeds_placeholder = None
         self.stop_out_placeholder = None
         self.graph = None
+        self._last_sde_args: tuple[float, float, float] | None = None
 
     def execute(
         self,
@@ -216,7 +217,6 @@ class CFMGraphExecutor:
         randn_tensor = torch.randn(
             (bat_size, self.config.patch_size, z_dim), device=input_tensor.device, dtype=input_tensor.dtype
         )
-        t = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
         sde_rnd = torch.randn(
             (self.config.steps, *randn_tensor.shape), device=input_tensor.device, dtype=input_tensor.dtype
         )
@@ -227,10 +227,14 @@ class CFMGraphExecutor:
         self.last_hidden_state_placeholder.copy_(input_tensor)
         self.his_lat_placeholder.copy_(his_lat)
         self.randn_like_placeholder.copy_(randn_tensor)
-        self.t_placeholder.copy_(t)
-        self.sde_args_placeholder[0] = cfg_strength
-        self.sde_args_placeholder[1] = sigma
-        self.sde_args_placeholder[2] = temperature
+        # t_placeholder holds the constant EPSS schedule built at capture;
+        # rebuilding it from a Python list each step is a blocking H2D copy.
+        sde_args = (cfg_strength, sigma, temperature)
+        if sde_args != self._last_sde_args:
+            self.sde_args_placeholder[0] = cfg_strength
+            self.sde_args_placeholder[1] = sigma
+            self.sde_args_placeholder[2] = temperature
+            self._last_sde_args = sde_args
         self.sde_rnd_placeholder.copy_(sde_rnd)
 
         self.graph.replay()
@@ -708,22 +712,50 @@ class MingAudioGenerator:
             if prefill_len >= max_cache_len:
                 raise ValueError(f"TTS prompt has {prefill_len} positions, exceeding cache limit {max_cache_len}")
             all_latents: list[torch.Tensor] = []
+            num_steps = min(max_steps, max_cache_len - prefill_len)
+            # On CUDA, launch the next LLM step before reading each stop probability.
+            overlap = device.type == "cuda"
+            stop_host = torch.empty((1,), dtype=torch.float32, pin_memory=True) if overlap else None
+            last_hs = None
 
-            for step in range(min(max_steps, max_cache_len - prefill_len)):
-                last_hs = self.llm_step(
-                    inputs_embeds,
-                    step=step,
-                    past_key_values=past_key_values,
-                    use_static_cache=use_static_cache,
-                    position=prefill_len + step - 1,
-                )
+            for step in range(num_steps):
+                if last_hs is None:
+                    last_hs = self.llm_step(
+                        inputs_embeds,
+                        step=step,
+                        past_key_values=past_key_values,
+                        use_static_cache=use_static_cache,
+                        position=prefill_len + step - 1,
+                    )
+                step_hs = last_hs
                 gen_lat, inputs_embeds, stop_out = self.cfm_sample_step(
-                    last_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
+                    step_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
                 )
                 his_lat = self._update_his_lat(his_lat, gen_lat)
                 all_latents.append(gen_lat)
 
-                stop_prob = stop_out.cpu()[0, 1].item()
+                latent_ready = None
+                last_hs = None
+                if overlap:
+                    # Queue the next LLM step before reading the stop
+                    # probability, so its launch overlaps the flow head on the
+                    # GPU. The step draws no random numbers; if this latent
+                    # stops the segment, its output is discarded.
+                    stop_host.copy_(stop_out[0, 1:2].float(), non_blocking=True)
+                    latent_ready = torch.cuda.Event()
+                    latent_ready.record()
+                    if step + 1 < num_steps:
+                        last_hs = self.llm_step(
+                            inputs_embeds,
+                            step=step + 1,
+                            past_key_values=past_key_values,
+                            use_static_cache=use_static_cache,
+                            position=prefill_len + step,
+                        )
+                    latent_ready.synchronize()
+                    stop_prob = float(stop_host[0])
+                else:
+                    stop_prob = stop_out.cpu()[0, 1].item()
 
                 if logger.isEnabledFor(logging.DEBUG):
                     if step % 50 == 0 or step < 5:
@@ -731,15 +763,18 @@ class MingAudioGenerator:
                             "step=%d stop_prob=%.4f hs_norm=%.4f lat_norm=%.4f emb_norm=%.4f",
                             step,
                             stop_prob,
-                            last_hs.float().norm().item(),
+                            step_hs.float().norm().item(),
                             gen_lat.float().norm().item(),
                             inputs_embeds.float().norm().item(),
                         )
 
                 stopped = step > min_new_token and stop_prob > stop_threshold
-                last = stopped or step + 1 == min(max_steps, max_cache_len - prefill_len)
+                last = stopped or step + 1 == num_steps
                 if on_latent is not None:
-                    on_latent(gen_lat, last)
+                    if latent_ready is None:
+                        on_latent(gen_lat, last)
+                    else:
+                        on_latent(gen_lat, last, latent_ready)
                 if stopped:
                     logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
                     break
@@ -824,7 +859,9 @@ class MingAudioGenerator:
                 use_cache=True,
             )
         else:
-            past_seen_tokens = int(past_key_values.get_seq_length())
+            # ``position`` is the cached length; reading it back from the
+            # cache would synchronize the host every step.
+            past_seen_tokens = position if position is not None else int(past_key_values.get_seq_length())
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],

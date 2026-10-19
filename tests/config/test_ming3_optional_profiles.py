@@ -92,3 +92,15 @@ def test_ming3_history_cache_profile_reaches_legacy_and_structured_builders(grap
         assert overrides["normalize_text"] is True
         assert overrides["tn_mode"] == "upstream"
         assert legacy[1].yaml_engine_args["hf_overrides"] == overrides
+
+
+def test_batched_tts_profile_only_widens_the_talker_batch():
+    base = resolve_deploy_yaml(_DEPLOY / "ming3_audio_tts.yaml")
+    batched = resolve_deploy_yaml(_DEPLOY / "ming3_audio_tts_batched.yaml")
+    stage = batched["stages"][0]
+    assert stage["max_num_seqs"] == 64
+    assert stage["enforce_eager"] is False
+    assert stage["engine_extras"]["hf_overrides"]["low_latency_streaming"] is True
+    for key in ("devices", "gpu_memory_utilization", "max_num_batched_tokens", "default_sampling_params"):
+        assert stage[key] == base["stages"][0][key]
+    assert batched["pipeline"] == base["pipeline"]

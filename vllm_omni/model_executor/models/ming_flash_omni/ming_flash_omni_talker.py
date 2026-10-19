@@ -30,11 +30,13 @@ from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
+from vllm_omni.model_executor.models.model_local_kv import ModelLocalKVScope, RowDriver, spec_from_hf_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.ming_talker import MingFlashOmniTalkerConfig
 
 from .native_text_frontend import normalize_native_fragment
-from .streaming import MingStreamingJob
+from .streaming import MingBatchedStreamJob, MingStreamingJob
+from .talker_batch import BatchedTalkerRequest, MingTalkerBatchEngine, TalkerSegment
 from .talker_module import CFM, DiT, MingAudioGenerator, build_tts_input
 from .text_processing import segment_and_normalize
 from .tts_request import GenerationParams as _GenerationParams
@@ -123,8 +125,18 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
         # AudioVAE
         self.audio_vae, self._vae_weight_source = self._init_audio_vae(config, self.talker_dir, model_path)
+        upsampling = getattr(getattr(self.audio_vae, "decoder", None), "upsampling", None)
+        if upsampling is not None and getattr(config, "low_latency_streaming", False):
+            # Low-latency streaming also emits a decoded chunk without waiting
+            # for the next one: only its last latent is held as lookahead.
+            upsampling.frame_holdback = True
 
         self._use_cuda_graphs = not vllm_config.model_config.enforce_eager
+        # With more than one scheduled sequence, every engine request joins
+        # one shared AR batch instead of the one-request streaming job.
+        max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1) or 1)
+        self._batch_rows = max_num_seqs if max_num_seqs > 1 else 0
+        self._batch_engine: MingTalkerBatchEngine | None = None
 
         self.audio_generator = MingAudioGenerator(
             config=self.config,
@@ -162,6 +174,20 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         generator = getattr(self, "audio_generator", None)
         if generator is None:
             return []
+        if getattr(self, "_batch_rows", 0):
+            return [
+                spec_from_hf_config(
+                    self.llm_config,
+                    name="talker_batched_kv",
+                    dtype=self.dtype,
+                    physical_capacity_positions=generator._max_cache_len,
+                    capacity_source=f"talker config max_cache_len={generator._max_cache_len}",
+                    scope=ModelLocalKVScope.MODEL,
+                    rows=RowDriver.MAX_NUM_SEQS,
+                    rows_reason="one KV row per scheduled sequence in the shared talker batch",
+                    allocation_note="allocated with the batch engine on the first request",
+                )
+            ]
         return generator.model_local_kv_specs()
 
     @property
@@ -323,6 +349,10 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         Engine requests carry request_ids and keep background generation alive
         across steps. Direct calls and profiling run the full loop inline.
         """
+        if request_ids and self._batch_rows:
+            return self._batched_forward(
+                request_ids, runtime_additional_information, input_ids, inputs_embeds, kwargs.get("seq_token_counts")
+            )
         additional_info = self._extract_additional_info(runtime_additional_information)
         params = self._resolve_generation_params(additional_info)
         if request_ids and params.stream_decode and not params.trim_trailing_silence:
@@ -354,8 +384,132 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
     def on_requests_finished(self, request_ids) -> None:
         for request_id in request_ids:
             job = self._stream_jobs.pop(request_id, None)
-            if job is not None:
+            if isinstance(job, MingBatchedStreamJob):
+                job.close(self._batch_engine)
+            elif job is not None:
                 job.close()
+
+    def _batched_forward(self, request_ids, runtime_infos, input_ids, inputs_embeds, token_counts) -> OmniOutput:
+        """Advance every scheduled request through the shared AR batch.
+
+        New requests are resolved here and handed to the engine thread; the
+        step then waits once for the batch (as ``MingStreamingJob`` does per
+        request) and VAE-decodes each request's newly arrived latents.
+        """
+        if self.audio_vae is None:
+            raise RuntimeError("Batched Talker requires AudioVAE")
+        engine = self._ensure_batch_engine()
+        offsets = [0]
+        for count in token_counts or []:
+            offsets.append(offsets[-1] + int(count))
+        jobs: list[MingBatchedStreamJob] = []
+        for index, request_id in enumerate(request_ids):
+            job = self._stream_jobs.get(request_id)
+            if job is None:
+                info = self._extract_additional_info([runtime_infos[index]] if runtime_infos else None)
+                span = slice(offsets[index], offsets[index + 1]) if len(offsets) > index + 1 else slice(None)
+                job = self._start_batched_job(
+                    info,
+                    input_ids[span] if input_ids is not None else None,
+                    inputs_embeds[span] if inputs_embeds is not None else None,
+                )
+                self._stream_jobs[request_id] = job
+            jobs.append(job)
+
+        poll_seconds = 0.1
+        if self.config.low_latency_streaming:
+            engine.wait_for_output(lambda: any(job.urgent() for job in jobs), poll_seconds)
+        else:
+            # Legacy collection waits one polling interval, then drains.
+            engine.wait_for_output(
+                lambda: all(job.final_published for job in jobs) or any(job.error is not None for job in jobs),
+                poll_seconds,
+            )
+        if engine.error is not None:
+            raise RuntimeError("Ming talker batch engine failed") from engine.error
+
+        audios = []
+        finished = []
+        for request_id, job in zip(request_ids, jobs, strict=True):
+            try:
+                audio, last = job.next_audio()
+            except Exception:
+                # One bad request must not fail the whole batched step.
+                logger.exception("Ming talker request %s failed", request_id)
+                audio, last = torch.empty(1, 1, 0, device=self.device), True
+            audios.append(audio.detach().float())
+            if last:
+                finished.append(request_id)
+        self.on_requests_finished(finished)
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={"audio": audios, "sr": torch.tensor(self.audio_vae.config.sample_rate)},
+        )
+
+    def _ensure_batch_engine(self) -> MingTalkerBatchEngine:
+        if self._batch_engine is None:
+            engine = MingTalkerBatchEngine(
+                self.audio_generator,
+                max_rows=self._batch_rows,
+                device=self.device,
+                use_cuda_graphs=self._use_cuda_graphs,
+            )
+            engine.start()
+            self._batch_engine = engine
+        return self._batch_engine
+
+    def _start_batched_job(self, info, input_ids, inputs_embeds) -> MingBatchedStreamJob:
+        params = self._resolve_generation_params(info)
+        streaming = params.stream_decode and not params.trim_trailing_silence
+
+        def decode_full(latents):
+            output = self._decode_to_output(
+                latents, stream_decode=params.stream_decode, trim_silence=params.trim_trailing_silence
+            )
+            audio = output.multimodal_outputs.get("audio")
+            return audio if audio is not None else torch.empty(1, 1, 0, device=self.device)
+
+        job = MingBatchedStreamJob(
+            self.audio_vae,
+            self.device,
+            low_latency_streaming=self.config.low_latency_streaming,
+            decode_full=None if streaming else decode_full,
+        )
+        if inputs_embeds is not None:
+            # Runner inputs are reusable buffers; the engine must own them.
+            inputs_embeds = inputs_embeds.clone()
+            if inputs_embeds.ndim == 2:
+                inputs_embeds = inputs_embeds.unsqueeze(0)
+        try:
+            voice = self._resolve_voice(info)
+            segments = self._tts_segments(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                text=info.get("text", ""),
+                params=params,
+                voice=voice,
+                native_fragments=info.get("ming_text_fragments"),
+            )
+        except Exception as exc:
+            job.fail(exc)
+            return job
+        if not segments:
+            job.final_published = True
+            return job
+        job.request = BatchedTalkerRequest(
+            segments,
+            publish=job.publish,
+            fail=job.fail,
+            prompt_wav_lat=voice.prompt_wav_lat,
+            min_steps=params.min_steps,
+            stop_threshold=params.stop_threshold,
+            cfg=params.cfg,
+            sigma=params.sigma,
+            temperature=params.temperature,
+            seed=params.seed,
+        )
+        self._batch_engine.submit(job.request)
+        return job
 
     def _stream_forward(self, request_id, input_ids, inputs_embeds, info, params) -> OmniOutput:
         job = self._stream_jobs.get(request_id)
@@ -539,7 +693,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             raise ValueError(f"Raw speaker embeddings must have {self.spk_head.in_features} features")
         return [self.spk_head(t.to(device=self.device, dtype=self.dtype)) for t in tensors]
 
-    def _generate_latents(
+    def _tts_segments(
         self,
         *,
         input_ids: torch.Tensor,
@@ -547,25 +701,12 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         text: str,
         params: _GenerationParams,
         voice: _VoiceContext,
-        on_latent=None,
         native_fragments: list[str] | None = None,
-    ) -> list[torch.Tensor]:
-        generator = self.audio_generator
-
+    ) -> list[TalkerSegment]:
+        """Build the prompt embeddings and step budget of each AR pass."""
         if inputs_embeds is not None:
             # Caller pre-built embeddings — run a single AR pass.
-            return generator.generate_latents(
-                inputs_embeds=inputs_embeds,
-                prompt_wav_lat=voice.prompt_wav_lat,
-                max_steps=params.max_steps,
-                min_new_token=params.min_steps,
-                stop_threshold=params.stop_threshold,
-                on_latent=on_latent,
-                cfg=params.cfg,
-                sigma=params.sigma,
-                temperature=params.temperature,
-                use_static_cache=params.use_static_cache,
-            )
+            return [TalkerSegment(inputs_embeds, params.max_steps)]
 
         spk_emb = self._project_spk_emb(voice.spk_emb, voice.already_projected, params.use_zero_spk_emb)
         if native_fragments is not None:
@@ -599,21 +740,10 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         if not text_segments:
             # vLLM passes 1D input_ids; Qwen2Model expects (batch, seq).
             inputs_embeds = self.model.get_input_embeddings()(input_ids.to(self.device)).unsqueeze(0)
-            return generator.generate_latents(
-                inputs_embeds=inputs_embeds,
-                prompt_wav_lat=voice.prompt_wav_lat,
-                max_steps=params.max_steps,
-                min_new_token=params.min_steps,
-                stop_threshold=params.stop_threshold,
-                on_latent=on_latent,
-                cfg=params.cfg,
-                sigma=params.sigma,
-                temperature=params.temperature,
-                use_static_cache=params.use_static_cache,
-            )
+            return [TalkerSegment(inputs_embeds, params.max_steps)]
 
-        all_latents: list[torch.Tensor] = []
-        for segment_index, segment in enumerate(text_segments):
+        segments = []
+        for segment in text_segments:
             seg_embeds, _ = build_tts_input(
                 tokenizer=self.tokenizer,
                 embed_tokens=self.model.get_input_embeddings(),
@@ -626,19 +756,47 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 prompt_text=voice.prompt_text,
                 prompt_wav_emb=voice.prompt_wav_emb,
             )
-            effective_max_steps = (
-                generator.duration_capped_steps(len(segment), params.max_steps)
+            max_steps = (
+                self.audio_generator.duration_capped_steps(len(segment), params.max_steps)
                 if params.duration_limit
                 else params.max_steps
             )
+            segments.append(TalkerSegment(seg_embeds, max_steps))
+        return segments
+
+    def _generate_latents(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        text: str,
+        params: _GenerationParams,
+        voice: _VoiceContext,
+        on_latent=None,
+        native_fragments: list[str] | None = None,
+    ) -> list[torch.Tensor]:
+        segments = self._tts_segments(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            text=text,
+            params=params,
+            voice=voice,
+            native_fragments=native_fragments,
+        )
+        all_latents: list[torch.Tensor] = []
+        for segment_index, segment in enumerate(segments):
             all_latents.extend(
-                generator.generate_latents(
-                    inputs_embeds=seg_embeds,
+                self.audio_generator.generate_latents(
+                    inputs_embeds=segment.embeds,
                     prompt_wav_lat=voice.prompt_wav_lat,
-                    max_steps=effective_max_steps,
+                    max_steps=segment.max_steps,
                     min_new_token=params.min_steps,
                     stop_threshold=params.stop_threshold,
-                    on_latent=(lambda latent, last: on_latent(latent, last and segment_index == len(text_segments) - 1))
+                    on_latent=(
+                        lambda latent, last, *ready: on_latent(
+                            latent, last and segment_index == len(segments) - 1, *ready
+                        )
+                    )
                     if on_latent is not None
                     else None,
                     cfg=params.cfg,

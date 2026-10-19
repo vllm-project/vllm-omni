@@ -339,6 +339,16 @@ curl http://localhost:8091/v1/audio/speech \
     --output speech.wav
 ```
 
+For concurrent clients, `ming3_audio_tts_batched.yaml` serves up to 64
+requests in one shared Talker batch: each step advances every active request by
+one latent, with the Qwen2 decode, CFM, aggregator and stop head captured as one
+CUDA graph per batch size. AudioVAE decoding stays per request. Batched decoding
+uses FlashAttention over a per-request KV row, so latents differ from the
+single-request path at bf16 rounding level, and seeded results depend on which
+requests share a step. `max_num_seqs: 1` keeps the single-request path. In the
+speech-output pipeline the same applies to the Talker stage: set stage 1
+`max_num_seqs` above one to batch concurrent replies.
+
 For voice cloning, pass `ref_audio` instead of `voice`, with optional `ref_text`.
 A registered `voice` name selects its stored reference audio and transcript.
 An unregistered string is interpreted as an IP caption by this standalone endpoint.

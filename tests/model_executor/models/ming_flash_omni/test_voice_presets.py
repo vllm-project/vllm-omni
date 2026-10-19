@@ -62,3 +62,37 @@ def test_weight_loading_registers_only_legacy_voice_presets(strict: bool, mocker
         talker.voice_presets.load_presets_from_manifest.assert_called_once_with(
             device=talker.device, dtype=talker.dtype
         )
+
+
+def test_inline_reference_audio_reuses_features_by_content(tmp_path: Path, mocker: MockerFixture) -> None:
+    registry = VoicePresetRegistry(
+        talker_dir=str(tmp_path),
+        model_path=str(tmp_path),
+        download_dir=None,
+        audio_vae=None,
+        aggregator=mocker.Mock(),
+        spk_head=torch.nn.Linear(2, 4),
+        patch_size=1,
+    )
+    extractor = mocker.Mock(return_value=torch.ones(1, 2))
+    registry.__dict__["_spkemb_extractor"] = extractor
+    samples = [0.1 * index for index in range(1, 1601)]
+
+    def resolve(audio):
+        return registry.resolve_reference(
+            None,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            need_speaker=True,
+            need_latents=False,
+            reference_audio=[{"samples": audio, "sample_rate": 16000}],
+        )
+
+    first = resolve(samples)
+    # Each streamed text segment resends the same voice samples.
+    assert resolve(list(samples)) is first
+    assert extractor.call_count == 1
+
+    changed = resolve([*samples[:-1], 0.0])
+    assert changed is not first
+    assert extractor.call_count == 2

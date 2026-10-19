@@ -154,11 +154,11 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "audex_tts": AUDEX_TTS_PIPELINE,
     "auk": AUK_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
-    "bailing_moe_v3_audio": MING3_AUDIO_FLASH_PIPELINE,
-    "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
+    "bailing_moe_v3_audio": MING3_AUDIO_FLASH_PIPELINE,
+    "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
     "causvid_wan": CAUSVID_WAN_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
