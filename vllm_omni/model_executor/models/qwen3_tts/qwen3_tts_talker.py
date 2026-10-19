@@ -245,6 +245,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_decode = talker_stream_decode_enabled(vllm_config)
         predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
         extra = predictor._stage_connector_extra_config(vllm_config)
+        if predictor._parse_bool_config(extra.get("code_predictor_frame_graph")):
+            # The 15 codebook steps replay their own NPU graph. An outer MTP
+            # graph would record the eager fallback and never enter that replay.
+            self.talker_mtp_graph_safe = False
         self.stream_first_audio = self.stream_decode and predictor._parse_bool_config(
             extra.get("talker_stream_first_audio")
         )
