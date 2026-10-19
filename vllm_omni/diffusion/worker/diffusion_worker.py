@@ -81,7 +81,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
-from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolve_diffusion_moe_lora_token_capacity
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -645,6 +645,13 @@ class DiffusionWorker:
                 raise ValueError("Dynamic PEFT LoRA requires a single adapter path and scale")
             max_cpu_loras = self.od_config.max_cpu_loras
             assert max_cpu_loras is not None, "max_cpu_loras must be resolved before worker initialization"
+            max_num_batched_tokens = None
+            if getattr(self.od_config, "is_moe", False) is True:
+                assert self.vllm_config is not None
+                max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                    self.od_config,
+                    self.vllm_config,
+                )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=pipeline,
                 device=self.device,
@@ -652,6 +659,7 @@ class DiffusionWorker:
                 max_cached_adapters=max_cpu_loras,
                 lora_path=lora_path,
                 lora_scale=lora_scale,
+                max_num_batched_tokens=max_num_batched_tokens,
             )
         elif lora_backend == LoRABackend.DISTILL:
             if hasattr(pipeline, "load_lora_weights"):
@@ -665,12 +673,21 @@ class DiffusionWorker:
         else:
             raise ValueError(f"Unknown LoRA backend: {lora_backend}. Available choices: {LoRABackend.__members__}")
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
         """Start or stop profiling for this GPU worker.
 
         Args:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
+            delay_iterations: Per-session worker steps before profiling starts.
+            max_iterations: Per-session limit on profiled worker steps.
         """
         profiler = self._get_profiler()
         if profiler is None:
@@ -682,7 +699,12 @@ class DiffusionWorker:
 
                 filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
                 profiler.set_trace_filename(filename)
-            profiler.start()
+            kwargs: dict[str, int] = {}
+            if delay_iterations is not None:
+                kwargs["delay_iterations"] = delay_iterations
+            if max_iterations is not None:
+                kwargs["max_iterations"] = max_iterations
+            profiler.start(**kwargs)
         else:
             profiler.stop()
 

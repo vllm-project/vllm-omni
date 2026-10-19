@@ -779,7 +779,10 @@ class StageRuntime:
         if kv_config.kv_connector == "MooncakeConnector" and kv_config.kv_role == "kv_producer":
             extra = kv_config.kv_connector_extra_config
             port = int(extra.get("bootstrap_port", 8998)) + replica_metadata.replica_id
-            extra["bootstrap_addr"] = f"http://{kv_config.kv_ip}:{port}"
+            # Upstream removed KVTransferConfig.kv_ip (f700178f90); fall back
+            # to its old default like omni_engine_base/pd_utils already do.
+            kv_ip = getattr(kv_config, "kv_ip", None) or "127.0.0.1"
+            extra["bootstrap_addr"] = f"http://{kv_ip}:{port}"
             if isinstance(replica_cfg, BaseVllmOmniStageConfig):
                 runtime_cfg: Any = replica_cfg.runtime_config
                 runtime_cfg.env = {

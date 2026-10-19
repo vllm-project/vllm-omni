@@ -11,7 +11,6 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import math
 import os
@@ -1272,39 +1271,40 @@ def _wait_for_multi_api_server_completion(
                 )
 
 
-def _start_api_server_process_manager(
-    *,
-    cleanup_timeout: float,
-    **manager_kwargs: object,
-) -> APIServerProcessManager:
-    """Construct vLLM's manager with rollback for a partial ``__init__``.
+class _EngineAddressListener:
+    """Present an engine-bound ZMQ address as vLLM's ``ZmqListener`` interface.
 
-    ``APIServerProcessManager`` starts workers one by one in ``__init__`` and
-    installs its finalizer only after every ``Process.start`` succeeds. Keep a
-    reference to the partially initialized object so workers started before a
-    later failure are still terminated.
+    Omni stage engines bind their own ZMQ sockets (stable IPC paths), so the
+    API-server manager receives the already-bound address instead of a
+    frontend-owned listener socket; workers connect by address exactly as
+    before upstream f226af0e11 switched ``APIServerProcessManager`` to
+    inherited listeners.
     """
-    from vllm.v1.utils import APIServerProcessManager, shutdown
 
-    manager = APIServerProcessManager.__new__(APIServerProcessManager)
-    try:
-        APIServerProcessManager.__init__(manager, **manager_kwargs)
-    except BaseException:
-        try:
-            for pipe in getattr(manager, "_address_pipes", ()):
-                with contextlib.suppress(Exception):
-                    pipe.close()
-            # A Process whose start() raised is still present in the upstream
-            # manager's list, but calling is_alive() on it raises because it
-            # has no Popen object. Only hand successfully started children to
-            # vLLM's shutdown helper.
-            started_processes = [process for process in getattr(manager, "processes", ()) if process.pid is not None]
-            if started_processes:
-                shutdown(started_processes, timeout=cleanup_timeout)
-        except Exception:
-            logger.exception("Failed to clean up partially started API server processes")
-        raise
-    return manager
+    def __init__(self, address: str) -> None:
+        self.address = address
+
+    @property
+    def socket(self) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+    def cleanup(self) -> None:
+        pass
+
+
+def _start_api_server_process_manager(**manager_kwargs: object) -> APIServerProcessManager:
+    """Construct vLLM's API server process manager.
+
+    Since upstream f226af0e11 the manager owns its own rollback: when a worker
+    ``Process.start`` fails inside ``__init__``, it shuts down the previously
+    started processes and cleans up every ZMQ listener itself.
+    """
+    from vllm.v1.utils import APIServerProcessManager
+
+    return APIServerProcessManager(**manager_kwargs)
 
 
 def run_multi_api_server_omni(args: TrackingNamespace) -> None:
@@ -1345,19 +1345,15 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
                 raise RuntimeError("Primary stage engine returned no addresses")
             timeout = float(getattr(args, "shutdown_timeout", 5) or 5)
             api_server_manager = _start_api_server_process_manager(
-                cleanup_timeout=timeout,
                 listen_address=listen_address,
                 sock=sock,
                 args=args,
                 num_servers=num_api_servers,
-                input_addresses=primary_addresses.inputs,
-                output_addresses=primary_addresses.outputs,
+                input_listeners=[_EngineAddressListener(addr) for addr in primary_addresses.inputs],
+                output_listeners=[_EngineAddressListener(addr) for addr in primary_addresses.outputs],
                 target_server_fn=run_omni_api_server_worker_proc,
             )
             engine_launch.watched_frontend_processes.extend(api_server_manager.processes)
-            actual_inputs, actual_outputs = api_server_manager.gather_actual_addresses()
-            primary_addresses.inputs = actual_inputs
-            primary_addresses.outputs = actual_outputs
 
         _wait_for_multi_api_server_completion(api_server_manager, engine_launch)
     finally:
